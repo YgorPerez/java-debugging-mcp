@@ -10,12 +10,21 @@ natural language.
 ## Features
 
 - **Remote Debugging**: Connect to any JVM started with JDWP enabled
-- **Breakpoint Management**: Set, list, and clear breakpoints by class and line
-- **Stack Inspection**: Get summarized stack frames with local variables
-- **Execution Control**: Step over/into/out, continue, pause
-- **Expression Evaluation**: Evaluate Java expressions in frame context
-- **Thread Management**: List and control thread execution
-- **Smart Summarization**: Handles large data structures without overwhelming the LLM
+- **Breakpoint Management**: Set/list/clear by class+line — with optional **hit-count** (stop on the
+  Nth hit) and **thread filters**, or set by **method name** (first line)
+- **Stack Inspection**: Stack frames with typed local variables and resolved **source lines**
+- **Execution Control**: **Step over/into/out**, continue, pause
+- **Expression Evaluation**: `localVar`/`this` with `.field` and `.method(args)` chains, resolving
+  overloads by arity and walking the superclass chain. Args: int, long, boolean, null, "string"
+- **Value Rendering**: Strings, typed objects (best-effort `toString()`), and **array contents**
+- **Set Values**: write a local variable in a suspended frame
+- **Thread Management**: tools default to the last thread that hit a breakpoint
+- **Structured Events**: `get_last_event` emits a machine-readable `[event]` line (thread, class.method:line)
+- **Safety**: a `panic` tool (clear all + resume) and a **watchdog** that auto-resumes a long-suspended
+  VM (`JDWP_WATCHDOG_SECS`, default 120) so a forgotten breakpoint can't freeze a shared instance
+
+> This fork implements `debug.evaluate` and `debug.step_*` (stubs upstream) plus the safety,
+> structured-event, array, set-value, and breakpoint-modifier features above.
 
 ## Quick Start
 

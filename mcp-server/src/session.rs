@@ -17,6 +17,13 @@ pub struct DebugSession {
     pub threads: HashMap<String, ThreadInfo>,
     pub last_event: Option<EventSet>,
     pub event_listener_task: Option<JoinHandle<()>>,
+    /// Thread of the most recent suspension event — used to default thread_id.
+    pub last_thread: Option<u64>,
+    /// Active single-step request id (must be cleared before the next resume).
+    pub pending_step: Option<i32>,
+    /// When the VM last suspended on an event; cleared on resume. Drives the watchdog.
+    pub suspended_since: Option<std::time::Instant>,
+    pub watchdog_task: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +67,10 @@ impl SessionManager {
             threads: HashMap::new(),
             last_event: None,
             event_listener_task: None,
+            last_thread: None,
+            pending_step: None,
+            suspended_since: None,
+            watchdog_task: None,
         };
 
         let mut sessions = self.sessions.lock().await;
@@ -94,6 +105,9 @@ impl SessionManager {
         if let Some(session_arc) = sessions.get(session_id) {
             let mut session = session_arc.lock().await;
             if let Some(task) = session.event_listener_task.take() {
+                task.abort();
+            }
+            if let Some(task) = session.watchdog_task.take() {
                 task.abort();
             }
         }

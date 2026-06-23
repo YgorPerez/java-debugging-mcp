@@ -23,6 +23,7 @@ pub mod stackframe;
 pub mod string;
 pub mod object;
 pub mod eval;
+pub mod extra;
 
 pub use connection::JdwpConnection;
 pub use eventloop::{EventLoopHandle, spawn_event_loop};

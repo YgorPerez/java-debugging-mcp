@@ -121,6 +121,8 @@ impl RequestHandler {
             "debug.pause" => self.handle_pause(call_params.arguments).await,
             "debug.disconnect" => self.handle_disconnect(call_params.arguments).await,
             "debug.get_last_event" => self.handle_get_last_event(call_params.arguments).await,
+            "debug.panic" => self.handle_panic(call_params.arguments).await,
+            "debug.set_value" => self.handle_set_value(call_params.arguments).await,
             _ => Err(format!("Unknown tool: {}", call_params.name)),
         };
 
@@ -172,6 +174,12 @@ impl RequestHandler {
                             if let Some(event_set) = event_opt {
                                 if let Some(session_guard) = session_manager.get_current_session().await {
                                     let mut session = session_guard.lock().await;
+                                    if let Some(tid) = event_thread(&event_set) {
+                                        session.last_thread = Some(tid);
+                                    }
+                                    if event_suspends(&event_set) {
+                                        session.suspended_since = Some(std::time::Instant::now());
+                                    }
                                     session.last_event = Some(event_set);
                                 } else {
                                     break; // Session gone
@@ -185,6 +193,39 @@ impl RequestHandler {
 
                     // Store task handle before releasing lock - prevents race with disconnect
                     session.event_listener_task = Some(task_handle);
+
+                    // Watchdog: auto-resume if a breakpoint leaves the VM suspended too long,
+                    // so a forgotten breakpoint can't freeze a request thread on a shared instance.
+                    let wd_manager = self.session_manager.clone();
+                    let watchdog = tokio::spawn(async move {
+                        let secs: u64 = std::env::var("JDWP_WATCHDOG_SECS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(120);
+                        if secs == 0 {
+                            return;
+                        }
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            match wd_manager.get_current_session().await {
+                                Some(g) => {
+                                    let mut s = g.lock().await;
+                                    if let Some(since) = s.suspended_since {
+                                        if since.elapsed().as_secs() >= secs {
+                                            if let Some(req) = s.pending_step.take() {
+                                                let _ = s.connection.clear_step(req).await;
+                                            }
+                                            let _ = s.connection.resume_all().await;
+                                            s.suspended_since = None;
+                                            info!("watchdog auto-resumed VM after {}s suspended", secs);
+                                        }
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    });
+                    session.watchdog_task = Some(watchdog);
                 }
 
                 Ok(format!("Connected to JVM at {}:{} (session: {})", host, port, session_id))
@@ -198,81 +239,78 @@ impl RequestHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'class_pattern' parameter".to_string())?;
 
-        let line = args.get("line")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| "Missing 'line' parameter".to_string())? as i32;
-
+        let line_opt = args.get("line").and_then(|v| v.as_i64()).map(|l| l as i32);
         let method_hint = args.get("method").and_then(|v| v.as_str());
+        if line_opt.is_none() && method_hint.is_none() {
+            return Err("Provide 'line' and/or 'method'".to_string());
+        }
+        let hit_count = args.get("hit_count").and_then(|v| v.as_i64()).map(|c| c as i32);
+        let thread_filter = arg_thread(&args);
 
-        // Get current session
         let session_guard = self.session_manager.get_current_session().await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
 
         let mut session = session_guard.lock().await;
 
-        // Convert class name to JVM signature format
-        // e.g., "com.example.MyClass" -> "Lcom/example/MyClass;"
         let signature = if class_pattern.starts_with('L') && class_pattern.ends_with(';') {
             class_pattern.to_string()
         } else {
             format!("L{};", class_pattern.replace('.', "/"))
         };
 
-        // Find the class
         let classes = session.connection.classes_by_signature(&signature).await
             .map_err(|e| format!("Failed to find class: {}", e))?;
-
         if classes.is_empty() {
             return Err(format!("Class not found: {}", class_pattern));
         }
+        let class_type_id = classes[0].type_id;
 
-        let class = &classes[0];
-
-        // Get methods
-        let methods = session.connection.get_methods(class.type_id).await
+        let methods = session.connection.get_methods(class_type_id).await
             .map_err(|e| format!("Failed to get methods: {}", e))?;
 
-        // Find the right method (use hint if provided, otherwise find first method containing the line)
-        let mut target_method = None;
-
+        // Resolve (method, bytecode index, line): by explicit line, by method name
+        // (first executable line), or a named method that also contains the line.
+        let mut chosen: Option<(jdwp_client::reftype::MethodInfo, u64, i32)> = None;
         for method in &methods {
             if let Some(hint) = method_hint {
-                if method.name == hint {
-                    target_method = Some(method);
-                    break;
+                if method.name != hint {
+                    continue;
                 }
             }
-
-            // Check if this method contains the line
-            if let Ok(line_table) = session.connection.get_line_table(class.type_id, method.method_id).await {
-                if line_table.lines.iter().any(|e| e.line_number == line) {
-                    target_method = Some(method);
+            let line_table = match session.connection.get_line_table(class_type_id, method.method_id).await {
+                Ok(lt) => lt,
+                Err(_) => continue,
+            };
+            if let Some(want) = line_opt {
+                if let Some(e) = line_table.lines.iter().find(|e| e.line_number == want) {
+                    chosen = Some((method.clone(), e.line_code_index, want));
                     break;
                 }
+                if method_hint.is_some() {
+                    if let Some(e) = line_table.lines.iter().min_by_key(|e| e.line_code_index) {
+                        chosen = Some((method.clone(), e.line_code_index, e.line_number));
+                        break;
+                    }
+                }
+            } else if let Some(e) = line_table.lines.iter().min_by_key(|e| e.line_code_index) {
+                chosen = Some((method.clone(), e.line_code_index, e.line_number));
+                break;
             }
         }
-
-        let method = target_method.ok_or_else(|| {
-            format!("No method found containing line {} in class {}", line, class_pattern)
+        let (method, index, line) = chosen.ok_or_else(|| match line_opt {
+            Some(l) => format!("No method contains line {} in {}", l, class_pattern),
+            None => format!("Method '{}' not found in {}", method_hint.unwrap_or(""), class_pattern),
         })?;
 
-        // Get line table and find bytecode index for the line
-        let line_table = session.connection.get_line_table(class.type_id, method.method_id).await
-            .map_err(|e| format!("Failed to get line table: {}", e))?;
-
-        let line_entry = line_table.lines.iter()
-            .find(|e| e.line_number == line)
-            .ok_or_else(|| format!("Line {} not found in method {}", line, method.name))?;
-
-        // Set the breakpoint!
-        let request_id = session.connection.set_breakpoint(
-            class.type_id,
+        let request_id = session.connection.set_breakpoint_ex(
+            class_type_id,
             method.method_id,
-            line_entry.line_code_index,
+            index,
             jdwp_client::SuspendPolicy::All,
+            hit_count,
+            thread_filter,
         ).await.map_err(|e| format!("Failed to set breakpoint: {}", e))?;
 
-        // Track the breakpoint in session
         let bp_id = format!("bp_{}", request_id);
         session.breakpoints.insert(bp_id.clone(), crate::session::BreakpointInfo {
             id: bp_id.clone(),
@@ -284,9 +322,16 @@ impl RequestHandler {
             hit_count: 0,
         });
 
+        let mut extra = String::new();
+        if let Some(c) = hit_count {
+            extra.push_str(&format!("\n   Stops on hit #{}", c));
+        }
+        if let Some(t) = thread_filter {
+            extra.push_str(&format!("\n   Thread filter: 0x{:x}", t));
+        }
         Ok(format!(
-            "✅ Breakpoint set at {}:{}\n   Method: {}\n   Breakpoint ID: {}\n   JDWP Request ID: {}",
-            class_pattern, line, method.name, bp_id, request_id
+            "✅ Breakpoint set at {}:{}\n   Method: {}\n   Breakpoint ID: {}\n   JDWP Request ID: {}{}",
+            class_pattern, line, method.name, bp_id, request_id, extra
         ))
     }
 
@@ -355,25 +400,76 @@ impl RequestHandler {
 
         let mut session = session_guard.lock().await;
 
+        // Drop any pending single-step request first, or it would re-fire on resume.
+        if let Some(req) = session.pending_step.take() {
+            let _ = session.connection.clear_step(req).await;
+        }
+        session.suspended_since = None;
         session.connection.resume_all().await
             .map_err(|e| format!("Failed to resume: {}", e))?;
 
         Ok("▶️  Execution resumed".to_string())
     }
 
-    async fn handle_step_over(&self, _args: serde_json::Value) -> Result<String, String> {
-        // TODO: Implement step over
-        Ok("Step over not yet implemented".to_string())
+    async fn handle_step_over(&self, args: serde_json::Value) -> Result<String, String> {
+        self.handle_step(args, jdwp_client::extra::StepDepth::Over, "over").await
     }
 
-    async fn handle_step_into(&self, _args: serde_json::Value) -> Result<String, String> {
-        // TODO: Implement step into
-        Ok("Step into not yet implemented".to_string())
+    async fn handle_step_into(&self, args: serde_json::Value) -> Result<String, String> {
+        self.handle_step(args, jdwp_client::extra::StepDepth::Into, "into").await
     }
 
-    async fn handle_step_out(&self, _args: serde_json::Value) -> Result<String, String> {
-        // TODO: Implement step out
-        Ok("Step out not yet implemented".to_string())
+    async fn handle_step_out(&self, args: serde_json::Value) -> Result<String, String> {
+        self.handle_step(args, jdwp_client::extra::StepDepth::Out, "out").await
+    }
+
+    async fn handle_step(
+        &self,
+        args: serde_json::Value,
+        depth: jdwp_client::extra::StepDepth,
+        label: &str,
+    ) -> Result<String, String> {
+        let session_guard = self.session_manager.get_current_session().await
+            .ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+
+        let thread_id = arg_thread(&args)
+            .or(session.last_thread)
+            .ok_or_else(|| "No thread to step. Pass thread_id, or hit a breakpoint first.".to_string())?;
+
+        // One active step request at a time; clear the previous before setting a new one.
+        if let Some(req) = session.pending_step.take() {
+            let _ = session.connection.clear_step(req).await;
+        }
+        let req = session.connection.set_step(thread_id, depth).await
+            .map_err(|e| format!("Failed to set step: {}", e))?;
+        session.pending_step = Some(req);
+        session.suspended_since = None;
+        session.connection.resume_all().await
+            .map_err(|e| format!("Failed to resume for step: {}", e))?;
+
+        Ok(format!(
+            "👣 Stepping {} on thread 0x{:x}. Call debug.get_last_event to see where it stopped.",
+            label, thread_id
+        ))
+    }
+
+    async fn handle_panic(&self, _args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.session_manager.get_current_session().await
+            .ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+
+        if let Some(req) = session.pending_step.take() {
+            let _ = session.connection.clear_step(req).await;
+        }
+        let n = session.breakpoints.len();
+        let _ = session.connection.clear_all_breakpoints().await;
+        session.breakpoints.clear();
+        session.suspended_since = None;
+        session.connection.resume_all().await
+            .map_err(|e| format!("Failed to resume: {}", e))?;
+
+        Ok(format!("🧯 Panic: cleared {} breakpoint(s) and resumed all threads.", n))
     }
 
     async fn handle_get_stack(&self, args: serde_json::Value) -> Result<String, String> {
@@ -394,9 +490,12 @@ impl RequestHandler {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        // If no thread specified, get all threads and use the first suspended one
+        // Prefer the explicit thread, then the last thread that hit a breakpoint/step,
+        // then fall back to the first thread.
         let target_thread = if let Some(tid) = thread_id {
             tid
+        } else if let Some(t) = session.last_thread {
+            t
         } else {
             let threads = session.connection.get_all_threads().await
                 .map_err(|e| format!("Failed to get threads: {}", e))?;
@@ -425,7 +524,12 @@ impl RequestHandler {
             // Try to get method name
             if let Ok(methods) = session.connection.get_methods(frame.location.class_id).await {
                 if let Some(method) = methods.iter().find(|m| m.method_id == frame.location.method_id) {
-                    output.push_str(&format!("  Method: {}\n", method.name));
+                    let method_name = method.name.clone();
+                    let line = source_line(&mut session.connection, frame.location.class_id, frame.location.method_id, frame.location.index).await;
+                    match line {
+                        Some(l) => output.push_str(&format!("  Method: {} (line {})\n", method_name, l)),
+                        None => output.push_str(&format!("  Method: {}\n", method_name)),
+                    }
 
                     // Get variables if requested
                     if include_variables {
@@ -471,15 +575,15 @@ impl RequestHandler {
     async fn handle_evaluate(&self, args: serde_json::Value) -> Result<String, String> {
         let expression = args.get("expression").and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'expression' parameter".to_string())?;
-        let thread_id = args.get("thread_id").and_then(|v| v.as_str())
-            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-            .ok_or_else(|| "Missing/invalid 'thread_id' (expected a hex string like \"0x2\")".to_string())?;
         let frame_index = args.get("frame_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let max_len = args.get("max_result_length").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
 
         let session_guard = self.session_manager.get_current_session().await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
+        let thread_id = arg_thread(&args)
+            .or(session.last_thread)
+            .ok_or_else(|| "No thread to evaluate in. Pass thread_id, or hit a breakpoint first.".to_string())?;
         let conn = &mut session.connection;
 
         let frames = conn.get_frames(thread_id, 0, -1).await
@@ -555,11 +659,31 @@ impl RequestHandler {
         let session_guard = self.session_manager.get_current_session().await
             .ok_or_else(|| "No active debug session".to_string())?;
 
-        let session = session_guard.lock().await;
+        let mut session = session_guard.lock().await;
 
-        if let Some(event_set) = &session.last_event {
-            let mut output = format!("🎯 Last event (suspend_policy={})\n\n", event_set.suspend_policy);
+        let event_set = match session.last_event.clone() {
+            Some(es) => es,
+            None => return Ok("No events received yet. Set a breakpoint and trigger it.".to_string()),
+        };
 
+        let mut output = String::new();
+        // Machine-readable summary of the first event, with source location resolved.
+        if let Some(ev) = event_set.events.first() {
+            if let Some((thread, loc)) = event_location(&ev.details) {
+                let (cls, method, line) = describe_location(&mut session.connection, &loc).await;
+                let summary = json!({
+                    "event": event_type_name(&ev.details),
+                    "thread": format!("0x{:x}", thread),
+                    "class": cls,
+                    "method": method,
+                    "line": line,
+                });
+                output.push_str(&format!("[event] {}\n\n", summary));
+            }
+        }
+        output.push_str(&format!("🎯 Last event (suspend_policy={})\n\n", event_set.suspend_policy));
+
+        {
             for (idx, event) in event_set.events.iter().enumerate() {
                 output.push_str(&format!("Event {}:\n", idx + 1));
                 output.push_str(&format!("  Request ID: {}\n", event.request_id));
@@ -604,27 +728,74 @@ impl RequestHandler {
 
                 output.push_str("\n");
             }
-
-            Ok(output)
-        } else {
-            Ok("No events received yet. Set a breakpoint and trigger it.".to_string())
         }
+
+        Ok(output)
+    }
+
+    async fn handle_set_value(&self, args: serde_json::Value) -> Result<String, String> {
+        let name = args.get("name").and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'name' (local variable)".to_string())?;
+        let value_str = args.get("value").and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'value' (literal: int, true/false, null, or \"string\")".to_string())?;
+        let frame_index = args.get("frame_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let session_guard = self.session_manager.get_current_session().await
+            .ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+        let thread_id = arg_thread(&args).or(session.last_thread)
+            .ok_or_else(|| "No thread. Pass thread_id, or hit a breakpoint first.".to_string())?;
+        let conn = &mut session.connection;
+
+        let frames = conn.get_frames(thread_id, 0, -1).await
+            .map_err(|e| format!("Failed to get frames: {}", e))?;
+        let frame = frames.get(frame_index).cloned()
+            .ok_or_else(|| format!("frame_index {} out of range", frame_index))?;
+
+        let vars = conn.get_variable_table(frame.location.class_id, frame.location.method_id).await
+            .map_err(|e| format!("Failed to read variable table: {}", e))?;
+        let idx = frame.location.index;
+        let var = vars.iter()
+            .find(|v| v.name == name && idx >= v.code_index && idx < v.code_index + v.length as u64)
+            .or_else(|| vars.iter().find(|v| v.name == name))
+            .ok_or_else(|| format!("Unknown local variable '{}'", name))?;
+        let sig_byte = *var.signature.as_bytes().first().ok_or_else(|| "Bad signature".to_string())?;
+
+        let value = literal_to_value(conn, value_str, sig_byte).await?;
+        conn.set_frame_value(thread_id, frame.frame_id, var.slot as i32, &value).await
+            .map_err(|e| format!("Failed to set value: {}", e))?;
+        Ok(format!("✅ Set {} = {}", name, value_str))
     }
 }
 
 // ===================================================================================
 // Expression evaluation
 //
-// Supports `localVar`/`this` followed by `.field` and `.noArgMethod()` chains, e.g.
+// Supports `localVar`/`this` followed by `.field` and `.method(args)` chains, e.g.
 //   reserva.getReservaPacote().getReservaHotelList().size()
-// Field access uses ObjectReference.GetValues; method calls use ObjectReference.InvokeMethod
-// (no-arg only for now); both walk the superclass chain to resolve inherited members.
-// Method arguments and operators are not supported yet.
+//   map.get("key").getName()
+// Field access uses ObjectReference.GetValues; method calls use ObjectReference.InvokeMethod,
+// resolving overloads by arity and walking the superclass chain for inherited members.
+// Supported argument literals: int, long (123L), boolean, null, and "string".
 // ===================================================================================
+
+use jdwp_client::events::EventKind;
+use jdwp_client::extra::{value_bool, value_int, value_long, value_null, value_object};
+use jdwp_client::types::Location;
+
+#[derive(Debug, Clone)]
+enum ArgLit {
+    Int(i32),
+    Long(i64),
+    Bool(bool),
+    Null,
+    Str(String),
+}
 
 struct Seg {
     name: String,
-    is_call: bool,
+    /// None = field access; Some = method call with these argument literals.
+    args: Option<Vec<ArgLit>>,
 }
 
 fn is_ident(s: &str) -> bool {
@@ -633,37 +804,127 @@ fn is_ident(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
+/// Split an expression into `.`-separated segments, ignoring dots inside () or "".
+fn split_segments(e: &str) -> Result<Vec<String>, String> {
+    let mut segs = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    for c in e.chars() {
+        match c {
+            '"' => {
+                in_str = !in_str;
+                cur.push(c);
+            }
+            '(' if !in_str => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' if !in_str => {
+                depth -= 1;
+                cur.push(c);
+            }
+            '.' if !in_str && depth == 0 => {
+                segs.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    if depth != 0 || in_str {
+        return Err("Unbalanced parentheses or quotes".to_string());
+    }
+    if !cur.trim().is_empty() {
+        segs.push(cur.trim().to_string());
+    }
+    Ok(segs)
+}
+
+fn parse_lit(t: &str) -> Result<ArgLit, String> {
+    let t = t.trim();
+    if t == "null" {
+        return Ok(ArgLit::Null);
+    }
+    if t == "true" {
+        return Ok(ArgLit::Bool(true));
+    }
+    if t == "false" {
+        return Ok(ArgLit::Bool(false));
+    }
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        return Ok(ArgLit::Str(t[1..t.len() - 1].to_string()));
+    }
+    if let Some(num) = t.strip_suffix('L').or_else(|| t.strip_suffix('l')) {
+        if let Ok(n) = num.parse::<i64>() {
+            return Ok(ArgLit::Long(n));
+        }
+    }
+    if let Ok(n) = t.parse::<i32>() {
+        return Ok(ArgLit::Int(n));
+    }
+    if let Ok(n) = t.parse::<i64>() {
+        return Ok(ArgLit::Long(n));
+    }
+    Err(format!(
+        "Unsupported argument literal: '{}' (supported: int, long like 123L, true/false, null, \"string\")",
+        t
+    ))
+}
+
+fn parse_args(inside: &str) -> Result<Vec<ArgLit>, String> {
+    let s = inside.trim();
+    if s.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_str = false;
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_str = !in_str;
+                cur.push(c);
+            }
+            ',' if !in_str => {
+                out.push(parse_lit(&cur)?);
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(parse_lit(&cur)?);
+    Ok(out)
+}
+
+fn parse_seg(raw: &str) -> Result<Seg, String> {
+    if let Some(open) = raw.find('(') {
+        if !raw.ends_with(')') {
+            return Err(format!("Malformed method call: '{}'", raw));
+        }
+        let name = raw[..open].trim();
+        if !is_ident(name) {
+            return Err(format!("Bad method name: '{}'", name));
+        }
+        let args = parse_args(&raw[open + 1..raw.len() - 1])?;
+        Ok(Seg { name: name.to_string(), args: Some(args) })
+    } else {
+        if !is_ident(raw) {
+            return Err(format!("Unsupported token: '{}'", raw));
+        }
+        Ok(Seg { name: raw.to_string(), args: None })
+    }
+}
+
 fn parse_expr(expr: &str) -> Result<Vec<Seg>, String> {
     let e = expr.trim();
     if e.is_empty() {
         return Err("Empty expression".to_string());
     }
-    let mut segs = Vec::new();
-    for raw in e.split('.') {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            return Err("Malformed expression (empty segment between dots)".to_string());
-        }
-        if let Some(name) = raw.strip_suffix("()") {
-            if !is_ident(name) {
-                return Err(format!("Unsupported method token: '{}'", raw));
-            }
-            segs.push(Seg { name: name.to_string(), is_call: true });
-        } else if raw.contains('(') || raw.contains(')') {
-            return Err(format!(
-                "Method arguments are not supported yet: '{}'. Supported: localVar/this with .field and .noArgMethod() chains.",
-                raw
-            ));
-        } else if is_ident(raw) {
-            segs.push(Seg { name: raw.to_string(), is_call: false });
-        } else {
-            return Err(format!(
-                "Unsupported expression token: '{}'. Supported: localVar/this with .field and .noArgMethod() chains.",
-                raw
-            ));
-        }
+    let raws = split_segments(e)?;
+    if raws.is_empty() {
+        return Err("Empty expression".to_string());
     }
-    Ok(segs)
+    raws.iter().map(|r| parse_seg(r)).collect()
 }
 
 /// JNI signature -> readable type name. "Lpkg/Cls;" -> "pkg.Cls"; "[I" -> "int[]".
@@ -693,6 +954,31 @@ fn decode_signature(sig: &str) -> String {
     format!("{}{}", base, "[]".repeat(dims))
 }
 
+/// Count the top-level argument types in a method descriptor like "(ILjava/lang/String;)V".
+fn sig_arg_count(sig: &str) -> usize {
+    let (a, b) = match (sig.find('('), sig.find(')')) {
+        (Some(a), Some(b)) if b > a => (a, b),
+        _ => return 0,
+    };
+    let mut count = 0;
+    let mut chars = sig[a + 1..b].chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '[' => continue, // array prefix; the following base type is the arg
+            'L' => {
+                for n in chars.by_ref() {
+                    if n == ';' {
+                        break;
+                    }
+                }
+                count += 1;
+            }
+            _ => count += 1,
+        }
+    }
+    count
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() > max {
         let t: String = s.chars().take(max).collect();
@@ -702,11 +988,12 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Find a no-arg method by name, walking the superclass chain. Returns (declaring type, method).
-async fn find_method(
+/// Find a method by name + argument count, walking the superclass chain.
+async fn find_method_arity(
     conn: &mut jdwp_client::JdwpConnection,
     type_id: u64,
     name: &str,
+    argc: usize,
 ) -> Result<Option<(u64, jdwp_client::reftype::MethodInfo)>, String> {
     let mut current = Some(type_id);
     let mut guard = 0;
@@ -716,7 +1003,7 @@ async fn find_method(
             break;
         }
         let methods = conn.get_methods(tid).await.map_err(|e| format!("Failed to get methods: {}", e))?;
-        if let Some(m) = methods.into_iter().find(|m| m.name == name && m.signature.starts_with("()")) {
+        if let Some(m) = methods.into_iter().find(|m| m.name == name && sig_arg_count(&m.signature) == argc) {
             return Ok(Some((tid, m)));
         }
         current = conn.get_superclass(tid).await.unwrap_or(None);
@@ -724,7 +1011,7 @@ async fn find_method(
     Ok(None)
 }
 
-/// Find a field by name, walking the superclass chain. Returns the field id.
+/// Find a field by name, walking the superclass chain.
 async fn find_field(
     conn: &mut jdwp_client::JdwpConnection,
     type_id: u64,
@@ -746,6 +1033,22 @@ async fn find_field(
     Ok(None)
 }
 
+async fn arglit_to_value(
+    conn: &mut jdwp_client::JdwpConnection,
+    a: &ArgLit,
+) -> Result<jdwp_client::types::Value, String> {
+    Ok(match a {
+        ArgLit::Int(n) => value_int(*n),
+        ArgLit::Long(n) => value_long(*n),
+        ArgLit::Bool(b) => value_bool(*b),
+        ArgLit::Null => value_null(),
+        ArgLit::Str(s) => {
+            let id = conn.create_string(s).await.map_err(|e| format!("Failed to create string arg: {}", e))?;
+            value_object(id)
+        }
+    })
+}
+
 async fn resolve_head(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: u64,
@@ -753,7 +1056,7 @@ async fn resolve_head(
     seg: &Seg,
 ) -> Result<jdwp_client::types::Value, String> {
     use jdwp_client::types::{Value, ValueData};
-    if seg.is_call {
+    if seg.args.is_some() {
         return Err("Expression must start with a local variable or 'this'".to_string());
     }
     if seg.name == "this" {
@@ -787,32 +1090,40 @@ async fn resolve_segment(
     use jdwp_client::types::ValueData;
     let obj_id = match &current.data {
         ValueData::Object(0) => {
-            return Err(format!("Cannot access '.{}{}' on null", seg.name, if seg.is_call { "()" } else { "" }))
+            return Err(format!("Cannot access '.{}' on null", seg.name))
         }
         ValueData::Object(id) => *id,
         _ => return Err(format!("Cannot access '.{}' on a primitive value", seg.name)),
     };
     let type_id = conn.get_object_reference_type(obj_id).await
         .map_err(|e| format!("Failed to resolve object type: {}", e))?;
-    if seg.is_call {
-        let (decl, m) = find_method(conn, type_id, &seg.name).await?
-            .ok_or_else(|| format!("No no-arg method '{}()' found on the object", seg.name))?;
-        let (ret, exc) = conn.invoke_method(obj_id, thread_id, decl, m.method_id, vec![]).await
-            .map_err(|e| format!("invoke {}() failed: {}", seg.name, e))?;
-        if exc != 0 {
-            let tn = match conn.get_object_reference_type(exc).await {
-                Ok(t) => decode_signature(&conn.get_signature(t).await.unwrap_or_default()),
-                Err(_) => "an exception".to_string(),
-            };
-            return Err(format!("{}() threw {}", seg.name, tn));
+
+    match &seg.args {
+        Some(arglits) => {
+            let mut argvals = Vec::with_capacity(arglits.len());
+            for a in arglits {
+                argvals.push(arglit_to_value(conn, a).await?);
+            }
+            let (decl, m) = find_method_arity(conn, type_id, &seg.name, argvals.len()).await?
+                .ok_or_else(|| format!("No method '{}' with {} argument(s) on the object", seg.name, argvals.len()))?;
+            let (ret, exc) = conn.invoke_method(obj_id, thread_id, decl, m.method_id, argvals).await
+                .map_err(|e| format!("invoke {}() failed: {}", seg.name, e))?;
+            if exc != 0 {
+                let tn = match conn.get_object_reference_type(exc).await {
+                    Ok(t) => decode_signature(&conn.get_signature(t).await.unwrap_or_default()),
+                    Err(_) => "an exception".to_string(),
+                };
+                return Err(format!("{}() threw {}", seg.name, tn));
+            }
+            Ok(ret)
         }
-        Ok(ret)
-    } else {
-        let fid = find_field(conn, type_id, &seg.name).await?
-            .ok_or_else(|| format!("No field '{}' found on the object", seg.name))?;
-        let vals = conn.get_object_values(obj_id, vec![fid]).await
-            .map_err(|e| format!("Failed to read field '{}': {}", seg.name, e))?;
-        vals.into_iter().next().ok_or_else(|| "No value returned for field".to_string())
+        None => {
+            let fid = find_field(conn, type_id, &seg.name).await?
+                .ok_or_else(|| format!("No field '{}' found on the object", seg.name))?;
+            let vals = conn.get_object_values(obj_id, vec![fid]).await
+                .map_err(|e| format!("Failed to read field '{}': {}", seg.name, e))?;
+            vals.into_iter().next().ok_or_else(|| "No value returned for field".to_string())
+        }
     }
 }
 
@@ -830,8 +1141,28 @@ async fn resolve_expression(
     Ok(current)
 }
 
-/// Render a value for display. Strings show their contents; objects show their type name
-/// (and, when `thread_id` is Some, a best-effort `toString()`); primitives show their value.
+/// Shallow render of an array element (no recursion / method invocation).
+async fn render_element(conn: &mut jdwp_client::JdwpConnection, value: &jdwp_client::types::Value) -> String {
+    use jdwp_client::types::ValueData;
+    match &value.data {
+        ValueData::Object(0) => "null".to_string(),
+        ValueData::Object(id) => {
+            if value.tag == 115 {
+                if let Ok(s) = conn.get_string_value(*id).await {
+                    return format!("\"{}\"", truncate(&s, 60));
+                }
+            }
+            match conn.get_object_reference_type(*id).await {
+                Ok(t) => format!("{} (id=0x{:x})", decode_signature(&conn.get_signature(t).await.unwrap_or_default()), id),
+                Err(_) => format!("(object) @{:x}", id),
+            }
+        }
+        _ => value.format(),
+    }
+}
+
+/// Render a value for display. Strings show contents; arrays show their elements; objects
+/// show their type name (and, when `thread_id` is Some, a best-effort `toString()`).
 async fn render_value(
     conn: &mut jdwp_client::JdwpConnection,
     value: &jdwp_client::types::Value,
@@ -867,8 +1198,24 @@ async fn render_value(
                     return format!("\"{}\"", truncate(&s, max_len));
                 }
             }
+            // Array contents
+            if value.tag == 91 {
+                if let Ok(len) = conn.get_array_length(id).await {
+                    let take = len.min(16);
+                    if let Ok(elems) = conn.get_array_values(id, 0, take).await {
+                        let mut parts = Vec::with_capacity(elems.len());
+                        for e in &elems {
+                            parts.push(render_element(conn, e).await);
+                        }
+                        let more = if len > take { format!(", … +{} more", len - take) } else { String::new() };
+                        let base = name.strip_suffix("[]").unwrap_or(name.as_str());
+                        return format!("{}[{}]{{{}{}}}", base, len, parts.join(", "), more);
+                    }
+                }
+            }
+            // best-effort toString() when we have a thread to run it on
             if let Some(tid) = thread_id {
-                if let Ok(Some((decl, m))) = find_method(conn, type_id, "toString").await {
+                if let Ok(Some((decl, m))) = find_method_arity(conn, type_id, "toString", 0).await {
                     if m.signature == "()Ljava/lang/String;" {
                         if let Ok((ret, exc)) = conn.invoke_method(id, tid, decl, m.method_id, vec![]).await {
                             if exc == 0 {
@@ -887,4 +1234,108 @@ async fn render_value(
             format!("{} (id=0x{:x})", name, id)
         }
     }
+}
+
+/// Convert a literal string to a Value, coercing int literals to the slot's primitive type.
+async fn literal_to_value(
+    conn: &mut jdwp_client::JdwpConnection,
+    s: &str,
+    sig_byte: u8,
+) -> Result<jdwp_client::types::Value, String> {
+    Ok(match parse_lit(s)? {
+        ArgLit::Str(st) => {
+            let id = conn.create_string(&st).await.map_err(|e| format!("Failed to create string: {}", e))?;
+            value_object(id)
+        }
+        ArgLit::Null => value_null(),
+        ArgLit::Bool(b) => value_bool(b),
+        ArgLit::Long(n) => value_long(n),
+        ArgLit::Int(n) => match sig_byte {
+            b'J' => value_long(n as i64),
+            b'Z' => value_bool(n != 0),
+            _ => value_int(n),
+        },
+    })
+}
+
+// ----- event / thread / location helpers -----
+
+fn arg_thread(args: &serde_json::Value) -> Option<u64> {
+    args.get("thread_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+}
+
+fn event_location(d: &EventKind) -> Option<(u64, Location)> {
+    match d {
+        EventKind::Breakpoint { thread, location }
+        | EventKind::Step { thread, location }
+        | EventKind::MethodEntry { thread, location }
+        | EventKind::MethodExit { thread, location } => Some((*thread, location.clone())),
+        EventKind::Exception { thread, location, .. } => Some((*thread, location.clone())),
+        _ => None,
+    }
+}
+
+fn event_thread(es: &jdwp_client::EventSet) -> Option<u64> {
+    es.events.first().and_then(|e| event_location(&e.details).map(|(t, _)| t))
+}
+
+fn event_suspends(es: &jdwp_client::EventSet) -> bool {
+    es.suspend_policy != 0
+        && es.events.iter().any(|e| {
+            matches!(
+                e.details,
+                EventKind::Breakpoint { .. }
+                    | EventKind::Step { .. }
+                    | EventKind::Exception { .. }
+                    | EventKind::MethodEntry { .. }
+                    | EventKind::MethodExit { .. }
+            )
+        })
+}
+
+fn event_type_name(d: &EventKind) -> &'static str {
+    match d {
+        EventKind::Breakpoint { .. } => "breakpoint",
+        EventKind::Step { .. } => "step",
+        EventKind::Exception { .. } => "exception",
+        EventKind::MethodEntry { .. } => "method_entry",
+        EventKind::MethodExit { .. } => "method_exit",
+        EventKind::VMStart { .. } => "vm_start",
+        EventKind::VMDeath => "vm_death",
+        EventKind::ThreadStart { .. } => "thread_start",
+        EventKind::ThreadDeath { .. } => "thread_death",
+        EventKind::ClassPrepare { .. } => "class_prepare",
+        EventKind::Unknown { .. } => "unknown",
+    }
+}
+
+/// Best-effort source line for a (class, method, bytecode index): the line whose code index
+/// is the greatest <= the given index.
+async fn source_line(
+    conn: &mut jdwp_client::JdwpConnection,
+    class_id: u64,
+    method_id: u64,
+    index: u64,
+) -> Option<i32> {
+    let lt = conn.get_line_table(class_id, method_id).await.ok()?;
+    lt.lines
+        .iter()
+        .filter(|e| e.line_code_index <= index)
+        .max_by_key(|e| e.line_code_index)
+        .map(|e| e.line_number)
+}
+
+/// Resolve (class name, method name, source line) for a location.
+async fn describe_location(conn: &mut jdwp_client::JdwpConnection, loc: &Location) -> (String, String, Option<i32>) {
+    let class = conn.get_signature(loc.class_id).await.ok().map(|s| decode_signature(&s)).unwrap_or_default();
+    let method = conn
+        .get_methods(loc.class_id)
+        .await
+        .ok()
+        .and_then(|ms| ms.into_iter().find(|m| m.method_id == loc.method_id).map(|m| m.name))
+        .unwrap_or_default();
+    let line = source_line(conn, loc.class_id, loc.method_id, loc.index).await;
+    (class, method, line)
 }

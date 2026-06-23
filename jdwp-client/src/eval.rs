@@ -89,7 +89,7 @@ impl JdwpConnection {
     }
 }
 
-fn write_tagged_value<B: BufMut>(buf: &mut B, v: &Value) {
+pub(crate) fn write_tagged_value<B: BufMut>(buf: &mut B, v: &Value) {
     buf.put_u8(v.tag);
     match &v.data {
         ValueData::Byte(x) => buf.put_i8(*x),
@@ -105,7 +105,7 @@ fn write_tagged_value<B: BufMut>(buf: &mut B, v: &Value) {
     }
 }
 
-fn read_value_by_tag(tag: u8, buf: &mut &[u8]) -> JdwpResult<ValueData> {
+pub(crate) fn read_value_by_tag(tag: u8, buf: &mut &[u8]) -> JdwpResult<ValueData> {
     match tag {
         66 => Ok(ValueData::Byte(buf.get_i8())),
         67 => Ok(ValueData::Char(buf.get_u16())),

@@ -48,10 +48,18 @@ pub fn get_tools() -> Vec<Tool> {
                     },
                     "method": {
                         "type": "string",
-                        "description": "Method name (optional, helps resolve ambiguity)"
+                        "description": "Method name (optional). If given without 'line', breaks at the method's first line."
+                    },
+                    "hit_count": {
+                        "type": "integer",
+                        "description": "Only stop on the Nth hit (optional)"
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Only stop when this thread (hex id) hits it (optional)"
                     }
                 },
-                "required": ["class_pattern", "line"]
+                "required": ["class_pattern"]
             }),
         },
         Tool {
@@ -100,7 +108,7 @@ pub fn get_tools() -> Vec<Tool> {
                         "description": "Thread ID to step"
                     }
                 },
-                "required": ["thread_id"]
+                "required": []
             }),
         },
         Tool {
@@ -114,7 +122,7 @@ pub fn get_tools() -> Vec<Tool> {
                         "description": "Thread ID to step"
                     }
                 },
-                "required": ["thread_id"]
+                "required": []
             }),
         },
         Tool {
@@ -128,7 +136,7 @@ pub fn get_tools() -> Vec<Tool> {
                         "description": "Thread ID to step"
                     }
                 },
-                "required": ["thread_id"]
+                "required": []
             }),
         },
         Tool {
@@ -157,7 +165,7 @@ pub fn get_tools() -> Vec<Tool> {
                         "default": 2
                     }
                 },
-                "required": ["thread_id"]
+                "required": []
             }),
         },
         Tool {
@@ -185,7 +193,7 @@ pub fn get_tools() -> Vec<Tool> {
                         "default": 500
                     }
                 },
-                "required": ["thread_id", "expression"]
+                "required": ["expression"]
             }),
         },
         Tool {
@@ -219,10 +227,32 @@ pub fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.get_last_event".to_string(),
-            description: "Get the last breakpoint/event received with thread ID".to_string(),
+            description: "Get the last breakpoint/event received. Includes a machine-readable [event] line with thread id and source location (class.method:line).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {}
+            }),
+        },
+        Tool {
+            name: "debug.panic".to_string(),
+            description: "Safety: clear ALL breakpoints and resume ALL threads. Use to unfreeze a JVM if a breakpoint left a thread suspended.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        Tool {
+            name: "debug.set_value".to_string(),
+            description: "Set a local variable in a suspended frame to a literal (int, long like 123L, true/false, null, or \"string\").".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Local variable name" },
+                    "value": { "type": "string", "description": "Literal: int, 123L, true/false, null, or \"string\"" },
+                    "thread_id": { "type": "string", "description": "Thread id (optional; defaults to last-hit thread)" },
+                    "frame_index": { "type": "integer", "description": "Frame index (default 0)", "default": 0 }
+                },
+                "required": ["name", "value"]
             }),
         },
     ]
