@@ -75,19 +75,26 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 
 | Tool | Description |
 |------|-------------|
-| `debug.attach` | Connect to JVM via JDWP |
-| `debug.set_breakpoint` | Set breakpoint at class:line |
+| `debug.attach` | Connect to a JVM via JDWP |
+| `debug.set_breakpoint` | Set a breakpoint by class+line, or by method name; optional `hit_count` and thread filter |
 | `debug.list_breakpoints` | List active breakpoints |
 | `debug.clear_breakpoint` | Remove a breakpoint |
 | `debug.continue` | Resume execution |
-| `debug.step_over` | Step over current line |
-| `debug.step_into` | Step into method |
-| `debug.step_out` | Step out of method |
-| `debug.get_stack` | Get stack frames with variables |
-| `debug.evaluate` | Evaluate expression |
+| `debug.step_over` | Step over current line (defaults to last-hit thread) |
+| `debug.step_into` | Step into a method call |
+| `debug.step_out` | Step out of the current method |
+| `debug.get_stack` | Stack frames with typed variables and source lines |
+| `debug.evaluate` | Evaluate `var`/`this` + `.field` / `.method(args)` chains in a frame |
+| `debug.set_value` | Set a local variable in a suspended frame |
+| `debug.get_last_event` | Last event, with a machine-readable `[event]` line (thread, class.method:line) |
 | `debug.list_threads` | List all threads |
-| `debug.pause` | Pause execution |
-| `debug.disconnect` | End debug session |
+| `debug.pause` | Pause execution (suspend all threads) |
+| `debug.panic` | Safety: clear all breakpoints and resume all threads |
+| `debug.disconnect` | End the debug session |
+
+Most tools take `thread_id` as an optional hex string (e.g. `"0x2"`); when omitted they default to
+the last thread that hit a breakpoint. A watchdog auto-resumes a VM left suspended for too long
+(`JDWP_WATCHDOG_SECS`, default 120).
 
 ## Example: Debugging with kubectl port-forward
 
@@ -167,36 +174,28 @@ cargo test
 
 ## Status
 
-✅ **Core Functionality Complete** - Ready for MCP integration
+✅ **Functionally complete** — 16 debug tools, integrated and validated against a live JVM.
 
-### Implemented Features
-- [x] Project structure
+### Implemented
 - [x] JDWP protocol (handshake, packets, encoding/decoding)
-- [x] MCP server skeleton with 13 debug tools
-- [x] VirtualMachine commands (Version, IDSizes, AllThreads, Suspend/Resume)
-- [x] ClassesBySignature (find classes by name)
-- [x] ReferenceType.Methods (get method info)
-- [x] Method.LineTable (map source lines to bytecode)
-- [x] Method.VariableTable (get variable metadata)
-- [x] EventRequest.Set (breakpoints with location modifiers)
-- [x] ThreadReference.Frames (get call stacks)
-- [x] StackFrame.GetValues (read variable values)
-- [x] Value formatting and display
-- [x] Architecture independence (big-endian protocol, works on Intel & ARM M1/M2/M3)
+- [x] MCP server with 16 debug tools (stdio transport)
+- [x] VirtualMachine commands (Version, IDSizes, AllThreads, Suspend/Resume, CreateString)
+- [x] ClassesBySignature, ReferenceType.Methods/Fields/Signature, ClassType.Superclass
+- [x] Method.LineTable / VariableTable
+- [x] EventRequest.Set/Clear/ClearAllBreakpoints — breakpoints with location, **count**, and **thread** modifiers
+- [x] ThreadReference.Frames, StackFrame.GetValues/SetValues/ThisObject
+- [x] ObjectReference.ReferenceType/GetValues/**InvokeMethod**, ArrayReference.Length/GetValues, StringReference.Value
+- [x] **Event loop** for async breakpoint/step notifications
+- [x] **Stepping** (step over/into/out)
+- [x] **Expression evaluation** — `var`/`this` + `.field` / `.method(args)` chains, overload-by-arity, superclass walk
+- [x] **String and object dereferencing**, array contents, best-effort `toString()`, source-line resolution
+- [x] **Safety**: `panic` + idle watchdog auto-resume
+- [x] Architecture independence (big-endian protocol; Intel & ARM)
 
-### Working Examples
-- [x] `test_connection` - Basic JDWP handshake
-- [x] `test_vm_commands` - Query JVM version and ID sizes
-- [x] `test_find_class` - Find classes and methods with line tables
-- [x] `test_breakpoint` - Set breakpoints at specific source lines
-- [x] `test_manual_stack` - Suspend and inspect thread stacks with variables
-
-### Next Steps
-- [ ] Event loop for async breakpoint notifications
-- [ ] Stepping commands (step over/into/out)
-- [ ] Expression evaluation
-- [ ] String and object dereferencing
-- [ ] Full MCP server integration
+### Possible future work
+- [ ] Conditional (expression) breakpoints
+- [ ] Multiple concurrent debug sessions
+- [ ] `long`/`boolean` literal arguments in `evaluate` (int/string/null/char supported today)
 
 ## References
 
