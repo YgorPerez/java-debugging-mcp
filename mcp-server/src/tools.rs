@@ -57,6 +57,14 @@ pub fn get_tools() -> Vec<Tool> {
                     "thread_id": {
                         "type": "string",
                         "description": "Only stop when this thread (hex id) hits it (optional)"
+                    },
+                    "condition": {
+                        "type": "string",
+                        "description": "Only stop when this boolean expression is true (evaluated in the hit frame). Supports `expr OP literal` (==, !=, <, >, <=, >=) and boolean method chains, e.g. `reserva.getReservaPacote().getReservaHotelList().size() > 0` or `getSgMoeda() == \"BRL\"`."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Target debug session (optional; defaults to the current one)"
                     }
                 },
                 "required": ["class_pattern"]

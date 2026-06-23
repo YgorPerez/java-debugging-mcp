@@ -19,6 +19,18 @@ impl RequestHandler {
         }
     }
 
+    /// Resolve the target session: an explicit `session_id` argument, else the current session.
+    /// (Supports multiple concurrent debug sessions to different JVMs.)
+    async fn resolve_session(
+        &self,
+        args: &serde_json::Value,
+    ) -> Option<std::sync::Arc<tokio::sync::Mutex<crate::session::DebugSession>>> {
+        match args.get("session_id").and_then(|v| v.as_str()) {
+            Some(sid) => self.session_manager.get_session_by_id(sid).await,
+            None => self.session_manager.get_current_session().await,
+        }
+    }
+
     pub async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         let result = match request.method.as_str() {
             "initialize" => self.handle_initialize(request.params),
@@ -155,7 +167,7 @@ impl RequestHandler {
                 let session_id = self.session_manager.create_session(connection).await;
 
                 // Get session guard once to prevent race between spawn and store
-                let session_guard = self.session_manager.get_current_session().await
+                let session_guard = self.resolve_session(&args).await
                     .ok_or_else(|| "Failed to get session after creation".to_string())?;
 
                 // Clone connection, spawn task, and store handle in single critical section
@@ -163,8 +175,9 @@ impl RequestHandler {
                     let mut session = session_guard.lock().await;
                     let connection_clone = session.connection.clone();
 
-                    // Spawn event listener task
+                    // Spawn event listener task (bound to THIS session, not "current").
                     let session_manager = self.session_manager.clone();
+                    let listener_sid = session_id.clone();
                     let task_handle = tokio::spawn(async move {
                         loop {
                             // Receive event without holding any locks!
@@ -172,15 +185,35 @@ impl RequestHandler {
 
                             // Store event (brief lock acquisition)
                             if let Some(event_set) = event_opt {
-                                if let Some(session_guard) = session_manager.get_current_session().await {
+                                if let Some(session_guard) = session_manager.get_session_by_id(&listener_sid).await {
                                     let mut session = session_guard.lock().await;
-                                    if let Some(tid) = event_thread(&event_set) {
-                                        session.last_thread = Some(tid);
+                                    // Conditional breakpoint: evaluate the condition on the hit thread
+                                    // and auto-resume (skip reporting) when it is not true.
+                                    let mut skip = false;
+                                    if let (Some((thread, _)), Some(req_id)) = (
+                                        event_set.events.first().and_then(|e| event_location(&e.details)),
+                                        event_set.events.first().map(|e| e.request_id),
+                                    ) {
+                                        let cond = session.breakpoints.values()
+                                            .find(|b| b.request_id == req_id)
+                                            .and_then(|b| b.condition.clone());
+                                        if let Some(cond) = cond {
+                                            let keep = evaluate_condition_on_thread(&mut session.connection, thread, &cond).await;
+                                            if !keep {
+                                                let _ = session.connection.resume_all().await;
+                                                skip = true;
+                                            }
+                                        }
                                     }
-                                    if event_suspends(&event_set) {
-                                        session.suspended_since = Some(std::time::Instant::now());
+                                    if !skip {
+                                        if let Some(tid) = event_thread(&event_set) {
+                                            session.last_thread = Some(tid);
+                                        }
+                                        if event_suspends(&event_set) {
+                                            session.suspended_since = Some(std::time::Instant::now());
+                                        }
+                                        session.last_event = Some(event_set);
                                     }
-                                    session.last_event = Some(event_set);
                                 } else {
                                     break; // Session gone
                                 }
@@ -197,6 +230,7 @@ impl RequestHandler {
                     // Watchdog: auto-resume if a breakpoint leaves the VM suspended too long,
                     // so a forgotten breakpoint can't freeze a request thread on a shared instance.
                     let wd_manager = self.session_manager.clone();
+                    let wd_sid = session_id.clone();
                     let watchdog = tokio::spawn(async move {
                         let secs: u64 = std::env::var("JDWP_WATCHDOG_SECS")
                             .ok()
@@ -207,7 +241,7 @@ impl RequestHandler {
                         }
                         loop {
                             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            match wd_manager.get_current_session().await {
+                            match wd_manager.get_session_by_id(&wd_sid).await {
                                 Some(g) => {
                                     let mut s = g.lock().await;
                                     if let Some(since) = s.suspended_since {
@@ -246,8 +280,9 @@ impl RequestHandler {
         }
         let hit_count = args.get("hit_count").and_then(|v| v.as_i64()).map(|c| c as i32);
         let thread_filter = arg_thread(&args);
+        let condition = args.get("condition").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-        let session_guard = self.session_manager.get_current_session().await
+        let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
 
         let mut session = session_guard.lock().await;
@@ -320,6 +355,7 @@ impl RequestHandler {
             method: Some(method.name.clone()),
             enabled: true,
             hit_count: 0,
+            condition: condition.clone(),
         });
 
         let mut extra = String::new();
@@ -329,14 +365,17 @@ impl RequestHandler {
         if let Some(t) = thread_filter {
             extra.push_str(&format!("\n   Thread filter: 0x{:x}", t));
         }
+        if let Some(c) = &condition {
+            extra.push_str(&format!("\n   Condition: {}", c));
+        }
         Ok(format!(
             "✅ Breakpoint set at {}:{}\n   Method: {}\n   Breakpoint ID: {}\n   JDWP Request ID: {}{}",
             class_pattern, line, method.name, bp_id, request_id, extra
         ))
     }
 
-    async fn handle_list_breakpoints(&self, _args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.session_manager.get_current_session().await
+    async fn handle_list_breakpoints(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
 
         let session = session_guard.lock().await;
@@ -371,7 +410,7 @@ impl RequestHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'breakpoint_id' parameter".to_string())?;
 
-        let session_guard = self.session_manager.get_current_session().await
+        let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
@@ -394,8 +433,8 @@ impl RequestHandler {
         ))
     }
 
-    async fn handle_continue(&self, _args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.session_manager.get_current_session().await
+    async fn handle_continue(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
@@ -429,7 +468,7 @@ impl RequestHandler {
         depth: jdwp_client::extra::StepDepth,
         label: &str,
     ) -> Result<String, String> {
-        let session_guard = self.session_manager.get_current_session().await
+        let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
@@ -454,8 +493,8 @@ impl RequestHandler {
         ))
     }
 
-    async fn handle_panic(&self, _args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.session_manager.get_current_session().await
+    async fn handle_panic(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
@@ -473,7 +512,7 @@ impl RequestHandler {
     }
 
     async fn handle_get_stack(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.session_manager.get_current_session().await
+        let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
@@ -578,7 +617,7 @@ impl RequestHandler {
         let frame_index = args.get("frame_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let max_len = args.get("max_result_length").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
 
-        let session_guard = self.session_manager.get_current_session().await
+        let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
         let thread_id = arg_thread(&args)
@@ -600,8 +639,8 @@ impl RequestHandler {
         Ok(format!("{} = {}", expression.trim(), rendered))
     }
 
-    async fn handle_list_threads(&self, _args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.session_manager.get_current_session().await
+    async fn handle_list_threads(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
@@ -631,8 +670,8 @@ impl RequestHandler {
         Ok(output)
     }
 
-    async fn handle_pause(&self, _args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.session_manager.get_current_session().await
+    async fn handle_pause(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
@@ -643,11 +682,13 @@ impl RequestHandler {
         Ok("⏸️  Execution paused (all threads suspended)".to_string())
     }
 
-    async fn handle_disconnect(&self, _args: serde_json::Value) -> Result<String, String> {
-        let current_session_id = self.session_manager.get_current_session_id().await;
+    async fn handle_disconnect(&self, args: serde_json::Value) -> Result<String, String> {
+        let target = match args.get("session_id").and_then(|v| v.as_str()) {
+            Some(s) => Some(s.to_string()),
+            None => self.session_manager.get_current_session_id().await,
+        };
 
-        if let Some(session_id) = current_session_id {
-            // Remove the session (this will also clear current session)
+        if let Some(session_id) = target {
             self.session_manager.remove_session(&session_id).await;
             Ok(format!("✅ Disconnected from debug session: {}", session_id))
         } else {
@@ -655,8 +696,8 @@ impl RequestHandler {
         }
     }
 
-    async fn handle_get_last_event(&self, _args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.session_manager.get_current_session().await
+    async fn handle_get_last_event(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
@@ -740,7 +781,7 @@ impl RequestHandler {
             .ok_or_else(|| "Missing 'value' (literal: int, true/false, null, or \"string\")".to_string())?;
         let frame_index = args.get("frame_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
-        let session_guard = self.session_manager.get_current_session().await
+        let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
         let thread_id = arg_thread(&args).or(session.last_thread)
@@ -1011,6 +1052,96 @@ async fn find_method_arity(
     Ok(None)
 }
 
+/// JDWP value tags for each method-descriptor parameter (objects/arrays collapse to 'L'=76).
+fn sig_param_tags(sig: &str) -> Vec<u8> {
+    let (a, b) = match (sig.find('('), sig.find(')')) {
+        (Some(a), Some(b)) if b > a => (a, b),
+        _ => return vec![],
+    };
+    let mut tags = Vec::new();
+    let mut chars = sig[a + 1..b].chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '[' => {
+                while let Some(&'[') = chars.peek() {
+                    chars.next();
+                }
+                if let Some('L') = chars.next() {
+                    for x in chars.by_ref() {
+                        if x == ';' {
+                            break;
+                        }
+                    }
+                }
+                tags.push(76);
+            }
+            'L' => {
+                for x in chars.by_ref() {
+                    if x == ';' {
+                        break;
+                    }
+                }
+                tags.push(76);
+            }
+            'Z' => tags.push(90),
+            'B' => tags.push(66),
+            'C' => tags.push(67),
+            'S' => tags.push(83),
+            'I' => tags.push(73),
+            'J' => tags.push(74),
+            'F' => tags.push(70),
+            'D' => tags.push(68),
+            _ => {}
+        }
+    }
+    tags
+}
+
+/// Is a provided argument value tag acceptable for a parameter tag?
+fn tag_compatible(param: u8, arg: u8) -> bool {
+    let is_obj = |t: u8| matches!(t, 76 | 115 | 116 | 103 | 108 | 99 | 91);
+    let is_num = |t: u8| matches!(t, 66 | 67 | 68 | 70 | 73 | 74 | 83);
+    param == arg || (is_obj(param) && is_obj(arg)) || (is_num(param) && is_num(arg))
+}
+
+/// Find a method by name + argument types (preferring a type-compatible overload, falling
+/// back to the first arity match), walking the superclass chain.
+async fn find_method_for_args(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+    name: &str,
+    arg_tags: &[u8],
+) -> Result<Option<(u64, jdwp_client::reftype::MethodInfo)>, String> {
+    let argc = arg_tags.len();
+    let mut current = Some(type_id);
+    let mut guard = 0;
+    let mut fallback: Option<(u64, jdwp_client::reftype::MethodInfo)> = None;
+    while let Some(tid) = current {
+        guard += 1;
+        if guard > 50 {
+            break;
+        }
+        let methods = conn.get_methods(tid).await.map_err(|e| format!("Failed to get methods: {}", e))?;
+        for m in methods {
+            if m.name != name {
+                continue;
+            }
+            let ptags = sig_param_tags(&m.signature);
+            if ptags.len() != argc {
+                continue;
+            }
+            if ptags.iter().zip(arg_tags).all(|(p, a)| tag_compatible(*p, *a)) {
+                return Ok(Some((tid, m)));
+            }
+            if fallback.is_none() {
+                fallback = Some((tid, m));
+            }
+        }
+        current = conn.get_superclass(tid).await.unwrap_or(None);
+    }
+    Ok(fallback)
+}
+
 /// Find a field by name, walking the superclass chain.
 async fn find_field(
     conn: &mut jdwp_client::JdwpConnection,
@@ -1104,7 +1235,8 @@ async fn resolve_segment(
             for a in arglits {
                 argvals.push(arglit_to_value(conn, a).await?);
             }
-            let (decl, m) = find_method_arity(conn, type_id, &seg.name, argvals.len()).await?
+            let arg_tags: Vec<u8> = argvals.iter().map(|v| v.tag).collect();
+            let (decl, m) = find_method_for_args(conn, type_id, &seg.name, &arg_tags).await?
                 .ok_or_else(|| format!("No method '{}' with {} argument(s) on the object", seg.name, argvals.len()))?;
             let (ret, exc) = conn.invoke_method(obj_id, thread_id, decl, m.method_id, argvals).await
                 .map_err(|e| format!("invoke {}() failed: {}", seg.name, e))?;
@@ -1338,4 +1470,144 @@ async fn describe_location(conn: &mut jdwp_client::JdwpConnection, loc: &Locatio
         .unwrap_or_default();
     let line = source_line(conn, loc.class_id, loc.method_id, loc.index).await;
     (class, method, line)
+}
+
+// ----- conditional breakpoints -----
+
+/// Evaluate a breakpoint condition on a thread's top frame. Returns true to KEEP the VM
+/// suspended (condition true, or it couldn't be evaluated), false to auto-resume.
+async fn evaluate_condition_on_thread(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    cond: &str,
+) -> bool {
+    let frame = match conn.get_frames(thread_id, 0, 1).await {
+        Ok(f) => match f.into_iter().next() {
+            Some(fr) => fr,
+            None => return true,
+        },
+        Err(_) => return true,
+    };
+    match eval_condition(conn, thread_id, &frame, cond).await {
+        Ok(b) => b,
+        Err(_) => true, // can't evaluate -> don't silently skip; keep suspended
+    }
+}
+
+/// Split a condition into `left OP right` at the top level (outside parens/quotes).
+fn split_comparison(cond: &str) -> Option<(String, String, String)> {
+    let ops = ["==", "!=", "<=", ">=", "<", ">"];
+    let mut depth = 0i32;
+    let mut in_str = false;
+    for (i, c) in cond.char_indices() {
+        if !in_str && depth == 0 && c != '"' && c != '(' && c != ')' {
+            for op in &ops {
+                if cond[i..].starts_with(op) {
+                    let left = cond[..i].trim().to_string();
+                    let right = cond[i + op.len()..].trim().to_string();
+                    if !left.is_empty() && !right.is_empty() {
+                        return Some((left, op.to_string(), right));
+                    }
+                }
+            }
+        }
+        match c {
+            '"' => in_str = !in_str,
+            '(' if !in_str => depth += 1,
+            ')' if !in_str => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+async fn eval_condition(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    frame: &jdwp_client::thread::Frame,
+    cond: &str,
+) -> Result<bool, String> {
+    if let Some((lhs, op, rhs)) = split_comparison(cond) {
+        let lv = resolve_expression(conn, thread_id, frame, &lhs).await?;
+        let rlit = parse_lit(rhs.trim())?;
+        compare_values(conn, &lv, &op, &rlit).await
+    } else {
+        let v = resolve_expression(conn, thread_id, frame, cond).await?;
+        match v.data {
+            jdwp_client::types::ValueData::Boolean(b) => Ok(b),
+            _ => Err("Condition did not evaluate to a boolean".to_string()),
+        }
+    }
+}
+
+async fn compare_values(
+    conn: &mut jdwp_client::JdwpConnection,
+    lv: &jdwp_client::types::Value,
+    op: &str,
+    rlit: &ArgLit,
+) -> Result<bool, String> {
+    use jdwp_client::types::ValueData::*;
+    let lnum: Option<f64> = match &lv.data {
+        Int(v) => Some(*v as f64),
+        Long(v) => Some(*v as f64),
+        Short(v) => Some(*v as f64),
+        Byte(v) => Some(*v as f64),
+        Char(v) => Some(*v as f64),
+        Float(v) => Some(*v as f64),
+        Double(v) => Some(*v),
+        _ => None,
+    };
+    let rnum: Option<f64> = match rlit {
+        ArgLit::Int(v) => Some(*v as f64),
+        ArgLit::Long(v) => Some(*v as f64),
+        _ => None,
+    };
+    if let (Some(l), Some(r)) = (lnum, rnum) {
+        return Ok(match op {
+            "==" => l == r,
+            "!=" => l != r,
+            "<" => l < r,
+            ">" => l > r,
+            "<=" => l <= r,
+            ">=" => l >= r,
+            _ => return Err("bad operator".to_string()),
+        });
+    }
+    if let (Boolean(l), ArgLit::Bool(r)) = (&lv.data, rlit) {
+        return match op {
+            "==" => Ok(l == r),
+            "!=" => Ok(l != r),
+            _ => Err("only == / != for booleans".to_string()),
+        };
+    }
+    if let Object(id) = &lv.data {
+        match rlit {
+            ArgLit::Null => {
+                return match op {
+                    "==" => Ok(*id == 0),
+                    "!=" => Ok(*id != 0),
+                    _ => Err("only == / != with null".to_string()),
+                }
+            }
+            ArgLit::Str(s) => {
+                if *id == 0 {
+                    return Ok(op == "!=");
+                }
+                let t = conn.get_object_reference_type(*id).await
+                    .map_err(|e| format!("Failed to resolve type: {}", e))?;
+                if conn.get_signature(t).await.unwrap_or_default() == "Ljava/lang/String;" {
+                    let sv = conn.get_string_value(*id).await
+                        .map_err(|e| format!("Failed to read string: {}", e))?;
+                    return match op {
+                        "==" => Ok(&sv == s),
+                        "!=" => Ok(&sv != s),
+                        _ => Err("only == / != for strings".to_string()),
+                    };
+                }
+                return Err("Left side is not a String".to_string());
+            }
+            _ => {}
+        }
+    }
+    Err("Unsupported comparison (numbers, booleans, null, or String value compares only)".to_string())
 }

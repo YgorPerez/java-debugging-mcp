@@ -187,15 +187,13 @@ cargo test
 - [x] ObjectReference.ReferenceType/GetValues/**InvokeMethod**, ArrayReference.Length/GetValues, StringReference.Value
 - [x] **Event loop** for async breakpoint/step notifications
 - [x] **Stepping** (step over/into/out)
-- [x] **Expression evaluation** — `var`/`this` + `.field` / `.method(args)` chains, overload-by-arity, superclass walk
+- [x] **Expression evaluation** — `var`/`this` + `.field` / `.method(args)` chains, type-aware overload resolution, superclass walk
 - [x] **String and object dereferencing**, array contents, best-effort `toString()`, source-line resolution
+- [x] **Conditional breakpoints** — `condition` evaluated in the hit frame (`expr OP literal` or boolean chains); auto-resumes when false
+- [x] **Multiple concurrent sessions** — `debug.attach` returns a `session_id`; tools take an optional `session_id` (defaults to current)
+- [x] **Argument literals** in `evaluate` / conditions: int, long (`123L`), boolean, null, `"string"`
 - [x] **Safety**: `panic` + idle watchdog auto-resume
 - [x] Architecture independence (big-endian protocol; Intel & ARM)
-
-### Possible future work
-- [ ] Conditional (expression) breakpoints
-- [ ] Multiple concurrent debug sessions
-- [ ] `long`/`boolean` literal arguments in `evaluate` (int/string/null/char supported today)
 
 ## References
 

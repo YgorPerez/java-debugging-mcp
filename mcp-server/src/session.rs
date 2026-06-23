@@ -35,6 +35,8 @@ pub struct BreakpointInfo {
     pub method: Option<String>,
     pub enabled: bool,
     pub hit_count: u32,
+    /// Optional server-side condition: on hit, evaluate it and auto-resume if it is not true.
+    pub condition: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +93,16 @@ impl SessionManager {
         } else {
             None
         }
+    }
+
+    pub async fn get_session_by_id(&self, session_id: &str) -> Option<Arc<Mutex<DebugSession>>> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(session_id).cloned()
+    }
+
+    pub async fn list_session_ids(&self) -> Vec<SessionId> {
+        let sessions = self.sessions.lock().await;
+        sessions.keys().cloned().collect()
     }
 
     pub async fn get_current_session_id(&self) -> Option<SessionId> {
