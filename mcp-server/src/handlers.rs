@@ -448,25 +448,9 @@ impl RequestHandler {
 
                                     if let Ok(values) = session.connection.get_frame_values(target_thread, frame.frame_id, slots).await {
                                         for (var, value) in active_vars.iter().zip(values.iter()) {
-                                            // Check if this is a string object (tag 115 = 's')
-                                            let formatted_value = if value.tag == 115 {
-                                                // This is a String object
-                                                if let jdwp_client::types::ValueData::Object(object_id) = &value.data {
-                                                    if *object_id != 0 {
-                                                        // Try to get the string value
-                                                        match session.connection.get_string_value(*object_id).await {
-                                                            Ok(string_val) => format!("(String) \"{}\"", string_val),
-                                                            Err(_) => value.format(), // Fall back to object ID
-                                                        }
-                                                    } else {
-                                                        "(String) null".to_string()
-                                                    }
-                                                } else {
-                                                    value.format()
-                                                }
-                                            } else {
-                                                value.format()
-                                            };
+                                            // Render with type name + string contents (no method
+                                            // invocation here — thread=None — to keep get_stack cheap).
+                                            let formatted_value = render_value(&mut session.connection, value, None, 200).await;
                                             output.push_str(&format!("    {} = {}\n", var.name, formatted_value));
                                         }
                                     }
@@ -484,9 +468,32 @@ impl RequestHandler {
         Ok(output)
     }
 
-    async fn handle_evaluate(&self, _args: serde_json::Value) -> Result<String, String> {
-        // TODO: Implement expression evaluation
-        Ok("Expression evaluation not yet implemented".to_string())
+    async fn handle_evaluate(&self, args: serde_json::Value) -> Result<String, String> {
+        let expression = args.get("expression").and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'expression' parameter".to_string())?;
+        let thread_id = args.get("thread_id").and_then(|v| v.as_str())
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .ok_or_else(|| "Missing/invalid 'thread_id' (expected a hex string like \"0x2\")".to_string())?;
+        let frame_index = args.get("frame_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let max_len = args.get("max_result_length").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
+
+        let session_guard = self.session_manager.get_current_session().await
+            .ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+        let conn = &mut session.connection;
+
+        let frames = conn.get_frames(thread_id, 0, -1).await
+            .map_err(|e| format!("Failed to get frames (is the thread suspended at a breakpoint?): {}", e))?;
+        if frames.is_empty() {
+            return Err("Thread has no stack frames (not suspended at a breakpoint?)".to_string());
+        }
+        let frame = frames.get(frame_index)
+            .ok_or_else(|| format!("frame_index {} out of range ({} frames)", frame_index, frames.len()))?
+            .clone();
+
+        let value = resolve_expression(conn, thread_id, &frame, expression).await?;
+        let rendered = render_value(conn, &value, Some(thread_id), max_len).await;
+        Ok(format!("{} = {}", expression.trim(), rendered))
     }
 
     async fn handle_list_threads(&self, _args: serde_json::Value) -> Result<String, String> {
@@ -601,6 +608,283 @@ impl RequestHandler {
             Ok(output)
         } else {
             Ok("No events received yet. Set a breakpoint and trigger it.".to_string())
+        }
+    }
+}
+
+// ===================================================================================
+// Expression evaluation
+//
+// Supports `localVar`/`this` followed by `.field` and `.noArgMethod()` chains, e.g.
+//   reserva.getReservaPacote().getReservaHotelList().size()
+// Field access uses ObjectReference.GetValues; method calls use ObjectReference.InvokeMethod
+// (no-arg only for now); both walk the superclass chain to resolve inherited members.
+// Method arguments and operators are not supported yet.
+// ===================================================================================
+
+struct Seg {
+    name: String,
+    is_call: bool,
+}
+
+fn is_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$').unwrap_or(false)
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+fn parse_expr(expr: &str) -> Result<Vec<Seg>, String> {
+    let e = expr.trim();
+    if e.is_empty() {
+        return Err("Empty expression".to_string());
+    }
+    let mut segs = Vec::new();
+    for raw in e.split('.') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err("Malformed expression (empty segment between dots)".to_string());
+        }
+        if let Some(name) = raw.strip_suffix("()") {
+            if !is_ident(name) {
+                return Err(format!("Unsupported method token: '{}'", raw));
+            }
+            segs.push(Seg { name: name.to_string(), is_call: true });
+        } else if raw.contains('(') || raw.contains(')') {
+            return Err(format!(
+                "Method arguments are not supported yet: '{}'. Supported: localVar/this with .field and .noArgMethod() chains.",
+                raw
+            ));
+        } else if is_ident(raw) {
+            segs.push(Seg { name: raw.to_string(), is_call: false });
+        } else {
+            return Err(format!(
+                "Unsupported expression token: '{}'. Supported: localVar/this with .field and .noArgMethod() chains.",
+                raw
+            ));
+        }
+    }
+    Ok(segs)
+}
+
+/// JNI signature -> readable type name. "Lpkg/Cls;" -> "pkg.Cls"; "[I" -> "int[]".
+fn decode_signature(sig: &str) -> String {
+    let bytes = sig.as_bytes();
+    let mut i = 0;
+    let mut dims = 0;
+    while i < bytes.len() && bytes[i] == b'[' {
+        dims += 1;
+        i += 1;
+    }
+    let base = match bytes.get(i) {
+        Some(b'L') => {
+            let end = if sig.ends_with(';') { sig.len() - 1 } else { sig.len() };
+            sig[i + 1..end].replace('/', ".")
+        }
+        Some(b'Z') => "boolean".to_string(),
+        Some(b'B') => "byte".to_string(),
+        Some(b'C') => "char".to_string(),
+        Some(b'S') => "short".to_string(),
+        Some(b'I') => "int".to_string(),
+        Some(b'J') => "long".to_string(),
+        Some(b'F') => "float".to_string(),
+        Some(b'D') => "double".to_string(),
+        _ => sig.to_string(),
+    };
+    format!("{}{}", base, "[]".repeat(dims))
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let t: String = s.chars().take(max).collect();
+        format!("{}… ({} chars total)", t, s.chars().count())
+    } else {
+        s.to_string()
+    }
+}
+
+/// Find a no-arg method by name, walking the superclass chain. Returns (declaring type, method).
+async fn find_method(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+    name: &str,
+) -> Result<Option<(u64, jdwp_client::reftype::MethodInfo)>, String> {
+    let mut current = Some(type_id);
+    let mut guard = 0;
+    while let Some(tid) = current {
+        guard += 1;
+        if guard > 50 {
+            break;
+        }
+        let methods = conn.get_methods(tid).await.map_err(|e| format!("Failed to get methods: {}", e))?;
+        if let Some(m) = methods.into_iter().find(|m| m.name == name && m.signature.starts_with("()")) {
+            return Ok(Some((tid, m)));
+        }
+        current = conn.get_superclass(tid).await.unwrap_or(None);
+    }
+    Ok(None)
+}
+
+/// Find a field by name, walking the superclass chain. Returns the field id.
+async fn find_field(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+    name: &str,
+) -> Result<Option<u64>, String> {
+    let mut current = Some(type_id);
+    let mut guard = 0;
+    while let Some(tid) = current {
+        guard += 1;
+        if guard > 50 {
+            break;
+        }
+        let fields = conn.get_fields(tid).await.map_err(|e| format!("Failed to get fields: {}", e))?;
+        if let Some(f) = fields.into_iter().find(|f| f.name == name) {
+            return Ok(Some(f.field_id));
+        }
+        current = conn.get_superclass(tid).await.unwrap_or(None);
+    }
+    Ok(None)
+}
+
+async fn resolve_head(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    frame: &jdwp_client::thread::Frame,
+    seg: &Seg,
+) -> Result<jdwp_client::types::Value, String> {
+    use jdwp_client::types::{Value, ValueData};
+    if seg.is_call {
+        return Err("Expression must start with a local variable or 'this'".to_string());
+    }
+    if seg.name == "this" {
+        let obj = conn.get_this_object(thread_id, frame.frame_id).await
+            .map_err(|e| format!("Failed to get 'this': {}", e))?;
+        if obj == 0 {
+            return Err("No 'this' in this frame (static method)".to_string());
+        }
+        return Ok(Value { tag: 76, data: ValueData::Object(obj) });
+    }
+    let vars = conn.get_variable_table(frame.location.class_id, frame.location.method_id).await
+        .map_err(|e| format!("Failed to read local variable table (compiled without -g?): {}", e))?;
+    let idx = frame.location.index;
+    let var = vars.iter()
+        .find(|v| v.name == seg.name && idx >= v.code_index && idx < v.code_index + v.length as u64)
+        .or_else(|| vars.iter().find(|v| v.name == seg.name))
+        .ok_or_else(|| format!("Unknown local variable '{}' in this frame", seg.name))?;
+    let sig_byte = *var.signature.as_bytes().first().ok_or_else(|| "Bad variable signature".to_string())?;
+    let slot = jdwp_client::stackframe::VariableSlot { slot: var.slot as i32, sig_byte };
+    let vals = conn.get_frame_values(thread_id, frame.frame_id, vec![slot]).await
+        .map_err(|e| format!("Failed to read variable value: {}", e))?;
+    vals.into_iter().next().ok_or_else(|| "No value returned for variable".to_string())
+}
+
+async fn resolve_segment(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    current: &jdwp_client::types::Value,
+    seg: &Seg,
+) -> Result<jdwp_client::types::Value, String> {
+    use jdwp_client::types::ValueData;
+    let obj_id = match &current.data {
+        ValueData::Object(0) => {
+            return Err(format!("Cannot access '.{}{}' on null", seg.name, if seg.is_call { "()" } else { "" }))
+        }
+        ValueData::Object(id) => *id,
+        _ => return Err(format!("Cannot access '.{}' on a primitive value", seg.name)),
+    };
+    let type_id = conn.get_object_reference_type(obj_id).await
+        .map_err(|e| format!("Failed to resolve object type: {}", e))?;
+    if seg.is_call {
+        let (decl, m) = find_method(conn, type_id, &seg.name).await?
+            .ok_or_else(|| format!("No no-arg method '{}()' found on the object", seg.name))?;
+        let (ret, exc) = conn.invoke_method(obj_id, thread_id, decl, m.method_id, vec![]).await
+            .map_err(|e| format!("invoke {}() failed: {}", seg.name, e))?;
+        if exc != 0 {
+            let tn = match conn.get_object_reference_type(exc).await {
+                Ok(t) => decode_signature(&conn.get_signature(t).await.unwrap_or_default()),
+                Err(_) => "an exception".to_string(),
+            };
+            return Err(format!("{}() threw {}", seg.name, tn));
+        }
+        Ok(ret)
+    } else {
+        let fid = find_field(conn, type_id, &seg.name).await?
+            .ok_or_else(|| format!("No field '{}' found on the object", seg.name))?;
+        let vals = conn.get_object_values(obj_id, vec![fid]).await
+            .map_err(|e| format!("Failed to read field '{}': {}", seg.name, e))?;
+        vals.into_iter().next().ok_or_else(|| "No value returned for field".to_string())
+    }
+}
+
+async fn resolve_expression(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    frame: &jdwp_client::thread::Frame,
+    expr: &str,
+) -> Result<jdwp_client::types::Value, String> {
+    let segs = parse_expr(expr)?;
+    let mut current = resolve_head(conn, thread_id, frame, &segs[0]).await?;
+    for seg in &segs[1..] {
+        current = resolve_segment(conn, thread_id, &current, seg).await?;
+    }
+    Ok(current)
+}
+
+/// Render a value for display. Strings show their contents; objects show their type name
+/// (and, when `thread_id` is Some, a best-effort `toString()`); primitives show their value.
+async fn render_value(
+    conn: &mut jdwp_client::JdwpConnection,
+    value: &jdwp_client::types::Value,
+    thread_id: Option<u64>,
+    max_len: usize,
+) -> String {
+    use jdwp_client::types::ValueData;
+    match &value.data {
+        ValueData::Byte(v) => format!("(byte) {}", v),
+        ValueData::Char(v) => format!("(char) '{}'", char::from_u32(*v as u32).unwrap_or('?')),
+        ValueData::Float(v) => format!("(float) {}", v),
+        ValueData::Double(v) => format!("(double) {}", v),
+        ValueData::Int(v) => format!("(int) {}", v),
+        ValueData::Long(v) => format!("(long) {}", v),
+        ValueData::Short(v) => format!("(short) {}", v),
+        ValueData::Boolean(v) => format!("(boolean) {}", v),
+        ValueData::Void => "(void)".to_string(),
+        ValueData::Object(0) => "null".to_string(),
+        ValueData::Object(id) => {
+            let id = *id;
+            if value.tag == 115 {
+                if let Ok(s) = conn.get_string_value(id).await {
+                    return format!("\"{}\"", truncate(&s, max_len));
+                }
+            }
+            let type_id = match conn.get_object_reference_type(id).await {
+                Ok(t) => t,
+                Err(_) => return format!("(object) @{:x}", id),
+            };
+            let name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+            if name == "java.lang.String" {
+                if let Ok(s) = conn.get_string_value(id).await {
+                    return format!("\"{}\"", truncate(&s, max_len));
+                }
+            }
+            if let Some(tid) = thread_id {
+                if let Ok(Some((decl, m))) = find_method(conn, type_id, "toString").await {
+                    if m.signature == "()Ljava/lang/String;" {
+                        if let Ok((ret, exc)) = conn.invoke_method(id, tid, decl, m.method_id, vec![]).await {
+                            if exc == 0 {
+                                if let ValueData::Object(sid) = ret.data {
+                                    if sid != 0 {
+                                        if let Ok(s) = conn.get_string_value(sid).await {
+                                            return format!("{} \"{}\"", name, truncate(&s, max_len));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            format!("{} (id=0x{:x})", name, id)
         }
     }
 }
