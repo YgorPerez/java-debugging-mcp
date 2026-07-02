@@ -158,8 +158,9 @@ impl RequestHandler {
 
     // Tool implementations (stubs for now)
     async fn handle_attach(&self, args: serde_json::Value) -> Result<String, String> {
-        let host = args.get("host").and_then(|v| v.as_str()).unwrap_or("localhost");
-        let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(5005) as u16;
+        let a: crate::args::AttachArgs = crate::args::parse(&args)?;
+        let host = a.host.as_str();
+        let port = a.port;
 
         match jdwp_client::JdwpConnection::connect(host, port).await {
             Ok(connection) => {
@@ -269,18 +270,17 @@ impl RequestHandler {
     }
 
     async fn handle_set_breakpoint(&self, args: serde_json::Value) -> Result<String, String> {
-        let class_pattern = args.get("class_pattern")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing 'class_pattern' parameter".to_string())?;
+        let a: crate::args::SetBreakpointArgs = crate::args::parse(&args)?;
+        let class_pattern = a.class_pattern.as_str();
 
-        let line_opt = args.get("line").and_then(|v| v.as_i64()).map(|l| l as i32);
-        let method_hint = args.get("method").and_then(|v| v.as_str());
+        let line_opt = a.line;
+        let method_hint = a.method.as_deref();
         if line_opt.is_none() && method_hint.is_none() {
             return Err("Provide 'line' and/or 'method'".to_string());
         }
-        let hit_count = args.get("hit_count").and_then(|v| v.as_i64()).map(|c| c as i32);
-        let thread_filter = arg_thread(&args);
-        let condition = args.get("condition").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let hit_count = a.hit_count;
+        let thread_filter = crate::args::parse_thread_id(&a.thread_id);
+        let condition = a.condition.clone();
 
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
@@ -406,9 +406,8 @@ impl RequestHandler {
     }
 
     async fn handle_clear_breakpoint(&self, args: serde_json::Value) -> Result<String, String> {
-        let bp_id = args.get("breakpoint_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing 'breakpoint_id' parameter".to_string())?;
+        let a: crate::args::ClearBreakpointArgs = crate::args::parse(&args)?;
+        let bp_id = a.breakpoint_id.as_str();
 
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
@@ -472,7 +471,8 @@ impl RequestHandler {
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
-        let thread_id = arg_thread(&args)
+        let a: crate::args::StepArgs = crate::args::parse(&args)?;
+        let thread_id = crate::args::parse_thread_id(&a.thread_id)
             .or(session.last_thread)
             .ok_or_else(|| "No thread to step. Pass thread_id, or hit a breakpoint first.".to_string())?;
 
@@ -517,17 +517,10 @@ impl RequestHandler {
 
         let mut session = session_guard.lock().await;
 
-        let thread_id = args.get("thread_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-
-        let max_frames = args.get("max_frames")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(20) as usize;
-
-        let include_variables = args.get("include_variables")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let a: crate::args::GetStackArgs = crate::args::parse(&args)?;
+        let thread_id = crate::args::parse_thread_id(&a.thread_id);
+        let max_frames = a.max_frames;
+        let include_variables = a.include_variables;
 
         // Prefer the explicit thread, then the last thread that hit a breakpoint/step,
         // then fall back to the first thread.
@@ -558,8 +551,7 @@ impl RequestHandler {
         // `package_filter` collapses frames whose class doesn't match (a JVM like WildFly buries a
         // few app frames under dozens of framework ones) into `… N frame(s) hidden` markers, and
         // skips the expensive method/variable round-trips for those hidden frames.
-        let package_filter = args.get("package_filter")
-            .and_then(|v| v.as_str())
+        let package_filter = a.package_filter.as_deref()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_lowercase());
 
@@ -644,16 +636,15 @@ impl RequestHandler {
     }
 
     async fn handle_evaluate(&self, args: serde_json::Value) -> Result<String, String> {
-        let expression = args.get("expression").and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing 'expression' parameter".to_string())?;
-        let frame_index = args.get("frame_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        // Default must match the schema in tools.rs (they used to drift: schema 500 vs code 4000).
-        let max_len = args.get("max_result_length").and_then(|v| v.as_u64()).unwrap_or(2000) as usize;
+        let a: crate::args::EvaluateArgs = crate::args::parse(&args)?;
+        let expression = a.expression.as_str();
+        let frame_index = a.frame_index;
+        let max_len = a.max_result_length;
 
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
-        let thread_id = arg_thread(&args)
+        let thread_id = crate::args::parse_thread_id(&a.thread_id)
             .or(session.last_thread)
             .ok_or_else(|| "No thread to evaluate in. Pass thread_id, or hit a breakpoint first.".to_string())?;
         let conn = &mut session.connection;
@@ -678,12 +669,12 @@ impl RequestHandler {
 
         let mut session = session_guard.lock().await;
 
-        let name_filter = args.get("name_filter")
-            .and_then(|v| v.as_str())
+        let a: crate::args::ListThreadsArgs = crate::args::parse(&args)?;
+        let name_filter = a.name_filter.as_deref()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_lowercase());
-        let only_suspended = args.get("only_suspended").and_then(|v| v.as_bool()).unwrap_or(false);
-        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(40).max(1) as usize;
+        let only_suspended = a.only_suspended;
+        let limit = a.limit.max(1);
         let filtering = name_filter.is_some() || only_suspended;
 
         let all = session.connection.get_all_threads().await
@@ -820,16 +811,15 @@ impl RequestHandler {
     }
 
     async fn handle_set_value(&self, args: serde_json::Value) -> Result<String, String> {
-        let name = args.get("name").and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing 'name' (local variable)".to_string())?;
-        let value_str = args.get("value").and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing 'value' (literal: int, true/false, null, or \"string\")".to_string())?;
-        let frame_index = args.get("frame_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let a: crate::args::SetValueArgs = crate::args::parse(&args)?;
+        let name = a.name.as_str();
+        let value_str = a.value.as_str();
+        let frame_index = a.frame_index;
 
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
-        let thread_id = arg_thread(&args).or(session.last_thread)
+        let thread_id = crate::args::parse_thread_id(&a.thread_id).or(session.last_thread)
             .ok_or_else(|| "No thread. Pass thread_id, or hit a breakpoint first.".to_string())?;
         let conn = &mut session.connection;
 
@@ -1436,12 +1426,6 @@ async fn literal_to_value(
 }
 
 // ----- event / thread / location helpers -----
-
-fn arg_thread(args: &serde_json::Value) -> Option<u64> {
-    args.get("thread_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-}
 
 fn event_location(d: &EventKind) -> Option<(u64, Location)> {
     match d {
