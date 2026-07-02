@@ -166,6 +166,10 @@ pub fn get_tools() -> Vec<Tool> {
                         "type": "boolean",
                         "description": "Include local variables under each frame (set false for just the call chain)",
                         "default": true
+                    },
+                    "package_filter": {
+                        "type": "string",
+                        "description": "Only show frames whose class name contains this substring (case-insensitive), e.g. your app package 'br.com.infotravel'; framework frames are collapsed into '… N frame(s) hidden'. Big token saver on deep JVM stacks."
                     }
                 },
                 "required": []
@@ -192,8 +196,8 @@ pub fn get_tools() -> Vec<Tool> {
                     },
                     "max_result_length": {
                         "type": "integer",
-                        "description": "Maximum length of result string",
-                        "default": 500
+                        "description": "Maximum length of the rendered result string (default 2000; raise for long toString()s)",
+                        "default": 2000
                     }
                 },
                 "required": ["expression"]

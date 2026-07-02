@@ -555,10 +555,22 @@ impl RequestHandler {
 
         // Compact format: one line per frame `#idx class.method:line`, variables indented
         // beneath. Raw JDWP class/method ids are omitted — they're noise to the caller.
-        let mut output = format!("Stack (thread 0x{:x}, {} frames):\n", target_thread, frames.len());
+        // `package_filter` collapses frames whose class doesn't match (a JVM like WildFly buries a
+        // few app frames under dozens of framework ones) into `… N frame(s) hidden` markers, and
+        // skips the expensive method/variable round-trips for those hidden frames.
+        let package_filter = args.get("package_filter")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase());
+
+        let mut output = match &package_filter {
+            Some(f) => format!("Stack (thread 0x{:x}, {} frames, filter \"{}\"):\n", target_thread, frames.len(), f),
+            None => format!("Stack (thread 0x{:x}, {} frames):\n", target_thread, frames.len()),
+        };
 
         // Cache class-name resolution across frames (recursion / same-class frames are common).
         let mut class_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        let mut hidden = 0usize;
 
         for (idx, frame) in frames.iter().enumerate() {
             let class_id = frame.location.class_id;
@@ -574,6 +586,15 @@ impl RequestHandler {
                     n
                 }
             };
+
+            // Collapse frames whose class doesn't match the filter (and skip their lookups).
+            if let Some(f) = &package_filter {
+                if !class_name.to_lowercase().contains(f.as_str()) {
+                    hidden += 1;
+                    continue;
+                }
+            }
+            flush_hidden(&mut output, &mut hidden);
 
             // Method name + source line, and the variable slots live at this bytecode index.
             let mut method_name = format!("method@{:x}", frame.location.method_id);
@@ -617,6 +638,7 @@ impl RequestHandler {
                 }
             }
         }
+        flush_hidden(&mut output, &mut hidden);
 
         Ok(output)
     }
@@ -625,7 +647,8 @@ impl RequestHandler {
         let expression = args.get("expression").and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'expression' parameter".to_string())?;
         let frame_index = args.get("frame_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let max_len = args.get("max_result_length").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
+        // Default must match the schema in tools.rs (they used to drift: schema 500 vs code 4000).
+        let max_len = args.get("max_result_length").and_then(|v| v.as_u64()).unwrap_or(2000) as usize;
 
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
@@ -1462,6 +1485,14 @@ fn event_type_name(d: &EventKind) -> &'static str {
         EventKind::ThreadDeath { .. } => "thread_death",
         EventKind::ClassPrepare { .. } => "class_prepare",
         EventKind::Unknown { .. } => "unknown",
+    }
+}
+
+/// Emit get_stack's collapsed "hidden frames" marker (from package_filter) and reset the counter.
+fn flush_hidden(output: &mut String, hidden: &mut usize) {
+    if *hidden > 0 {
+        output.push_str(&format!("   … {} frame(s) hidden\n", *hidden));
+        *hidden = 0;
     }
 }
 
