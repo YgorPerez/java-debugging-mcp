@@ -5,7 +5,7 @@
 use crate::commands::{command_sets, thread_commands};
 use crate::connection::JdwpConnection;
 use crate::protocol::{CommandPacket, JdwpResult};
-use crate::reader::{read_i32, read_u64};
+use crate::reader::{read_i32, read_string, read_u64};
 use crate::types::{FrameId, Location, MethodId, ReferenceTypeId, ThreadId};
 use bytes::BufMut;
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,35 @@ impl JdwpConnection {
         }
 
         Ok(threads)
+    }
+
+    /// Get a thread's name (ThreadReference.Name).
+    pub async fn get_thread_name(&mut self, thread_id: ThreadId) -> JdwpResult<String> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::NAME);
+        packet.data.put_u64(thread_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        read_string(&mut data)
+    }
+
+    /// Get a thread's (thread_status, suspend_status) (ThreadReference.Status).
+    /// suspend_status != 0 means the thread is currently suspended.
+    pub async fn get_thread_status(&mut self, thread_id: ThreadId) -> JdwpResult<(i32, i32)> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::STATUS);
+        packet.data.put_u64(thread_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let thread_status = read_i32(&mut data)?;
+        let suspend_status = read_i32(&mut data)?;
+        Ok((thread_status, suspend_status))
     }
 
     /// Suspend all threads (VirtualMachine.Suspend)

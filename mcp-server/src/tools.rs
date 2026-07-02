@@ -149,13 +149,13 @@ pub fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.get_stack".to_string(),
-            description: "Get stack frames with summarized variables".to_string(),
+            description: "Get stack frames (compact: one line per frame `#i class.method:line`, locals indented beneath)".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "thread_id": {
                         "type": "string",
-                        "description": "Thread ID"
+                        "description": "Thread ID (optional; defaults to the last thread that hit a breakpoint/step)"
                     },
                     "max_frames": {
                         "type": "integer",
@@ -164,13 +164,8 @@ pub fn get_tools() -> Vec<Tool> {
                     },
                     "include_variables": {
                         "type": "boolean",
-                        "description": "Include local variables in frames",
+                        "description": "Include local variables under each frame (set false for just the call chain)",
                         "default": true
-                    },
-                    "max_variable_depth": {
-                        "type": "integer",
-                        "description": "How deep to traverse object graphs (1-3)",
-                        "default": 2
                     }
                 },
                 "required": []
@@ -206,10 +201,25 @@ pub fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.list_threads".to_string(),
-            description: "List all threads with status".to_string(),
+            description: "List threads by name (one `0x<id> <name>` line each). A JVM like WildFly has hundreds of threads — filter with name_filter, and note the last thread that hit a breakpoint is already reported by debug.get_last_event.".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "name_filter": {
+                        "type": "string",
+                        "description": "Only threads whose name contains this substring (case-insensitive), e.g. 'Avail' or 'task'"
+                    },
+                    "only_suspended": {
+                        "type": "boolean",
+                        "description": "Only threads currently suspended (also appends each thread's run status)",
+                        "default": false
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max threads to return (default 40); the rest are reported as a hidden count",
+                        "default": 40
+                    }
+                }
             }),
         },
         Tool {

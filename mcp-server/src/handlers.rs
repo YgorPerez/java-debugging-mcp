@@ -553,59 +553,69 @@ impl RequestHandler {
             return Ok(format!("Thread {:x} has no stack frames", target_thread));
         }
 
-        let mut output = format!("🔍 Stack for thread {:x} ({} frames):\n\n", target_thread, frames.len());
+        // Compact format: one line per frame `#idx class.method:line`, variables indented
+        // beneath. Raw JDWP class/method ids are omitted — they're noise to the caller.
+        let mut output = format!("Stack (thread 0x{:x}, {} frames):\n", target_thread, frames.len());
+
+        // Cache class-name resolution across frames (recursion / same-class frames are common).
+        let mut class_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
 
         for (idx, frame) in frames.iter().enumerate() {
-            output.push_str(&format!("Frame {}:\n", idx));
-            output.push_str(&format!("  Location: class={:x}, method={:x}, index={}\n",
-                frame.location.class_id, frame.location.method_id, frame.location.index));
+            let class_id = frame.location.class_id;
+            let class_name = match class_names.get(&class_id) {
+                Some(n) => n.clone(),
+                None => {
+                    let n = session.connection.get_signature(class_id).await
+                        .ok()
+                        .map(|s| decode_signature(&s))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| format!("class@{:x}", class_id));
+                    class_names.insert(class_id, n.clone());
+                    n
+                }
+            };
 
-            // Try to get method name
-            if let Ok(methods) = session.connection.get_methods(frame.location.class_id).await {
+            // Method name + source line, and the variable slots live at this bytecode index.
+            let mut method_name = format!("method@{:x}", frame.location.method_id);
+            let mut line: Option<i32> = None;
+            let mut active: Vec<(String, jdwp_client::stackframe::VariableSlot)> = Vec::new();
+            if let Ok(methods) = session.connection.get_methods(class_id).await {
                 if let Some(method) = methods.iter().find(|m| m.method_id == frame.location.method_id) {
-                    let method_name = method.name.clone();
-                    let line = source_line(&mut session.connection, frame.location.class_id, frame.location.method_id, frame.location.index).await;
-                    match line {
-                        Some(l) => output.push_str(&format!("  Method: {} (line {})\n", method_name, l)),
-                        None => output.push_str(&format!("  Method: {}\n", method_name)),
-                    }
-
-                    // Get variables if requested
+                    method_name = method.name.clone();
+                    line = source_line(&mut session.connection, class_id, frame.location.method_id, frame.location.index).await;
                     if include_variables {
-                        match session.connection.get_variable_table(frame.location.class_id, frame.location.method_id).await {
-                            Ok(var_table) => {
-                                let current_index = frame.location.index;
-                                let active_vars: Vec<_> = var_table.iter()
-                                    .filter(|v| current_index >= v.code_index && current_index < v.code_index + v.length as u64)
-                                    .collect();
-
-                                if !active_vars.is_empty() {
-                                    output.push_str(&format!("  Variables ({}):\n", active_vars.len()));
-
-                                    let slots: Vec<jdwp_client::stackframe::VariableSlot> = active_vars.iter()
-                                        .map(|v| jdwp_client::stackframe::VariableSlot {
-                                            slot: v.slot as i32,
-                                            sig_byte: v.signature.as_bytes()[0],
-                                        })
-                                        .collect();
-
-                                    if let Ok(values) = session.connection.get_frame_values(target_thread, frame.frame_id, slots).await {
-                                        for (var, value) in active_vars.iter().zip(values.iter()) {
-                                            // Render with type name + string contents (no method
-                                            // invocation here — thread=None — to keep get_stack cheap).
-                                            let formatted_value = render_value(&mut session.connection, value, None, 200).await;
-                                            output.push_str(&format!("    {} = {}\n", var.name, formatted_value));
-                                        }
-                                    }
-                                }
+                        if let Ok(var_table) = session.connection.get_variable_table(class_id, frame.location.method_id).await {
+                            let ci = frame.location.index;
+                            for v in var_table.iter()
+                                .filter(|v| ci >= v.code_index && ci < v.code_index + v.length as u64)
+                            {
+                                active.push((v.name.clone(), jdwp_client::stackframe::VariableSlot {
+                                    slot: v.slot as i32,
+                                    sig_byte: v.signature.as_bytes()[0],
+                                }));
                             }
-                            Err(_) => {}
                         }
                     }
                 }
             }
 
-            output.push_str("\n");
+            match line {
+                Some(l) => output.push_str(&format!("#{} {}.{}:{}\n", idx, class_name, method_name, l)),
+                None => output.push_str(&format!("#{} {}.{}\n", idx, class_name, method_name)),
+            }
+
+            if include_variables && !active.is_empty() {
+                let slots: Vec<jdwp_client::stackframe::VariableSlot> =
+                    active.iter().map(|(_, s)| s.clone()).collect();
+                if let Ok(values) = session.connection.get_frame_values(target_thread, frame.frame_id, slots).await {
+                    for ((name, _), value) in active.iter().zip(values.iter()) {
+                        // Render with type name + string contents (no method invocation here —
+                        // thread=None — to keep get_stack cheap).
+                        let formatted_value = render_value(&mut session.connection, value, None, 200).await;
+                        output.push_str(&format!("     {} = {}\n", name, formatted_value));
+                    }
+                }
+            }
         }
 
         Ok(output)
@@ -645,26 +655,72 @@ impl RequestHandler {
 
         let mut session = session_guard.lock().await;
 
-        let threads = session.connection.get_all_threads().await
+        let name_filter = args.get("name_filter")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase());
+        let only_suspended = args.get("only_suspended").and_then(|v| v.as_bool()).unwrap_or(false);
+        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(40).max(1) as usize;
+        let filtering = name_filter.is_some() || only_suspended;
+
+        let all = session.connection.get_all_threads().await
             .map_err(|e| format!("Failed to get threads: {}", e))?;
+        let total = all.len();
 
-        let mut output = format!("🧵 {} thread(s):\n\n", threads.len());
-
-        for (idx, thread_id) in threads.iter().enumerate() {
-            output.push_str(&format!("  Thread {} (ID: 0x{:x})\n", idx + 1, thread_id));
-
-            // Try to get frame count
-            match session.connection.get_frames(*thread_id, 0, 1).await {
-                Ok(frames) if !frames.is_empty() => {
-                    output.push_str("     Status: Has frames (possibly suspended)\n");
-                }
-                Ok(_) => {
-                    output.push_str("     Status: Running (no frames)\n");
-                }
-                Err(_) => {
-                    output.push_str("     Status: Cannot inspect\n");
+        // (id, name, status label). One JVM round-trip per thread for the name, plus one for the
+        // status only when only_suspended is set. With no filter we stop scanning once we have
+        // `limit` rows so a 300-thread WildFly doesn't cost 300 round-trips for a peek.
+        let mut rows: Vec<(u64, String, Option<String>)> = Vec::new();
+        for tid in &all {
+            if !filtering && rows.len() >= limit {
+                break;
+            }
+            let name = session.connection.get_thread_name(*tid).await.unwrap_or_default();
+            if let Some(f) = &name_filter {
+                if !name.to_lowercase().contains(f.as_str()) {
+                    continue;
                 }
             }
+            let status = if only_suspended {
+                match session.connection.get_thread_status(*tid).await {
+                    Ok((ts, ss)) => {
+                        if ss == 0 {
+                            continue; // not suspended
+                        }
+                        Some(thread_status_name(ts).to_string())
+                    }
+                    Err(_) => continue,
+                }
+            } else {
+                None
+            };
+            rows.push((*tid, name, status));
+        }
+
+        let shown = rows.len().min(limit);
+        let hidden = if filtering {
+            rows.len().saturating_sub(shown)
+        } else {
+            total.saturating_sub(rows.len())
+        };
+
+        let mut note = String::new();
+        if let Some(f) = &name_filter {
+            note.push_str(&format!(" name~\"{}\"", f));
+        }
+        if only_suspended {
+            note.push_str(" suspended-only");
+        }
+
+        let mut output = format!("{}/{} thread(s){}:\n", shown, total, note);
+        for (tid, name, status) in rows.iter().take(limit) {
+            match status {
+                Some(s) => output.push_str(&format!("0x{:x} {} [{}]\n", tid, name, s)),
+                None => output.push_str(&format!("0x{:x} {}\n", tid, name)),
+            }
+        }
+        if hidden > 0 {
+            output.push_str(&format!("… +{} more (raise limit or use name_filter)\n", hidden));
         }
 
         Ok(output)
@@ -707,71 +763,37 @@ impl RequestHandler {
             None => return Ok("No events received yet. Set a breakpoint and trigger it.".to_string()),
         };
 
-        let mut output = String::new();
-        // Machine-readable summary of the first event, with source location resolved.
-        if let Some(ev) = event_set.events.first() {
+        // Compact, machine-readable summary only — one [event] line per event with the source
+        // location resolved. Raw JDWP ids and the human-readable decoration are intentionally
+        // omitted; they cost tokens and the caller never uses them.
+        let mut lines: Vec<String> = Vec::with_capacity(event_set.events.len() + 1);
+        for ev in &event_set.events {
+            let mut obj = serde_json::Map::new();
+            obj.insert("event".to_string(), json!(event_type_name(&ev.details)));
             if let Some((thread, loc)) = event_location(&ev.details) {
                 let (cls, method, line) = describe_location(&mut session.connection, &loc).await;
-                let summary = json!({
-                    "event": event_type_name(&ev.details),
-                    "thread": format!("0x{:x}", thread),
-                    "class": cls,
-                    "method": method,
-                    "line": line,
-                });
-                output.push_str(&format!("[event] {}\n\n", summary));
-            }
-        }
-        output.push_str(&format!("🎯 Last event (suspend_policy={})\n\n", event_set.suspend_policy));
-
-        {
-            for (idx, event) in event_set.events.iter().enumerate() {
-                output.push_str(&format!("Event {}:\n", idx + 1));
-                output.push_str(&format!("  Request ID: {}\n", event.request_id));
-
-                match &event.details {
-                    jdwp_client::events::EventKind::Breakpoint { thread, location } => {
-                        output.push_str("  Type: Breakpoint\n");
-                        output.push_str(&format!("  ⚡ Thread ID: 0x{:x}\n", thread));
-                        output.push_str(&format!("  Location: class=0x{:x}, method=0x{:x}, index={}\n",
-                            location.class_id, location.method_id, location.index));
+                obj.insert("thread".to_string(), json!(format!("0x{:x}", thread)));
+                obj.insert("class".to_string(), json!(cls));
+                obj.insert("method".to_string(), json!(method));
+                obj.insert("line".to_string(), json!(line));
+            } else {
+                match &ev.details {
+                    jdwp_client::events::EventKind::VMStart { thread }
+                    | jdwp_client::events::EventKind::ThreadStart { thread }
+                    | jdwp_client::events::EventKind::ThreadDeath { thread } => {
+                        obj.insert("thread".to_string(), json!(format!("0x{:x}", thread)));
                     }
-                    jdwp_client::events::EventKind::Step { thread, location } => {
-                        output.push_str("  Type: Step\n");
-                        output.push_str(&format!("  Thread ID: 0x{:x}\n", thread));
-                        output.push_str(&format!("  Location: class=0x{:x}, method=0x{:x}, index={}\n",
-                            location.class_id, location.method_id, location.index));
+                    jdwp_client::events::EventKind::ClassPrepare { thread, signature, .. } => {
+                        obj.insert("thread".to_string(), json!(format!("0x{:x}", thread)));
+                        obj.insert("class".to_string(), json!(signature));
                     }
-                    jdwp_client::events::EventKind::VMStart { thread } => {
-                        output.push_str("  Type: VM Start\n");
-                        output.push_str(&format!("  Thread ID: 0x{:x}\n", thread));
-                    }
-                    jdwp_client::events::EventKind::VMDeath => {
-                        output.push_str("  Type: VM Death\n");
-                    }
-                    jdwp_client::events::EventKind::ThreadStart { thread } => {
-                        output.push_str("  Type: Thread Start\n");
-                        output.push_str(&format!("  Thread ID: 0x{:x}\n", thread));
-                    }
-                    jdwp_client::events::EventKind::ThreadDeath { thread } => {
-                        output.push_str("  Type: Thread Death\n");
-                        output.push_str(&format!("  Thread ID: 0x{:x}\n", thread));
-                    }
-                    jdwp_client::events::EventKind::ClassPrepare { thread, ref_type, signature, .. } => {
-                        output.push_str("  Type: Class Prepare\n");
-                        output.push_str(&format!("  Thread ID: 0x{:x}\n", thread));
-                        output.push_str(&format!("  Class: {} (0x{:x})\n", signature, ref_type));
-                    }
-                    _ => {
-                        output.push_str("  Type: Other\n");
-                    }
+                    _ => {}
                 }
-
-                output.push_str("\n");
             }
+            lines.push(format!("[event] {}", serde_json::Value::Object(obj)));
         }
-
-        Ok(output)
+        lines.push(format!("[suspended] {}", event_suspends(&event_set)));
+        Ok(lines.join("\n"))
     }
 
     async fn handle_set_value(&self, args: serde_json::Value) -> Result<String, String> {
@@ -1440,6 +1462,18 @@ fn event_type_name(d: &EventKind) -> &'static str {
         EventKind::ThreadDeath { .. } => "thread_death",
         EventKind::ClassPrepare { .. } => "class_prepare",
         EventKind::Unknown { .. } => "unknown",
+    }
+}
+
+/// JDWP threadStatus code -> short label (see types::ThreadStatus).
+fn thread_status_name(ts: i32) -> &'static str {
+    match ts {
+        0 => "zombie",
+        1 => "running",
+        2 => "sleeping",
+        3 => "monitor",
+        4 => "wait",
+        _ => "unknown",
     }
 }
 

@@ -83,11 +83,11 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | `debug.step_over` | Step over current line (defaults to last-hit thread) |
 | `debug.step_into` | Step into a method call |
 | `debug.step_out` | Step out of the current method |
-| `debug.get_stack` | Stack frames with typed variables and source lines |
+| `debug.get_stack` | Stack frames, compact `#i class.method:line` with typed locals indented |
 | `debug.evaluate` | Evaluate `var`/`this` + `.field` / `.method(args)` chains in a frame |
 | `debug.set_value` | Set a local variable in a suspended frame |
-| `debug.get_last_event` | Last event, with a machine-readable `[event]` line (thread, class.method:line) |
-| `debug.list_threads` | List all threads |
+| `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line) + `[suspended]` |
+| `debug.list_threads` | List threads by name; filter with `name_filter` / `only_suspended` / `limit` |
 | `debug.pause` | Pause execution (suspend all threads) |
 | `debug.panic` | Safety: clear all breakpoints and resume all threads |
 | `debug.disconnect` | End the debug session |
