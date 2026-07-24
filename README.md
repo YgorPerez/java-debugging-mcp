@@ -151,13 +151,27 @@ jdwp-mcp/
 │   ├── protocol.rs     # MCP JSON-RPC
 │   ├── handlers.rs     # Request routing
 │   ├── tools.rs        # Tool definitions
-│   └── session.rs      # Debug session state
-└── examples/           # Usage examples
+│   ├── session.rs      # Debug session state
+│   └── tests/          # MCP-level integration tests (real binary + real JVM)
+└── examples/
+    ├── test_*.rs       # jdwp-client protocol examples
+    └── probes/         # Java programs the tests and examples attach to
 ```
 
 ### Testing
 
-Use the companion [java-example-for-k8s](../java-example-for-k8s) as a test target:
+```bash
+cargo test                      # unit tests (fast, no JVM)
+scripts/integration-test.sh     # MCP-level: the real binary over JSON-RPC against probe JVMs
+scripts/doctor.sh               # the rust-doctor health gate CI runs
+```
+
+`scripts/integration-test.sh` runs `mcp-server/tests/mcp_integration.rs`, which launches and reaps its
+own probe JVMs from `examples/probes/` — no manual steps. It does need a JDK: without one every test
+prints `SKIP` and passes, so check for `SKIP` lines before reading a green run as coverage.
+
+For poking at the tools by hand against a realistic app, use the companion
+[java-example-for-k8s](../java-example-for-k8s) as a target:
 
 ```bash
 cd ../java-example-for-k8s
@@ -165,8 +179,6 @@ mvn clean package
 java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 \
   -jar target/probe-demo-0.0.1-SNAPSHOT.jar
 ```
-
-Then test MCP tools against this running app.
 
 ### Building
 

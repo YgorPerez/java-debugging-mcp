@@ -43,22 +43,34 @@ The Rust test files in this directory demonstrate low-level JDWP protocol usage:
 
 These are primarily for library development and testing.
 
-### MCP-level harnesses
+### MCP-level coverage lives in `cargo test`, not here
 
-These drive the built `jdwp-mcp` binary over JSON-RPC on stdio, so they cover the server's handlers
-rather than just the wire primitives. Each file's header has the exact commands to run it.
+Tests that exercise the **server's handlers** (rather than the raw protocol) are integration tests in
+`mcp-server/tests/mcp_integration.rs`. They drive the real `jdwp-mcp` binary over JSON-RPC on stdio
+against a probe JVM they launch and reap themselves:
 
-- **test_eval_invoke.rs** - Expression resolution: static-method invocation, object arguments,
-  overload selection, conditional breakpoints. Paired with `probes/EvalProbe.java`.
-- **test_watchpoint.rs** - Field watchpoints: static and instance modification (old → new), access
-  watches, and the list/clear/panic bookkeeping. Paired with `probes/WatchProbe.java`.
+```bash
+scripts/integration-test.sh                # all
+scripts/integration-test.sh force_return   # filter by name
+```
+
+They currently cover expression resolution (static-method invocation, object arguments, overload
+selection, conditional breakpoints), field watchpoints, deferred breakpoints, and `force_return`.
+Needs a JDK — without one each test prints `SKIP` and passes, so check for `SKIP` before trusting a
+green run.
 
 ### probes/
 
-Java programs the harnesses attach to. Compile with `javac -g` (without `-g` there is no
-local-variable table and locals can't be read), then launch with
-`-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:<port>` — one fresh port per run,
-since `server=y` stops listening after the first connection.
+The Java programs everything attaches to. The integration harness compiles and launches these for
+you; only the `jdwp-client` examples need you to do it by hand:
+
+```bash
+javac -g Probe.java   # -g is required: no -g means no local-variable table, so no locals at all
+java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 -cp . Probe
+```
+
+Use a fresh port per run — `server=y` stops listening after the first connection. Breakpoint lines are
+marked with `// BP<n>` comments so tests can find them by marker instead of by number.
 
 ## Quick Reference
 

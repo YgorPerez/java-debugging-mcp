@@ -7,25 +7,43 @@ item and finish it.
 
 ## How to validate anything here (the house pattern)
 
-Features are proven with an example that drives a purpose-built probe JVM:
+Two layers, two mechanisms. Pick by what the change touches.
 
-1. Write a tiny Java probe with the shape you need under `examples/probes/`; compile with the JBR
-   javac at `/snap/intellij-idea-ultimate/*/jbr/bin/javac` (no system JDK on this box, JRE only).
-   Pass `-g` or the local-variable table is missing and locals can't be read.
-2. Launch it with `-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:<port>`
-   (dt_socket `server=y` accepts ONE connection then stops listening — use a fresh port per run).
-3. Add an `examples/test_*.rs` that exercises the new behaviour and asserts the outcome; run with
-   `cargo run --release --example …`. Pick the layer to drive:
-   - **`jdwp-client` primitives** — register the example in `jdwp-client/Cargo.toml`. Worked
-     patterns: `examples/test_static_field.rs`, `examples/test_deferred_bp.rs`.
-   - **`mcp-server` handlers** — register it in `mcp-server/Cargo.toml` and spawn
-     `target/release/jdwp-mcp` as a child, speaking JSON-RPC over its stdio. This is the only way to
-     cover the handler glue (expression resolution, event pump, session state). Worked pattern:
-     `examples/test_eval_invoke.rs` and `examples/test_watchpoint.rs` (see TEST-1 for the gaps).
+**MCP-server behaviour (handlers, event pump, session state) — an integration test.**
+These drive the real `jdwp-mcp` binary over JSON-RPC on stdio against a real probe JVM, and they run
+from `cargo test`:
 
-Note: the `mcp__jdwp__` tools in a running Claude Code session hold the OLD binary — a rebuild
-(`cargo build --release`) is only picked up after a Claude Code restart. That's why validation goes
-through library examples, not the live tools, within a session.
+```
+scripts/integration-test.sh              # all of them
+scripts/integration-test.sh force_return # filter by test name
+```
+
+Add cases to `mcp-server/tests/mcp_integration.rs`; the harness (`tests/common/mod.rs`) compiles and
+launches the probe, picks a free port, reaps the JVM, and captures the probe's stdout+stderr. Write a
+probe under `examples/probes/` and mark breakpoint lines with `// BP<n>` comments — tests locate them
+by marker, so editing the Java can't silently point a test at the wrong statement.
+
+They are `#[ignore]`d (they spawn JVMs and need a JDK), which is why the runner passes `--ignored`.
+Scope to `--test mcp_integration`: a bare `cargo test -- --ignored` also un-ignores jdwp-client's
+illustrative ```ignore doctests, which were never meant to compile. **With no JDK every test prints
+`SKIP` and passes** — so a green run on a JDK-less machine proves nothing; grep the output for `SKIP`.
+
+**Raw `jdwp-client` protocol work — an example.**
+Register an `examples/test_*.rs` in `jdwp-client/Cargo.toml` and run it against a hand-launched probe:
+
+1. Compile the probe with `-g` (without it there is no local-variable table, so no locals can be
+   read at all). No system JDK on this box — the JBR at `/snap/intellij-idea-ultimate/*/jbr/bin/javac`
+   is the only one, which is also why the test harness looks there.
+2. `java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:<port> -cp . Probe`
+   (dt_socket `server=y` accepts ONE connection then stops listening — fresh port per run).
+3. `cargo run --release --example …`
+
+Worked patterns: `examples/test_static_field.rs`, `examples/test_deferred_bp.rs`.
+
+Note: the `mcp__jdwp__` tools in a running Claude Code session hold the OLD binary — a rebuild is only
+picked up after a Claude Code restart. That's why validation goes through tests/examples, not the live
+tools, within a session. The integration tests sidestep this entirely: they spawn the binary Cargo just
+built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale binary.
 
 ---
 
@@ -38,8 +56,9 @@ through library examples, not the live tools, within a session.
   load. Primitives: ClassPrepare wire-decode, `set_class_prepare`/`clear_class_prepare`,
   `resume_thread`. Validated end-to-end (`examples/test_deferred_bp.rs`).
 - **`debug.force_return`** — force the current method to return a value, skipping its body.
-  Primitive `force_early_return` (ThreadReference.ForceEarlyReturn). ⚠️ compile-verified only — a
-  runtime example is still owed (see TEST-1).
+  Primitive `force_early_return` (ThreadReference.ForceEarlyReturn). Now runtime-verified: the test
+  forces boolean/String/int returns and reads the probe's OWN stdout to confirm the caller received
+  the forced value, not just that the debugger reported success.
 - **Exception breakpoints (EXC-1)** — `debug.set_exception_breakpoint {class_pattern, caught,
   uncaught}` breaks on a thrown exception (type + subclasses), reported via `debug.get_last_event`
   with the exception type + caught/uncaught + catch location. Primitives: `Exception` wire-decode,
@@ -51,6 +70,17 @@ through library examples, not the live tools, within a session.
   (ClassType.SetValues) + `set_object_values` (ObjectReference.SetValues). Legacy `name` key still
   accepted. Validated — static String/int + instance int/String/boolean written and read back
   (`examples/test_set_field.rs`).
+- **MCP-handler integration tests (TEST-1)** — `mcp-server/tests/mcp_integration.rs` +
+  `tests/common/mod.rs`: the real `jdwp-mcp` binary driven over JSON-RPC on stdio against real probe
+  JVMs, runnable with `scripts/integration-test.sh` (no manual steps — the harness compiles the probe,
+  picks a free port, launches and reaps the JVM, and captures its stdout+stderr). Four tests cover the
+  expression handlers, watchpoints, the **deferred-breakpoint** `CLASS_PREPARE` path, and
+  **force_return**. The `Server` helper the two ex-example harnesses each carried a copy of now lives
+  in one place, and those examples are deleted. Tests spawn `CARGO_BIN_EXE_jdwp-mcp`, so they can never
+  run against a stale binary. With no JDK they print `SKIP` and pass, keeping a JDK-less CI green.
+  Gotcha found: `Class.getMethod` only sees *public* methods, so reflecting into a package-private
+  probe method throws `NoSuchMethodException` — and because the harness was discarding the probe's
+  stderr, that surfaced as a bare timeout. The harness now folds stderr into the captured output.
 - **Field watchpoints (WATCH-1)** — `debug.set_watchpoint {class_name, field_name, modify, access}`
   breaks when a field is written (or read), answering "who mutates this?". A write hit reports the
   mutating `class.method:line`, the field, whether it's static, the owning instance, and the
@@ -92,30 +122,8 @@ through library examples, not the live tools, within a session.
 Priority key: **P1** = highest payoff for the infotravel/integraWS investigations (shared 8180 +
 silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
 
-> **TRACE-1, EXC-1, SETF-1 (all P1) and EVAL-1, EVAL-2, WATCH-1 are done** — see Shipped above.
-
-### TEST-1 — MCP-handler integration tests + force_return runtime example  · P2 · M
-
-**What to build**
-`examples/test_eval_invoke.rs` and `examples/test_watchpoint.rs` established the JSON-RPC-over-stdio
-harness shape (spawn `target/release/jdwp-mcp`, drive `tools/call`, assert on the returned text) and
-cover the expression and watchpoint handlers. What still has no coverage is the rest of the
-`mcp-server` glue — the event pump arming deferred breakpoints, `handle_set_breakpoint`'s deferred
-path + race re-check, and `handle_force_return` — and nothing runs from `cargo test`.
-
-The two harnesses now carry a byte-identical copy of the `Server` helper, which is the concrete
-argument for extracting it: put it in one place, add the missing scenarios on top, and make the whole
-thing runnable without a hand-launched probe (the harness should start the probe JVM itself, picking a
-free port).
-
-**Acceptance criteria**
-- [ ] The `Server` stdio-JSON-RPC helper lives in one place, reused by every MCP-level example/test
-- [ ] A test starts the server, attaches to a probe, and asserts a deferred breakpoint arms + fires through the real handlers
-- [ ] `force_return` runtime example: break in a method, force a value, continue, observe the caller receive the forced value
-- [ ] Runs from `cargo test` (or a documented script) with no manual steps — the harness launches and reaps the probe JVM
-
-**Blocked by**
-None.
+> **TRACE-1, EXC-1, SETF-1 (all P1) and EVAL-1, EVAL-2, WATCH-1, TEST-1 are done** — see Shipped
+> above. Only DOC-1 and the two OBJ-* items remain.
 
 ### DOC-1 — `jdwp-trace` skill / silent-catch playbook (infotravel-dev-toolkit)  · P2 · S
 
@@ -175,7 +183,8 @@ via `debug.evaluate`.** What's genuinely missing is *automatic recursive object 
 
 - **OBJ-1 — recursive object expansion** (items 7, 9, 12, 13): an opt-in `debug.get_stack {expand_objects:true, max_depth}` / `debug.evaluate` deep mode that walks instance fields to a bounded depth with a per-node cap, cycle detection, and collection-aware rendering (List/Map/Set/Optional element-level, not just `toString`). Needs the depth/breadth config knobs (13) and a real type cache (8) to stay cheap. **New item — not yet in the backlog above.**
 - **OBJ-2 — collection search/filter** (item 16): filter/slice large collections during inspection (e.g. `list[0..10]`, `map.get("k")` already works via EVAL; a predicate filter does not). Depends on OBJ-1. **New item.**
-- Items 10 & 14 (HelloController / actuator examples) fold into **TEST-1** (integration harness) and **DOC-1**.
+- Items 10 & 14 (HelloController / actuator examples): the integration harness they needed now exists
+  (TEST-1), so these are just cases to add to `mcp_integration.rs` plus a write-up under **DOC-1**.
 - Field-path *method-call* richness is done (EVAL-1 static-method invocation + EVAL-2 object
   arguments). The remaining gap in overload resolution is **interface-typed parameters** and **boxed
   primitives**: `arg_type` walks only the superclass chain, so those fall through to the
