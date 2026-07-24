@@ -178,14 +178,13 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## Appendix: original 4-week roadmap — validated status (2026-07-24)
 
-The early "object-inspection" roadmap below was validated line-by-line against the current code.
-Legend: ✅ done · 🟡 partial · ⬜ not started. Evidence in `path:sym` form. (The original list
-numbered two items `6`; renumbered 1–17 here.)
+The early "object-inspection" roadmap below was validated line-by-line against the current code, with
+evidence in `path:sym` form. (The original list numbered two items `6`; renumbered 1–18 here.)
 
-Headline (updated): **Weeks 1–2 are done, and the Week 4 headline — field-path navigation — shipped
-via `debug.evaluate`.** Recursive expansion and collection-aware inspection shipped too (OBJ-1). What
-remains from this roadmap is a session-level type cache (item 8/17); collection search/filter shipped
-as OBJ-2.
+Headline (final): **all 18 items are done.** The last three to land were the type cache (8/17) and the
+metrics verification + example (10/14). `docs/VARIABLE_INSPECTION_PLAN.md` now records the plan against
+what was actually built, including the decisions that went the other way — chiefly that object expansion
+is opt-in rather than automatic, because expanding a collection invokes methods in the debuggee.
 
 ### Week 1 — Core infrastructure — ✅ complete
 1. ✅ Fix `INVALID_LENGTH` — `get_frames(thread, 0, -1)` (all frames) in `handlers.rs:handle_get_stack`.
@@ -197,36 +196,36 @@ as OBJ-2.
 
 ### Week 2 — Object inspection — ✅ complete
 7. ✅ Recursive object expansion (max depth) — `expand_objects:true` walks a bounded field tree with cycle detection (`handlers.rs:render_value_deep`). Off by default, so the shallow `TypeName (id=0x…)` rendering is still what you get unless you ask.
-8. 🟡 Type cache — only a per-call class-name cache in `get_stack` (`class_names` map) plus `package_filter` to skip framework frames; no persistent/session type or object cache.
+8. ✅ Type cache — per-connection `TypeCache` (`connection.rs`) memoises each loaded type's signature, declared fields, declared methods and superclass; shared across connection clones. Values are deliberately not cached. **Measured: 48% fewer JDWP packets on a cold deep expansion, 62% on a warm one** (see `docs/VARIABLE_INSPECTION_PLAN.md`).
 9. ✅ `get_stack` object expansion — opt-in via `expand_objects` (same renderer as 7). The default still passes `thread=None` on purpose, so the cheap path performs no `toString`/invocation per local.
-10. ⬜ HelloController `meterRegistry` verification — no such automated test; `examples/observability-debugging.md` is the closest (a manual write-up).
+10. ✅ `meterRegistry` verification — `roadmap_metrics_inspection_criteria` (`mcp_integration.rs`) asserts each of the plan's original success criteria. Caveat: it runs against `examples/probes/MetricsProbe.java`, a stand-in reproducing Micrometer's object *shape* (`meterRegistry.meters : Map<String, Counter>`, `Counter.id.name`, a real `AtomicInteger`) — Spring can't be a test dependency here, and the companion `java-example-for-k8s` app isn't on this box. So the **tool** is verified against the real structure; Spring's own class names, line numbers and bean lifecycle are not.
 
 ### Week 3 — Collections & polish — ✅ complete
 11. ✅ Array inspection — `extra.rs:get_array_length`/`get_array_values`; `render_value` expands arrays (first 16 elements, then `… +N more`). Surfaced through `evaluate`/`get_stack`, not a dedicated tool.
 12. ✅ Special handling for List/Map/Set/Optional — element-level under `expand_objects` (entries as `key → value` for maps); `toString()` remains the shallow rendering. Keyed/indexed access via subscripts (`counts["k"]`, `lines[0]`) or ordinary method calls; slicing/predicates shipped as OBJ-2.
 13. ✅ Config for inspection depth/limits — `max_result_length`, `max_frames`/`include_variables`/`package_filter`, plus `expand_objects`/`max_depth`/`max_children` and the node budget.
-14. ⬜ Actuator-metrics debugging example — not present as a runnable example.
+14. ✅ Actuator-metrics example — `examples/observability-debugging.md`, rewritten around today's tools with **captured** output (it previously showed hand-written "Expected Response" blocks for a session that was never run, and objects as bare `@0x…` IDs). Same stand-in caveat as item 10, stated in the doc.
 
-### Week 4 — Advanced navigation — ✅ complete (bar the type cache in 17)
+### Week 4 — Advanced navigation — ✅ complete
 15. ✅ Field-path navigation (`this.meterRegistry.meters`) — `debug.evaluate` resolves `this`/local/`Class` heads then `.field` / `.method(args)` chains (`handlers.rs:resolve_expression`). Static-method calls and object arguments shipped too (EVAL-1/EVAL-2, see Shipped).
 16. ✅ Collection search/filter — `[a..b]` slices and `[?predicate]` filters (`handlers.rs:apply_subscripts`), plus `[i]`/`["k"]` indexed access.
-17. 🟡 Performance/caching — class-name cache (per `get_stack` call), `package_filter`, single-threaded `invoke_method`, token-trimmed outputs, and the deep-render node budget. Still no session-level type/object cache; see the OBJ-1 note below.
+17. ✅ Performance/caching — the per-connection `TypeCache` (item 8), plus `package_filter`, single-threaded `invoke_method`, token-trimmed outputs, and the deep-render node budget. No object-*value* cache, by design.
 18. ✅ Documentation & examples — README tool table, `examples/*.rs` probes, `examples/observability-debugging.md`, `docs/`. Ongoing.
 
 ### What's actually left (net of the above)
 
-- ~~**OBJ-1 — recursive object expansion**~~ (items 7, 9, 12, 13) — **shipped**, see above. The one
-  piece of its original description not done is the *type cache* (item 8): expansion still re-reads
-  signatures and field lists per object, so a wide graph makes repeat round trips for the same type.
-  The node budget keeps that bounded rather than fast. A session-level `type_id → (name, fields,
-  container kind)` cache is the obvious follow-up if expansion ever feels slow on a real JVM.
+- ~~**OBJ-1 — recursive object expansion**~~ (items 7, 9, 12, 13) — **shipped**, including the type
+  cache it wanted (item 8). Not cached: the `classify_container` verdict, which still costs a method
+  lookup per rendered object — though that lookup is now itself served from the cached method list.
 - ~~**OBJ-2 — collection search/filter**~~ (item 16) — **shipped**, see above. Not covered: writing
   through a subscript (`list[0] = x` would need `List.set`/array element stores — `set_value` refuses
   it rather than doing the wrong thing), filtering a `Map`'s entries (no entry-shaped result type;
   `map.values()` then filter works), and a predicate whose *left* side needs a frame local inside a
   call argument (the frame is stale after `toArray()`).
-- Items 10 & 14 (HelloController / actuator examples): the integration harness they needed now exists
-  (TEST-1), so these are just cases to add to `mcp_integration.rs` plus a write-up under **DOC-1**.
+- ~~Items 10 & 14 (HelloController / actuator examples)~~ — **shipped** as
+  `roadmap_metrics_inspection_criteria` + the rewritten `examples/observability-debugging.md`. The only
+  thing still owed is a run against a genuine Spring Boot app, which needs the companion
+  `java-example-for-k8s` (not on this machine) — the stand-in verifies the tool, not the framework.
 - Field-path *method-call* richness is done (EVAL-1 static-method invocation + EVAL-2 object
   arguments). The remaining gap in overload resolution is **interface-typed parameters** and **boxed
   primitives**: `arg_type` walks only the superclass chain, so those fall through to the

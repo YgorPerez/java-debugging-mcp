@@ -21,13 +21,20 @@ impl JdwpConnection {
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_signature(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<String> {
+        // A loaded type's signature never changes, so this is the cheapest cache hit available and the
+        // most frequently asked question in the whole tool.
+        if let Some(hit) = self.types().signature(ref_type_id) {
+            return Ok(hit);
+        }
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::SIGNATURE);
         packet.data.put_u64(ref_type_id);
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
         let mut data = reply.data();
-        read_string(&mut data)
+        let sig = read_string(&mut data)?;
+        self.types().put_signature(ref_type_id, &sig);
+        Ok(sig)
     }
 
     /// ClassType.Superclass — direct superclass of a class (None for java.lang.Object).
@@ -35,6 +42,11 @@ impl JdwpConnection {
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_superclass(&mut self, class_id: ClassId) -> JdwpResult<Option<ClassId>> {
+        match self.types().superclass(class_id) {
+            crate::connection::CachedSuperclass::Root => return Ok(None),
+            crate::connection::CachedSuperclass::Parent(p) => return Ok(Some(p)),
+            crate::connection::CachedSuperclass::Unknown => {}
+        }
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::CLASS_TYPE, CLASS_TYPE_SUPERCLASS);
         packet.data.put_u64(class_id);
@@ -42,7 +54,9 @@ impl JdwpConnection {
         reply.check_error()?;
         let mut data = reply.data();
         let sc = read_u64(&mut data)?;
-        Ok(if sc == 0 { None } else { Some(sc) })
+        let parent = if sc == 0 { None } else { Some(sc) };
+        self.types().put_superclass(class_id, parent);
+        Ok(parent)
     }
 
     /// StackFrame.ThisObject — the `this` reference for a frame (0 = static method).

@@ -560,6 +560,100 @@ fn collection_subscripts_index_slice_and_filter() {
     );
 }
 
+/// The original roadmap's success criteria (`docs/VARIABLE_INSPECTION_PLAN.md`, appendix items 10/14),
+/// checked one by one against a stand-in for Spring Boot + Micrometer.
+///
+/// The criteria were written against a `HelloController` with a Micrometer `meterRegistry`. Spring
+/// can't be a test dependency here, so `MetricsProbe` reproduces the object *shape* — a registry
+/// holding a `Map<String, Counter>`, a `Counter` with a nested `id.name`/`id.tags`, and a real
+/// `AtomicInteger`. That verifies the tool against the real structure; what it cannot verify is
+/// Spring's own class names and bean lifecycle.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn roadmap_metrics_inspection_criteria() {
+    let Some(jdk) = jdk_or_skip("roadmap_metrics_inspection_criteria") else { return };
+    let probe = Probe::launch(&jdk, "MetricsProbe").expect("launch MetricsProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let line = probe_line(&probe_source("MetricsProbe"), "// BP1");
+    server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({"class_pattern": "MetricsProbe$HelloController", "line": line}),
+    );
+    let hit = server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in HelloController.hello never fired");
+
+    // "Set a breakpoint in HelloController" + the Week-1 BLOCKER: know WHICH thread hit it, rather
+    // than guessing among dozens.
+    assert_contains_all("the hit names its thread and location", &hit, &["\"method\":\"hello\"", "\"thread\":\"0x"]);
+
+    // "See that meterRegistry is a SimpleMeterRegistry"
+    assert_contains_all(
+        "meterRegistry's concrete type",
+        &server.evaluate("this.meterRegistry"),
+        &["SimpleMeterRegistry"],
+    );
+
+    // "See fields of meterRegistry (including the meters collection)"
+    let registry = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "this.meterRegistry", "expand_objects": true, "max_depth": 2}),
+    );
+    assert_contains_all(
+        "meterRegistry fields, with the meters map expanded",
+        &registry,
+        &["meters = ", "3 entries", "\"hello_requests_total\"", "\"http.server.requests\""],
+    );
+
+    // "See that helloCounter exists with count=42.0"
+    assert_contains_all("helloCounter's count", &server.evaluate("this.helloCounter.count"), &["(double) 42"]);
+
+    // "See string values directly (not object IDs)" — and the Week-4 headline, field-path navigation.
+    assert_contains_all(
+        "field path through a nested object to a String",
+        &server.evaluate("this.helloCounter.id.name"),
+        &["\"hello_requests_total\""],
+    );
+    assert_contains_all(
+        "and into a collection on that nested object",
+        &server.evaluate("this.helloCounter.id.tags[0]"),
+        &["uri=/hello"],
+    );
+
+    // Stretch goal: "show me this.meterRegistry.meters and get the map contents".
+    let meters = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "this.meterRegistry.meters", "expand_objects": true, "max_depth": 3}),
+    );
+    assert_contains_all(
+        "the map renders as key → value with drillable entries",
+        &meters,
+        &["→", "hello_requests_total", "count = (double)"],
+    );
+
+    // Stretch goal: "find metrics with name containing 'hello'" — the filter, keyed on the element.
+    let hello_only = server.evaluate("this.meterRegistry.meters.values()[?id.name != \"http.server.requests\"]");
+    assert_contains_all(
+        "filter the registry down to the hello meters",
+        &hello_only,
+        &["2 of 3 matched", "hello_requests_total", "hello_errors_total"],
+    );
+
+    // A real JDK library object, and a boxed-style wrapper: AtomicInteger holds an int `value`.
+    assert_contains_all(
+        "a library object expands too",
+        &server.call(
+            "debug.evaluate",
+            serde_json::json!({"expression": "this.requestCount", "expand_objects": true, "max_depth": 1}),
+        ),
+        &["AtomicInteger", "value = (int)"],
+    );
+
+    server.panic_reset();
+}
+
 /// Pull the ints out of `"old":"(int) 5"` / `"new":"(int) 6"` in an event line.
 fn parse_old_new(ev: &str) -> Option<(i64, i64)> {
     let grab = |key: &str| -> Option<i64> {

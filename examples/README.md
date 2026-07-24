@@ -12,9 +12,11 @@ All examples assume:
 ## Examples
 
 ### [observability-debugging.md](observability-debugging.md)
-**Real-World Spring Boot Debugging** *(Advanced)*
+**Debugging a missing metric** *(the roadmap's headline use case)*
 
-Investigates an ObservationRegistry post-processing issue similar to [spring-security#15658](https://github.com/spring-projects/spring-security/issues/15658).
+"Why isn't my custom metric showing up in `/actuator/metrics`?" — answered by reading the live registry
+instead of adding logging. Output is captured from a real run against `probes/MetricsProbe.java`, a
+stand-in for Spring + Micrometer; the doc says which parts you must adapt for a real app.
 
 **What You'll Learn:**
 - Setting breakpoints in framework code (Spring, Micrometer)
@@ -56,7 +58,8 @@ scripts/integration-test.sh force_return   # filter by name
 
 They currently cover expression resolution (static-method invocation, object arguments, overload
 selection, conditional breakpoints), field watchpoints, deferred breakpoints, `force_return`, and
-recursive object expansion, and collection subscripts (index / map key / slice / filter).
+recursive object expansion, collection subscripts (index / map key / slice / filter), and the original
+roadmap's metrics-inspection criteria.
 Needs a JDK — without one each test prints `SKIP` and passes, so check for `SKIP` before trusting a
 green run.
 

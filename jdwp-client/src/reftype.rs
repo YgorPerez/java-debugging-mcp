@@ -34,6 +34,11 @@ impl JdwpConnection {
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_methods(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<Vec<MethodInfo>> {
+        // Declared methods are fixed for a loaded type. Overload scoring walks this list once per
+        // candidate class per call, so the hit rate here is high.
+        if let Some(hit) = self.types().methods(ref_type_id) {
+            return Ok(hit);
+        }
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::METHODS);
 
@@ -63,6 +68,7 @@ impl JdwpConnection {
             });
         }
 
+        self.types().put_methods(ref_type_id, &methods);
         Ok(methods)
     }
 
@@ -85,6 +91,11 @@ impl JdwpConnection {
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_fields(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<Vec<FieldInfo>> {
+        // Declared fields are fixed for a loaded type. Expanding N objects of the same class used to ask
+        // the JVM for this list N times.
+        if let Some(hit) = self.types().fields(ref_type_id) {
+            return Ok(hit);
+        }
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::FIELDS);
 
@@ -114,6 +125,7 @@ impl JdwpConnection {
             });
         }
 
+        self.types().put_fields(ref_type_id, &fields);
         Ok(fields)
     }
 }

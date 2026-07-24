@@ -1,326 +1,114 @@
-# Variable Inspection Implementation Plan
-
-## Goal
-
-Make the JDWP debugger useful for inspecting variable values in both user code and library code (like Spring Boot, Micrometer) to support real-world debugging scenarios.
-
-**Core Use Case**: "Why isn't my custom metric showing up in `/actuator/metrics`?"
-
-Users need to:
-1. Set a breakpoint where a metric is registered
-2. Navigate to the right thread/frame
-3. See the actual values of variables (not just object IDs)
-4. Inspect fields of objects (e.g., `meterRegistry` fields)
-5. Drill down into collections and nested objects
-
-## Current State
-
-### What Works ✅
-- Connect/disconnect to JVM
-- Set/clear breakpoints
-- List threads
-- Get stack frames
-- See variable names and types in frames
-- Continue/pause execution
-- ✅ **String values**: Now show actual string contents (Week 1 complete!)
-
-### What Doesn't Work ❌
-- **⚠️ CRITICAL: Breakpoint event visibility**: When a breakpoint hits, users don't know which thread to inspect!
-  - Events contain thread ID but MCP server doesn't expose them
-  - Users must manually guess which of 36 threads hit the breakpoint
-  - Makes the tool unusable for real debugging
-- **Object field access**: Can't see fields of an object
-- **Collection inspection**: Can't see what's in a List/Map/Set
-- **Primitive values in objects**: Primitives in objects aren't accessible
-- **Expression evaluation**: Can't call methods like `toString()` or `getMeters()`
-
-## Implementation Phases
-
-### Phase 1: Basic Object Inspection (Highest Priority)
-
-**Goal**: Show useful information about variables without expression evaluation.
-
-#### 1.1 String Value Retrieval
-**JDWP Commands**:
-- `StringReference.Value` (command set 10, command 1)
-
-**Implementation**:
-```rust
-// In jdwp-client/src/string.rs
-pub async fn get_string_value(&mut self, object_id: ObjectId) -> JdwpResult<String>
-```
-
-**User Experience**:
-```
-Variables:
-  - message = (String) "Hello World"  // Instead of @0x123
-  - count = (int) 42
-```
-
-#### 1.2 Object Field Values
-**JDWP Commands**:
-- `ReferenceType.Fields` (get field IDs and signatures)
-- `ObjectReference.GetValues` (get field values)
-
-**Implementation**:
-```rust
-// In jdwp-client/src/object.rs
-pub async fn get_object_fields(&mut self, object_id: ObjectId) -> JdwpResult<Vec<Field>>
-
-pub struct Field {
-    pub name: String,
-    pub signature: String,
-    pub value: Value,
-}
-```
-
-**User Experience**:
-```
-Variables:
-  - this = (HelloController) @0x456
-    ├─ meterRegistry = (SimpleMeterRegistry) @0x789
-    ├─ helloCounter = (Counter) @0xabc
-    └─ requestCount = (AtomicInteger) @0xdef
-```
-
-#### 1.3 Array/Collection Inspection
-**JDWP Commands**:
-- `ArrayReference.Length`
-- `ArrayReference.GetValues`
-
-**Implementation**:
-```rust
-// In jdwp-client/src/array.rs
-pub async fn get_array_length(&mut self, array_id: ObjectId) -> JdwpResult<i32>
-pub async fn get_array_values(&mut self, array_id: ObjectId, first_index: i32, length: i32) -> JdwpResult<Vec<Value>>
-```
-
-**User Experience**:
-```
-Variables:
-  - args = (String[]) length=3
-    ├─ [0] = "arg1"
-    ├─ [1] = "arg2"
-    └─ [2] = "arg3"
-```
-
-#### 1.4 Enhanced Stack Frame Display
-**Update**: Modify `handle_get_stack()` to automatically expand objects.
-
-**Configuration**:
-```rust
-pub struct InspectionConfig {
-    pub max_depth: usize,           // Default: 2
-    pub max_collection_items: usize, // Default: 10
-    pub auto_expand_strings: bool,   // Default: true
-    pub expand_fields: bool,         // Default: true
-}
-```
-
-**User Experience**:
-```
-Frame 0: HelloController.hello:57
-  Variables:
-    - this = (HelloController) @0x456
-      ├─ meterRegistry = (SimpleMeterRegistry) @0x789
-      │  └─ meters = (ConcurrentHashMap) @0xbcd size=15
-      ├─ helloCounter = (Counter) @0xabc
-      │  ├─ id = (Meter.Id) @0xef0
-      │  │  ├─ name = "hello_requests_total"
-      │  │  └─ tags = (List) size=1
-      │  └─ count = 42.0
-      └─ requestCount = (AtomicInteger) @0xdef value=42
-    - sample = (Timer.Sample) @0x111
-```
-
-### Phase 2: Smart Object Navigation
-
-**Goal**: Help users find the information they need without knowing JDWP internals.
-
-#### 2.1 Type Information Cache
-**Problem**: Every object inspection requires multiple JDWP calls to get type info.
-
-**Solution**: Cache `ReferenceType.Fields` results by class ID.
-
-```rust
-// In mcp-server/src/session.rs
-pub struct TypeCache {
-    fields: HashMap<ReferenceTypeId, Vec<FieldInfo>>,
-}
-```
-
-#### 2.2 Natural Language Field Access
-**Goal**: Users say "show me this.meterRegistry" instead of navigating manually.
-
-**Implementation**: Parse field path and fetch recursively.
-
-```rust
-// In mcp-server/src/handlers.rs
-async fn handle_inspect_field(&self, args: Value) -> Result<String, String> {
-    // Parse "this.meterRegistry.meters"
-    // Navigate: get 'this' from frame -> get 'meterRegistry' field -> get 'meters' field
-}
-```
-
-**User Experience**:
-```
-> Show me this.meterRegistry.meters
-(ConcurrentHashMap) size=15
-  ├─ "hello_requests_total" -> (Counter) count=42.0
-  ├─ "http.server.requests" -> (Timer) count=5
-  └─ ... (10 more items)
-```
-
-#### 2.3 Collection Search
-**Goal**: Find items in collections without dumping everything.
-
-```rust
-async fn handle_find_in_collection(&self, args: Value) -> Result<String, String> {
-    // Find meter with name containing "hello"
-}
-```
-
-**User Experience**:
-```
-> Find meters with name containing "hello"
-Found 2 matches:
-  - hello_requests_total (Counter) count=42.0
-  - hello_errors_total (Counter) count=3.0
-```
-
-### Phase 3: Expression Evaluation (Future)
-
-**Goal**: Allow method calls and complex expressions.
-
-**JDWP Commands**:
-- `StackFrame.GetValues` (get variable values in frame)
-- `ObjectReference.InvokeMethod` (call methods on objects)
-- `ClassType.InvokeMethod` (call static methods)
-
-**Challenges**:
-- Expression parsing (could use a Java parser crate)
-- Method signature resolution
-- Handling exceptions during evaluation
-- Thread management (requires suspending threads)
-
-**Deferred**: This is complex and Phase 1-2 provide 80% of the value.
-
-## Implementation Order
-
-### Week 1: Core Infrastructure
-1. ✅ Fix INVALID_LENGTH bug
-2. ✅ Implement `StringReference.Value` command
-3. ✅ Implement `ReferenceType.Fields` command
-4. ✅ Implement `ObjectReference.GetValues` command
-5. ✅ Auto-expand strings in `handle_get_stack()`
-6. **🚨 BLOCKER: Expose breakpoint events to users**
-   - Add MCP handler to show last breakpoint event with thread ID
-   - Store last event in session
-   - Return thread ID when breakpoint hits
-
-### Week 2: Object Inspection
-6. Implement recursive object expansion (with max depth)
-7. Add type cache for performance
-8. Update `handle_get_stack()` to auto-expand objects
-9. Test with HelloController (verify we can see meterRegistry fields)
-
-### Week 3: Collections & Polish
-10. Implement array inspection commands
-11. Add special handling for common types (List, Map, Set, Optional)
-12. Add configuration for inspection depth/limits
-13. Create actuator metrics debugging example (NOW VALID!)
-
-### Week 4: Advanced Navigation
-14. Implement field path navigation ("this.meterRegistry.meters")
-15. Add collection search/filter
-16. Performance optimization and caching
-17. Documentation and examples
-
-## Success Criteria
-
-### Minimum Viable (Phase 1)
-A user can:
-- Set a breakpoint in HelloController
-- See that `meterRegistry` is a SimpleMeterRegistry
-- See fields of `meterRegistry` (including `meters` collection)
-- See that `helloCounter` exists with count=42.0
-- See string values directly (not object IDs)
-
-### Stretch Goal (Phase 2)
-A user can:
-- Ask "show me this.meterRegistry.meters" and get the map contents
-- Ask "find metrics with name containing 'hello'" and get matches
-- Navigate complex object graphs without knowing JDWP
-
-## JDWP Commands Reference
-
-### Priority 1 (Phase 1)
-| Command | Command Set | ID | Purpose |
-|---------|-------------|----|----|
-| StringReference.Value | 10 | 1 | Get string contents |
-| ReferenceType.Fields | 2 | 4 | Get field info for a class |
-| ObjectReference.GetValues | 9 | 2 | Get field values from object |
-| ArrayReference.Length | 13 | 1 | Get array length |
-| ArrayReference.GetValues | 13 | 2 | Get array elements |
-
-### Priority 2 (Phase 2)
-| Command | Command Set | ID | Purpose |
-|---------|-------------|----|----|
-| ReferenceType.Methods | 2 | 5 | Get method info (for future eval) |
-| ObjectReference.ReferenceType | 9 | 1 | Get type of an object |
-
-### Priority 3 (Phase 3 - Future)
-| Command | Command Set | ID | Purpose |
-|---------|-------------|----|----|
-| StackFrame.GetValues | 16 | 1 | Get variable values by slot |
-| ObjectReference.InvokeMethod | 9 | 6 | Call methods on objects |
-| ClassType.InvokeMethod | 3 | 3 | Call static methods |
-
-## Testing Strategy
-
-### Unit Tests (in jdwp-client)
-- Test each JDWP command implementation
-- Mock JDWP responses
-- Test edge cases (null objects, empty collections)
-
-### Integration Tests (in mcp-server)
-- Test against actual Java application (HelloController)
-- Verify object expansion works
-- Test recursive expansion with depth limits
-- Performance testing (large collections, deep nesting)
-
-### Example Validation
-- Follow the actuator metrics example step-by-step
-- Verify every command in the example works
-- Ensure output matches documentation
-
-## Open Questions
-
-1. **How deep should we auto-expand objects?**
-   - Proposal: max_depth=2 by default, configurable via args
-
-2. **How to handle circular references?**
-   - Proposal: Track visited objects, show "... (circular reference)" when detected
-
-3. **How to handle large collections?**
-   - Proposal: Show first 10 items, add "show more" capability
-
-4. **Should we cache object field values?**
-   - Proposal: No - values may change, always fetch fresh
-
-5. **How to present nested data in MCP text output?**
-   - Proposal: Use tree characters (├─ └─) like current stack output
-
-## Non-Goals
-
-- **Full debugger UI**: We're building a backend, not a GUI
-- **Hot code reload**: Out of scope for JDWP
-- **Code modification**: Read-only inspection only
-- **Performance profiling**: Use a proper profiler
-- **Memory leak detection**: Use a proper memory analyzer
+# Variable Inspection — plan, and what it became
+
+**Status: delivered.** This started as a 4-week plan to make the debugger useful for inspecting live
+variables. Every phase shipped; the document is kept as the record of what was planned, what was built,
+and the handful of decisions worth remembering.
+
+For the current tool list see `README.md`. For where each roadmap item landed in the code, see the
+appendix of `TODO.md`.
+
+## The goal
+
+**Core use case**: *"Why isn't my custom metric showing up in `/actuator/metrics`?"*
+
+To answer that, a user needed to set a breakpoint where a metric is registered, find the right thread
+and frame, see real values rather than object IDs, inspect an object's fields, and drill into
+collections and nested objects.
+
+All six work. `examples/observability-debugging.md` walks the use case end to end with captured output,
+and `roadmap_metrics_inspection_criteria` in `mcp-server/tests/mcp_integration.rs` asserts the original
+success criteria as an automated test.
+
+## What was built
+
+| Planned | Shipped as |
+|---|---|
+| String values, not object IDs | `render_value` — strings, arrays and boxed wrappers render as their contents |
+| Object field access | `debug.evaluate {expand_objects:true}` — a bounded field tree, own + inherited |
+| Collection inspection | element-level `List`/`Set`/`Map`/`Optional`; maps as `key → value` |
+| Which thread hit the breakpoint (the Week-1 **blocker**) | `debug.get_last_event` — a machine-readable `[event]` line naming the thread and location |
+| Type information cache | per-connection `TypeCache` (`jdwp-client/src/connection.rs`) |
+| Field-path navigation (`this.meterRegistry.meters`) | `debug.evaluate` resolves local/`this`/`Class` heads then `.field` / `.method(args)` chains |
+| Collection search | `[?predicate]` filters, `[a..b]` slices, `[i]` / `["key"]` subscripts |
+| Expression evaluation (deferred as "Phase 3, future") | shipped — including static-method invocation and object arguments |
+
+Beyond the plan: conditional breakpoints, non-suspending logpoints, exception breakpoints, field
+watchpoints, live field writes, `force_return`, multiple concurrent sessions, and a safety watchdog.
+
+## Decisions worth remembering
+
+The plan's Open Questions, as answered by the implementation.
+
+**How deep should objects auto-expand?** They don't — expansion is **opt-in**. The plan assumed
+auto-expansion at `max_depth=2`, but expanding a collection means *invoking methods in the debuggee*
+(`toArray`, `entrySet`), which needs a suspended thread and has side effects. Doing that for every local
+of every frame by default would make `get_stack` slow and side-effecting. So the default renders objects
+as `Type (id=0x…)` with no invocation at all, and `expand_objects:true` asks for the tree. `max_depth`
+does default to 2 once you ask.
+
+**How to handle circular references?** Cycle detection is **path-based**: an object already on the
+current path renders as `↩ Type (id=…, cycle)`. Path-based rather than globally-seen on purpose — a
+value reachable twice by different routes is worth printing twice when you're inspecting, whereas a true
+cycle must not recurse.
+
+**How to handle large collections?** `max_children` (default 16) bounds fields per object and elements
+per collection, and the output states what it truncated. A total **node budget** (400) bounds the whole
+render, so a shallow-but-bushy graph can't blow up either. For finding rather than browsing, filter:
+`[?pred]` scans up to 1000 elements and reports `N of M matched`, so an empty result is distinguishable
+from an unscanned one.
+
+**Should object field values be cached?** No — as the plan proposed. The `TypeCache` holds only a type's
+*shape* (signature, declared fields, declared methods, superclass), which is immutable for a loaded
+type. Values change as the program runs, so a cached value would be a lie.
+
+**How to present nested data?** Indented braces rather than the planned `├─ └─` tree characters — they
+survive terminal and JSON round-trips better, and match how the stack output already reads.
+
+## The type cache, measured
+
+Object inspection asks the same questions repeatedly: walking a superclass chain to find one field, or
+scoring method overloads, re-reads the same field and method lists for every object of a type. Expanding
+a 20-element collection asked the JVM for the element type's fields 20 times.
+
+Counting JDWP packets for one deep expansion of the `DeepProbe` graph (`max_depth:3, max_children:30`):
+
+| | cold expansion | a second identical expansion |
+|---|---|---|
+| without cache | 421 packets | 414 more |
+| with cache | 218 packets | 159 more |
+
+**48% fewer packets cold, 62% warm.** Cold still improves because the same types recur *within* a single
+expansion. Wall-clock barely moves over loopback, where a round trip is sub-millisecond — the win is a
+remote JVM (e.g. `kubectl port-forward`), where 200 fewer round trips is the difference.
+
+Staleness is bounded by design: the cache belongs to the connection, so reattaching after a redeploy
+gets a fresh one. A class unload or an external `RedefineClasses` could serve stale shape data; both are
+documented at `TypeCache`.
+
+## Testing
+
+The plan called for unit tests per JDWP command, integration tests against a real app, and validating
+the example step by step. What exists:
+
+- **Unit tests** for the pure logic — schema generation, the type cache, tool registration.
+- **Integration tests** (`mcp-server/tests/mcp_integration.rs`) driving the real `jdwp-mcp` binary over
+  JSON-RPC against probe JVMs the harness compiles, launches and reaps itself. Run with
+  `scripts/integration-test.sh`. Seven tests cover expression resolution, watchpoints, deferred
+  breakpoints, `force_return`, deep expansion, collection subscripts, and the roadmap criteria above.
+- **The example is validated** by the roadmap-criteria test, and its output blocks are captured from a
+  real run rather than written by hand.
+
+Mock-JDWP-response unit tests were **not** built. Driving a real JVM caught things a mock could not
+have: a modifier-kind mix-up that came back as a bare `INTERNAL` naming nothing, frame IDs silently
+invalidated by method invocation, and an ill-typed invoke that **SIGSEGV'd the debuggee**. A mock would
+have agreed with all three.
+
+## Non-goals (unchanged)
+
+Full debugger UI · hot code reload · code modification beyond `set_value`/`force_return` · performance
+profiling · memory-leak detection.
 
 ## Resources
 
 - [JDWP Specification](https://docs.oracle.com/javase/8/docs/technotes/guides/jpda/jdwp-spec.html)
-- [JDI Documentation](https://docs.oracle.com/javase/8/docs/jdk/api/jpda/jdi/) (reference implementation)
-- [Existing JDWP client implementations](https://github.com/search?q=jdwp+client)
+- [JDI Documentation](https://docs.oracle.com/javase/8/docs/jdk/api/jpda/jdi/) — the reference implementation
