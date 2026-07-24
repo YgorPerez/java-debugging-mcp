@@ -118,7 +118,7 @@ fn execution_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.set_value".to_string(),
-            description: "Write a value to a local variable, a static field (e.g. ConfigDefaultUtils.dsInfra — flip tenant/infra on a live JVM without a restart), or an instance field (this.status, reserva.total). Value is a literal (int, long like 123L, true/false, null, or \"string\") coerced to the target's declared type. Locals/instance fields need a suspended thread; statics don't.".to_string(),
+            description: "Write a value to a local variable, a static field (e.g. ConfigDefaultUtils.dsInfra — flip tenant/infra on a live JVM without a restart), an instance field (this.status, reserva.total), or one element of an array/List/Map (numbers[0], counts[\"key\"] — via ArrayReference.SetValues, List.set or Map.put, reporting the value it displaced). Value is a literal (int, long like 123L, true/false, null, or \"string\") coerced to the target's declared type. Locals, instance fields and elements need a suspended thread; statics don't.".to_string(),
             input_schema: to_val(schemars::schema_for!(SetValueArgs)),
         },
         Tool {
@@ -144,7 +144,7 @@ fn inspection_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.evaluate".to_string(),
-            description: "Evaluate a Java expression in frame context. Heads: a local, this, or a class name; then chain .field and .method(args), including static fields and static methods (ConfigDefaultUtils.getUrl()). Arguments may be literals or expressions passed by reference (svc.matches(reserva), foo.handle(this)). Method calls need a suspended thread; a plain static-field read does not. Subscripts work on arrays/List/Map: lines[0] (index, keeps chaining), counts[\"key\"] (map lookup), lines[2..5] (half-open slice), lines[?qty > 3] (filter, whose left side resolves against each element). Pass expand_objects:true to get a recursive field tree instead of one line — it walks nested objects, arrays, and List/Set/Map/Optional contents to max_depth, detects cycles, and unboxes Integer/Long/etc.".to_string(),
+            description: "Evaluate a Java expression in frame context. Heads: a local, this, or a class name; then chain .field and .method(args), including static fields and static methods (ConfigDefaultUtils.getUrl()). Arguments may be literals or expressions passed by reference (svc.matches(reserva), foo.handle(this)). Method calls need a suspended thread; a plain static-field read does not. Subscripts work on arrays/List/Map: lines[0] (index, keeps chaining), counts[\"key\"] (map lookup), lines[2..5] (half-open slice), lines[?qty > 3] (filter, whose left side resolves against each element; filtering a Map tests its values and keeps the keys as key → value). Pass expand_objects:true to get a recursive field tree instead of one line — it walks nested objects, arrays, and List/Set/Map/Optional contents to max_depth, detects cycles, and unboxes Integer/Long/etc.".to_string(),
             input_schema: to_val(schemars::schema_for!(EvaluateArgs)),
         },
         Tool {

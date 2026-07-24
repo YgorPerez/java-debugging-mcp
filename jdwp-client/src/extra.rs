@@ -5,7 +5,7 @@ use crate::commands::{
     command_sets, event_commands, event_kinds, step_depths, step_sizes, vm_commands,
 };
 use crate::connection::JdwpConnection;
-use crate::eval::write_tagged_value;
+use crate::eval::{write_tagged_value, write_untagged_value};
 use crate::eventrequest::SuspendPolicy;
 use crate::protocol::{CommandPacket, JdwpResult};
 use crate::reader::{read_i32, read_u64, read_u8, read_value_by_tag};
@@ -20,6 +20,7 @@ const MOD_STEP: u8 = 10;
 // ArrayReference command set (13)
 const ARRAY_LENGTH: u8 = 1;
 const ARRAY_GET_VALUES: u8 = 2;
+const ARRAY_SET_VALUES: u8 = 3;
 
 /// Step depth selector for `set_step`.
 #[derive(Debug, Clone, Copy)]
@@ -176,6 +177,34 @@ impl JdwpConnection {
             }
         }
         Ok(out)
+    }
+
+    /// `ArrayReference.SetValues` — overwrite `values.len()` elements starting at `first`.
+    ///
+    /// Values go on the wire **untagged**, so each must already be coerced to the array's component
+    /// type: writing an `int` into a `long[]` with the wrong width corrupts the element rather than
+    /// failing. The caller reads the component type from the array's signature and coerces first.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails, including `INVALID_LENGTH` when the range
+    /// runs past the end of the array.
+    pub async fn set_array_values(
+        &mut self,
+        array_id: ObjectId,
+        first: i32,
+        values: &[Value],
+    ) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::ARRAY_REFERENCE, ARRAY_SET_VALUES);
+        packet.data.put_u64(array_id);
+        packet.data.put_i32(first);
+        packet.data.put_i32(i32::try_from(values.len()).unwrap_or(i32::MAX));
+        for v in values {
+            write_untagged_value(&mut packet.data, v);
+        }
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+        Ok(())
     }
 
     /// VirtualMachine.CreateString — mirror a string into the target VM, returning its id.

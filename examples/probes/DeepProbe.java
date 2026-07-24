@@ -84,6 +84,9 @@ public class DeepProbe {
         int[] numbers = {1, 2, 3};
         String[] words = {"alpha", "beta"};
         List<Line> lines = new ArrayList<>();
+        // OBJ-4: a Map whose VALUES have fields worth filtering on, so `byId[?qty > 3]` has real work
+        // and the surviving entries have keys worth keeping.
+        Map<String, Line> byId = new LinkedHashMap<>();
         int threshold = 3;
 
         Order() {
@@ -104,6 +107,9 @@ public class DeepProbe {
             lines.add(new Line("cc", 2, true));
             lines.add(new Line("dd", 9, false));
             lines.add(new Line("ee", 4, false));
+            for (Line l : lines) {
+                byId.put(l.sku, l);
+            }
         }
     }
 

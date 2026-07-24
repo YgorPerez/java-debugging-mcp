@@ -567,19 +567,20 @@ fn collection_subscripts_index_slice_and_filter() {
         &server.evaluate("order.lines[?paid == true].sku"),
         &["selects several values"],
     );
-    // A subscript in a write target used to be parsed and then dropped, writing the whole field.
+    // A subscript in a write target used to be parsed and then dropped, writing the whole field. An
+    // *indexed* write is now supported (OBJ-4, see `subscript_writes_and_map_entry_filters`); a slice or
+    // filter target still has nothing single to write, and says so.
     assert_contains_all(
-        "a subscripted set_value target is refused, not silently widened",
+        "a multi-value set_value target is refused, not silently widened",
         &server.call("debug.set_value", serde_json::json!({"target": "order.lines[0..2]", "value": "1"})),
-        &["Subscripts aren't supported"],
-    );
-    assert_contains_all(
-        "an indexed write is refused too",
-        &server.call("debug.set_value", serde_json::json!({"target": "order.numbers[0]", "value": "1"})),
-        &["Subscripts aren't supported"],
+        &["selects several elements"],
     );
     // A Map has no positional order, so slicing one points at the alternatives.
-    assert_contains_all("slicing a Map explains itself", &server.evaluate("order.counts[0..1]"), &["is a Map"]);
+    assert_contains_all(
+        "slicing a Map explains itself",
+        &server.evaluate("order.counts[0..1]"),
+        &["no order to slice"],
+    );
 
     // --- Subscripts compose with deep expansion ---
     let deep_filter = server.call(
@@ -947,6 +948,97 @@ fn get_stack_node_budget_bounds_the_whole_call() {
         "i = (int)",
         "order = DeepProbe$Order",
     ]);
+
+    server.panic_reset();
+}
+
+/// OBJ-4: the two things OBJ-2 deliberately left out — writing through a subscript, and filtering a
+/// `Map` without losing the keys.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn subscript_writes_and_map_entry_filters() {
+    let Some(jdk) = jdk_or_skip("subscript_writes_and_map_entry_filters") else { return };
+    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let line = probe_line(&probe_source("DeepProbe"), "// BP1");
+    server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({"class_pattern": "DeepProbe", "line": line}),
+    );
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in DeepProbe.inspect never fired");
+
+    let write = |server: &mut Server, target: &str, value: &str| {
+        server.call("debug.set_value", serde_json::json!({"target": target, "value": value}))
+    };
+
+    // --- Array element: ArrayReference.SetValues, no invocation in the debuggee ---
+    let set = write(&mut server, "order.numbers[1]", "42");
+    assert_contains_all("array element written, old value reported", &set, &["numbers[1] = 42", "was (int) 2"]);
+    assert_contains_all("and it stuck", &server.evaluate("order.numbers[1]"), &["(int) 42"]);
+    // The neighbours must be untouched — an untagged write of the wrong width would corrupt them.
+    assert_contains_all("neighbours intact", &server.evaluate("order.numbers[0]"), &["(int) 1"]);
+    assert_contains_all("neighbours intact", &server.evaluate("order.numbers[2]"), &["(int) 3"]);
+
+    // --- List element: List.set(index, value), which hands back what it displaced ---
+    let set = write(&mut server, "order.tags[0]", "\"replaced\"");
+    assert_contains_all("List element written via set()", &set, &["tags[0] = ", "urgent", "set()"]);
+    assert_contains_all("and it stuck", &server.evaluate("order.tags[0]"), &["\"replaced\""]);
+
+    // --- Map value: Map.put(key, value), with the int boxed into the Integer the map holds ---
+    let set = write(&mut server, "order.counts[\"a\"]", "9");
+    assert_contains_all("Map value written via put()", &set, &["counts[\"a\"] = 9", "put()"]);
+    assert_contains_all("and it stuck, boxed", &server.evaluate("order.counts[\"a\"]"), &["(int) 9"]);
+
+    // --- The refusals ---
+    assert_contains_all(
+        "out of bounds",
+        &write(&mut server, "order.numbers[9]", "1"),
+        &["out of bounds", "length 3"],
+    );
+    assert_contains_all(
+        "type mismatch against the component type",
+        &write(&mut server, "order.numbers[0]", "\"text\""),
+        &["int"],
+    );
+    assert_contains_all(
+        "a slice names several elements, so there is nothing single to write",
+        &write(&mut server, "order.numbers[0..2]", "1"),
+        &["selects several elements"],
+    );
+    assert_contains_all(
+        "so does a filter",
+        &write(&mut server, "order.lines[?paid == true]", "1"),
+        &["selects several elements"],
+    );
+    // The array write must not have been corrupted by any of the refused attempts.
+    assert_contains_all("refusals changed nothing", &server.evaluate("order.numbers[0]"), &["(int) 1"]);
+
+    // --- Map entry filtering: predicate against each VALUE, keys preserved in the output ---
+    // qty > 3 keeps bb(5), dd(9) and ee(4) — three of five.
+    let matched = server.evaluate("order.byId[?qty > 3]");
+    assert_contains_all("filtered entries render as key → value", &matched, &[
+        "3 of 5 entr(ies)",
+        "\"bb\" → ",
+        "Line(bb,5,false)",
+        "\"dd\" → ",
+        "Line(dd,9,false)",
+        "\"ee\" → ",
+    ]);
+    assert!(!matched.contains("Line(aa"), "qty 1 must not match qty > 3:\n{matched}");
+    assert!(!matched.contains("Line(cc"), "qty 2 must not match qty > 3:\n{matched}");
+    assert!(!matched.contains("[0] = "), "map results are keyed, not positional:\n{matched}");
+    // Zero matches is still a keyed, counted answer rather than an error.
+    assert_contains_all("no matches", &server.evaluate("order.byId[?qty > 99]"), &["0 of 5 entr(ies)"]);
+    // A slice still has no meaning on a Map, and says why.
+    assert_contains_all(
+        "slicing a Map is refused with the alternative",
+        &server.evaluate("order.byId[0..2]"),
+        &["no order to slice"],
+    );
 
     server.panic_reset();
 }

@@ -656,12 +656,17 @@ impl RequestHandler {
             Resolved::One(value) => render_one(conn, &value, thread_id, max_len, deep).await,
             // A slice/filter result: the header carries how many of how many were selected, which is
             // as important as the values — "0 matched" and "0 scanned" mean very different things.
-            Resolved::Many { header, values } => {
+            Resolved::Many { header, values, keys } => {
                 let shown = values.len().min(a.max_children.max(1));
                 let mut out = format!("{header} {{");
                 for (i, v) in values.iter().take(shown).enumerate() {
                     let r = render_one(conn, v, thread_id, max_len, deep).await;
-                    let _ = write!(out, "\n  [{i}] = {r}");
+                    // Map entries keep their keys; everything else is positional.
+                    match keys.get(i) {
+                        Some(k) => write!(out, "\n  {k} → {r}"),
+                        None => write!(out, "\n  [{i}] = {r}"),
+                    }
+                    .unwrap_or_default();
                 }
                 if values.len() > shown {
                     let _ = write!(out, "\n  … +{} more (raise max_children)", values.len() - shown);
@@ -822,16 +827,27 @@ impl RequestHandler {
 
         let segs = parse_expr(&target)?;
 
-        // A subscript in a write target would otherwise be parsed and then silently dropped, writing
-        // to the whole field instead of the element the caller named. Writing through a subscript
-        // would need List.set(i, v) / array element stores, which this tool doesn't do yet — so say so
-        // rather than do the wrong thing quietly.
-        if let Some(seg) = segs.iter().find(|s| !s.subs.is_empty()) {
+        // A slice or filter names several elements, so there is no single place to write. Refused
+        // explicitly: this used to parse the subscript and then silently drop it, writing the whole
+        // field instead of the elements the caller named.
+        if let Some(seg) = segs.iter().find(|s| {
+            s.subs.iter().any(|x| !matches!(x, Subscript::Index(_)))
+        }) {
             return Err(format!(
-                "Subscripts aren't supported in a set_value target ('{}[…]'): it writes a single \
-                 field, local, or static. Use debug.evaluate to inspect elements.",
+                "'{}[…]' selects several elements with a slice or filter, so there is nothing single \
+                 to write. Use one index (e.g. [0]) to write one element.",
                 seg.name
             ));
+        }
+
+        // `xs[0] = v` — an element write. The container is everything before the final `[…]`, which
+        // resolve_expression handles including earlier subscripts (`grid[0][1]`).
+        let last_seg = segs.last().ok_or_else(|| "Empty target path".to_string())?;
+        if let Some(Subscript::Index(key)) = last_seg.subs.last().cloned() {
+            let open = trailing_subscript_start(&target)
+                .ok_or_else(|| format!("Could not find the final subscript in '{target}'"))?;
+            let container_expr = target.get(..open).unwrap_or_default().trim().to_string();
+            return set_element(conn, thread_opt, frame_index, &container_expr, &key, value_str).await;
         }
 
         // Single bare identifier → local variable in a suspended frame (the original behavior).
@@ -840,7 +856,7 @@ impl RequestHandler {
         }
 
         // Multi-segment target: the last segment is the field; the prefix names the container.
-        let field_seg = segs.last().ok_or_else(|| "Empty target path".to_string())?;
+        let field_seg = last_seg;
         if field_seg.args.is_some() {
             return Err("The last segment must be a field, not a method call".to_string());
         }
@@ -2623,6 +2639,174 @@ async fn set_local_variable(
     Ok(format!("✅ Set local {name} = {value_str}"))
 }
 
+/// How an index/key literal reads back in a confirmation message.
+fn render_arglit(a: &ArgLit) -> String {
+    match a {
+        ArgLit::Int(n) => n.to_string(),
+        ArgLit::Long(n) => format!("{n}L"),
+        ArgLit::Bool(b) => b.to_string(),
+        ArgLit::Null => "null".to_string(),
+        ArgLit::Str(s) => format!("\"{s}\""),
+        ArgLit::Expr(e) => e.clone(),
+    }
+}
+
+/// Byte offset of the `[` that opens the *final* top-level subscript of `target`, if it ends in one.
+///
+/// Scanned from the end at bracket depth 0, so a nested subscript inside a predicate
+/// (`orders[?tags[0] == "x"]`) can't be mistaken for the outer one. `parse_expr` has already validated
+/// that the brackets balance.
+fn trailing_subscript_start(target: &str) -> Option<usize> {
+    let t = target.trim_end();
+    if !t.ends_with(']') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, c) in t.char_indices().rev() {
+        match c {
+            ']' => depth += 1,
+            '[' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Write one element of an array, a `List`, or a `Map` — the `xs[0] = v` case of `set_value`.
+///
+/// Two mechanisms behind one syntax, split by whether invoking anything is needed: an array is written
+/// with `ArrayReference.SetValues` and has no side effects, while a collection is written by calling a
+/// method on it (see [`set_collection_element`]).
+async fn set_element(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_opt: Option<u64>,
+    frame_index: usize,
+    container_expr: &str,
+    key: &ArgLit,
+    raw_value: &str,
+) -> Result<String, String> {
+    let tid = thread_opt.ok_or_else(|| {
+        format!("Writing '{container_expr}[…]' needs a suspended thread — pause one or hit a breakpoint first")
+    })?;
+    let frames = conn.get_frames(tid, 0, -1).await
+        .map_err(|e| format!("Failed to get frames (is the thread suspended?): {e}"))?;
+    let frame = frames.get(frame_index).or_else(|| frames.first()).cloned();
+    let container = resolve_expression(conn, Some(tid), frame.as_ref(), container_expr).await?;
+    let id = as_object_id(&container)
+        .ok_or_else(|| format!("'{container_expr}' is null or a primitive, so it has no elements"))?;
+
+    if container.tag == 91 {
+        return set_array_element(conn, id, container_expr, key, raw_value).await;
+    }
+    set_collection_element(conn, tid, frame.as_ref(), id, container_expr, key, raw_value).await
+}
+
+/// Write one element of a `List` (via `set(index, value)`) or a `Map` (via `put(key, value)`).
+///
+/// Both are found by *arity*, and looking for `set` before `put` is unambiguous because a `List` has no
+/// `put` and a `Map` has no `set` — the same trick `apply_index` uses to find `get`. Both calls return
+/// the element they displaced, so the confirmation reports old → new without a separate read.
+#[allow(clippy::too_many_arguments)] // an element write needs all of it: where, what, and with what
+async fn set_collection_element(
+    conn: &mut jdwp_client::JdwpConnection,
+    tid: u64,
+    frame: Option<&jdwp_client::thread::Frame>,
+    id: u64,
+    container_expr: &str,
+    key: &ArgLit,
+    raw_value: &str,
+) -> Result<String, String> {
+    let type_id = conn.get_object_reference_type(id).await
+        .map_err(|e| format!("Failed to resolve type of '{container_expr}': {e}"))?;
+    let writer = match find_method_arity(conn, type_id, "set", 2).await? {
+        Some((d, m)) => Some((d, m, false)),
+        None => find_method_arity(conn, type_id, "put", 2).await?.map(|(d, m)| (d, m, true)),
+    };
+    let Some((decl, m, is_map)) = writer else {
+        let name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+        return Err(format!(
+            "'{container_expr}' is a {name}, which has neither set(index, value) nor \
+             put(key, value) — element writes work on arrays, List and Map"
+        ));
+    };
+
+    // The index/key: a List index is an int; a Map key is whatever the caller wrote (boxed below).
+    let key_value = if is_map {
+        arglit_to_value(conn, Some(tid), frame, key).await?
+    } else {
+        let ArgLit::Int(i) = key else {
+            return Err(format!("A List index must be an int, got {key:?} on '{container_expr}'"));
+        };
+        value_int(*i)
+    };
+    // The value parameter's declared type drives the literal's coercion; for `set(int, E)` and
+    // `put(K, V)` that is a reference, so `coerce_args` boxes a primitive into its wrapper.
+    let params = sig_param_types(&m.signature);
+    let value_sig = params.get(1).map_or("Ljava/lang/Object;", String::as_str);
+    let sig_byte = *value_sig.as_bytes().first().unwrap_or(&b'L');
+    let new_value = literal_to_value(conn, raw_value, sig_byte).await?;
+    let args = coerce_args(conn, tid, &m.signature, vec![key_value, new_value]).await?;
+
+    let (ret, exc) = conn.invoke_method(id, tid, decl, m.method_id, args).await
+        .map_err(|e| format!("{}() on '{container_expr}' failed: {e}", m.name))?;
+    let displaced = invoke_result(conn, &m.name, ret, exc).await?;
+    let old = render_value(conn, &displaced, Some(tid), 200).await;
+    Ok(format!(
+        "✅ Set {container_expr}[{}] = {raw_value} (was {old}) via {}()",
+        render_arglit(key),
+        m.name,
+    ))
+}
+
+/// Write one array element via `ArrayReference.SetValues`, coercing the literal to the array's
+/// component type. No invocation, so — unlike the collection path — it has no side effects.
+async fn set_array_element(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    container_expr: &str,
+    key: &ArgLit,
+    raw_value: &str,
+) -> Result<String, String> {
+    let ArgLit::Int(i) = key else {
+        return Err(format!("An array index must be an int, got {key:?} on '{container_expr}'"));
+    };
+    let len = conn.get_array_length(id).await
+        .map_err(|e| format!("Failed to read length of '{container_expr}': {e}"))?;
+    if *i < 0 || *i >= len {
+        return Err(format!("Index {i} is out of bounds for '{container_expr}' (length {len})"));
+    }
+    // "[I" -> 'I', "[Ljava/lang/String;" -> 'L'. The component type is what the value must match:
+    // ArrayReference.SetValues writes untagged, so a wrong width would corrupt the element silently.
+    let type_id = conn.get_object_reference_type(id).await
+        .map_err(|e| format!("Failed to resolve type of '{container_expr}': {e}"))?;
+    let sig = conn.get_signature(type_id).await.unwrap_or_default();
+    let component = sig.strip_prefix('[').unwrap_or(&sig).to_string();
+    let sig_byte = *component.as_bytes().first().unwrap_or(&b'L');
+
+    let old = conn.get_array_values(id, *i, 1).await.ok().and_then(|v| v.into_iter().next());
+    let value = literal_to_value(conn, raw_value, sig_byte).await?;
+    if !tag_compatible(sig_byte, value.tag) {
+        return Err(format!(
+            "'{container_expr}[{i}]' is {} — a {} literal can't be written to it",
+            decode_signature(&component),
+            decode_signature(&String::from_utf8_lossy(&[value.tag])),
+        ));
+    }
+    conn.set_array_values(id, *i, std::slice::from_ref(&value)).await
+        .map_err(|e| format!("Failed to write '{container_expr}[{i}]': {e}"))?;
+
+    let was = match old {
+        Some(v) => format!(" (was {})", render_value(conn, &v, None, 200).await),
+        None => String::new(),
+    };
+    Ok(format!("✅ Set {container_expr}[{i}] = {raw_value}{was}"))
+}
+
 /// Instance-field attempt: resolve `container_expr` to an object via a suspended frame and write
 /// `field_name`. Returns `Done` on success, `Fallthrough` (with the reason) when the container isn't
 /// a usable object or there is no thread; errors only on a hard failure (null container, JVM error).
@@ -2921,16 +3105,40 @@ async fn box_primitive(
     (exc == 0).then_some(ret)
 }
 
-/// Read a bounded prefix of an array's or collection's elements.
+/// What one scan of a container yielded.
+struct Scan {
+    /// The elements read — for a `Map`, its *values*.
+    values: Vec<jdwp_client::types::Value>,
+    /// Rendered keys, parallel to `values`, when the container was a `Map`. Empty otherwise.
+    keys: Vec<String>,
+    /// The container's full length, which may exceed what was read (the scan cap).
+    len: i32,
+    /// The container's type name, for the result header.
+    name: String,
+}
+
+/// Whether a scan may descend into a `Map`'s entries.
 ///
-/// Returns the elements read, the container's full length, and its type name. `Collection` needs a
-/// suspended thread (it calls `toArray()`); arrays don't.
+/// A filter can — it renders survivors as `key → value`. A slice can't: a map has no positional order
+/// to take a range of.
+#[derive(PartialEq, Eq)]
+enum MapScan {
+    Refuse,
+    Entries,
+}
+
+/// Read a bounded prefix of an array's, collection's, or map's elements.
+///
+/// A `Collection` needs a suspended thread (it calls `toArray()`); arrays don't. A `Map` needs one too,
+/// and costs the most: `entrySet()`, `toArray()`, then `getKey()`/`getValue()` per entry — which is why
+/// the scan cap matters more here than anywhere else.
 async fn scan_elements(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: Option<u64>,
     base: &jdwp_client::types::Value,
     label: &str,
-) -> Result<(Vec<jdwp_client::types::Value>, i32, String), String> {
+    maps: MapScan,
+) -> Result<Scan, String> {
     let id = as_object_id(base)
         .ok_or_else(|| format!("Cannot slice or filter '{label}' — it is null or a primitive"))?;
     let name = type_name_of(conn, id).await;
@@ -2951,12 +3159,14 @@ async fn scan_elements(
                 .as_ref()
                 .and_then(as_object_id)
                 .ok_or_else(|| format!("toArray() on '{label}' returned nothing usable"))?,
-            // A Map has no positional order to slice; filtering entries would need an entry-shaped
-            // result type, which `Resolved` deliberately doesn't have.
+            Some(ContainerKind::Map) if maps == MapScan::Entries => {
+                return scan_map_entries(conn, id, type_id, tid, label, name).await
+            }
+            // A slice needs positional order, which a Map has none of.
             Some(ContainerKind::Map) => {
                 return Err(format!(
-                    "'{label}' is a Map — slice/filter works on arrays and Collections. Use \
-                     {label}[\"key\"] for one entry, or {label}.values() to filter the values."
+                    "'{label}' is a Map, so there is no order to slice. Use {label}[\"key\"] for one \
+                     entry, or a filter ({label}[?…]) which keeps the keys."
                 ))
             }
             _ => {
@@ -2979,7 +3189,60 @@ async fn scan_elements(
             .await
             .map_err(|e| format!("Failed to read elements of '{label}': {e}"))?
     };
-    Ok((values, len, name))
+    Ok(Scan { values, keys: Vec::new(), len, name })
+}
+
+/// Read a `Map`'s entries as (rendered key, value) pairs, so a filter over the values can still say
+/// which key each survivor was under.
+///
+/// Keys are rendered eagerly and WITHOUT invoking `toString()` (`thread_id` None): the point of the key
+/// is to identify the entry, and a filter is already invoking enough in the debuggee.
+async fn scan_map_entries(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    type_id: u64,
+    tid: u64,
+    label: &str,
+    name: String,
+) -> Result<Scan, String> {
+    let set = invoke_no_arg(conn, id, type_id, tid, "entrySet")
+        .await
+        .as_ref()
+        .and_then(as_object_id)
+        .ok_or_else(|| format!("entrySet() on '{label}' returned nothing usable"))?;
+    let set_type = conn
+        .get_object_reference_type(set)
+        .await
+        .map_err(|e| format!("Failed to resolve the entry set of '{label}': {e}"))?;
+    let arr = invoke_no_arg(conn, set, set_type, tid, "toArray")
+        .await
+        .as_ref()
+        .and_then(as_object_id)
+        .ok_or_else(|| format!("toArray() on the entry set of '{label}' returned nothing usable"))?;
+    let len = conn
+        .get_array_length(arr)
+        .await
+        .map_err(|e| format!("Failed to read the entry count of '{label}': {e}"))?;
+    let take = len.min(SUBSCRIPT_SCAN_CAP);
+    let entries = if take == 0 {
+        Vec::new()
+    } else {
+        conn.get_array_values(arr, 0, take)
+            .await
+            .map_err(|e| format!("Failed to read entries of '{label}': {e}"))?
+    };
+
+    let mut values = Vec::with_capacity(entries.len());
+    let mut keys = Vec::with_capacity(entries.len());
+    for e in &entries {
+        // An unreadable entry is skipped rather than failing the whole scan, matching how the deep
+        // renderer treats one.
+        if let Some((k, v)) = entry_pair(conn, e, tid).await {
+            keys.push(render_value(conn, &k, None, 100).await);
+            values.push(v);
+        }
+    }
+    Ok(Scan { values, keys, len, name })
 }
 
 /// `expr[a..b]` — a half-open slice.
@@ -2991,7 +3254,8 @@ async fn apply_range(
     to: i64,
     label: &str,
 ) -> Result<Resolved, String> {
-    let (values, len, name) = scan_elements(conn, thread_id, base, label).await?;
+    let Scan { values, len, name, .. } =
+        scan_elements(conn, thread_id, base, label, MapScan::Refuse).await?;
     if from < 0 {
         return Err(format!("Range start must not be negative in '{label}[{from}..{to}]'"));
     }
@@ -3009,6 +3273,7 @@ async fn apply_range(
     Ok(Resolved::Many {
         header: format!("{name}[{from}..{to}] → {} of {len}{note}", slice.len()),
         values: slice,
+        keys: Vec::new(),
     })
 }
 
@@ -3041,15 +3306,25 @@ async fn apply_filter(
     // means an element-independent right side is evaluated once instead of once per element.
     let pred = prepare_predicate(conn, thread_id, frame, predicate).await?;
 
-    let (values, len, name) = scan_elements(conn, thread_id, base, label).await?;
+    // A Map filters by its VALUES — `meters[?id.name == "x"]` reads naturally that way — and the
+    // matching keys come along so the result can say which entry each survivor was.
+    let Scan { values, keys, len, name } =
+        scan_elements(conn, thread_id, base, label, MapScan::Entries).await?;
     let scanned = i32::try_from(values.len()).unwrap_or(i32::MAX);
+    let is_map = !keys.is_empty();
 
     let mut kept = Vec::new();
+    let mut kept_keys = Vec::new();
     let mut errors = 0usize;
     let mut first_error = None;
-    for v in values {
+    for (i, v) in values.into_iter().enumerate() {
         match eval_predicate_on(conn, thread_id, &v, &pred).await {
-            Ok(true) => kept.push(v),
+            Ok(true) => {
+                if let Some(k) = keys.get(i) {
+                    kept_keys.push(k.clone());
+                }
+                kept.push(v);
+            }
             Ok(false) => {}
             Err(e) => {
                 errors += 1;
@@ -3073,9 +3348,11 @@ async fn apply_filter(
         (false, 0) => String::new(),
         (false, n) => format!(" ({n} element(s) errored)"),
     };
+    let unit = if is_map { "entr(ies)" } else { "matched" };
     Ok(Resolved::Many {
-        header: format!("{name}[?{predicate}] → {} of {scanned} matched{note}", kept.len()),
+        header: format!("{name}[?{predicate}] → {} of {scanned} {unit}{note}", kept.len()),
         values: kept,
+        keys: kept_keys,
     })
 }
 
@@ -3285,6 +3562,12 @@ enum Resolved {
         /// How the selection went, e.g. "3 of 20 matched" — worth reporting even when empty.
         header: String,
         values: Vec<jdwp_client::types::Value>,
+        /// Rendered keys, parallel to `values`, when the selection came from a `Map`. Empty otherwise.
+        ///
+        /// Filtering a map by its values is the useful operation (`meters[?id.name == "x"]`), but a
+        /// bare list of survivors throws away the thing you were looking for — which key each one was
+        /// under. Carrying the keys alongside lets the result render as `key → value`.
+        keys: Vec<String>,
     },
 }
 

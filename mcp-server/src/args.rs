@@ -167,6 +167,8 @@ pub struct EvaluateArgs {
     /// `lines[2..5]` (half-open slice) and `lines[?qty > 3]` (filter). In a filter the left side is
     /// resolved against **each element** — `lines[?status == "OPEN"]`, `lines[?getQty() == 2]` — while
     /// the right side may be a literal or an expression read from the frame (`lines[?qty > limit]`).
+    /// Filtering a `Map` tests its **values** and renders survivors as `key → value`, so you keep the
+    /// keys you were looking for; a `Map` can't be sliced (no positional order).
     /// A slice or filter selects several values, so nothing can be chained after it.
     pub expression: String,
     /// Thread ID (optional; defaults to the last thread that hit a breakpoint).
@@ -210,10 +212,11 @@ pub struct ListThreadsArgs {
 /// Arguments for `debug.set_value`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetValueArgs {
-    /// What to write. Either a local variable name (`counter`), a static field
-    /// (`ConfigDefaultUtils.dsInfra` or a fully-qualified `pkg.Class.field`), or an instance field
-    /// reached from a suspended frame (`this.status`, `reserva.total`). Accepts the legacy key
-    /// `name`.
+    /// What to write. A local variable name (`counter`), a static field
+    /// (`ConfigDefaultUtils.dsInfra` or a fully-qualified `pkg.Class.field`), an instance field
+    /// reached from a suspended frame (`this.status`, `reserva.total`), or **one element** of an array,
+    /// `List` or `Map` (`numbers[0]`, `tags[1]`, `counts["a"]`). A slice or filter target is refused —
+    /// it names several elements, so there is nothing single to write. Accepts the legacy key `name`.
     #[serde(alias = "name")]
     pub target: String,
     /// Literal: int, 123L, true/false, null, or "string". Coerced to the target's declared type.

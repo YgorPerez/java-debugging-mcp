@@ -156,6 +156,25 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   `int` for a reference parameter, which reads it as an oop and **SIGSEGVs the debuggee** (reproduced
   — hs_err + core dump). The fallback is now kind-checked, so a type-mismatched invoke is refused
   with an error instead of crashing the target.
+- **Subscript writes and `Map`-entry filtering (OBJ-4)** — the two gaps OBJ-2 left, both closed.
+  **Writing through a subscript**: `set_value {target:"numbers[0]"}` now works on an array (new
+  `ArrayReference.SetValues` primitive — no invocation, so no side effects), a `List` (`set(index, value)`)
+  and a `Map` (`put(key, value)`). `set` is looked up before `put`, which is unambiguous because a `List`
+  has no `put` and a `Map` no `set` — the same arity trick `apply_index` uses for `get`. Both collection
+  calls hand back the element they displaced, so the confirmation reports **old → new** without a second
+  read. An array write coerces the literal to the array's *component* type, because `SetValues` is
+  untagged and a wrong width would corrupt the element silently; a collection write boxes a primitive
+  into the wrapper the collection actually holds (the `coerce_args` path added for EVAL-3). A slice or
+  filter target is still refused — it names several elements, so there is nothing single to write.
+  **Filtering a `Map`**: `byId[?qty > 3]` tests each **value** (the natural reading, and what
+  `values()[?…]` already did) but keeps the keys, rendering survivors as `key → value` —
+  `Resolved::Many` carries a parallel list of rendered keys, so nothing else in the resolution chain
+  changed. Slicing a map is still refused, now naming the filter as the alternative.
+  Validated by `subscript_writes_and_map_entry_filters`: each write read back, **neighbouring array
+  elements proven untouched**, out-of-bounds and type-mismatched writes refused, slice/filter targets
+  refused, and a map filter's keys checked along with a `0 of 5` result and the slice refusal.
+  One expectation of mine was wrong first time round, the same way as during OBJ-2: `qty > 3` matches
+  three of the five lines, not two.
 - **Interface-typed parameters and autoboxing in overload resolution (EVAL-3)** — `arg_type` walked only
   the superclass chain, so a parameter typed as an interface the argument implements (`handle(Runnable)`)
   could never match precisely, and neither could a boxed primitive (`f(Integer)` given an `int`). Both
@@ -285,26 +304,6 @@ silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
 > TEST-1, OBJ-1, OBJ-2, DOC-1) plus all 18 appendix items. A review of that work found ten more items;
 > the three **defects in what shipped** (TRACE-2, OBJ-3, EVT-1) are now done and moved to Shipped, and
 > what remains below is follow-on work rather than anything broken.
-
-### OBJ-4 — Subscript writes and `Map`-entry filtering  · P2 · M
-
-**What to build**
-The two things OBJ-2 deliberately left out.
-- **Writing through a subscript**: `set_value {target:"list[0]"}` is refused today (it used to parse the
-  subscript and silently write the whole field). Supporting it means `List.set(i, v)` for collections and
-  an `ArrayReference.SetValues` primitive for arrays.
-- **Filtering a `Map`'s entries**: `map[?…]` errors, because `Resolved` has no entry-shaped variant.
-  `map.values()[?…]` works but loses the keys. Needs either an entry pair in `Resolved` or a documented
-  key-preserving rendering.
-
-**Acceptance criteria**
-- [ ] `set_value` writes an array element and a `List` element, and still refuses a slice/filter target
-- [ ] `ArrayReference.SetValues` in `jdwp-client`
-- [ ] `map[?predicate]` filters entries and renders survivors as `key → value`
-- [ ] Probe coverage for each, including an out-of-bounds write and a type-mismatched write
-
-**Blocked by**
-None.
 
 ### TEST-3 — Verify against a real Spring Boot app  · P2 · S
 

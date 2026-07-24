@@ -25,14 +25,15 @@ natural language.
   objects, arrays, and **`List`/`Set`/`Map`/`Optional` contents** into a field tree — bounded by
   `max_depth`/`max_children` and a node budget, with **cycle detection** and unboxed wrappers
 - **Collection Subscripts**: `lines[0]`, `counts["key"]`, `lines[2..5]` (slice) and
-  **`lines[?qty > 3]`** (filter, with the left side resolved against each element)
+  **`lines[?qty > 3]`** (filter, with the left side resolved against each element). Filtering a `Map`
+  keeps the keys (`key → value`), and a single element can be **written** as well as read
+- **Set Values**: a local, a static or instance field, or one element of an array / `List` / `Map`
 - **Field Watchpoints**: break when a field is read or written — `debug.set_watchpoint` reports the
   mutating location with the **old → new** value, for "who changes this behind my back?"
 - **Non-suspending trace mode**: `trace:true` on a breakpoint, an **exception breakpoint** or a
   **watchpoint** snapshots the hit and resumes the thread immediately instead of freezing the VM —
   the only safe way to use any of them on a shared instance. Read the snapshots with
   `debug.get_traces`
-- **Set Values**: write a local variable in a suspended frame
 - **Thread Management**: tools default to the last thread that hit a breakpoint
 - **Structured Events**: `get_last_event` emits a machine-readable `[event]` line (thread, class.method:line),
   from a bounded buffer — a burst of hits isn't lost, and the reply says how many are still pending
@@ -103,7 +104,7 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | `debug.step_out` | Step out of the current method |
 | `debug.get_stack` | Stack frames, compact `#i class.method:line` with typed locals indented |
 | `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods, object arguments, `[i]`/`["k"]`/`[a..b]`/`[?pred]` subscripts, and `expand_objects` for a deep field tree |
-| `debug.set_value` | Write a local variable, a static field (`Class.field`), or an instance field (`this.field`) |
+| `debug.set_value` | Write a local variable, a static field (`Class.field`), an instance field (`this.field`), or one element (`xs[0]`, `counts["k"]`) |
 | `debug.set_watchpoint` | Break when a field is written (or read) — reports the mutating location + old → new value; `trace:true` collects hits without suspending |
 | `debug.force_return` | Force the current method to return a given value, skipping the rest of its body |
 | `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line, exception type, watched field's old → new) + `[suspended]`; events are buffered, so `limit` reads a backlog and `drain` discards it |
