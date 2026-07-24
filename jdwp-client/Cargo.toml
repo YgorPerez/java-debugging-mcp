@@ -18,7 +18,6 @@ bytes.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
-reqwest = "0.11"
 
 [[example]]
 name = "test_connection"
@@ -47,3 +46,23 @@ path = "../examples/test_manual_stack.rs"
 [[example]]
 name = "test_string_values"
 path = "../examples/test_string_values.rs"
+
+[[example]]
+name = "test_static_field"
+path = "../examples/test_static_field.rs"
+
+[[example]]
+name = "test_deferred_bp"
+path = "../examples/test_deferred_bp.rs"
+
+[[example]]
+name = "test_exception_bp"
+path = "../examples/test_exception_bp.rs"
+
+[[example]]
+name = "test_set_field"
+path = "../examples/test_set_field.rs"
+
+[[example]]
+name = "test_trace_bp"
+path = "../examples/test_trace_bp.rs"

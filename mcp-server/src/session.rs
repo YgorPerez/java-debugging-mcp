@@ -3,7 +3,7 @@
 // Manages JDWP connection state, breakpoints, and thread tracking
 
 use jdwp_client::{JdwpConnection, EventSet};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -24,6 +24,74 @@ pub struct DebugSession {
     /// When the VM last suspended on an event; cleared on resume. Drives the watchdog.
     pub suspended_since: Option<std::time::Instant>,
     pub watchdog_task: Option<JoinHandle<()>>,
+    /// Breakpoints requested on classes not yet loaded. Each holds a CLASS_PREPARE request that
+    /// fires when the class loads; the event pump then arms the real breakpoint. See handlers.rs.
+    pub pending_breakpoints: Vec<PendingBreakpoint>,
+    /// Active exception breakpoints (EXCEPTION event requests), keyed by their `exc_` id.
+    pub exception_requests: HashMap<String, ExceptionRequestInfo>,
+    /// Ring buffer of trace/logpoint snapshots (see TraceRecord). Bounded by MAX_TRACES.
+    pub traces: VecDeque<TraceRecord>,
+    /// Monotonic sequence for trace records (survives ring-buffer eviction).
+    pub trace_seq: u64,
+}
+
+/// Max trace snapshots retained per session; oldest are evicted (documented cap for TRACE-1).
+pub const MAX_TRACES: usize = 500;
+
+/// One captured hit of a trace/logpoint breakpoint: where it fired, on which thread, the in-scope
+/// locals/args at that point, and an optional evaluated expression. Recorded without leaving the
+/// thread suspended.
+#[derive(Debug, Clone)]
+pub struct TraceRecord {
+    pub seq: u64,
+    pub bp_id: String,
+    pub thread: u64,
+    pub class: String,
+    pub method: String,
+    pub line: Option<i32>,
+    /// (name, rendered value) for each in-scope local/argument at the hit.
+    pub args: Vec<(String, String)>,
+    /// (expression, rendered result) when the logpoint had a trace expression.
+    pub expr: Option<(String, String)>,
+}
+
+/// An active exception breakpoint: an EXCEPTION event request that fires when a matching
+/// exception is thrown. Tracked so it shows in list_breakpoints and is cleared by
+/// clear_breakpoint / panic, like a normal breakpoint.
+#[derive(Debug, Clone)]
+pub struct ExceptionRequestInfo {
+    /// The `exc_` id reported to the caller.
+    pub id: String,
+    /// The JDWP EXCEPTION event-request id.
+    pub request_id: i32,
+    /// Dotted class pattern the caller gave, or "*" for all exceptions.
+    pub class_pattern: String,
+    pub caught: bool,
+    pub uncaught: bool,
+}
+
+/// A breakpoint waiting for its class to load. The CLASS_PREPARE request suspends the preparing
+/// thread (EventThread policy) so the real breakpoint can be armed before any of the class's code
+/// runs; the pump then resumes that one thread.
+#[derive(Debug, Clone)]
+pub struct PendingBreakpoint {
+    /// The bp_ id reserved for this breakpoint (reported now, armed later).
+    pub bp_id: String,
+    /// The CLASS_PREPARE event-request id (cleared once armed).
+    pub class_prepare_request_id: i32,
+    /// Dotted class pattern (as the user gave it) — for messages.
+    pub class_pattern: String,
+    /// JNI signature ("Lpkg/Cls;") to match against the ClassPrepare event signature.
+    pub signature: String,
+    pub line: Option<i32>,
+    pub method: Option<String>,
+    pub hit_count: Option<i32>,
+    pub thread_filter: Option<u64>,
+    pub condition: Option<String>,
+    /// Arm as a non-suspending trace/logpoint (EventThread suspend, snapshot, resume).
+    pub trace: bool,
+    /// Optional expression to evaluate and record on each trace hit.
+    pub trace_expr: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +105,10 @@ pub struct BreakpointInfo {
     pub hit_count: u32,
     /// Optional server-side condition: on hit, evaluate it and auto-resume if it is not true.
     pub condition: Option<String>,
+    /// Non-suspending trace/logpoint: on hit, snapshot into the ring buffer and resume the thread.
+    pub trace: bool,
+    /// Optional expression evaluated and recorded on each trace hit.
+    pub trace_expr: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +145,10 @@ impl SessionManager {
             pending_step: None,
             suspended_since: None,
             watchdog_task: None,
+            pending_breakpoints: Vec::new(),
+            exception_requests: HashMap::new(),
+            traces: VecDeque::new(),
+            trace_seq: 0,
         };
 
         let mut sessions = self.sessions.lock().await;

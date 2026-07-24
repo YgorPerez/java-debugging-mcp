@@ -91,6 +91,14 @@ impl JdwpConnection {
 
 pub(crate) fn write_tagged_value<B: BufMut>(buf: &mut B, v: &Value) {
     buf.put_u8(v.tag);
+    write_untagged_value(buf, v);
+}
+
+/// Write a value's raw bytes with NO leading type tag. JDWP `SetValues` commands
+/// (ClassType.SetValues for statics, ObjectReference.SetValues for instance fields) take
+/// "untagged-value"s whose type is inferred from the field being written, so the value must
+/// already be coerced to the field's declared type.
+pub(crate) fn write_untagged_value<B: BufMut>(buf: &mut B, v: &Value) {
     match &v.data {
         ValueData::Byte(x) => buf.put_i8(*x),
         ValueData::Char(x) => buf.put_u16(*x),

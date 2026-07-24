@@ -137,4 +137,41 @@ impl JdwpConnection {
 
         Ok(())
     }
+
+    /// Resume a single thread (ThreadReference.Resume) — decrements just that thread's suspend
+    /// count, leaving other suspended threads alone. Used after arming a deferred breakpoint on the
+    /// thread that a ClassPrepare event suspended, so class init proceeds without disturbing any
+    /// thread parked at a real breakpoint.
+    pub async fn resume_thread(&mut self, thread_id: ThreadId) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::RESUME);
+        packet.data.put_u64(thread_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        Ok(())
+    }
+
+    /// Force the topmost frame of a suspended thread to return `value` immediately
+    /// (ThreadReference.ForceEarlyReturn). The thread must be suspended and the value's tag must be
+    /// assignable to the method's declared return type — pass a `Void` value for a `void` method.
+    /// Lets a caller short-circuit a method (e.g. make a rejecting `salvar` return `true`) without
+    /// editing and redeploying code. Requires the JVM's `canForceEarlyReturn` capability.
+    pub async fn force_early_return(
+        &mut self,
+        thread_id: ThreadId,
+        value: &crate::types::Value,
+    ) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet =
+            CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::FORCE_EARLY_RETURN);
+        packet.data.put_u64(thread_id);
+        crate::eval::write_tagged_value(&mut packet.data, value);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        Ok(())
+    }
 }

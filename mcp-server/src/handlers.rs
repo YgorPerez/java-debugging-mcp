@@ -135,6 +135,9 @@ impl RequestHandler {
             "debug.get_last_event" => self.handle_get_last_event(call_params.arguments).await,
             "debug.panic" => self.handle_panic(call_params.arguments).await,
             "debug.set_value" => self.handle_set_value(call_params.arguments).await,
+            "debug.force_return" => self.handle_force_return(call_params.arguments).await,
+            "debug.set_exception_breakpoint" => self.handle_set_exception_breakpoint(call_params.arguments).await,
+            "debug.get_traces" => self.handle_get_traces(call_params.arguments).await,
             _ => Err(format!("Unknown tool: {}", call_params.name)),
         };
 
@@ -188,6 +191,93 @@ impl RequestHandler {
                             if let Some(event_set) = event_opt {
                                 if let Some(session_guard) = session_manager.get_session_by_id(&listener_sid).await {
                                     let mut session = session_guard.lock().await;
+
+                                    // Deferred-breakpoint arming: a ClassPrepare event means a
+                                    // watched class just loaded. Arm any pending breakpoints for it
+                                    // (before its code runs — the preparing thread is suspended by
+                                    // the EventThread policy), then resume that one thread. This
+                                    // event is internal plumbing, so never surface it as last_event.
+                                    if let Some((cp_thread, cp_ref, cp_sig)) = event_set.events.iter().find_map(|e| match &e.details {
+                                        jdwp_client::events::EventKind::ClassPrepare { thread, ref_type, signature, .. } =>
+                                            Some((*thread, *ref_type, signature.clone())),
+                                        _ => None,
+                                    }) {
+                                        let pending: Vec<crate::session::PendingBreakpoint> = session
+                                            .pending_breakpoints.iter().filter(|p| p.signature == cp_sig).cloned().collect();
+                                        for pend in pending {
+                                            match resolve_bp_location(&mut session.connection, cp_ref, pend.line, pend.method.as_deref()).await {
+                                                Ok((method, index, line)) => {
+                                                    let sp = if pend.trace {
+                                                        jdwp_client::SuspendPolicy::EventThread
+                                                    } else {
+                                                        jdwp_client::SuspendPolicy::All
+                                                    };
+                                                    match session.connection.set_breakpoint_ex(
+                                                        cp_ref, method.method_id, index,
+                                                        sp, pend.hit_count, pend.thread_filter,
+                                                    ).await {
+                                                        Ok(req_id) => {
+                                                            session.breakpoints.insert(pend.bp_id.clone(), crate::session::BreakpointInfo {
+                                                                id: pend.bp_id.clone(),
+                                                                request_id: req_id,
+                                                                class_pattern: pend.class_pattern.clone(),
+                                                                line: line as u32,
+                                                                method: Some(method.name.clone()),
+                                                                enabled: true,
+                                                                hit_count: 0,
+                                                                condition: pend.condition.clone(),
+                                                                trace: pend.trace,
+                                                                trace_expr: pend.trace_expr.clone(),
+                                                            });
+                                                            let _ = session.connection.clear_class_prepare(pend.class_prepare_request_id).await;
+                                                            session.pending_breakpoints.retain(|p| p.bp_id != pend.bp_id);
+                                                            info!("Armed deferred breakpoint {} on {} (line {})", pend.bp_id, pend.class_pattern, line);
+                                                        }
+                                                        Err(e) => warn!("Failed to arm deferred breakpoint {}: {}", pend.bp_id, e),
+                                                    }
+                                                }
+                                                Err(e) => warn!("Deferred breakpoint {}: class {} loaded but location unresolved: {}", pend.bp_id, pend.class_pattern, e),
+                                            }
+                                        }
+                                        let _ = session.connection.resume_thread(cp_thread).await;
+                                        continue;
+                                    }
+
+                                    // Trace / logpoint: a breakpoint hit whose bp is marked `trace`.
+                                    // It suspended only the hit thread (EventThread policy), so we
+                                    // snapshot its frame into the ring buffer and resume THAT thread
+                                    // immediately — never surfacing it as last_event and never
+                                    // leaving anything suspended.
+                                    if let (Some((thread, loc)), Some(req_id)) = (
+                                        event_set.events.first().and_then(|e| event_location(&e.details)),
+                                        event_set.events.first().map(|e| e.request_id),
+                                    ) {
+                                        let trace_bp = session.breakpoints.values()
+                                            .find(|b| b.request_id == req_id && b.trace).cloned();
+                                        if let Some(bp) = trace_bp {
+                                            // Honor a condition, if any: skip recording when it isn't true.
+                                            let record = if let Some(cond) = &bp.condition {
+                                                if evaluate_condition_on_thread(&mut session.connection, thread, cond).await {
+                                                    Some(capture_trace(&mut session.connection, &bp, thread, &loc).await)
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                Some(capture_trace(&mut session.connection, &bp, thread, &loc).await)
+                                            };
+                                            if let Some(mut rec) = record {
+                                                session.trace_seq += 1;
+                                                rec.seq = session.trace_seq;
+                                                if session.traces.len() >= crate::session::MAX_TRACES {
+                                                    session.traces.pop_front();
+                                                }
+                                                session.traces.push_back(rec);
+                                            }
+                                            let _ = session.connection.resume_thread(thread).await;
+                                            continue;
+                                        }
+                                    }
+
                                     // Conditional breakpoint: evaluate the condition on the hit thread
                                     // and auto-resume (skip reporting) when it is not true.
                                     let mut skip = false;
@@ -281,6 +371,15 @@ impl RequestHandler {
         let hit_count = a.hit_count;
         let thread_filter = crate::args::parse_thread_id(&a.thread_id);
         let condition = a.condition.clone();
+        let trace = a.trace;
+        let trace_expr = a.trace_expr.clone();
+        // A logpoint suspends only the hit thread (so we can read its args), then resumes it in the
+        // event pump — nothing is left frozen. A normal breakpoint suspends all threads.
+        let suspend_policy = if trace {
+            jdwp_client::SuspendPolicy::EventThread
+        } else {
+            jdwp_client::SuspendPolicy::All
+        };
 
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
@@ -296,52 +395,71 @@ impl RequestHandler {
         let classes = session.connection.classes_by_signature(&signature).await
             .map_err(|e| format!("Failed to find class: {}", e))?;
         if classes.is_empty() {
-            return Err(format!("Class not found: {}", class_pattern));
+            // Class not loaded yet — defer. Register a CLASS_PREPARE watch (EventThread suspend, so
+            // we can arm the real breakpoint before any of the class's code runs) and stash the
+            // spec; the event pump arms it when the class loads.
+            let cp_req = session.connection.set_class_prepare(class_pattern, jdwp_client::SuspendPolicy::EventThread).await
+                .map_err(|e| format!("Failed to register class-prepare watch: {}", e))?;
+
+            // Close the race where the class loaded between the check above and registering the
+            // watch (its ClassPrepare would have fired before the watch existed): re-check now that
+            // the watch is in place. If it's loaded, arm immediately and drop the watch.
+            let recheck = session.connection.classes_by_signature(&signature).await.unwrap_or_default();
+            if let Some(c) = recheck.first() {
+                let ctid = c.type_id;
+                let _ = session.connection.clear_class_prepare(cp_req).await;
+                let (method, index, line) = resolve_bp_location(&mut session.connection, ctid, line_opt, method_hint)
+                    .await.map_err(|e| format!("{} in {}", e, class_pattern))?;
+                let request_id = session.connection.set_breakpoint_ex(
+                    ctid, method.method_id, index, suspend_policy, hit_count, thread_filter,
+                ).await.map_err(|e| format!("Failed to set breakpoint: {}", e))?;
+                let bp_id = format!("bp_{}", request_id);
+                session.breakpoints.insert(bp_id.clone(), crate::session::BreakpointInfo {
+                    id: bp_id.clone(), request_id, class_pattern: class_pattern.to_string(),
+                    line: line as u32, method: Some(method.name.clone()), enabled: true,
+                    hit_count: 0, condition: condition.clone(), trace, trace_expr: trace_expr.clone(),
+                });
+                return Ok(format!(
+                    "✅ {} set at {}:{} (class had just loaded)\n   Method: {}\n   Breakpoint ID: {}",
+                    if trace { "Trace breakpoint" } else { "Breakpoint" }, class_pattern, line, method.name, bp_id
+                ));
+            }
+
+            let bp_id = format!("bp_{}", cp_req);
+            session.pending_breakpoints.push(crate::session::PendingBreakpoint {
+                bp_id: bp_id.clone(),
+                class_prepare_request_id: cp_req,
+                class_pattern: class_pattern.to_string(),
+                signature: signature.clone(),
+                line: line_opt,
+                method: method_hint.map(str::to_string),
+                hit_count,
+                thread_filter,
+                condition: condition.clone(),
+                trace,
+                trace_expr: trace_expr.clone(),
+            });
+            let where_ = match (line_opt, method_hint) {
+                (Some(l), _) => format!("line {}", l),
+                (None, Some(m)) => format!("method {}", m),
+                _ => String::new(),
+            };
+            return Ok(format!(
+                "⏳ Deferred breakpoint for {} ({}) — {} is not loaded yet. It will arm automatically when the class loads (trigger the request that loads it), then hit normally.\n   Breakpoint ID: {}",
+                class_pattern, where_, class_pattern, bp_id
+            ));
         }
         let class_type_id = classes[0].type_id;
 
-        let methods = session.connection.get_methods(class_type_id).await
-            .map_err(|e| format!("Failed to get methods: {}", e))?;
-
-        // Resolve (method, bytecode index, line): by explicit line, by method name
-        // (first executable line), or a named method that also contains the line.
-        let mut chosen: Option<(jdwp_client::reftype::MethodInfo, u64, i32)> = None;
-        for method in &methods {
-            if let Some(hint) = method_hint {
-                if method.name != hint {
-                    continue;
-                }
-            }
-            let line_table = match session.connection.get_line_table(class_type_id, method.method_id).await {
-                Ok(lt) => lt,
-                Err(_) => continue,
-            };
-            if let Some(want) = line_opt {
-                if let Some(e) = line_table.lines.iter().find(|e| e.line_number == want) {
-                    chosen = Some((method.clone(), e.line_code_index, want));
-                    break;
-                }
-                if method_hint.is_some() {
-                    if let Some(e) = line_table.lines.iter().min_by_key(|e| e.line_code_index) {
-                        chosen = Some((method.clone(), e.line_code_index, e.line_number));
-                        break;
-                    }
-                }
-            } else if let Some(e) = line_table.lines.iter().min_by_key(|e| e.line_code_index) {
-                chosen = Some((method.clone(), e.line_code_index, e.line_number));
-                break;
-            }
-        }
-        let (method, index, line) = chosen.ok_or_else(|| match line_opt {
-            Some(l) => format!("No method contains line {} in {}", l, class_pattern),
-            None => format!("Method '{}' not found in {}", method_hint.unwrap_or(""), class_pattern),
-        })?;
+        let (method, index, line) = resolve_bp_location(&mut session.connection, class_type_id, line_opt, method_hint)
+            .await
+            .map_err(|e| format!("{} in {}", e, class_pattern))?;
 
         let request_id = session.connection.set_breakpoint_ex(
             class_type_id,
             method.method_id,
             index,
-            jdwp_client::SuspendPolicy::All,
+            suspend_policy,
             hit_count,
             thread_filter,
         ).await.map_err(|e| format!("Failed to set breakpoint: {}", e))?;
@@ -356,9 +474,17 @@ impl RequestHandler {
             enabled: true,
             hit_count: 0,
             condition: condition.clone(),
+            trace,
+            trace_expr: trace_expr.clone(),
         });
 
         let mut extra = String::new();
+        if trace {
+            extra.push_str("\n   Mode: trace (non-suspending) — read hits with debug.get_traces");
+            if let Some(e) = &trace_expr {
+                extra.push_str(&format!("\n   Trace expr: {}", e));
+            }
+        }
         if let Some(c) = hit_count {
             extra.push_str(&format!("\n   Stops on hit #{}", c));
         }
@@ -369,7 +495,8 @@ impl RequestHandler {
             extra.push_str(&format!("\n   Condition: {}", c));
         }
         Ok(format!(
-            "✅ Breakpoint set at {}:{}\n   Method: {}\n   Breakpoint ID: {}\n   JDWP Request ID: {}{}",
+            "✅ {} set at {}:{}\n   Method: {}\n   Breakpoint ID: {}\n   JDWP Request ID: {}{}",
+            if trace { "Trace breakpoint" } else { "Breakpoint" },
             class_pattern, line, method.name, bp_id, request_id, extra
         ))
     }
@@ -380,26 +507,54 @@ impl RequestHandler {
 
         let session = session_guard.lock().await;
 
-        if session.breakpoints.is_empty() {
+        if session.breakpoints.is_empty() && session.pending_breakpoints.is_empty()
+            && session.exception_requests.is_empty()
+        {
             return Ok("No breakpoints set".to_string());
         }
 
-        let mut output = format!("📍 {} breakpoint(s):\n\n", session.breakpoints.len());
+        let mut output = format!(
+            "📍 {} breakpoint(s), {} deferred, {} exception:\n\n",
+            session.breakpoints.len(), session.pending_breakpoints.len(), session.exception_requests.len()
+        );
 
         for (_, bp) in session.breakpoints.iter() {
             output.push_str(&format!(
-                "  {} [{}] {}:{}\n",
+                "  {} [{}] {}:{}{}\n",
                 if bp.enabled { "✓" } else { "✗" },
                 bp.id,
                 bp.class_pattern,
-                bp.line
+                bp.line,
+                if bp.trace { " (trace)" } else { "" },
             ));
             if let Some(method) = &bp.method {
                 output.push_str(&format!("     Method: {}\n", method));
             }
+            if let Some(e) = &bp.trace_expr {
+                output.push_str(&format!("     Trace expr: {}\n", e));
+            }
             if bp.hit_count > 0 {
                 output.push_str(&format!("     Hits: {}\n", bp.hit_count));
             }
+        }
+
+        for pb in session.pending_breakpoints.iter() {
+            let where_ = match (pb.line, &pb.method) {
+                (Some(l), _) => format!("line {}", l),
+                (None, Some(m)) => format!("method {}", m),
+                _ => "?".to_string(),
+            };
+            output.push_str(&format!("  ⏳ [{}] {} ({}) — waiting for class load\n", pb.bp_id, pb.class_pattern, where_));
+        }
+
+        for er in session.exception_requests.values() {
+            let which = match (er.caught, er.uncaught) {
+                (true, true) => "caught+uncaught",
+                (true, false) => "caught",
+                (false, true) => "uncaught",
+                (false, false) => "none",
+            };
+            output.push_str(&format!("  ⚡ [{}] exception {} ({})\n", er.id, er.class_pattern, which));
         }
 
         Ok(output)
@@ -413,6 +568,20 @@ impl RequestHandler {
             .ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
+
+        // An exception breakpoint lives in exception_requests as an EXCEPTION event request.
+        if let Some(er) = session.exception_requests.remove(bp_id) {
+            let _ = session.connection.clear_exception_request(er.request_id).await;
+            return Ok(format!("✅ Exception breakpoint cleared: {} ({})", bp_id, er.class_pattern));
+        }
+
+        // A deferred (not-yet-armed) breakpoint lives in pending_breakpoints with only a
+        // CLASS_PREPARE watch — clear that watch instead of a real breakpoint request.
+        if let Some(pos) = session.pending_breakpoints.iter().position(|p| p.bp_id == bp_id) {
+            let pb = session.pending_breakpoints.remove(pos);
+            let _ = session.connection.clear_class_prepare(pb.class_prepare_request_id).await;
+            return Ok(format!("✅ Deferred breakpoint cleared: {} ({})", bp_id, pb.class_pattern));
+        }
 
         // Find the breakpoint
         let bp_info = session.breakpoints.get(bp_id)
@@ -502,13 +671,27 @@ impl RequestHandler {
             let _ = session.connection.clear_step(req).await;
         }
         let n = session.breakpoints.len();
+        let np = session.pending_breakpoints.len();
+        let ne = session.exception_requests.len();
         let _ = session.connection.clear_all_breakpoints().await;
         session.breakpoints.clear();
+        // Also drop deferred breakpoints' CLASS_PREPARE watches.
+        let pend: Vec<i32> = session.pending_breakpoints.drain(..).map(|p| p.class_prepare_request_id).collect();
+        for req in pend {
+            let _ = session.connection.clear_class_prepare(req).await;
+        }
+        // ClearAllBreakpoints only removes BREAKPOINT requests — clear exception requests too.
+        let excs: Vec<i32> = session.exception_requests.drain().map(|(_, e)| e.request_id).collect();
+        for req in excs {
+            let _ = session.connection.clear_exception_request(req).await;
+        }
         session.suspended_since = None;
         session.connection.resume_all().await
             .map_err(|e| format!("Failed to resume: {}", e))?;
 
-        Ok(format!("🧯 Panic: cleared {} breakpoint(s) and resumed all threads.", n))
+        Ok(format!("🧯 Panic: cleared {} breakpoint(s){}{} and resumed all threads.", n,
+            if np > 0 { format!(" + {} deferred", np) } else { String::new() },
+            if ne > 0 { format!(" + {} exception", ne) } else { String::new() }))
     }
 
     async fn handle_get_stack(&self, args: serde_json::Value) -> Result<String, String> {
@@ -644,22 +827,26 @@ impl RequestHandler {
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
-        let thread_id = crate::args::parse_thread_id(&a.thread_id)
-            .or(session.last_thread)
-            .ok_or_else(|| "No thread to evaluate in. Pass thread_id, or hit a breakpoint first.".to_string())?;
+        // A thread/frame is only needed to read locals or invoke methods. A pure static-field read
+        // (Class.FIELD) works on a running VM, so a missing/un-suspended thread is not fatal here —
+        // resolve_expression falls back to the static path when there's no frame.
+        let thread_id = crate::args::parse_thread_id(&a.thread_id).or(session.last_thread);
         let conn = &mut session.connection;
 
-        let frames = conn.get_frames(thread_id, 0, -1).await
-            .map_err(|e| format!("Failed to get frames (is the thread suspended at a breakpoint?): {}", e))?;
-        if frames.is_empty() {
-            return Err("Thread has no stack frames (not suspended at a breakpoint?)".to_string());
-        }
-        let frame = frames.get(frame_index)
-            .ok_or_else(|| format!("frame_index {} out of range ({} frames)", frame_index, frames.len()))?
-            .clone();
+        let frame = match thread_id {
+            Some(tid) => match conn.get_frames(tid, 0, -1).await {
+                Ok(frames) if !frames.is_empty() => frames.get(frame_index).cloned().or_else(|| {
+                    // Out-of-range index: fall back to the top frame rather than erroring, so a
+                    // static read still works even if the requested frame doesn't exist.
+                    frames.first().cloned()
+                }),
+                _ => None,
+            },
+            None => None,
+        };
 
-        let value = resolve_expression(conn, thread_id, &frame, expression).await?;
-        let rendered = render_value(conn, &value, Some(thread_id), max_len).await;
+        let value = resolve_expression(conn, thread_id, frame.as_ref(), expression).await?;
+        let rendered = render_value(conn, &value, thread_id, max_len).await;
         Ok(format!("{} = {}", expression.trim(), rendered))
     }
 
@@ -790,6 +977,20 @@ impl RequestHandler {
                 obj.insert("class".to_string(), json!(cls));
                 obj.insert("method".to_string(), json!(method));
                 obj.insert("line".to_string(), json!(line));
+
+                // For an exception hit, add the exception type, whether it is caught, and where.
+                if let jdwp_client::events::EventKind::Exception { exception, catch_location, .. } = &ev.details {
+                    let exc_type = match session.connection.get_object_reference_type(*exception).await {
+                        Ok(t) => decode_signature(&session.connection.get_signature(t).await.unwrap_or_default()),
+                        Err(_) => "unknown".to_string(),
+                    };
+                    obj.insert("exception".to_string(), json!(exc_type));
+                    obj.insert("caught".to_string(), json!(catch_location.is_some()));
+                    if let Some(cl) = catch_location {
+                        let (ccls, cmethod, cline) = describe_location(&mut session.connection, cl).await;
+                        obj.insert("caught_at".to_string(), json!(format!("{}.{}:{}", ccls, cmethod, cline.unwrap_or(-1))));
+                    }
+                }
             } else {
                 match &ev.details {
                     jdwp_client::events::EventKind::VMStart { thread }
@@ -812,9 +1013,113 @@ impl RequestHandler {
 
     async fn handle_set_value(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::SetValueArgs = crate::args::parse(&args)?;
-        let name = a.name.as_str();
+        let target = a.target.trim().to_string();
         let value_str = a.value.as_str();
         let frame_index = a.frame_index;
+
+        let session_guard = self.resolve_session(&args).await
+            .ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+        let thread_opt = crate::args::parse_thread_id(&a.thread_id).or(session.last_thread);
+        let conn = &mut session.connection;
+
+        let segs = parse_expr(&target)?;
+
+        // Single bare identifier → local variable in a suspended frame (the original behavior).
+        if segs.len() == 1 {
+            if segs[0].args.is_some() {
+                return Err("Cannot assign to a method call".to_string());
+            }
+            let name = &segs[0].name;
+            let thread_id = thread_opt
+                .ok_or_else(|| "No thread. Pass thread_id, or hit a breakpoint first.".to_string())?;
+            let frames = conn.get_frames(thread_id, 0, -1).await
+                .map_err(|e| format!("Failed to get frames: {}", e))?;
+            let frame = frames.get(frame_index).cloned()
+                .ok_or_else(|| format!("frame_index {} out of range", frame_index))?;
+            let vars = conn.get_variable_table(frame.location.class_id, frame.location.method_id).await
+                .map_err(|e| format!("Failed to read variable table: {}", e))?;
+            let idx = frame.location.index;
+            let var = vars.iter()
+                .find(|v| &v.name == name && idx >= v.code_index && idx < v.code_index + v.length as u64)
+                .or_else(|| vars.iter().find(|v| &v.name == name))
+                .ok_or_else(|| format!("Unknown local variable '{}' (for a static/instance field use Class.field or obj.field)", name))?;
+            let sig_byte = *var.signature.as_bytes().first().ok_or_else(|| "Bad signature".to_string())?;
+            let value = literal_to_value(conn, value_str, sig_byte).await?;
+            if !tag_compatible(sig_byte, value.tag) {
+                return Err(type_mismatch_err(name, &var.signature, &value));
+            }
+            conn.set_frame_value(thread_id, frame.frame_id, var.slot as i32, &value).await
+                .map_err(|e| format!("Failed to set value: {}", e))?;
+            return Ok(format!("✅ Set local {} = {}", name, value_str));
+        }
+
+        // Multi-segment target: the last segment is the field; the prefix names the container.
+        let field_seg = segs.last().unwrap();
+        if field_seg.args.is_some() {
+            return Err("The last segment must be a field, not a method call".to_string());
+        }
+        let field_name = field_seg.name.clone();
+        let raws = split_segments(&target)?;
+        let container_expr = raws[..raws.len() - 1].join(".");
+
+        // Instance-field attempt: resolve the container to an object using a suspended frame.
+        let mut instance_err: Option<String> = None;
+        if let Some(thread_id) = thread_opt {
+            let frame = conn.get_frames(thread_id, 0, -1).await.ok().and_then(|f| f.get(frame_index).cloned());
+            match resolve_expression(conn, Some(thread_id), frame.as_ref(), &container_expr).await {
+                Ok(v) => match v.data {
+                    jdwp_client::types::ValueData::Object(0) => {
+                        return Err(format!("Cannot set '.{}' — '{}' is null", field_name, container_expr))
+                    }
+                    jdwp_client::types::ValueData::Object(obj_id) => {
+                        let type_id = conn.get_object_reference_type(obj_id).await
+                            .map_err(|e| format!("Failed to resolve object type: {}", e))?;
+                        let f = find_field_info(conn, type_id, &field_name, Some(false)).await?
+                            .ok_or_else(|| format!("No instance field '{}' on the resolved object", field_name))?;
+                        let sig_byte = *f.signature.as_bytes().first().ok_or_else(|| "Bad field signature".to_string())?;
+                        let value = literal_to_value(conn, value_str, sig_byte).await?;
+                        if !tag_compatible(sig_byte, value.tag) {
+                            return Err(type_mismatch_err(&field_name, &f.signature, &value));
+                        }
+                        conn.set_object_values(obj_id, vec![(f.field_id, value)]).await
+                            .map_err(|e| format!("Failed to set instance field: {}", e))?;
+                        return Ok(format!("✅ Set instance field {}.{} = {}", container_expr, field_name, value_str));
+                    }
+                    _ => instance_err = Some(format!("'{}' is a primitive, not an object", container_expr)),
+                },
+                Err(e) => instance_err = Some(e),
+            }
+        }
+
+        // Static-field attempt: treat the container as a dotted class name.
+        if let Some(class_id) = resolve_class_by_dotted(conn, &container_expr).await? {
+            let f = find_field_info(conn, class_id, &field_name, Some(true)).await?
+                .ok_or_else(|| format!("class '{}' has no static field '{}'", container_expr, field_name))?;
+            let sig_byte = *f.signature.as_bytes().first().ok_or_else(|| "Bad field signature".to_string())?;
+            let value = literal_to_value(conn, value_str, sig_byte).await?;
+            if !tag_compatible(sig_byte, value.tag) {
+                return Err(type_mismatch_err(&field_name, &f.signature, &value));
+            }
+            conn.set_reference_values(class_id, vec![(f.field_id, value)]).await
+                .map_err(|e| format!("Failed to set static field: {}", e))?;
+            return Ok(format!("✅ Set static field {}.{} = {}", container_expr, field_name, value_str));
+        }
+
+        Err(match instance_err {
+            Some(e) => format!(
+                "Could not write '{}': '{}' didn't resolve to an object ({}) and isn't a loaded class.",
+                target, container_expr, e
+            ),
+            None => format!(
+                "Could not write '{}': '{}' is not a loaded class, and there's no suspended thread to resolve it as an object.",
+                target, container_expr
+            ),
+        })
+    }
+
+    async fn handle_force_return(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::ForceReturnArgs = crate::args::parse(&args)?;
 
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
@@ -824,23 +1129,137 @@ impl RequestHandler {
         let conn = &mut session.connection;
 
         let frames = conn.get_frames(thread_id, 0, -1).await
-            .map_err(|e| format!("Failed to get frames: {}", e))?;
-        let frame = frames.get(frame_index).cloned()
-            .ok_or_else(|| format!("frame_index {} out of range", frame_index))?;
+            .map_err(|e| format!("Failed to get frames (is the thread suspended?): {}", e))?;
+        let frame = frames.first().cloned()
+            .ok_or_else(|| "Thread has no frames (not suspended?)".to_string())?;
 
-        let vars = conn.get_variable_table(frame.location.class_id, frame.location.method_id).await
-            .map_err(|e| format!("Failed to read variable table: {}", e))?;
-        let idx = frame.location.index;
-        let var = vars.iter()
-            .find(|v| v.name == name && idx >= v.code_index && idx < v.code_index + v.length as u64)
-            .or_else(|| vars.iter().find(|v| v.name == name))
-            .ok_or_else(|| format!("Unknown local variable '{}'", name))?;
-        let sig_byte = *var.signature.as_bytes().first().ok_or_else(|| "Bad signature".to_string())?;
+        // The forced value must match the top method's declared return type. Pull the return
+        // descriptor (the part after ')') so we coerce the literal correctly and handle void.
+        let methods = conn.get_methods(frame.location.class_id).await
+            .map_err(|e| format!("Failed to get methods: {}", e))?;
+        let method = methods.iter().find(|m| m.method_id == frame.location.method_id)
+            .ok_or_else(|| "Could not resolve the current method".to_string())?;
+        let ret_sig = method.signature.rsplit(')').next().unwrap_or("V");
+        let ret_byte = *ret_sig.as_bytes().first().unwrap_or(&b'V');
 
-        let value = literal_to_value(conn, value_str, sig_byte).await?;
-        conn.set_frame_value(thread_id, frame.frame_id, var.slot as i32, &value).await
-            .map_err(|e| format!("Failed to set value: {}", e))?;
-        Ok(format!("✅ Set {} = {}", name, value_str))
+        let raw = a.value.as_deref().map(str::trim).unwrap_or("");
+        let value = if ret_byte == b'V' {
+            jdwp_client::types::Value { tag: 86, data: jdwp_client::types::ValueData::Void }
+        } else if raw.is_empty() {
+            return Err(format!(
+                "{}() returns {} — a 'value' is required (int, 123L, true/false, null, or \"string\")",
+                method.name, decode_signature(ret_sig)
+            ));
+        } else {
+            literal_to_value(conn, raw, ret_byte).await?
+        };
+
+        conn.force_early_return(thread_id, &value).await
+            .map_err(|e| format!("ForceEarlyReturn failed (JVM may lack canForceEarlyReturn, or the value type is wrong): {}", e))?;
+
+        let shown = if ret_byte == b'V' { "void".to_string() } else { raw.to_string() };
+        Ok(format!(
+            "✅ Forced {}() to return {} — thread still suspended; call debug.continue to let it proceed.",
+            method.name, shown
+        ))
+    }
+
+    async fn handle_set_exception_breakpoint(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::SetExceptionBreakpointArgs = crate::args::parse(&args)?;
+        if !a.caught && !a.uncaught {
+            return Err("Set at least one of caught/uncaught to true — otherwise nothing is reported.".to_string());
+        }
+
+        let session_guard = self.resolve_session(&args).await
+            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
+        let mut session = session_guard.lock().await;
+
+        // Resolve the target exception class to a ref type id (None => all exceptions). The class
+        // must be loaded; unlike a line breakpoint we don't defer, because an exception request
+        // needs a concrete referenceTypeID up front.
+        let pattern = a.class_pattern.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let ref_type = match pattern {
+            Some(p) => {
+                let tid = resolve_class_by_dotted(&mut session.connection, p).await?
+                    .ok_or_else(|| format!(
+                        "Exception class '{}' is not loaded yet — trigger it once so the JVM loads it, then retry (exception breakpoints can't be deferred).",
+                        p
+                    ))?;
+                Some(tid)
+            }
+            None => None,
+        };
+
+        let request_id = session.connection
+            .set_exception_request(ref_type, a.caught, a.uncaught, jdwp_client::SuspendPolicy::All)
+            .await
+            .map_err(|e| format!("Failed to set exception breakpoint: {}", e))?;
+
+        let class_pattern = pattern.unwrap_or("*").to_string();
+        let exc_id = format!("exc_{}", request_id);
+        session.exception_requests.insert(exc_id.clone(), crate::session::ExceptionRequestInfo {
+            id: exc_id.clone(),
+            request_id,
+            class_pattern: class_pattern.clone(),
+            caught: a.caught,
+            uncaught: a.uncaught,
+        });
+
+        let which = match (a.caught, a.uncaught) {
+            (true, true) => "caught + uncaught",
+            (true, false) => "caught only",
+            (false, true) => "uncaught only",
+            (false, false) => unreachable!(),
+        };
+        let noisy = if pattern.is_none() {
+            "\n   ⚠️  Matches ALL exceptions — expect frequent hits; clear it as soon as you're done."
+        } else {
+            ""
+        };
+        Ok(format!(
+            "✅ Exception breakpoint set on {} ({})\n   Breakpoint ID: {}\n   Hits are reported via debug.get_last_event.{}",
+            class_pattern, which, exc_id, noisy
+        ))
+    }
+
+    async fn handle_get_traces(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::GetTracesArgs = crate::args::parse(&args)?;
+        let session_guard = self.resolve_session(&args).await
+            .ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+
+        if session.traces.is_empty() {
+            return Ok("No trace snapshots yet. Set a breakpoint with trace:true and trigger it.".to_string());
+        }
+        let total = session.traces.len();
+        let take = a.limit.min(total);
+        let start = total - take;
+        let mut lines = Vec::with_capacity(take + 2);
+        lines.push(format!(
+            "📢 {} trace snapshot(s) (showing {}, buffer cap {}):",
+            total, take, crate::session::MAX_TRACES
+        ));
+        for rec in session.traces.iter().skip(start) {
+            let args_s = if rec.args.is_empty() {
+                String::new()
+            } else {
+                let parts: Vec<String> = rec.args.iter().map(|(n, v)| format!("{}={}", n, v)).collect();
+                format!(" {{{}}}", parts.join(", "))
+            };
+            let expr_s = match &rec.expr {
+                Some((e, v)) => format!(" | {} => {}", e, v),
+                None => String::new(),
+            };
+            lines.push(format!(
+                "#{} [{}] {}.{}:{} thread=0x{:x}{}{}",
+                rec.seq, rec.bp_id, rec.class, rec.method, rec.line.unwrap_or(-1), rec.thread, args_s, expr_s
+            ));
+        }
+        if a.clear {
+            session.traces.clear();
+            lines.push("(buffer cleared)".to_string());
+        }
+        Ok(lines.join("\n"))
     }
 }
 
@@ -1178,6 +1597,91 @@ async fn find_method_for_args(
 }
 
 /// Find a field by name, walking the superclass chain.
+/// Resolve a breakpoint location (method, bytecode index, source line) on an already-loaded class,
+/// by explicit line, by method name (first executable line), or a named method containing the line.
+/// Shared by the immediate path and the deferred (class-prepare) arming path.
+async fn resolve_bp_location(
+    conn: &mut jdwp_client::JdwpConnection,
+    class_type_id: u64,
+    line_opt: Option<i32>,
+    method_hint: Option<&str>,
+) -> Result<(jdwp_client::reftype::MethodInfo, u64, i32), String> {
+    let methods = conn.get_methods(class_type_id).await
+        .map_err(|e| format!("Failed to get methods: {}", e))?;
+    let mut chosen: Option<(jdwp_client::reftype::MethodInfo, u64, i32)> = None;
+    for method in &methods {
+        if let Some(hint) = method_hint {
+            if method.name != hint {
+                continue;
+            }
+        }
+        let line_table = match conn.get_line_table(class_type_id, method.method_id).await {
+            Ok(lt) => lt,
+            Err(_) => continue,
+        };
+        if let Some(want) = line_opt {
+            if let Some(e) = line_table.lines.iter().find(|e| e.line_number == want) {
+                chosen = Some((method.clone(), e.line_code_index, want));
+                break;
+            }
+            if method_hint.is_some() {
+                if let Some(e) = line_table.lines.iter().min_by_key(|e| e.line_code_index) {
+                    chosen = Some((method.clone(), e.line_code_index, e.line_number));
+                    break;
+                }
+            }
+        } else if let Some(e) = line_table.lines.iter().min_by_key(|e| e.line_code_index) {
+            chosen = Some((method.clone(), e.line_code_index, e.line_number));
+            break;
+        }
+    }
+    chosen.ok_or_else(|| match line_opt {
+        Some(l) => format!("No method contains line {}", l),
+        None => format!("Method '{}' not found", method_hint.unwrap_or("")),
+    })
+}
+
+/// Find a field (with its id + JNI signature) by name, walking the superclass chain. `want_static`:
+/// `Some(true)` = static only, `Some(false)` = instance only, `None` = either. Returns the full
+/// FieldInfo so the caller can coerce/validate the value against the field's declared type.
+async fn find_field_info(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+    name: &str,
+    want_static: Option<bool>,
+) -> Result<Option<jdwp_client::reftype::FieldInfo>, String> {
+    const ACC_STATIC: i32 = 0x0008;
+    let mut current = Some(type_id);
+    let mut guard = 0;
+    while let Some(tid) = current {
+        guard += 1;
+        if guard > 50 {
+            break;
+        }
+        let fields = conn.get_fields(tid).await.map_err(|e| format!("Failed to get fields: {}", e))?;
+        if let Some(f) = fields.into_iter().find(|f| {
+            f.name == name
+                && match want_static {
+                    Some(true) => (f.mod_bits & ACC_STATIC) != 0,
+                    Some(false) => (f.mod_bits & ACC_STATIC) == 0,
+                    None => true,
+                }
+        }) {
+            return Ok(Some(f));
+        }
+        current = conn.get_superclass(tid).await.unwrap_or(None);
+    }
+    Ok(None)
+}
+
+/// Clear error when a literal can't be assigned to a field/variable's declared type.
+fn type_mismatch_err(name: &str, field_sig: &str, value: &jdwp_client::types::Value) -> String {
+    format!(
+        "Type mismatch: '{}' is declared {}, but the value {} is not assignable — pass a compatible literal.",
+        name, decode_signature(field_sig), value.format()
+    )
+}
+
 async fn find_field(
     conn: &mut jdwp_client::JdwpConnection,
     type_id: u64,
@@ -1249,7 +1753,7 @@ async fn resolve_head(
 
 async fn resolve_segment(
     conn: &mut jdwp_client::JdwpConnection,
-    thread_id: u64,
+    thread_id: Option<u64>,
     current: &jdwp_client::types::Value,
     seg: &Seg,
 ) -> Result<jdwp_client::types::Value, String> {
@@ -1266,6 +1770,9 @@ async fn resolve_segment(
 
     match &seg.args {
         Some(arglits) => {
+            let thread_id = thread_id.ok_or_else(|| {
+                format!("Calling '.{}()' needs a suspended thread — pause one or hit a breakpoint first", seg.name)
+            })?;
             let mut argvals = Vec::with_capacity(arglits.len());
             for a in arglits {
                 argvals.push(arglit_to_value(conn, a).await?);
@@ -1296,16 +1803,142 @@ async fn resolve_segment(
 
 async fn resolve_expression(
     conn: &mut jdwp_client::JdwpConnection,
-    thread_id: u64,
-    frame: &jdwp_client::thread::Frame,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
     expr: &str,
 ) -> Result<jdwp_client::types::Value, String> {
     let segs = parse_expr(expr)?;
-    let mut current = resolve_head(conn, thread_id, frame, &segs[0]).await?;
-    for seg in &segs[1..] {
+
+    // Head resolution has two paths. With a suspended frame we first try the head segment as a
+    // local variable or `this` (the common case at a breakpoint). If there is no frame, or the
+    // head isn't a local, we fall back to reading a static field off a class named by the leading
+    // dotted prefix (e.g. `br.com.infotravel.util.ConfigDefaultUtils.dsUrlMotor`). Static reads
+    // don't need a suspended thread at all.
+    let head_result = match (thread_id, frame) {
+        (Some(tid), Some(fr)) => Some(resolve_head(conn, tid, fr, &segs[0]).await),
+        _ => None,
+    };
+
+    let (mut current, start) = match head_result {
+        Some(Ok(v)) => (v, 1usize),
+        _ => {
+            let (v, consumed) = resolve_static_head(conn, &segs).await.map_err(|static_err| {
+                match &head_result {
+                    Some(Err(head_err)) => {
+                        format!("{} (also not a resolvable static field: {})", head_err, static_err)
+                    }
+                    _ => format!(
+                        "No suspended frame to read locals from, and not a resolvable static field: {}",
+                        static_err
+                    ),
+                }
+            })?;
+            (v, consumed)
+        }
+    };
+
+    for seg in &segs[start..] {
         current = resolve_segment(conn, thread_id, &current, seg).await?;
     }
     Ok(current)
+}
+
+/// Fallback head resolution: treat a leading dotted prefix as a class name and read a static field.
+///
+/// Given segments like `[br, com, infotravel, util, ConfigDefaultUtils, dsUrlMotor]`, try the
+/// longest class prefix first (so package names and nested classes win), resolve it to a loaded
+/// reference type, then read the next segment as a static field. Returns the field value plus the
+/// number of segments consumed (class prefix + the field), so the caller can continue chaining
+/// (`.getFoo()`, `.bar`) on the result.
+async fn resolve_static_head(
+    conn: &mut jdwp_client::JdwpConnection,
+    segs: &[Seg],
+) -> Result<(jdwp_client::types::Value, usize), String> {
+    let n = segs.len();
+    if n < 2 {
+        return Err("a static read needs at least Class.field".to_string());
+    }
+    // k = number of segments forming the class name; field is segs[k]. Longest prefix first.
+    for k in (1..n).rev() {
+        // The class-name segments and the field segment must all be plain (no method args).
+        if segs[..k].iter().any(|s| s.args.is_some()) || segs[k].args.is_some() {
+            continue;
+        }
+        let dotted = segs[..k].iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".");
+        if let Some(type_id) = resolve_class_by_dotted(conn, &dotted).await? {
+            let fid = find_static_field(conn, type_id, &segs[k].name).await?.ok_or_else(|| {
+                format!("class '{}' has no static field '{}'", dotted, segs[k].name)
+            })?;
+            let vals = conn
+                .get_reference_values(type_id, vec![fid])
+                .await
+                .map_err(|e| format!("Failed to read static field '{}': {}", segs[k].name, e))?;
+            let v = vals
+                .into_iter()
+                .next()
+                .ok_or_else(|| "No value returned for static field".to_string())?;
+            return Ok((v, k + 1));
+        }
+    }
+    Err("no loaded class matches the leading segment(s)".to_string())
+}
+
+/// Resolve a dotted class name to a loaded reference type id.
+///
+/// First tries the name as fully-qualified via `classes_by_signature`. If that misses and the name
+/// is a bare simple name (no dot), scans `all_classes` for a class whose signature ends in
+/// `/Name;` — so `ConfigDefaultUtils.dsUrlMotor` works without spelling out the package. Prefers a
+/// class (tag 1) over an interface when several match.
+async fn resolve_class_by_dotted(
+    conn: &mut jdwp_client::JdwpConnection,
+    dotted: &str,
+) -> Result<Option<u64>, String> {
+    let sig = format!("L{};", dotted.replace('.', "/"));
+    let classes = conn
+        .classes_by_signature(&sig)
+        .await
+        .map_err(|e| format!("classes_by_signature failed: {}", e))?;
+    if let Some(c) = classes.iter().find(|c| c.ref_type_tag == 1).or_else(|| classes.first()) {
+        return Ok(Some(c.type_id));
+    }
+
+    if !dotted.contains('.') {
+        let suffix = format!("/{};", dotted);
+        let bare = format!("L{};", dotted); // default-package class
+        let all = conn.all_classes().await.map_err(|e| format!("all_classes failed: {}", e))?;
+        let matches = |s: &str| s.ends_with(&suffix) || s == bare;
+        if let Some(c) = all.iter().find(|c| c.ref_type_tag == 1 && matches(&c.signature)) {
+            return Ok(Some(c.type_id));
+        }
+        if let Some(c) = all.iter().find(|c| matches(&c.signature)) {
+            return Ok(Some(c.type_id));
+        }
+    }
+    Ok(None)
+}
+
+/// Find a static field by name, walking the superclass chain. Skips instance fields so the id we
+/// hand to ReferenceType.GetValues is always a valid static.
+async fn find_static_field(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+    name: &str,
+) -> Result<Option<u64>, String> {
+    const ACC_STATIC: i32 = 0x0008;
+    let mut current = Some(type_id);
+    let mut guard = 0;
+    while let Some(tid) = current {
+        guard += 1;
+        if guard > 50 {
+            break;
+        }
+        let fields = conn.get_fields(tid).await.map_err(|e| format!("Failed to get fields: {}", e))?;
+        if let Some(f) = fields.into_iter().find(|f| f.name == name && (f.mod_bits & ACC_STATIC) != 0) {
+            return Ok(Some(f.field_id));
+        }
+        current = conn.get_superclass(tid).await.unwrap_or(None);
+    }
+    Ok(None)
 }
 
 /// Shallow render of an array element (no recursion / method invocation).
@@ -1420,6 +2053,11 @@ async fn literal_to_value(
         ArgLit::Int(n) => match sig_byte {
             b'J' => value_long(n as i64),
             b'Z' => value_bool(n != 0),
+            b'B' => jdwp_client::types::Value { tag: 66, data: jdwp_client::types::ValueData::Byte(n as i8) },
+            b'S' => jdwp_client::types::Value { tag: 83, data: jdwp_client::types::ValueData::Short(n as i16) },
+            b'C' => jdwp_client::types::Value { tag: 67, data: jdwp_client::types::ValueData::Char(n as u16) },
+            b'F' => jdwp_client::types::Value { tag: 70, data: jdwp_client::types::ValueData::Float(n as f32) },
+            b'D' => jdwp_client::types::Value { tag: 68, data: jdwp_client::types::ValueData::Double(n as f64) },
             _ => value_int(n),
         },
     })
@@ -1521,6 +2159,55 @@ async fn describe_location(conn: &mut jdwp_client::JdwpConnection, loc: &Locatio
     (class, method, line)
 }
 
+/// Snapshot a trace/logpoint hit: source location, in-scope locals/args, and any trace expression.
+/// The hit thread is suspended (EventThread policy) while this runs; the caller resumes it right
+/// after. Argument values are rendered WITHOUT invoking toString() (thread_id None), so tracing
+/// stays side-effect free; the explicit `trace_expr` may invoke methods since the user asked for it.
+async fn capture_trace(
+    conn: &mut jdwp_client::JdwpConnection,
+    bp: &crate::session::BreakpointInfo,
+    thread: u64,
+    loc: &Location,
+) -> crate::session::TraceRecord {
+    let (class, method, line) = describe_location(conn, loc).await;
+    let mut args: Vec<(String, String)> = Vec::new();
+    let mut expr: Option<(String, String)> = None;
+
+    if let Ok(frames) = conn.get_frames(thread, 0, 1).await {
+        if let Some(frame) = frames.first().cloned() {
+            if let Ok(var_table) = conn.get_variable_table(loc.class_id, loc.method_id).await {
+                let ci = loc.index;
+                let in_scope: Vec<_> = var_table.iter()
+                    .filter(|v| ci >= v.code_index && ci < v.code_index + v.length as u64)
+                    .collect();
+                let slots: Vec<jdwp_client::stackframe::VariableSlot> = in_scope.iter()
+                    .map(|v| jdwp_client::stackframe::VariableSlot {
+                        slot: v.slot as i32,
+                        sig_byte: v.signature.as_bytes().first().copied().unwrap_or(b'I'),
+                    })
+                    .collect();
+                if !slots.is_empty() {
+                    if let Ok(vals) = conn.get_frame_values(thread, frame.frame_id, slots).await {
+                        for (v, val) in in_scope.iter().zip(vals.iter()) {
+                            let rendered = render_value(conn, val, None, 100).await;
+                            args.push((v.name.clone(), rendered));
+                        }
+                    }
+                }
+            }
+            if let Some(e) = &bp.trace_expr {
+                let rendered = match resolve_expression(conn, Some(thread), Some(&frame), e).await {
+                    Ok(v) => render_value(conn, &v, Some(thread), 200).await,
+                    Err(err) => format!("<error: {}>", err),
+                };
+                expr = Some((e.clone(), rendered));
+            }
+        }
+    }
+
+    crate::session::TraceRecord { seq: 0, bp_id: bp.id.clone(), thread, class, method, line, args, expr }
+}
+
 // ----- conditional breakpoints -----
 
 /// Evaluate a breakpoint condition on a thread's top frame. Returns true to KEEP the VM
@@ -1577,11 +2264,11 @@ async fn eval_condition(
     cond: &str,
 ) -> Result<bool, String> {
     if let Some((lhs, op, rhs)) = split_comparison(cond) {
-        let lv = resolve_expression(conn, thread_id, frame, &lhs).await?;
+        let lv = resolve_expression(conn, Some(thread_id), Some(frame), &lhs).await?;
         let rlit = parse_lit(rhs.trim())?;
         compare_values(conn, &lv, &op, &rlit).await
     } else {
-        let v = resolve_expression(conn, thread_id, frame, cond).await?;
+        let v = resolve_expression(conn, Some(thread_id), Some(frame), cond).await?;
         match v.data {
             jdwp_client::types::ValueData::Boolean(b) => Ok(b),
             _ => Err("Condition did not evaluate to a boolean".to_string()),

@@ -76,16 +76,19 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | Tool | Description |
 |------|-------------|
 | `debug.attach` | Connect to a JVM via JDWP |
-| `debug.set_breakpoint` | Set a breakpoint by class+line, or by method name; optional `hit_count` and thread filter |
-| `debug.list_breakpoints` | List active breakpoints |
-| `debug.clear_breakpoint` | Remove a breakpoint |
+| `debug.set_breakpoint` | Set a breakpoint by class+line, or by method name; optional `hit_count`, thread filter, `condition`, or `trace:true` (non-suspending logpoint) |
+| `debug.set_exception_breakpoint` | Break when an exception (of a class + its subclasses, or all) is thrown; `caught`/`uncaught` selectable |
+| `debug.get_traces` | Read snapshots captured by trace/logpoint breakpoints (bounded ring buffer; optional `clear`) |
+| `debug.list_breakpoints` | List active breakpoints (line, deferred, exception) |
+| `debug.clear_breakpoint` | Remove a breakpoint (line, deferred, or exception) |
 | `debug.continue` | Resume execution |
 | `debug.step_over` | Step over current line (defaults to last-hit thread) |
 | `debug.step_into` | Step into a method call |
 | `debug.step_out` | Step out of the current method |
 | `debug.get_stack` | Stack frames, compact `#i class.method:line` with typed locals indented |
 | `debug.evaluate` | Evaluate `var`/`this` + `.field` / `.method(args)` chains in a frame |
-| `debug.set_value` | Set a local variable in a suspended frame |
+| `debug.set_value` | Write a local variable, a static field (`Class.field`), or an instance field (`this.field`) |
+| `debug.force_return` | Force the current method to return a given value, skipping the rest of its body |
 | `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line) + `[suspended]` |
 | `debug.list_threads` | List threads by name; filter with `name_filter` / `only_suspended` / `limit` |
 | `debug.pause` | Pause execution (suspend all threads) |
@@ -171,6 +174,22 @@ cargo build --release
 # Run tests
 cargo test
 ```
+
+### Code health
+
+[rust-doctor](https://github.com/arthjean/rust-doctor) folds clippy, `cargo-audit`/`deny`/`geiger`,
+and custom AST rules into one 0–100 score. Run it locally (no Rust build of the tool — `npx` fetches
+a prebuilt binary):
+
+```bash
+scripts/doctor.sh              # score card for the workspace
+scripts/doctor.sh --verbose    # per-finding file:line detail
+scripts/doctor.sh --diff main  # only files changed vs main
+```
+
+The same check runs in CI (`.github/workflows/rust-doctor.yml`, pinned to v0.2.0), gating on errors
+and posting a PR summary + SARIF. Installing the optional external tools (`cargo install cargo-audit
+cargo-deny cargo-machete cargo-geiger`) unlocks the dependency/unsafe passes it otherwise skips.
 
 ## Status
 

@@ -126,4 +126,38 @@ impl JdwpConnection {
 
         Ok(classes)
     }
+
+    /// List every loaded reference type (VirtualMachine.AllClasses command).
+    ///
+    /// Heavier than `classes_by_signature` (returns thousands of entries), but lets a caller
+    /// resolve a class by *simple* name when the full package isn't known — e.g. match any
+    /// signature ending in `/ConfigDefaultUtils;`.
+    pub async fn all_classes(&mut self) -> JdwpResult<Vec<ClassInfo>> {
+        let id = self.next_id();
+        let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::ALL_CLASSES);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+
+        let classes_count = read_i32(&mut data)?;
+        let mut classes = Vec::with_capacity(classes_count as usize);
+
+        for _ in 0..classes_count {
+            let ref_type_tag = read_u8(&mut data)?;
+            let type_id = crate::reader::read_u64(&mut data)?;
+            let signature = read_string(&mut data)?;
+            let status = read_i32(&mut data)?;
+
+            classes.push(ClassInfo {
+                ref_type_tag,
+                type_id,
+                signature,
+                status,
+            });
+        }
+
+        Ok(classes)
+    }
 }

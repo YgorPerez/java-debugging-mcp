@@ -15,6 +15,7 @@ fn default_max_frames() -> usize { 20 }
 fn default_true() -> bool { true }
 fn default_max_result_length() -> usize { 2000 }
 fn default_limit() -> usize { 40 }
+fn default_trace_limit() -> usize { 50 }
 
 /// Parse an optional hex thread id like "0x2" (or "2") into a raw id.
 pub fn parse_thread_id(s: &Option<String>) -> Option<u64> {
@@ -66,8 +67,29 @@ pub struct SetBreakpointArgs {
     /// `reserva.getReservaPacote().getReservaHotelList().size() > 0` or `getSgMoeda() == "BRL"`.
     #[serde(default)]
     pub condition: Option<String>,
+    /// Logpoint mode: on hit, snapshot (location, thread, in-scope locals/args, optional
+    /// `trace_expr`) into a ring buffer and resume immediately WITHOUT suspending — safe on a
+    /// shared instance where a normal breakpoint could freeze a request thread. Read snapshots
+    /// with debug.get_traces.
+    #[serde(default)]
+    pub trace: bool,
+    /// Only with `trace:true` — an expression to evaluate in the hit frame and record alongside
+    /// the snapshot (e.g. `reserva.getStatus()`).
+    #[serde(default)]
+    pub trace_expr: Option<String>,
     // NOTE: `session_id` is a cross-cutting argument handled uniformly by `resolve_session`
     // (from the raw arguments) for every tool, so it is intentionally not a typed field here.
+}
+
+/// Arguments for `debug.get_traces`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetTracesArgs {
+    /// Max snapshots to return, most recent last (default 50).
+    #[serde(default = "default_trace_limit")]
+    pub limit: usize,
+    /// Clear the trace buffer after returning it.
+    #[serde(default)]
+    pub clear: bool,
 }
 
 /// Arguments for debug.clear_breakpoint.
@@ -137,16 +159,49 @@ pub struct ListThreadsArgs {
 /// Arguments for debug.set_value.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetValueArgs {
-    /// Local variable name.
-    pub name: String,
-    /// Literal: int, 123L, true/false, null, or "string".
+    /// What to write. Either a local variable name (`counter`), a static field
+    /// (`ConfigDefaultUtils.dsInfra` or a fully-qualified `pkg.Class.field`), or an instance field
+    /// reached from a suspended frame (`this.status`, `reserva.total`). Accepts the legacy key
+    /// `name`.
+    #[serde(alias = "name")]
+    pub target: String,
+    /// Literal: int, 123L, true/false, null, or "string". Coerced to the target's declared type.
     pub value: String,
-    /// Thread id (optional; defaults to last-hit thread).
+    /// Thread id (optional; defaults to last-hit thread). Needed for locals and instance fields.
     #[serde(default)]
     pub thread_id: Option<String>,
-    /// Frame index (default 0).
+    /// Frame index (default 0). Used for locals and for resolving an instance-field prefix.
     #[serde(default)]
     pub frame_index: usize,
+}
+
+/// Arguments for `debug.set_exception_breakpoint`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetExceptionBreakpointArgs {
+    /// Exception class to break on (e.g. "java.lang.NullPointerException" or
+    /// "br.com.infotravel.ErrorException"); its subclasses match too. Omit to break on ALL
+    /// exceptions — noisy, since the JVM throws/catches internally constantly. The class must
+    /// already be loaded (trigger it once if unsure).
+    #[serde(default)]
+    pub class_pattern: Option<String>,
+    /// Break on exceptions that ARE caught somewhere up the stack (default true).
+    #[serde(default = "default_true")]
+    pub caught: bool,
+    /// Break on exceptions that are NOT caught (propagate out; default true).
+    #[serde(default = "default_true")]
+    pub uncaught: bool,
+}
+
+/// Arguments for `debug.force_return`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ForceReturnArgs {
+    /// Return value literal, coerced to the method's declared return type: int, 123L, true/false,
+    /// null, or "string". Omit (or pass "void") for a void method.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// Thread id (optional; defaults to last-hit thread). Must be suspended.
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -165,9 +220,25 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(EvaluateArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(ListThreadsArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(SetValueArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(SetExceptionBreakpointArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(ForceReturnArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(GetTracesArgs)).unwrap(),
         ];
         for s in schemas {
             assert_eq!(s.get("type").and_then(|t| t.as_str()), Some("object"));
         }
+    }
+
+    // set_value's target accepts both the new `target` key and the legacy `name` key, so existing
+    // callers keep working after the locals→fields generalization.
+    #[test]
+    fn set_value_accepts_target_and_legacy_name() {
+        let by_target: SetValueArgs =
+            serde_json::from_value(serde_json::json!({"target": "ConfigDefaultUtils.dsInfra", "value": "DEV"})).unwrap();
+        assert_eq!(by_target.target, "ConfigDefaultUtils.dsInfra");
+
+        let by_name: SetValueArgs =
+            serde_json::from_value(serde_json::json!({"name": "counter", "value": "5"})).unwrap();
+        assert_eq!(by_name.target, "counter");
     }
 }

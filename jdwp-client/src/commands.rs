@@ -86,6 +86,7 @@ pub mod thread_commands {
     pub const STOP: u8 = 10;
     pub const INTERRUPT: u8 = 11;
     pub const SUSPEND_COUNT: u8 = 12;
+    pub const FORCE_EARLY_RETURN: u8 = 14;
 }
 
 // EventRequest commands (set 15)

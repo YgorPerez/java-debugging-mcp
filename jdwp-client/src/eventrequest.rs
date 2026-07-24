@@ -77,4 +77,92 @@ impl JdwpConnection {
 
         Ok(())
     }
+
+    /// Request notification when a class matching `class_pattern` is prepared/loaded
+    /// (EventRequest.Set, eventKind CLASS_PREPARE, with a ClassMatch modifier). The pattern is a
+    /// dotted class name, optionally with a leading/trailing `*` wildcard (e.g.
+    /// `br.com.infotravel.service.PontoVendaSrv`). Returns the request id. This is the primitive
+    /// behind deferred ("class not loaded yet") breakpoints: register it, then arm the real
+    /// breakpoint when the matching ClassPrepare event arrives.
+    pub async fn set_class_prepare(
+        &mut self,
+        class_pattern: &str,
+        suspend_policy: SuspendPolicy,
+    ) -> JdwpResult<i32> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
+
+        packet.data.put_u8(event_kinds::CLASS_PREPARE);
+        packet.data.put_u8(suspend_policy as u8);
+
+        // One modifier: ClassMatch (5) with the dotted class pattern.
+        packet.data.put_i32(1);
+        packet.data.put_u8(5);
+        let pat = class_pattern.as_bytes();
+        packet.data.put_u32(pat.len() as u32);
+        packet.data.extend_from_slice(pat);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let request_id = read_i32(&mut data)?;
+        Ok(request_id)
+    }
+
+    /// Clear a CLASS_PREPARE request by id (EventRequest.Clear command).
+    pub async fn clear_class_prepare(&mut self, request_id: i32) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
+        packet.data.put_u8(event_kinds::CLASS_PREPARE);
+        packet.data.put_i32(request_id);
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+        Ok(())
+    }
+
+    /// Break when an exception is thrown (EventRequest.Set, eventKind EXCEPTION, with an
+    /// ExceptionOnly modifier). `ref_type` restricts to a single exception class *and its
+    /// subclasses*; pass `None` (or 0) to catch every exception — noisy, since a live JVM throws
+    /// and catches exceptions internally all the time, so prefer a concrete type. `caught` /
+    /// `uncaught` select which throws to report (at least one should be true). Returns the request
+    /// id. This is the primitive behind `debug.set_exception_breakpoint`.
+    pub async fn set_exception_request(
+        &mut self,
+        ref_type: Option<ReferenceTypeId>,
+        caught: bool,
+        uncaught: bool,
+        suspend_policy: SuspendPolicy,
+    ) -> JdwpResult<i32> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
+
+        packet.data.put_u8(event_kinds::EXCEPTION);
+        packet.data.put_u8(suspend_policy as u8);
+
+        // One modifier: ExceptionOnly (8) — refType (0 = all), caught flag, uncaught flag.
+        packet.data.put_i32(1);
+        packet.data.put_u8(8);
+        packet.data.put_u64(ref_type.unwrap_or(0));
+        packet.data.put_u8(caught as u8);
+        packet.data.put_u8(uncaught as u8);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let request_id = read_i32(&mut data)?;
+        Ok(request_id)
+    }
+
+    /// Clear an EXCEPTION request by id (EventRequest.Clear command).
+    pub async fn clear_exception_request(&mut self, request_id: i32) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
+        packet.data.put_u8(event_kinds::EXCEPTION);
+        packet.data.put_i32(request_id);
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+        Ok(())
+    }
 }
