@@ -21,7 +21,7 @@ Features are proven with an example that drives a purpose-built probe JVM:
    - **`mcp-server` handlers** — register it in `mcp-server/Cargo.toml` and spawn
      `target/release/jdwp-mcp` as a child, speaking JSON-RPC over its stdio. This is the only way to
      cover the handler glue (expression resolution, event pump, session state). Worked pattern:
-     `examples/test_eval_invoke.rs` (see TEST-1 for what it doesn't cover yet).
+     `examples/test_eval_invoke.rs` and `examples/test_watchpoint.rs` (see TEST-1 for the gaps).
 
 Note: the `mcp__jdwp__` tools in a running Claude Code session hold the OLD binary — a rebuild
 (`cargo build --release`) is only picked up after a Claude Code restart. That's why validation goes
@@ -51,6 +51,19 @@ through library examples, not the live tools, within a session.
   (ClassType.SetValues) + `set_object_values` (ObjectReference.SetValues). Legacy `name` key still
   accepted. Validated — static String/int + instance int/String/boolean written and read back
   (`examples/test_set_field.rs`).
+- **Field watchpoints (WATCH-1)** — `debug.set_watchpoint {class_name, field_name, modify, access}`
+  breaks when a field is written (or read), answering "who mutates this?". A write hit reports the
+  mutating `class.method:line`, the field, whether it's static, the owning instance, and the
+  **old → new** pair — the old value is read while the thread sits suspended *before* the pending
+  store commits. A read hit reports a single `value` instead. Primitives: `FIELD_ACCESS` /
+  `FIELD_MODIFICATION` wire-decode (incl. JDWP's `valueToBe`), `set_field_watch`/`clear_field_watch`
+  with a `FieldOnly` modifier, and a `WatchKind` enum. `list`/`clear`/`panic` are aware (a watch
+  survives `ClearAllBreakpoints`, so panic clears them explicitly). Validated end-to-end through the
+  real MCP server — 17 checks (`examples/test_watchpoint.rs` + `examples/probes/WatchProbe.java`),
+  covering static + instance modify, access-only, and the bookkeeping/error paths.
+  Gotchas found: JDWP's `FieldOnly` modifier is modKind **9** (`ClassOnly` is 4) — the wrong number
+  returns a bare `INTERNAL` (113), naming nothing, so the modifier kinds are now named constants.
+  And `static final int` is inlined by javac, so a `FIELD_ACCESS` watch on one never fires.
 - **Static-method invocation + object arguments (EVAL-1, EVAL-2)** — `debug.evaluate` now calls
   static methods off a class head (`EvalProbe.twice(21)`, `ConfigDefaultUtils.getUrl()`) and accepts
   **expressions** as arguments, passed by reference (`a.matches(b)`, `EvalProbe.describe(a)`,
@@ -79,36 +92,21 @@ through library examples, not the live tools, within a session.
 Priority key: **P1** = highest payoff for the infotravel/integraWS investigations (shared 8180 +
 silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
 
-> **TRACE-1, EXC-1, SETF-1 (all P1) and EVAL-1, EVAL-2 are done** — see the Shipped section above.
-
-### WATCH-1 — Field watchpoints (modification)  · P2 · M
-
-**What to build**
-Break when a field is modified (FIELD_MODIFICATION event) — "who mutates this?" e.g. `it_b2c.empresa_id`.
-Optionally FIELD_ACCESS too. Needs the field event decode + EventRequest with a FieldOnly modifier +
-a `debug.set_watchpoint {class, field, access|modify}` tool.
-
-**Acceptance criteria**
-- [ ] Field modification event decoded (thread, field, old/new value, location)
-- [ ] `set_field_watch(ref_type, field_id, modify/access)` + clear in `jdwp-client`
-- [ ] `debug.set_watchpoint` tool; hit reports the mutating location + old→new value
-- [ ] Probe that mutates a watched field stops with the correct old/new values
-
-**Blocked by**
-None. (Shares the event-parse + EventRequest.Set pattern with EXC-1.)
+> **TRACE-1, EXC-1, SETF-1 (all P1) and EVAL-1, EVAL-2, WATCH-1 are done** — see Shipped above.
 
 ### TEST-1 — MCP-handler integration tests + force_return runtime example  · P2 · M
 
 **What to build**
-`examples/test_eval_invoke.rs` established the JSON-RPC-over-stdio harness shape (spawn
-`target/release/jdwp-mcp`, drive `tools/call`, assert on the returned text) and covers the expression
-handlers. What still has no coverage is the rest of the `mcp-server` glue — the event pump arming
-deferred breakpoints, `handle_set_breakpoint`'s deferred path + race re-check, and
-`handle_force_return` — and nothing runs from `cargo test`.
+`examples/test_eval_invoke.rs` and `examples/test_watchpoint.rs` established the JSON-RPC-over-stdio
+harness shape (spawn `target/release/jdwp-mcp`, drive `tools/call`, assert on the returned text) and
+cover the expression and watchpoint handlers. What still has no coverage is the rest of the
+`mcp-server` glue — the event pump arming deferred breakpoints, `handle_set_breakpoint`'s deferred
+path + race re-check, and `handle_force_return` — and nothing runs from `cargo test`.
 
-Extract the `Server` helper out of `test_eval_invoke.rs` into something shareable, add the missing
-scenarios on top of it, and make the whole thing runnable without a hand-launched probe (the harness
-should start the probe JVM itself, picking a free port).
+The two harnesses now carry a byte-identical copy of the `Server` helper, which is the concrete
+argument for extracting it: put it in one place, add the missing scenarios on top, and make the whole
+thing runnable without a hand-launched probe (the harness should start the probe JVM itself, picking a
+free port).
 
 **Acceptance criteria**
 - [ ] The `Server` stdio-JSON-RPC helper lives in one place, reused by every MCP-level example/test

@@ -28,6 +28,8 @@ pub struct DebugSession {
     pub pending_breakpoints: Vec<PendingBreakpoint>,
     /// Active exception breakpoints (EXCEPTION event requests), keyed by their `exc_` id.
     pub exception_requests: HashMap<String, ExceptionRequestInfo>,
+    /// Active field watchpoints (`FIELD_ACCESS` / `FIELD_MODIFICATION` requests), keyed by `watch_` id.
+    pub watchpoints: HashMap<String, WatchpointInfo>,
     /// Ring buffer of trace/logpoint snapshots (see `TraceRecord`). Bounded by `MAX_TRACES`.
     pub traces: VecDeque<TraceRecord>,
     /// Monotonic sequence for trace records (survives ring-buffer eviction).
@@ -67,6 +69,26 @@ pub struct ExceptionRequestInfo {
     pub class_pattern: String,
     pub caught: bool,
     pub uncaught: bool,
+}
+
+/// An active field watchpoint: a `FIELD_ACCESS` or `FIELD_MODIFICATION` event request on one field.
+/// Tracked so it shows in `list_breakpoints` and is cleared by `clear_breakpoint` / panic like a
+/// normal breakpoint — `ClearAllBreakpoints` does not touch it.
+#[derive(Debug, Clone)]
+pub struct WatchpointInfo {
+    /// The JDWP event-request id.
+    pub request_id: i32,
+    /// Which event kind this was registered as — `Clear` needs the same kind back.
+    pub kind: jdwp_client::WatchKind,
+    /// Dotted class name the caller gave, for messages.
+    pub class_name: String,
+    pub field_name: String,
+    /// Whether the field is static, for the `list_breakpoints` line.
+    ///
+    /// The declaring type, field id, and signature are deliberately NOT kept here: a hit carries all
+    /// three itself, so `get_last_event` resolves them from the event and can still describe a hit
+    /// whose watchpoint has already been cleared.
+    pub is_static: bool,
 }
 
 /// A breakpoint waiting for its class to load. The `CLASS_PREPARE` request suspends the preparing
@@ -136,6 +158,7 @@ impl SessionManager {
             watchdog_task: None,
             pending_breakpoints: Vec::new(),
             exception_requests: HashMap::new(),
+            watchpoints: HashMap::new(),
             traces: VecDeque::new(),
             trace_seq: 0,
         };

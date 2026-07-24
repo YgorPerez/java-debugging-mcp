@@ -188,6 +188,7 @@ impl RequestHandler {
             "debug.set_value" => self.handle_set_value(args).await,
             "debug.force_return" => self.handle_force_return(args).await,
             "debug.set_exception_breakpoint" => self.handle_set_exception_breakpoint(args).await,
+            "debug.set_watchpoint" => self.handle_set_watchpoint(args).await,
             "debug.get_traces" => self.handle_get_traces(args).await,
             _ => return None,
         })
@@ -304,14 +305,15 @@ impl RequestHandler {
         let session = session_guard.lock().await;
 
         if session.breakpoints.is_empty() && session.pending_breakpoints.is_empty()
-            && session.exception_requests.is_empty()
+            && session.exception_requests.is_empty() && session.watchpoints.is_empty()
         {
             return Ok("No breakpoints set".to_string());
         }
 
         let mut output = format!(
-            "📍 {} breakpoint(s), {} deferred, {} exception:\n\n",
-            session.breakpoints.len(), session.pending_breakpoints.len(), session.exception_requests.len()
+            "📍 {} breakpoint(s), {} deferred, {} exception, {} watchpoint(s):\n\n",
+            session.breakpoints.len(), session.pending_breakpoints.len(),
+            session.exception_requests.len(), session.watchpoints.len()
         );
 
         for (bp_id, bp) in &session.breakpoints {
@@ -324,6 +326,10 @@ impl RequestHandler {
 
         for er in session.exception_requests.values() {
             render_exception_line(&mut output, er);
+        }
+
+        for (watch_id, wp) in &session.watchpoints {
+            render_watchpoint_line(&mut output, watch_id, wp);
         }
         drop(session);
 
@@ -343,6 +349,16 @@ impl RequestHandler {
         if let Some(er) = session.exception_requests.remove(bp_id) {
             let _ = session.connection.clear_exception_request(er.request_id).await;
             return Ok(format!("✅ Exception breakpoint cleared: {} ({})", bp_id, er.class_pattern));
+        }
+
+        // A watchpoint lives in watchpoints as a FIELD_ACCESS / FIELD_MODIFICATION request; Clear
+        // must name the same event kind the request was created with.
+        if let Some(wp) = session.watchpoints.remove(bp_id) {
+            let _ = session.connection.clear_field_watch(wp.request_id, wp.kind).await;
+            return Ok(format!(
+                "✅ Watchpoint cleared: {} ({}.{} {})",
+                bp_id, wp.class_name, wp.field_name, wp.kind.label()
+            ));
         }
 
         // A deferred (not-yet-armed) breakpoint lives in pending_breakpoints with only a
@@ -445,6 +461,7 @@ impl RequestHandler {
         let n = session.breakpoints.len();
         let np = session.pending_breakpoints.len();
         let ne = session.exception_requests.len();
+        let nw = session.watchpoints.len();
         let _ = session.connection.clear_all_breakpoints().await;
         session.breakpoints.clear();
         // Also drop deferred breakpoints' CLASS_PREPARE watches.
@@ -457,14 +474,22 @@ impl RequestHandler {
         for req in excs {
             let _ = session.connection.clear_exception_request(req).await;
         }
+        // Field watches are likewise untouched by ClearAllBreakpoints, and leaving one armed keeps
+        // the debuggee de-optimised — so panic must drop them too.
+        let watches: Vec<(i32, jdwp_client::WatchKind)> =
+            session.watchpoints.drain().map(|(_, w)| (w.request_id, w.kind)).collect();
+        for (req, kind) in watches {
+            let _ = session.connection.clear_field_watch(req, kind).await;
+        }
         session.suspended_since = None;
         session.connection.resume_all().await
             .map_err(|e| format!("Failed to resume: {e}"))?;
         drop(session);
 
-        Ok(format!("🧯 Panic: cleared {} breakpoint(s){}{} and resumed all threads.", n,
+        Ok(format!("🧯 Panic: cleared {} breakpoint(s){}{}{} and resumed all threads.", n,
             if np > 0 { format!(" + {np} deferred") } else { String::new() },
-            if ne > 0 { format!(" + {ne} exception") } else { String::new() }))
+            if ne > 0 { format!(" + {ne} exception") } else { String::new() },
+            if nw > 0 { format!(" + {nw} watchpoint") } else { String::new() }))
     }
 
     async fn handle_get_stack(&self, args: serde_json::Value) -> Result<String, String> {
@@ -703,6 +728,9 @@ impl RequestHandler {
                         obj.insert("caught_at".to_string(), json!(format!("{}.{}:{}", caught_class, caught_method, caught_line.unwrap_or(-1))));
                     }
                 }
+
+                // For a watchpoint hit, add which field was touched and its value(s).
+                describe_field_event(&mut session.connection, &ev.details, &mut obj).await;
             } else {
                 match &ev.details {
                     jdwp_client::events::EventKind::VMStart { thread }
@@ -882,6 +910,70 @@ impl RequestHandler {
         ))
     }
 
+    async fn handle_set_watchpoint(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::SetWatchpointArgs = crate::args::parse(&args)?;
+        if !a.modify && !a.access {
+            return Err("Set at least one of modify/access to true — otherwise nothing is reported.".to_string());
+        }
+        let class_name = a.class_name.trim();
+        let field_name = a.field_name.trim();
+
+        let session_guard = self.resolve_session(&args).await
+            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
+        let mut session = session_guard.lock().await;
+
+        // A watchpoint needs a concrete fieldID up front, so — unlike a line breakpoint — it can't
+        // be deferred until the class loads.
+        let type_id = resolve_class_by_dotted(&mut session.connection, class_name).await?
+            .ok_or_else(|| format!(
+                "Class '{class_name}' is not loaded yet — exercise it once so the JVM loads it, then retry (watchpoints can't be deferred)."
+            ))?;
+        let (declaring_type, field) =
+            find_field_info(&mut session.connection, type_id, field_name, None).await?
+                .ok_or_else(|| format!("Class '{class_name}' has no field '{field_name}' (nor does any superclass)"))?;
+        let is_static = (field.mod_bits & ACC_STATIC) != 0;
+
+        // Each kind is its own JDWP request, so "modify + access" registers two and reports two ids.
+        let mut kinds = Vec::with_capacity(2);
+        if a.modify {
+            kinds.push(jdwp_client::WatchKind::Modify);
+        }
+        if a.access {
+            kinds.push(jdwp_client::WatchKind::Access);
+        }
+
+        let mut ids = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            let request_id = session.connection
+                .set_field_watch(declaring_type, field.field_id, kind, jdwp_client::SuspendPolicy::All)
+                .await
+                .map_err(|e| format!(
+                    "Failed to set {} watchpoint: {e} (error 99 NOT_IMPLEMENTED means this JVM lacks canWatchField{})",
+                    kind.label(),
+                    if kind == jdwp_client::WatchKind::Access { "Access" } else { "Modification" },
+                ))?;
+            let watch_id = format!("watch_{}_{request_id}", kind.label());
+            ids.push(format!("{watch_id} ({})", kind.label()));
+            session.watchpoints.insert(watch_id, crate::session::WatchpointInfo {
+                request_id,
+                kind,
+                class_name: class_name.to_string(),
+                field_name: field_name.to_string(),
+                is_static,
+            });
+        }
+        drop(session);
+
+        let kindness = if is_static { "static" } else { "instance" };
+        Ok(format!(
+            "✅ Watchpoint set on {}.{} ({kindness} {})\n   Breakpoint ID(s): {}\n   Hits are reported via debug.get_last_event with the mutating location and old → new value.\n   ⚠️  A watched field can't be JIT-optimised — expect the debuggee to slow down; clear it when done.",
+            class_name,
+            field_name,
+            decode_signature(&field.signature),
+            ids.join(", "),
+        ))
+    }
+
     async fn handle_get_traces(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::GetTracesArgs = crate::args::parse(&args)?;
         let session_guard = self.resolve_session(&args).await
@@ -957,6 +1049,82 @@ fn render_exception_line(output: &mut String, er: &crate::session::ExceptionRequ
         (false, false) => "none",
     };
     let _ = writeln!(output, "  ⚡ [{}] exception {} ({})", er.id, er.class_pattern, which);
+}
+
+/// Add a watchpoint hit's field details to a `get_last_event` entry: the field (as
+/// `Declaring.name`), whether it is static, and its value(s).
+///
+/// For a modification the JVM reports the value the pending store *will* write, and the store has
+/// not committed yet — so reading the field right now yields the value being replaced. That is where
+/// `old`/`new` come from. It only holds while the hit thread is still suspended; after a
+/// `debug.continue` the write lands and `old` would read back as the new value. A no-op write
+/// (`x = x`) legitimately reports the same value on both sides.
+///
+/// The field name is resolved from the event's own declaring type rather than the session's
+/// watchpoint list, so a hit still describes itself after the watchpoint has been cleared.
+async fn describe_field_event(
+    conn: &mut jdwp_client::JdwpConnection,
+    details: &EventKind,
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    use jdwp_client::events::EventKind as K;
+    let (f, new_value) = match details {
+        K::FieldAccess { field } => (field, None),
+        K::FieldModification { field, new_value } => (field, Some(new_value)),
+        _ => return,
+    };
+    let (ref_type, field_id, instance) = (f.ref_type, f.field_id, f.object);
+
+    let declaring = decode_signature(&conn.get_signature(ref_type).await.unwrap_or_default());
+    let info = conn.get_fields(ref_type).await.ok()
+        .and_then(|fs| fs.into_iter().find(|f| f.field_id == field_id));
+    let (name, is_static) = info.map_or_else(
+        // No field info means the type's field list didn't include the id the event named; fall back
+        // to the raw id and infer staticness from whether an instance was reported.
+        || (format!("field@{field_id:x}"), instance == 0),
+        |f| (f.name, (f.mod_bits & ACC_STATIC) != 0),
+    );
+    obj.insert("field".to_string(), json!(format!("{declaring}.{name}")));
+    obj.insert("static".to_string(), json!(is_static));
+    if instance != 0 {
+        obj.insert("instance".to_string(), json!(format!("0x{instance:x}")));
+    }
+
+    // Rendered with thread=None on purpose: no toString() invocation while the VM sits suspended
+    // inside an event, which keeps reporting a hit side-effect-free.
+    let current = if instance == 0 {
+        conn.get_reference_values(ref_type, vec![field_id]).await.ok()
+    } else {
+        conn.get_object_values(instance, vec![field_id]).await.ok()
+    }
+    .and_then(|vs| vs.into_iter().next());
+
+    match new_value {
+        Some(nv) => {
+            if let Some(old) = current {
+                obj.insert("old".to_string(), json!(render_value(conn, &old, None, 200).await));
+            }
+            obj.insert("new".to_string(), json!(render_value(conn, nv, None, 200).await));
+        }
+        // A read doesn't change anything, so there is one value to report, not a pair.
+        None => {
+            if let Some(v) = current {
+                obj.insert("value".to_string(), json!(render_value(conn, &v, None, 200).await));
+            }
+        }
+    }
+}
+
+fn render_watchpoint_line(output: &mut String, watch_id: &str, wp: &crate::session::WatchpointInfo) {
+    let _ = writeln!(
+        output,
+        "  👁  [{}] watch {}.{} on {} ({})",
+        watch_id,
+        wp.class_name,
+        wp.field_name,
+        wp.kind.label(),
+        if wp.is_static { "static" } else { "instance" },
+    );
 }
 
 /// Resolve a frame's class name, using and populating a per-call cache (recursion / same-class
@@ -1857,13 +2025,15 @@ async fn resolve_bp_location(
 /// Find a field (with its id + JNI signature) by name, walking the superclass chain. `want_static`:
 /// `Some(true)` = static only, `Some(false)` = instance only, `None` = either. Returns the full
 /// `FieldInfo` so the caller can coerce/validate the value against the field's declared type.
+/// Find a field by name, walking the superclass chain. Returns the type that *declares* it together
+/// with its info — the declaring type is what JDWP's `FieldOnly` watch modifier requires, and it may
+/// be a superclass of `type_id`.
 async fn find_field_info(
     conn: &mut jdwp_client::JdwpConnection,
     type_id: u64,
     name: &str,
     want_static: Option<bool>,
-) -> Result<Option<jdwp_client::reftype::FieldInfo>, String> {
-    const ACC_STATIC: i32 = 0x0008;
+) -> Result<Option<(u64, jdwp_client::reftype::FieldInfo)>, String> {
     let mut current = Some(type_id);
     let mut guard = 0;
     while let Some(tid) = current {
@@ -1880,7 +2050,7 @@ async fn find_field_info(
                     None => true,
                 }
         }) {
-            return Ok(Some(f));
+            return Ok(Some((tid, f)));
         }
         current = conn.get_superclass(tid).await.unwrap_or(None);
     }
@@ -1965,7 +2135,7 @@ async fn set_instance_field(
     };
     let type_id = conn.get_object_reference_type(obj_id).await
         .map_err(|e| format!("Failed to resolve object type: {e}"))?;
-    let f = find_field_info(conn, type_id, field_name, Some(false)).await?
+    let (_, f) = find_field_info(conn, type_id, field_name, Some(false)).await?
         .ok_or_else(|| format!("No instance field '{field_name}' on the resolved object"))?;
     let sig_byte = *f.signature.as_bytes().first().ok_or_else(|| "Bad field signature".to_string())?;
     let value = literal_to_value(conn, value_str, sig_byte).await?;
@@ -1988,7 +2158,7 @@ async fn set_static_field(
     let Some(class_id) = resolve_class_by_dotted(conn, container_expr).await? else {
         return Ok(None);
     };
-    let f = find_field_info(conn, class_id, field_name, Some(true)).await?
+    let (_, f) = find_field_info(conn, class_id, field_name, Some(true)).await?
         .ok_or_else(|| format!("class '{container_expr}' has no static field '{field_name}'"))?;
     let sig_byte = *f.signature.as_bytes().first().ok_or_else(|| "Bad field signature".to_string())?;
     let value = literal_to_value(conn, value_str, sig_byte).await?;
@@ -2559,6 +2729,9 @@ fn event_location(d: &EventKind) -> Option<(u64, Location)> {
         | EventKind::MethodEntry { thread, location }
         | EventKind::MethodExit { thread, location }
         | EventKind::Exception { thread, location, .. } => Some((*thread, location.clone())),
+        EventKind::FieldAccess { field } | EventKind::FieldModification { field, .. } => {
+            Some((field.thread, field.location.clone()))
+        }
         _ => None,
     }
 }
@@ -2577,6 +2750,8 @@ fn event_suspends(es: &jdwp_client::EventSet) -> bool {
                     | EventKind::Exception { .. }
                     | EventKind::MethodEntry { .. }
                     | EventKind::MethodExit { .. }
+                    | EventKind::FieldAccess { .. }
+                    | EventKind::FieldModification { .. }
             )
         })
 }
@@ -2593,6 +2768,8 @@ const fn event_type_name(d: &EventKind) -> &'static str {
         EventKind::ThreadStart { .. } => "thread_start",
         EventKind::ThreadDeath { .. } => "thread_death",
         EventKind::ClassPrepare { .. } => "class_prepare",
+        EventKind::FieldAccess { .. } => "field_access",
+        EventKind::FieldModification { .. } => "field_modification",
         EventKind::Unknown { .. } => "unknown",
     }
 }

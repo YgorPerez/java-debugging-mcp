@@ -49,7 +49,7 @@ pub use connection::JdwpConnection;
 pub use eventloop::{EventLoopHandle, spawn_event_loop};
 pub use events::EventSet;
 pub use protocol::{JdwpError, JdwpResult};
-pub use eventrequest::SuspendPolicy;
+pub use eventrequest::{SuspendPolicy, WatchKind};
 
 #[cfg(test)]
 mod tests {

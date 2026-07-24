@@ -45,9 +45,13 @@ These are primarily for library development and testing.
 
 ### MCP-level harnesses
 
-- **test_eval_invoke.rs** - Drives the built `jdwp-mcp` binary over JSON-RPC on stdio, so it covers
-  the server's handlers (expression resolution, overload selection, conditional breakpoints) rather
-  than just the wire primitives. Paired with `probes/EvalProbe.java`; see the file header to run it.
+These drive the built `jdwp-mcp` binary over JSON-RPC on stdio, so they cover the server's handlers
+rather than just the wire primitives. Each file's header has the exact commands to run it.
+
+- **test_eval_invoke.rs** - Expression resolution: static-method invocation, object arguments,
+  overload selection, conditional breakpoints. Paired with `probes/EvalProbe.java`.
+- **test_watchpoint.rs** - Field watchpoints: static and instance modification (old → new), access
+  watches, and the list/clear/panic bookkeeping. Paired with `probes/WatchProbe.java`.
 
 ### probes/
 

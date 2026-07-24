@@ -31,3 +31,7 @@ tempfile = "3.8"
 [[example]]
 name = "test_eval_invoke"
 path = "../examples/test_eval_invoke.rs"
+
+[[example]]
+name = "test_watchpoint"
+path = "../examples/test_watchpoint.rs"

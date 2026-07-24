@@ -20,6 +20,8 @@ natural language.
   literals (int, long, boolean, null, `"string"`) **or expressions passed by reference**
   (`svc.matches(reserva)`, `foo.handle(this, cfg.getId())`)
 - **Value Rendering**: Strings, typed objects (best-effort `toString()`), and **array contents**
+- **Field Watchpoints**: break when a field is read or written — `debug.set_watchpoint` reports the
+  mutating location with the **old → new** value, for "who changes this behind my back?"
 - **Set Values**: write a local variable in a suspended frame
 - **Thread Management**: tools default to the last thread that hit a breakpoint
 - **Structured Events**: `get_last_event` emits a machine-readable `[event]` line (thread, class.method:line)
@@ -91,8 +93,9 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | `debug.get_stack` | Stack frames, compact `#i class.method:line` with typed locals indented |
 | `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods and object arguments included |
 | `debug.set_value` | Write a local variable, a static field (`Class.field`), or an instance field (`this.field`) |
+| `debug.set_watchpoint` | Break when a field is written (or read) — reports the mutating location + old → new value |
 | `debug.force_return` | Force the current method to return a given value, skipping the rest of its body |
-| `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line) + `[suspended]` |
+| `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line, exception type, watched field's old → new) + `[suspended]` |
 | `debug.list_threads` | List threads by name; filter with `name_filter` / `only_suspended` / `limit` |
 | `debug.pause` | Pause execution (suspend all threads) |
 | `debug.panic` | Safety: clear all breakpoints and resume all threads |
@@ -205,7 +208,7 @@ passes it otherwise skips.
 - [x] VirtualMachine commands (Version, IDSizes, AllThreads, Suspend/Resume, CreateString)
 - [x] ClassesBySignature, ReferenceType.Methods/Fields/Signature, ClassType.Superclass
 - [x] Method.LineTable / VariableTable
-- [x] EventRequest.Set/Clear/ClearAllBreakpoints — breakpoints with location, **count**, and **thread** modifiers
+- [x] EventRequest.Set/Clear/ClearAllBreakpoints — breakpoints with location, **count**, **thread**, **exception**, and **field** modifiers
 - [x] ThreadReference.Frames, StackFrame.GetValues/SetValues/ThisObject
 - [x] ObjectReference.ReferenceType/GetValues/**InvokeMethod**, ClassType.**InvokeMethod** (statics), ArrayReference.Length/GetValues, StringReference.Value
 - [x] **Event loop** for async breakpoint/step notifications
@@ -219,7 +222,9 @@ passes it otherwise skips.
 - [x] **Conditional breakpoints** — `condition` evaluated in the hit frame (`expr OP expr` or boolean chains); auto-resumes when false
 - [x] **Multiple concurrent sessions** — `debug.attach` returns a `session_id`; tools take an optional `session_id` (defaults to current)
 - [x] **Arguments** in `evaluate` / conditions: literals (int, long `123L`, boolean, null, `"string"`) or expressions
-- [x] **Safety**: `panic` + idle watchdog auto-resume
+- [x] **Field watchpoints** — `FIELD_MODIFICATION` / `FIELD_ACCESS` requests; a write hit reports the
+      mutating location and the old → new pair (the old value is read before the pending store commits)
+- [x] **Safety**: `panic` + idle watchdog auto-resume (clears breakpoints, exception breakpoints and watchpoints)
 - [x] Architecture independence (big-endian protocol; Intel & ARM)
 
 ## References

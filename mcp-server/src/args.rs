@@ -197,6 +197,24 @@ pub struct SetExceptionBreakpointArgs {
     pub uncaught: bool,
 }
 
+/// Arguments for `debug.set_watchpoint`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetWatchpointArgs {
+    /// Class declaring the field (e.g. `ConfigDefaultUtils` or a fully-qualified
+    /// `br.com.infotravel.util.ConfigDefaultUtils`). Must already be loaded — a watchpoint needs a
+    /// concrete field id, so it can't be deferred like a line breakpoint.
+    pub class_name: String,
+    /// Field to watch (e.g. `dsInfra`, `empresaId`). Inherited fields are found by walking
+    /// superclasses; the watch is registered on the class that actually declares it.
+    pub field_name: String,
+    /// Break on writes (`FIELD_MODIFICATION`) — the default, and what answers "who mutates this?".
+    #[serde(default = "default_true")]
+    pub modify: bool,
+    /// Also break on reads (`FIELD_ACCESS`). Noisy on a hot field; off by default.
+    #[serde(default)]
+    pub access: bool,
+}
+
 /// Arguments for `debug.force_return`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ForceReturnArgs {
@@ -226,6 +244,7 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(ListThreadsArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(SetValueArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(SetExceptionBreakpointArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(SetWatchpointArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(ForceReturnArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(GetTracesArgs)).unwrap(),
         ];
