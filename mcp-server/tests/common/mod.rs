@@ -11,10 +11,6 @@
 //
 //     scripts/integration-test.sh          # or: cargo test --test mcp_integration -- --ignored
 //
-// Scope it to `--test mcp_integration`: a bare `cargo test -- --ignored` also hands `--ignored` to the
-// doctest harness, which then tries to compile the deliberately-```ignore illustrative doctests in
-// jdwp-client and fails for reasons that have nothing to do with these tests.
-//
 // They are `#[ignore]`d because they spawn JVMs and take seconds, not milliseconds.
 
 #![allow(dead_code)] // each test file uses a subset of this harness

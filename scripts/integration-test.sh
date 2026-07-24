@@ -12,9 +12,8 @@
 #   scripts/integration-test.sh force_return       # only tests whose name contains this
 #   scripts/integration-test.sh -- --test-threads=1  # serial, easier to read when debugging
 #
-# Note the `--test mcp_integration` scope below: a bare `cargo test -- --ignored` would also hand
-# `--ignored` to the doctest harness and try to compile jdwp-client's deliberately-`ignore`d
-# illustrative doctests, which fail for unrelated reasons.
+# The `--test mcp_integration` scope keeps the output to these tests and skips rebuilding the other
+# harnesses; `cargo test -- --ignored` also works if you want everything.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

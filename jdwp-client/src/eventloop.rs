@@ -37,19 +37,23 @@ pub struct CommandRequest {
 /// - Events should be consumed from a single task/clone
 ///
 /// # Example
-/// ```ignore
+/// ```no_run
+/// # use jdwp_client::EventLoopHandle;
+/// # use jdwp_client::protocol::CommandPacket;
+/// # async fn demo(event_loop: EventLoopHandle, cmd1: CommandPacket, cmd2: CommandPacket) {
 /// // Good: Single event consumer
 /// let handle1 = event_loop.clone();
 /// let handle2 = event_loop.clone();
 ///
 /// // Both can send commands
-/// handle1.send_command(cmd1);
-/// handle2.send_command(cmd2);
+/// let _ = handle1.send_command(cmd1).await;
+/// let _ = handle2.send_command(cmd2).await;
 ///
 /// // Only one should consume events
 /// while let Some(event) = handle1.recv_event().await {
 ///     // Process event
 /// }
+/// # }
 /// ```
 #[derive(Clone, Debug)]
 pub struct EventLoopHandle {

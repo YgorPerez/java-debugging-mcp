@@ -19,9 +19,13 @@ impl JdwpConnection {
     /// The actual string value
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use jdwp_client::types::ObjectId;
+    /// # async fn demo(mut connection: jdwp_client::JdwpConnection, string_object_id: ObjectId)
+    /// #     -> jdwp_client::JdwpResult<()> {
     /// let value = connection.get_string_value(string_object_id).await?;
     /// println!("String value: {}", value);
+    /// # Ok(()) }
     /// ```
     ///
     /// # Errors

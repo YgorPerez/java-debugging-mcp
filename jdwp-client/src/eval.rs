@@ -3,10 +3,10 @@
 
 use crate::commands::{command_sets, object_reference_commands, reference_type_commands, stack_frame_commands};
 use crate::connection::JdwpConnection;
-use crate::protocol::{CommandPacket, JdwpError, JdwpResult};
-use crate::reader::{read_string, read_u64, read_u8};
+use crate::protocol::{CommandPacket, JdwpResult};
+use crate::reader::{read_string, read_u64, read_u8, read_value_by_tag};
 use crate::types::{ClassId, FrameId, MethodId, ObjectId, ReferenceTypeId, ThreadId, Value, ValueData};
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
 
 // ClassType.Superclass lives in command set 3 (CLASS_TYPE), command 1.
 const CLASS_TYPE_SUPERCLASS: u8 = 1;
@@ -178,18 +178,3 @@ pub(crate) fn write_untagged_value<B: BufMut>(buf: &mut B, v: &Value) {
     }
 }
 
-pub(crate) fn read_value_by_tag(tag: u8, buf: &mut &[u8]) -> JdwpResult<ValueData> {
-    match tag {
-        66 => Ok(ValueData::Byte(buf.get_i8())),
-        67 => Ok(ValueData::Char(buf.get_u16())),
-        68 => Ok(ValueData::Double(buf.get_f64())),
-        70 => Ok(ValueData::Float(buf.get_f32())),
-        73 => Ok(ValueData::Int(buf.get_i32())),
-        74 => Ok(ValueData::Long(buf.get_i64())),
-        83 => Ok(ValueData::Short(buf.get_i16())),
-        90 => Ok(ValueData::Boolean(buf.get_u8() != 0)),
-        86 => Ok(ValueData::Void),
-        76 | 115 | 116 | 103 | 108 | 99 | 91 => Ok(ValueData::Object(read_u64(buf)?)),
-        _ => Err(JdwpError::Protocol(format!("Unknown value tag: {tag}"))),
-    }
-}

@@ -5,9 +5,9 @@
 use crate::commands::{command_sets, stack_frame_commands};
 use crate::connection::JdwpConnection;
 use crate::protocol::{CommandPacket, JdwpResult};
-use crate::reader::{read_u64, read_u8};
-use crate::types::{FrameId, ThreadId, Value, ValueData};
-use bytes::{Buf, BufMut};
+use crate::reader::{read_u8, read_value_by_tag};
+use crate::types::{FrameId, ThreadId, Value};
+use bytes::BufMut;
 
 /// Variable slot information for `GetValues`
 #[derive(Debug, Clone, Copy)]
@@ -66,32 +66,3 @@ impl JdwpConnection {
     }
 }
 
-/// Read a value based on its type tag
-fn read_value_by_tag(tag: u8, buf: &mut &[u8]) -> JdwpResult<ValueData> {
-    match tag {
-        // 'B' = byte
-        66 => Ok(ValueData::Byte(buf.get_i8())),
-        // 'C' = char
-        67 => Ok(ValueData::Char(buf.get_u16())),
-        // 'D' = double
-        68 => Ok(ValueData::Double(buf.get_f64())),
-        // 'F' = float
-        70 => Ok(ValueData::Float(buf.get_f32())),
-        // 'I' = int
-        73 => Ok(ValueData::Int(buf.get_i32())),
-        // 'J' = long
-        74 => Ok(ValueData::Long(buf.get_i64())),
-        // 'S' = short
-        83 => Ok(ValueData::Short(buf.get_i16())),
-        // 'Z' = boolean
-        90 => Ok(ValueData::Boolean(buf.get_u8() != 0)),
-        // 'V' = void
-        86 => Ok(ValueData::Void),
-        // Object types (L, s, t, g, l, c, [)
-        76 | 115 | 116 | 103 | 108 | 99 | 91 => {
-            let object_id = read_u64(buf)?;
-            Ok(ValueData::Object(object_id))
-        }
-        _ => Err(crate::protocol::JdwpError::Protocol(format!("Unknown value tag: {tag}"))),
-    }
-}

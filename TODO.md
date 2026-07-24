@@ -24,9 +24,8 @@ probe under `examples/probes/` and mark breakpoint lines with `// BP<n>` comment
 by marker, so editing the Java can't silently point a test at the wrong statement.
 
 They are `#[ignore]`d (they spawn JVMs and need a JDK), which is why the runner passes `--ignored`.
-Scope to `--test mcp_integration`: a bare `cargo test -- --ignored` also un-ignores jdwp-client's
-illustrative ```ignore doctests, which were never meant to compile. **With no JDK every test prints
-`SKIP` and passes** — so a green run on a JDK-less machine proves nothing; grep the output for `SKIP`.
+**With no JDK every test prints `SKIP` and passes** — so a green run on a JDK-less machine proves
+nothing; grep the output for `SKIP`.
 
 **Raw `jdwp-client` protocol work — an example.**
 Register an `examples/test_*.rs` in `jdwp-client/Cargo.toml` and run it against a hand-launched probe:
@@ -157,6 +156,30 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   `int` for a reference parameter, which reads it as an oop and **SIGSEGVs the debuggee** (reproduced
   — hs_err + core dump). The fallback is now kind-checked, so a type-mismatched invoke is refused
   with an error instead of crashing the target.
+- **Wire-reader unit tests, and the panic they found (TEST-2)** — the readers had zero coverage against
+  malformed input, which a real JVM never produces and a real *bug* does. 12 table-driven tests now
+  cover them (`reader.rs`, `events.rs`; plain `cargo test`, no JDK): every `ValueData` variant
+  round-trips `write_untagged_value` → `read_value_by_tag`, **every** truncation of every value and of a
+  whole event packet returns `Err`, an unknown value tag is refused without advancing the buffer, an
+  unhandled event kind degrades to `Unknown`, and `read_string` handles empty / truncated / lying
+  lengths and invalid UTF-8.
+  What they found: `read_value_by_tag` existed in **three copies** (`eval`, `stackframe`, `object`),
+  none of which checked the buffer — `bytes::Buf::get_*` **panics** on a short read (verified against
+  `bytes`, not assumed), and `parse_field_modification_event` calls that path with a `valueToBe` straight
+  off the wire. A truncated FIELD_MODIFICATION reply would therefore panic the **event-loop task**,
+  killing the session rather than surfacing an error. There is now one implementation in `reader.rs`,
+  made total by resolving each tag's width up front — so an unknown tag fails before the buffer is
+  touched, and a known one is bounds-checked once. `read_string`'s length prefix is checked against what
+  is actually left, and every fixed-width reader shares one `ensure` that names the field that ran out.
+- **jdwp-client's doc examples compile (DOC-2)** — six illustrative examples were ```` ```ignore ````
+  and would not have compiled, so `cargo test -- --ignored` handed `--ignored` to the doctest harness
+  and failed for reasons unrelated to whatever you were running — which is the only reason
+  `scripts/integration-test.sh` had to scope itself to `--test mcp_integration`. Each is now `no_run`
+  with its setup on hidden `#` lines, so the example text stays as short as it was but is **type-checked
+  against the real signatures** and can't drift. That caught one already-wrong snippet: the
+  `EventLoopHandle` example called the async `send_command` without awaiting it. The scoping workaround
+  and its three explanatory comments are gone; the script keeps `--test mcp_integration` only to narrow
+  the output.
 - **Non-suspending exception breakpoints and watchpoints (TRACE-2)** — `trace:true` now works on
   **all three** kinds of stop point, not just line breakpoints:
   `debug.set_exception_breakpoint {…, trace:true}` and `debug.set_watchpoint {…, trace:true}` arm with
@@ -289,46 +312,6 @@ rather than adding a cache on faith.
 - [ ] Container kind memoised per type id
 - [ ] A measured packet count for a deep expansion, before and after, recorded in the plan doc
 - [ ] Closed as "no measurable gain" if that is what the numbers say
-
-**Blocked by**
-None.
-
-### TEST-2 — The wire readers have no unit tests  · P2 · S
-
-**What to build**
-Driving a real JVM has earned its keep — it caught a modifier-kind mix-up, frame ids invalidated by
-invocation, and an ill-typed invoke that SIGSEGV'd the debuggee, none of which a mock would have
-questioned. But it leaves `read_value_by_tag`, `read_string`, `read_location` and the event parsers with
-zero coverage against **malformed or truncated** input, which a real JVM never produces. A truncated
-reply currently panics or misparses rather than erroring cleanly.
-
-Table-driven tests over byte slices: each value tag, a truncated buffer per reader, an unknown tag, an
-empty event set. Cheap, fast, and no JVM.
-
-**Acceptance criteria**
-- [ ] Every `ValueData` variant round-trips through `write_untagged_value` → `read_value_by_tag`
-- [ ] A truncated buffer returns `Err`, never panics, for each reader
-- [ ] An unknown value tag and an unknown event kind are handled as errors/`Unknown`, not panics
-- [ ] Runs under plain `cargo test` (no `--ignored`, no JDK)
-
-**Blocked by**
-None.
-
-### DOC-2 — jdwp-client's illustrative doctests don't compile  · P2 · S
-
-**What to build**
-Several doc examples are ```` ```ignore ```` and would not compile (`await` outside async, undefined
-bindings). Consequence: `cargo test -- --ignored` un-ignores them and fails for reasons unrelated to
-what you were running, which is the only reason `scripts/integration-test.sh` must scope itself to
-`--test mcp_integration`. Anyone typing the obvious command hits it.
-
-Either make them compile (`no_run` with a real async wrapper) or make them non-doctest fenced blocks
-(```` ```text ````) so nothing tries. Then drop the scoping workaround from the script and its comment.
-
-**Acceptance criteria**
-- [ ] `cargo test -- --ignored` passes without the `--test` scope
-- [ ] Every doc example either compiles or is not a doctest
-- [ ] The workaround comments in `scripts/integration-test.sh` and the test headers are removed
 
 **Blocked by**
 None.

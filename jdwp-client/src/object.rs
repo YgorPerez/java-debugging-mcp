@@ -6,9 +6,9 @@ use crate::commands::{command_sets, object_reference_commands};
 use crate::connection::JdwpConnection;
 use crate::eval::write_untagged_value;
 use crate::protocol::{CommandPacket, JdwpResult};
-use crate::reader::{read_i32, read_u64, read_u8};
-use crate::types::{FieldId, ObjectId, ReferenceTypeId, Value, ValueData};
-use bytes::{Buf, BufMut};
+use crate::reader::{read_i32, read_u64, read_u8, read_value_by_tag};
+use crate::types::{FieldId, ObjectId, ReferenceTypeId, Value};
+use bytes::BufMut;
 use serde::{Deserialize, Serialize};
 
 /// Field value from an object
@@ -64,9 +64,15 @@ impl JdwpConnection {
     /// Vector of Values corresponding to the requested fields
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use jdwp_client::types::{FieldId, ObjectId};
+    /// # async fn demo(
+    /// #     mut connection: jdwp_client::JdwpConnection,
+    /// #     object_id: ObjectId, field_id1: FieldId, field_id2: FieldId,
+    /// # ) -> jdwp_client::JdwpResult<()> {
     /// let fields = vec![field_id1, field_id2];
     /// let values = connection.get_object_values(object_id, fields).await?;
+    /// # Ok(()) }
     /// ```
     ///
     /// # Errors
@@ -232,39 +238,6 @@ impl JdwpConnection {
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
         Ok(())
-    }
-}
-
-/// Read a value based on its type tag (same as in stackframe.rs)
-fn read_value_by_tag(tag: u8, buf: &mut &[u8]) -> JdwpResult<ValueData> {
-    match tag {
-        // 'B' = byte
-        66 => Ok(ValueData::Byte(buf.get_i8())),
-        // 'C' = char
-        67 => Ok(ValueData::Char(buf.get_u16())),
-        // 'D' = double
-        68 => Ok(ValueData::Double(buf.get_f64())),
-        // 'F' = float
-        70 => Ok(ValueData::Float(buf.get_f32())),
-        // 'I' = int
-        73 => Ok(ValueData::Int(buf.get_i32())),
-        // 'J' = long
-        74 => Ok(ValueData::Long(buf.get_i64())),
-        // 'S' = short
-        83 => Ok(ValueData::Short(buf.get_i16())),
-        // 'Z' = boolean
-        90 => Ok(ValueData::Boolean(buf.get_u8() != 0)),
-        // 'V' = void
-        86 => Ok(ValueData::Void),
-        // Object types (L, s, t, g, l, c, [)
-        // L = object, s = string, t = thread, g = thread group, l = class loader, c = class object, [ = array
-        76 | 115 | 116 | 103 | 108 | 99 | 91 => {
-            let object_id = read_u64(buf)?;
-            Ok(ValueData::Object(object_id))
-        }
-        _ => Err(crate::protocol::JdwpError::Protocol(format!(
-            "Unknown value tag: {tag}"
-        ))),
     }
 }
 

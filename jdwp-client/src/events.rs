@@ -250,7 +250,7 @@ fn parse_field_modification_event(buf: &mut &[u8]) -> JdwpResult<EventKind> {
     let field = parse_field_event_head(buf)?;
     // valueToBe: a tagged value carrying what the pending write will store.
     let tag = read_u8(buf)?;
-    let new_value = Value { tag, data: crate::eval::read_value_by_tag(tag, buf)? };
+    let new_value = Value { tag, data: crate::reader::read_value_by_tag(tag, buf)? };
     Ok(EventKind::FieldModification { field, new_value })
 }
 
@@ -267,4 +267,133 @@ fn read_location(buf: &mut &[u8]) -> JdwpResult<Location> {
         method_id,
         index,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::event_kinds;
+
+    /// Build an event-packet body: suspend policy, event count, then each event's bytes.
+    fn packet(suspend_policy: u8, events: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = vec![suspend_policy];
+        out.extend_from_slice(&i32::try_from(events.len()).unwrap_or(0).to_be_bytes());
+        for e in events {
+            out.extend_from_slice(e);
+        }
+        out
+    }
+
+    /// A JDWP location: typeTag, classID, methodID, code index.
+    fn location(class: u64, method: u64, index: u64) -> Vec<u8> {
+        let mut out = vec![1];
+        out.extend_from_slice(&class.to_be_bytes());
+        out.extend_from_slice(&method.to_be_bytes());
+        out.extend_from_slice(&index.to_be_bytes());
+        out
+    }
+
+    fn breakpoint_event(request_id: i32, thread: u64) -> Vec<u8> {
+        let mut out = vec![event_kinds::BREAKPOINT];
+        out.extend_from_slice(&request_id.to_be_bytes());
+        out.extend_from_slice(&thread.to_be_bytes());
+        out.extend_from_slice(&location(0x11, 0x22, 3));
+        out
+    }
+
+    /// A `FIELD_MODIFICATION` event, whose trailing `valueToBe` is the one place an event parser reads a
+    /// tagged value — and the path that used to panic on a short buffer instead of erroring.
+    fn field_modification_event(new_value: i32) -> Vec<u8> {
+        let mut out = vec![event_kinds::FIELD_MODIFICATION];
+        out.extend_from_slice(&7i32.to_be_bytes()); // requestId
+        out.extend_from_slice(&0x1u64.to_be_bytes()); // thread
+        out.extend_from_slice(&location(0x11, 0x22, 3));
+        out.push(1); // refTypeTag
+        out.extend_from_slice(&0x33u64.to_be_bytes()); // refType
+        out.extend_from_slice(&0x44u64.to_be_bytes()); // fieldId
+        out.push(crate::reader::value_tags::OBJECT); // object tag
+        out.extend_from_slice(&0u64.to_be_bytes()); // object (0 = static field)
+        out.push(crate::reader::value_tags::INT);
+        out.extend_from_slice(&new_value.to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn an_empty_event_set_parses_as_zero_events() {
+        let set = parse_event_packet(&packet(2, &[])).expect("an empty set is well-formed");
+        assert_eq!(set.suspend_policy, 2);
+        assert!(set.events.is_empty());
+    }
+
+    #[test]
+    fn a_well_formed_set_parses_every_event() {
+        let wire = packet(1, &[breakpoint_event(5, 0xabc), field_modification_event(42)]);
+        let set = parse_event_packet(&wire).expect("well-formed");
+        assert_eq!(set.events.len(), 2);
+        match &set.events[0].details {
+            EventKind::Breakpoint { thread, location } => {
+                assert_eq!(*thread, 0xabc);
+                assert_eq!(location.method_id, 0x22);
+            }
+            other => panic!("expected a breakpoint, got {other:?}"),
+        }
+        match &set.events[1].details {
+            EventKind::FieldModification { field, new_value } => {
+                assert_eq!(field.field_id, 0x44);
+                assert!(matches!(new_value.data, crate::types::ValueData::Int(42)));
+            }
+            other => panic!("expected a field modification, got {other:?}"),
+        }
+    }
+
+    /// An event kind we don't parse must degrade to `Unknown`, not fail the whole set: the JVM sends
+    /// kinds we never requested (monitor events, frame pops), and dropping the set would lose
+    /// the events beside it.
+    #[test]
+    fn an_unhandled_event_kind_becomes_unknown_rather_than_an_error() {
+        // MONITOR_WAIT is a real JDWP kind this client never requests and does not parse — the honest
+        // case, rather than a number the protocol doesn't define.
+        let mut ev = vec![event_kinds::MONITOR_WAIT];
+        ev.extend_from_slice(&1i32.to_be_bytes());
+        let set = parse_event_packet(&packet(0, &[ev])).expect("an unhandled kind is not a parse failure");
+        assert!(
+            matches!(set.events.first().map(|e| &e.details), Some(EventKind::Unknown { kind })
+                if *kind == event_kinds::MONITOR_WAIT),
+            "expected Unknown, got {:?}",
+            set.events.first().map(|e| &e.details)
+        );
+    }
+
+    /// Every truncation of a valid packet must error rather than panic. This is the assertion that
+    /// would have caught the pre-`reader` behaviour: a short `valueToBe` panicked the event-loop task,
+    /// killing the whole debug session instead of reporting a malformed reply.
+    #[test]
+    fn every_truncation_of_a_packet_errors_instead_of_panicking() {
+        for event in [breakpoint_event(5, 0xabc), field_modification_event(42)] {
+            let wire = packet(1, &[event]);
+            for keep in 0..wire.len() {
+                let short = &wire[..keep];
+                // The count field can read as 0 before it is complete, which is a legitimate empty set.
+                let parsed = parse_event_packet(short);
+                if let Ok(set) = parsed {
+                    assert!(
+                        set.events.is_empty(),
+                        "{keep} of {} bytes parsed as {} complete event(s)",
+                        wire.len(),
+                        set.events.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A claimed event count far larger than the data must not pre-allocate for it or panic — it must
+    /// fail when the events run out.
+    #[test]
+    fn a_lying_event_count_errors_rather_than_over_reading() {
+        let mut wire = vec![1u8];
+        wire.extend_from_slice(&1000i32.to_be_bytes());
+        wire.extend_from_slice(&breakpoint_event(5, 0xabc));
+        assert!(parse_event_packet(&wire).is_err(), "1000 claimed, 1 supplied");
+    }
 }

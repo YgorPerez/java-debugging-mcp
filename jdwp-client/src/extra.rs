@@ -5,10 +5,10 @@ use crate::commands::{
     command_sets, event_commands, event_kinds, step_depths, step_sizes, vm_commands,
 };
 use crate::connection::JdwpConnection;
-use crate::eval::{read_value_by_tag, write_tagged_value};
+use crate::eval::write_tagged_value;
 use crate::eventrequest::SuspendPolicy;
 use crate::protocol::{CommandPacket, JdwpResult};
-use crate::reader::{read_i32, read_u64, read_u8};
+use crate::reader::{read_i32, read_u64, read_u8, read_value_by_tag};
 use crate::types::{FrameId, MethodId, ObjectId, ReferenceTypeId, ThreadId, Value, ValueData};
 use bytes::BufMut;
 

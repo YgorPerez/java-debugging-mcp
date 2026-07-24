@@ -83,10 +83,12 @@ impl JdwpConnection {
     /// This is useful for polling events without blocking the current task.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # async fn demo(connection: jdwp_client::JdwpConnection) {
     /// if let Some(event) = connection.try_recv_event().await {
     ///     // Handle event
     /// }
+    /// # }
     /// ```
     pub async fn try_recv_event(&self) -> Option<EventSet> {
         self.event_loop.try_recv_event().await
@@ -100,10 +102,12 @@ impl JdwpConnection {
     /// Returns `None` if the event loop has shut down.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # async fn demo(connection: jdwp_client::JdwpConnection) {
     /// while let Some(event) = connection.recv_event().await {
     ///     // Process event
     /// }
+    /// # }
     /// ```
     pub async fn recv_event(&self) -> Option<EventSet> {
         self.event_loop.recv_event().await

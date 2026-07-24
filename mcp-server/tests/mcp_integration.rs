@@ -8,9 +8,6 @@
 //     scripts/integration-test.sh
 //     cargo test --test mcp_integration -- --ignored --nocapture   # also shows SKIP reasons
 //
-// Always scope to `--test mcp_integration`: a bare `cargo test -- --ignored` also un-ignores the
-// illustrative ```ignore doctests in jdwp-client, which are not meant to compile.
-//
 // Without a JDK each test prints SKIP and passes, so a JDK-less CI stays green rather than red.
 
 mod common;

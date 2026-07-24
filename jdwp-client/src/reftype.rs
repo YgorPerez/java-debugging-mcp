@@ -81,11 +81,15 @@ impl JdwpConnection {
     /// Vector of `FieldInfo` containing field IDs, names, signatures, and modifiers
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use jdwp_client::types::ReferenceTypeId;
+    /// # async fn demo(mut connection: jdwp_client::JdwpConnection, class_id: ReferenceTypeId)
+    /// #     -> jdwp_client::JdwpResult<()> {
     /// let fields = connection.get_fields(class_id).await?;
     /// for field in fields {
     ///     println!("Field: {} ({})", field.name, field.signature);
     /// }
+    /// # Ok(()) }
     /// ```
     ///
     /// # Errors
