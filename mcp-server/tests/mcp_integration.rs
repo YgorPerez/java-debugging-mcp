@@ -77,6 +77,49 @@ fn evaluate_static_methods_and_object_arguments() {
         &["has no static method"],
     );
 
+    // --- EVAL-3: parameters the superclass chain can't settle ---
+    // An interface never appears in an argument's superclass chain, so these need the JVM's own answer.
+    assert_contains_all(
+        "directly implemented interface",
+        &server.evaluate("EvalProbe.takesRunnable(EvalProbe.task)"),
+        &["Runnable"],
+    );
+    // Subtask implements Runnable only through its superclass — the case a direct-superinterface query
+    // misses, and the reason the walk has to be transitive.
+    assert_contains_all(
+        "interface inherited via superclass",
+        &server.evaluate("EvalProbe.takesRunnable(EvalProbe.subtask)"),
+        &["Runnable"],
+    );
+    // And on a JDK class we don't own.
+    assert_contains_all(
+        "interface on a library type",
+        &server.evaluate("EvalProbe.takesComparable(\"x\")"),
+        &["Comparable"],
+    );
+    // The negative case, which is the whole point: an argument that does NOT implement the interface
+    // must be refused, not passed anyway by a blind arity/kind fallback.
+    assert_contains_all(
+        "an object that doesn't implement the interface is refused",
+        &server.evaluate("EvalProbe.takesRunnable(a)"),
+        &["has no static method"],
+    );
+    assert_contains_all(
+        "an unrelated class parameter is refused",
+        &server.evaluate("EvalProbe.takesThread(a)"),
+        &["has no static method"],
+    );
+    // Autoboxing: an int argument selects f(Integer), and a real Integer reaches the method.
+    assert_contains_all("int boxes into Integer", &server.evaluate("EvalProbe.takesInteger(5)"), &["Integer:5"]);
+    // Array covariance — a String[] is an Object[], which no signature comparison can tell you.
+    assert_contains_all(
+        "array covariance",
+        &server.evaluate("EvalProbe.takesObjects(EvalProbe.words)"),
+        &["Object[]:2"],
+    );
+    // The cheap path must be unchanged: an exact match still wins without asking the JVM anything.
+    assert_contains_all("exact overload still preferred", &server.evaluate("EvalProbe.pick(a)"), &["Item:alpha"]);
+
     // --- Conditions whose right-hand side is an expression, not a literal ---
     // Each gets its own line so its hit is distinguishable from every earlier one by line number.
     // Both hold on every iteration, so a miss means the condition failed to evaluate.

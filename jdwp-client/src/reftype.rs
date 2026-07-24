@@ -72,6 +72,80 @@ impl JdwpConnection {
         Ok(methods)
     }
 
+    /// `ReferenceType.Interfaces` — the interfaces this type declares **directly**.
+    ///
+    /// Direct only, per the JDWP spec: `class A implements Runnable` reports `Runnable`, and a class
+    /// whose *superclass* implements it reports nothing. Use [`Self::implements_interface`] for the
+    /// question callers actually have.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn get_interfaces(
+        &mut self,
+        ref_type_id: ReferenceTypeId,
+    ) -> JdwpResult<Vec<ReferenceTypeId>> {
+        if let Some(hit) = self.types().interfaces(ref_type_id) {
+            return Ok(hit);
+        }
+        let id = self.next_id();
+        let mut packet =
+            CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::INTERFACES);
+        packet.data.put_u64(ref_type_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let count = read_i32(&mut data)?;
+        let mut ifaces = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        for _ in 0..count {
+            ifaces.push(read_u64(&mut data)?);
+        }
+        self.types().put_interfaces(ref_type_id, &ifaces);
+        Ok(ifaces)
+    }
+
+    /// Whether `type_id` implements the interface whose JNI signature is `wanted` (e.g.
+    /// `"Ljava/lang/Runnable;"`), the way `instanceof` would answer it.
+    ///
+    /// Walks the whole lattice, because JDWP only reports *direct* superinterfaces: up the superclass
+    /// chain (a parent's interfaces are inherited) and across each type's interfaces transitively (an
+    /// interface extends interfaces). Every step reads through the type cache, so a repeat question
+    /// about the same class costs nothing.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if a JDWP request fails or a reply cannot be parsed.
+    pub async fn implements_interface(
+        &mut self,
+        type_id: ReferenceTypeId,
+        wanted: &str,
+    ) -> JdwpResult<bool> {
+        // Breadth-first over (superclasses × interfaces), with `seen` guarding the diamonds that make
+        // interface graphs a lattice rather than a tree — without it, `Collection` is visited once per
+        // path that reaches it.
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = vec![type_id];
+        // A bound on pathological/cyclic input, matching the superclass walks elsewhere in the crate.
+        let mut steps = 0;
+        while let Some(current) = queue.pop() {
+            steps += 1;
+            if steps > 500 {
+                break;
+            }
+            if !seen.insert(current) {
+                continue;
+            }
+            if self.get_signature(current).await.is_ok_and(|s| s == wanted) {
+                return Ok(true);
+            }
+            queue.extend(self.get_interfaces(current).await.unwrap_or_default());
+            if let Some(parent) = self.get_superclass(current).await.unwrap_or(None) {
+                queue.push(parent);
+            }
+        }
+        Ok(false)
+    }
+
     /// Get fields for a reference type (ReferenceType.Fields command)
     ///
     /// # Arguments
@@ -133,3 +207,4 @@ impl JdwpConnection {
         Ok(fields)
     }
 }
+

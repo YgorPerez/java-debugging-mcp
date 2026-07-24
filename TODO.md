@@ -156,6 +156,26 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   `int` for a reference parameter, which reads it as an oop and **SIGSEGVs the debuggee** (reproduced
   — hs_err + core dump). The fallback is now kind-checked, so a type-mismatched invoke is refused
   with an error instead of crashing the target.
+- **Interface-typed parameters and autoboxing in overload resolution (EVAL-3)** — `arg_type` walked only
+  the superclass chain, so a parameter typed as an interface the argument implements (`handle(Runnable)`)
+  could never match precisely, and neither could a boxed primitive (`f(Integer)` given an `int`). Both
+  fell through to an arity-and-kind fallback that picked the first candidate — right often enough to be
+  untrustworthy.
+  Overload selection is now two passes, cheap first: plain scoring (no round trips) as before, and only
+  if *nothing* scores are the arity-matching leftovers put to the JVM — `ReferenceType.Interfaces`
+  (command set 2, command 10), walked transitively through the type cache, plus autoboxing and array
+  covariance. An argument that doesn't satisfy a parameter is now **refused**, and a chosen overload's
+  reference parameters get their primitives boxed for real via `valueOf` before the invoke.
+  ⚠️ **The JVM does not catch this for you.** Measured with the old fallback restored:
+  `takesRunnable(anItem)` *succeeded* and returned normally — `InvokeMethod` accepted an object that does
+  not implement the parameter's interface. It only looked harmless because that method body ignores its
+  argument; one calling `r.run()` would have been operating on a value of the wrong type. Being wrong here
+  is silent, which is why the check is strict rather than best-effort.
+  Validated in `evaluate_static_methods_and_object_arguments` against new `EvalProbe` overloads: a
+  directly-implemented interface, one **inherited through a superclass** (which a direct-superinterface
+  query misses), an interface on a JDK type, an `int` boxed into `f(Integer)`, `String[]` into
+  `f(Object[])`, and two negative cases that must be refused. The negatives were confirmed load-bearing by
+  restoring the old fallback and watching them fail.
 - **Container-kind caching: measured, no gain, dropped (PERF-1)** — closed the way the item asked to be
   closed. `classify_container` runs per rendered object and its verdict is a pure function of the type,
   so memoising it looks obviously right. A/B on the heaviest case available (`batch`: 20 identical
@@ -265,28 +285,6 @@ silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
 > TEST-1, OBJ-1, OBJ-2, DOC-1) plus all 18 appendix items. A review of that work found ten more items;
 > the three **defects in what shipped** (TRACE-2, OBJ-3, EVT-1) are now done and moved to Shipped, and
 > what remains below is follow-on work rather than anything broken.
-
-### EVAL-3 — Interface-typed parameters and boxed primitives in overload resolution  · P2 · M
-
-**What to build**
-`arg_type` walks only the superclass chain, so a parameter typed as an interface the argument implements
-(`handle(Runnable)`) never matches precisely and falls through to the kind-compatible fallback — as does
-a boxed primitive (`f(Integer)` given an int). The fallback picks the first arity-and-kind match, which
-is right often enough to be untrustworthy.
-
-Needs `ReferenceType.Interfaces` (command set 2, command 10), walked transitively — interfaces extend
-interfaces — plus autoboxing in `score_param` so an `int` argument can score against `Integer`.
-
-**Acceptance criteria**
-- [ ] `ReferenceType.Interfaces` in `jdwp-client`, with the transitive walk memoised in `TypeCache`
-- [ ] An argument matches an interface-typed parameter it actually implements, and is *rejected* for one
-      it doesn't — no silent fallback
-- [ ] An int argument selects `f(Integer)` when that is the only candidate, boxing via `valueOf`
-- [ ] Probe with `pick(Runnable)`/`pick(Comparable)`/`pick(Integer)` overloads asserts each resolves
-
-**Blocked by**
-None. Note the fallback exists precisely because this is missing — see the SIGSEGV note under EVAL-1/2
-for why a wrong pick is dangerous rather than merely wrong.
 
 ### OBJ-4 — Subscript writes and `Map`-entry filtering  · P2 · M
 

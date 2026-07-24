@@ -166,6 +166,10 @@ pub(crate) struct TypeCache {
     /// `None` means "this type has no superclass" (`java.lang.Object`), which is itself worth caching —
     /// it's the terminator of every superclass walk in the crate.
     superclasses: Mutex<HashMap<ClassId, Option<ClassId>>>,
+    /// **Direct** superinterfaces, as JDWP reports them. The transitive set is derived by walking these
+    /// (an interface extends interfaces), and each step is a cache hit after the first visit — which is
+    /// what makes an `instanceof`-style check affordable enough to use during overload resolution.
+    interfaces: Mutex<HashMap<ReferenceTypeId, Vec<ReferenceTypeId>>>,
 }
 
 /// A superclass cache lookup has three outcomes, and conflating the last two would make every
@@ -225,6 +229,14 @@ impl TypeCache {
     pub(crate) fn put_superclass(&self, id: ClassId, parent: Option<ClassId>) {
         guard!(self.superclasses).insert(id, parent);
     }
+
+    pub(crate) fn interfaces(&self, id: ReferenceTypeId) -> Option<Vec<ReferenceTypeId>> {
+        guard!(self.interfaces).get(&id).cloned()
+    }
+
+    pub(crate) fn put_interfaces(&self, id: ReferenceTypeId, ifaces: &[ReferenceTypeId]) {
+        guard!(self.interfaces).insert(id, ifaces.to_vec());
+    }
 }
 
 #[cfg(test)]
@@ -261,6 +273,14 @@ mod tests {
         // A different type id must not see the first one's entries.
         assert_eq!(c.signature(8), None);
         assert!(c.fields(8).is_none());
+
+        // Direct superinterfaces. An empty list is a real answer worth caching — most classes have
+        // none, and the transitive walk asks about every type it passes.
+        assert!(c.interfaces(7).is_none());
+        c.put_interfaces(7, &[11, 12]);
+        assert_eq!(c.interfaces(7), Some(vec![11, 12]));
+        c.put_interfaces(8, &[]);
+        assert_eq!(c.interfaces(8), Some(vec![]), "\"implements nothing\" must cache as Some(empty)");
     }
 
     // "cached: no superclass" must not read as "not cached", or the top of every superclass walk would

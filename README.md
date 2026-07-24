@@ -16,7 +16,8 @@ natural language.
 - **Execution Control**: **Step over/into/out**, continue, pause
 - **Expression Evaluation**: `localVar`/`this`/`Class` heads with `.field` and `.method(args)` chains
   — including **static fields and static methods** (`ConfigDefaultUtils.getUrl()`) — resolving
-  overloads by the arguments' **runtime types** and walking the superclass chain. Arguments are
+  overloads by the arguments' **runtime types**, including interfaces they implement (walked
+  transitively) and autoboxing, and refusing an argument a parameter can't accept. Arguments are
   literals (int, long, boolean, null, `"string"`) **or expressions passed by reference**
   (`svc.matches(reserva)`, `foo.handle(this, cfg.getId())`)
 - **Value Rendering**: Strings, typed objects (best-effort `toString()`), and **array contents**

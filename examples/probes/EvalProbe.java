@@ -28,6 +28,28 @@ public class EvalProbe {
     // instance method that must NOT be picked for a static call of the same name/arity
     public String pick(int n) { return "instance"; }
 
+    // --- EVAL-3: parameters whose match can't be read off the superclass chain ---
+    // An interface-typed parameter never appears in an argument's superclass chain, so matching one
+    // means asking the JVM (ReferenceType.Interfaces, walked transitively).
+    public static String takesRunnable(Runnable r) { return "Runnable"; }
+    public static String takesComparable(Comparable<?> c) { return "Comparable"; }
+    // Only reachable by autoboxing an int argument. Note it is NOT overloaded with an int version:
+    // Java itself would prefer the primitive, so an overload pair here would test the wrong thing.
+    public static String takesInteger(Integer boxed) { return "Integer:" + boxed; }
+    // A concrete class with no relation to the arguments above — the negative case that must be
+    // REJECTED rather than picked by a blind arity/kind fallback.
+    public static String takesThread(Thread t) { return "Thread"; }
+    // Array covariance: a String[] is an Object[], which no signature comparison can tell you.
+    public static String takesObjects(Object[] xs) { return "Object[]:" + xs.length; }
+
+    // Implements one interface directly and inherits another through its superclass, so the
+    // transitive walk has something to find that a direct-superinterface query would miss.
+    public static class Task implements Runnable {
+        @Override public void run() { }
+    }
+
+    public static class Subtask extends Task { }
+
     public static class Item {
         String name;
         int qty;
@@ -39,6 +61,9 @@ public class EvalProbe {
     }
 
     static Item holder = new Item("holder", 3);
+    static Task task = new Task();
+    static Subtask subtask = new Subtask();
+    static String[] words = {"alpha", "beta"};
 
     // The BP<n> markers are how test_eval_invoke.rs finds its breakpoint lines — it greps this file
     // rather than hardcoding numbers, so editing above here is safe. Keep one marker per line.

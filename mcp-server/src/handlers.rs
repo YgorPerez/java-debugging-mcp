@@ -1895,44 +1895,46 @@ enum ArgType {
     Primitive(u8),
     /// A null reference — assignable to any reference parameter.
     Null,
-    /// A live object: the JNI signatures of its class and every superclass, most specific first
-    /// (always ending in `Ljava/lang/Object;`).
-    Object(Vec<String>),
+    /// A live object: its runtime type id, plus the JNI signatures of its class and every superclass,
+    /// most specific first (always ending in `Ljava/lang/Object;`).
+    ///
+    /// The chain answers "is this parameter one of my supertypes?" without a round trip. The type id is
+    /// what makes the *interface* question askable, since JDWP reports only direct superinterfaces and
+    /// the lattice has to be walked (see `JdwpConnection::implements_interface`).
+    Object { type_id: u64, chain: Vec<String> },
 }
 
 /// Classify one argument value, reading the object's runtime class chain when it is a reference.
 ///
 /// The chain is what makes an object argument resolvable to a specific overload: a parameter is
-/// assignable from the argument exactly when its declared type appears in the chain. Interfaces are
-/// not walked, so an interface-typed parameter can't be matched precisely and lands on
-/// [`kind_compatible`] instead.
+/// assignable from the argument exactly when its declared type appears in the chain. Interface-typed
+/// parameters are not in the chain — they are settled separately by [`assignable`], which asks the JVM.
 async fn arg_type(conn: &mut jdwp_client::JdwpConnection, v: &jdwp_client::types::Value) -> ArgType {
     let id = match v.data {
         jdwp_client::types::ValueData::Object(0) => return ArgType::Null,
         jdwp_client::types::ValueData::Object(id) => id,
         _ => return ArgType::Primitive(v.tag),
     };
+    let runtime_type = conn.get_object_reference_type(id).await.unwrap_or(0);
     let mut chain = Vec::new();
-    if let Ok(t) = conn.get_object_reference_type(id).await {
-        let mut current = Some(t);
-        let mut guard = 0;
-        while let Some(tid) = current {
-            guard += 1;
-            if guard > 50 {
-                break;
-            }
-            match conn.get_signature(tid).await {
-                Ok(s) => chain.push(s),
-                Err(_) => break,
-            }
-            current = conn.get_superclass(tid).await.unwrap_or(None);
+    let mut current = (runtime_type != 0).then_some(runtime_type);
+    let mut guard = 0;
+    while let Some(tid) = current {
+        guard += 1;
+        if guard > 50 {
+            break;
         }
+        match conn.get_signature(tid).await {
+            Ok(s) => chain.push(s),
+            Err(_) => break,
+        }
+        current = conn.get_superclass(tid).await.unwrap_or(None);
     }
     // Array types have no walkable superclass chain, so make the universal supertype explicit.
     if !chain.iter().any(|s| s == "Ljava/lang/Object;") {
         chain.push("Ljava/lang/Object;".to_string());
     }
-    ArgType::Object(chain)
+    ArgType::Object { type_id: runtime_type, chain }
 }
 
 /// Score how well `arg` fits the parameter descriptor `param`: `None` = not assignable at all,
@@ -1949,7 +1951,7 @@ fn score_param(param: &str, arg: &ArgType) -> Option<u32> {
             }
             Some(if ptag == *tag { 2 } else { 1 })
         }
-        ArgType::Object(chain) => {
+        ArgType::Object { chain, .. } => {
             if !is_ref {
                 return None;
             }
@@ -1960,30 +1962,115 @@ fn score_param(param: &str, arg: &ArgType) -> Option<u32> {
     }
 }
 
-/// Weaker check for the cases [`score_param`] can't settle — chiefly an interface-typed parameter,
-/// which never appears in the argument's superclass chain. Only the *kind* has to agree: a reference
-/// argument for a reference parameter, a widening-compatible primitive for a primitive one.
+/// Settle the cases [`score_param`] can't, by asking the JVM. `None` = genuinely not assignable.
 ///
-/// A primitive argument for a reference parameter stays a hard mismatch. That is not pedantry: JDWP
-/// hands the raw int straight to the JVM, which reads it as an object pointer and dies with a
-/// SIGSEGV — the debuggee crashes rather than reporting an error.
-fn kind_compatible(param: &str, arg: &ArgType) -> bool {
-    let is_ref = param.starts_with('L') || param.starts_with('[');
+/// Three things the superclass chain alone cannot answer:
+/// - **An interface-typed parameter** (`handle(Runnable)`): JDWP reports only *direct*
+///   superinterfaces, so the lattice has to be walked — `implements_interface` does it through the type
+///   cache, and the answer is authoritative. An object that does *not* implement it is now **rejected**
+///   rather than passed anyway.
+/// - **A boxed primitive** (`f(Integer)` given an `int`): assignable via autoboxing, and the value is
+///   boxed for real before the invoke — see [`coerce_args`].
+/// - **Array covariance** (`f(Object[])` given a `String[]`): element assignability isn't checkable from
+///   a signature, so any array is accepted for any array parameter. The JVM type-checks references
+///   itself, so the worst case is a rejected invoke, not a crash.
+///
+/// Everything scores 1 — the lowest rung. These are all *less* specific than a match `score_param`
+/// found, so an exact overload always wins.
+///
+/// A primitive argument for a non-boxing reference parameter stays a hard mismatch. That is not
+/// pedantry: JDWP hands the raw int straight to the JVM, which reads it as an object pointer and dies
+/// with a SIGSEGV — the debuggee crashes rather than reporting an error.
+///
+/// Reference mismatches are just as important to catch here, because **the JVM does not catch them**.
+/// Measured: with the old blind fallback, `takesRunnable(anItem)` *succeeded* and returned normally —
+/// `InvokeMethod` accepted an object that does not implement the parameter's interface. Nothing failed
+/// because that method body never used the argument; one that called `r.run()` would have been acting on
+/// a value of the wrong type. So being wrong here is silent, not loud, which is why the check is strict.
+async fn assignable(
+    conn: &mut jdwp_client::JdwpConnection,
+    param: &str,
+    arg: &ArgType,
+) -> Option<u32> {
     match arg {
-        ArgType::Null | ArgType::Object(_) => is_ref,
+        // Handled entirely by `score_param`: null fits any reference, and a primitive either widens
+        // into a primitive parameter or boxes into its own wrapper.
+        ArgType::Null => None,
         ArgType::Primitive(tag) => {
-            param.chars().next().and_then(primitive_tag).is_some_and(|p| tag_compatible(p, *tag))
+            boxed_wrapper_of(*tag).filter(|w| w == &param).map(|_| 1)
+        }
+        ArgType::Object { type_id, chain } => {
+            if param.starts_with('[') {
+                // Array parameter: accept only an array argument.
+                return chain.first().is_some_and(|s| s.starts_with('[')).then_some(1);
+            }
+            if !param.starts_with('L') || *type_id == 0 {
+                return None;
+            }
+            conn.implements_interface(*type_id, param).await.unwrap_or(false).then_some(1)
         }
     }
 }
 
+/// The JNI signature of the wrapper class a primitive tag autoboxes into.
+const fn boxed_wrapper_of(tag: u8) -> Option<&'static str> {
+    Some(match tag {
+        b'I' => "Ljava/lang/Integer;",
+        b'J' => "Ljava/lang/Long;",
+        b'S' => "Ljava/lang/Short;",
+        b'B' => "Ljava/lang/Byte;",
+        b'C' => "Ljava/lang/Character;",
+        b'Z' => "Ljava/lang/Boolean;",
+        b'F' => "Ljava/lang/Float;",
+        b'D' => "Ljava/lang/Double;",
+        _ => return None,
+    })
+}
+
+/// Box any primitive argument whose parameter is a reference type, so `f(Integer)` called with `5`
+/// receives a real `Integer` — handing the JVM a raw int for a reference parameter is what SIGSEGVs it.
+///
+/// Called after overload selection, on the chosen method's signature, so it boxes exactly what that
+/// method's parameters require. A no-op for the common case, and it costs a `valueOf` invoke per
+/// argument it does box.
+async fn coerce_args(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    signature: &str,
+    args: Vec<jdwp_client::types::Value>,
+) -> Result<Vec<jdwp_client::types::Value>, String> {
+    let params = sig_param_types(signature);
+    let mut out = Vec::with_capacity(args.len());
+    for (i, v) in args.into_iter().enumerate() {
+        let wants_ref = params.get(i).is_some_and(|p| p.starts_with('L') || p.starts_with('['));
+        let is_primitive = !matches!(v.data, jdwp_client::types::ValueData::Object(_));
+        if wants_ref && is_primitive {
+            let boxed = box_primitive(conn, thread_id, &v).await.ok_or_else(|| {
+                format!(
+                    "argument {} is a primitive but parameter {} is {} — boxing it via valueOf failed",
+                    i + 1,
+                    i + 1,
+                    params.get(i).map_or("a reference type", String::as_str),
+                )
+            })?;
+            out.push(boxed);
+        } else {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
 /// Find the method `name` to invoke for a concrete argument list, walking the superclass chain.
 ///
-/// Overloads of matching arity are scored by how specifically each parameter accepts its argument
-/// (see [`score_param`]) and the best-scoring one wins; ties go to the most derived class, since the
-/// walk starts at the runtime type. If nothing is assignable, a *kind*-compatible overload is used
-/// as a fallback (see [`kind_compatible`]) — never a mere arity match, which can hand the JVM a
-/// misinterpreted argument and crash it.
+/// Two passes, cheap first. Overloads of matching arity are scored by how specifically each parameter
+/// accepts its argument ([`score_param`], no round trips) and the best-scoring one wins; ties go to the
+/// most derived class, since the walk starts at the runtime type. Only if *nothing* scored are the
+/// arity-matching leftovers put to the JVM ([`assignable`]) — which is where an interface-typed
+/// parameter, a boxed primitive, or array covariance gets settled, at the cost of some round trips.
+///
+/// An overload no pass can justify is **not** used. A mere arity match once handed the JVM an `int` for
+/// a reference parameter, which it read as an object pointer and died on.
 ///
 /// `want_static` filters on the method's `ACC_STATIC` flag: `Some(true)` for a `Class.m()` call
 /// (JDWP's `ClassType.InvokeMethod` only accepts statics), `Some(false)` for an instance call, and
@@ -2003,7 +2090,9 @@ async fn find_method_for_args(
     let mut current = Some(type_id);
     let mut guard = 0;
     let mut best: Option<(u32, u64, jdwp_client::reftype::MethodInfo)> = None;
-    let mut fallback: Option<(u64, jdwp_client::reftype::MethodInfo)> = None;
+    // Right arity, but plain scoring couldn't justify at least one parameter — an interface, a wrapper,
+    // an array. Kept most-derived-first for the second pass, and only paid for if nothing scores.
+    let mut unresolved: Vec<(u64, jdwp_client::reftype::MethodInfo)> = Vec::new();
     while let Some(tid) = current {
         guard += 1;
         if guard > 50 {
@@ -2021,8 +2110,7 @@ async fn find_method_for_args(
             if params.len() != argtypes.len() {
                 continue;
             }
-            // `None` anywhere means at least one argument isn't assignable to its parameter, which
-            // rules the overload out entirely.
+            // `None` anywhere means at least one argument isn't plainly assignable to its parameter.
             let scored = params
                 .iter()
                 .zip(&argtypes)
@@ -2033,16 +2121,8 @@ async fn find_method_for_args(
                 Some(total) if best.as_ref().is_none_or(|(bs, ..)| total > *bs) => {
                     best = Some((total, tid, m));
                 }
-                // A fallback is only ever read when nothing scored at all, so recording one is
-                // pointless once `best` is set — which also keeps `m` movable into exactly one
-                // of these arms.
-                _ if best.is_none()
-                    && fallback.is_none()
-                    && params.iter().zip(&argtypes).all(|(p, a)| kind_compatible(p, a)) =>
-                {
-                    fallback = Some((tid, m));
-                }
-                _ => {}
+                Some(_) => {}
+                None => unresolved.push((tid, m)),
             }
         }
         // A match at this level shadows anything inherited; stop before paying for more round-trips.
@@ -2051,7 +2131,44 @@ async fn find_method_for_args(
         }
         current = conn.get_superclass(tid).await.unwrap_or(None);
     }
-    Ok(best.map(|(_, t, m)| (t, m)).or(fallback))
+    if let Some((_, t, m)) = best {
+        return Ok(Some((t, m)));
+    }
+    Ok(resolve_unsettled(conn, unresolved, &argtypes).await)
+}
+
+/// Second-pass overload selection: for candidates plain scoring couldn't justify, put every unsettled
+/// parameter to the JVM ([`assignable`]) and keep the best-scoring candidate that is fully assignable.
+///
+/// Separate from [`find_method_for_args`] because it is the expensive half — it can cost round trips per
+/// parameter — and runs only when the cheap pass found nothing at all.
+async fn resolve_unsettled(
+    conn: &mut jdwp_client::JdwpConnection,
+    candidates: Vec<(u64, jdwp_client::reftype::MethodInfo)>,
+    argtypes: &[ArgType],
+) -> Option<(u64, jdwp_client::reftype::MethodInfo)> {
+    let mut resolved: Option<(u32, u64, jdwp_client::reftype::MethodInfo)> = None;
+    for (tid, m) in candidates {
+        let mut total = 0;
+        let mut all_ok = true;
+        for (p, a) in sig_param_types(&m.signature).iter().zip(argtypes) {
+            let score = match score_param(p, a) {
+                Some(s) => Some(s),
+                None => assignable(conn, p, a).await,
+            };
+            if let Some(s) = score {
+                total += s;
+            } else {
+                all_ok = false;
+                break;
+            }
+        }
+        // Strictly-greater keeps the first (most derived) candidate on a tie, as the first pass does.
+        if all_ok && resolved.as_ref().is_none_or(|(bs, ..)| total > *bs) {
+            resolved = Some((total, tid, m));
+        }
+    }
+    resolved.map(|(_, t, m)| (t, m))
 }
 
 /// Spawn the per-session event pump: receive events off the connection (holding no lock while
@@ -3091,6 +3208,8 @@ async fn invoke_segment_method(
                 argvals.len()
             )
         })?;
+    // Box any primitive the chosen overload declares as a reference (`f(Integer)` given `5`).
+    let argvals = coerce_args(conn, tid, &m.signature, argvals).await?;
     let (ret, exc) = conn.invoke_method(obj_id, tid, decl, m.method_id, argvals).await
         .map_err(|e| format!("invoke {}() failed: {}", seg.name, e))?;
     invoke_result(conn, &seg.name, ret, exc).await
@@ -3359,6 +3478,8 @@ async fn invoke_static_member(
                 argvals.len()
             )
         })?;
+    // Box any primitive the chosen overload declares as a reference (`f(Integer)` given `5`).
+    let argvals = coerce_args(conn, tid, &m.signature, argvals).await?;
     let (ret, exc) = conn
         .invoke_static_method(decl, tid, m.method_id, argvals)
         .await
