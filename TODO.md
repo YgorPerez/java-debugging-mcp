@@ -317,14 +317,240 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## Backlog
 
-**Empty.** Everything filed here has shipped — the original ten items (TRACE-1, EXC-1, SETF-1, EVAL-1,
-EVAL-2, WATCH-1, TEST-1, OBJ-1, OBJ-2, DOC-1), all 18 appendix items, and all ten from the
-post-completion review (TRACE-2, OBJ-3, EVT-1, SESS-1, EVAL-3, OBJ-4, PERF-1, TEST-2, DOC-2, TEST-3).
-PERF-1 closed as *measured, no gain*, which is a result rather than a build.
+Priority key: **P1** = highest payoff for the infotravel/integraWS investigations (shared 8180 +
+silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
 
-New work goes here as a vertical slice, with the same shape as the entries above: what to build, the
-shape of the change, acceptance criteria you can check, and what blocks it. The validation pattern is at
-the top of this file.
+> The first ten items shipped, then a review of that work produced ten more, which also shipped
+> (TRACE-2, OBJ-3, EVT-1, SESS-1, EVAL-3, OBJ-4, PERF-1, TEST-2, DOC-2, TEST-3). The items below came out
+> of a second review, and they share a theme worth stating plainly: **the parts meant to keep a shared
+> JVM safe are the least finished parts.** Each was verified against the code, not suspected.
+
+### SAFE-1 — `debug.disconnect` can leave the JVM frozen forever  · P1 · S
+
+**What to build**
+`handle_disconnect` (`handlers.rs:747`) calls `remove_session`, which aborts the event listener **and the
+watchdog** and drops the session (`session.rs:269`). It never resumes anything. So: hit a breakpoint,
+call `debug.disconnect`, and every thread stays suspended with nothing left alive to rescue it — the
+watchdog that would have auto-resumed after 120s was just killed on the way out.
+
+On the shared 8180 that is the worst outcome in this project's threat model, produced by the tool whose
+name sounds like the safe way out. The tell: `Server`'s `Drop` in `tests/common/mod.rs` calls
+`debug.panic` before killing the child — the harness knows to do this and the tool doesn't.
+
+**Shape of the change**
+`VirtualMachine.Dispose` (command set 1, command 6) is defined to clear every event request and resume
+every thread; the constant is already in `commands.rs:34`, unused. Add `dispose()` to `jdwp-client` and
+call it before dropping the session. Failing that, at minimum clear stop points + `resume_all` — but
+`Dispose` is the JVM's own answer and cannot leave a request behind.
+
+**Acceptance criteria**
+- [ ] `debug.disconnect` on a session suspended at a breakpoint leaves the JVM **running**
+- [ ] No event request survives the disconnect (a re-attach sees a clean VM)
+- [ ] Integration test: break, disconnect, then `Probe::wait_for_line` proves the probe resumed printing —
+      the debuggee's own output is the only thing that proves this, per the TRACE-2 pattern
+- [ ] The reply says what it resumed/cleared, so the caller knows the JVM was left safe
+
+**Blocked by**
+None.
+
+### SAFE-2 — the watchdog treats the symptom and leaves the cause armed  · P1 · S
+
+**What to build**
+The watchdog (`handlers.rs:2385`) clears the pending step, calls `resume_all`, and stops. The breakpoint
+that froze the VM is still armed, so on a hit endpoint the cycle is freeze → 120s → resume → freeze again
+on the very next request, indefinitely — each round burning two minutes of everyone else's requests.
+
+It should disarm what caused the suspension (or convert it to a `trace:true` logpoint, which is the same
+information without the freeze) and report which stop point it killed and why.
+
+**Shape of the change**
+The watchdog knows `last_event`, so it can identify the request id that suspended the VM and clear that
+one rather than everything. Prefer surgical: clearing every stop point on a timeout would silently throw
+away a careful setup.
+
+**Acceptance criteria**
+- [ ] After a watchdog resume, the offending stop point no longer suspends the VM
+- [ ] What was disarmed is discoverable — in `list_breakpoints` and in the next `get_last_event`/log line
+- [ ] Unrelated stop points survive
+- [ ] Integration test with `JDWP_WATCHDOG_SECS=1`: a probe hitting a breakpoint in a loop keeps running
+      after one watchdog cycle instead of re-freezing
+
+**Blocked by**
+None. Shares its test harness with TEST-4.
+
+### TEST-4 — the watchdog has no tests at all  · P1 · S
+
+**What to build**
+Zero mentions of the watchdog in either test file. It is the primary safety mechanism of the whole
+project — the thing that makes attaching to a shared instance defensible — and the only subsystem with no
+coverage. `JDWP_WATCHDOG_SECS` is already an env var, so a test can set it to 1 second.
+
+**Acceptance criteria**
+- [ ] A suspended VM is auto-resumed after the configured timeout, proven by the **probe's own output**
+- [ ] `JDWP_WATCHDOG_SECS=0` disables it (documented behaviour, currently unverified)
+- [ ] A pending single-step request is cleared by the resume (it must be, or the next resume fails)
+- [ ] The test doesn't add 120s to the suite — it sets the timeout to ~1s
+
+**Blocked by**
+None. Do it before SAFE-2 so the fix has something to prove itself against.
+
+### TRACE-3 — a traced hot field can flood the debuggee  · P1 · M
+
+**What to build**
+TRACE-2 made `trace:true` available on watchpoints and exception breakpoints, which means it is now easy
+to arm something that fires thousands of times a second. Every hit costs a `get_frames`, a variable
+table, a `get_frame_values` and the describers (`capture_trace`, `handlers.rs:4702`). `MAX_TRACES` bounds
+**memory**, not per-hit work in the target.
+
+So the mode advertised as "safe on a shared instance" can degrade the app *worse* than a suspending
+breakpoint, which at least stops at the first hit. This is a gap introduced by TRACE-2 and should be
+closed by whoever relies on it.
+
+**Shape of the change**
+A hit budget per stop point, with auto-disarm and a note in `get_traces` saying it disarmed itself.
+JDWP's `Count` modifier (modKind 1) enforces a limit *inside the JVM*, which is strictly better than
+counting on our side — no packet is sent at all once it expires. Consider also a cheap mode that records
+only the location and skips the frame walk.
+
+**Acceptance criteria**
+- [ ] A traced stop point disarms itself after N hits (default documented; overridable)
+- [ ] `get_traces` says a stop point stopped recording, and why — silence must not read as "no hits"
+- [ ] Integration test: a probe writing a field in a tight loop yields exactly N traces, then the probe
+      **speeds back up** (measurable from its own output rate)
+- [ ] `list_breakpoints` shows the remaining budget
+
+**Blocked by**
+None.
+
+### FILT-1 — no thread filter on exception breakpoints or watchpoints  · P1 · M
+
+**What to build**
+`thread_filter` is threaded only into `set_breakpoint_ex`; `set_exception_request`
+(`eventrequest.rs:156`) and `set_field_watch` (`eventrequest.rs:212`) accept no modifiers beyond their
+own. On a WildFly with hundreds of threads, restricting a stop point to **your** request thread is the
+single largest noise reduction available — and it composes with trace mode, which is exactly the
+combination the infotravel investigations want: catch only the throws from the request you just made.
+
+**Shape of the change**
+`ThreadOnly` is modKind 3; add it to `mod_kinds` (`eventrequest.rs:24`) and accept an optional
+`thread_id` on both tools. The hard part is ergonomic, not protocol: you need the thread id *before* the
+event, so document the flow (`list_threads {name_filter}` → arm → trigger).
+
+**Acceptance criteria**
+- [ ] `thread_id` on `set_exception_breakpoint` and `set_watchpoint`, honoured by the JVM
+- [ ] A probe throwing on two threads reports only the filtered one
+- [ ] Composes with `trace:true`
+- [ ] The tool descriptions explain how to get a thread id first
+
+**Blocked by**
+None.
+
+### EVAL-4 — no `&&` / `||` in conditions or predicates  · P2 · M
+
+**What to build**
+`split_comparison` (`handlers.rs:4819`) recognises only the six comparison operators, so
+`[?paid == true && qty > 3]` and `condition: total > 100 && status == "OPEN"` are both unavailable.
+Today you filter twice or pick one clause — for a conditional breakpoint there is no "filter twice".
+
+**Shape of the change**
+Split on `&&`/`||` at bracket/quote depth 0 *before* splitting comparisons, and evaluate left to right
+with short-circuiting (which also keeps the round-trip cost down — the second clause is only resolved if
+the first holds). Keep the element-relative left side working per clause, and keep the existing
+"resolve the element-independent side once" optimisation from OBJ-2.
+
+**Acceptance criteria**
+- [ ] `&&` and `||` in both breakpoint conditions and `[?…]` predicates, short-circuiting
+- [ ] Precedence is documented and tested (`a || b && c`), or parentheses are required and enforced
+- [ ] A clause that fails to evaluate is reported as an error, not silently false
+- [ ] Probe coverage for a two-clause predicate that matches a different set than either clause alone
+
+**Blocked by**
+None.
+
+### BP-1 — `enabled` is dead state the UI advertises  · P2 · S
+
+**What to build**
+`BreakpointInfo.enabled` (`session.rs:180`) is set to `true` at both construction sites and never
+mutated, yet `render_breakpoint_line` prints `✓`/`✗` from it — so the `✗` branch cannot happen and the
+tick mark carries no information.
+
+Either implement it (`debug.toggle_breakpoint`, which is genuinely useful — silence a breakpoint without
+losing its condition/trace_expr and having to retype them) or delete the field and the marker.
+
+**Acceptance criteria**
+- [ ] Either a disabled breakpoint stops firing while staying listed, or the field and `✗` are gone
+- [ ] If implemented: disabling clears the JDWP request but keeps the definition, and re-enabling re-arms
+      it at the same location
+- [ ] No dead state left behind either way
+
+**Blocked by**
+None.
+
+### TRACE-4 — `get_traces` can't be filtered  · P2 · S
+
+**What to build**
+Three kinds of stop point now share one 500-entry ring buffer (`handle_get_traces`,
+`handlers.rs:1077`), and the only controls are `limit` and `clear`. Reading "the throws from `exc_4`"
+means eyeballing everything.
+
+Add filtering by stop-point id and/or class, and consider a `since` (sequence number) so a poller can ask
+for what's new — the `seq` is already recorded for exactly this kind of use.
+
+**Acceptance criteria**
+- [ ] `debug.get_traces {bp_id}` and/or `{class_filter}` narrows the output
+- [ ] `since` returns only records newer than a given seq, so polling doesn't re-read everything
+- [ ] The header still says how many exist versus how many are shown
+
+**Blocked by**
+None.
+
+### SETF-2 — `set_value` writes literals only  · P2 · M
+
+**What to build**
+`literal_to_value` refuses `ArgLit::Expr` (`handlers.rs:4523`), so a write can only be a literal. You
+cannot copy a live value — `this.cfg = other.cfg`, `reserva.cliente = clienteValido` — which is how you
+inject a known-good object to prove a downstream failure, the same move `force_return` supports for
+return values.
+
+**Shape of the change**
+Resolve the right-hand side with `resolve_expression` (a thread/frame is already available for locals and
+instance fields), then validate the resolved value's runtime type against the target's declared type
+using the EVAL-3 assignability check — including the interface case. A reference of the wrong type must be
+refused, not written: the JVM does **not** validate this (see the EVAL-3 note).
+
+**Acceptance criteria**
+- [ ] `set_value {target:"this.a", value:"other.b"}` writes the live reference
+- [ ] A type-incompatible source is refused, naming both types
+- [ ] Literals keep working unchanged, including the narrowing conversions
+- [ ] Probe coverage: object field ← object field, and a refused mismatch
+
+**Blocked by**
+None. Wants EVAL-3's `assignable`, which has shipped.
+
+### SAFE-3 — no read-only mode  · P2 · S
+
+**What to build**
+`debug.evaluate` can invoke any method on the target, and `set_value` / `force_return` / `set_watchpoint`
+all mutate it. Nothing distinguishes "let me look" from "let me change things", so pointing this at a
+production JVM means trusting every future caller — including an agent — not to call something
+destructive. `deleteAll()` is a valid expression today.
+
+**Shape of the change**
+A `JDWP_READONLY=1` env (and/or a per-session flag from `attach`) that refuses invocation, writes and
+`force_return`. Note the honest cost: collection expansion and `toString()` rendering *are* invocations,
+so read-only necessarily means shallower output — `expand_objects` falls back to fields and ids. Say that
+in the refusal rather than pretending nothing is lost.
+
+**Acceptance criteria**
+- [ ] With read-only set, `set_value`/`force_return`/method invocation are refused with a clear reason
+- [ ] Reads that need no invocation still work: locals, fields, statics, arrays, `get_stack`, watchpoint
+      and exception reporting
+- [ ] `list_sessions` shows which sessions are read-only
+- [ ] Documented as a guard against accident, **not** a security boundary — anyone who can reach the JDWP
+      port can do anything anyway
+
+**Blocked by**
+None.
 
 ---
 
@@ -344,7 +570,7 @@ is opt-in rather than automatic, because expanding a collection invokes methods 
 3. ✅ `ReferenceType.Fields` — `reftype.rs:get_fields`.
 4. ✅ `ObjectReference.GetValues` — `object.rs:get_object_values`.
 5. ✅ Auto-expand strings in `get_stack` — `render_value` prints string contents (`handlers.rs:handle_get_stack` renders each local).
-6. ✅ **(was BLOCKER)** Expose breakpoint events — `debug.get_last_event` tool + `session.last_event`; the event pump stores the hit thread and `get_last_event` returns `{event, thread, class, method, line}` (also for steps/exceptions). `handlers.rs:handle_get_last_event`.
+6. ✅ **(was BLOCKER)** Expose breakpoint events — `debug.get_last_event` tool + the session's event ring buffer (a single `last_event` slot originally; see EVT-1); the event pump stores the hit thread and `get_last_event` returns `{seq, event, thread, class, method, line}` (also for steps/exceptions). `handlers.rs:handle_get_last_event`.
 
 ### Week 2 — Object inspection — ✅ complete
 7. ✅ Recursive object expansion (max depth) — `expand_objects:true` walks a bounded field tree with cycle detection (`handlers.rs:render_value_deep`). Off by default, so the shallow `TypeName (id=0x…)` rendering is still what you get unless you ask.
