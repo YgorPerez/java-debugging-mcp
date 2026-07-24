@@ -570,7 +570,17 @@ impl RequestHandler {
             if include_variables && !active.is_empty() {
                 // Render with type name + string contents (no method invocation here —
                 // thread=None — to keep get_stack cheap).
-                render_frame_variables(&mut session.connection, &mut output, target_thread, frame.frame_id, &active).await;
+                // Deep expansion invokes methods in the debuggee, which needs the suspended thread —
+                // pass it only when expansion was asked for, so the default stays cheap and
+                // side-effect-free (no toString() per local).
+                let deep = a.expand_objects.then(|| DeepOpts {
+                    depth_limit: a.max_depth,
+                    child_limit: a.max_children.max(1),
+                    text_len: 200,
+                });
+                render_frame_variables(
+                    &mut session.connection, &mut output, target_thread, frame.frame_id, &active, deep,
+                ).await;
             }
         }
         drop(session);
@@ -607,7 +617,16 @@ impl RequestHandler {
         };
 
         let value = resolve_expression(conn, thread_id, frame.as_ref(), expression).await?;
-        let rendered = render_value(conn, &value, thread_id, max_len).await;
+        let rendered = if a.expand_objects {
+            let opts = DeepOpts {
+                depth_limit: a.max_depth,
+                child_limit: a.max_children.max(1),
+                text_len: max_len,
+            };
+            render_value_deep(conn, &value, thread_id, opts).await
+        } else {
+            render_value(conn, &value, thread_id, max_len).await
+        };
         drop(session);
         Ok(format!("{} = {}", expression.trim(), rendered))
     }
@@ -1178,18 +1197,26 @@ async fn frame_method_info(
 }
 
 /// Render a frame's in-scope variables beneath its stack line.
+///
+/// `deep` is `Some` only when the caller asked for expansion. Shallow rendering deliberately passes
+/// `thread_id: None`, which keeps `get_stack` from invoking `toString()` on every local of every
+/// frame — that would make the default path both slow and side-effecting.
 async fn render_frame_variables(
     conn: &mut jdwp_client::JdwpConnection,
     output: &mut String,
     target_thread: u64,
     frame_id: u64,
     active: &[(String, jdwp_client::stackframe::VariableSlot)],
+    deep: Option<DeepOpts>,
 ) {
     let slots: Vec<jdwp_client::stackframe::VariableSlot> =
         active.iter().map(|(_, s)| *s).collect();
     if let Ok(values) = conn.get_frame_values(target_thread, frame_id, slots).await {
         for ((name, _), value) in active.iter().zip(values.iter()) {
-            let formatted_value = render_value(conn, value, None, 200).await;
+            let formatted_value = match deep {
+                Some(opts) => render_value_deep(conn, value, Some(target_thread), opts).await,
+                None => render_value(conn, value, None, 200).await,
+            };
             let _ = writeln!(output, "     {name} = {formatted_value}");
         }
     }
@@ -2585,6 +2612,16 @@ async fn render_value(
 ) -> String {
     use jdwp_client::types::ValueData;
     match &value.data {
+        ValueData::Object(0) => "null".to_string(),
+        ValueData::Object(id) => render_object(conn, *id, value.tag, thread_id, max_len).await,
+        other => render_primitive(other).unwrap_or_else(|| "(?)".to_string()),
+    }
+}
+
+/// Render a primitive value; `None` for a reference (which needs a JVM round trip to describe).
+fn render_primitive(data: &jdwp_client::types::ValueData) -> Option<String> {
+    use jdwp_client::types::ValueData;
+    Some(match data {
         ValueData::Byte(v) => format!("(byte) {v}"),
         ValueData::Char(v) => format!("(char) '{}'", char::from_u32(u32::from(*v)).unwrap_or('?')),
         ValueData::Float(v) => format!("(float) {v}"),
@@ -2594,8 +2631,501 @@ async fn render_value(
         ValueData::Short(v) => format!("(short) {v}"),
         ValueData::Boolean(v) => format!("(boolean) {v}"),
         ValueData::Void => "(void)".to_string(),
-        ValueData::Object(0) => "null".to_string(),
-        ValueData::Object(id) => render_object(conn, *id, value.tag, thread_id, max_len).await,
+        ValueData::Object(_) => return None,
+    })
+}
+
+// ----- deep (recursive) object rendering: OBJ-1 -----
+
+/// Bounds for a deep render, all caller-visible.
+///
+/// Every one of these exists because the alternative is unbounded work against a live JVM:
+/// `max_depth` stops a linked structure from being walked forever, `max_children` stops one wide
+/// object from flooding the output, and the node budget in [`DeepState`] caps the *total* cost so a
+/// shallow-but-bushy graph can't blow up either.
+#[derive(Clone, Copy)]
+struct DeepOpts {
+    /// How many levels of fields/elements to expand. 0 renders nothing deeply (the shallow form).
+    depth_limit: usize,
+    /// Fields per object, or elements per array/collection, before "… +N more".
+    child_limit: usize,
+    /// Max length of a rendered string value.
+    text_len: usize,
+}
+
+/// Default total nodes one deep render may visit. Reached only by genuinely large graphs; the point
+/// is that a pathological object can't hang the tool, and the output says when it was hit.
+const DEEP_NODE_BUDGET: usize = 400;
+
+/// Mutable state threaded through one deep render.
+struct DeepState {
+    /// Nodes left to visit across the whole render.
+    budget: usize,
+    /// Object ids on the current path, for cycle detection. Path-based (not globally-seen) on
+    /// purpose: a value reachable twice by different routes is worth printing twice in a debugger,
+    /// but a true cycle (`parent.child.parent`) must not recurse.
+    path: Vec<u64>,
+}
+
+/// Deep-render a value: walk instance fields, array elements, and collection contents to a bounded
+/// depth, with cycle detection.
+///
+/// Needs `thread_id` for collections and `toString()` — both require invoking methods in the
+/// debuggee, which JDWP only does on a suspended thread. Without one, collections fall back to their
+/// type name and only plain fields/arrays expand.
+async fn render_value_deep(
+    conn: &mut jdwp_client::JdwpConnection,
+    value: &jdwp_client::types::Value,
+    thread_id: Option<u64>,
+    opts: DeepOpts,
+) -> String {
+    let mut state = DeepState { budget: DEEP_NODE_BUDGET, path: Vec::new() };
+    let body = render_node(conn, value, thread_id, opts, &mut state, 0).await;
+    if state.budget == 0 {
+        format!("{body}\n… node budget ({DEEP_NODE_BUDGET}) exhausted — raise max_depth only if needed")
+    } else {
+        body
+    }
+}
+
+/// Boxed, type-erased recursion entry — an `async fn` cannot name its own future type.
+fn render_node_boxed<'a>(
+    conn: &'a mut jdwp_client::JdwpConnection,
+    value: &'a jdwp_client::types::Value,
+    thread_id: Option<u64>,
+    opts: DeepOpts,
+    state: &'a mut DeepState,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
+    Box::pin(render_node(conn, value, thread_id, opts, state, depth))
+}
+
+async fn render_node(
+    conn: &mut jdwp_client::JdwpConnection,
+    value: &jdwp_client::types::Value,
+    thread_id: Option<u64>,
+    opts: DeepOpts,
+    state: &mut DeepState,
+    depth: usize,
+) -> String {
+    if let Some(p) = render_primitive(&value.data) {
+        return p;
+    }
+    let jdwp_client::types::ValueData::Object(id) = value.data else {
+        return "(?)".to_string();
+    };
+    if id == 0 {
+        return "null".to_string();
+    }
+    if state.budget == 0 {
+        return format!("… (budget exhausted) @0x{id:x}");
+    }
+    state.budget -= 1;
+
+    // A cycle: this exact object is already an ancestor of itself.
+    if state.path.contains(&id) {
+        let name = type_name_of(conn, id).await;
+        return format!("↩ {name} (id=0x{id:x}, cycle)");
+    }
+
+    // A boxed primitive is a leaf, whatever the depth: expanding it would turn a `List<Integer>`
+    // into twenty `java.lang.Integer { value = (int) n }` blocks instead of twenty numbers.
+    if let Some(unboxed) = render_boxed_primitive(conn, id).await {
+        return unboxed;
+    }
+
+    // At the depth limit, stop expanding but still say as much as one line can — toString() is the
+    // most informative summary available, so this is where it earns its keep.
+    if depth >= opts.depth_limit {
+        return render_object(conn, id, value.tag, thread_id, opts.text_len).await;
+    }
+
+    // Strings and arrays already have good shallow renderings; strings are terminal, arrays recurse.
+    if value.tag == 115 {
+        if let Ok(s) = conn.get_string_value(id).await {
+            return format!("\"{}\"", truncate(&s, opts.text_len));
+        }
+    }
+    let Ok(type_id) = conn.get_object_reference_type(id).await else {
+        return format!("(object) @{id:x}");
+    };
+    let name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+    if name == "java.lang.String" {
+        if let Ok(s) = conn.get_string_value(id).await {
+            return format!("\"{}\"", truncate(&s, opts.text_len));
+        }
+    }
+
+    state.path.push(id);
+    let rendered = expand_object(conn, id, type_id, &name, value.tag, thread_id, opts, state, depth).await;
+    state.path.pop();
+    rendered
+}
+
+/// Expand one non-string reference: an array, a recognised collection, or a plain object's fields.
+#[allow(clippy::too_many_arguments)] // one render step genuinely needs all of this context
+async fn expand_object(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    type_id: u64,
+    name: &str,
+    tag: u8,
+    thread_id: Option<u64>,
+    opts: DeepOpts,
+    state: &mut DeepState,
+    depth: usize,
+) -> String {
+    if tag == 91 {
+        return render_array_deep(conn, id, name, thread_id, opts, state, depth).await;
+    }
+    // Collections need method invocation, so only attempt them with a suspended thread.
+    if let Some(tid) = thread_id {
+        if let Some(rendered) =
+            render_collection_deep(conn, id, type_id, name, tid, opts, state, depth).await
+        {
+            return rendered;
+        }
+    }
+    render_fields_deep(conn, id, type_id, name, thread_id, opts, state, depth).await
+}
+
+/// Expand a plain object's instance fields (its own and inherited).
+#[allow(clippy::too_many_arguments)]
+async fn render_fields_deep(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    type_id: u64,
+    name: &str,
+    thread_id: Option<u64>,
+    opts: DeepOpts,
+    state: &mut DeepState,
+    depth: usize,
+) -> String {
+    let fields = collect_instance_fields(conn, type_id).await;
+    if fields.is_empty() {
+        // Nothing to expand — a one-liner beats an empty brace block.
+        return render_object(conn, id, 76, thread_id, opts.text_len).await;
+    }
+    let shown = fields.len().min(opts.child_limit);
+    let ids: Vec<u64> = fields.iter().take(shown).map(|f| f.field_id).collect();
+    let Ok(values) = conn.get_object_values(id, ids).await else {
+        return format!("{name} (id=0x{id:x}, fields unreadable)");
+    };
+
+    let pad = indent(depth + 1);
+    let mut out = format!("{name} (id=0x{id:x}) {{");
+    for (f, v) in fields.iter().take(shown).zip(&values) {
+        let rendered = render_node_boxed(conn, v, thread_id, opts, state, depth + 1).await;
+        let _ = write!(out, "\n{pad}{} = {rendered}", f.name);
+    }
+    if fields.len() > shown {
+        let _ = write!(out, "\n{pad}… +{} more field(s)", fields.len() - shown);
+    }
+    let _ = write!(out, "\n{}}}", indent(depth));
+    out
+}
+
+/// Expand array elements, recursing into each.
+async fn render_array_deep(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    name: &str,
+    thread_id: Option<u64>,
+    opts: DeepOpts,
+    state: &mut DeepState,
+    depth: usize,
+) -> String {
+    let Ok(len) = conn.get_array_length(id).await else {
+        return format!("{name} (id=0x{id:x}, length unreadable)");
+    };
+    let base = name.strip_suffix("[]").unwrap_or(name);
+    render_indexed_block(conn, &format!("{base}[{len}]"), id, len, thread_id, opts, state, depth)
+        .await
+        .unwrap_or_else(|| format!("{name} (id=0x{id:x}, elements unreadable)"))
+}
+
+/// Indentation for a node at `depth`. Children are drawn at `indent(depth + 1)` and the closing
+/// brace at `indent(depth)`, so it lines up under the text that opened the block.
+fn indent(depth: usize) -> String {
+    "  ".repeat(depth)
+}
+
+/// Every non-static field of a type, its own first then inherited, in declaration order.
+async fn collect_instance_fields(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+) -> Vec<jdwp_client::reftype::FieldInfo> {
+    let mut out = Vec::new();
+    let mut current = Some(type_id);
+    let mut guard = 0;
+    while let Some(tid) = current {
+        guard += 1;
+        if guard > 50 {
+            break;
+        }
+        match conn.get_fields(tid).await {
+            Ok(fields) => out.extend(fields.into_iter().filter(|f| (f.mod_bits & ACC_STATIC) == 0)),
+            Err(_) => break,
+        }
+        current = conn.get_superclass(tid).await.unwrap_or(None);
+    }
+    out
+}
+
+/// What kind of container an object turned out to be, for element-level rendering.
+enum ContainerKind {
+    /// Anything with `toArray()` + `size()` — `List`, `Set`, `Queue`, …
+    Collection,
+    /// Anything with `entrySet()` + `size()`.
+    Map,
+    /// `java.util.Optional` exactly.
+    Optional,
+}
+
+/// Classify an object as a container by looking for distinctive methods rather than by checking
+/// interfaces.
+///
+/// This is duck typing, and deliberately so: deciding "is this a `java.util.Map`?" properly means
+/// walking the *transitive* interface hierarchy (`ReferenceType.Interfaces` returns only direct
+/// superinterfaces), which is many round trips per object rendered. The concrete classes that matter
+/// — `ArrayList`, `HashMap`, `HashSet`, … — declare these methods themselves or inherit them from an
+/// abstract base the superclass walk already covers.
+///
+/// The cost of a false positive is bounded: a non-collection class that happens to have `toArray()`
+/// and `size()` gets rendered element-wise, which is odd but not wrong, and never unsafe.
+async fn classify_container(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+    name: &str,
+) -> Option<ContainerKind> {
+    if name == "java.util.Optional" {
+        return Some(ContainerKind::Optional);
+    }
+    // `size()I` is the cheap discriminator: bail before the more expensive lookups without it.
+    let has_size = find_method_arity(conn, type_id, "size", 0)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|(_, m)| m.signature == "()I");
+    if !has_size {
+        return None;
+    }
+    if find_method_arity(conn, type_id, "entrySet", 0).await.ok().flatten().is_some() {
+        return Some(ContainerKind::Map);
+    }
+    if find_method_arity(conn, type_id, "toArray", 0)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|(_, m)| m.signature == "()[Ljava/lang/Object;")
+    {
+        return Some(ContainerKind::Collection);
+    }
+    None
+}
+
+/// Element-level rendering for a collection, map, or `Optional`. `None` when the object isn't one (or
+/// its contents can't be read), so the caller falls back to field expansion.
+#[allow(clippy::too_many_arguments)]
+async fn render_collection_deep(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    type_id: u64,
+    name: &str,
+    tid: u64,
+    opts: DeepOpts,
+    state: &mut DeepState,
+    depth: usize,
+) -> Option<String> {
+    match classify_container(conn, type_id, name).await? {
+        ContainerKind::Optional => render_optional_deep(conn, id, type_id, tid, opts, state, depth).await,
+        ContainerKind::Collection => {
+            render_elements_deep(conn, id, type_id, name, tid, opts, state, depth).await
+        }
+        ContainerKind::Map => render_map_deep(conn, id, type_id, name, tid, opts, state, depth).await,
+    }
+}
+
+/// `Optional[value]` or `Optional.empty`.
+async fn render_optional_deep(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    type_id: u64,
+    tid: u64,
+    opts: DeepOpts,
+    state: &mut DeepState,
+    depth: usize,
+) -> Option<String> {
+    // isPresent() first: get() on an empty Optional throws, and a thrown call is indistinguishable
+    // here from a broken one.
+    let present = matches!(
+        invoke_no_arg(conn, id, type_id, tid, "isPresent").await,
+        Some(jdwp_client::types::Value { data: jdwp_client::types::ValueData::Boolean(true), .. })
+    );
+    if !present {
+        return Some("Optional.empty".to_string());
+    }
+    let v = invoke_no_arg(conn, id, type_id, tid, "get").await?;
+    let rendered = render_node_boxed(conn, &v, Some(tid), opts, state, depth + 1).await;
+    Some(format!("Optional[{rendered}]"))
+}
+
+/// A `Collection`'s elements, reached through `toArray()`.
+#[allow(clippy::too_many_arguments)]
+async fn render_elements_deep(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    type_id: u64,
+    name: &str,
+    tid: u64,
+    opts: DeepOpts,
+    state: &mut DeepState,
+    depth: usize,
+) -> Option<String> {
+    let arr = as_object_id(&invoke_no_arg(conn, id, type_id, tid, "toArray").await?)?;
+    let len = conn.get_array_length(arr).await.ok()?;
+    render_indexed_block(conn, &format!("{name}[{len}]"), arr, len, Some(tid), opts, state, depth).await
+}
+
+/// A `Map`'s entries as `key → value` lines.
+#[allow(clippy::too_many_arguments)]
+async fn render_map_deep(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    type_id: u64,
+    name: &str,
+    tid: u64,
+    opts: DeepOpts,
+    state: &mut DeepState,
+    depth: usize,
+) -> Option<String> {
+    // entrySet() then toArray() on that set: two invocations to reach an indexable array of
+    // Map.Entry, then getKey()/getValue() per entry — which is why `child_limit` matters here.
+    let set = as_object_id(&invoke_no_arg(conn, id, type_id, tid, "entrySet").await?)?;
+    let set_type = conn.get_object_reference_type(set).await.ok()?;
+    let arr = as_object_id(&invoke_no_arg(conn, set, set_type, tid, "toArray").await?)?;
+    let len = conn.get_array_length(arr).await.ok()?;
+    if len == 0 {
+        return Some(format!("{name}{{}} (0 entries)"));
+    }
+    let take = len.min(i32::try_from(opts.child_limit).unwrap_or(i32::MAX));
+    let entries = conn.get_array_values(arr, 0, take).await.ok()?;
+
+    let pad = indent(depth + 1);
+    let mut out = format!("{name}({len} entries) {{");
+    for e in &entries {
+        let Some((k, v)) = entry_pair(conn, e, tid).await else { continue };
+        let kr = render_node_boxed(conn, &k, Some(tid), opts, state, depth + 1).await;
+        let vr = render_node_boxed(conn, &v, Some(tid), opts, state, depth + 1).await;
+        let _ = write!(out, "\n{pad}{kr} → {vr}");
+    }
+    if len > take {
+        let _ = write!(out, "\n{pad}… +{} more entr(ies)", len - take);
+    }
+    let _ = write!(out, "\n{}}}", indent(depth));
+    Some(out)
+}
+
+/// Read one `Map.Entry`'s key and value. `None` if either call fails, so the entry is skipped rather
+/// than aborting the whole map.
+async fn entry_pair(
+    conn: &mut jdwp_client::JdwpConnection,
+    entry_value: &jdwp_client::types::Value,
+    tid: u64,
+) -> Option<(jdwp_client::types::Value, jdwp_client::types::Value)> {
+    let entry = as_object_id(entry_value)?;
+    let etype = conn.get_object_reference_type(entry).await.ok()?;
+    let k = invoke_no_arg(conn, entry, etype, tid, "getKey").await?;
+    let v = invoke_no_arg(conn, entry, etype, tid, "getValue").await?;
+    Some((k, v))
+}
+
+/// Render `len` elements of the array `arr` as an indented `{ [i] = … }` block under `header`,
+/// honouring `child_limit`. Shared by real arrays and by collections (which reach an array via
+/// `toArray()`), so both truncate and indent identically.
+#[allow(clippy::too_many_arguments)]
+async fn render_indexed_block(
+    conn: &mut jdwp_client::JdwpConnection,
+    header: &str,
+    arr: u64,
+    len: i32,
+    thread_id: Option<u64>,
+    opts: DeepOpts,
+    state: &mut DeepState,
+    depth: usize,
+) -> Option<String> {
+    if len == 0 {
+        return Some(format!("{header} {{}}"));
+    }
+    let take = len.min(i32::try_from(opts.child_limit).unwrap_or(i32::MAX));
+    let elems = conn.get_array_values(arr, 0, take).await.ok()?;
+    let pad = indent(depth + 1);
+    let mut out = format!("{header} {{");
+    for (i, e) in elems.iter().enumerate() {
+        let rendered = render_node_boxed(conn, e, thread_id, opts, state, depth + 1).await;
+        let _ = write!(out, "\n{pad}[{i}] = {rendered}");
+    }
+    if len > take {
+        let _ = write!(out, "\n{pad}… +{} more", len - take);
+    }
+    let _ = write!(out, "\n{}}}", indent(depth));
+    Some(out)
+}
+
+/// Invoke a no-arg method by name, returning its value. `None` if there is no such method, the call
+/// fails, or it throws — every caller treats all three as "can't expand this, fall back".
+async fn invoke_no_arg(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    type_id: u64,
+    tid: u64,
+    method: &str,
+) -> Option<jdwp_client::types::Value> {
+    let (decl, m) = find_method_arity(conn, type_id, method, 0).await.ok()??;
+    let (ret, exc) = conn.invoke_method(id, tid, decl, m.method_id, vec![]).await.ok()?;
+    (exc == 0).then_some(ret)
+}
+
+/// The non-null object id in a value, if it is one.
+const fn as_object_id(v: &jdwp_client::types::Value) -> Option<u64> {
+    match v.data {
+        jdwp_client::types::ValueData::Object(0) => None,
+        jdwp_client::types::ValueData::Object(id) => Some(id),
+        _ => None,
+    }
+}
+
+/// The `java.lang.*` primitive wrappers. Each holds exactly one private `value` field, so reading
+/// that field is both the whole content and the useful rendering.
+const BOXED_PRIMITIVES: [&str; 8] = [
+    "java.lang.Integer",
+    "java.lang.Long",
+    "java.lang.Short",
+    "java.lang.Byte",
+    "java.lang.Character",
+    "java.lang.Boolean",
+    "java.lang.Float",
+    "java.lang.Double",
+];
+
+/// If `id` is a boxed primitive, render the primitive it holds. `None` for anything else, or if the
+/// `value` field can't be read (in which case the caller renders it as an ordinary object).
+async fn render_boxed_primitive(conn: &mut jdwp_client::JdwpConnection, id: u64) -> Option<String> {
+    let type_id = conn.get_object_reference_type(id).await.ok()?;
+    let name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+    if !BOXED_PRIMITIVES.contains(&name.as_str()) {
+        return None;
+    }
+    let (_, f) = find_field_info(conn, type_id, "value", Some(false)).await.ok()??;
+    let v = conn.get_object_values(id, vec![f.field_id]).await.ok()?.into_iter().next()?;
+    render_primitive(&v.data)
+}
+
+/// The type name of a live object, or a placeholder if it can't be read.
+async fn type_name_of(conn: &mut jdwp_client::JdwpConnection, id: u64) -> String {
+    match conn.get_object_reference_type(id).await {
+        Ok(t) => decode_signature(&conn.get_signature(t).await.unwrap_or_default()),
+        Err(_) => "object".to_string(),
     }
 }
 

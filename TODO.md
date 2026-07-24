@@ -70,6 +70,23 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   (ClassType.SetValues) + `set_object_values` (ObjectReference.SetValues). Legacy `name` key still
   accepted. Validated — static String/int + instance int/String/boolean written and read back
   (`examples/test_set_field.rs`).
+- **Recursive object expansion (OBJ-1)** — `expand_objects:true` on `debug.evaluate` /
+  `debug.get_stack` renders a value as an indented field tree instead of one line: nested objects
+  (own + inherited fields), array elements, and element-level `List`/`Set`/`Map`/`Optional` contents.
+  Bounded by `max_depth` (default 2), `max_children` (16) and a total node budget (400) that reports
+  when it is hit; **cycle detection** is path-based, so `customer.self` and a parent↔child
+  `order.customer.lastOrder` render as `↩ Type (id=…, cycle)` instead of recursing. Boxed wrappers
+  unbox, so a `List<Integer>` is twenty numbers rather than twenty `Integer { value = … }` blocks. At
+  the depth limit it falls back to the shallow `toString()` summary, which is the most informative
+  single line available. Off by default: expansion invokes `toArray`/`entrySet`/`getKey` in the
+  debuggee, which needs a suspended thread and has side effects, so the cheap path stays cheap.
+  Container detection is duck typing on `size()`+`toArray()`/`entrySet()` rather than an interface
+  check — `ReferenceType.Interfaces` returns only *direct* superinterfaces, so a real
+  `instanceof Map` test costs many round trips per rendered object; a false positive only renders
+  something element-wise that isn't a collection, which is odd but never unsafe.
+  Validated by `deep_expansion_…` in `mcp_integration.rs` against `examples/probes/DeepProbe.java`,
+  which carries every shape on purpose: cycles, an inherited field, an over-cap list, empty
+  collections, an empty `Optional`, and both primitive and object arrays.
 - **MCP-handler integration tests (TEST-1)** — `mcp-server/tests/mcp_integration.rs` +
   `tests/common/mod.rs`: the real `jdwp-mcp` binary driven over JSON-RPC on stdio against real probe
   JVMs, runnable with `scripts/integration-test.sh` (no manual steps — the harness compiles the probe,
@@ -122,8 +139,9 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 Priority key: **P1** = highest payoff for the infotravel/integraWS investigations (shared 8180 +
 silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
 
-> **TRACE-1, EXC-1, SETF-1 (all P1) and EVAL-1, EVAL-2, WATCH-1, TEST-1 are done** — see Shipped
-> above. Only DOC-1 and the two OBJ-* items remain.
+> **TRACE-1, EXC-1, SETF-1 (all P1) and EVAL-1, EVAL-2, WATCH-1, TEST-1, OBJ-1 are done** — see
+> Shipped above. Remaining: **DOC-1** (lives in the sibling `infotravel-dev-toolkit` repo) and
+> **OBJ-2** (collection search/filter, in the appendix).
 
 ### DOC-1 — `jdwp-trace` skill / silent-catch playbook (infotravel-dev-toolkit)  · P2 · S
 
@@ -149,9 +167,9 @@ The early "object-inspection" roadmap below was validated line-by-line against t
 Legend: ✅ done · 🟡 partial · ⬜ not started. Evidence in `path:sym` form. (The original list
 numbered two items `6`; renumbered 1–17 here.)
 
-Headline: **Week 1 is fully done, and the Week 4 headline — field-path navigation — already shipped
-via `debug.evaluate`.** What's genuinely missing is *automatic recursive object expansion* and
-*collection-aware inspection*; today you drill into objects/collections manually with `evaluate`.
+Headline (updated): **Weeks 1–2 are done, and the Week 4 headline — field-path navigation — shipped
+via `debug.evaluate`.** Recursive expansion and collection-aware inspection shipped too (OBJ-1). What
+remains from this roadmap is collection *search/filter* (OBJ-2) and a session-level type cache.
 
 ### Week 1 — Core infrastructure — ✅ complete
 1. ✅ Fix `INVALID_LENGTH` — `get_frames(thread, 0, -1)` (all frames) in `handlers.rs:handle_get_stack`.
@@ -161,28 +179,36 @@ via `debug.evaluate`.** What's genuinely missing is *automatic recursive object 
 5. ✅ Auto-expand strings in `get_stack` — `render_value` prints string contents (`handlers.rs:handle_get_stack` renders each local).
 6. ✅ **(was BLOCKER)** Expose breakpoint events — `debug.get_last_event` tool + `session.last_event`; the event pump stores the hit thread and `get_last_event` returns `{event, thread, class, method, line}` (also for steps/exceptions). `handlers.rs:handle_get_last_event`.
 
-### Week 2 — Object inspection — 🟡 partial
-7. ⬜ Recursive object expansion (max depth) — not implemented. Objects render as `TypeName (id=0x…)` (or `TypeName "toString()"` when a thread is available in `evaluate`); there is no field-tree walk and no depth bound (`render_value`). Drilling is manual via `evaluate` `.field` chains.
+### Week 2 — Object inspection — ✅ complete
+7. ✅ Recursive object expansion (max depth) — `expand_objects:true` walks a bounded field tree with cycle detection (`handlers.rs:render_value_deep`). Off by default, so the shallow `TypeName (id=0x…)` rendering is still what you get unless you ask.
 8. 🟡 Type cache — only a per-call class-name cache in `get_stack` (`class_names` map) plus `package_filter` to skip framework frames; no persistent/session type or object cache.
-9. 🟡 `get_stack` auto-expands objects — expands **strings + arrays** only; objects show type + id (rendered with `thread=None` on purpose, to keep `get_stack` cheap — no `toString`/invocation). Full object auto-expansion is 7.
+9. ✅ `get_stack` object expansion — opt-in via `expand_objects` (same renderer as 7). The default still passes `thread=None` on purpose, so the cheap path performs no `toString`/invocation per local.
 10. ⬜ HelloController `meterRegistry` verification — no such automated test; `examples/observability-debugging.md` is the closest (a manual write-up).
 
 ### Week 3 — Collections & polish — 🟡 partial
 11. ✅ Array inspection — `extra.rs:get_array_length`/`get_array_values`; `render_value` expands arrays (first 16 elements, then `… +N more`). Surfaced through `evaluate`/`get_stack`, not a dedicated tool.
-12. 🟡 Special handling for List/Map/Set/Optional — no structural/element-level expansion; they render via `toString()` in `evaluate` (readable) but not in `get_stack`. No keyed/indexed element access.
-13. 🟡 Config for inspection depth/limits — have `max_result_length` (evaluate), `max_frames`/`include_variables`/`package_filter` (get_stack), and a hardcoded 16-element array cap. No **depth** knob (there is no recursion to bound yet).
+12. ✅ Special handling for List/Map/Set/Optional — element-level under `expand_objects` (entries as `key → value` for maps); `toString()` remains the shallow rendering. Keyed/indexed access works via ordinary method calls (`map.get("k")`, `list.get(0)`); *slicing/predicates* are OBJ-2.
+13. ✅ Config for inspection depth/limits — `max_result_length`, `max_frames`/`include_variables`/`package_filter`, plus `expand_objects`/`max_depth`/`max_children` and the node budget.
 14. ⬜ Actuator-metrics debugging example — not present as a runnable example.
 
 ### Week 4 — Advanced navigation — 🟡 partial (headline done)
 15. ✅ Field-path navigation (`this.meterRegistry.meters`) — `debug.evaluate` resolves `this`/local/`Class` heads then `.field` / `.method(args)` chains (`handlers.rs:resolve_expression`). Static-method calls and object arguments shipped too (EVAL-1/EVAL-2, see Shipped).
 16. ⬜ Collection search/filter — not implemented.
-17. 🟡 Performance/caching — class-name cache, `package_filter`, single-threaded `invoke_method`, and token-trimmed outputs exist; no general type/object-id cache.
+17. 🟡 Performance/caching — class-name cache (per `get_stack` call), `package_filter`, single-threaded `invoke_method`, token-trimmed outputs, and the deep-render node budget. Still no session-level type/object cache; see the OBJ-1 note below.
 18. ✅ Documentation & examples — README tool table, `examples/*.rs` probes, `examples/observability-debugging.md`, `docs/`. Ongoing.
 
 ### What's actually left (net of the above)
 
-- **OBJ-1 — recursive object expansion** (items 7, 9, 12, 13): an opt-in `debug.get_stack {expand_objects:true, max_depth}` / `debug.evaluate` deep mode that walks instance fields to a bounded depth with a per-node cap, cycle detection, and collection-aware rendering (List/Map/Set/Optional element-level, not just `toString`). Needs the depth/breadth config knobs (13) and a real type cache (8) to stay cheap. **New item — not yet in the backlog above.**
-- **OBJ-2 — collection search/filter** (item 16): filter/slice large collections during inspection (e.g. `list[0..10]`, `map.get("k")` already works via EVAL; a predicate filter does not). Depends on OBJ-1. **New item.**
+- ~~**OBJ-1 — recursive object expansion**~~ (items 7, 9, 12, 13) — **shipped**, see above. The one
+  piece of its original description not done is the *type cache* (item 8): expansion still re-reads
+  signatures and field lists per object, so a wide graph makes repeat round trips for the same type.
+  The node budget keeps that bounded rather than fast. A session-level `type_id → (name, fields,
+  container kind)` cache is the obvious follow-up if expansion ever feels slow on a real JVM.
+- **OBJ-2 — collection search/filter** (item 16) · P2 · M: slice or filter a large collection during
+  inspection rather than always taking the first N. `map.get("k")` already works via EVAL, and
+  `max_children` bounds output, but `list[0..10]` and a predicate filter do not exist. Now unblocked
+  (OBJ-1 shipped). Note `list.get(3)` and `list.size()` already work today through ordinary method
+  calls, so the gap is specifically *slicing* and *predicates*, not indexed access.
 - Items 10 & 14 (HelloController / actuator examples): the integration harness they needed now exists
   (TEST-1), so these are just cases to add to `mcp_integration.rs` plus a write-up under **DOC-1**.
 - Field-path *method-call* richness is done (EVAL-1 static-method invocation + EVAL-2 object

@@ -134,12 +134,12 @@ fn inspection_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.get_stack".to_string(),
-            description: "Get stack frames (compact: one line per frame `#i class.method:line`, locals indented beneath)".to_string(),
+            description: "Get stack frames (compact: one line per frame `#i class.method:line`, locals indented beneath). Objects show as `Type (id=…)` by default; pass expand_objects:true to expand each local into a field tree (with max_depth / max_children) — costly, so narrow the stack with max_frames/package_filter first.".to_string(),
             input_schema: to_val(schemars::schema_for!(GetStackArgs)),
         },
         Tool {
             name: "debug.evaluate".to_string(),
-            description: "Evaluate a Java expression in frame context. Heads: a local, this, or a class name; then chain .field and .method(args), including static fields and static methods (ConfigDefaultUtils.getUrl()). Arguments may be literals or expressions passed by reference (svc.matches(reserva), foo.handle(this)). Method calls need a suspended thread; a plain static-field read does not.".to_string(),
+            description: "Evaluate a Java expression in frame context. Heads: a local, this, or a class name; then chain .field and .method(args), including static fields and static methods (ConfigDefaultUtils.getUrl()). Arguments may be literals or expressions passed by reference (svc.matches(reserva), foo.handle(this)). Method calls need a suspended thread; a plain static-field read does not. Pass expand_objects:true to get a recursive field tree instead of one line — it walks nested objects, arrays, and List/Set/Map/Optional contents to max_depth, detects cycles, and unboxes Integer/Long/etc.".to_string(),
             input_schema: to_val(schemars::schema_for!(EvaluateArgs)),
         },
         Tool {

@@ -20,6 +20,9 @@ natural language.
   literals (int, long, boolean, null, `"string"`) **or expressions passed by reference**
   (`svc.matches(reserva)`, `foo.handle(this, cfg.getId())`)
 - **Value Rendering**: Strings, typed objects (best-effort `toString()`), and **array contents**
+- **Recursive Expansion**: `expand_objects:true` on `debug.evaluate` / `debug.get_stack` walks nested
+  objects, arrays, and **`List`/`Set`/`Map`/`Optional` contents** into a field tree — bounded by
+  `max_depth`/`max_children` and a node budget, with **cycle detection** and unboxed wrappers
 - **Field Watchpoints**: break when a field is read or written — `debug.set_watchpoint` reports the
   mutating location with the **old → new** value, for "who changes this behind my back?"
 - **Set Values**: write a local variable in a suspended frame
@@ -91,7 +94,7 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | `debug.step_into` | Step into a method call |
 | `debug.step_out` | Step out of the current method |
 | `debug.get_stack` | Stack frames, compact `#i class.method:line` with typed locals indented |
-| `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods and object arguments included |
+| `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods and object arguments included; `expand_objects` for a deep field tree |
 | `debug.set_value` | Write a local variable, a static field (`Class.field`), or an instance field (`this.field`) |
 | `debug.set_watchpoint` | Break when a field is written (or read) — reports the mutating location + old → new value |
 | `debug.force_return` | Force the current method to return a given value, skipping the rest of its body |
@@ -231,6 +234,8 @@ passes it otherwise skips.
       against each argument's runtime class chain (so `pick(Item)` beats `pick(Object)`), and a
       type-mismatched invoke is refused rather than handed to the JVM
 - [x] **String and object dereferencing**, array contents, best-effort `toString()`, source-line resolution
+- [x] **Recursive object expansion** — bounded depth/breadth + node budget, cycle detection, boxed-wrapper
+      unboxing, and element-level `List`/`Set`/`Map`/`Optional` rendering (`expand_objects`)
 - [x] **Conditional breakpoints** — `condition` evaluated in the hit frame (`expr OP expr` or boolean chains); auto-resumes when false
 - [x] **Multiple concurrent sessions** — `debug.attach` returns a `session_id`; tools take an optional `session_id` (defaults to current)
 - [x] **Arguments** in `evaluate` / conditions: literals (int, long `123L`, boolean, null, `"string"`) or expressions

@@ -16,6 +16,8 @@ const fn default_true() -> bool { true }
 const fn default_max_result_length() -> usize { 2000 }
 const fn default_limit() -> usize { 40 }
 const fn default_trace_limit() -> usize { 50 }
+const fn default_max_depth() -> usize { 2 }
+const fn default_max_children() -> usize { 16 }
 
 /// Parse an optional hex thread id like "0x2" (or "2") into a raw id.
 pub fn parse_thread_id(s: Option<&str>) -> Option<u64> {
@@ -125,6 +127,16 @@ pub struct GetStackArgs {
     /// Big token saver on deep JVM stacks.
     #[serde(default)]
     pub package_filter: Option<String>,
+    /// Expand each local recursively rather than showing objects as `Type (id=…)`. Costs many JVM
+    /// round trips per frame, so pair it with `max_frames`/`package_filter` to keep the stack narrow.
+    #[serde(default)]
+    pub expand_objects: bool,
+    /// Only with `expand_objects` — levels to expand per local (default 2).
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
+    /// Only with `expand_objects` — max fields/elements per node (default 16).
+    #[serde(default = "default_max_children")]
+    pub max_children: usize,
 }
 
 /// Arguments for debug.evaluate.
@@ -145,6 +157,19 @@ pub struct EvaluateArgs {
     /// Maximum length of the rendered result string (raise for long toString()s).
     #[serde(default = "default_max_result_length")]
     pub max_result_length: usize,
+    /// Expand the result recursively instead of showing one line: walks instance fields, array
+    /// elements, and the contents of `List`/`Set`/`Map`/`Optional`, with cycle detection. Needs a
+    /// suspended thread for collections (it invokes `toArray`/`entrySet` in the debuggee).
+    #[serde(default)]
+    pub expand_objects: bool,
+    /// Only with `expand_objects` — how many levels to expand (default 2). Deeper costs more JVM
+    /// round trips; a total node budget caps the work regardless.
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
+    /// Only with `expand_objects` — max fields per object / elements per collection before
+    /// "… +N more" (default 16).
+    #[serde(default = "default_max_children")]
+    pub max_children: usize,
 }
 
 /// Arguments for `debug.list_threads`.
@@ -251,6 +276,21 @@ mod tests {
         for s in schemas {
             assert_eq!(s.get("type").and_then(|t| t.as_str()), Some("object"));
         }
+    }
+
+    // The deep-expansion knobs default to off/2/16 — the tool descriptions state those numbers, and
+    // a silent change would make the docs wrong rather than break a test.
+    #[test]
+    fn expansion_defaults_match_the_documented_values() {
+        let ev: EvaluateArgs = serde_json::from_value(serde_json::json!({"expression": "x"})).unwrap();
+        assert!(!ev.expand_objects, "expansion must be opt-in: it invokes methods in the debuggee");
+        assert_eq!(ev.max_depth, 2);
+        assert_eq!(ev.max_children, 16);
+
+        let st: GetStackArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!st.expand_objects);
+        assert_eq!(st.max_depth, 2);
+        assert_eq!(st.max_children, 16);
     }
 
     // set_value's target accepts both the new `target` key and the legacy `name` key, so existing

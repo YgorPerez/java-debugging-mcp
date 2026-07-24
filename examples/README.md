@@ -55,7 +55,8 @@ scripts/integration-test.sh force_return   # filter by name
 ```
 
 They currently cover expression resolution (static-method invocation, object arguments, overload
-selection, conditional breakpoints), field watchpoints, deferred breakpoints, and `force_return`.
+selection, conditional breakpoints), field watchpoints, deferred breakpoints, `force_return`, and
+recursive object expansion.
 Needs a JDK — without one each test prints `SKIP` and passes, so check for `SKIP` before trusting a
 green run.
 

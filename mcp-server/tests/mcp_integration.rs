@@ -332,6 +332,101 @@ fn force_return_changes_what_the_caller_receives() {
     server.panic_reset();
 }
 
+/// OBJ-1: recursive expansion — nested objects, collections, cycles, and the bounds.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn deep_expansion_walks_objects_collections_and_survives_cycles() {
+    let Some(jdk) = jdk_or_skip("deep_expansion_walks_objects_collections_and_survives_cycles") else { return };
+    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let line = probe_line(&probe_source("DeepProbe"), "// BP1");
+    server.call("debug.set_breakpoint", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in DeepProbe.inspect never fired");
+
+    // Shallow stays shallow: the default must not start invoking methods or walking graphs.
+    let shallow = server.evaluate("order");
+    assert!(
+        !shallow.contains("status") && !shallow.contains('\n'),
+        "default evaluate must stay a one-liner, got: {shallow}"
+    );
+
+    let deep = |server: &mut Server, expr: &str, depth: usize| {
+        server.call(
+            "debug.evaluate",
+            serde_json::json!({"expression": expr, "expand_objects": true, "max_depth": depth}),
+        )
+    };
+
+    // --- Fields, including an inherited one, and nesting to the requested depth ---
+    let d3 = deep(&mut server, "order", 3);
+    assert_contains_all(
+        "primitive and String fields expand",
+        &d3,
+        &["id = (int) 42", "status = \"OPEN\"", "total = (double) 19.5", "paid = (boolean) false"],
+    );
+    assert_contains_all("inherited field is included", &d3, &["recordId = (int) 7"]);
+    assert_contains_all(
+        "nesting reaches a grandchild object",
+        &d3,
+        &["customer = ", "name = \"Ana\"", "address = ", "city = \"Lisbon\""],
+    );
+
+    // --- Cycles must be reported, not recursed ---
+    assert!(d3.contains("cycle"), "expected a cycle marker for customer.self / lastOrder in:\n{d3}");
+
+    // --- Collections, element-level ---
+    assert_contains_all(
+        "List elements",
+        &d3,
+        &["tags = ", "[0] = \"urgent\"", "[1] = \"fragile\""],
+    );
+    assert_contains_all("Map entries render as key → value", &d3, &["counts = ", "\"a\" → (int) 1"]);
+    assert_contains_all("Set elements", &d3, &["labels = ", "\"x\""]);
+    assert_contains_all("Optional present and empty", &d3, &["note = Optional[\"gift\"]", "missing = Optional.empty"]);
+    assert_contains_all("empty List", &d3, &["empty = "]);
+
+    // --- Arrays take a different path from collections ---
+    assert_contains_all(
+        "primitive and object arrays",
+        &d3,
+        &["numbers = int[3]", "(int) 1", "words = java.lang.String[2]", "\"alpha\""],
+    );
+
+    // --- Breadth bound ---
+    let capped = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "order.many", "expand_objects": true, "max_depth": 2, "max_children": 5}),
+    );
+    assert_contains_all("child limit truncates and says so", &capped, &["[0] = ", "… +15 more"]);
+    assert!(!capped.contains("[5] ="), "max_children=5 must not render a 6th element:\n{capped}");
+
+    // --- Depth bound: depth 1 expands `order`'s own fields but must not expand `customer`'s ---
+    let d1 = deep(&mut server, "order", 1);
+    assert_contains_all("depth 1 still shows own fields", &d1, &["id = (int) 42", "customer = "]);
+    assert!(
+        !d1.contains("city = "),
+        "max_depth=1 must not reach order.customer.address.city:\n{d1}"
+    );
+
+    // --- get_stack expansion is the same machinery on a frame's locals ---
+    let stack = server.call(
+        "debug.get_stack",
+        serde_json::json!({"expand_objects": true, "max_depth": 2, "max_frames": 1, "package_filter": "DeepProbe"}),
+    );
+    assert_contains_all("get_stack expands locals", &stack, &["order = ", "id = (int) 42", "name = \"Ana\""]);
+
+    // A deep render must never leave the VM wedged: the probe keeps printing after we resume.
+    server.panic_reset();
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("inspect ")).is_some(),
+        "probe stopped running after deep expansion — an invocation likely left a thread suspended"
+    );
+}
+
 /// Pull the ints out of `"old":"(int) 5"` / `"new":"(int) 6"` in an event line.
 fn parse_old_new(ev: &str) -> Option<(i64, i64)> {
     let grab = |key: &str| -> Option<i64> {
