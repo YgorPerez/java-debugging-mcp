@@ -70,6 +70,18 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   (ClassType.SetValues) + `set_object_values` (ObjectReference.SetValues). Legacy `name` key still
   accepted. Validated — static String/int + instance int/String/boolean written and read back
   (`examples/test_set_field.rs`).
+- **`jdwp-trace` skill / swallowed-exception playbook (DOC-1)** — lives in the sibling
+  `infotravel-dev-toolkit` repo (`skills/jdwp-trace/`, commit `8546bbf`), cross-linked from
+  `ask-infotravel` and the README, with a pointer from `run-infotravel` § 3 left in that repo's working
+  tree (its SKILL.md had unrelated uncommitted edits, so the hunk wasn't swept into this commit).
+  Three silent-catch sites, each **verified against the current Java source** rather than transcribed —
+  and the first one differs from this backlog item's description: in `IntegraSrv.post` the swallow is a
+  missing `else` on `if (status == 200)` (any non-200 returns `null`, status recorded nowhere), not a
+  silent catch; that catch does log, but rethrows `ErrorException(result)` with `result` null, and
+  `ErrorException(String)` has no cause. `EnviaEmailSrv.enviarEmailIntegrador:162` is the complete
+  swallow (its `save()` is commented out, so the failure it records dies with the method).
+  Recipes are built on `trace:true` logpoints, since 8180 is shared and a normal breakpoint freezes the
+  whole VM — which is what made TRACE-1 the prerequisite.
 - **Collection search/filter (OBJ-2)** — `[…]` subscripts in `debug.evaluate` expressions:
   `lines[0]` / `counts["key"]` (index — narrows to one value, so `lines[0].sku` keeps chaining),
   `lines[2..5]` (half-open slice, clamped rather than erroring on an over-long range), and
@@ -156,28 +168,11 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## Backlog
 
-Priority key: **P1** = highest payoff for the infotravel/integraWS investigations (shared 8180 +
-silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
-
-> **Everything in this repo is done** — TRACE-1, EXC-1, SETF-1, EVAL-1, EVAL-2, WATCH-1, TEST-1,
-> OBJ-1, OBJ-2. See Shipped above. The only item left is **DOC-1**, which lives in the sibling
-> `infotravel-dev-toolkit` repo.
-
-### DOC-1 — `jdwp-trace` skill / silent-catch playbook (infotravel-dev-toolkit)  · P2 · S
-
-**What to build**
-Lives in the sibling `infotravel-dev-toolkit` repo, but tracked here because it depends on TRACE-1 +
-EXC-1. A skill (or recipes folded into run-infotravel) that pairs logpoints + exception breakpoints
-with the known silent-catch sites, as a ready playbook: "OTP/email/save silently fails → exception-
-break these classes / trace these methods."
-
-**Acceptance criteria**
-- [ ] Names the concrete silent-catch sites (IntegraSrv.post non-200, EnviaEmailSrv:162, ErrorException swallows)
-- [ ] Gives a copy-paste trace/exception-breakpoint recipe for each
-- [ ] Cross-linked from run-infotravel § 3 and ask-infotravel
-
-**Blocked by**
-~~TRACE-1, EXC-1~~ — both shipped; DOC-1 is now unblocked.
+> **The backlog is empty** — TRACE-1, EXC-1, SETF-1, EVAL-1, EVAL-2, WATCH-1, TEST-1, OBJ-1, OBJ-2 and
+> DOC-1 are all shipped; see the Shipped section above. What's left is the follow-ups noted there: a
+> session-level **type cache** (appendix items 8/17), **interface-typed parameters and boxed primitives**
+> in overload resolution (needs `ReferenceType.Interfaces`), and the OBJ-2 gaps (writing through a
+> subscript, filtering a `Map`'s entries). None is blocking anything.
 
 ---
 
