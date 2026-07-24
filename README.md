@@ -109,6 +109,7 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | `debug.list_threads` | List threads by name; filter with `name_filter` / `only_suspended` / `limit` |
 | `debug.pause` | Pause execution (suspend all threads) |
 | `debug.panic` | Safety: clear all breakpoints and resume all threads |
+| `debug.list_sessions` | List live sessions — `host:port`, which is current, suspended or DEAD, and how many stop points/traces/events each holds |
 | `debug.disconnect` | End the debug session |
 
 Most tools take `thread_id` as an optional hex string (e.g. `"0x2"`); when omitted they default to
@@ -248,7 +249,7 @@ passes it otherwise skips.
 - [x] **Collection subscripts** — index, `Map` key lookup (with key boxing), half-open slice, and
       predicate filter with element-relative left sides; bounded by a documented scan cap
 - [x] **Conditional breakpoints** — `condition` evaluated in the hit frame (`expr OP expr` or boolean chains); auto-resumes when false
-- [x] **Multiple concurrent sessions** — `debug.attach` returns a `session_id`; tools take an optional `session_id` (defaults to current)
+- [x] **Multiple concurrent sessions** — `debug.attach` returns a `session_id`; tools take an optional `session_id` (defaults to current); `debug.list_sessions` finds one you lost
 - [x] **Arguments** in `evaluate` / conditions: literals (int, long `123L`, boolean, null, `"string"`) or expressions
 - [x] **Field watchpoints** — `FIELD_MODIFICATION` / `FIELD_ACCESS` requests; a write hit reports the
       mutating location and the old → new pair (the old value is read before the pending store commits)

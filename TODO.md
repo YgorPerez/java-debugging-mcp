@@ -156,6 +156,18 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   `int` for a reference parameter, which reads it as an oop and **SIGSEGVs the debuggee** (reproduced
   — hs_err + core dump). The fallback is now kind-checked, so a type-mismatched invoke is refused
   with an error instead of crashing the target.
+- **`debug.list_sessions` (SESS-1)** — concurrent sessions worked but were unfindable: `attach` handed
+  back a `session_id` and every tool accepted one, yet a caller who lost it could only reach "current".
+  The new tool lists each session's `host:port`, marks the current one, and reports whether it is
+  running / SUSPENDED / **DEAD**, with its stop-point count and any buffered traces/events. Liveness is
+  read from the event pump — it exits when the connection closes, so a finished task means the JVM is
+  gone. Deliberately *not* a JDWP round trip, which could hang on exactly the half-dead socket this is
+  meant to diagnose. `DebugSession` now remembers its endpoint (the connection doesn't).
+  A dead session is reported, not reaped: this is the tool you reach for when you are already unsure
+  what is attached, and one that silently dropped entries mid-listing would be a worse instrument.
+  `debug.disconnect {session_id}` is the escape hatch, and the listing says so.
+  Validated by `list_sessions_names_every_attachment_and_flags_a_dead_one` — two probes attached, counts
+  proven per-session, the older probe killed, the dead one flagged while the live one is untouched.
 - **Wire-reader unit tests, and the panic they found (TEST-2)** — the readers had zero coverage against
   malformed input, which a real JVM never produces and a real *bug* does. 12 table-driven tests now
   cover them (`reader.rs`, `events.rs`; plain `cargo test`, no JDK): every `ValueData` variant
@@ -240,22 +252,6 @@ silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
 > TEST-1, OBJ-1, OBJ-2, DOC-1) plus all 18 appendix items. A review of that work found ten more items;
 > the three **defects in what shipped** (TRACE-2, OBJ-3, EVT-1) are now done and moved to Shipped, and
 > what remains below is follow-on work rather than anything broken.
-
-### SESS-1 — No way to enumerate sessions  · P2 · S
-
-**What to build**
-Multiple concurrent sessions work — `debug.attach` returns a `session_id` and every tool accepts one —
-but there is no `debug.list_sessions`, so a caller who loses the id can only reach "current". Add a tool
-listing each session with its host:port, whether it is current, its stop-point counts, and whether it is
-suspended.
-
-**Acceptance criteria**
-- [ ] `debug.list_sessions` lists every live session, marking the current one
-- [ ] Each row carries enough to pick one: host:port, suspended state, breakpoint/watchpoint counts
-- [ ] A dead session (JVM gone) is either reaped or shown as dead rather than listed as healthy
-
-**Blocked by**
-None.
 
 ### EVAL-3 — Interface-typed parameters and boxed primitives in overload resolution  · P2 · M
 

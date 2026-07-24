@@ -13,6 +13,9 @@ pub type SessionId = String;
 #[derive(Debug)]
 pub struct DebugSession {
     pub connection: JdwpConnection,
+    /// The `host:port` this session attached to. Kept so `debug.list_sessions` can identify a session
+    /// by where it points rather than by an opaque id — the connection itself doesn't remember.
+    pub endpoint: String,
     pub breakpoints: HashMap<String, BreakpointInfo>,
     /// Ring buffer of reportable events, oldest first. Bounded by `MAX_EVENTS`.
     ///
@@ -198,10 +201,11 @@ impl SessionManager {
         }
     }
 
-    pub async fn create_session(&self, connection: JdwpConnection) -> SessionId {
+    pub async fn create_session(&self, connection: JdwpConnection, endpoint: String) -> SessionId {
         let session_id = format!("session_{}", uuid::v4());
         let session = DebugSession {
             connection,
+            endpoint,
             breakpoints: HashMap::new(),
             events: VecDeque::new(),
             event_seq: 0,
@@ -247,6 +251,19 @@ impl SessionManager {
     pub async fn get_current_session_id(&self) -> Option<SessionId> {
         let current = self.current_session.lock().await;
         current.clone()
+    }
+
+    /// Every live session, id-sorted, with the current session's id.
+    ///
+    /// Sorted so repeated calls list them in the same order (a `HashMap` iteration order is arbitrary),
+    /// and ids embed a timestamp, so this is oldest-first in practice.
+    pub async fn list(&self) -> (Vec<(SessionId, Arc<Mutex<DebugSession>>)>, Option<SessionId>) {
+        let sessions = self.sessions.lock().await;
+        let mut rows: Vec<(SessionId, Arc<Mutex<DebugSession>>)> =
+            sessions.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect();
+        drop(sessions); // release the map lock before taking the current-session lock
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        (rows, self.get_current_session_id().await)
     }
 
     pub async fn remove_session(&self, session_id: &str) {

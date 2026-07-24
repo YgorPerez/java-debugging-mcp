@@ -39,6 +39,11 @@ fn session_tools() -> Vec<Tool> {
             input_schema: to_val(schemars::schema_for!(AttachArgs)),
         },
         Tool {
+            name: "debug.list_sessions".to_string(),
+            description: "List every live debug session — its host:port, whether it is the current one (all tools default to that), whether it is suspended, and how many stop points/traces/events it holds. Use it when you have lost a session_id, or to check what is still attached before walking away. A session whose JVM has gone is shown as DEAD.".to_string(),
+            input_schema: empty(),
+        },
+        Tool {
             name: "debug.disconnect".to_string(),
             description: "Disconnect from JVM debug session".to_string(),
             input_schema: empty(),
@@ -168,6 +173,7 @@ mod tests {
         assert_eq!(names.len(), tools.len(), "duplicate tool name in get_tools()");
         for expected in [
             "debug.attach",
+            "debug.list_sessions",
             "debug.disconnect",
             "debug.set_breakpoint",
             "debug.set_exception_breakpoint",

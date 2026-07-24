@@ -940,3 +940,90 @@ fn parse_old_new(ev: &str) -> Option<(i64, i64)> {
     Some((grab("old")?, grab("new")?))
 }
 
+
+/// SESS-1: `debug.list_sessions` — concurrent sessions are addressable, and one whose JVM has gone is
+/// reported dead rather than listed as healthy.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn list_sessions_names_every_attachment_and_flags_a_dead_one() {
+    let Some(jdk) = jdk_or_skip("list_sessions_names_every_attachment_and_flags_a_dead_one") else { return };
+    let mut server = Server::start().expect("start server");
+
+    assert_contains_all(
+        "no sessions yet",
+        &server.call("debug.list_sessions", serde_json::json!({})),
+        &["No debug sessions"],
+    );
+
+    // Two probes, so the listing has to distinguish them — and the second attach becomes current.
+    let first = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let attach_first = server.attach(first.port);
+    let first_id = session_id_from(&attach_first).expect("no session id in attach reply");
+    let second = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
+    let attach_second = server.attach(second.port);
+    let second_id = session_id_from(&attach_second).expect("no session id in attach reply");
+    assert_ne!(first_id, second_id, "each attach must get its own session");
+
+    // Give the older session a stop point, so the counts are visibly per-session rather than global.
+    server.call(
+        "debug.set_watchpoint",
+        serde_json::json!({
+            "session_id": first_id, "class_name": "WatchProbe", "field_name": "counter", "trace": true,
+        }),
+    );
+
+    let listed = server.call("debug.list_sessions", serde_json::json!({}));
+    assert_contains_all("both sessions, by endpoint", &listed, &[
+        "2 session(s)",
+        &first.port.to_string(),
+        &second.port.to_string(),
+        &first_id,
+        &second_id,
+    ]);
+    assert_contains_all("the newest attach is current", &listed, &["← current"]);
+    assert_eq!(listed.matches("← current").count(), 1, "exactly one session is current:\n{listed}");
+    let current_line = listed
+        .lines()
+        .find(|l| l.contains("← current"))
+        .expect("a current line");
+    assert!(
+        current_line.contains(&second_id),
+        "the last attach should be current, got: {current_line}"
+    );
+    let first_line = listed.lines().find(|l| l.contains(&first_id)).expect("a line for the first session");
+    assert_contains_all("per-session stop-point count", first_line, &["1 stop point(s)"]);
+
+    // Kill the older probe's JVM. The event pump ends with the connection, which is what marks the
+    // session dead — no round trip, so this can't hang on a half-closed socket.
+    drop(first);
+    let mut dead_seen = String::new();
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        dead_seen = server.call("debug.list_sessions", serde_json::json!({}));
+        if dead_seen.contains("DEAD") {
+            break;
+        }
+    }
+    let dead_line = dead_seen
+        .lines()
+        .find(|l| l.contains(&first_id))
+        .unwrap_or_else(|| panic!("no line for the dead session in:\n{dead_seen}"));
+    assert_contains_all("a gone JVM is reported dead", dead_line, &["DEAD"]);
+    // The surviving session must not be collateral damage.
+    let live_line = dead_seen.lines().find(|l| l.contains(&second_id)).expect("a line for the live session");
+    assert!(!live_line.contains("DEAD"), "the other session is still attached: {live_line}");
+
+    // And it can be removed by id, which is the escape hatch the listing points at.
+    server.call("debug.disconnect", serde_json::json!({"session_id": first_id}));
+    let after = server.call("debug.list_sessions", serde_json::json!({}));
+    assert_contains_all("one left", &after, &["1 session(s)", &second_id]);
+    assert!(!after.contains(&first_id), "the disconnected session must be gone:\n{after}");
+}
+
+/// Pull `session_id` out of an attach reply — `… (session: session_abc123)`.
+fn session_id_from(attach_reply: &str) -> Option<String> {
+    let at = attach_reply.find("session: ")? + "session: ".len();
+    let rest = &attach_reply[at..];
+    let end = rest.find(')')?;
+    Some(rest[..end].to_string())
+}

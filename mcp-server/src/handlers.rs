@@ -171,6 +171,7 @@ impl RequestHandler {
             "debug.step_into" => self.handle_step_into(args).await,
             "debug.step_out" => self.handle_step_out(args).await,
             "debug.pause" => self.handle_pause(args).await,
+            "debug.list_sessions" => self.handle_list_sessions().await,
             "debug.disconnect" => self.handle_disconnect(args).await,
             "debug.panic" => self.handle_panic(args).await,
             _ => return None,
@@ -202,7 +203,9 @@ impl RequestHandler {
         let connection = jdwp_client::JdwpConnection::connect(host, port).await
             .map_err(|e| format!("Failed to connect: {e}"))?;
 
-        let session_id = self.session_manager.create_session(connection).await;
+        let session_id = self.session_manager
+            .create_session(connection, format!("{host}:{port}"))
+            .await;
         // Get the session guard once so the listener/watchdog handles are stored before we return.
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "Failed to get session after creation".to_string())?;
@@ -225,6 +228,30 @@ impl RequestHandler {
         }
 
         Ok(format!("Connected to JVM at {host}:{port} (session: {session_id})"))
+    }
+
+    /// List every live session, so a caller who lost a `session_id` can find it again.
+    ///
+    /// Read-only on purpose. A dead session is *reported* dead rather than reaped: this is the tool you
+    /// reach for when you are already confused about what is attached, and having it silently drop
+    /// entries mid-listing would make it a worse instrument. `debug.disconnect {session_id}` removes one.
+    async fn handle_list_sessions(&self) -> Result<String, String> {
+        let (sessions, current) = self.session_manager.list().await;
+        if sessions.is_empty() {
+            return Ok("No debug sessions. Use debug.attach to open one.".to_string());
+        }
+
+        let mut out = format!("{} session(s):\n", sessions.len());
+        for (sid, guard) in &sessions {
+            // Scoped so each session's lock is released before the next is taken.
+            let line = {
+                let s = guard.lock().await;
+                render_session_line(sid, &s, current.as_ref())
+            };
+            out.push_str(&line);
+        }
+        out.push_str("\nEvery tool takes an optional session_id; without one it uses the current session.");
+        Ok(out)
     }
 
     async fn handle_set_breakpoint(&self, args: serde_json::Value) -> Result<String, String> {
@@ -1079,6 +1106,51 @@ const fn suspend_policy_for(trace: bool) -> jdwp_client::SuspendPolicy {
     } else {
         jdwp_client::SuspendPolicy::All
     }
+}
+
+/// Format one session into the `debug.list_sessions` output, as a whole line including its newline.
+///
+/// Liveness comes from the event pump: it exits when the connection closes, so a finished task means
+/// the JVM is gone. That costs nothing to check, unlike a JDWP round trip — which could itself hang on
+/// a half-dead socket, exactly the case this is meant to diagnose.
+fn render_session_line(
+    sid: &str,
+    s: &crate::session::DebugSession,
+    current: Option<&crate::session::SessionId>,
+) -> String {
+    let is_current = current.is_some_and(|c| c == sid);
+    let dead = s.event_listener_task.as_ref().is_some_and(tokio::task::JoinHandle::is_finished);
+    let state = if dead {
+        "DEAD (JVM gone — debug.disconnect it)"
+    } else if s.suspended_since.is_some() {
+        "SUSPENDED"
+    } else {
+        "running"
+    };
+    let stops = s.breakpoints.len()
+        + s.pending_breakpoints.len()
+        + s.exception_requests.len()
+        + s.watchpoints.len();
+    let mut line = format!(
+        "  {} [{}] {} — {}, {} stop point(s)",
+        if is_current { "▶" } else { " " },
+        sid,
+        s.endpoint,
+        state,
+        stops,
+    );
+    // Buffer counts only when there is something to read, so a quiet session stays one short line.
+    if !s.traces.is_empty() {
+        let _ = write!(line, ", {} trace(s)", s.traces.len());
+    }
+    if !s.events.is_empty() {
+        let _ = write!(line, ", {} event(s)", s.events.len());
+    }
+    if is_current {
+        line.push_str(" ← current");
+    }
+    line.push('\n');
+    line
 }
 
 /// Format one active breakpoint into the `debug.list_breakpoints` output. `bp_id` is its map key.
