@@ -107,9 +107,23 @@ public class DeepProbe {
         }
     }
 
+    // OBJ-3: a SECOND, deliberately heavy local in the same frame as `order`, so one get_stack call
+    // has more than one expandable local to spend its node budget on. The same order 20 times over —
+    // siblings, not a cycle, so each renders in full (path-based detection only stops a value
+    // reachable from itself), which is ~500 nodes per handful. With the old per-local budget this one
+    // frame could spend several times the documented cap; with one shared budget it must stop.
+    static List<Order> batchOf(Order order) {
+        List<Order> batch = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            batch.add(order);
+        }
+        return batch;
+    }
+
     static void inspect(Order order, int n) {
         int local = n;
-        System.out.println("inspect " + local + " " + order.id); // BP1
+        List<Order> batch = batchOf(order);
+        System.out.println("inspect " + local + " " + order.id + " " + batch.size()); // BP1
     }
 
     public static void main(String[] args) throws Exception {

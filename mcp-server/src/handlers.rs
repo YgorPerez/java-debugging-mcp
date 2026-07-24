@@ -240,13 +240,7 @@ impl RequestHandler {
         } else {
             format!("L{};", class_pattern.replace('.', "/"))
         };
-        // A logpoint suspends only the hit thread (so we can read its args), then resumes it in the
-        // event pump — nothing is left frozen. A normal breakpoint suspends all threads.
-        let suspend_policy = if a.trace {
-            jdwp_client::SuspendPolicy::EventThread
-        } else {
-            jdwp_client::SuspendPolicy::All
-        };
+        let suspend_policy = suspend_policy_for(a.trace);
         let spec = BreakpointSpec {
             class_pattern: class_pattern.to_string(),
             signature,
@@ -503,18 +497,9 @@ impl RequestHandler {
         let max_frames = a.max_frames;
         let include_variables = a.include_variables;
 
-        // Prefer the explicit thread, then the last thread that hit a breakpoint/step,
-        // then fall back to the first thread.
-        let target_thread = if let Some(tid) = thread_id {
-            tid
-        } else if let Some(t) = session.last_thread {
-            t
-        } else {
-            let threads = session.connection.get_all_threads().await
-                .map_err(|e| format!("Failed to get threads: {e}"))?;
-
-            *threads.first().ok_or_else(|| "No threads found".to_string())?
-        };
+        let last_thread = session.last_thread;
+        let target_thread =
+            resolve_target_thread(&mut session.connection, thread_id, last_thread).await?;
 
         // Get frames (-1 means all frames to avoid INVALID_LENGTH errors)
         let mut frames = session.connection.get_frames(target_thread, 0, -1).await
@@ -544,6 +529,19 @@ impl RequestHandler {
         // Cache class-name resolution across frames (recursion / same-class frames are common).
         let mut class_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
         let mut hidden = 0usize;
+        // ONE node budget for the whole call — see STACK_NODE_BUDGET. Deep expansion invokes methods
+        // in the debuggee, which needs the suspended thread, so `deep` is Some only when asked for;
+        // the default path stays cheap and side-effect-free (no toString() per local).
+        let mut deep = a.expand_objects.then(|| {
+            (
+                DeepOpts {
+                    depth_limit: a.max_depth,
+                    child_limit: a.max_children.max(1),
+                    text_len: 200,
+                },
+                DeepState::new(STACK_NODE_BUDGET),
+            )
+        });
 
         for (idx, frame) in frames.iter().enumerate() {
             let class_id = frame.location.class_id;
@@ -568,19 +566,23 @@ impl RequestHandler {
             };
 
             if include_variables && !active.is_empty() {
-                // Render with type name + string contents (no method invocation here —
-                // thread=None — to keep get_stack cheap).
-                // Deep expansion invokes methods in the debuggee, which needs the suspended thread —
-                // pass it only when expansion was asked for, so the default stays cheap and
-                // side-effect-free (no toString() per local).
-                let deep = a.expand_objects.then(|| DeepOpts {
-                    depth_limit: a.max_depth,
-                    child_limit: a.max_children.max(1),
-                    text_len: 200,
-                });
-                render_frame_variables(
-                    &mut session.connection, &mut output, target_thread, frame.frame_id, &active, deep,
+                let stopped_at = render_frame_variables(
+                    &mut session.connection,
+                    &mut output,
+                    target_thread,
+                    (idx, frame.frame_id),
+                    &active,
+                    deep.as_mut().map(|(opts, state)| (*opts, state)),
                 ).await;
+                // Out of budget: name where it stopped and abandon the remaining frames, rather than
+                // repeating "budget exhausted" under every local of every frame left.
+                if let Some(local) = stopped_at {
+                    let _ = writeln!(
+                        output,
+                        "   … node budget ({STACK_NODE_BUDGET}) exhausted at #{idx} {class_name}.{method_name} local `{local}` — remaining frames not expanded. Narrow with package_filter/max_frames/max_depth, or inspect one value with debug.evaluate."
+                    );
+                    break;
+                }
             }
         }
         drop(session);
@@ -725,63 +727,57 @@ impl RequestHandler {
     }
 
     async fn handle_get_last_event(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::GetLastEventArgs = crate::args::parse(&args)?;
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
 
-        let Some(event_set) = session.last_event.clone() else {
+        if session.events.is_empty() {
             return Ok("No events received yet. Set a breakpoint and trigger it.".to_string());
-        };
+        }
 
-        // Compact, machine-readable summary only — one [event] line per event with the source
-        // location resolved. Raw JDWP ids and the human-readable decoration are intentionally
-        // omitted; they cost tokens and the caller never uses them.
-        let mut lines: Vec<String> = Vec::with_capacity(event_set.events.len() + 1);
-        for ev in &event_set.events {
-            let mut obj = serde_json::Map::new();
-            obj.insert("event".to_string(), json!(event_type_name(&ev.details)));
-            if let Some((thread, loc)) = event_location(&ev.details) {
-                let (cls, method, line) = describe_location(&mut session.connection, &loc).await;
-                obj.insert("thread".to_string(), json!(format!("0x{:x}", thread)));
-                obj.insert("class".to_string(), json!(cls));
-                obj.insert("method".to_string(), json!(method));
-                obj.insert("line".to_string(), json!(line));
+        // Newest last, matching `get_traces` — so a bare call (limit 1) prints exactly the latest
+        // event as it always did, and a larger limit reads as a chronological tail.
+        let total = session.events.len();
+        let take = a.limit.max(1).min(total);
+        let shown: Vec<crate::session::EventRecord> =
+            session.events.iter().skip(total - take).cloned().collect();
+        let (dropped, unshown) = (session.events_dropped, total - take);
 
-                // For an exception hit, add the exception type, whether it is caught, and where.
-                if let jdwp_client::events::EventKind::Exception { exception, catch_location, .. } = &ev.details {
-                    let exc_type = match session.connection.get_object_reference_type(*exception).await {
-                        Ok(t) => decode_signature(&session.connection.get_signature(t).await.unwrap_or_default()),
-                        Err(_) => "unknown".to_string(),
-                    };
-                    obj.insert("exception".to_string(), json!(exc_type));
-                    obj.insert("caught".to_string(), json!(catch_location.is_some()));
-                    if let Some(cl) = catch_location {
-                        let (caught_class, caught_method, caught_line) = describe_location(&mut session.connection, cl).await;
-                        obj.insert("caught_at".to_string(), json!(format!("{}.{}:{}", caught_class, caught_method, caught_line.unwrap_or(-1))));
-                    }
-                }
-
-                // For a watchpoint hit, add which field was touched and its value(s).
-                describe_field_event(&mut session.connection, &ev.details, &mut obj).await;
-            } else {
-                match &ev.details {
-                    jdwp_client::events::EventKind::VMStart { thread }
-                    | jdwp_client::events::EventKind::ThreadStart { thread }
-                    | jdwp_client::events::EventKind::ThreadDeath { thread } => {
-                        obj.insert("thread".to_string(), json!(format!("0x{:x}", thread)));
-                    }
-                    jdwp_client::events::EventKind::ClassPrepare { thread, signature, .. } => {
-                        obj.insert("thread".to_string(), json!(format!("0x{:x}", thread)));
-                        obj.insert("class".to_string(), json!(signature));
-                    }
-                    _ => {}
-                }
+        let mut lines: Vec<String> = Vec::new();
+        for rec in &shown {
+            // Compact, machine-readable summary only — one [event] line per event with the source
+            // location resolved. Raw JDWP ids and the human-readable decoration are intentionally
+            // omitted; they cost tokens and the caller never uses them.
+            for ev in &rec.set.events {
+                let mut obj = serde_json::Map::new();
+                obj.insert("seq".to_string(), json!(rec.seq));
+                obj.insert("event".to_string(), json!(event_type_name(&ev.details)));
+                describe_event_into(&mut session.connection, &ev.details, &mut obj).await;
+                lines.push(format!("[event] {}", serde_json::Value::Object(obj)));
             }
-            lines.push(format!("[event] {}", serde_json::Value::Object(obj)));
+        }
+        // The newest event is the last one printed, so this describes the state you are in now.
+        let suspended = shown.last().is_some_and(|r| event_suspends(&r.set));
+        if a.drain {
+            session.events.clear();
         }
         drop(session);
-        lines.push(format!("[suspended] {}", event_suspends(&event_set)));
+
+        lines.push(format!("[suspended] {suspended}"));
+        // Only when there is something to catch up on: silence means "you have seen everything".
+        if unshown > 0 {
+            lines.push(format!(
+                "[pending] {unshown} older event(s) buffered — pass limit to read them, drain:true to discard"
+            ));
+        }
+        if dropped > 0 {
+            lines.push(format!(
+                "[dropped] {dropped} event(s) evicted (buffer cap {}) — read events sooner, or narrow the breakpoint",
+                crate::session::MAX_EVENTS
+            ));
+        }
         Ok(lines.join("\n"))
     }
 
@@ -923,8 +919,10 @@ impl RequestHandler {
             None => None,
         };
 
+        // A traced request suspends only the throwing thread, which the pump snapshots and resumes —
+        // so a shared JVM keeps serving while you collect throws.
         let request_id = session.connection
-            .set_exception_request(ref_type, a.caught, a.uncaught, jdwp_client::SuspendPolicy::All)
+            .set_exception_request(ref_type, a.caught, a.uncaught, suspend_policy_for(a.trace))
             .await
             .map_err(|e| format!("Failed to set exception breakpoint: {e}"))?;
 
@@ -936,6 +934,8 @@ impl RequestHandler {
             class_pattern: class_pattern.clone(),
             caught: a.caught,
             uncaught: a.uncaught,
+            trace: a.trace,
+            trace_expr: a.trace_expr.clone(),
         });
         drop(session);
 
@@ -950,8 +950,13 @@ impl RequestHandler {
         } else {
             ""
         };
+        let mode = if a.trace {
+            "\n   Mode: trace (non-suspending) — throws are snapshotted and the thread resumed; read them with debug.get_traces"
+        } else {
+            "\n   Hits are reported via debug.get_last_event.\n   ⚠️  Suspends ALL threads on each throw — on a shared JVM use trace:true instead."
+        };
         Ok(format!(
-            "✅ Exception breakpoint set on {class_pattern} ({which})\n   Breakpoint ID: {exc_id}\n   Hits are reported via debug.get_last_event.{noisy}"
+            "✅ Exception breakpoint set on {class_pattern} ({which})\n   Breakpoint ID: {exc_id}{mode}{noisy}"
         ))
     }
 
@@ -990,7 +995,7 @@ impl RequestHandler {
         let mut ids = Vec::with_capacity(kinds.len());
         for kind in kinds {
             let request_id = session.connection
-                .set_field_watch(declaring_type, field.field_id, kind, jdwp_client::SuspendPolicy::All)
+                .set_field_watch(declaring_type, field.field_id, kind, suspend_policy_for(a.trace))
                 .await
                 .map_err(|e| format!(
                     "Failed to set {} watchpoint: {e} (error 99 NOT_IMPLEMENTED means this JVM lacks canWatchField{})",
@@ -1005,13 +1010,20 @@ impl RequestHandler {
                 class_name: class_name.to_string(),
                 field_name: field_name.to_string(),
                 is_static,
+                trace: a.trace,
+                trace_expr: a.trace_expr.clone(),
             });
         }
         drop(session);
 
         let kindness = if is_static { "static" } else { "instance" };
+        let where_hits = if a.trace {
+            "   Mode: trace (non-suspending) — each hit is snapshotted with the mutating location and old → new value, then the thread resumes; read them with debug.get_traces."
+        } else {
+            "   Hits are reported via debug.get_last_event with the mutating location and old → new value.\n   ⚠️  Suspends ALL threads on each hit — on a shared JVM use trace:true instead."
+        };
         Ok(format!(
-            "✅ Watchpoint set on {}.{} ({kindness} {})\n   Breakpoint ID(s): {}\n   Hits are reported via debug.get_last_event with the mutating location and old → new value.\n   ⚠️  A watched field can't be JIT-optimised — expect the debuggee to slow down; clear it when done.",
+            "✅ Watchpoint set on {}.{} ({kindness} {})\n   Breakpoint ID(s): {}\n{where_hits}\n   ⚠️  A watched field can't be JIT-optimised — expect the debuggee to slow down; clear it when done.",
             class_name,
             field_name,
             decode_signature(&field.signature),
@@ -1037,11 +1049,13 @@ impl RequestHandler {
             total, take, crate::session::MAX_TRACES
         ));
         for rec in session.traces.iter().skip(start) {
+            let detail_s = format_trace_detail(rec);
             let args_s = format_trace_args(rec);
             let expr_s = format_trace_expr(rec);
             lines.push(format!(
-                "#{} [{}] {}.{}:{} thread=0x{:x}{}{}",
-                rec.seq, rec.bp_id, rec.class, rec.method, rec.line.unwrap_or(-1), rec.thread, args_s, expr_s
+                "#{} [{}] {}.{}:{} thread=0x{:x}{}{}{}",
+                rec.seq, rec.bp_id, rec.class, rec.method, rec.line.unwrap_or(-1), rec.thread,
+                detail_s, args_s, expr_s
             ));
         }
         if a.clear {
@@ -1050,6 +1064,20 @@ impl RequestHandler {
             lines.push("(buffer cleared)".to_string());
         }
         Ok(lines.join("\n"))
+    }
+}
+
+/// The suspend policy a stop point should be armed with. Shared by all three kinds (line breakpoint,
+/// exception breakpoint, watchpoint) so "traced" means one thing everywhere.
+///
+/// A traced hit suspends only the hit thread — enough to read its frame — and the event pump resumes
+/// it immediately, so nothing is left frozen. Anything else suspends every thread and waits for the
+/// caller, which on a shared JVM stalls other people's requests.
+const fn suspend_policy_for(trace: bool) -> jdwp_client::SuspendPolicy {
+    if trace {
+        jdwp_client::SuspendPolicy::EventThread
+    } else {
+        jdwp_client::SuspendPolicy::All
     }
 }
 
@@ -1093,7 +1121,69 @@ fn render_exception_line(output: &mut String, er: &crate::session::ExceptionRequ
         (false, true) => "uncaught",
         (false, false) => "none",
     };
-    let _ = writeln!(output, "  ⚡ [{}] exception {} ({})", er.id, er.class_pattern, which);
+    let _ = writeln!(
+        output,
+        "  ⚡ [{}] exception {} ({which}){}",
+        er.id,
+        er.class_pattern,
+        if er.trace { " (trace)" } else { "" },
+    );
+}
+
+/// Describe one event into a `get_last_event` entry: where it happened, plus whatever is specific to
+/// the kind. Everything a caller needs about a hit, in one place — so the trace path (TRACE-2) can
+/// reuse the kind-specific halves and report exactly what a suspending hit would.
+async fn describe_event_into(
+    conn: &mut jdwp_client::JdwpConnection,
+    details: &EventKind,
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    use jdwp_client::events::EventKind as K;
+    if let Some((thread, loc)) = event_location(details) {
+        let (cls, method, line) = describe_location(conn, &loc).await;
+        obj.insert("thread".to_string(), json!(format!("0x{thread:x}")));
+        obj.insert("class".to_string(), json!(cls));
+        obj.insert("method".to_string(), json!(method));
+        obj.insert("line".to_string(), json!(line));
+        describe_exception_event(conn, details, obj).await;
+        describe_field_event(conn, details, obj).await;
+        return;
+    }
+    // Events with no location still name their thread, and a class-prepare names its class.
+    match details {
+        K::VMStart { thread } | K::ThreadStart { thread } | K::ThreadDeath { thread } => {
+            obj.insert("thread".to_string(), json!(format!("0x{thread:x}")));
+        }
+        K::ClassPrepare { thread, signature, .. } => {
+            obj.insert("thread".to_string(), json!(format!("0x{thread:x}")));
+            obj.insert("class".to_string(), json!(signature));
+        }
+        _ => {}
+    }
+}
+
+/// Add an exception hit's details: the thrown type, whether it is caught, and where it is caught.
+///
+/// `caught` comes from the presence of a catch location, which is how JDWP reports it — an exception
+/// with no catch location propagates out of the thread.
+async fn describe_exception_event(
+    conn: &mut jdwp_client::JdwpConnection,
+    details: &EventKind,
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let EventKind::Exception { exception, catch_location, .. } = details else {
+        return;
+    };
+    let exc_type = match conn.get_object_reference_type(*exception).await {
+        Ok(t) => decode_signature(&conn.get_signature(t).await.unwrap_or_default()),
+        Err(_) => "unknown".to_string(),
+    };
+    obj.insert("exception".to_string(), json!(exc_type));
+    obj.insert("caught".to_string(), json!(catch_location.is_some()));
+    if let Some(cl) = catch_location {
+        let (cls, method, line) = describe_location(conn, cl).await;
+        obj.insert("caught_at".to_string(), json!(format!("{}.{}:{}", cls, method, line.unwrap_or(-1))));
+    }
 }
 
 /// Add a watchpoint hit's field details to a `get_last_event` entry: the field (as
@@ -1163,12 +1253,13 @@ async fn describe_field_event(
 fn render_watchpoint_line(output: &mut String, watch_id: &str, wp: &crate::session::WatchpointInfo) {
     let _ = writeln!(
         output,
-        "  👁  [{}] watch {}.{} on {} ({})",
+        "  👁  [{}] watch {}.{} on {} ({}){}",
         watch_id,
         wp.class_name,
         wp.field_name,
         wp.kind.label(),
         if wp.is_static { "static" } else { "instance" },
+        if wp.trace { " (trace)" } else { "" },
     );
 }
 
@@ -1222,30 +1313,75 @@ async fn frame_method_info(
     (method_name, line, active)
 }
 
+/// The thread a stack read should target: the caller's explicit choice, else the last thread that hit
+/// a breakpoint or step, else the VM's first thread.
+///
+/// The last-hit fallback is what lets every other tool be called without a thread id after a
+/// breakpoint fires, which is the common case; the first-thread fallback only matters on a VM nothing
+/// has stopped yet.
+async fn resolve_target_thread(
+    conn: &mut jdwp_client::JdwpConnection,
+    explicit: Option<u64>,
+    last_hit: Option<u64>,
+) -> Result<u64, String> {
+    if let Some(tid) = explicit.or(last_hit) {
+        return Ok(tid);
+    }
+    let threads = conn.get_all_threads().await
+        .map_err(|e| format!("Failed to get threads: {e}"))?;
+    threads.first().copied().ok_or_else(|| "No threads found".to_string())
+}
+
 /// Render a frame's in-scope variables beneath its stack line.
 ///
-/// `deep` is `Some` only when the caller asked for expansion. Shallow rendering deliberately passes
-/// `thread_id: None`, which keeps `get_stack` from invoking `toString()` on every local of every
-/// frame — that would make the default path both slow and side-effecting.
+/// `deep` is `Some` only when the caller asked for expansion, and carries the budget shared by the
+/// whole `get_stack` call — so the cap bounds the call, not each local (OBJ-3). Shallow rendering
+/// deliberately passes `thread_id: None`, which keeps `get_stack` from invoking `toString()` on every
+/// local of every frame — that would make the default path both slow and side-effecting.
+///
+/// Returns the name of the local the shared budget ran out on, if it did, so the caller can say where
+/// it stopped and skip the remaining frames instead of emitting page after page of
+/// "budget exhausted".
+///
+/// `frame` is `(index, id)`, and the index is the load-bearing half when expanding: deep expansion
+/// invokes methods in the debuggee (`toArray`, `toString`), and JDWP invalidates a thread's frame ids
+/// the moment a method is invoked on it. So any id read before an earlier frame was expanded is stale,
+/// and reading locals through one fails — *silently*, printing a frame with no locals as though it had
+/// none. Frame indices stay valid, so the id is re-read per frame. One extra round trip, only on the
+/// path that already costs many.
 async fn render_frame_variables(
     conn: &mut jdwp_client::JdwpConnection,
     output: &mut String,
     target_thread: u64,
-    frame_id: u64,
+    frame: (usize, u64),
     active: &[(String, jdwp_client::stackframe::VariableSlot)],
-    deep: Option<DeepOpts>,
-) {
-    let slots: Vec<jdwp_client::stackframe::VariableSlot> =
-        active.iter().map(|(_, s)| *s).collect();
-    if let Ok(values) = conn.get_frame_values(target_thread, frame_id, slots).await {
-        for ((name, _), value) in active.iter().zip(values.iter()) {
-            let formatted_value = match deep {
-                Some(opts) => render_value_deep(conn, value, Some(target_thread), opts).await,
-                None => render_value(conn, value, None, 200).await,
-            };
-            let _ = writeln!(output, "     {name} = {formatted_value}");
+    mut deep: Option<(DeepOpts, &mut DeepState)>,
+) -> Option<String> {
+    let (idx, mut frame_id) = frame;
+    if deep.is_some() && idx > 0 {
+        let fresh = conn.get_frames(target_thread, i32::try_from(idx).unwrap_or(0), 1).await;
+        if let Some(f) = fresh.ok().and_then(|fs| fs.into_iter().next()) {
+            frame_id = f.frame_id;
         }
     }
+    let slots: Vec<jdwp_client::stackframe::VariableSlot> =
+        active.iter().map(|(_, s)| *s).collect();
+    let Ok(values) = conn.get_frame_values(target_thread, frame_id, slots).await else {
+        return None;
+    };
+    for ((name, _), value) in active.iter().zip(values.iter()) {
+        let formatted_value = match &mut deep {
+            Some((opts, state)) => {
+                render_node(conn, value, Some(target_thread), *opts, state, 0).await
+            }
+            None => render_value(conn, value, None, 200).await,
+        };
+        let _ = writeln!(output, "     {name} = {formatted_value}");
+        if deep.as_ref().is_some_and(|(_, state)| state.exhausted()) {
+            return Some(name.clone());
+        }
+    }
+    None
 }
 
 // ===================================================================================
@@ -1895,11 +2031,7 @@ async fn try_arm_deferred_breakpoints(
     for pend in pending {
         match resolve_bp_location(&mut session.connection, cp_ref, pend.line, pend.method.as_deref()).await {
             Ok((method, index, line)) => {
-                let sp = if pend.trace {
-                    jdwp_client::SuspendPolicy::EventThread
-                } else {
-                    jdwp_client::SuspendPolicy::All
-                };
+                let sp = suspend_policy_for(pend.trace);
                 match session.connection.set_breakpoint_ex(
                     cp_ref, method.method_id, index, sp, pend.hit_count, pend.thread_filter,
                 ).await {
@@ -1931,34 +2063,71 @@ async fn try_arm_deferred_breakpoints(
     true
 }
 
-/// A breakpoint hit whose bp is marked `trace` suspended only the hit thread (`EventThread`
-/// policy). Snapshot its frame into the ring buffer and resume THAT thread immediately — never
-/// surfacing it as `last_event`. Returns `true` if a trace breakpoint was matched and handled.
+/// What a traced (non-suspending) stop point needs at hit time, whichever kind registered it.
+struct TracedRequest {
+    /// The caller-facing id (`bp_`/`exc_`/`watch_`), used as the trace record's label.
+    id: String,
+    /// Only line breakpoints can carry one; an exception or field request has no condition.
+    condition: Option<String>,
+    trace_expr: Option<String>,
+}
+
+/// Find the traced stop point that a JDWP request id belongs to, across all three kinds.
+///
+/// One lookup, three maps — deliberately not a fourth map keyed by request id. Each kind already owns
+/// its bookkeeping (and its `clear`/`panic` handling), so a parallel index would be a second source of
+/// truth that could outlive an entry it points at. The maps are small enough that scanning is free.
+fn find_traced_request(
+    session: &crate::session::DebugSession,
+    req_id: i32,
+) -> Option<TracedRequest> {
+    if let Some((id, b)) = session.breakpoints.iter().find(|(_, b)| b.request_id == req_id && b.trace) {
+        return Some(TracedRequest {
+            id: id.clone(),
+            condition: b.condition.clone(),
+            trace_expr: b.trace_expr.clone(),
+        });
+    }
+    if let Some((id, e)) =
+        session.exception_requests.iter().find(|(_, e)| e.request_id == req_id && e.trace)
+    {
+        return Some(TracedRequest { id: id.clone(), condition: None, trace_expr: e.trace_expr.clone() });
+    }
+    if let Some((id, w)) = session.watchpoints.iter().find(|(_, w)| w.request_id == req_id && w.trace) {
+        return Some(TracedRequest { id: id.clone(), condition: None, trace_expr: w.trace_expr.clone() });
+    }
+    None
+}
+
+/// A hit on a stop point marked `trace` — a line breakpoint, an exception breakpoint, or a field
+/// watchpoint — suspended only the hit thread (`EventThread` policy). Snapshot it into the ring
+/// buffer and resume THAT thread immediately, never surfacing it as an event. Returns `true` if a
+/// traced request was matched and handled.
 async fn try_record_trace(
     session: &mut crate::session::DebugSession,
     event_set: &jdwp_client::EventSet,
 ) -> bool {
-    let (Some((thread, loc)), Some(req_id)) = (
+    let (Some((thread, loc)), Some((req_id, details))) = (
         event_set.events.first().and_then(|e| event_location(&e.details)),
-        event_set.events.first().map(|e| e.request_id),
+        event_set.events.first().map(|e| (e.request_id, e.details.clone())),
     ) else {
         return false;
     };
-    let Some((bp_id, bp)) = session.breakpoints.iter()
-        .find(|(_, b)| b.request_id == req_id && b.trace)
-        .map(|(k, b)| (k.clone(), b.clone()))
-    else {
+    let Some(req) = find_traced_request(session, req_id) else {
         return false;
     };
-    // Honor a condition, if any: skip recording when it isn't true.
-    let record = if let Some(cond) = &bp.condition {
-        if evaluate_condition_on_thread(&mut session.connection, thread, cond).await {
-            Some(capture_trace(&mut session.connection, &bp_id, &bp, thread, &loc).await)
-        } else {
-            None
-        }
+    // Honor a condition, if any: skip recording when it isn't true. Only a line breakpoint can have
+    // one, so for a traced exception/watch hit this is always false.
+    let skip = match &req.condition {
+        Some(cond) => !evaluate_condition_on_thread(&mut session.connection, thread, cond).await,
+        None => false,
+    };
+    let record = if skip {
+        None
     } else {
-        Some(capture_trace(&mut session.connection, &bp_id, &bp, thread, &loc).await)
+        Some(capture_trace(
+            &mut session.connection, &req.id, req.trace_expr.as_deref(), thread, &loc, &details,
+        ).await)
     };
     if let Some(mut rec) = record {
         session.trace_seq += 1;
@@ -2000,7 +2169,7 @@ async fn store_reportable_event(
         if event_suspends(&event_set) {
             session.suspended_since = Some(std::time::Instant::now());
         }
-        session.last_event = Some(event_set);
+        session.push_event(event_set);
     }
 }
 
@@ -3271,6 +3440,19 @@ struct DeepOpts {
 /// is that a pathological object can't hang the tool, and the output says when it was hit.
 const DEEP_NODE_BUDGET: usize = 400;
 
+/// Total nodes ONE `get_stack {expand_objects:true}` call may visit, across every frame and local.
+///
+/// `get_stack` expands many values, not one, so it gets a larger allowance than a single
+/// `debug.evaluate` — but it must be *one* allowance for the whole call. Per-value budgets multiply:
+/// 20 locals × 20 frames × 400 is ~160k nodes of round trips against a possibly-shared JVM, which is
+/// not a cap in any useful sense.
+///
+/// 1000 rather than something larger because two costs bind, not one: JDWP round trips *and* the size
+/// of the reply. A node is roughly a line of output, so a thousand of them is already a reply no
+/// caller wants in full — narrowing with `package_filter` / `max_frames` / `max_depth` is the answer,
+/// and the exhaustion notice says so.
+const STACK_NODE_BUDGET: usize = 1000;
+
 /// Mutable state threaded through one deep render.
 struct DeepState {
     /// Nodes left to visit across the whole render.
@@ -3279,6 +3461,17 @@ struct DeepState {
     /// purpose: a value reachable twice by different routes is worth printing twice in a debugger,
     /// but a true cycle (`parent.child.parent`) must not recurse.
     path: Vec<u64>,
+}
+
+impl DeepState {
+    const fn new(budget: usize) -> Self {
+        Self { budget, path: Vec::new() }
+    }
+
+    /// Whether the budget ran out during the render(s) so far.
+    const fn exhausted(&self) -> bool {
+        self.budget == 0
+    }
 }
 
 /// Deep-render a value: walk instance fields, array elements, and collection contents to a bounded
@@ -3293,9 +3486,9 @@ async fn render_value_deep(
     thread_id: Option<u64>,
     opts: DeepOpts,
 ) -> String {
-    let mut state = DeepState { budget: DEEP_NODE_BUDGET, path: Vec::new() };
+    let mut state = DeepState::new(DEEP_NODE_BUDGET);
     let body = render_node(conn, value, thread_id, opts, &mut state, 0).await;
-    if state.budget == 0 {
+    if state.exhausted() {
         format!("{body}\n… node budget ({DEEP_NODE_BUDGET}) exhausted — raise max_depth only if needed")
     } else {
         body
@@ -4013,16 +4206,23 @@ async fn describe_location(conn: &mut jdwp_client::JdwpConnection, loc: &Locatio
     (class, method, line)
 }
 
-/// Snapshot a trace/logpoint hit: source location, in-scope locals/args, and any trace expression.
+/// Snapshot a trace/logpoint hit: source location, in-scope locals/args, the kind-specific detail
+/// (exception type + catch site, or a watched field's old → new pair), and any trace expression.
+///
 /// The hit thread is suspended (`EventThread` policy) while this runs; the caller resumes it right
 /// after. Argument values are rendered WITHOUT invoking `toString()` (`thread_id` None), so tracing
 /// stays side-effect free; the explicit `trace_expr` may invoke methods since the user asked for it.
+///
+/// The watchpoint detail must be captured HERE rather than at read time for the same reason
+/// `get_last_event` reports it inline: the old value is only readable while the pending store has not
+/// committed, which is exactly this window.
 async fn capture_trace(
     conn: &mut jdwp_client::JdwpConnection,
     bp_id: &str,
-    bp: &crate::session::BreakpointInfo,
+    trace_expr: Option<&str>,
     thread: u64,
     loc: &Location,
+    details: &EventKind,
 ) -> crate::session::TraceRecord {
     let (class, method, line) = describe_location(conn, loc).await;
     let mut args: Vec<(String, String)> = Vec::new();
@@ -4053,17 +4253,46 @@ async fn capture_trace(
                     }
                 }
             }
-            if let Some(e) = &bp.trace_expr {
+            if let Some(e) = trace_expr {
                 let rendered = match resolve_expression(conn, Some(thread), Some(&frame), e).await {
                     Ok(v) => render_value(conn, &v, Some(thread), 200).await,
                     Err(err) => format!("<error: {err}>"),
                 };
-                expr = Some((e.clone(), rendered));
+                expr = Some((e.to_string(), rendered));
             }
         }
     }
 
-    crate::session::TraceRecord { seq: 0, bp_id: bp_id.to_string(), thread, class, method, line, args, expr }
+    // Reuse the same describers `get_last_event` uses, so a traced exception/watch hit says exactly
+    // what a suspending one would; the pairs are flattened for the one-line trace rendering.
+    let mut obj = serde_json::Map::new();
+    describe_exception_event(conn, details, &mut obj).await;
+    describe_field_event(conn, details, &mut obj).await;
+    let detail = obj.into_iter().map(|(k, v)| (k, json_scalar_to_string(&v))).collect();
+
+    crate::session::TraceRecord {
+        seq: 0, bp_id: bp_id.to_string(), thread, class, method, line, args, expr, detail,
+    }
+}
+
+/// Render a JSON scalar for a one-line trace record: strings unquoted (they are already rendered
+/// values like `"OPEN"` or `(int) 3`), everything else as-is.
+fn json_scalar_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Format a traced hit's kind-specific detail as ` k=v k=v` (empty for a plain line logpoint).
+///
+/// Ahead of the locals on purpose: for an exception or watchpoint hit this *is* the answer — which
+/// exception, or which field went from what to what — and the locals are supporting context.
+fn format_trace_detail(rec: &crate::session::TraceRecord) -> String {
+    rec.detail.iter().fold(String::new(), |mut acc, (k, v)| {
+        let _ = write!(acc, " {k}={v}");
+        acc
+    })
 }
 
 /// Format a trace record's captured args as ` {n=v, …}` (empty string when there are none).

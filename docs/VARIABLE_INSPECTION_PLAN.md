@@ -52,8 +52,9 @@ value reachable twice by different routes is worth printing twice when you're in
 cycle must not recurse.
 
 **How to handle large collections?** `max_children` (default 16) bounds fields per object and elements
-per collection, and the output states what it truncated. A total **node budget** (400) bounds the whole
-render, so a shallow-but-bushy graph can't blow up either. For finding rather than browsing, filter:
+per collection, and the output states what it truncated. A total **node budget** bounds the whole call,
+so a shallow-but-bushy graph can't blow up either — 400 for one `debug.evaluate`, 1000 shared across an
+entire `debug.get_stack` (it expands many values, not one; per-value budgets would multiply). For finding rather than browsing, filter:
 `[?pred]` scans up to 1000 elements and reports `N of M matched`, so an empty result is distinguishable
 from an unscanned one.
 
@@ -93,8 +94,9 @@ the example step by step. What exists:
 - **Unit tests** for the pure logic — schema generation, the type cache, tool registration.
 - **Integration tests** (`mcp-server/tests/mcp_integration.rs`) driving the real `jdwp-mcp` binary over
   JSON-RPC against probe JVMs the harness compiles, launches and reaps itself. Run with
-  `scripts/integration-test.sh`. Seven tests cover expression resolution, watchpoints, deferred
-  breakpoints, `force_return`, deep expansion, collection subscripts, and the roadmap criteria above.
+  `scripts/integration-test.sh`. Eleven tests cover expression resolution, watchpoints, deferred
+  breakpoints, `force_return`, deep expansion and its node budget, collection subscripts, the event
+  buffer, non-suspending traces, and the roadmap criteria above.
 - **The example is validated** by the roadmap-criteria test, and its output blocks are captured from a
   real run rather than written by hand.
 

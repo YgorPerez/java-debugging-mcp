@@ -27,9 +27,14 @@ natural language.
   **`lines[?qty > 3]`** (filter, with the left side resolved against each element)
 - **Field Watchpoints**: break when a field is read or written — `debug.set_watchpoint` reports the
   mutating location with the **old → new** value, for "who changes this behind my back?"
+- **Non-suspending trace mode**: `trace:true` on a breakpoint, an **exception breakpoint** or a
+  **watchpoint** snapshots the hit and resumes the thread immediately instead of freezing the VM —
+  the only safe way to use any of them on a shared instance. Read the snapshots with
+  `debug.get_traces`
 - **Set Values**: write a local variable in a suspended frame
 - **Thread Management**: tools default to the last thread that hit a breakpoint
-- **Structured Events**: `get_last_event` emits a machine-readable `[event]` line (thread, class.method:line)
+- **Structured Events**: `get_last_event` emits a machine-readable `[event]` line (thread, class.method:line),
+  from a bounded buffer — a burst of hits isn't lost, and the reply says how many are still pending
 - **Safety**: a `panic` tool (clear all + resume) and a **watchdog** that auto-resumes a long-suspended
   VM (`JDWP_WATCHDOG_SECS`, default 120) so a forgotten breakpoint can't freeze a shared instance
 
@@ -87,8 +92,8 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 |------|-------------|
 | `debug.attach` | Connect to a JVM via JDWP |
 | `debug.set_breakpoint` | Set a breakpoint by class+line, or by method name; optional `hit_count`, thread filter, `condition`, or `trace:true` (non-suspending logpoint) |
-| `debug.set_exception_breakpoint` | Break when an exception (of a class + its subclasses, or all) is thrown; `caught`/`uncaught` selectable |
-| `debug.get_traces` | Read snapshots captured by trace/logpoint breakpoints (bounded ring buffer; optional `clear`) |
+| `debug.set_exception_breakpoint` | Break when an exception (of a class + its subclasses, or all) is thrown; `caught`/`uncaught` selectable, or `trace:true` to collect throws without suspending |
+| `debug.get_traces` | Read snapshots captured by any `trace:true` stop point — line, exception or watchpoint (bounded ring buffer; optional `clear`) |
 | `debug.list_breakpoints` | List active breakpoints (line, deferred, exception) |
 | `debug.clear_breakpoint` | Remove a breakpoint (line, deferred, or exception) |
 | `debug.continue` | Resume execution |
@@ -98,9 +103,9 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | `debug.get_stack` | Stack frames, compact `#i class.method:line` with typed locals indented |
 | `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods, object arguments, `[i]`/`["k"]`/`[a..b]`/`[?pred]` subscripts, and `expand_objects` for a deep field tree |
 | `debug.set_value` | Write a local variable, a static field (`Class.field`), or an instance field (`this.field`) |
-| `debug.set_watchpoint` | Break when a field is written (or read) — reports the mutating location + old → new value |
+| `debug.set_watchpoint` | Break when a field is written (or read) — reports the mutating location + old → new value; `trace:true` collects hits without suspending |
 | `debug.force_return` | Force the current method to return a given value, skipping the rest of its body |
-| `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line, exception type, watched field's old → new) + `[suspended]` |
+| `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line, exception type, watched field's old → new) + `[suspended]`; events are buffered, so `limit` reads a backlog and `drain` discards it |
 | `debug.list_threads` | List threads by name; filter with `name_filter` / `only_suspended` / `limit` |
 | `debug.pause` | Pause execution (suspend all threads) |
 | `debug.panic` | Safety: clear all breakpoints and resume all threads |

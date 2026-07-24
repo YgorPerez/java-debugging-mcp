@@ -654,6 +654,283 @@ fn roadmap_metrics_inspection_criteria() {
     server.panic_reset();
 }
 
+/// TRACE-2: an exception breakpoint in trace mode records each throw and leaves nothing suspended.
+///
+/// The suspension check is the load-bearing assertion, and it can only be made against the
+/// *debuggee's* own output: the debugger reports success either way, so "no complaint" proves nothing.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn traced_exception_breakpoints_record_throws_without_suspending() {
+    let Some(jdk) = jdk_or_skip("traced_exception_breakpoints_record_throws_without_suspending") else { return };
+    let probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // An exception request needs a concrete ref type, so the class must already be loaded — one tick
+    // means integrate() has thrown at least once, which is what loads it.
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    let set = server.call(
+        "debug.set_exception_breakpoint",
+        serde_json::json!({
+            "class_pattern": "ExcProbe$SwallowedException", "trace": true, "trace_expr": "i",
+        }),
+    );
+    assert_contains_all("traced exception breakpoint is armed", &set, &["exc_", "trace (non-suspending)"]);
+
+    // The whole point: the probe keeps printing. A suspending exception breakpoint stops the ticks
+    // dead on the first throw — and every throw here is caught, so this would freeze on a code path
+    // the application itself considers a non-event.
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
+            .is_some(),
+        "probe stopped ticking after a traced exception breakpoint — a throw left it suspended\n  output: {:?}",
+        probe.output(),
+    );
+
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    assert_contains_all(
+        "each throw is recorded with its exception detail",
+        &traces,
+        &[
+            "exc_",
+            "ExcProbe.integrate",
+            "exception=ExcProbe$SwallowedException",
+            "caught=true",
+            "caught_at=ExcProbe.integrate",
+        ],
+    );
+    // Locals and the trace expression are captured in the throwing frame, exactly as for a logpoint.
+    assert_contains_all("locals and trace expr", &traces, &["{i=(int) ", "i =>"]);
+
+    // A traced hit must never surface as an event — that is what would suggest a suspended VM.
+    let ev = server.last_event();
+    assert!(
+        !ev.contains("\"event\":\"exception\""),
+        "a traced throw must not be reported as a suspending event: {ev}"
+    );
+
+    // Trace mode is visible in the bookkeeping, so a later reader can tell why nothing is frozen.
+    assert_contains_all(
+        "listed as traced",
+        &server.call("debug.list_breakpoints", serde_json::json!({})),
+        &["exception ExcProbe$SwallowedException", "(trace)"],
+    );
+
+    server.panic_reset();
+}
+
+/// TRACE-2: a watchpoint in trace mode records the mutating location and the old → new pair without
+/// suspending — "who mutates this?" answered on a JVM you are not allowed to freeze.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn traced_watchpoints_record_writes_without_suspending() {
+    let Some(jdk) = jdk_or_skip("traced_watchpoints_record_writes_without_suspending") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    let set = server.call(
+        "debug.set_watchpoint",
+        serde_json::json!({"class_name": "WatchProbe", "field_name": "counter", "trace": true}),
+    );
+    assert_contains_all("traced watchpoint is armed", &set, &["watch_modify_", "trace (non-suspending)"]);
+
+    // WatchProbe's tick number IS `counter`, so a rising tick proves both that the probe is running
+    // and that the writes the watchpoint is reporting are really committing.
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
+            .is_some(),
+        "probe stopped ticking after a traced watchpoint — a write left it suspended\n  output: {:?}",
+        probe.output(),
+    );
+
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    assert_contains_all(
+        "each write is recorded with its field detail",
+        &traces,
+        &["watch_modify_", "WatchProbe.bumpCounter", "field=WatchProbe.counter", "static=true"],
+    );
+    // The old → new pair is the whole value of the hit, and it is only readable while the pending
+    // store has not committed — i.e. it has to be captured at trace time, not at read time.
+    let hit = traces
+        .lines()
+        .rev()
+        .find(|l| l.contains("field=WatchProbe.counter"))
+        .unwrap_or_else(|| panic!("no counter trace line in:\n{traces}"));
+    let (old, new) = (
+        trace_int(hit, "old").unwrap_or_else(|| panic!("no old= in: {hit}")),
+        trace_int(hit, "new").unwrap_or_else(|| panic!("no new= in: {hit}")),
+    );
+    assert_eq!(new, old + 1, "bumpCounter does counter+1, so the pair must be one apart: {hit}");
+
+    let ev = server.last_event();
+    assert!(
+        !ev.contains("\"event\":\"field_modification\""),
+        "a traced write must not be reported as a suspending event: {ev}"
+    );
+    assert_contains_all(
+        "listed as traced",
+        &server.call("debug.list_breakpoints", serde_json::json!({})),
+        &["watch WatchProbe.counter", "(trace)"],
+    );
+
+    server.panic_reset();
+}
+
+/// EVT-1: a second hit must not erase the first. Before the event ring buffer, `last_event` was one
+/// slot, so the breakpoint below was silently gone by the time the step landed.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn events_are_buffered_so_a_second_hit_doesnt_erase_the_first() {
+    let Some(jdk) = jdk_or_skip("events_are_buffered_so_a_second_hit_doesnt_erase_the_first") else { return };
+    let probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // A breakpoint then a step: two suspending events in a row, the second arriving before anything
+    // has read the first. Single-threaded and deterministic, unlike racing two threads at one line.
+    let line = probe_line(&probe_source("ExcProbe"), "// BP2");
+    server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({"class_pattern": "ExcProbe", "line": line}),
+    );
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in ExcProbe.main never fired");
+    server.call("debug.step_over", serde_json::json!({}));
+    server
+        .wait_for_event("\"event\":\"step\"", EVENT_TIMEOUT)
+        .expect("step never reported");
+
+    // A bare call still means "the newest event", as it always did — plus a note that there is more.
+    let latest = server.last_event();
+    assert_contains_all("newest event, and the backlog is announced", &latest, &[
+        "\"event\":\"step\"",
+        "[pending] 1 older event",
+    ]);
+    assert!(
+        !latest.contains("\"event\":\"breakpoint\""),
+        "the default limit must return only the newest event: {latest}"
+    );
+
+    // Both are still there. This is the assertion that fails against a single-slot `last_event`.
+    let both = server.call("debug.get_last_event", serde_json::json!({"limit": 5}));
+    assert_contains_all("both hits are retrievable", &both, &[
+        "\"event\":\"breakpoint\"",
+        "\"event\":\"step\"",
+    ]);
+    assert!(
+        both.find("\"event\":\"breakpoint\"") < both.find("\"event\":\"step\""),
+        "buffered events read oldest-first, so the breakpoint must precede the step:\n{both}"
+    );
+    assert!(!both.contains("[pending]"), "nothing is pending once all of it is shown:\n{both}");
+
+    // Draining discards what was read, so the next call doesn't re-report old hits.
+    server.panic_reset();
+    server.call("debug.get_last_event", serde_json::json!({"limit": 10, "drain": true}));
+    let after = server.last_event();
+    assert!(
+        !after.contains("\"event\":\"breakpoint\"") && !after.contains("\"event\":\"step\""),
+        "drain:true must discard the events it returned, got: {after}"
+    );
+}
+
+/// OBJ-3: `get_stack {expand_objects:true}` must spend ONE node budget across the whole call. It used
+/// to allocate a fresh 400 per local, so a 20-local frame × 20 frames could walk ~160k nodes against a
+/// possibly-shared JVM — a documented cap that bounded nothing.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn get_stack_node_budget_bounds_the_whole_call() {
+    let Some(jdk) = jdk_or_skip("get_stack_node_budget_bounds_the_whole_call") else { return };
+    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let line = probe_line(&probe_source("DeepProbe"), "// BP1");
+    server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({"class_pattern": "DeepProbe", "line": line}),
+    );
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in DeepProbe.inspect never fired");
+
+    // `inspect` holds `order` and `batch` (the same order four times over), and `main` below it holds
+    // `order` again — several expandable locals across two frames, which is exactly the shape a
+    // per-local budget failed to bound.
+    let stack = server.call(
+        "debug.get_stack",
+        serde_json::json!({"expand_objects": true, "max_depth": 5, "max_children": 30}),
+    );
+    assert_contains_all("the cap is reported once, naming where it stopped", &stack, &[
+        "node budget (1000) exhausted at #",
+        "remaining frames not expanded",
+    ]);
+    assert!(
+        stack.matches("node budget").count() == 1,
+        "the exhaustion notice belongs once per call, not per local:\n{stack}"
+    );
+    assert!(
+        stack.trim_end().ends_with("debug.evaluate."),
+        "expansion must stop at the cap, not carry on into later frames:\n{stack}"
+    );
+    // Sanity: it did real work before giving up, rather than bailing on the first local.
+    assert_contains_all("it expanded what it could", &stack, &["order = ", "id = (int) 42"]);
+
+    // `debug.evaluate` is unchanged: its own, smaller budget, and its own message.
+    let one = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "batch", "expand_objects": true, "max_depth": 5, "max_children": 30}),
+    );
+    assert_contains_all("evaluate keeps its documented per-expression budget", &one, &[
+        "node budget (400) exhausted",
+    ]);
+
+    // Every frame keeps its locals under expansion. Expanding frame #0 invokes toArray/toString in the
+    // debuggee, which invalidates the thread's frame ids — so frame #1's id, read before that, is
+    // stale. It used to fail silently, printing `main` with no locals as though it had none.
+    let both_frames = server.call(
+        "debug.get_stack",
+        serde_json::json!({"expand_objects": true, "max_depth": 1, "max_children": 2}),
+    );
+    let main_frame = both_frames
+        .split_once("DeepProbe.main")
+        .map_or_else(|| panic!("no main frame in:\n{both_frames}"), |(_, rest)| rest.to_string());
+    assert_contains_all("a frame below an expanded one still shows its locals", &main_frame, &[
+        "i = (int)",
+        "order = DeepProbe$Order",
+    ]);
+
+    server.panic_reset();
+}
+
+/// The `<n>` of `ExcProbe`'s / `WatchProbe`'s `tick <n> …` line. Both count something that only advances
+/// while the JVM is running, which is how a test proves nothing was left suspended.
+fn tick_index(line: &str) -> Option<i64> {
+    line.strip_prefix("tick ")?.split_whitespace().next()?.parse().ok()
+}
+
+/// The highest tick a probe has printed so far.
+fn highest_tick(probe: &Probe) -> Option<i64> {
+    probe.output().iter().filter_map(|l| tick_index(l)).max()
+}
+
+/// Pull `<key>=(int) N` out of one `debug.get_traces` line.
+fn trace_int(line: &str, key: &str) -> Option<i64> {
+    let needle = format!("{key}=(int) ");
+    let at = line.find(&needle)? + needle.len();
+    let rest = &line[at..];
+    let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
 /// Pull the ints out of `"old":"(int) 5"` / `"new":"(int) 6"` in an event line.
 fn parse_old_new(ev: &str) -> Option<(i64, i64)> {
     let grab = |key: &str| -> Option<i64> {
@@ -665,3 +942,4 @@ fn parse_old_new(ev: &str) -> Option<(i64, i64)> {
     };
     Some((grab("old")?, grab("new")?))
 }
+

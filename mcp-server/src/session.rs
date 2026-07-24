@@ -14,7 +14,16 @@ pub type SessionId = String;
 pub struct DebugSession {
     pub connection: JdwpConnection,
     pub breakpoints: HashMap<String, BreakpointInfo>,
-    pub last_event: Option<EventSet>,
+    /// Ring buffer of reportable events, oldest first. Bounded by `MAX_EVENTS`.
+    ///
+    /// A single `Option` slot here used to mean a second hit erased the first with no trace — the
+    /// worst kind of gap in a debugging tool, because the answer you read looks complete. Traces got
+    /// a bounded buffer from the start; events now get the same treatment.
+    pub events: VecDeque<EventRecord>,
+    /// Monotonic sequence for event records (survives ring-buffer eviction).
+    pub event_seq: u64,
+    /// How many events the ring buffer has evicted — reported so a caller knows it fell behind.
+    pub events_dropped: u64,
     pub event_listener_task: Option<JoinHandle<()>>,
     /// Thread of the most recent suspension event — used to default `thread_id`.
     pub last_thread: Option<u64>,
@@ -39,6 +48,33 @@ pub struct DebugSession {
 /// Max trace snapshots retained per session; oldest are evicted (documented cap for TRACE-1).
 pub const MAX_TRACES: usize = 500;
 
+/// Max reportable events retained per session; oldest are evicted, counted in `events_dropped`.
+///
+/// Smaller than `MAX_TRACES` on purpose: a suspending event holds a thread, so they arrive at human
+/// pace, whereas traces stream from a running VM. 100 is far more than a session can work through.
+pub const MAX_EVENTS: usize = 100;
+
+/// One reportable event as it arrived, with a sequence number so `debug.get_last_event` can say
+/// which of several hits it is showing.
+#[derive(Debug, Clone)]
+pub struct EventRecord {
+    pub seq: u64,
+    pub set: EventSet,
+}
+
+impl DebugSession {
+    /// Push a reportable event, evicting the oldest if the buffer is full. Returns the assigned seq.
+    pub fn push_event(&mut self, set: EventSet) -> u64 {
+        self.event_seq += 1;
+        if self.events.len() >= MAX_EVENTS {
+            self.events.pop_front();
+            self.events_dropped += 1;
+        }
+        self.events.push_back(EventRecord { seq: self.event_seq, set });
+        self.event_seq
+    }
+}
+
 /// One captured hit of a trace/logpoint breakpoint: where it fired, on which thread, the in-scope
 /// locals/args at that point, and an optional evaluated expression. Recorded without leaving the
 /// thread suspended.
@@ -54,6 +90,13 @@ pub struct TraceRecord {
     pub args: Vec<(String, String)>,
     /// (expression, rendered result) when the logpoint had a trace expression.
     pub expr: Option<(String, String)>,
+    /// What kind of stop point this came from, and anything specific to it: for an exception, the
+    /// type and catch location; for a watchpoint, the field and its old → new pair. Empty for a
+    /// plain line logpoint, whose location and args already say everything.
+    ///
+    /// Kept as ordered key/value pairs rather than a formatted string so the renderer, not the
+    /// capture, decides how a trace line reads.
+    pub detail: Vec<(String, String)>,
 }
 
 /// An active exception breakpoint: an EXCEPTION event request that fires when a matching
@@ -69,6 +112,11 @@ pub struct ExceptionRequestInfo {
     pub class_pattern: String,
     pub caught: bool,
     pub uncaught: bool,
+    /// Non-suspending trace mode: armed with `EventThread`, each throw is snapshotted into the trace
+    /// ring buffer and the hit thread resumed, so a shared JVM is never frozen (TRACE-2).
+    pub trace: bool,
+    /// Optional expression evaluated in the throwing frame and recorded on each trace hit.
+    pub trace_expr: Option<String>,
 }
 
 /// An active field watchpoint: a `FIELD_ACCESS` or `FIELD_MODIFICATION` event request on one field.
@@ -89,6 +137,11 @@ pub struct WatchpointInfo {
     /// three itself, so `get_last_event` resolves them from the event and can still describe a hit
     /// whose watchpoint has already been cleared.
     pub is_static: bool,
+    /// Non-suspending trace mode: armed with `EventThread`, each hit is snapshotted (including the
+    /// old → new pair) into the trace ring buffer and the thread resumed (TRACE-2).
+    pub trace: bool,
+    /// Optional expression evaluated in the mutating frame and recorded on each trace hit.
+    pub trace_expr: Option<String>,
 }
 
 /// A breakpoint waiting for its class to load. The `CLASS_PREPARE` request suspends the preparing
@@ -150,7 +203,9 @@ impl SessionManager {
         let session = DebugSession {
             connection,
             breakpoints: HashMap::new(),
-            last_event: None,
+            events: VecDeque::new(),
+            event_seq: 0,
+            events_dropped: 0,
             event_listener_task: None,
             last_thread: None,
             pending_step: None,

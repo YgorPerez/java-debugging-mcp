@@ -157,6 +157,48 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   `int` for a reference parameter, which reads it as an oop and **SIGSEGVs the debuggee** (reproduced
   — hs_err + core dump). The fallback is now kind-checked, so a type-mismatched invoke is refused
   with an error instead of crashing the target.
+- **Non-suspending exception breakpoints and watchpoints (TRACE-2)** — `trace:true` now works on
+  **all three** kinds of stop point, not just line breakpoints:
+  `debug.set_exception_breakpoint {…, trace:true}` and `debug.set_watchpoint {…, trace:true}` arm with
+  `EventThread`, snapshot the hit, and resume that thread — so the two tools you most want on the
+  shared 8180 (silent catches; "who mutates this?") no longer freeze other people's requests. A traced
+  throw records the exception type + caught/catch location; a traced write records the **old → new**
+  pair, captured at hit time because the old value is only readable before the pending store commits.
+  The hit path is one `find_traced_request` lookup across `breakpoints` / `exception_requests` /
+  `watchpoints` — deliberately three small scans rather than a fourth map keyed by request id, which
+  would be a second source of truth that could outlive the entry it points at. `get_last_event`'s
+  exception/field describers are now shared with the trace capture, so a traced hit reports exactly
+  what a suspending one would. `list_breakpoints` marks traced entries, and both tool descriptions now
+  say that the default suspends everything.
+  Validated by `traced_exception_breakpoints_…` and `traced_watchpoints_…` in `mcp_integration.rs`
+  (+ `examples/probes/ExcProbe.java`, a throw-and-swallow loop): each asserts the hits land in
+  `get_traces` **and** that the probe's own tick line keeps advancing — the debugger reports success
+  either way, so only the debuggee's output proves nothing was left suspended.
+  The `jdwp-trace` skill in the sibling repo is updated to match: Rule 0 now covers all three kinds,
+  site 2's step 2 is traced, and the one thing a trace genuinely can't give you (the calling stack) is
+  stated once, where the suspension discipline lives.
+- **One node budget per `get_stack` call (OBJ-3)** — `DEEP_NODE_BUDGET` was allocated fresh per
+  `render_value_deep`, and `get_stack` called it once per local, so `expand_objects:true` on 20 frames
+  × 20 locals could walk ~160k nodes against a possibly-shared JVM: a documented cap that bounded
+  nothing. One `DeepState` now spans the whole call (`STACK_NODE_BUDGET` = 1000, larger than
+  `evaluate`'s 400 because a stack legitimately expands many values, but not larger still — a node is
+  roughly a line, so 1000 is already more reply than anyone wants). On exhaustion the output says so
+  **once**, naming the frame and local it stopped at, and abandons the remaining frames instead of
+  repeating the notice under each one. `evaluate` is untouched.
+  Bug this surfaced: `get_stack {expand_objects:true}` **silently dropped the locals of every frame
+  below the first**. Expanding a collection invokes `toArray`/`toString`, and JDWP invalidates a
+  thread's frame ids the moment a method is invoked on it — so each later frame's id was stale, the
+  read failed, and the frame printed as though it had no locals at all. Frame *indices* stay valid, so
+  the id is re-read per frame on the expansion path. Both are asserted by
+  `get_stack_node_budget_bounds_the_whole_call`.
+- **Bounded event buffer (EVT-1)** — `last_event` was a single `Option`, so a second hit overwrote the
+  first with no trace: on a busy WildFly you read whichever event landed last and had no way to know
+  what you missed. Events now go into a ring buffer (`MAX_EVENTS` = 100) with a monotonic seq and an
+  eviction count. `debug.get_last_event` still returns just the newest (so nothing that worked before
+  changes), and adds `[pending] N older event(s)` / `[dropped] N evicted` so a caller knows to catch
+  up; `limit` reads the backlog oldest-first, `drain` discards what it returned. Validated by
+  `events_are_buffered_so_a_second_hit_doesnt_erase_the_first` — a breakpoint then a step, both still
+  retrievable, which is exactly what the single slot lost.
 - **Non-suspending trace breakpoints / logpoints (TRACE-1)** — `debug.set_breakpoint {…,
   trace:true, trace_expr}` captures a snapshot (location, thread, in-scope locals/args, optional
   expression) and resumes just the hit thread (EventThread policy) — never freezes the VM. Bounded
@@ -172,91 +214,9 @@ Priority key: **P1** = highest payoff for the infotravel/integraWS investigation
 silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
 
 > Everything from the original backlog shipped (TRACE-1, EXC-1, SETF-1, EVAL-1, EVAL-2, WATCH-1,
-> TEST-1, OBJ-1, OBJ-2, DOC-1) plus all 18 appendix items. The items below came out of a review of that
-> work — the first three are **defects in what shipped**, not new features, and each was verified
-> against the code rather than suspected.
-
-### TRACE-2 — Non-suspending exception breakpoints and watchpoints  · P1 · M
-
-**What to build**
-`trace:true` gave line breakpoints a logpoint mode (snapshot + resume the hit thread, never freeze the
-VM). Exception breakpoints and watchpoints never got it: both hard-code `SuspendPolicy::All`
-(`handlers.rs:927`, `handlers.rs:993`), and `try_record_trace` only matches entries in
-`session.breakpoints` with `b.trace` — so an exception or field hit always suspends every thread.
-
-That undercuts the premise the whole project is built around. The shared 8180 instance is exactly where
-you most want an exception breakpoint (silent catches) or a watchpoint ("who mutates this?"), and today
-using either freezes other people's requests until you continue or the watchdog fires.
-
-**It also makes the `jdwp-trace` skill self-contradictory** (sibling `infotravel-dev-toolkit`): its
-Rule 0 says never freeze a shared instance, then site 2's step-2 recipe reaches for
-`debug.set_exception_breakpoint`, which does exactly that. **Do this regardless of when TRACE-2 lands**:
-if the tools can't yet be non-suspending, the skill must say so at that step instead of implying Rule 0
-covers it.
-
-**Shape of the change**
-- `trace` (+ optional `trace_expr`) on `debug.set_exception_breakpoint` and `debug.set_watchpoint`,
-  arming with `EventThread` and recording into the existing trace ring buffer.
-- Generalise the trace-hit path: `try_record_trace` currently looks only in `session.breakpoints`, so it
-  needs to consult `exception_requests` and `watchpoints` too. A shared "traced request" lookup keyed by
-  JDWP request id is probably cleaner than three maps.
-- A watchpoint's trace record should keep the old → new pair, which is the whole value of the hit.
-
-**Acceptance criteria**
-- [ ] `debug.set_exception_breakpoint {…, trace:true}` records the throw (type, location, caught/catch
-      location) into `debug.get_traces` and never leaves a thread suspended
-- [ ] `debug.set_watchpoint {…, trace:true}` records the mutating location and old → new value the same way
-- [ ] Integration test in `mcp_integration.rs`: a traced exception/watch hit appears in `get_traces`,
-      and `Probe::wait_for_line` confirms the probe keeps printing throughout — which is what actually
-      proves no suspension, rather than the absence of a complaint
-- [ ] `jdwp-trace` in the sibling repo is consistent with whatever the tools can actually do
-
-**Blocked by**
-None. Shares the `EventThread`-suspend + snapshot + resume machinery with TRACE-1.
-
-### OBJ-3 — The deep-render node budget doesn't bound `get_stack`  · P1 · S
-
-**What to build**
-`DEEP_NODE_BUDGET` (400) is allocated fresh per `render_value_deep` call (`handlers.rs:3296`), and
-`render_frame_variables` calls it **once per local**. So `debug.get_stack {expand_objects:true}` on a
-frame with 20 locals can spend 20 × 400 nodes, and across `max_frames:20` up to ~160,000 — against a
-possibly-shared JVM. The budget bounds `debug.evaluate` as documented; for `get_stack` it does nothing.
-
-Thread one budget through a whole `get_stack` call so the cap means what the docs say. Consider whether
-the per-call figure should differ between the two tools (a stack legitimately wants more than one
-expression) — but it must be *a* cap either way.
-
-**Acceptance criteria**
-- [ ] One budget spans an entire `get_stack` call, not one local
-- [ ] When it runs out, the output says so once, and says which frame/local it stopped at
-- [ ] Integration test: a frame with many expandable locals stops at the cap instead of walking all of them
-- [ ] The `evaluate` behaviour and its docs are unchanged
-
-**Blocked by**
-None.
-
-### EVT-1 — `last_event` is a single slot, so hits are silently lost  · P1 · S
-
-**What to build**
-`DebugSession.last_event` is an `Option<EventSet>` (`session.rs:17`). A second hit before you call
-`debug.get_last_event` overwrites the first with no trace. Traces got a bounded ring buffer
-(`MAX_TRACES` = 500); events never did.
-
-On a busy WildFly — or with a broad exception breakpoint, which the tool description already warns is
-noisy — you read whichever event happened to land last and have no idea how many you missed. That is the
-worst kind of gap in a debugging tool: it looks like an answer.
-
-Give events the same bounded ring buffer as traces, keep `debug.get_last_event` returning the most
-recent one (so nothing breaks), and report how many are queued so the caller knows to drain.
-
-**Acceptance criteria**
-- [ ] Events land in a bounded buffer; the oldest are evicted with a count, never dropped silently
-- [ ] `debug.get_last_event` still returns the newest event, and says how many others are pending
-- [ ] Some way to read the rest (extend `get_traces`, or a `limit`/`drain` argument on `get_last_event`)
-- [ ] Integration test: two hits in quick succession are both retrievable
-
-**Blocked by**
-None.
+> TEST-1, OBJ-1, OBJ-2, DOC-1) plus all 18 appendix items. A review of that work found ten more items;
+> the three **defects in what shipped** (TRACE-2, OBJ-3, EVT-1) are now done and moved to Shipped, and
+> what remains below is follow-on work rather than anything broken.
 
 ### SESS-1 — No way to enumerate sessions  · P2 · S
 
@@ -433,8 +393,9 @@ is opt-in rather than automatic, because expanding a collection invokes methods 
 ### What's actually left (net of the above)
 
 - ~~**OBJ-1 — recursive object expansion**~~ (items 7, 9, 12, 13) — **shipped**, including the type
-  cache it wanted (item 8). Two follow-ups are now tracked in the backlog: **OBJ-3** (the node budget
-  doesn't actually bound `get_stack`) and **PERF-1** (caching the container classification).
+  cache it wanted (item 8). Of its two follow-ups, **OBJ-3** (one node budget per `get_stack` call, plus
+  the frame-id staleness it uncovered) has shipped; **PERF-1** (caching the container classification)
+  is still open.
 - ~~**OBJ-2 — collection search/filter**~~ (item 16) — **shipped**, see above. Not covered: writing
   through a subscript (`list[0] = x` would need `List.set`/array element stores — `set_value` refuses
   it rather than doing the wrong thing), filtering a `Map`'s entries (no entry-shaped result type;

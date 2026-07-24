@@ -137,10 +137,10 @@ The registry not containing it moves the question upstream to registration. Two 
   breakpoint on a not-yet-loaded class **defers** and arms itself when the class loads, so you don't
   have to race the startup.
 - **Watch the registry field** to catch whoever replaces it:
-  `debug.set_watchpoint {class_name:"…HelloController", field_name:"meterRegistry"}` reports the
-  mutating `class.method:line` with the old → new value. Clear it when done — a watched field can't be
-  JIT-optimised.
+  `debug.set_watchpoint {class_name:"…HelloController", field_name:"meterRegistry", trace:true}`
+  reports the mutating `class.method:line` with the old → new value. Clear it when done — a watched
+  field can't be JIT-optimised.
 
-On a shared JVM, prefer `trace:true` logpoints over suspending breakpoints: they snapshot the frame and
-resume immediately, so a forgotten breakpoint can't freeze other people's requests. Read them with
-`debug.get_traces`.
+On a shared JVM, pass `trace:true` — breakpoints, exception breakpoints and watchpoints all take it.
+Each snapshots the hit and resumes immediately, so a forgotten stop point can't freeze other people's
+requests. Read the snapshots with `debug.get_traces`.

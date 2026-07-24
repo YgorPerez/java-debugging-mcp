@@ -4,7 +4,7 @@
 // advertised schema always matches what the handler deserializes. Tools with no arguments use an
 // empty object schema.
 
-use crate::args::{AttachArgs, SetBreakpointArgs, ClearBreakpointArgs, StepArgs, GetStackArgs, EvaluateArgs, ListThreadsArgs, SetValueArgs, GetTracesArgs, SetExceptionBreakpointArgs, SetWatchpointArgs, ForceReturnArgs};
+use crate::args::{AttachArgs, SetBreakpointArgs, ClearBreakpointArgs, StepArgs, GetStackArgs, EvaluateArgs, GetLastEventArgs, ListThreadsArgs, SetValueArgs, GetTracesArgs, SetExceptionBreakpointArgs, SetWatchpointArgs, ForceReturnArgs};
 use crate::protocol::Tool;
 use serde_json::json;
 
@@ -57,12 +57,12 @@ fn stop_point_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.set_exception_breakpoint".to_string(),
-            description: "Break when an exception is thrown. Give class_pattern (e.g. java.lang.NullPointerException or a custom ErrorException) to target one type + its subclasses — ideal for silent-catch bugs where a swallowed exception hides the failure. Omit class_pattern to catch ALL exceptions (noisy). caught/uncaught select which throws to report. The hit is reported via debug.get_last_event with the exception type + throw/catch location.".to_string(),
+            description: "Break when an exception is thrown. Give class_pattern (e.g. java.lang.NullPointerException or a custom ErrorException) to target one type + its subclasses — ideal for silent-catch bugs where a swallowed exception hides the failure. Omit class_pattern to catch ALL exceptions (noisy). caught/uncaught select which throws to report. The hit is reported via debug.get_last_event with the exception type + throw/catch location. Pass trace:true to collect throws WITHOUT suspending — required on a shared instance, where the default freezes every thread on each throw; read them with debug.get_traces.".to_string(),
             input_schema: to_val(schemars::schema_for!(SetExceptionBreakpointArgs)),
         },
         Tool {
             name: "debug.set_watchpoint".to_string(),
-            description: "Break when a field is read or written — answers \"who mutates this?\" for a field that changes behind your back (a config flag, an id, a status). Give class_name + field_name; modify:true (default) breaks on writes and reports the mutating location with old → new value, access:true also breaks on reads (noisy). The class must already be loaded — watchpoints can't be deferred. Hits come back via debug.get_last_event. A watched field can't be JIT-optimised, so clear it when done.".to_string(),
+            description: "Break when a field is read or written — answers \"who mutates this?\" for a field that changes behind your back (a config flag, an id, a status). Give class_name + field_name; modify:true (default) breaks on writes and reports the mutating location with old → new value, access:true also breaks on reads (noisy). The class must already be loaded — watchpoints can't be deferred. Hits come back via debug.get_last_event; pass trace:true to collect them WITHOUT suspending (required on a shared instance) and read them with debug.get_traces. A watched field can't be JIT-optimised, so clear it when done.".to_string(),
             input_schema: to_val(schemars::schema_for!(SetWatchpointArgs)),
         },
         Tool {
@@ -129,8 +129,8 @@ fn inspection_tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "debug.get_last_event".to_string(),
-            description: "Get the last breakpoint/event received. Includes a machine-readable [event] line with thread id and source location (class.method:line); for an exception hit the type and catch location, and for a watchpoint hit the field with its old → new value.".to_string(),
-            input_schema: empty(),
+            description: "Get the last breakpoint/event received. Includes a machine-readable [event] line with thread id and source location (class.method:line); for an exception hit the type and catch location, and for a watchpoint hit the field with its old → new value. Events are buffered, so a burst of hits isn't lost: the reply says how many older ones are pending — pass limit to read them (oldest first), drain:true to discard what you've read.".to_string(),
+            input_schema: to_val(schemars::schema_for!(GetLastEventArgs)),
         },
         Tool {
             name: "debug.get_stack".to_string(),
@@ -149,7 +149,7 @@ fn inspection_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.get_traces".to_string(),
-            description: "Return snapshots captured by trace/logpoint breakpoints (debug.set_breakpoint with trace:true): each shows where it fired, the thread, in-scope locals/args, and any trace_expr result. Bounded ring buffer (most recent kept). Pass clear:true to empty the buffer after reading.".to_string(),
+            description: "Return snapshots captured by non-suspending trace mode — debug.set_breakpoint, debug.set_exception_breakpoint or debug.set_watchpoint with trace:true. Each shows where it fired, the thread, in-scope locals/args, any trace_expr result, plus the exception type/catch site or the field's old → new value. Bounded ring buffer (most recent kept). Pass clear:true to empty the buffer after reading.".to_string(),
             input_schema: to_val(schemars::schema_for!(GetTracesArgs)),
         },
     ]

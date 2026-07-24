@@ -16,6 +16,7 @@ const fn default_true() -> bool { true }
 const fn default_max_result_length() -> usize { 2000 }
 const fn default_limit() -> usize { 40 }
 const fn default_trace_limit() -> usize { 50 }
+const fn default_event_limit() -> usize { 1 }
 const fn default_max_depth() -> usize { 2 }
 const fn default_max_children() -> usize { 16 }
 
@@ -93,6 +94,19 @@ pub struct GetTracesArgs {
     /// Clear the trace buffer after returning it.
     #[serde(default)]
     pub clear: bool,
+}
+
+/// Arguments for `debug.get_last_event`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetLastEventArgs {
+    /// How many buffered events to return, most recent LAST (default 1 — just the latest). Raise it
+    /// to catch up when the reply says events are pending, e.g. after a broad exception breakpoint.
+    #[serde(default = "default_event_limit")]
+    pub limit: usize,
+    /// Discard the events returned, so the next call only sees newer ones. Off by default, so
+    /// repeated calls keep reporting the same latest hit.
+    #[serde(default)]
+    pub drain: bool,
 }
 
 /// Arguments for `debug.clear_breakpoint`.
@@ -227,6 +241,16 @@ pub struct SetExceptionBreakpointArgs {
     /// Break on exceptions that are NOT caught (propagate out; default true).
     #[serde(default = "default_true")]
     pub uncaught: bool,
+    /// Logpoint mode: on each throw, snapshot (throw location, thread, in-scope locals, exception
+    /// type, catch location) into a ring buffer and resume immediately WITHOUT suspending — the safe
+    /// choice on a shared instance, where a suspending exception breakpoint freezes other people's
+    /// requests. Read snapshots with `debug.get_traces`.
+    #[serde(default)]
+    pub trace: bool,
+    /// Only with `trace:true` — an expression to evaluate in the throwing frame and record alongside
+    /// the snapshot (e.g. `this.getStatus()`).
+    #[serde(default)]
+    pub trace_expr: Option<String>,
 }
 
 /// Arguments for `debug.set_watchpoint`.
@@ -245,6 +269,15 @@ pub struct SetWatchpointArgs {
     /// Also break on reads (`FIELD_ACCESS`). Noisy on a hot field; off by default.
     #[serde(default)]
     pub access: bool,
+    /// Logpoint mode: on each hit, snapshot (mutating location, thread, in-scope locals, the field's
+    /// old → new pair) into a ring buffer and resume immediately WITHOUT suspending — the safe choice
+    /// on a shared instance. Read snapshots with `debug.get_traces`.
+    #[serde(default)]
+    pub trace: bool,
+    /// Only with `trace:true` — an expression to evaluate in the mutating frame and record alongside
+    /// the snapshot.
+    #[serde(default)]
+    pub trace_expr: Option<String>,
 }
 
 /// Arguments for `debug.force_return`.
@@ -279,6 +312,7 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(SetWatchpointArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(ForceReturnArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(GetTracesArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(GetLastEventArgs)).unwrap(),
         ];
         for s in schemas {
             assert_eq!(s.get("type").and_then(|t| t.as_str()), Some("object"));
@@ -298,6 +332,15 @@ mod tests {
         assert!(!st.expand_objects);
         assert_eq!(st.max_depth, 2);
         assert_eq!(st.max_children, 16);
+    }
+
+    // `get_last_event` gained a buffer (EVT-1) but must stay backward compatible: a bare call still
+    // returns exactly the newest event and does not consume it, so polling it twice is safe.
+    #[test]
+    fn get_last_event_defaults_to_the_newest_event_only_and_keeps_it() {
+        let a: GetLastEventArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(a.limit, 1);
+        assert!(!a.drain);
     }
 
     // set_value's target accepts both the new `target` key and the legacy `name` key, so existing
