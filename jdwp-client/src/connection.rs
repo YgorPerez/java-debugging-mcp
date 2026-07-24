@@ -119,6 +119,21 @@ impl JdwpConnection {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// How many command packets this connection has issued.
+    ///
+    /// The measurement instrument for anything that claims to cut JVM round trips. Wall-clock is the
+    /// wrong tool over loopback, where a round trip is sub-millisecond and noise swamps the signal —
+    /// that mistake is why the type cache first looked like it did nothing (0.98s → 0.95s). Packet
+    /// count is what actually differs on a remote JVM, and it is deterministic.
+    ///
+    /// Every command takes exactly one id from the same counter, so the difference across an operation
+    /// is its packet cost. Events are pushed by the JVM and never counted here.
+    #[must_use]
+    pub fn packets_sent(&self) -> u32 {
+        // -1 because ids start at 1: nothing has been sent when the next id is still 1.
+        self.next_id.load(Ordering::SeqCst).saturating_sub(1)
+    }
+
     /// This connection's type-metadata cache. Used by the `get_signature` / `get_fields` /
     /// `get_methods` / `get_superclass` implementations in the sibling modules.
     pub(crate) fn types(&self) -> &TypeCache {

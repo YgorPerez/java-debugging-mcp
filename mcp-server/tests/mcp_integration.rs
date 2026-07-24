@@ -1027,3 +1027,76 @@ fn session_id_from(attach_reply: &str) -> Option<String> {
     let end = rest.find(')')?;
     Some(rest[..end].to_string())
 }
+
+/// The packet-count instrument behind every round-trip claim in
+/// `docs/VARIABLE_INSPECTION_PLAN.md`, as a regression guard: a deep expansion of the `DeepProbe` graph
+/// must stay in the low hundreds of JDWP commands.
+///
+/// Wall-clock is the wrong tool here — over loopback a round trip is sub-millisecond, and noise swamps
+/// the signal (measuring the type cache that way first suggested it did nothing). The bound is generous
+/// on purpose: it exists to catch a return to per-object refetching, which measured 421 packets against
+/// the cache's 218, not to pin an exact number that a different JDK would shift.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn deep_expansion_stays_within_its_packet_budget() {
+    let Some(jdk) = jdk_or_skip("deep_expansion_stays_within_its_packet_budget") else { return };
+    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let line = probe_line(&probe_source("DeepProbe"), "// BP1");
+    server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({"class_pattern": "DeepProbe", "line": line}),
+    );
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in DeepProbe.inspect never fired");
+
+    let expand = |server: &mut Server| {
+        server.call(
+            "debug.evaluate",
+            serde_json::json!({
+                "expression": "order", "expand_objects": true, "max_depth": 3, "max_children": 30,
+            }),
+        )
+    };
+
+    let before = packets_sent(&mut server);
+    expand(&mut server);
+    let cold = packets_sent(&mut server) - before;
+
+    // A second identical expansion pays only for values, since every type's shape is already cached.
+    expand(&mut server);
+    let warm = packets_sent(&mut server) - before - cold;
+
+    println!("deep expansion: {cold} packets cold, {warm} warm");
+    assert!(cold > 0 && warm > 0, "the instrument reported nothing: {cold} cold, {warm} warm");
+    assert!(
+        cold < 600,
+        "a cold deep expansion cost {cold} packets — the type cache measured 218; has shape caching regressed?"
+    );
+    assert!(
+        warm < cold,
+        "a warm expansion ({warm}) should cost less than a cold one ({cold}) — that is what the cache buys"
+    );
+
+    server.panic_reset();
+}
+
+/// The current session's JDWP command count, from `debug.list_sessions`.
+fn packets_sent(server: &mut Server) -> u32 {
+    let listed = server.call("debug.list_sessions", serde_json::json!({}));
+    let line = listed
+        .lines()
+        .find(|l| l.contains("← current"))
+        .unwrap_or_else(|| panic!("no current session in:\n{listed}"));
+    let (head, _) = line
+        .split_once(" JDWP packet(s)")
+        .unwrap_or_else(|| panic!("no packet count in: {line}"));
+    head.rsplit(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("unparseable packet count in: {line}"))
+}
+

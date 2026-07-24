@@ -32,8 +32,9 @@ success criteria as an automated test.
 | Collection search | `[?predicate]` filters, `[a..b]` slices, `[i]` / `["key"]` subscripts |
 | Expression evaluation (deferred as "Phase 3, future") | shipped — including static-method invocation and object arguments |
 
-Beyond the plan: conditional breakpoints, non-suspending logpoints, exception breakpoints, field
-watchpoints, live field writes, `force_return`, multiple concurrent sessions, and a safety watchdog.
+Beyond the plan: conditional breakpoints, non-suspending `trace:true` mode on every kind of stop point,
+exception breakpoints, field watchpoints, live field writes, `force_return`, multiple concurrent sessions
+(with `debug.list_sessions`), and a safety watchdog.
 
 ## Decisions worth remembering
 
@@ -54,9 +55,9 @@ cycle must not recurse.
 **How to handle large collections?** `max_children` (default 16) bounds fields per object and elements
 per collection, and the output states what it truncated. A total **node budget** bounds the whole call,
 so a shallow-but-bushy graph can't blow up either — 400 for one `debug.evaluate`, 1000 shared across an
-entire `debug.get_stack` (it expands many values, not one; per-value budgets would multiply). For finding rather than browsing, filter:
-`[?pred]` scans up to 1000 elements and reports `N of M matched`, so an empty result is distinguishable
-from an unscanned one.
+entire `debug.get_stack` (it expands many values, not one; per-value budgets would multiply). For
+finding rather than browsing, filter: `[?pred]` scans up to 1000 elements and reports `N of M matched`,
+so an empty result is distinguishable from an unscanned one.
 
 **Should object field values be cached?** No — as the plan proposed. The `TypeCache` holds only a type's
 *shape* (signature, declared fields, declared methods, superclass), which is immutable for a loaded
@@ -86,6 +87,28 @@ Staleness is bounded by design: the cache belongs to the connection, so reattach
 gets a fresh one. A class unload or an external `RedefineClasses` could serve stale shape data; both are
 documented at `TypeCache`.
 
+**Repeat the measurement yourself**: `debug.list_sessions` reports each session's JDWP packet count, so
+the cost of any operation is the difference across it (`JdwpConnection::packets_sent`).
+`deep_expansion_stays_within_its_packet_budget` in `mcp_integration.rs` does exactly that, and keeps a
+generous upper bound as a regression guard.
+
+### Caching the container classification — measured, then dropped
+
+`classify_container` decides List/Map/Optional/none per rendered object, and the verdict is a pure
+function of the type, so memoising it looks obviously right. It isn't. Measured A/B on the heaviest case
+available — `batch`, twenty identical `Order`s each holding six collections, ~160 classifications of a
+handful of types:
+
+| | packets | wall-clock (best of 5, ×3 runs) |
+|---|---|---|
+| without the memo | 1165 | 158 / 153 / 154 ms |
+| with a per-render memo | 1165 | 156 / 152 / 154 ms |
+
+Identical packet counts and indistinguishable time, because the lookups already hit the cached method
+lists — the type cache had eaten this cost. The memo was reverted rather than kept on faith: a cache
+that saves nothing still has to be understood, and this one held type ids whose lifetime had to be
+reasoned about. The comment on `ContainerKind` records the verdict so it isn't re-proposed.
+
 ## Testing
 
 The plan called for unit tests per JDWP command, integration tests against a real app, and validating
@@ -94,9 +117,9 @@ the example step by step. What exists:
 - **Unit tests** for the pure logic — schema generation, the type cache, tool registration.
 - **Integration tests** (`mcp-server/tests/mcp_integration.rs`) driving the real `jdwp-mcp` binary over
   JSON-RPC against probe JVMs the harness compiles, launches and reaps itself. Run with
-  `scripts/integration-test.sh`. Eleven tests cover expression resolution, watchpoints, deferred
-  breakpoints, `force_return`, deep expansion and its node budget, collection subscripts, the event
-  buffer, non-suspending traces, and the roadmap criteria above.
+  `scripts/integration-test.sh`. Fourteen tests cover expression resolution, watchpoints, deferred
+  breakpoints, `force_return`, deep expansion with its node budget and packet budget, collection
+  subscripts, the event buffer, non-suspending traces, session listing, and the roadmap criteria above.
 - **The example is validated** by the roadmap-criteria test, and its output blocks are captured from a
   real run rather than written by hand.
 

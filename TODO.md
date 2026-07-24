@@ -156,6 +156,19 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   `int` for a reference parameter, which reads it as an oop and **SIGSEGVs the debuggee** (reproduced
   — hs_err + core dump). The fallback is now kind-checked, so a type-mismatched invoke is refused
   with an error instead of crashing the target.
+- **Container-kind caching: measured, no gain, dropped (PERF-1)** — closed the way the item asked to be
+  closed. `classify_container` runs per rendered object and its verdict is a pure function of the type,
+  so memoising it looks obviously right. A/B on the heaviest case available (`batch`: 20 identical
+  `Order`s × 6 collections each, ~160 classifications) gave **1165 packets either way** and 152–158 ms
+  either way — indistinguishable, because those lookups already hit the cached method lists, so the type
+  cache had eaten this cost already. The memo was **reverted**: a cache that saves nothing still has to
+  be understood, and this one held type ids whose lifetime needed reasoning about. Numbers and reasoning
+  are in `docs/VARIABLE_INSPECTION_PLAN.md`, and `ContainerKind` carries a comment so it isn't
+  re-proposed.
+  Kept from the attempt, because the plan doc promised a measurement method nobody could actually repeat:
+  `JdwpConnection::packets_sent()`, a per-session packet count in `debug.list_sessions`, and
+  `deep_expansion_stays_within_its_packet_budget` — which records the cost (211 cold / 159 warm) and
+  guards against a return to per-object refetching (which measured 421).
 - **`debug.list_sessions` (SESS-1)** — concurrent sessions worked but were unfindable: `attach` handed
   back a `session_id` and every tool accepted one, yet a caller who lost it could only reach "current".
   The new tool lists each session's `host:port`, marks the current one, and reports whether it is
@@ -291,23 +304,6 @@ The two things OBJ-2 deliberately left out.
 - [ ] `ArrayReference.SetValues` in `jdwp-client`
 - [ ] `map[?predicate]` filters entries and renders survivors as `key → value`
 - [ ] Probe coverage for each, including an out-of-bounds write and a type-mismatched write
-
-**Blocked by**
-None.
-
-### PERF-1 — Cache the container classification  · P2 · S
-
-**What to build**
-`classify_container` runs a method lookup per rendered object to decide List/Map/Optional/none. Those
-lookups now hit the cached method list, so the cost is small — but the verdict itself is a pure function
-of the type and belongs in `TypeCache` beside the rest. Measure before and after with the packet-count
-method in `docs/VARIABLE_INSPECTION_PLAN.md`; if it doesn't move the number, close this as not worth it
-rather than adding a cache on faith.
-
-**Acceptance criteria**
-- [ ] Container kind memoised per type id
-- [ ] A measured packet count for a deep expansion, before and after, recorded in the plan doc
-- [ ] Closed as "no measurable gain" if that is what the numbers say
 
 **Blocked by**
 None.

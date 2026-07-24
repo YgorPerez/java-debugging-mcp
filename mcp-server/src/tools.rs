@@ -40,7 +40,7 @@ fn session_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.list_sessions".to_string(),
-            description: "List every live debug session — its host:port, whether it is the current one (all tools default to that), whether it is suspended, and how many stop points/traces/events it holds. Use it when you have lost a session_id, or to check what is still attached before walking away. A session whose JVM has gone is shown as DEAD.".to_string(),
+            description: "List every live debug session — its host:port, whether it is the current one (all tools default to that), whether it is suspended, how many stop points/traces/events it holds, and how many JDWP packets it has cost. Use it when you have lost a session_id, or to check what is still attached before walking away. A session whose JVM has gone is shown as DEAD.".to_string(),
             input_schema: empty(),
         },
         Tool {

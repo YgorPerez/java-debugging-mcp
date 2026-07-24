@@ -1132,12 +1132,13 @@ fn render_session_line(
         + s.exception_requests.len()
         + s.watchpoints.len();
     let mut line = format!(
-        "  {} [{}] {} — {}, {} stop point(s)",
+        "  {} [{}] {} — {}, {} stop point(s), {} JDWP packet(s)",
         if is_current { "▶" } else { " " },
         sid,
         s.endpoint,
         state,
         stops,
+        s.connection.packets_sent(),
     );
     // Buffer counts only when there is something to read, so a quiet session stays one short line.
     if !s.traces.is_empty() {
@@ -3752,6 +3753,9 @@ async fn collect_instance_fields(
 }
 
 /// What kind of container an object turned out to be, for element-level rendering.
+///
+/// Deliberately NOT memoised per type, though the verdict is a pure function of one: measured, it is
+/// free. See "Caching the container classification" in `docs/VARIABLE_INSPECTION_PLAN.md`.
 enum ContainerKind {
     /// Anything with `toArray()` + `size()` — `List`, `Set`, `Queue`, …
     Collection,
