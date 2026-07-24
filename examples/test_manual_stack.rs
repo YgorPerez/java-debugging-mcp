@@ -19,14 +19,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = JdwpConnection::connect("localhost", 5005).await?;
     println!("✓ Connected to JVM\n");
 
-    // First, make a request to ensure hello() is on the stack
-    println!("💡 Making request to trigger hello()...");
-    tokio::task::spawn(async {
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        let _ = reqwest::get("http://localhost:8080/").await;
-    });
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
+    // Put app code on the stack before we suspend — trigger some traffic against the target JVM
+    // now (e.g. `curl http://localhost:8080/`). We pause briefly to give that a chance to land.
+    println!("💡 Trigger some app traffic now (e.g. curl your endpoint); suspending in ~1s...");
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
     println!("⏸️  Suspending all threads...");
     conn.suspend_all().await?;

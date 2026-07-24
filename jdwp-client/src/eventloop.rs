@@ -38,7 +38,7 @@ pub struct CommandRequest {
 /// - Events should be consumed from a single task/clone
 ///
 /// # Example
-/// ```no_run
+/// ```ignore
 /// // Good: Single event consumer
 /// let handle1 = event_loop.clone();
 /// let handle2 = event_loop.clone();

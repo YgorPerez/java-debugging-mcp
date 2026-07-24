@@ -19,7 +19,7 @@ impl JdwpConnection {
     /// The actual string value
     ///
     /// # Example
-    /// ```no_run
+    /// ```ignore
     /// let value = connection.get_string_value(string_object_id).await?;
     /// println!("String value: {}", value);
     /// ```

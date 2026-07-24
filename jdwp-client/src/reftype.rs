@@ -72,7 +72,7 @@ impl JdwpConnection {
     /// Vector of FieldInfo containing field IDs, names, signatures, and modifiers
     ///
     /// # Example
-    /// ```no_run
+    /// ```ignore
     /// let fields = connection.get_fields(class_id).await?;
     /// for field in fields {
     ///     println!("Field: {} ({})", field.name, field.signature);

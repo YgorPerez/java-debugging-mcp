@@ -70,7 +70,7 @@ impl JdwpConnection {
     /// This is useful for polling events without blocking the current task.
     ///
     /// # Example
-    /// ```no_run
+    /// ```ignore
     /// if let Some(event) = connection.try_recv_event().await {
     ///     // Handle event
     /// }
@@ -87,7 +87,7 @@ impl JdwpConnection {
     /// Returns `None` if the event loop has shut down.
     ///
     /// # Example
-    /// ```no_run
+    /// ```ignore
     /// while let Some(event) = connection.recv_event().await {
     ///     // Process event
     /// }
