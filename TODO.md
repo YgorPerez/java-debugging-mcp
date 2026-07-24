@@ -141,3 +141,48 @@ break these classes / trace these methods."
 
 **Blocked by**
 ~~TRACE-1, EXC-1~~ — both shipped; DOC-1 is now unblocked.
+
+---
+
+## Appendix: original 4-week roadmap — validated status (2026-07-24)
+
+The early "object-inspection" roadmap below was validated line-by-line against the current code.
+Legend: ✅ done · 🟡 partial · ⬜ not started. Evidence in `path:sym` form. (The original list
+numbered two items `6`; renumbered 1–17 here.)
+
+Headline: **Week 1 is fully done, and the Week 4 headline — field-path navigation — already shipped
+via `debug.evaluate`.** What's genuinely missing is *automatic recursive object expansion* and
+*collection-aware inspection*; today you drill into objects/collections manually with `evaluate`.
+
+### Week 1 — Core infrastructure — ✅ complete
+1. ✅ Fix `INVALID_LENGTH` — `get_frames(thread, 0, -1)` (all frames) in `handlers.rs:handle_get_stack`.
+2. ✅ `StringReference.Value` — `string.rs:get_string_value`.
+3. ✅ `ReferenceType.Fields` — `reftype.rs:get_fields`.
+4. ✅ `ObjectReference.GetValues` — `object.rs:get_object_values`.
+5. ✅ Auto-expand strings in `get_stack` — `render_value` prints string contents (`handlers.rs:handle_get_stack` renders each local).
+6. ✅ **(was BLOCKER)** Expose breakpoint events — `debug.get_last_event` tool + `session.last_event`; the event pump stores the hit thread and `get_last_event` returns `{event, thread, class, method, line}` (also for steps/exceptions). `handlers.rs:handle_get_last_event`.
+
+### Week 2 — Object inspection — 🟡 partial
+7. ⬜ Recursive object expansion (max depth) — not implemented. Objects render as `TypeName (id=0x…)` (or `TypeName "toString()"` when a thread is available in `evaluate`); there is no field-tree walk and no depth bound (`render_value`). Drilling is manual via `evaluate` `.field` chains.
+8. 🟡 Type cache — only a per-call class-name cache in `get_stack` (`class_names` map) plus `package_filter` to skip framework frames; no persistent/session type or object cache.
+9. 🟡 `get_stack` auto-expands objects — expands **strings + arrays** only; objects show type + id (rendered with `thread=None` on purpose, to keep `get_stack` cheap — no `toString`/invocation). Full object auto-expansion is 7.
+10. ⬜ HelloController `meterRegistry` verification — no such automated test; `examples/observability-debugging.md` is the closest (a manual write-up).
+
+### Week 3 — Collections & polish — 🟡 partial
+11. ✅ Array inspection — `extra.rs:get_array_length`/`get_array_values`; `render_value` expands arrays (first 16 elements, then `… +N more`). Surfaced through `evaluate`/`get_stack`, not a dedicated tool.
+12. 🟡 Special handling for List/Map/Set/Optional — no structural/element-level expansion; they render via `toString()` in `evaluate` (readable) but not in `get_stack`. No keyed/indexed element access.
+13. 🟡 Config for inspection depth/limits — have `max_result_length` (evaluate), `max_frames`/`include_variables`/`package_filter` (get_stack), and a hardcoded 16-element array cap. No **depth** knob (there is no recursion to bound yet).
+14. ⬜ Actuator-metrics debugging example — not present as a runnable example.
+
+### Week 4 — Advanced navigation — 🟡 partial (headline done)
+15. ✅ Field-path navigation (`this.meterRegistry.meters`) — `debug.evaluate` resolves `this`/local/`Class` heads then `.field` / `.method(args)` chains (`handlers.rs:resolve_expression`). Object args in calls and static-method calls are the open follow-ups (see EVAL-1/EVAL-2).
+16. ⬜ Collection search/filter — not implemented.
+17. 🟡 Performance/caching — class-name cache, `package_filter`, single-threaded `invoke_method`, and token-trimmed outputs exist; no general type/object-id cache.
+18. ✅ Documentation & examples — README tool table, `examples/*.rs` probes, `examples/observability-debugging.md`, `docs/`. Ongoing.
+
+### What's actually left (net of the above)
+
+- **OBJ-1 — recursive object expansion** (items 7, 9, 12, 13): an opt-in `debug.get_stack {expand_objects:true, max_depth}` / `debug.evaluate` deep mode that walks instance fields to a bounded depth with a per-node cap, cycle detection, and collection-aware rendering (List/Map/Set/Optional element-level, not just `toString`). Needs the depth/breadth config knobs (13) and a real type cache (8) to stay cheap. **New item — not yet in the backlog above.**
+- **OBJ-2 — collection search/filter** (item 16): filter/slice large collections during inspection (e.g. `list[0..10]`, `map.get("k")` already works via EVAL; a predicate filter does not). Depends on OBJ-1. **New item.**
+- Items 10 & 14 (HelloController / actuator examples) fold into **TEST-1** (integration harness) and **DOC-1**.
+- Field-path *method-call* richness continues under **EVAL-1** (static-method invocation) and **EVAL-2** (object arguments).
