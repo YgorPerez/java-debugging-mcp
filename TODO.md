@@ -156,6 +156,26 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   `int` for a reference parameter, which reads it as an oop and **SIGSEGVs the debuggee** (reproduced
   — hs_err + core dump). The fallback is now kind-checked, so a type-mismatched invoke is refused
   with an error instead of crashing the target.
+- **Verified against a real Spring Boot app (TEST-3)** — the roadmap criteria were re-run against a live
+  **Spring Boot 2.6 + `micrometer-registry-prometheus`** app with 84 real meters, not the stand-in.
+  Substituted `golv2` (a real infotravel service, already built as a fat jar on this box) for the
+  companion `java-example-for-k8s` the item named, which still isn't here — the point of the item was a
+  genuine Spring app, and this is a better one: it's the actual stack this debugger exists for.
+  Everything held. `MetricsEndpoint.listNames` broke by **method name** with no line number,
+  `this.registry.getMeters().size()` read `(int) 84`, `getMeters()[0].getId().getName()` chained through
+  index + calls to a real string, a predicate filter over 84 meters answered `8 of 84 matched`, and a
+  `Map`-entry filter (OBJ-4, shipped the same day) answered `5 of 84 entr(ies)` with keys intact.
+  The differences are all about **finding**, as the item predicted: the registry is `MetricsEndpoint.registry`
+  (not a controller's `meterRegistry`), and — the one that matters — real Micrometer keys `meterMap` by a
+  `Meter.Id` **object**, so the stand-in's `meters["name"]` has no real equivalent (`meterMap["logback.events"]`
+  correctly returns `null`). On the real thing you filter, which also handles the fact that one metric
+  *name* is many meters, one per tag combination — usually why a metric looks "missing".
+  **One defect fixed as a result**: filtered map keys are now rendered with `toString()`. They had read as
+  `Meter$Id (id=0xaf)` — accurate and useless — when the key is the identity you just filtered for. A
+  filter already invokes a predicate per value, so rendering the surviving keys adds no new side effects.
+  Recorded in `examples/observability-debugging.md` § "Against a real Spring Boot app". Deliberately **not**
+  a checked-in test: it needs a 50 MB prebuilt jar from a sibling repo that no CI runner has. The stand-in
+  test stays the automated guard; this is the human-verified evidence behind it.
 - **Subscript writes and `Map`-entry filtering (OBJ-4)** — the two gaps OBJ-2 left, both closed.
   **Writing through a subscript**: `set_value {target:"numbers[0]"}` now works on an array (new
   `ArrayReference.SetValues` primitive — no invocation, so no side effects), a `List` (`set(index, value)`)
@@ -297,32 +317,14 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## Backlog
 
-Priority key: **P1** = highest payoff for the infotravel/integraWS investigations (shared 8180 +
-silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
+**Empty.** Everything filed here has shipped — the original ten items (TRACE-1, EXC-1, SETF-1, EVAL-1,
+EVAL-2, WATCH-1, TEST-1, OBJ-1, OBJ-2, DOC-1), all 18 appendix items, and all ten from the
+post-completion review (TRACE-2, OBJ-3, EVT-1, SESS-1, EVAL-3, OBJ-4, PERF-1, TEST-2, DOC-2, TEST-3).
+PERF-1 closed as *measured, no gain*, which is a result rather than a build.
 
-> Everything from the original backlog shipped (TRACE-1, EXC-1, SETF-1, EVAL-1, EVAL-2, WATCH-1,
-> TEST-1, OBJ-1, OBJ-2, DOC-1) plus all 18 appendix items. A review of that work found ten more items;
-> the three **defects in what shipped** (TRACE-2, OBJ-3, EVT-1) are now done and moved to Shipped, and
-> what remains below is follow-on work rather than anything broken.
-
-### TEST-3 — Verify against a real Spring Boot app  · P2 · S
-
-**What to build**
-`roadmap_metrics_inspection_criteria` runs against `MetricsProbe`, a stand-in reproducing Micrometer's
-object shape. It verifies the tool against the real structure; it cannot verify Spring's own class
-names, line numbers, or bean lifecycle. Run the same checks against the companion
-`java-example-for-k8s` (a `HelloController` with a real `meterRegistry`) and record what differs.
-
-Expect the differences to be about *finding* things — which class and line to break on, when beans
-exist — rather than about reading them.
-
-**Acceptance criteria**
-- [ ] The metrics criteria pass against a real Spring Boot + Micrometer app
-- [ ] Anything the stand-in got wrong is fixed, in the probe or the tool
-- [ ] `examples/observability-debugging.md` gains the real class/line names alongside the stand-in ones
-
-**Blocked by**
-The companion `java-example-for-k8s` app, which is not on this machine.
+New work goes here as a vertical slice, with the same shape as the entries above: what to build, the
+shape of the change, acceptance criteria you can check, and what blocks it. The validation pattern is at
+the top of this file.
 
 ---
 
@@ -364,20 +366,16 @@ is opt-in rather than automatic, because expanding a collection invokes methods 
 
 ### What's actually left (net of the above)
 
-- ~~**OBJ-1 — recursive object expansion**~~ (items 7, 9, 12, 13) — **shipped**, including the type
-  cache it wanted (item 8). Of its two follow-ups, **OBJ-3** (one node budget per `get_stack` call, plus
-  the frame-id staleness it uncovered) has shipped; **PERF-1** (caching the container classification)
-  is still open.
-- ~~**OBJ-2 — collection search/filter**~~ (item 16) — **shipped**, see above. Not covered: writing
-  through a subscript (`list[0] = x` would need `List.set`/array element stores — `set_value` refuses
-  it rather than doing the wrong thing), filtering a `Map`'s entries (no entry-shaped result type;
-  `map.values()` then filter works) — both now tracked as **OBJ-4** — and a predicate whose *left* side
-  needs a frame local inside a call argument (the frame is stale after `toArray()`).
-- ~~Items 10 & 14 (HelloController / actuator examples)~~ — **shipped** as
-  `roadmap_metrics_inspection_criteria` + the rewritten `examples/observability-debugging.md`. The only
-  thing still owed is a run against a genuine Spring Boot app, which needs the companion
-  `java-example-for-k8s` (not on this machine) — the stand-in verifies the tool, not the framework.
-  Tracked as **TEST-3**.
-- Field-path *method-call* richness is done (EVAL-1 static-method invocation + EVAL-2 object
-  arguments). The remaining gap in overload resolution is **interface-typed parameters** and **boxed
-  primitives** — tracked as **EVAL-3**.
+**Nothing.** Each of the follow-ups this appendix used to point at has shipped:
+
+- ~~**OBJ-1 — recursive object expansion**~~ (items 7, 9, 12, 13), with the type cache it wanted (item 8);
+  its follow-ups **OBJ-3** (one node budget per `get_stack` call, plus the frame-id staleness it uncovered)
+  and **PERF-1** (container-kind caching — measured, no gain, dropped) are closed too.
+- ~~**OBJ-2 — collection search/filter**~~ (item 16), and the two gaps it left as **OBJ-4**: writing through
+  a subscript, and filtering a `Map` while keeping its keys.
+- ~~Items 10 & 14 (`HelloController` / actuator examples)~~ — the stand-in test and the rewritten
+  `examples/observability-debugging.md`, now backed by **TEST-3**: the same criteria run against a real
+  Spring Boot + Micrometer app, with the differences recorded.
+- ~~Overload resolution's remaining gap~~ — interface-typed parameters and boxed primitives, shipped as
+  **EVAL-3**, which also removed the arity-and-kind fallback that could pass an argument no parameter
+  accepted.

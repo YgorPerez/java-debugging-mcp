@@ -3195,8 +3195,11 @@ async fn scan_elements(
 /// Read a `Map`'s entries as (rendered key, value) pairs, so a filter over the values can still say
 /// which key each survivor was under.
 ///
-/// Keys are rendered eagerly and WITHOUT invoking `toString()` (`thread_id` None): the point of the key
-/// is to identify the entry, and a filter is already invoking enough in the debuggee.
+/// Keys ARE rendered with `toString()`. Normally this code avoids that (see `describe_field_event`), but
+/// a key exists to identify its entry, and a real key is often an object: measured against Micrometer,
+/// `meterMap` is keyed by `Meter.Id`, which without `toString()` renders as
+/// `Meter$Id (id=0xaf)` — true, and useless. The filter is already invoking a predicate against every
+/// value, so one more call per surviving entry changes nothing about the side effects.
 async fn scan_map_entries(
     conn: &mut jdwp_client::JdwpConnection,
     id: u64,
@@ -3238,7 +3241,7 @@ async fn scan_map_entries(
         // An unreadable entry is skipped rather than failing the whole scan, matching how the deep
         // renderer treats one.
         if let Some((k, v)) = entry_pair(conn, e, tid).await {
-            keys.push(render_value(conn, &k, None, 100).await);
+            keys.push(render_value(conn, &k, Some(tid), 120).await);
             values.push(v);
         }
     }

@@ -17,7 +17,8 @@ collections and nested objects.
 
 All six work. `examples/observability-debugging.md` walks the use case end to end with captured output,
 and `roadmap_metrics_inspection_criteria` in `mcp-server/tests/mcp_integration.rs` asserts the original
-success criteria as an automated test.
+success criteria as an automated test — re-verified against a real Spring Boot + Micrometer registry, not
+only the stand-in.
 
 ## What was built
 
@@ -122,6 +123,10 @@ the example step by step. What exists:
   subscripts, the event buffer, non-suspending traces, session listing, and the roadmap criteria above.
 - **The example is validated** by the roadmap-criteria test, and its output blocks are captured from a
   real run rather than written by hand.
+- **The criteria were also run against a real Spring Boot + Micrometer app** (84 live meters), which is
+  what the stand-in cannot prove. All of them held; the differences were about *finding* the registry, and
+  they are recorded in `examples/observability-debugging.md`. That run is not a checked-in test — it needs a
+  prebuilt app no CI runner has — so the stand-in remains the automated guard.
 
 Mock-JDWP-response unit tests were **not** built. Driving a real JVM caught things a mock could not
 have: a modifier-kind mix-up that came back as a bare `INTERNAL` naming nothing, frame IDs silently

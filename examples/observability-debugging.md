@@ -16,8 +16,9 @@ pulling Spring into the test harness. The integration test
 it, so **the tool behaviour is proven**.
 
 What a stand-in cannot prove is Spring's own specifics: real class names, line numbers, and the bean
-lifecycle. Adapt those against your app — the commands and the shape of the answers carry over
-unchanged.
+lifecycle. Those were checked separately against a **real Spring Boot 2.6 app with
+`micrometer-registry-prometheus`** (`golv2`), and § "Against a real Spring Boot app" at the end records
+what actually differs. Every command below is the same; the differences are all about *finding* things.
 
 Run the stand-in yourself:
 
@@ -140,6 +141,54 @@ The registry not containing it moves the question upstream to registration. Two 
   `debug.set_watchpoint {class_name:"…HelloController", field_name:"meterRegistry", trace:true}`
   reports the mutating `class.method:line` with the old → new value. Clear it when done — a watched
   field can't be JIT-optimised.
+
+## Against a real Spring Boot app
+
+The stand-in above proves the tool; this section is what changed when the same criteria were run against
+a live Spring Boot 2.6 app with `micrometer-registry-prometheus` (84 real meters). Only the *finding*
+differs — every command works the same once you are pointed at the right object.
+
+**Break on the actuator endpoint, not a controller.** The registry is easiest to reach from the code that
+already walks it, and a method name is enough — no line number to go stale:
+
+```
+debug.set_breakpoint {class_pattern:"org.springframework.boot.actuate.metrics.MetricsEndpoint",
+                      method:"listNames"}
+… curl http://host:port/<context>/actuator/metrics …
+```
+
+**The registry is `this.registry`, not `this.meterRegistry`**, and its runtime type is
+`io.micrometer.prometheus.PrometheusMeterRegistry`. `this.registry.getMeters().size()` answered `(int) 84`.
+
+**A real registry is NOT keyed by name.** Micrometer's field is
+`meterMap : ConcurrentHashMap<Meter.Id, Meter>` — the key is a `Meter.Id` **object**, so the stand-in's
+`meters["hello_requests_total"]` has no real equivalent: `meterMap["logback.events"]` correctly returns
+`null`, because no such key exists. **Filter instead**, which is also how you find a metric whose exact
+tags you don't know:
+
+```
+debug.evaluate {expression:"this.registry.getMeters()[?getId().getName() == \"jvm.memory.used\"]"}
+debug.evaluate {expression:"this.registry.meterMap[?getId().getName() == \"logback.events\"]"}
+```
+
+```
+… → 8 of 84 matched { … }
+… → 5 of 84 entr(ies) {
+  Meter$Id "MeterId{name='logback.events', tags=[tag(level=trace)]}" → PrometheusCounter …
+  Meter$Id "MeterId{name='logback.events', tags=[tag(level=warn)]}"  → PrometheusCounter …
+```
+
+`8 of 84` and `5 of 84` are the whole point: one metric *name* is many meters, one per tag combination —
+which is the usual reason a metric looks "missing" from a query.
+
+**Use `package_filter` on a real stack.** The actuator call arrives through reflection and lambda
+trampolines; `{package_filter:"actuate"}` cut a 20-frame stack to 5 real ones and collapsed the rest.
+
+**One improvement came out of this run**: filtered map keys are now rendered with `toString()`. Against
+Micrometer they had read as `Meter$Id (id=0xaf)` — accurate and useless — where the key is the identity
+you just filtered for.
+
+## On a shared JVM
 
 On a shared JVM, pass `trace:true` — breakpoints, exception breakpoints and watchpoints all take it.
 Each snapshots the hit and resumes immediately, so a forgotten stop point can't freeze other people's
