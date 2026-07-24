@@ -43,6 +43,19 @@ The Rust test files in this directory demonstrate low-level JDWP protocol usage:
 
 These are primarily for library development and testing.
 
+### MCP-level harnesses
+
+- **test_eval_invoke.rs** - Drives the built `jdwp-mcp` binary over JSON-RPC on stdio, so it covers
+  the server's handlers (expression resolution, overload selection, conditional breakpoints) rather
+  than just the wire primitives. Paired with `probes/EvalProbe.java`; see the file header to run it.
+
+### probes/
+
+Java programs the harnesses attach to. Compile with `javac -g` (without `-g` there is no
+local-variable table and locals can't be read), then launch with
+`-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:<port>` — one fresh port per run,
+since `server=y` stops listening after the first connection.
+
 ## Quick Reference
 
 ### Essential Prompts

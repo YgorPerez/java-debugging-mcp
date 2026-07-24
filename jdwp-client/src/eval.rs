@@ -1,5 +1,5 @@
 // Primitives for expression evaluation: type signatures, superclass walking,
-// `this` object, and (no-arg) method invocation.
+// `this` object, and method invocation (instance and static).
 
 use crate::commands::{command_sets, object_reference_commands, reference_type_commands, stack_frame_commands};
 use crate::connection::JdwpConnection;
@@ -10,6 +10,8 @@ use bytes::{Buf, BufMut};
 
 // ClassType.Superclass lives in command set 3 (CLASS_TYPE), command 1.
 const CLASS_TYPE_SUPERCLASS: u8 = 1;
+// ClassType.InvokeMethod is command 3 of the same set.
+const CLASS_TYPE_INVOKE_METHOD: u8 = 3;
 // InvokeMethod option: run only the invoked thread, not every suspended thread.
 const INVOKE_SINGLE_THREADED: i32 = 1;
 
@@ -88,17 +90,54 @@ impl JdwpConnection {
 
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
-        let mut data = reply.data();
-
-        let ret_tag = read_u8(&mut data)?;
-        let ret = Value {
-            tag: ret_tag,
-            data: read_value_by_tag(ret_tag, &mut data)?,
-        };
-        let _exc_tag = read_u8(&mut data)?;
-        let exc_id = read_u64(&mut data)?;
-        Ok((ret, exc_id))
+        read_invoke_reply(reply.data())
     }
+
+    /// `ClassType.InvokeMethod` — invoke a *static* method on a suspended thread.
+    /// Returns (return value, exception object id) — exception id 0 means no exception.
+    ///
+    /// `class_id` must be the class that declares `method_id` (walk the superclass chain to find
+    /// it, as `ObjectReference.InvokeMethod` requires too). Uses `INVOKE_SINGLE_THREADED` so only
+    /// the target thread runs during the call.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn invoke_static_method(
+        &mut self,
+        class_id: ClassId,
+        thread_id: ThreadId,
+        method_id: MethodId,
+        args: Vec<Value>,
+    ) -> JdwpResult<(Value, ObjectId)> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::CLASS_TYPE, CLASS_TYPE_INVOKE_METHOD);
+        packet.data.put_u64(class_id);
+        packet.data.put_u64(thread_id);
+        packet.data.put_u64(method_id);
+        packet.data.put_i32(i32::try_from(args.len()).unwrap_or(i32::MAX));
+        for a in &args {
+            write_tagged_value(&mut packet.data, a);
+        }
+        packet.data.put_i32(INVOKE_SINGLE_THREADED);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+        read_invoke_reply(reply.data())
+    }
+}
+
+/// Parse an `InvokeMethod` reply body: a tagged return value followed by a tagged exception
+/// reference (object id 0 = the method returned normally). Shared by the instance and static
+/// invoke commands, whose replies are identical.
+fn read_invoke_reply(mut data: &[u8]) -> JdwpResult<(Value, ObjectId)> {
+    let ret_tag = read_u8(&mut data)?;
+    let ret = Value {
+        tag: ret_tag,
+        data: read_value_by_tag(ret_tag, &mut data)?,
+    };
+    let _exc_tag = read_u8(&mut data)?;
+    let exc_id = read_u64(&mut data)?;
+    Ok((ret, exc_id))
 }
 
 pub(crate) fn write_tagged_value<B: BufMut>(buf: &mut B, v: &Value) {

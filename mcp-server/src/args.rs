@@ -62,8 +62,10 @@ pub struct SetBreakpointArgs {
     #[serde(default)]
     pub thread_id: Option<String>,
     /// Only stop when this boolean expression is true, evaluated in the hit frame. Supports
-    /// `expr OP literal` (==, !=, <, >, <=, >=) and boolean method chains, e.g.
-    /// `reserva.getReservaPacote().getReservaHotelList().size() > 0` or `getSgMoeda() == "BRL"`.
+    /// `expr OP expr` (==, !=, <, >, <=, >=) and boolean method chains, e.g.
+    /// `reserva.getReservaPacote().getReservaHotelList().size() > 0`, `getSgMoeda() == "BRL"`, or
+    /// `total > Config.LIMITE`. Either side may be a literal or an expression; two Strings compare
+    /// by content, other objects by identity.
     #[serde(default)]
     pub condition: Option<String>,
     /// Logpoint mode: on hit, snapshot (location, thread, in-scope locals/args, optional
@@ -128,7 +130,11 @@ pub struct GetStackArgs {
 /// Arguments for debug.evaluate.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvaluateArgs {
-    /// Java expression to evaluate.
+    /// Java expression. Heads: a local, `this`, or a class (`ConfigDefaultUtils`, or fully
+    /// qualified). Then chain `.field` and `.method(args)` freely, including static members
+    /// (`ConfigDefaultUtils.getUrl()`). Arguments may be literals (int, `123L`, true/false, null,
+    /// `"string"`) or expressions passed by reference — a local, `this.field`, or a nested call
+    /// (`svc.matches(reserva)`, `foo.handle(this, cfg.getId())`).
     pub expression: String,
     /// Thread ID (optional; defaults to the last thread that hit a breakpoint).
     #[serde(default)]

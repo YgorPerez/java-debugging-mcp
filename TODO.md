@@ -7,17 +7,21 @@ item and finish it.
 
 ## How to validate anything here (the house pattern)
 
-There is no automated integration harness for the MCP layer yet (see TEST-1), so features are proven
-with a throwaway example that drives `jdwp-client` against a purpose-built probe JVM:
+Features are proven with an example that drives a purpose-built probe JVM:
 
-1. Write a tiny Java probe with the shape you need; compile with the JBR javac at
-   `/snap/intellij-idea-ultimate/*/jbr/bin/javac` (no system JDK on this box, JRE only).
+1. Write a tiny Java probe with the shape you need under `examples/probes/`; compile with the JBR
+   javac at `/snap/intellij-idea-ultimate/*/jbr/bin/javac` (no system JDK on this box, JRE only).
+   Pass `-g` or the local-variable table is missing and locals can't be read.
 2. Launch it with `-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:<port>`
    (dt_socket `server=y` accepts ONE connection then stops listening — use a fresh port per run).
-3. Add an `examples/test_*.rs` (register it in `jdwp-client/Cargo.toml`) that exercises the new
-   primitives and asserts the outcome; run with `cargo run --release --example …`.
-
-See `examples/test_static_field.rs` and `examples/test_deferred_bp.rs` for the two worked patterns.
+3. Add an `examples/test_*.rs` that exercises the new behaviour and asserts the outcome; run with
+   `cargo run --release --example …`. Pick the layer to drive:
+   - **`jdwp-client` primitives** — register the example in `jdwp-client/Cargo.toml`. Worked
+     patterns: `examples/test_static_field.rs`, `examples/test_deferred_bp.rs`.
+   - **`mcp-server` handlers** — register it in `mcp-server/Cargo.toml` and spawn
+     `target/release/jdwp-mcp` as a child, speaking JSON-RPC over its stdio. This is the only way to
+     cover the handler glue (expression resolution, event pump, session state). Worked pattern:
+     `examples/test_eval_invoke.rs` (see TEST-1 for what it doesn't cover yet).
 
 Note: the `mcp__jdwp__` tools in a running Claude Code session hold the OLD binary — a rebuild
 (`cargo build --release`) is only picked up after a Claude Code restart. That's why validation goes
@@ -47,6 +51,20 @@ through library examples, not the live tools, within a session.
   (ClassType.SetValues) + `set_object_values` (ObjectReference.SetValues). Legacy `name` key still
   accepted. Validated — static String/int + instance int/String/boolean written and read back
   (`examples/test_set_field.rs`).
+- **Static-method invocation + object arguments (EVAL-1, EVAL-2)** — `debug.evaluate` now calls
+  static methods off a class head (`EvalProbe.twice(21)`, `ConfigDefaultUtils.getUrl()`) and accepts
+  **expressions** as arguments, passed by reference (`a.matches(b)`, `EvalProbe.describe(a)`,
+  `EvalProbe.twice(a.plus(1))`). Primitive `invoke_static_method` (ClassType.InvokeMethod);
+  overloads are resolved against each argument's **runtime class chain**, so `pick(Item)` beats
+  `pick(Object)` where a tag-only match couldn't tell them apart. Breakpoint conditions inherited the
+  same generalization — the right-hand side may now be an expression (`total > Config.LIMITE`,
+  `a.name == b.name`), compared value-to-value (Strings by content, other objects by identity).
+  Validated end-to-end through the real MCP server over JSON-RPC (`examples/test_eval_invoke.rs` +
+  `examples/probes/EvalProbe.java`), 19 checks.
+  ⚠️ **Safety note discovered here**: the old arity-only overload fallback could hand the JVM an
+  `int` for a reference parameter, which reads it as an oop and **SIGSEGVs the debuggee** (reproduced
+  — hs_err + core dump). The fallback is now kind-checked, so a type-mismatched invoke is refused
+  with an error instead of crashing the target.
 - **Non-suspending trace breakpoints / logpoints (TRACE-1)** — `debug.set_breakpoint {…,
   trace:true, trace_expr}` captures a snapshot (location, thread, in-scope locals/args, optional
   expression) and resumes just the hit thread (EventThread policy) — never freezes the VM. Bounded
@@ -61,37 +79,7 @@ through library examples, not the live tools, within a session.
 Priority key: **P1** = highest payoff for the infotravel/integraWS investigations (shared 8180 +
 silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
 
-> **TRACE-1, EXC-1, SETF-1 (all P1) are done** — see the Shipped section above.
-
-### EVAL-1 — Static-method invocation in `debug.evaluate`  · P2 · M
-
-**What to build**
-Let `evaluate` call static methods (`ConfigDefaultUtils.getX()`, `SomeSrv.helper(a)`), not just read
-static fields. `resolve_static_head` currently reads fields only. Add ClassType.InvokeMethod and route
-a trailing `(...)` on a class-prefixed head through it.
-
-**Acceptance criteria**
-- [ ] `debug.evaluate {expression:"SomeClass.staticMethod(1)"}` returns the result
-- [ ] Works on a resolved class from FQN or bare-name scan; needs a suspended thread (document it)
-- [ ] Probe with a static method returning a value, invoked via evaluate, matches the real return
-
-**Blocked by**
-None. Pairs naturally with EVAL-2.
-
-### EVAL-2 — Object arguments in method calls  · P2 · M
-
-**What to build**
-`evaluate` method-call args are primitive/string/null literals only (`arglit`). Allow passing an
-existing object — a local, `this`, or a sub-expression — as an argument (`foo.matches(reserva)`,
-`svc.handle(this)`). Also unlocks richer conditional breakpoints.
-
-**Acceptance criteria**
-- [ ] An argument that is an identifier/sub-expression resolves to a value and is passed by reference
-- [ ] Method overload resolution still picks the right method with object args
-- [ ] Probe: call a method taking an object arg, using a local as the arg, and assert the result
-
-**Blocked by**
-None.
+> **TRACE-1, EXC-1, SETF-1 (all P1) and EVAL-1, EVAL-2 are done** — see the Shipped section above.
 
 ### WATCH-1 — Field watchpoints (modification)  · P2 · M
 
@@ -112,16 +100,21 @@ None. (Shares the event-parse + EventRequest.Set pattern with EXC-1.)
 ### TEST-1 — MCP-handler integration tests + force_return runtime example  · P2 · M
 
 **What to build**
-The two examples validate the `jdwp-client` layer, but the `mcp-server` glue (event pump arming
-deferred breakpoints, `handle_set_breakpoint` deferred path + race re-check, `handle_force_return`)
-has no automated coverage. Build a small harness that spins up the MCP server against a probe JVM and
-drives it over JSON-RPC, plus a runtime example proving `force_early_return` actually changes a
-method's returned value.
+`examples/test_eval_invoke.rs` established the JSON-RPC-over-stdio harness shape (spawn
+`target/release/jdwp-mcp`, drive `tools/call`, assert on the returned text) and covers the expression
+handlers. What still has no coverage is the rest of the `mcp-server` glue — the event pump arming
+deferred breakpoints, `handle_set_breakpoint`'s deferred path + race re-check, and
+`handle_force_return` — and nothing runs from `cargo test`.
+
+Extract the `Server` helper out of `test_eval_invoke.rs` into something shareable, add the missing
+scenarios on top of it, and make the whole thing runnable without a hand-launched probe (the harness
+should start the probe JVM itself, picking a free port).
 
 **Acceptance criteria**
+- [ ] The `Server` stdio-JSON-RPC helper lives in one place, reused by every MCP-level example/test
 - [ ] A test starts the server, attaches to a probe, and asserts a deferred breakpoint arms + fires through the real handlers
 - [ ] `force_return` runtime example: break in a method, force a value, continue, observe the caller receive the forced value
-- [ ] Runs from `cargo test` (or a documented script) without manual steps beyond launching the probe
+- [ ] Runs from `cargo test` (or a documented script) with no manual steps — the harness launches and reaps the probe JVM
 
 **Blocked by**
 None.
@@ -175,7 +168,7 @@ via `debug.evaluate`.** What's genuinely missing is *automatic recursive object 
 14. ⬜ Actuator-metrics debugging example — not present as a runnable example.
 
 ### Week 4 — Advanced navigation — 🟡 partial (headline done)
-15. ✅ Field-path navigation (`this.meterRegistry.meters`) — `debug.evaluate` resolves `this`/local/`Class` heads then `.field` / `.method(args)` chains (`handlers.rs:resolve_expression`). Object args in calls and static-method calls are the open follow-ups (see EVAL-1/EVAL-2).
+15. ✅ Field-path navigation (`this.meterRegistry.meters`) — `debug.evaluate` resolves `this`/local/`Class` heads then `.field` / `.method(args)` chains (`handlers.rs:resolve_expression`). Static-method calls and object arguments shipped too (EVAL-1/EVAL-2, see Shipped).
 16. ⬜ Collection search/filter — not implemented.
 17. 🟡 Performance/caching — class-name cache, `package_filter`, single-threaded `invoke_method`, and token-trimmed outputs exist; no general type/object-id cache.
 18. ✅ Documentation & examples — README tool table, `examples/*.rs` probes, `examples/observability-debugging.md`, `docs/`. Ongoing.
@@ -185,4 +178,7 @@ via `debug.evaluate`.** What's genuinely missing is *automatic recursive object 
 - **OBJ-1 — recursive object expansion** (items 7, 9, 12, 13): an opt-in `debug.get_stack {expand_objects:true, max_depth}` / `debug.evaluate` deep mode that walks instance fields to a bounded depth with a per-node cap, cycle detection, and collection-aware rendering (List/Map/Set/Optional element-level, not just `toString`). Needs the depth/breadth config knobs (13) and a real type cache (8) to stay cheap. **New item — not yet in the backlog above.**
 - **OBJ-2 — collection search/filter** (item 16): filter/slice large collections during inspection (e.g. `list[0..10]`, `map.get("k")` already works via EVAL; a predicate filter does not). Depends on OBJ-1. **New item.**
 - Items 10 & 14 (HelloController / actuator examples) fold into **TEST-1** (integration harness) and **DOC-1**.
-- Field-path *method-call* richness continues under **EVAL-1** (static-method invocation) and **EVAL-2** (object arguments).
+- Field-path *method-call* richness is done (EVAL-1 static-method invocation + EVAL-2 object
+  arguments). The remaining gap in overload resolution is **interface-typed parameters** and **boxed
+  primitives**: `arg_type` walks only the superclass chain, so those fall through to the
+  kind-compatible fallback rather than being matched precisely. Would need ReferenceType.Interfaces.

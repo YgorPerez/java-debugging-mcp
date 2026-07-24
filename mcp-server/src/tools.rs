@@ -67,7 +67,7 @@ pub fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.evaluate".to_string(),
-            description: "Evaluate expression in frame context".to_string(),
+            description: "Evaluate a Java expression in frame context. Heads: a local, this, or a class name; then chain .field and .method(args), including static fields and static methods (ConfigDefaultUtils.getUrl()). Arguments may be literals or expressions passed by reference (svc.matches(reserva), foo.handle(this)). Method calls need a suspended thread; a plain static-field read does not.".to_string(),
             input_schema: to_val(schemars::schema_for!(EvaluateArgs)),
         },
         Tool {

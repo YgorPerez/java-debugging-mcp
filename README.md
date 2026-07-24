@@ -14,8 +14,11 @@ natural language.
   Nth hit) and **thread filters**, or set by **method name** (first line)
 - **Stack Inspection**: Stack frames with typed local variables and resolved **source lines**
 - **Execution Control**: **Step over/into/out**, continue, pause
-- **Expression Evaluation**: `localVar`/`this` with `.field` and `.method(args)` chains, resolving
-  overloads by arity and walking the superclass chain. Args: int, long, boolean, null, "string"
+- **Expression Evaluation**: `localVar`/`this`/`Class` heads with `.field` and `.method(args)` chains
+  — including **static fields and static methods** (`ConfigDefaultUtils.getUrl()`) — resolving
+  overloads by the arguments' **runtime types** and walking the superclass chain. Arguments are
+  literals (int, long, boolean, null, `"string"`) **or expressions passed by reference**
+  (`svc.matches(reserva)`, `foo.handle(this, cfg.getId())`)
 - **Value Rendering**: Strings, typed objects (best-effort `toString()`), and **array contents**
 - **Set Values**: write a local variable in a suspended frame
 - **Thread Management**: tools default to the last thread that hit a breakpoint
@@ -86,7 +89,7 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | `debug.step_into` | Step into a method call |
 | `debug.step_out` | Step out of the current method |
 | `debug.get_stack` | Stack frames, compact `#i class.method:line` with typed locals indented |
-| `debug.evaluate` | Evaluate `var`/`this` + `.field` / `.method(args)` chains in a frame |
+| `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods and object arguments included |
 | `debug.set_value` | Write a local variable, a static field (`Class.field`), or an instance field (`this.field`) |
 | `debug.force_return` | Force the current method to return a given value, skipping the rest of its body |
 | `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line) + `[suspended]` |
@@ -204,14 +207,18 @@ passes it otherwise skips.
 - [x] Method.LineTable / VariableTable
 - [x] EventRequest.Set/Clear/ClearAllBreakpoints — breakpoints with location, **count**, and **thread** modifiers
 - [x] ThreadReference.Frames, StackFrame.GetValues/SetValues/ThisObject
-- [x] ObjectReference.ReferenceType/GetValues/**InvokeMethod**, ArrayReference.Length/GetValues, StringReference.Value
+- [x] ObjectReference.ReferenceType/GetValues/**InvokeMethod**, ClassType.**InvokeMethod** (statics), ArrayReference.Length/GetValues, StringReference.Value
 - [x] **Event loop** for async breakpoint/step notifications
 - [x] **Stepping** (step over/into/out)
-- [x] **Expression evaluation** — `var`/`this` + `.field` / `.method(args)` chains, type-aware overload resolution, superclass walk
+- [x] **Expression evaluation** — `var`/`this`/`Class` + `.field` / `.method(args)` chains, superclass walk
+- [x] **Static-method invocation** — `Class.staticMethod(args)`, restricted to `ACC_STATIC` overloads
+- [x] **Object arguments** — pass a local, `this`, or a nested expression by reference; overloads resolved
+      against each argument's runtime class chain (so `pick(Item)` beats `pick(Object)`), and a
+      type-mismatched invoke is refused rather than handed to the JVM
 - [x] **String and object dereferencing**, array contents, best-effort `toString()`, source-line resolution
-- [x] **Conditional breakpoints** — `condition` evaluated in the hit frame (`expr OP literal` or boolean chains); auto-resumes when false
+- [x] **Conditional breakpoints** — `condition` evaluated in the hit frame (`expr OP expr` or boolean chains); auto-resumes when false
 - [x] **Multiple concurrent sessions** — `debug.attach` returns a `session_id`; tools take an optional `session_id` (defaults to current)
-- [x] **Argument literals** in `evaluate` / conditions: int, long (`123L`), boolean, null, `"string"`
+- [x] **Arguments** in `evaluate` / conditions: literals (int, long `123L`, boolean, null, `"string"`) or expressions
 - [x] **Safety**: `panic` + idle watchdog auto-resume
 - [x] Architecture independence (big-endian protocol; Intel & ARM)
 

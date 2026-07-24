@@ -1042,6 +1042,9 @@ use jdwp_client::events::EventKind;
 use jdwp_client::extra::{value_bool, value_int, value_long, value_null, value_object};
 use jdwp_client::types::Location;
 
+/// A method-call argument (or the right-hand side of a breakpoint condition). Everything but
+/// `Expr` is a self-contained literal; `Expr` is an arbitrary sub-expression (`reserva`,
+/// `this.status`, `svc.getId()`) that must be resolved against a suspended frame before use.
 #[derive(Debug, Clone)]
 enum ArgLit {
     Int(i32),
@@ -1049,11 +1052,12 @@ enum ArgLit {
     Bool(bool),
     Null,
     Str(String),
+    Expr(String),
 }
 
 struct Seg {
     name: String,
-    /// None = field access; Some = method call with these argument literals.
+    /// None = field access; Some = method call with these arguments (possibly empty).
     args: Option<Vec<ArgLit>>,
 }
 
@@ -1124,11 +1128,20 @@ fn parse_lit(t: &str) -> Result<ArgLit, String> {
     if let Ok(n) = t.parse::<i64>() {
         return Ok(ArgLit::Long(n));
     }
+    // Not a literal — accept it as a sub-expression if it parses as one (`reserva`, `this.status`,
+    // `cfg.getName()`), so callers can pass an existing object by reference. Rejecting here would
+    // otherwise be the only way to spell "unsupported token".
+    if parse_expr(t).is_ok() {
+        return Ok(ArgLit::Expr(t.to_string()));
+    }
     Err(format!(
-        "Unsupported argument literal: '{t}' (supported: int, long like 123L, true/false, null, \"string\")"
+        "Unsupported argument: '{t}' (a literal — int, long like 123L, true/false, null, \"string\" — \
+         or an expression like a local, this.field, or obj.getX())"
     ))
 }
 
+/// Split a call's argument list on top-level commas. Commas inside a string literal or nested
+/// parentheses (`foo.matches(bar.key(1, 2))`) belong to the inner argument, not this list.
 fn parse_args(inside: &str) -> Result<Vec<ArgLit>, String> {
     let s = inside.trim();
     if s.is_empty() {
@@ -1137,13 +1150,22 @@ fn parse_args(inside: &str) -> Result<Vec<ArgLit>, String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_str = false;
+    let mut depth = 0i32;
     for c in s.chars() {
         match c {
             '"' => {
                 in_str = !in_str;
                 cur.push(c);
             }
-            ',' if !in_str => {
+            '(' if !in_str => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' if !in_str => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if !in_str && depth == 0 => {
                 out.push(parse_lit(&cur)?);
                 cur.clear();
             }
@@ -1269,37 +1291,42 @@ async fn find_method_arity(
     Ok(None)
 }
 
-/// JDWP value tags for each method-descriptor parameter (objects/arrays collapse to 'L'=76).
-fn sig_param_tags(sig: &str) -> Vec<u8> {
+/// Split a method descriptor's parameter list into raw JNI type descriptors:
+/// `"(I[Ljava/lang/String;Z)V"` -> `["I", "[Ljava/lang/String;", "Z"]`.
+///
+/// Unlike a tag-per-parameter view, this keeps each reference type's *name*, which is what lets
+/// overload resolution tell `pick(String)` from `pick(Item)` — both of which are just tag 'L'.
+fn sig_param_types(sig: &str) -> Vec<String> {
     let (a, b) = match (sig.find('('), sig.find(')')) {
         (Some(a), Some(b)) if b > a => (a, b),
         _ => return vec![],
     };
-    let mut tags = Vec::new();
-    let mut chars = sig[a + 1..b].chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '[' => {
-                while chars.peek() == Some(&'[') {
-                    chars.next();
+    let mut out = Vec::new();
+    let mut chars = sig.get(a + 1..b).unwrap_or_default().chars();
+    while let Some(first) = chars.next() {
+        let mut t = String::from(first);
+        // Array descriptors nest: consume every '[' to reach the element type.
+        let mut base = first;
+        while base == '[' {
+            match chars.next() {
+                Some(n) => {
+                    t.push(n);
+                    base = n;
                 }
-                if chars.next() == Some('L') {
-                    skip_to_semicolon(&mut chars);
-                }
-                tags.push(76);
+                None => break,
             }
-            'L' => {
-                skip_to_semicolon(&mut chars);
-                tags.push(76);
-            }
-            other => {
-                if let Some(t) = primitive_tag(other) {
-                    tags.push(t);
+        }
+        if base == 'L' {
+            for n in chars.by_ref() {
+                t.push(n);
+                if n == ';' {
+                    break;
                 }
             }
         }
+        out.push(t);
     }
-    tags
+    out
 }
 
 /// Map a primitive JNI type char to its JDWP value tag; `None` for a non-primitive char.
@@ -1317,15 +1344,6 @@ const fn primitive_tag(c: char) -> Option<u8> {
     })
 }
 
-/// Advance `chars` past the rest of an object type name, up to and including its terminating ';'.
-fn skip_to_semicolon(chars: &mut impl Iterator<Item = char>) {
-    for x in chars.by_ref() {
-        if x == ';' {
-            break;
-        }
-    }
-}
-
 /// Is a provided argument value tag acceptable for a parameter tag?
 fn tag_compatible(param: u8, arg: u8) -> bool {
     let is_obj = |t: u8| matches!(t, 76 | 115 | 116 | 103 | 108 | 99 | 91);
@@ -1333,17 +1351,124 @@ fn tag_compatible(param: u8, arg: u8) -> bool {
     param == arg || (is_obj(param) && is_obj(arg)) || (is_num(param) && is_num(arg))
 }
 
-/// Find a method by name + argument types (preferring a type-compatible overload, falling
-/// back to the first arity match), walking the superclass chain.
+/// `ACC_STATIC` in a JVM method's access flags (JVMS 4.6).
+const ACC_STATIC: i32 = 0x0008;
+
+/// What an argument actually *is* at the moment of the call, which is what overload resolution
+/// scores against.
+enum ArgType {
+    /// A primitive value carrying this JDWP tag.
+    Primitive(u8),
+    /// A null reference — assignable to any reference parameter.
+    Null,
+    /// A live object: the JNI signatures of its class and every superclass, most specific first
+    /// (always ending in `Ljava/lang/Object;`).
+    Object(Vec<String>),
+}
+
+/// Classify one argument value, reading the object's runtime class chain when it is a reference.
+///
+/// The chain is what makes an object argument resolvable to a specific overload: a parameter is
+/// assignable from the argument exactly when its declared type appears in the chain. Interfaces are
+/// not walked, so an interface-typed parameter can't be matched precisely and lands on
+/// [`kind_compatible`] instead.
+async fn arg_type(conn: &mut jdwp_client::JdwpConnection, v: &jdwp_client::types::Value) -> ArgType {
+    let id = match v.data {
+        jdwp_client::types::ValueData::Object(0) => return ArgType::Null,
+        jdwp_client::types::ValueData::Object(id) => id,
+        _ => return ArgType::Primitive(v.tag),
+    };
+    let mut chain = Vec::new();
+    if let Ok(t) = conn.get_object_reference_type(id).await {
+        let mut current = Some(t);
+        let mut guard = 0;
+        while let Some(tid) = current {
+            guard += 1;
+            if guard > 50 {
+                break;
+            }
+            match conn.get_signature(tid).await {
+                Ok(s) => chain.push(s),
+                Err(_) => break,
+            }
+            current = conn.get_superclass(tid).await.unwrap_or(None);
+        }
+    }
+    // Array types have no walkable superclass chain, so make the universal supertype explicit.
+    if !chain.iter().any(|s| s == "Ljava/lang/Object;") {
+        chain.push("Ljava/lang/Object;".to_string());
+    }
+    ArgType::Object(chain)
+}
+
+/// Score how well `arg` fits the parameter descriptor `param`: `None` = not assignable at all,
+/// higher = more specific. Scoring by specificity is what makes `pick(Item)` beat `pick(Object)`
+/// for an `Item` argument, and an exact `int` beat a widened `long`.
+fn score_param(param: &str, arg: &ArgType) -> Option<u32> {
+    let is_ref = param.starts_with('L') || param.starts_with('[');
+    match arg {
+        ArgType::Null => is_ref.then_some(1),
+        ArgType::Primitive(tag) => {
+            let ptag = param.chars().next().and_then(primitive_tag)?;
+            if !tag_compatible(ptag, *tag) {
+                return None;
+            }
+            Some(if ptag == *tag { 2 } else { 1 })
+        }
+        ArgType::Object(chain) => {
+            if !is_ref {
+                return None;
+            }
+            let idx = chain.iter().position(|s| s == param)?;
+            // Distance from the end of the chain: the runtime class itself scores highest.
+            Some(u32::try_from(chain.len() - idx).unwrap_or(1) + 1)
+        }
+    }
+}
+
+/// Weaker check for the cases [`score_param`] can't settle — chiefly an interface-typed parameter,
+/// which never appears in the argument's superclass chain. Only the *kind* has to agree: a reference
+/// argument for a reference parameter, a widening-compatible primitive for a primitive one.
+///
+/// A primitive argument for a reference parameter stays a hard mismatch. That is not pedantry: JDWP
+/// hands the raw int straight to the JVM, which reads it as an object pointer and dies with a
+/// SIGSEGV — the debuggee crashes rather than reporting an error.
+fn kind_compatible(param: &str, arg: &ArgType) -> bool {
+    let is_ref = param.starts_with('L') || param.starts_with('[');
+    match arg {
+        ArgType::Null | ArgType::Object(_) => is_ref,
+        ArgType::Primitive(tag) => {
+            param.chars().next().and_then(primitive_tag).is_some_and(|p| tag_compatible(p, *tag))
+        }
+    }
+}
+
+/// Find the method `name` to invoke for a concrete argument list, walking the superclass chain.
+///
+/// Overloads of matching arity are scored by how specifically each parameter accepts its argument
+/// (see [`score_param`]) and the best-scoring one wins; ties go to the most derived class, since the
+/// walk starts at the runtime type. If nothing is assignable, a *kind*-compatible overload is used
+/// as a fallback (see [`kind_compatible`]) — never a mere arity match, which can hand the JVM a
+/// misinterpreted argument and crash it.
+///
+/// `want_static` filters on the method's `ACC_STATIC` flag: `Some(true)` for a `Class.m()` call
+/// (JDWP's `ClassType.InvokeMethod` only accepts statics), `Some(false)` for an instance call, and
+/// `None` to accept either.
 async fn find_method_for_args(
     conn: &mut jdwp_client::JdwpConnection,
     type_id: u64,
     name: &str,
-    arg_tags: &[u8],
+    args: &[jdwp_client::types::Value],
+    want_static: Option<bool>,
 ) -> Result<Option<(u64, jdwp_client::reftype::MethodInfo)>, String> {
-    let argc = arg_tags.len();
+    let mut argtypes = Vec::with_capacity(args.len());
+    for v in args {
+        argtypes.push(arg_type(conn, v).await);
+    }
+
     let mut current = Some(type_id);
     let mut guard = 0;
+    let mut best: Option<(u32, u64, jdwp_client::reftype::MethodInfo)> = None;
     let mut fallback: Option<(u64, jdwp_client::reftype::MethodInfo)> = None;
     while let Some(tid) = current {
         guard += 1;
@@ -1355,20 +1480,44 @@ async fn find_method_for_args(
             if m.name != name {
                 continue;
             }
-            let ptags = sig_param_tags(&m.signature);
-            if ptags.len() != argc {
+            if want_static.is_some_and(|want| want != (m.mod_bits & ACC_STATIC != 0)) {
                 continue;
             }
-            if ptags.iter().zip(arg_tags).all(|(p, a)| tag_compatible(*p, *a)) {
-                return Ok(Some((tid, m)));
+            let params = sig_param_types(&m.signature);
+            if params.len() != argtypes.len() {
+                continue;
             }
-            if fallback.is_none() {
-                fallback = Some((tid, m));
+            // `None` anywhere means at least one argument isn't assignable to its parameter, which
+            // rules the overload out entirely.
+            let scored = params
+                .iter()
+                .zip(&argtypes)
+                .try_fold(0u32, |acc, (p, a)| score_param(p, a).map(|s| acc + s));
+            match scored {
+                // Strictly-greater keeps the first (most derived) winner on a tie, so an override
+                // in a subclass shadows the inherited method as Java would.
+                Some(total) if best.as_ref().is_none_or(|(bs, ..)| total > *bs) => {
+                    best = Some((total, tid, m));
+                }
+                // A fallback is only ever read when nothing scored at all, so recording one is
+                // pointless once `best` is set — which also keeps `m` movable into exactly one
+                // of these arms.
+                _ if best.is_none()
+                    && fallback.is_none()
+                    && params.iter().zip(&argtypes).all(|(p, a)| kind_compatible(p, a)) =>
+                {
+                    fallback = Some((tid, m));
+                }
+                _ => {}
             }
+        }
+        // A match at this level shadows anything inherited; stop before paying for more round-trips.
+        if best.is_some() {
+            break;
         }
         current = conn.get_superclass(tid).await.unwrap_or(None);
     }
-    Ok(fallback)
+    Ok(best.map(|(_, t, m)| (t, m)).or(fallback))
 }
 
 /// Spawn the per-session event pump: receive events off the connection (holding no lock while
@@ -1872,8 +2021,13 @@ async fn find_field(
     Ok(None)
 }
 
+/// Turn one parsed argument into a JDWP value. Literals are built directly; an `Expr` argument is
+/// resolved in the caller's evaluation context, so an existing object (a local, `this`, or a field/
+/// method chain) is passed **by reference** — the same object the debuggee already holds.
 async fn arglit_to_value(
     conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
     a: &ArgLit,
 ) -> Result<jdwp_client::types::Value, String> {
     Ok(match a {
@@ -1885,6 +2039,9 @@ async fn arglit_to_value(
             let id = conn.create_string(s).await.map_err(|e| format!("Failed to create string arg: {e}"))?;
             value_object(id)
         }
+        ArgLit::Expr(e) => resolve_expression_boxed(conn, thread_id, frame, e)
+            .await
+            .map_err(|err| format!("argument '{e}': {err}"))?,
     })
 }
 
@@ -1923,6 +2080,7 @@ async fn resolve_head(
 async fn resolve_segment(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
     current: &jdwp_client::types::Value,
     seg: &Seg,
 ) -> Result<jdwp_client::types::Value, String> {
@@ -1938,7 +2096,7 @@ async fn resolve_segment(
         .map_err(|e| format!("Failed to resolve object type: {e}"))?;
 
     if let Some(arglits) = &seg.args {
-        invoke_segment_method(conn, thread_id, obj_id, type_id, seg, arglits).await
+        invoke_segment_method(conn, thread_id, frame, obj_id, type_id, seg, arglits).await
     } else {
         read_segment_field(conn, obj_id, type_id, seg).await
     }
@@ -1948,29 +2106,57 @@ async fn resolve_segment(
 async fn invoke_segment_method(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
     obj_id: u64,
     type_id: u64,
     seg: &Seg,
     arglits: &[ArgLit],
 ) -> Result<jdwp_client::types::Value, String> {
-    let thread_id = thread_id.ok_or_else(|| {
+    let tid = thread_id.ok_or_else(|| {
         format!("Calling '.{}()' needs a suspended thread — pause one or hit a breakpoint first", seg.name)
     })?;
+    let argvals = eval_args(conn, thread_id, frame, arglits).await?;
+    let (decl, m) = find_method_for_args(conn, type_id, &seg.name, &argvals, None).await?
+        .ok_or_else(|| {
+            format!(
+                "No method '{}' on the object accepts {} argument(s) of these types",
+                seg.name,
+                argvals.len()
+            )
+        })?;
+    let (ret, exc) = conn.invoke_method(obj_id, tid, decl, m.method_id, argvals).await
+        .map_err(|e| format!("invoke {}() failed: {}", seg.name, e))?;
+    invoke_result(conn, &seg.name, ret, exc).await
+}
+
+/// Resolve every parsed argument of a call to a JDWP value, in source order.
+async fn eval_args(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
+    arglits: &[ArgLit],
+) -> Result<Vec<jdwp_client::types::Value>, String> {
     let mut argvals = Vec::with_capacity(arglits.len());
     for a in arglits {
-        argvals.push(arglit_to_value(conn, a).await?);
+        argvals.push(arglit_to_value(conn, thread_id, frame, a).await?);
     }
-    let arg_tags: Vec<u8> = argvals.iter().map(|v| v.tag).collect();
-    let (decl, m) = find_method_for_args(conn, type_id, &seg.name, &arg_tags).await?
-        .ok_or_else(|| format!("No method '{}' with {} argument(s) on the object", seg.name, argvals.len()))?;
-    let (ret, exc) = conn.invoke_method(obj_id, thread_id, decl, m.method_id, argvals).await
-        .map_err(|e| format!("invoke {}() failed: {}", seg.name, e))?;
+    Ok(argvals)
+}
+
+/// Unwrap an `InvokeMethod` outcome: a non-zero exception id means the invoked method threw, which
+/// is reported as an error naming the exception type rather than a value.
+async fn invoke_result(
+    conn: &mut jdwp_client::JdwpConnection,
+    name: &str,
+    ret: jdwp_client::types::Value,
+    exc: u64,
+) -> Result<jdwp_client::types::Value, String> {
     if exc != 0 {
         let tn = match conn.get_object_reference_type(exc).await {
             Ok(t) => decode_signature(&conn.get_signature(t).await.unwrap_or_default()),
             Err(_) => "an exception".to_string(),
         };
-        return Err(format!("{}() threw {}", seg.name, tn));
+        return Err(format!("{name}() threw {tn}"));
     }
     Ok(ret)
 }
@@ -1987,6 +2173,18 @@ async fn read_segment_field(
     let vals = conn.get_object_values(obj_id, vec![fid]).await
         .map_err(|e| format!("Failed to read field '{}': {}", seg.name, e))?;
     vals.into_iter().next().ok_or_else(|| "No value returned for field".to_string())
+}
+
+/// `resolve_expression` with its future boxed and type-erased. An `Expr` argument inside a method
+/// call re-enters expression resolution, and an `async fn` cannot name its own future type — this
+/// erases it. Recursion terminates because every sub-expression is strictly shorter than its parent.
+fn resolve_expression_boxed<'a>(
+    conn: &'a mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&'a jdwp_client::thread::Frame>,
+    expr: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<jdwp_client::types::Value, String>> + Send + 'a>> {
+    Box::pin(resolve_expression(conn, thread_id, frame, expr))
 }
 
 async fn resolve_expression(
@@ -2011,13 +2209,13 @@ async fn resolve_expression(
     };
 
     let (mut current, start) = if let Some(Ok(v)) = head_result { (v, 1usize) } else {
-        let (v, consumed) = resolve_static_head(conn, &segs).await.map_err(|static_err| {
+        let (v, consumed) = resolve_static_head(conn, thread_id, frame, &segs).await.map_err(|static_err| {
             match &head_result {
                 Some(Err(head_err)) => {
-                    format!("{head_err} (also not a resolvable static field: {static_err})")
+                    format!("{head_err} (also not a resolvable static member: {static_err})")
                 }
                 _ => format!(
-                    "No suspended frame to read locals from, and not a resolvable static field: {static_err}"
+                    "No suspended frame to read locals from, and not a resolvable static member: {static_err}"
                 ),
             }
         })?;
@@ -2025,52 +2223,108 @@ async fn resolve_expression(
     };
 
     for seg in segs.iter().skip(start) {
-        current = resolve_segment(conn, thread_id, &current, seg).await?;
+        current = resolve_segment(conn, thread_id, frame, &current, seg).await?;
     }
     Ok(current)
 }
 
-/// Fallback head resolution: treat a leading dotted prefix as a class name and read a static field.
+/// Fallback head resolution: treat a leading dotted prefix as a class name, then read the next
+/// segment as a static **field** or invoke it as a static **method**.
 ///
 /// Given segments like `[br, com, infotravel, util, ConfigDefaultUtils, dsUrlMotor]`, try the
 /// longest class prefix first (so package names and nested classes win), resolve it to a loaded
-/// reference type, then read the next segment as a static field. Returns the field value plus the
-/// number of segments consumed (class prefix + the field), so the caller can continue chaining
+/// reference type, then resolve the next segment against it. Returns the value plus the number of
+/// segments consumed (class prefix + the member), so the caller can continue chaining
 /// (`.getFoo()`, `.bar`) on the result.
+///
+/// A static field read needs no suspended thread; a static method call does (JDWP runs the
+/// invocation on a thread), and says so if none is available.
 async fn resolve_static_head(
     conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
     segs: &[Seg],
 ) -> Result<(jdwp_client::types::Value, usize), String> {
     let n = segs.len();
     if n < 2 {
-        return Err("a static read needs at least Class.field".to_string());
+        return Err("a static access needs at least Class.field or Class.method()".to_string());
     }
-    // k = number of segments forming the class name; the field is the next segment. Longest
+    // k = number of segments forming the class name; the member is the next segment. Longest
     // prefix first. `split_at(k)` keeps every access in-bounds (1 <= k < n).
     for k in (1..n).rev() {
         let (class_segs, rest) = segs.split_at(k);
-        let Some(field_seg) = rest.first() else { continue };
-        // The class-name segments and the field segment must all be plain (no method args).
-        if class_segs.iter().any(|s| s.args.is_some()) || field_seg.args.is_some() {
+        let Some(member) = rest.first() else { continue };
+        // Only the member segment may carry arguments — a class name never does.
+        if class_segs.iter().any(|s| s.args.is_some()) {
             continue;
         }
         let dotted = class_segs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".");
-        if let Some(type_id) = resolve_class_by_dotted(conn, &dotted).await? {
-            let fid = find_static_field(conn, type_id, &field_seg.name).await?.ok_or_else(|| {
-                format!("class '{}' has no static field '{}'", dotted, field_seg.name)
-            })?;
-            let vals = conn
-                .get_reference_values(type_id, vec![fid])
-                .await
-                .map_err(|e| format!("Failed to read static field '{}': {}", field_seg.name, e))?;
-            let v = vals
-                .into_iter()
-                .next()
-                .ok_or_else(|| "No value returned for static field".to_string())?;
-            return Ok((v, k + 1));
-        }
+        let Some(type_id) = resolve_class_by_dotted(conn, &dotted).await? else { continue };
+        let v = match &member.args {
+            Some(arglits) => {
+                invoke_static_member(conn, thread_id, frame, type_id, &dotted, member, arglits).await?
+            }
+            None => read_static_field(conn, type_id, &dotted, &member.name).await?,
+        };
+        return Ok((v, k + 1));
     }
     Err("no loaded class matches the leading segment(s)".to_string())
+}
+
+/// Read `Class.field` off a resolved reference type. Needs no suspended thread.
+async fn read_static_field(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+    dotted: &str,
+    name: &str,
+) -> Result<jdwp_client::types::Value, String> {
+    let fid = find_static_field(conn, type_id, name)
+        .await?
+        .ok_or_else(|| format!("class '{dotted}' has no static field '{name}'"))?;
+    let vals = conn
+        .get_reference_values(type_id, vec![fid])
+        .await
+        .map_err(|e| format!("Failed to read static field '{name}': {e}"))?;
+    vals.into_iter().next().ok_or_else(|| "No value returned for static field".to_string())
+}
+
+/// Invoke `Class.method(args)` via `ClassType.InvokeMethod`.
+///
+/// Overload selection is restricted to *static* methods, so an instance method of the same name and
+/// arity can't be picked (JDWP would reject the invoke). The declaring class from the lookup — not
+/// the class the user named — is what gets invoked, which is what JDWP requires for an inherited
+/// static.
+async fn invoke_static_member(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
+    type_id: u64,
+    dotted: &str,
+    member: &Seg,
+    arglits: &[ArgLit],
+) -> Result<jdwp_client::types::Value, String> {
+    let tid = thread_id.ok_or_else(|| {
+        format!(
+            "Calling static '{}.{}()' needs a suspended thread — pause one or hit a breakpoint first",
+            dotted, member.name
+        )
+    })?;
+    let argvals = eval_args(conn, thread_id, frame, arglits).await?;
+    let (decl, m) = find_method_for_args(conn, type_id, &member.name, &argvals, Some(true))
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "class '{}' has no static method '{}' accepting {} argument(s) of these types",
+                dotted,
+                member.name,
+                argvals.len()
+            )
+        })?;
+    let (ret, exc) = conn
+        .invoke_static_method(decl, tid, m.method_id, argvals)
+        .await
+        .map_err(|e| format!("invoke static {}.{}() failed: {}", dotted, member.name, e))?;
+    invoke_result(conn, &member.name, ret, exc).await
 }
 
 /// Resolve a dotted class name to a loaded reference type id.
@@ -2268,6 +2522,13 @@ async fn literal_to_value(
         ArgLit::Null => value_null(),
         ArgLit::Bool(b) => value_bool(b),
         ArgLit::Long(n) => value_long(n),
+        // `debug.set_value` writes a literal only — copying another live value would need the
+        // caller's frame, which this coercion path (also used for deferred writes) doesn't have.
+        ArgLit::Expr(e) => {
+            return Err(format!(
+                "'{e}' is not a literal — set_value takes a literal (int, 123L, true/false, null, \"string\")"
+            ))
+        }
         // Assigning an integer literal to a narrower Java primitive performs Java's own
         // narrowing conversion (`(byte)`, `(short)`, `(char)`, `(float)`) — a deliberate,
         // possibly-lossy reinterpretation, exactly as `javac` would compile it.
@@ -2550,8 +2811,15 @@ async fn eval_condition(
 ) -> Result<bool, String> {
     if let Some((lhs, op, rhs)) = split_comparison(condition) {
         let lv = resolve_expression(conn, Some(thread_id), Some(frame), &lhs).await?;
-        let rlit = parse_lit(rhs.trim())?;
-        compare_values(conn, &lv, &op, &rlit).await
+        // A non-literal right-hand side (`other.id`, `this.limit`) is resolved in the same frame and
+        // compared value-to-value; literals keep their existing coercion path.
+        match parse_lit(rhs.trim())? {
+            ArgLit::Expr(e) => {
+                let rv = resolve_expression(conn, Some(thread_id), Some(frame), &e).await?;
+                compare_resolved(conn, &lv, &op, &rv).await
+            }
+            rlit => compare_values(conn, &lv, &op, &rlit).await,
+        }
     } else {
         let v = resolve_expression(conn, Some(thread_id), Some(frame), condition).await?;
         match v.data {
@@ -2588,6 +2856,55 @@ async fn compare_values(
         return compare_object(conn, *id, op, rlit).await;
     }
     Err("Unsupported comparison (numbers, booleans, null, or String value compares only)".to_string())
+}
+
+/// Compare two already-resolved values — used when the right-hand side of a condition is an
+/// expression rather than a literal. Numbers compare on one f64 scale, booleans with `==`/`!=`,
+/// two Strings by content, and any other pair of references by identity.
+async fn compare_resolved(
+    conn: &mut jdwp_client::JdwpConnection,
+    lv: &jdwp_client::types::Value,
+    op: &str,
+    rv: &jdwp_client::types::Value,
+) -> Result<bool, String> {
+    use jdwp_client::types::ValueData::{Boolean, Object};
+    if let (Some(l), Some(r)) = (value_as_f64(&lv.data), value_as_f64(&rv.data)) {
+        return compare_f64(l, r, op);
+    }
+    if let (Boolean(l), Boolean(r)) = (&lv.data, &rv.data) {
+        return match op {
+            "==" => Ok(l == r),
+            "!=" => Ok(l != r),
+            _ => Err("only == / != for booleans".to_string()),
+        };
+    }
+    if let (Object(l), Object(r)) = (&lv.data, &rv.data) {
+        if op != "==" && op != "!=" {
+            return Err("only == / != when comparing objects".to_string());
+        }
+        // Two live Strings compare by content (what the user means by `s == other.name`); anything
+        // else compares by reference identity, matching Java's own `==` on objects.
+        let equal = match (string_value_of(conn, *l).await, string_value_of(conn, *r).await) {
+            (Some(a), Some(b)) => a == b,
+            _ => l == r,
+        };
+        return Ok(if op == "==" { equal } else { !equal });
+    }
+    Err("Unsupported comparison (compare numbers with numbers, booleans with booleans, or objects with objects)"
+        .to_string())
+}
+
+/// The contents of `id` if it is a live `java.lang.String`; `None` for null, a non-String, or a
+/// read failure.
+async fn string_value_of(conn: &mut jdwp_client::JdwpConnection, id: u64) -> Option<String> {
+    if id == 0 {
+        return None;
+    }
+    let t = conn.get_object_reference_type(id).await.ok()?;
+    if conn.get_signature(t).await.ok()? != "Ljava/lang/String;" {
+        return None;
+    }
+    conn.get_string_value(id).await.ok()
 }
 
 /// A JDWP numeric value widened to f64 for comparison; `None` for non-numeric values. Widening an
