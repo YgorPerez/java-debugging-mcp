@@ -147,6 +147,13 @@ pub struct EvaluateArgs {
     /// (`ConfigDefaultUtils.getUrl()`). Arguments may be literals (int, `123L`, true/false, null,
     /// `"string"`) or expressions passed by reference — a local, `this.field`, or a nested call
     /// (`svc.matches(reserva)`, `foo.handle(this, cfg.getId())`).
+    ///
+    /// Subscripts work on arrays, `List` and `Map`:
+    /// `lines[0]` (index — keeps chaining, so `lines[0].sku` works), `counts["key"]` (map lookup),
+    /// `lines[2..5]` (half-open slice) and `lines[?qty > 3]` (filter). In a filter the left side is
+    /// resolved against **each element** — `lines[?status == "OPEN"]`, `lines[?getQty() == 2]` — while
+    /// the right side may be a literal or an expression read from the frame (`lines[?qty > limit]`).
+    /// A slice or filter selects several values, so nothing can be chained after it.
     pub expression: String,
     /// Thread ID (optional; defaults to the last thread that hit a breakpoint).
     #[serde(default)]

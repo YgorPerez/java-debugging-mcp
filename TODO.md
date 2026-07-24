@@ -70,6 +70,26 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   (ClassType.SetValues) + `set_object_values` (ObjectReference.SetValues). Legacy `name` key still
   accepted. Validated — static String/int + instance int/String/boolean written and read back
   (`examples/test_set_field.rs`).
+- **Collection search/filter (OBJ-2)** — `[…]` subscripts in `debug.evaluate` expressions:
+  `lines[0]` / `counts["key"]` (index — narrows to one value, so `lines[0].sku` keeps chaining),
+  `lines[2..5]` (half-open slice, clamped rather than erroring on an over-long range), and
+  `lines[?qty > 3]` (predicate filter). In a filter the **left side resolves against each element**
+  (`[?status == "OPEN"]`, `[?getQty() == 2]`) so there is no element variable to learn; the right side
+  is a literal or an ordinary expression read from the frame (`[?qty > order.threshold]`).
+  A `Map` key that is a primitive is boxed via `Wrapper.valueOf` before `get(Object)` sees it.
+  Slices and filters select several values, which JDWP has no value type for, so they **end the
+  expression** — `Resolved::Many` is terminal and chaining after one is refused with an explanation
+  rather than silently picking the first. Results report `N of M matched`, so "0 matched" is
+  distinguishable from "nothing was scanned", and a predicate that fails on *every* element is an
+  error rather than an empty result. Scanning is capped (1000 elements) and says when it truncated.
+  Validated by `collection_subscripts_…` in `mcp_integration.rs`.
+  Two bugs this surfaced, both fixed: (1) JDWP **invalidates a thread's frame ids** as soon as a
+  method is invoked on it, so `toArray()` staled the frame before a right-hand side like
+  `order.threshold` could be read — the predicate's element-independent half is now resolved *before*
+  scanning, which also stops it being re-evaluated per element; (2) `debug.set_value` parsed a
+  subscript in its target and then dropped it, writing the whole field instead of the named element —
+  now refused explicitly. Shallow rendering also unboxes wrappers now, so `counts["b"]` reads
+  `(int) 2` rather than `java.lang.Integer "2"`, matching the deep renderer.
 - **Recursive object expansion (OBJ-1)** — `expand_objects:true` on `debug.evaluate` /
   `debug.get_stack` renders a value as an indented field tree instead of one line: nested objects
   (own + inherited fields), array elements, and element-level `List`/`Set`/`Map`/`Optional` contents.
@@ -139,9 +159,9 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 Priority key: **P1** = highest payoff for the infotravel/integraWS investigations (shared 8180 +
 silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
 
-> **TRACE-1, EXC-1, SETF-1 (all P1) and EVAL-1, EVAL-2, WATCH-1, TEST-1, OBJ-1 are done** — see
-> Shipped above. Remaining: **DOC-1** (lives in the sibling `infotravel-dev-toolkit` repo) and
-> **OBJ-2** (collection search/filter, in the appendix).
+> **Everything in this repo is done** — TRACE-1, EXC-1, SETF-1, EVAL-1, EVAL-2, WATCH-1, TEST-1,
+> OBJ-1, OBJ-2. See Shipped above. The only item left is **DOC-1**, which lives in the sibling
+> `infotravel-dev-toolkit` repo.
 
 ### DOC-1 — `jdwp-trace` skill / silent-catch playbook (infotravel-dev-toolkit)  · P2 · S
 
@@ -169,7 +189,8 @@ numbered two items `6`; renumbered 1–17 here.)
 
 Headline (updated): **Weeks 1–2 are done, and the Week 4 headline — field-path navigation — shipped
 via `debug.evaluate`.** Recursive expansion and collection-aware inspection shipped too (OBJ-1). What
-remains from this roadmap is collection *search/filter* (OBJ-2) and a session-level type cache.
+remains from this roadmap is a session-level type cache (item 8/17); collection search/filter shipped
+as OBJ-2.
 
 ### Week 1 — Core infrastructure — ✅ complete
 1. ✅ Fix `INVALID_LENGTH` — `get_frames(thread, 0, -1)` (all frames) in `handlers.rs:handle_get_stack`.
@@ -185,15 +206,15 @@ remains from this roadmap is collection *search/filter* (OBJ-2) and a session-le
 9. ✅ `get_stack` object expansion — opt-in via `expand_objects` (same renderer as 7). The default still passes `thread=None` on purpose, so the cheap path performs no `toString`/invocation per local.
 10. ⬜ HelloController `meterRegistry` verification — no such automated test; `examples/observability-debugging.md` is the closest (a manual write-up).
 
-### Week 3 — Collections & polish — 🟡 partial
+### Week 3 — Collections & polish — ✅ complete
 11. ✅ Array inspection — `extra.rs:get_array_length`/`get_array_values`; `render_value` expands arrays (first 16 elements, then `… +N more`). Surfaced through `evaluate`/`get_stack`, not a dedicated tool.
-12. ✅ Special handling for List/Map/Set/Optional — element-level under `expand_objects` (entries as `key → value` for maps); `toString()` remains the shallow rendering. Keyed/indexed access works via ordinary method calls (`map.get("k")`, `list.get(0)`); *slicing/predicates* are OBJ-2.
+12. ✅ Special handling for List/Map/Set/Optional — element-level under `expand_objects` (entries as `key → value` for maps); `toString()` remains the shallow rendering. Keyed/indexed access via subscripts (`counts["k"]`, `lines[0]`) or ordinary method calls; slicing/predicates shipped as OBJ-2.
 13. ✅ Config for inspection depth/limits — `max_result_length`, `max_frames`/`include_variables`/`package_filter`, plus `expand_objects`/`max_depth`/`max_children` and the node budget.
 14. ⬜ Actuator-metrics debugging example — not present as a runnable example.
 
-### Week 4 — Advanced navigation — 🟡 partial (headline done)
+### Week 4 — Advanced navigation — ✅ complete (bar the type cache in 17)
 15. ✅ Field-path navigation (`this.meterRegistry.meters`) — `debug.evaluate` resolves `this`/local/`Class` heads then `.field` / `.method(args)` chains (`handlers.rs:resolve_expression`). Static-method calls and object arguments shipped too (EVAL-1/EVAL-2, see Shipped).
-16. ⬜ Collection search/filter — not implemented.
+16. ✅ Collection search/filter — `[a..b]` slices and `[?predicate]` filters (`handlers.rs:apply_subscripts`), plus `[i]`/`["k"]` indexed access.
 17. 🟡 Performance/caching — class-name cache (per `get_stack` call), `package_filter`, single-threaded `invoke_method`, token-trimmed outputs, and the deep-render node budget. Still no session-level type/object cache; see the OBJ-1 note below.
 18. ✅ Documentation & examples — README tool table, `examples/*.rs` probes, `examples/observability-debugging.md`, `docs/`. Ongoing.
 
@@ -204,11 +225,11 @@ remains from this roadmap is collection *search/filter* (OBJ-2) and a session-le
   signatures and field lists per object, so a wide graph makes repeat round trips for the same type.
   The node budget keeps that bounded rather than fast. A session-level `type_id → (name, fields,
   container kind)` cache is the obvious follow-up if expansion ever feels slow on a real JVM.
-- **OBJ-2 — collection search/filter** (item 16) · P2 · M: slice or filter a large collection during
-  inspection rather than always taking the first N. `map.get("k")` already works via EVAL, and
-  `max_children` bounds output, but `list[0..10]` and a predicate filter do not exist. Now unblocked
-  (OBJ-1 shipped). Note `list.get(3)` and `list.size()` already work today through ordinary method
-  calls, so the gap is specifically *slicing* and *predicates*, not indexed access.
+- ~~**OBJ-2 — collection search/filter**~~ (item 16) — **shipped**, see above. Not covered: writing
+  through a subscript (`list[0] = x` would need `List.set`/array element stores — `set_value` refuses
+  it rather than doing the wrong thing), filtering a `Map`'s entries (no entry-shaped result type;
+  `map.values()` then filter works), and a predicate whose *left* side needs a frame local inside a
+  call argument (the frame is stale after `toArray()`).
 - Items 10 & 14 (HelloController / actuator examples): the integration harness they needed now exists
   (TEST-1), so these are just cases to add to `mcp_integration.rs` plus a write-up under **DOC-1**.
 - Field-path *method-call* richness is done (EVAL-1 static-method invocation + EVAL-2 object

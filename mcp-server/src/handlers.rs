@@ -616,16 +616,30 @@ impl RequestHandler {
             None => None,
         };
 
-        let value = resolve_expression(conn, thread_id, frame.as_ref(), expression).await?;
-        let rendered = if a.expand_objects {
-            let opts = DeepOpts {
-                depth_limit: a.max_depth,
-                child_limit: a.max_children.max(1),
-                text_len: max_len,
-            };
-            render_value_deep(conn, &value, thread_id, opts).await
-        } else {
-            render_value(conn, &value, thread_id, max_len).await
+        let resolved = resolve_expression_multi(conn, thread_id, frame.as_ref(), expression).await?;
+        let deep = a.expand_objects.then(|| DeepOpts {
+            depth_limit: a.max_depth,
+            child_limit: a.max_children.max(1),
+            text_len: max_len,
+        });
+
+        let rendered = match resolved {
+            Resolved::One(value) => render_one(conn, &value, thread_id, max_len, deep).await,
+            // A slice/filter result: the header carries how many of how many were selected, which is
+            // as important as the values — "0 matched" and "0 scanned" mean very different things.
+            Resolved::Many { header, values } => {
+                let shown = values.len().min(a.max_children.max(1));
+                let mut out = format!("{header} {{");
+                for (i, v) in values.iter().take(shown).enumerate() {
+                    let r = render_one(conn, v, thread_id, max_len, deep).await;
+                    let _ = write!(out, "\n  [{i}] = {r}");
+                }
+                if values.len() > shown {
+                    let _ = write!(out, "\n  … +{} more (raise max_children)", values.len() - shown);
+                }
+                out.push_str("\n}");
+                out
+            }
         };
         drop(session);
         Ok(format!("{} = {}", expression.trim(), rendered))
@@ -784,6 +798,18 @@ impl RequestHandler {
         let conn = &mut session.connection;
 
         let segs = parse_expr(&target)?;
+
+        // A subscript in a write target would otherwise be parsed and then silently dropped, writing
+        // to the whole field instead of the element the caller named. Writing through a subscript
+        // would need List.set(i, v) / array element stores, which this tool doesn't do yet — so say so
+        // rather than do the wrong thing quietly.
+        if let Some(seg) = segs.iter().find(|s| !s.subs.is_empty()) {
+            return Err(format!(
+                "Subscripts aren't supported in a set_value target ('{}[…]'): it writes a single \
+                 field, local, or static. Use debug.evaluate to inspect elements.",
+                seg.name
+            ));
+        }
 
         // Single bare identifier → local variable in a suspended frame (the original behavior).
         if let [seg] = segs.as_slice() {
@@ -1254,6 +1280,22 @@ struct Seg {
     name: String,
     /// None = field access; Some = method call with these arguments (possibly empty).
     args: Option<Vec<ArgLit>>,
+    /// Trailing `[…]` subscripts, applied left to right after the field/method resolves, so
+    /// `grid[0][1]` and `orders[?paid == true]` both work.
+    subs: Vec<Subscript>,
+}
+
+/// A `[…]` subscript. `Index` narrows to one value and keeps chaining; `Range` and `Filter` produce
+/// several values and therefore end the expression (see [`Resolved`]).
+#[derive(Debug, Clone)]
+enum Subscript {
+    /// `[3]` on an array/List, or `["key"]` / `[7]` on a Map.
+    Index(ArgLit),
+    /// `[2..5]` — half-open, like Rust's ranges, on an array or collection.
+    Range(i64, i64),
+    /// `[?predicate]` — keep elements the predicate holds for. The left side of the predicate is
+    /// resolved *against each element*, so `orders[?status == "OPEN"]` needs no element variable.
+    Filter(String),
 }
 
 fn is_ident(s: &str) -> bool {
@@ -1263,6 +1305,9 @@ fn is_ident(s: &str) -> bool {
 }
 
 /// Split an expression into `.`-separated segments, ignoring dots inside () or "".
+/// Split an expression on `.`, ignoring dots inside quotes, parentheses, or brackets. Brackets matter
+/// as much as parens: a filter predicate like `[?customer.name == "Ana"]` is full of dots that belong
+/// to the subscript, not to the outer chain.
 fn split_segments(e: &str) -> Result<Vec<String>, String> {
     let mut segs = Vec::new();
     let mut cur = String::new();
@@ -1274,14 +1319,16 @@ fn split_segments(e: &str) -> Result<Vec<String>, String> {
                 in_str = !in_str;
                 cur.push(c);
             }
-            '(' if !in_str => {
+            '(' | '[' if !in_str => {
                 depth += 1;
                 cur.push(c);
             }
-            ')' if !in_str => {
+            ')' | ']' if !in_str => {
                 depth -= 1;
                 cur.push(c);
             }
+            // A `..` range inside a subscript is at depth > 0, so it can't be mistaken for a chain
+            // separator; only a top-level dot splits.
             '.' if !in_str && depth == 0 => {
                 segs.push(cur.trim().to_string());
                 cur.clear();
@@ -1290,12 +1337,92 @@ fn split_segments(e: &str) -> Result<Vec<String>, String> {
         }
     }
     if depth != 0 || in_str {
-        return Err("Unbalanced parentheses or quotes".to_string());
+        return Err("Unbalanced parentheses, brackets or quotes".to_string());
     }
     if !cur.trim().is_empty() {
         segs.push(cur.trim().to_string());
     }
     Ok(segs)
+}
+
+/// Split a raw segment into its `name`/`name(args)` head and its trailing `[…]` groups.
+fn split_subscripts(raw: &str) -> Result<(String, Vec<String>), String> {
+    // The head ends at the first `[` that is outside quotes and outside parentheses — parens can
+    // legitimately contain a bracket, as in `foo(bar["k"])`.
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut head_end = raw.len();
+    for (i, c) in raw.char_indices() {
+        match c {
+            '"' => in_str = !in_str,
+            '(' if !in_str => depth += 1,
+            ')' if !in_str => depth -= 1,
+            '[' if !in_str && depth == 0 => {
+                head_end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let head = raw[..head_end].trim().to_string();
+    let mut rest = raw[head_end..].trim();
+    let mut groups = Vec::new();
+    while !rest.is_empty() {
+        if !rest.starts_with('[') {
+            return Err(format!("Unexpected text after a subscript: '{rest}'"));
+        }
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut close = None;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '"' => in_str = !in_str,
+                '[' if !in_str => depth += 1,
+                ']' if !in_str => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            return Err(format!("Unclosed '[' in '{raw}'"));
+        };
+        groups.push(rest[1..close].trim().to_string());
+        rest = rest[close + 1..].trim();
+    }
+    Ok((head, groups))
+}
+
+/// Parse one `[…]` body: `?pred` is a filter, `a..b` a half-open range, anything else an index.
+fn parse_subscript(inner: &str) -> Result<Subscript, String> {
+    let t = inner.trim();
+    if t.is_empty() {
+        return Err("Empty subscript '[]' — use [i], [a..b], or [?predicate]".to_string());
+    }
+    if let Some(pred) = t.strip_prefix('?') {
+        if pred.trim().is_empty() {
+            return Err("Empty filter '[?]' — give a predicate, e.g. [?status == \"OPEN\"]".to_string());
+        }
+        return Ok(Subscript::Filter(pred.trim().to_string()));
+    }
+    if let Some((a, b)) = t.split_once("..") {
+        let parse_bound = |x: &str, what: &str| -> Result<i64, String> {
+            x.trim()
+                .parse::<i64>()
+                .map_err(|_| format!("Range {what} must be an integer, got '{}' in '[{t}]'", x.trim()))
+        };
+        let from = parse_bound(a, "start")?;
+        let to = parse_bound(b, "end")?;
+        if to < from {
+            return Err(format!("Range '[{t}]' ends before it starts"));
+        }
+        return Ok(Subscript::Range(from, to));
+    }
+    Ok(Subscript::Index(parse_lit(t)?))
 }
 
 fn parse_lit(t: &str) -> Result<ArgLit, String> {
@@ -1372,21 +1499,24 @@ fn parse_args(inside: &str) -> Result<Vec<ArgLit>, String> {
 }
 
 fn parse_seg(raw: &str) -> Result<Seg, String> {
-    if let Some(open) = raw.find('(') {
-        if !raw.ends_with(')') {
-            return Err(format!("Malformed method call: '{raw}'"));
+    let (head, sub_groups) = split_subscripts(raw)?;
+    let subs = sub_groups.iter().map(|g| parse_subscript(g)).collect::<Result<Vec<_>, _>>()?;
+
+    if let Some(open) = head.find('(') {
+        if !head.ends_with(')') {
+            return Err(format!("Malformed method call: '{head}'"));
         }
-        let name = raw[..open].trim();
+        let name = head[..open].trim();
         if !is_ident(name) {
             return Err(format!("Bad method name: '{name}'"));
         }
-        let args = parse_args(&raw[open + 1..raw.len() - 1])?;
-        Ok(Seg { name: name.to_string(), args: Some(args) })
+        let args = parse_args(&head[open + 1..head.len() - 1])?;
+        Ok(Seg { name: name.to_string(), args: Some(args), subs })
     } else {
-        if !is_ident(raw) {
-            return Err(format!("Unsupported token: '{raw}'"));
+        if !is_ident(&head) {
+            return Err(format!("Unsupported token: '{head}'"));
         }
-        Ok(Seg { name: raw.to_string(), args: None })
+        Ok(Seg { name: head, args: None, subs })
     }
 }
 
@@ -2274,7 +2404,405 @@ async fn resolve_head(
     frame_values.into_iter().next().ok_or_else(|| "No value returned for variable".to_string())
 }
 
-async fn resolve_segment(
+// ----- collection subscripts: OBJ-2 -----
+
+/// How many elements a slice or filter will read from a collection before giving up.
+///
+/// A filter has to look at every element to be meaningful, but "every element" of a production
+/// collection can be millions — each one a JDWP round trip. So the scan is capped and the result says
+/// how much of the collection it actually covered, rather than quietly reporting a partial answer as
+/// if it were complete.
+const SUBSCRIPT_SCAN_CAP: i32 = 1000;
+
+/// Apply a segment's `[…]` subscripts left to right.
+///
+/// An `Index` narrows to one value, so it can be followed by more subscripts or more chain. A `Range`
+/// or `Filter` produces several, which ends the expression — the caller enforces that.
+async fn apply_subscripts(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
+    base: jdwp_client::types::Value,
+    subs: &[Subscript],
+    label: &str,
+) -> Result<Resolved, String> {
+    let mut current = base;
+    for (i, sub) in subs.iter().enumerate() {
+        match sub {
+            Subscript::Index(key) => {
+                current = apply_index(conn, thread_id, frame, &current, key, label).await?;
+            }
+            Subscript::Range(from, to) => {
+                if i + 1 < subs.len() {
+                    return Err(multi_then_chain_error(label));
+                }
+                return apply_range(conn, thread_id, &current, *from, *to, label).await;
+            }
+            Subscript::Filter(pred) => {
+                if i + 1 < subs.len() {
+                    return Err(multi_then_chain_error(label));
+                }
+                // Boxed: a predicate re-enters expression resolution, which can reach a nested
+                // subscript, and every such cycle runs through here.
+                return apply_filter_boxed(conn, thread_id, frame, &current, pred, label).await;
+            }
+        }
+    }
+    Ok(Resolved::One(current))
+}
+
+/// `expr[i]` on an array or `List`, or `expr[key]` on a `Map`.
+///
+/// A `Map` is tried first when the object has `get(Object)`, because `counts["a"]` should mean the
+/// mapping, not an ordinal position.
+async fn apply_index(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
+    base: &jdwp_client::types::Value,
+    key: &ArgLit,
+    label: &str,
+) -> Result<jdwp_client::types::Value, String> {
+    let id = as_object_id(base)
+        .ok_or_else(|| format!("Cannot index '{label}' — it is null or a primitive"))?;
+
+    // Arrays are indexable without invoking anything, so handle them before touching the debuggee.
+    if base.tag == 91 {
+        let ArgLit::Int(i) = key else {
+            return Err(format!("An array index must be an int, got {key:?} on '{label}'"));
+        };
+        let len = conn
+            .get_array_length(id)
+            .await
+            .map_err(|e| format!("Failed to read length of '{label}': {e}"))?;
+        if *i < 0 || *i >= len {
+            return Err(format!("Index {i} is out of bounds for '{label}' (length {len})"));
+        }
+        return conn
+            .get_array_values(id, *i, 1)
+            .await
+            .map_err(|e| format!("Failed to read '{label}[{i}]': {e}"))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("No value returned for '{label}[{i}]'"));
+    }
+
+    let tid = thread_id.ok_or_else(|| {
+        format!("Indexing '{label}' needs a suspended thread — it calls get() in the debuggee")
+    })?;
+    let type_id = conn
+        .get_object_reference_type(id)
+        .await
+        .map_err(|e| format!("Failed to resolve type of '{label}': {e}"))?;
+
+    // Look `get` up by *arity*, not by argument type, and read its parameter to decide how to call
+    // it. Two reasons: a type-aware lookup can't match `Map.get(Object)` against an int key at all
+    // (that needs boxing first), and "no 1-arg get()" is the only honest test for "not indexable" —
+    // matching on the key type instead would report a String index into a List as "not indexable".
+    let Some((decl, m)) = find_method_arity(conn, type_id, "get", 1).await? else {
+        return Err(format!(
+            "'{label}' is not indexable — no 1-argument get() found (arrays, List and Map are supported)"
+        ));
+    };
+    let params = sig_param_types(&m.signature);
+    let takes_reference = params.first().is_some_and(|p| p.starts_with('L') || p.starts_with('['));
+
+    let arg = if takes_reference {
+        // Map.get(Object) cannot take a raw primitive: hand it a wrapper, or the JVM reads the int as
+        // an object pointer and dies.
+        let key_value = arglit_to_value(conn, thread_id, frame, key).await?;
+        if render_primitive(&key_value.data).is_some() {
+            box_primitive(conn, tid, &key_value).await.ok_or_else(|| {
+                format!("Could not box the key for '{label}[…]' — try a String key")
+            })?
+        } else {
+            key_value
+        }
+    } else {
+        // A List: get(int) needs a genuine int index.
+        let ArgLit::Int(i) = key else {
+            return Err(format!(
+                "A list index must be an int — '{label}' takes {}, got {key:?}",
+                params.first().map_or("?", String::as_str)
+            ));
+        };
+        value_int(*i)
+    };
+
+    let (ret, exc) = conn
+        .invoke_method(id, tid, decl, m.method_id, vec![arg])
+        .await
+        .map_err(|e| format!("'{label}[…]' get() failed: {e}"))?;
+    invoke_result(conn, "get", ret, exc).await
+}
+
+/// Wrap a primitive value in its `java.lang.*` box via `Wrapper.valueOf(x)`.
+async fn box_primitive(
+    conn: &mut jdwp_client::JdwpConnection,
+    tid: u64,
+    v: &jdwp_client::types::Value,
+) -> Option<jdwp_client::types::Value> {
+    use jdwp_client::types::ValueData;
+    let class = match v.data {
+        ValueData::Int(_) => "java.lang.Integer",
+        ValueData::Long(_) => "java.lang.Long",
+        ValueData::Short(_) => "java.lang.Short",
+        ValueData::Byte(_) => "java.lang.Byte",
+        ValueData::Char(_) => "java.lang.Character",
+        ValueData::Boolean(_) => "java.lang.Boolean",
+        ValueData::Float(_) => "java.lang.Float",
+        ValueData::Double(_) => "java.lang.Double",
+        ValueData::Object(_) | ValueData::Void => return None,
+    };
+    let type_id = resolve_class_by_dotted(conn, class).await.ok()??;
+    let (decl, m) = find_method_for_args(conn, type_id, "valueOf", std::slice::from_ref(v), Some(true))
+        .await
+        .ok()??;
+    let (ret, exc) = conn.invoke_static_method(decl, tid, m.method_id, vec![v.clone()]).await.ok()?;
+    (exc == 0).then_some(ret)
+}
+
+/// Read a bounded prefix of an array's or collection's elements.
+///
+/// Returns the elements read, the container's full length, and its type name. `Collection` needs a
+/// suspended thread (it calls `toArray()`); arrays don't.
+async fn scan_elements(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    base: &jdwp_client::types::Value,
+    label: &str,
+) -> Result<(Vec<jdwp_client::types::Value>, i32, String), String> {
+    let id = as_object_id(base)
+        .ok_or_else(|| format!("Cannot slice or filter '{label}' — it is null or a primitive"))?;
+    let name = type_name_of(conn, id).await;
+
+    let arr = if base.tag == 91 {
+        id
+    } else {
+        let tid = thread_id.ok_or_else(|| {
+            format!("Slicing or filtering '{label}' needs a suspended thread — it calls toArray() in the debuggee")
+        })?;
+        let type_id = conn
+            .get_object_reference_type(id)
+            .await
+            .map_err(|e| format!("Failed to resolve type of '{label}': {e}"))?;
+        match classify_container(conn, type_id, &name).await {
+            Some(ContainerKind::Collection) => invoke_no_arg(conn, id, type_id, tid, "toArray")
+                .await
+                .as_ref()
+                .and_then(as_object_id)
+                .ok_or_else(|| format!("toArray() on '{label}' returned nothing usable"))?,
+            // A Map has no positional order to slice; filtering entries would need an entry-shaped
+            // result type, which `Resolved` deliberately doesn't have.
+            Some(ContainerKind::Map) => {
+                return Err(format!(
+                    "'{label}' is a Map — slice/filter works on arrays and Collections. Use \
+                     {label}[\"key\"] for one entry, or {label}.values() to filter the values."
+                ))
+            }
+            _ => {
+                return Err(format!(
+                    "'{label}' is not sliceable — expected an array or a Collection, got {name}"
+                ))
+            }
+        }
+    };
+
+    let len = conn
+        .get_array_length(arr)
+        .await
+        .map_err(|e| format!("Failed to read length of '{label}': {e}"))?;
+    let take = len.min(SUBSCRIPT_SCAN_CAP);
+    let values = if take == 0 {
+        Vec::new()
+    } else {
+        conn.get_array_values(arr, 0, take)
+            .await
+            .map_err(|e| format!("Failed to read elements of '{label}': {e}"))?
+    };
+    Ok((values, len, name))
+}
+
+/// `expr[a..b]` — a half-open slice.
+async fn apply_range(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    base: &jdwp_client::types::Value,
+    from: i64,
+    to: i64,
+    label: &str,
+) -> Result<Resolved, String> {
+    let (values, len, name) = scan_elements(conn, thread_id, base, label).await?;
+    if from < 0 {
+        return Err(format!("Range start must not be negative in '{label}[{from}..{to}]'"));
+    }
+    // Clamp rather than error: `list[0..100]` on a 20-element list is a normal way to ask for
+    // "up to 100", and erroring would just make the caller guess the length first.
+    let start = usize::try_from(from).unwrap_or(0).min(values.len());
+    let end = usize::try_from(to).unwrap_or(0).min(values.len());
+    let slice = values.get(start..end).unwrap_or_default().to_vec();
+    let scanned = i32::try_from(values.len()).unwrap_or(i32::MAX);
+    let note = if scanned < len {
+        format!(" (only the first {scanned} of {len} were read — scan cap)")
+    } else {
+        String::new()
+    };
+    Ok(Resolved::Many {
+        header: format!("{name}[{from}..{to}] → {} of {len}{note}", slice.len()),
+        values: slice,
+    })
+}
+
+/// Boxed, type-erased entry to [`apply_filter`] — breaks the async recursion cycle
+/// (subscript → filter → predicate → expression → subscript).
+fn apply_filter_boxed<'a>(
+    conn: &'a mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&'a jdwp_client::thread::Frame>,
+    base: &'a jdwp_client::types::Value,
+    predicate: &'a str,
+    label: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Resolved, String>> + Send + 'a>> {
+    Box::pin(apply_filter(conn, thread_id, frame, base, predicate, label))
+}
+
+/// `expr[?predicate]` — keep the elements the predicate holds for.
+async fn apply_filter(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
+    base: &jdwp_client::types::Value,
+    predicate: &str,
+    label: &str,
+) -> Result<Resolved, String> {
+    // Prepare the predicate BEFORE reading any elements. Two reasons, one of them a correctness bug
+    // found the hard way: `scan_elements` invokes `toArray()` in the debuggee, and JDWP invalidates a
+    // thread's frame ids as soon as a method is invoked on it — so a right-hand side like
+    // `order.threshold`, which reads a local, must be resolved while the frame is still valid. It also
+    // means an element-independent right side is evaluated once instead of once per element.
+    let pred = prepare_predicate(conn, thread_id, frame, predicate).await?;
+
+    let (values, len, name) = scan_elements(conn, thread_id, base, label).await?;
+    let scanned = i32::try_from(values.len()).unwrap_or(i32::MAX);
+
+    let mut kept = Vec::new();
+    let mut errors = 0usize;
+    let mut first_error = None;
+    for v in values {
+        match eval_predicate_on(conn, thread_id, &v, &pred).await {
+            Ok(true) => kept.push(v),
+            Ok(false) => {}
+            Err(e) => {
+                errors += 1;
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+    // A predicate that fails on every element is a broken predicate, not an empty result — say so
+    // instead of reporting "0 matched" and letting the caller believe the collection was checked.
+    if errors > 0 && kept.is_empty() && errors == usize::try_from(scanned).unwrap_or(usize::MAX) {
+        return Err(format!(
+            "Predicate '{predicate}' failed on every element of '{label}': {}",
+            first_error.unwrap_or_default()
+        ));
+    }
+    let note = match (scanned < len, errors) {
+        (true, 0) => format!(" (scanned the first {scanned} of {len} — scan cap)"),
+        (true, n) => format!(" (scanned the first {scanned} of {len} — scan cap; {n} element(s) errored)"),
+        (false, 0) => String::new(),
+        (false, n) => format!(" ({n} element(s) errored)"),
+    };
+    Ok(Resolved::Many {
+        header: format!("{name}[?{predicate}] → {} of {scanned} matched{note}", kept.len()),
+        values: kept,
+    })
+}
+
+/// A filter predicate with everything that does not depend on the element already resolved.
+enum Predicate {
+    /// `lhs OP rhs`: `lhs` is re-resolved against each element, `rhs` was resolved once.
+    Compare { lhs: String, op: String, rhs: PredRhs },
+    /// A boolean chain evaluated against each element.
+    Bool(String),
+}
+
+/// The right-hand side of a comparison: a literal, or a value already read from the frame.
+enum PredRhs {
+    Lit(ArgLit),
+    Value(jdwp_client::types::Value),
+}
+
+/// Split a predicate and resolve its element-independent half.
+///
+/// The left side is deliberately kept as text: it is resolved *against each element*, which is what
+/// lets `orders[?status == "OPEN"]` work without an element variable.
+async fn prepare_predicate(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
+    predicate: &str,
+) -> Result<Predicate, String> {
+    let Some((lhs, op, rhs)) = split_comparison(predicate) else {
+        return Ok(Predicate::Bool(predicate.to_string()));
+    };
+    let rhs = match parse_lit(rhs.trim())? {
+        ArgLit::Expr(e) => PredRhs::Value(resolve_expression(conn, thread_id, frame, &e).await?),
+        lit => PredRhs::Lit(lit),
+    };
+    Ok(Predicate::Compare { lhs, op, rhs })
+}
+
+/// Evaluate a prepared predicate against one element.
+///
+/// Takes no frame: by this point every frame-dependent part is already a value, and the element's own
+/// fields and methods are reached through its object id, which invocation does not invalidate.
+async fn eval_predicate_on(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    element: &jdwp_client::types::Value,
+    pred: &Predicate,
+) -> Result<bool, String> {
+    match pred {
+        Predicate::Compare { lhs, op, rhs } => {
+            let lv = resolve_relative(conn, thread_id, None, element, lhs).await?;
+            match rhs {
+                PredRhs::Value(rv) => compare_resolved(conn, &lv, op, rv).await,
+                PredRhs::Lit(lit) => compare_values(conn, &lv, op, lit).await,
+            }
+        }
+        Predicate::Bool(expr) => {
+            let v = resolve_relative(conn, thread_id, None, element, expr).await?;
+            match v.data {
+                jdwp_client::types::ValueData::Boolean(b) => Ok(b),
+                _ => Err(format!("Predicate '{expr}' did not evaluate to a boolean")),
+            }
+        }
+    }
+}
+
+/// Resolve a chain (`status`, `customer.name`, `getTotal()`) starting from `base` rather than from a
+/// local or a class — the element-relative resolution filters need.
+async fn resolve_relative(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
+    base: &jdwp_client::types::Value,
+    expr: &str,
+) -> Result<jdwp_client::types::Value, String> {
+    let segs = parse_expr(expr)?;
+    let mut current = base.clone();
+    for seg in &segs {
+        let member = resolve_member(conn, thread_id, frame, &current, seg).await?;
+        current = apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name)
+            .await?
+            .single("A filter predicate")?;
+    }
+    Ok(current)
+}
+
+async fn resolve_member(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: Option<u64>,
     frame: Option<&jdwp_client::thread::Frame>,
@@ -2384,12 +2912,53 @@ fn resolve_expression_boxed<'a>(
     Box::pin(resolve_expression(conn, thread_id, frame, expr))
 }
 
+/// The outcome of resolving an expression.
+///
+/// A slice or filter yields several values, and JDWP has no "several values" value — materialising a
+/// new array in the debuggee would mean allocating in the program under inspection. So those end the
+/// expression: `orders[0].name` chains fine (an index narrows to one value), while
+/// `orders[?paid == true].name` is rejected with an explanation rather than silently picking one.
+enum Resolved {
+    One(jdwp_client::types::Value),
+    Many {
+        /// How the selection went, e.g. "3 of 20 matched" — worth reporting even when empty.
+        header: String,
+        values: Vec<jdwp_client::types::Value>,
+    },
+}
+
+impl Resolved {
+    /// Require a single value, explaining the restriction if the expression produced several.
+    fn single(self, what: &str) -> Result<jdwp_client::types::Value, String> {
+        match self {
+            Self::One(v) => Ok(v),
+            Self::Many { .. } => Err(format!(
+                "{what} needs a single value, but this expression ends in a slice or filter which \
+                 selects several. Narrow it with an index (e.g. [0]) or drop the subscript."
+            )),
+        }
+    }
+}
+
+/// Resolve an expression to exactly one value. The common path: every existing caller (conditions,
+/// `set_value`, call arguments, trace expressions) needs one value and gets a clear error otherwise.
 async fn resolve_expression(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: Option<u64>,
     frame: Option<&jdwp_client::thread::Frame>,
     expr: &str,
 ) -> Result<jdwp_client::types::Value, String> {
+    resolve_expression_multi(conn, thread_id, frame, expr)
+        .await?
+        .single("This")
+}
+
+async fn resolve_expression_multi(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
+    expr: &str,
+) -> Result<Resolved, String> {
     let segs = parse_expr(expr)?;
     let Some(head_seg) = segs.first() else {
         return Err("Empty expression".to_string());
@@ -2419,10 +2988,41 @@ async fn resolve_expression(
         (v, consumed)
     };
 
-    for seg in segs.iter().skip(start) {
-        current = resolve_segment(conn, thread_id, frame, &current, seg).await?;
+    // The head's own subscripts still have to be applied — `orders[0]` is a single segment. For a
+    // static head, `start` counts the class-name prefix too, so the member is the last consumed one.
+    let head_owner = segs
+        .get(start.saturating_sub(1))
+        .ok_or_else(|| "Internal error: head resolution consumed no segments".to_string())?;
+    match apply_subscripts(conn, thread_id, frame, current, &head_owner.subs, &head_owner.name).await? {
+        Resolved::One(v) => current = v,
+        // A multi-value subscript must be the last thing in the expression.
+        many @ Resolved::Many { .. } => {
+            return if start < segs.len() {
+                Err(multi_then_chain_error(&head_owner.name))
+            } else {
+                Ok(many)
+            }
+        }
     }
-    Ok(current)
+
+    let last = segs.len().saturating_sub(1);
+    for (i, seg) in segs.iter().enumerate().skip(start) {
+        let member = resolve_member(conn, thread_id, frame, &current, seg).await?;
+        match apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name).await? {
+            Resolved::One(v) => current = v,
+            many @ Resolved::Many { .. } => {
+                return if i < last { Err(multi_then_chain_error(&seg.name)) } else { Ok(many) };
+            }
+        }
+    }
+    Ok(Resolved::One(current))
+}
+
+fn multi_then_chain_error(name: &str) -> String {
+    format!(
+        "'{name}[…]' selects several values, so nothing can be chained after it. \
+         Use an index (e.g. [0]) to pick one, or make the slice/filter the end of the expression."
+    )
 }
 
 /// Fallback head resolution: treat a leading dotted prefix as a class name, then read the next
@@ -2599,6 +3199,20 @@ async fn render_element(conn: &mut jdwp_client::JdwpConnection, value: &jdwp_cli
             }
         }
         _ => value.format(),
+    }
+}
+
+/// Render one value either shallowly or deeply, depending on whether expansion was requested.
+async fn render_one(
+    conn: &mut jdwp_client::JdwpConnection,
+    value: &jdwp_client::types::Value,
+    thread_id: Option<u64>,
+    max_len: usize,
+    deep: Option<DeepOpts>,
+) -> String {
+    match deep {
+        Some(opts) => render_value_deep(conn, value, thread_id, opts).await,
+        None => render_value(conn, value, thread_id, max_len).await,
     }
 }
 
@@ -3157,6 +3771,12 @@ async fn render_object(
         if let Some(rendered) = render_array(conn, id, &name).await {
             return rendered;
         }
+    }
+    // A boxed primitive reads better as the value it holds than as `java.lang.Integer "2"`, and this
+    // needs no thread — unlike the toString() below. (render_node checks this too, so a boxed value
+    // stays a leaf there regardless of depth rather than being expanded into a `value` field.)
+    if let Some(unboxed) = render_boxed_primitive(conn, id).await {
+        return unboxed;
     }
     // best-effort toString() when we have a thread to run it on
     if let Some(tid) = thread_id {

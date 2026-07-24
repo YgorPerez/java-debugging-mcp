@@ -354,10 +354,14 @@ fn deep_expansion_walks_objects_collections_and_survives_cycles() {
         "default evaluate must stay a one-liner, got: {shallow}"
     );
 
+    // Order has more fields than the default child limit of 16, and inherited fields come last, so
+    // ask for enough to see them all — the truncation behaviour itself is asserted separately below.
     let deep = |server: &mut Server, expr: &str, depth: usize| {
         server.call(
             "debug.evaluate",
-            serde_json::json!({"expression": expr, "expand_objects": true, "max_depth": depth}),
+            serde_json::json!({
+                "expression": expr, "expand_objects": true, "max_depth": depth, "max_children": 30
+            }),
         )
     };
 
@@ -396,6 +400,14 @@ fn deep_expansion_walks_objects_collections_and_survives_cycles() {
         &["numbers = int[3]", "(int) 1", "words = java.lang.String[2]", "\"alpha\""],
     );
 
+    // --- Breadth bound: fields truncate and say so, not just elements ---
+    let few_fields = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "order", "expand_objects": true, "max_depth": 1, "max_children": 3}),
+    );
+    assert_contains_all("field truncation is reported", &few_fields, &["id = (int) 42", "more field(s)"]);
+    assert!(!few_fields.contains("recordId"), "max_children=3 must not reach the 17th field:\n{few_fields}");
+
     // --- Breadth bound ---
     let capped = server.call(
         "debug.evaluate",
@@ -424,6 +436,127 @@ fn deep_expansion_walks_objects_collections_and_survives_cycles() {
     assert!(
         probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("inspect ")).is_some(),
         "probe stopped running after deep expansion — an invocation likely left a thread suspended"
+    );
+}
+
+/// OBJ-2: collection subscripts — indexing, slicing, and predicate filters.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn collection_subscripts_index_slice_and_filter() {
+    let Some(jdk) = jdk_or_skip("collection_subscripts_index_slice_and_filter") else { return };
+    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let line = probe_line(&probe_source("DeepProbe"), "// BP1");
+    server.call("debug.set_breakpoint", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in DeepProbe.inspect never fired");
+
+    // --- [i]: index narrows to one value, so it keeps chaining ---
+    assert_contains_all("List index", &server.evaluate("order.lines[0]"), &["Line(aa,1,true)"]);
+    assert_contains_all("index then field", &server.evaluate("order.lines[1].sku"), &["\"bb\""]);
+    assert_contains_all("index then method", &server.evaluate("order.lines[3].getQty()"), &["(int) 9"]);
+    assert_contains_all("array index", &server.evaluate("order.numbers[2]"), &["(int) 3"]);
+    assert_contains_all("String array index", &server.evaluate("order.words[0]"), &["\"alpha\""]);
+    // A Map subscript is a key lookup, not a position — and an int key must be boxed for get(Object).
+    assert_contains_all("Map string key", &server.evaluate("order.counts[\"b\"]"), &["(int) 2"]);
+    assert_contains_all("Optional via index is refused clearly", &server.evaluate("order.note[0]"), &["not indexable"]);
+
+    // Bounds and type errors say which is which.
+    assert_contains_all("array out of bounds", &server.evaluate("order.numbers[9]"), &["out of bounds"]);
+    assert_contains_all(
+        "non-int list index",
+        &server.evaluate("order.lines[\"x\"]"),
+        &["list index must be an int"],
+    );
+
+    // --- [a..b]: half-open slice ---
+    let sliced = server.evaluate("order.lines[1..3]");
+    assert_contains_all("slice reports selection and count", &sliced, &["2 of 5", "[0] = ", "Line(bb,5,false)", "Line(cc,2,true)"]);
+    assert!(!sliced.contains("Line(aa"), "slice [1..3] must exclude element 0:\n{sliced}");
+    assert!(!sliced.contains("Line(dd"), "slice [1..3] must be half-open:\n{sliced}");
+    // An over-long range clamps rather than erroring — asking for "up to 100" is normal.
+    assert_contains_all("over-long range clamps", &server.evaluate("order.lines[0..100]"), &["5 of 5"]);
+    assert_contains_all("empty range", &server.evaluate("order.lines[2..2]"), &["0 of 5"]);
+    assert_contains_all("array slice", &server.evaluate("order.numbers[0..2]"), &["2 of 3", "(int) 1"]);
+    assert_contains_all("reversed range is rejected", &server.evaluate("order.lines[3..1]"), &["ends before it starts"]);
+
+    // --- [?predicate]: left side resolves against each element ---
+    let paid = server.evaluate("order.lines[?paid == true]");
+    assert_contains_all("boolean field predicate", &paid, &["2 of 5 matched", "Line(aa,1,true)", "Line(cc,2,true)"]);
+    assert!(!paid.contains("Line(bb"), "unpaid lines must not match:\n{paid}");
+
+    // qty > 3 matches bb(5), dd(9) AND ee(4) — three, not two.
+    assert_contains_all(
+        "numeric comparison predicate",
+        &server.evaluate("order.lines[?qty > 3]"),
+        &["3 of 5 matched", "Line(bb,5,false)", "Line(dd,9,false)", "Line(ee,4,false)"],
+    );
+    assert_contains_all(
+        "method-call predicate",
+        &server.evaluate("order.lines[?getQty() == 2]"),
+        &["1 of 5 matched", "Line(cc,2,true)"],
+    );
+    assert_contains_all(
+        "String predicate",
+        &server.evaluate("order.lines[?sku == \"ee\"]"),
+        &["1 of 5 matched", "Line(ee,4,false)"],
+    );
+    // The right-hand side may be an ordinary expression, so a predicate can reference the frame.
+    // threshold is 3, so this must agree with the literal `qty > 3` above.
+    assert_contains_all(
+        "predicate right side reads an enclosing field",
+        &server.evaluate("order.lines[?qty > order.threshold]"),
+        &["3 of 5 matched"],
+    );
+    // A match-nothing predicate is a real answer, and must not look like a broken one.
+    assert_contains_all("no matches still reports the scan", &server.evaluate("order.lines[?qty > 999]"), &["0 of 5 matched"]);
+    // A predicate that can't resolve on any element is an error, not "0 matched".
+    assert_contains_all(
+        "broken predicate is an error, not an empty result",
+        &server.evaluate("order.lines[?nosuchfield == 1]"),
+        &["failed on every element"],
+    );
+    assert_contains_all("string filter on a String list", &server.evaluate("order.tags[?length() == 7]"), &["1 of 2 matched"]);
+
+    // --- Multi-value results end the expression, explicitly ---
+    assert_contains_all(
+        "chaining after a filter is refused with a reason",
+        &server.evaluate("order.lines[?paid == true].sku"),
+        &["selects several values"],
+    );
+    // A subscript in a write target used to be parsed and then dropped, writing the whole field.
+    assert_contains_all(
+        "a subscripted set_value target is refused, not silently widened",
+        &server.call("debug.set_value", serde_json::json!({"target": "order.lines[0..2]", "value": "1"})),
+        &["Subscripts aren't supported"],
+    );
+    assert_contains_all(
+        "an indexed write is refused too",
+        &server.call("debug.set_value", serde_json::json!({"target": "order.numbers[0]", "value": "1"})),
+        &["Subscripts aren't supported"],
+    );
+    // A Map has no positional order, so slicing one points at the alternatives.
+    assert_contains_all("slicing a Map explains itself", &server.evaluate("order.counts[0..1]"), &["is a Map"]);
+
+    // --- Subscripts compose with deep expansion ---
+    let deep_filter = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "order.lines[?paid == true]", "expand_objects": true, "max_depth": 2}),
+    );
+    assert_contains_all(
+        "filter results expand",
+        &deep_filter,
+        &["2 of 5 matched", "sku = \"aa\"", "qty = (int) 1", "paid = (boolean) true"],
+    );
+
+    // Filters invoke methods in the debuggee; the VM must still be usable afterwards.
+    server.panic_reset();
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("inspect ")).is_some(),
+        "probe stopped running after subscript evaluation"
     );
 }
 

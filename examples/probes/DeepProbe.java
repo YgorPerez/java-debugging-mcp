@@ -12,6 +12,7 @@
 //   - an empty list and an empty Optional, the usual off-by-one traps
 //   - an int[] and a String[], since arrays take a different path from collections
 //   - an inherited field (Order extends Record), which must show up alongside declared ones
+//   - a List<Line> with a mix of paid/unpaid and varying totals, for OBJ-2 slice/filter subscripts
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -25,6 +26,28 @@ public class DeepProbe {
     static class Record {
         // Inherited by Order: field collection must walk superclasses, not just the concrete type.
         int recordId = 7;
+    }
+
+    // Element type for the OBJ-2 subscript tests: a field, a getter and a boolean, so predicates can
+    // be written against each.
+    static class Line {
+        String sku;
+        int qty;
+        boolean paid;
+
+        Line(String sku, int qty, boolean paid) {
+            this.sku = sku;
+            this.qty = qty;
+            this.paid = paid;
+        }
+
+        int getQty() {
+            return qty;
+        }
+
+        @Override public String toString() {
+            return "Line(" + sku + "," + qty + "," + paid + ")";
+        }
     }
 
     static class Address {
@@ -60,6 +83,8 @@ public class DeepProbe {
         Optional<String> missing = Optional.empty();
         int[] numbers = {1, 2, 3};
         String[] words = {"alpha", "beta"};
+        List<Line> lines = new ArrayList<>();
+        int threshold = 3;
 
         Order() {
             customer.lastOrder = this;
@@ -73,6 +98,12 @@ public class DeepProbe {
             counts.put("b", 2);
             labels.add("x");
             labels.add("y");
+            // 2 paid, 3 unpaid; qty spans the threshold both ways, so predicates have real work.
+            lines.add(new Line("aa", 1, true));
+            lines.add(new Line("bb", 5, false));
+            lines.add(new Line("cc", 2, true));
+            lines.add(new Line("dd", 9, false));
+            lines.add(new Line("ee", 4, false));
         }
     }
 
