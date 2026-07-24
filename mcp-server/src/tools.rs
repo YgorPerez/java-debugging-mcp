@@ -4,7 +4,7 @@
 // advertised schema always matches what the handler deserializes. Tools with no arguments use an
 // empty object schema.
 
-use crate::args::{AttachArgs, SetBreakpointArgs, ClearBreakpointArgs, StepArgs, GetStackArgs, EvaluateArgs, GetLastEventArgs, ListThreadsArgs, SetValueArgs, GetTracesArgs, SetExceptionBreakpointArgs, SetWatchpointArgs, ForceReturnArgs};
+use crate::args::{AttachArgs, SetBreakpointArgs, ClearBreakpointArgs, StepArgs, GetStackArgs, EvaluateArgs, GetLastEventArgs, ListThreadsArgs, SetValueArgs, GetTracesArgs, SetExceptionBreakpointArgs, SetWatchpointArgs, ForceReturnArgs, ToggleBreakpointArgs};
 use crate::protocol::Tool;
 use serde_json::json;
 
@@ -81,6 +81,11 @@ fn stop_point_tools() -> Vec<Tool> {
             input_schema: to_val(schemars::schema_for!(ClearBreakpointArgs)),
         },
         Tool {
+            name: "debug.toggle_breakpoint".to_string(),
+            description: "Silence or re-arm a line breakpoint (bp_…) without losing its condition/trace_expr — disabling clears the JDWP request but keeps the definition, enabling re-arms it at the same location. Pass enabled:false/true, or omit to flip. Handy to quiet a chatty breakpoint on a shared JVM without having to retype it.".to_string(),
+            input_schema: to_val(schemars::schema_for!(ToggleBreakpointArgs)),
+        },
+        Tool {
             name: "debug.panic".to_string(),
             description: "Safety: clear ALL breakpoints, exception breakpoints and watchpoints, and resume ALL threads. Use to unfreeze a JVM if a breakpoint left a thread suspended.".to_string(),
             input_schema: empty(),
@@ -118,7 +123,7 @@ fn execution_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.set_value".to_string(),
-            description: "Write a value to a local variable, a static field (e.g. ConfigDefaultUtils.dsInfra — flip tenant/infra on a live JVM without a restart), an instance field (this.status, reserva.total), or one element of an array/List/Map (numbers[0], counts[\"key\"] — via ArrayReference.SetValues, List.set or Map.put, reporting the value it displaced). Value is a literal (int, long like 123L, true/false, null, or \"string\") coerced to the target's declared type. Locals, instance fields and elements need a suspended thread; statics don't.".to_string(),
+            description: "Write a value to a local variable, a static field (e.g. ConfigDefaultUtils.dsInfra — flip tenant/infra on a live JVM without a restart), an instance field (this.status, reserva.total), or one element of an array/List/Map (numbers[0], counts[\"key\"] — via ArrayReference.SetValues, List.set or Map.put, reporting the value it displaced). Value is either a literal (int, long like 123L, true/false, null, or \"string\") coerced to the target's declared type, OR another live expression whose value is copied by reference (this.cfg = other.cfg, reserva.cliente = clienteValido) — a type-incompatible source is refused, naming both types. Locals, instance fields and elements need a suspended thread; statics don't.".to_string(),
             input_schema: to_val(schemars::schema_for!(SetValueArgs)),
         },
         Tool {
@@ -154,7 +159,7 @@ fn inspection_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.get_traces".to_string(),
-            description: "Return snapshots captured by non-suspending trace mode — debug.set_breakpoint, debug.set_exception_breakpoint or debug.set_watchpoint with trace:true. Each shows where it fired, the thread, in-scope locals/args, any trace_expr result, plus the exception type/catch site or the field's old → new value. Bounded ring buffer (most recent kept). Pass clear:true to empty the buffer after reading.".to_string(),
+            description: "Return snapshots captured by non-suspending trace mode — debug.set_breakpoint, debug.set_exception_breakpoint or debug.set_watchpoint with trace:true. Each shows where it fired, the thread, in-scope locals/args, any trace_expr result, plus the exception type/catch site or the field's old → new value. Bounded ring buffer (most recent kept). Narrow with bp_id (one stop point), class_filter (substring), or since (only records newer than a #seq you already saw, for polling). Pass clear:true to empty the buffer after reading.".to_string(),
             input_schema: to_val(schemars::schema_for!(GetTracesArgs)),
         },
     ]
@@ -180,6 +185,7 @@ mod tests {
             "debug.set_watchpoint",
             "debug.list_breakpoints",
             "debug.clear_breakpoint",
+            "debug.toggle_breakpoint",
             "debug.panic",
             "debug.continue",
             "debug.pause",

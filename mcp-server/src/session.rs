@@ -35,6 +35,16 @@ pub struct DebugSession {
     /// When the VM last suspended on an event; cleared on resume. Drives the watchdog.
     pub suspended_since: Option<std::time::Instant>,
     pub watchdog_task: Option<JoinHandle<()>>,
+    /// What the watchdog last did, if anything — surfaced in `list_breakpoints` and `get_last_event`
+    /// so a caller who was away learns the VM was auto-resumed and which stop point was disarmed (SAFE-2).
+    pub last_watchdog_note: Option<String>,
+    /// Notes about traced stop points that disarmed themselves on reaching their hit budget (TRACE-3).
+    /// Surfaced by `get_traces` so silence is never mistaken for "no more hits"; cleared with `clear`.
+    pub trace_disarms: Vec<String>,
+    /// Read-only guard (SAFE-3): when set, method invocation, `set_value` and `force_return` are
+    /// refused, so pointing the debugger at a production JVM can't accidentally mutate it. A guard
+    /// against accident, NOT a security boundary — anyone who can reach the JDWP port can do anything.
+    pub read_only: bool,
     /// Breakpoints requested on classes not yet loaded. Each holds a `CLASS_PREPARE` request that
     /// fires when the class loads; the event pump then arms the real breakpoint. See handlers.rs.
     pub pending_breakpoints: Vec<PendingBreakpoint>,
@@ -120,6 +130,11 @@ pub struct ExceptionRequestInfo {
     pub trace: bool,
     /// Optional expression evaluated in the throwing frame and recorded on each trace hit.
     pub trace_expr: Option<String>,
+    /// Remaining trace-hit budget (TRACE-3): each traced hit decrements it, and on reaching zero the
+    /// request disarms itself so a hot throw site can't flood. `None` means unbounded.
+    pub trace_budget: Option<u32>,
+    /// Thread this request is filtered to (`ThreadOnly`), if any — for the `list_breakpoints` line (FILT-1).
+    pub thread_filter: Option<u64>,
 }
 
 /// An active field watchpoint: a `FIELD_ACCESS` or `FIELD_MODIFICATION` event request on one field.
@@ -145,6 +160,11 @@ pub struct WatchpointInfo {
     pub trace: bool,
     /// Optional expression evaluated in the mutating frame and recorded on each trace hit.
     pub trace_expr: Option<String>,
+    /// Remaining trace-hit budget (TRACE-3): each traced hit decrements it, and on reaching zero the
+    /// watch disarms itself so a hot field can't flood the debuggee. `None` means unbounded.
+    pub trace_budget: Option<u32>,
+    /// Thread this watch is filtered to (`ThreadOnly`), if any — for the `list_breakpoints` line (FILT-1).
+    pub thread_filter: Option<u64>,
 }
 
 /// A breakpoint waiting for its class to load. The `CLASS_PREPARE` request suspends the preparing
@@ -169,14 +189,20 @@ pub struct PendingBreakpoint {
     pub trace: bool,
     /// Optional expression to evaluate and record on each trace hit.
     pub trace_expr: Option<String>,
+    /// Trace-hit budget carried through to the real breakpoint once the class loads (TRACE-3).
+    pub trace_budget: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BreakpointInfo {
-    pub request_id: i32,
+    /// The live JDWP request id, or `None` when the breakpoint is disabled — its definition is kept
+    /// so it can be re-armed, but no request is set in the JVM (BP-1).
+    pub request_id: Option<i32>,
     pub class_pattern: String,
     pub line: u32,
     pub method: Option<String>,
+    /// Whether the breakpoint is currently armed in the JVM. A disabled breakpoint stays listed (so
+    /// its `condition`/`trace_expr` aren't lost) but has no JDWP request and never fires (BP-1).
     pub enabled: bool,
     pub hit_count: u32,
     /// Optional server-side condition: on hit, evaluate it and auto-resume if it is not true.
@@ -185,6 +211,23 @@ pub struct BreakpointInfo {
     pub trace: bool,
     /// Optional expression evaluated and recorded on each trace hit.
     pub trace_expr: Option<String>,
+    /// Remaining trace-hit budget (TRACE-3); `None` means unbounded.
+    pub trace_budget: Option<u32>,
+    /// Everything needed to re-arm this breakpoint at the same location after a `toggle_breakpoint`
+    /// disable (BP-1). Kept for every armed breakpoint so disable→enable round-trips exactly.
+    pub arm: BreakpointArm,
+}
+
+/// The resolved JDWP location and modifiers for a breakpoint, kept so a disabled breakpoint can be
+/// re-armed at exactly the same place with the same behaviour (BP-1).
+#[derive(Debug, Clone)]
+pub struct BreakpointArm {
+    pub class_id: u64,
+    pub method_id: u64,
+    pub bytecode_index: u64,
+    pub suspend_policy: jdwp_client::SuspendPolicy,
+    pub hit_count: Option<i32>,
+    pub thread_filter: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -201,7 +244,7 @@ impl SessionManager {
         }
     }
 
-    pub async fn create_session(&self, connection: JdwpConnection, endpoint: String) -> SessionId {
+    pub async fn create_session(&self, connection: JdwpConnection, endpoint: String, read_only: bool) -> SessionId {
         let session_id = format!("session_{}", uuid::v4());
         let session = DebugSession {
             connection,
@@ -215,6 +258,9 @@ impl SessionManager {
             pending_step: None,
             suspended_since: None,
             watchdog_task: None,
+            last_watchdog_note: None,
+            trace_disarms: Vec::new(),
+            read_only,
             pending_breakpoints: Vec::new(),
             exception_requests: HashMap::new(),
             watchpoints: HashMap::new(),

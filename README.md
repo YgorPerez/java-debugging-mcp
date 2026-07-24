@@ -93,19 +93,20 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | Tool | Description |
 |------|-------------|
 | `debug.attach` | Connect to a JVM via JDWP |
-| `debug.set_breakpoint` | Set a breakpoint by class+line, or by method name; optional `hit_count`, thread filter, `condition`, or `trace:true` (non-suspending logpoint) |
-| `debug.set_exception_breakpoint` | Break when an exception (of a class + its subclasses, or all) is thrown; `caught`/`uncaught` selectable, or `trace:true` to collect throws without suspending |
-| `debug.get_traces` | Read snapshots captured by any `trace:true` stop point — line, exception or watchpoint (bounded ring buffer; optional `clear`) |
-| `debug.list_breakpoints` | List active breakpoints (line, deferred, exception) |
-| `debug.clear_breakpoint` | Remove a breakpoint (line, deferred, or exception) |
+| `debug.set_breakpoint` | Set a breakpoint by class+line, or by method name; optional `hit_count`, thread filter, `condition` (with `&&`/`||`), or `trace:true` (non-suspending logpoint, with `trace_max_hits`) |
+| `debug.set_exception_breakpoint` | Break when an exception (of a class + its subclasses, or all) is thrown; `caught`/`uncaught` selectable, an optional `thread_id` filter, or `trace:true` (with `trace_max_hits`) to collect throws without suspending |
+| `debug.get_traces` | Read snapshots captured by any `trace:true` stop point — line, exception or watchpoint (bounded ring buffer; narrow with `bp_id` / `class_filter` / `since`, optional `clear`) |
+| `debug.list_breakpoints` | List active breakpoints (line, deferred, exception, watchpoint) with trace budgets and thread filters |
+| `debug.clear_breakpoint` | Remove a breakpoint (line, deferred, exception, or watchpoint) |
+| `debug.toggle_breakpoint` | Silence or re-arm a line breakpoint (`bp_…`) without losing its `condition`/`trace_expr` |
 | `debug.continue` | Resume execution |
 | `debug.step_over` | Step over current line (defaults to last-hit thread) |
 | `debug.step_into` | Step into a method call |
 | `debug.step_out` | Step out of the current method |
 | `debug.get_stack` | Stack frames, compact `#i class.method:line` with typed locals indented |
-| `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods, object arguments, `[i]`/`["k"]`/`[a..b]`/`[?pred]` subscripts, and `expand_objects` for a deep field tree |
-| `debug.set_value` | Write a local variable, a static field (`Class.field`), an instance field (`this.field`), or one element (`xs[0]`, `counts["k"]`) |
-| `debug.set_watchpoint` | Break when a field is written (or read) — reports the mutating location + old → new value; `trace:true` collects hits without suspending |
+| `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods, object arguments, `[i]`/`["k"]`/`[a..b]`/`[?pred]` subscripts (predicates support `&&`/`||`), and `expand_objects` for a deep field tree |
+| `debug.set_value` | Write a local variable, a static field (`Class.field`), an instance field (`this.field`), or one element (`xs[0]`, `counts["k"]`) — from a literal or a copied live reference (`this.a = other.b`) |
+| `debug.set_watchpoint` | Break when a field is written (or read) — reports the mutating location + old → new value; optional `thread_id` filter; `trace:true` (with `trace_max_hits`) collects hits without suspending |
 | `debug.force_return` | Force the current method to return a given value, skipping the rest of its body |
 | `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line, exception type, watched field's old → new) + `[suspended]`; events are buffered, so `limit` reads a backlog and `drain` discards it |
 | `debug.list_threads` | List threads by name; filter with `name_filter` / `only_suspended` / `limit` |
@@ -116,7 +117,11 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 
 Most tools take `thread_id` as an optional hex string (e.g. `"0x2"`); when omitted they default to
 the last thread that hit a breakpoint. A watchdog auto-resumes a VM left suspended for too long
-(`JDWP_WATCHDOG_SECS`, default 120).
+(`JDWP_WATCHDOG_SECS`, default 120; `0` disables) and disarms the stop point that caused it, so it
+can't just re-freeze on the next hit. `debug.disconnect` resumes the VM and clears every request on
+the way out, so it can never leave a shared JVM frozen. Set `JDWP_READONLY=1` (or `read_only:true` on
+`debug.attach`) to open a session that refuses method invocation, `set_value` and `force_return` — a
+guard against accidentally mutating a production JVM, not a security boundary.
 
 ## Example: Debugging with kubectl port-forward
 
