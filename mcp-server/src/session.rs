@@ -14,22 +14,21 @@ pub type SessionId = String;
 pub struct DebugSession {
     pub connection: JdwpConnection,
     pub breakpoints: HashMap<String, BreakpointInfo>,
-    pub threads: HashMap<String, ThreadInfo>,
     pub last_event: Option<EventSet>,
     pub event_listener_task: Option<JoinHandle<()>>,
-    /// Thread of the most recent suspension event — used to default thread_id.
+    /// Thread of the most recent suspension event — used to default `thread_id`.
     pub last_thread: Option<u64>,
     /// Active single-step request id (must be cleared before the next resume).
     pub pending_step: Option<i32>,
     /// When the VM last suspended on an event; cleared on resume. Drives the watchdog.
     pub suspended_since: Option<std::time::Instant>,
     pub watchdog_task: Option<JoinHandle<()>>,
-    /// Breakpoints requested on classes not yet loaded. Each holds a CLASS_PREPARE request that
+    /// Breakpoints requested on classes not yet loaded. Each holds a `CLASS_PREPARE` request that
     /// fires when the class loads; the event pump then arms the real breakpoint. See handlers.rs.
     pub pending_breakpoints: Vec<PendingBreakpoint>,
     /// Active exception breakpoints (EXCEPTION event requests), keyed by their `exc_` id.
     pub exception_requests: HashMap<String, ExceptionRequestInfo>,
-    /// Ring buffer of trace/logpoint snapshots (see TraceRecord). Bounded by MAX_TRACES.
+    /// Ring buffer of trace/logpoint snapshots (see `TraceRecord`). Bounded by `MAX_TRACES`.
     pub traces: VecDeque<TraceRecord>,
     /// Monotonic sequence for trace records (survives ring-buffer eviction).
     pub trace_seq: u64,
@@ -56,8 +55,8 @@ pub struct TraceRecord {
 }
 
 /// An active exception breakpoint: an EXCEPTION event request that fires when a matching
-/// exception is thrown. Tracked so it shows in list_breakpoints and is cleared by
-/// clear_breakpoint / panic, like a normal breakpoint.
+/// exception is thrown. Tracked so it shows in `list_breakpoints` and is cleared by
+/// `clear_breakpoint` / panic, like a normal breakpoint.
 #[derive(Debug, Clone)]
 pub struct ExceptionRequestInfo {
     /// The `exc_` id reported to the caller.
@@ -70,25 +69,25 @@ pub struct ExceptionRequestInfo {
     pub uncaught: bool,
 }
 
-/// A breakpoint waiting for its class to load. The CLASS_PREPARE request suspends the preparing
-/// thread (EventThread policy) so the real breakpoint can be armed before any of the class's code
+/// A breakpoint waiting for its class to load. The `CLASS_PREPARE` request suspends the preparing
+/// thread (`EventThread` policy) so the real breakpoint can be armed before any of the class's code
 /// runs; the pump then resumes that one thread.
 #[derive(Debug, Clone)]
 pub struct PendingBreakpoint {
     /// The bp_ id reserved for this breakpoint (reported now, armed later).
     pub bp_id: String,
-    /// The CLASS_PREPARE event-request id (cleared once armed).
+    /// The `CLASS_PREPARE` event-request id (cleared once armed).
     pub class_prepare_request_id: i32,
     /// Dotted class pattern (as the user gave it) — for messages.
     pub class_pattern: String,
-    /// JNI signature ("Lpkg/Cls;") to match against the ClassPrepare event signature.
+    /// JNI signature ("Lpkg/Cls;") to match against the `ClassPrepare` event signature.
     pub signature: String,
     pub line: Option<i32>,
     pub method: Option<String>,
     pub hit_count: Option<i32>,
     pub thread_filter: Option<u64>,
     pub condition: Option<String>,
-    /// Arm as a non-suspending trace/logpoint (EventThread suspend, snapshot, resume).
+    /// Arm as a non-suspending trace/logpoint (`EventThread` suspend, snapshot, resume).
     pub trace: bool,
     /// Optional expression to evaluate and record on each trace hit.
     pub trace_expr: Option<String>,
@@ -96,7 +95,6 @@ pub struct PendingBreakpoint {
 
 #[derive(Debug, Clone)]
 pub struct BreakpointInfo {
-    pub id: String,
     pub request_id: i32,
     pub class_pattern: String,
     pub line: u32,
@@ -109,14 +107,6 @@ pub struct BreakpointInfo {
     pub trace: bool,
     /// Optional expression evaluated and recorded on each trace hit.
     pub trace_expr: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ThreadInfo {
-    pub id: String,
-    pub name: String,
-    pub status: String,
-    pub suspended: bool,
 }
 
 #[derive(Clone)]
@@ -138,7 +128,6 @@ impl SessionManager {
         let session = DebugSession {
             connection,
             breakpoints: HashMap::new(),
-            threads: HashMap::new(),
             last_event: None,
             event_listener_task: None,
             last_thread: None,
@@ -153,6 +142,7 @@ impl SessionManager {
 
         let mut sessions = self.sessions.lock().await;
         sessions.insert(session_id.clone(), Arc::new(Mutex::new(session)));
+        drop(sessions); // release the map lock before taking the current-session lock
 
         // Set as current session
         let mut current = self.current_session.lock().await;
@@ -176,11 +166,6 @@ impl SessionManager {
         sessions.get(session_id).cloned()
     }
 
-    pub async fn list_session_ids(&self) -> Vec<SessionId> {
-        let sessions = self.sessions.lock().await;
-        sessions.keys().cloned().collect()
-    }
-
     pub async fn get_current_session_id(&self) -> Option<SessionId> {
         let current = self.current_session.lock().await;
         current.clone()
@@ -201,6 +186,7 @@ impl SessionManager {
         }
 
         sessions.remove(session_id);
+        drop(sessions); // release the map lock before taking the current-session lock
 
         // Clear current if it was this session
         let mut current = self.current_session.lock().await;
@@ -220,9 +206,9 @@ mod uuid {
         let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis();
 
-        format!("{:x}{:x}", timestamp, counter)
+        format!("{timestamp:x}{counter:x}")
     }
 }

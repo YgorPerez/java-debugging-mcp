@@ -30,6 +30,9 @@ pub struct FieldInfo {
 
 impl JdwpConnection {
     /// Get methods for a reference type (ReferenceType.Methods command)
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_methods(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<Vec<MethodInfo>> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::METHODS);
@@ -44,7 +47,7 @@ impl JdwpConnection {
 
         // Read number of methods
         let methods_count = read_i32(&mut data)?;
-        let mut methods = Vec::with_capacity(methods_count as usize);
+        let mut methods = Vec::with_capacity(usize::try_from(methods_count).unwrap_or(0));
 
         for _ in 0..methods_count {
             let method_id = read_u64(&mut data)?;
@@ -66,10 +69,10 @@ impl JdwpConnection {
     /// Get fields for a reference type (ReferenceType.Fields command)
     ///
     /// # Arguments
-    /// * `ref_type_id` - The ReferenceTypeId to get fields for
+    /// * `ref_type_id` - The `ReferenceTypeId` to get fields for
     ///
     /// # Returns
-    /// Vector of FieldInfo containing field IDs, names, signatures, and modifiers
+    /// Vector of `FieldInfo` containing field IDs, names, signatures, and modifiers
     ///
     /// # Example
     /// ```ignore
@@ -78,6 +81,9 @@ impl JdwpConnection {
     ///     println!("Field: {} ({})", field.name, field.signature);
     /// }
     /// ```
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_fields(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<Vec<FieldInfo>> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::FIELDS);
@@ -92,7 +98,7 @@ impl JdwpConnection {
 
         // Read number of fields
         let fields_count = read_i32(&mut data)?;
-        let mut fields = Vec::with_capacity(fields_count as usize);
+        let mut fields = Vec::with_capacity(usize::try_from(fields_count).unwrap_or(0));
 
         for _ in 0..fields_count {
             let field_id = read_u64(&mut data)?;

@@ -22,10 +22,13 @@ impl JdwpConnection {
     /// Get the reference type (class) of an object (ObjectReference.ReferenceType command)
     ///
     /// # Arguments
-    /// * `object_id` - The ObjectId of the object
+    /// * `object_id` - The `ObjectId` of the object
     ///
     /// # Returns
-    /// The ReferenceTypeId of the object's class
+    /// The `ReferenceTypeId` of the object's class
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_object_reference_type(
         &mut self,
         object_id: ObjectId,
@@ -54,8 +57,8 @@ impl JdwpConnection {
     /// Get field values from an object (ObjectReference.GetValues command)
     ///
     /// # Arguments
-    /// * `object_id` - The ObjectId of the object
-    /// * `field_ids` - Vector of FieldIds to retrieve
+    /// * `object_id` - The `ObjectId` of the object
+    /// * `field_ids` - Vector of `FieldIds` to retrieve
     ///
     /// # Returns
     /// Vector of Values corresponding to the requested fields
@@ -65,6 +68,9 @@ impl JdwpConnection {
     /// let fields = vec![field_id1, field_id2];
     /// let values = connection.get_object_values(object_id, fields).await?;
     /// ```
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_object_values(
         &mut self,
         object_id: ObjectId,
@@ -81,7 +87,7 @@ impl JdwpConnection {
         packet.data.put_u64(object_id);
 
         // Write number of fields
-        packet.data.put_i32(field_ids.len() as i32);
+        packet.data.put_i32(i32::try_from(field_ids.len()).unwrap_or(i32::MAX));
 
         // Write each field ID
         for field_id in &field_ids {
@@ -95,7 +101,7 @@ impl JdwpConnection {
 
         // Read number of values (should match field_ids.len())
         let values_count = read_i32(&mut data)?;
-        let mut values = Vec::with_capacity(values_count as usize);
+        let mut values = Vec::with_capacity(usize::try_from(values_count).unwrap_or(0));
 
         for _ in 0..values_count {
             let tag = read_u8(&mut data)?;
@@ -117,11 +123,14 @@ impl JdwpConnection {
     /// required. Use it to read things like `ConfigDefaultUtils.dsUrlMotor`.
     ///
     /// # Arguments
-    /// * `ref_type_id` - The ReferenceTypeId of the class (from `classes_by_signature`)
-    /// * `field_ids` - Vector of static FieldIds to retrieve (from `get_fields`)
+    /// * `ref_type_id` - The `ReferenceTypeId` of the class (from `classes_by_signature`)
+    /// * `field_ids` - Vector of static `FieldIds` to retrieve (from `get_fields`)
     ///
     /// # Returns
     /// Vector of Values corresponding to the requested fields
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_reference_values(
         &mut self,
         ref_type_id: ReferenceTypeId,
@@ -139,7 +148,7 @@ impl JdwpConnection {
         packet.data.put_u64(ref_type_id);
 
         // Write number of fields
-        packet.data.put_i32(field_ids.len() as i32);
+        packet.data.put_i32(i32::try_from(field_ids.len()).unwrap_or(i32::MAX));
 
         // Write each field ID
         for field_id in &field_ids {
@@ -153,7 +162,7 @@ impl JdwpConnection {
 
         // Read number of values (should match field_ids.len())
         let values_count = read_i32(&mut data)?;
-        let mut values = Vec::with_capacity(values_count as usize);
+        let mut values = Vec::with_capacity(usize::try_from(values_count).unwrap_or(0));
 
         for _ in 0..values_count {
             let tag = read_u8(&mut data)?;
@@ -173,6 +182,9 @@ impl JdwpConnection {
     /// Each value is written *untagged* — its wire type comes from the field's declared type — so
     /// coerce every value to match its field first (see the mcp-server field-write path). Lets you
     /// flip a static like `ConfigDefaultUtils.dsInfra` on a running JVM.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_reference_values(
         &mut self,
         class_id: ReferenceTypeId,
@@ -183,7 +195,7 @@ impl JdwpConnection {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::CLASS_TYPE, CLASS_TYPE_SET_VALUES);
         packet.data.put_u64(class_id);
-        packet.data.put_i32(updates.len() as i32);
+        packet.data.put_i32(i32::try_from(updates.len()).unwrap_or(i32::MAX));
         for (field_id, value) in &updates {
             packet.data.put_u64(*field_id);
             write_untagged_value(&mut packet.data, value);
@@ -197,6 +209,9 @@ impl JdwpConnection {
     ///
     /// Like `set_reference_values`, values are untagged and must already be coerced to each
     /// field's declared type.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_object_values(
         &mut self,
         object_id: ObjectId,
@@ -209,7 +224,7 @@ impl JdwpConnection {
             object_reference_commands::SET_VALUES,
         );
         packet.data.put_u64(object_id);
-        packet.data.put_i32(updates.len() as i32);
+        packet.data.put_i32(i32::try_from(updates.len()).unwrap_or(i32::MAX));
         for (field_id, value) in &updates {
             packet.data.put_u64(*field_id);
             write_untagged_value(&mut packet.data, value);
@@ -248,15 +263,14 @@ fn read_value_by_tag(tag: u8, buf: &mut &[u8]) -> JdwpResult<ValueData> {
             Ok(ValueData::Object(object_id))
         }
         _ => Err(crate::protocol::JdwpError::Protocol(format!(
-            "Unknown value tag: {}",
-            tag
+            "Unknown value tag: {tag}"
         ))),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn test_object_values_packet() {

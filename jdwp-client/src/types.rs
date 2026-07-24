@@ -96,21 +96,22 @@ pub enum ValueData {
 
 impl Value {
     /// Format value for display
+    #[must_use]
     pub fn format(&self) -> String {
         match &self.data {
-            ValueData::Byte(v) => format!("(byte) {}", v),
-            ValueData::Char(v) => format!("(char) '{}'", char::from_u32(*v as u32).unwrap_or('?')),
-            ValueData::Float(v) => format!("(float) {}", v),
-            ValueData::Double(v) => format!("(double) {}", v),
-            ValueData::Int(v) => format!("(int) {}", v),
-            ValueData::Long(v) => format!("(long) {}", v),
-            ValueData::Short(v) => format!("(short) {}", v),
-            ValueData::Boolean(v) => format!("(boolean) {}", v),
+            ValueData::Byte(v) => format!("(byte) {v}"),
+            ValueData::Char(v) => format!("(char) '{}'", char::from_u32(u32::from(*v)).unwrap_or('?')),
+            ValueData::Float(v) => format!("(float) {v}"),
+            ValueData::Double(v) => format!("(double) {v}"),
+            ValueData::Int(v) => format!("(int) {v}"),
+            ValueData::Long(v) => format!("(long) {v}"),
+            ValueData::Short(v) => format!("(short) {v}"),
+            ValueData::Boolean(v) => format!("(boolean) {v}"),
             ValueData::Object(id) => {
                 if *id == 0 {
                     "(object) null".to_string()
                 } else {
-                    format!("(object) @{:x}", id)
+                    format!("(object) @{id:x}")
                 }
             }
             ValueData::Void => "(void)".to_string(),

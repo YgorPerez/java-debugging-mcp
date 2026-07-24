@@ -5,12 +5,21 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
 authors = ["Ed Sweeney <ed@onextent.com>"]
 license = "MIT"
 repository = "https://github.com/navicore/jdwp-mcp"
 description = "MCP server for Java debugging via JDWP protocol"
+readme = "README.md"
 keywords = ["mcp", "jdwp", "java", "debugger", "llm"]
 categories = ["development-tools::debugging", "command-line-utilities"]
+
+# NOTE: the clippy lint policy lives as crate-root `#![warn(...)]`/`#![allow(...)]`
+# attributes in `jdwp-client/src/lib.rs` and `mcp-server/src/main.rs`, not here.
+# The CI health gate (rust-doctor) passes its clippy lint flags on the command
+# line, which a Cargo `[lints]` table cannot override; only source-level crate
+# attributes can. Keeping the policy in one place (the crate roots) avoids a
+# manifest table that silently fails to apply under the gate.
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

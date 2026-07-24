@@ -13,7 +13,7 @@ impl JdwpConnection {
     /// Get the string value from a String object (StringReference.Value command)
     ///
     /// # Arguments
-    /// * `string_id` - The ObjectId of the String object
+    /// * `string_id` - The `ObjectId` of the String object
     ///
     /// # Returns
     /// The actual string value
@@ -23,6 +23,9 @@ impl JdwpConnection {
     /// let value = connection.get_string_value(string_object_id).await?;
     /// println!("String value: {}", value);
     /// ```
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_string_value(&mut self, string_id: ObjectId) -> JdwpResult<String> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(
@@ -48,7 +51,7 @@ impl JdwpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn test_string_value_packet() {

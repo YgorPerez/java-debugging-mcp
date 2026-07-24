@@ -1,3 +1,16 @@
+// Throwaway JDWP protocol test harness (manual, ad-hoc) — not production code;
+// stdout / `unwrap` / indexing / panics are fine here.
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::panic_in_result_fn,
+    clippy::manual_unwrap_or_default
+)]
 // End-to-end test of EXC-1 exception breakpoints:
 //   set_exception_request(target only) -> Exception wire-parse -> event fires on the target throw
 //   with the right exception type + a catch location; the non-target exception never fires because

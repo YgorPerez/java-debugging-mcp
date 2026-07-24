@@ -10,17 +10,16 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 fn default_host() -> String { "localhost".to_string() }
-fn default_port() -> u16 { 5005 }
-fn default_max_frames() -> usize { 20 }
-fn default_true() -> bool { true }
-fn default_max_result_length() -> usize { 2000 }
-fn default_limit() -> usize { 40 }
-fn default_trace_limit() -> usize { 50 }
+const fn default_port() -> u16 { 5005 }
+const fn default_max_frames() -> usize { 20 }
+const fn default_true() -> bool { true }
+const fn default_max_result_length() -> usize { 2000 }
+const fn default_limit() -> usize { 40 }
+const fn default_trace_limit() -> usize { 50 }
 
 /// Parse an optional hex thread id like "0x2" (or "2") into a raw id.
-pub fn parse_thread_id(s: &Option<String>) -> Option<u64> {
-    s.as_deref()
-        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+pub fn parse_thread_id(s: Option<&str>) -> Option<u64> {
+    s.and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
 }
 
 /// Deserialize tool arguments into a typed struct, tolerating a missing/`null` arguments value
@@ -31,7 +30,7 @@ pub fn parse<T: serde::de::DeserializeOwned>(args: &serde_json::Value) -> Result
     } else {
         args.clone()
     };
-    serde_json::from_value(v).map_err(|e| format!("Invalid arguments: {}", e))
+    serde_json::from_value(v).map_err(|e| format!("Invalid arguments: {e}"))
 }
 
 /// Arguments for debug.attach.
@@ -45,7 +44,7 @@ pub struct AttachArgs {
     pub port: u16,
 }
 
-/// Arguments for debug.set_breakpoint.
+/// Arguments for `debug.set_breakpoint`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetBreakpointArgs {
     /// Class name pattern (e.g. "com.example.MyClass").
@@ -70,7 +69,7 @@ pub struct SetBreakpointArgs {
     /// Logpoint mode: on hit, snapshot (location, thread, in-scope locals/args, optional
     /// `trace_expr`) into a ring buffer and resume immediately WITHOUT suspending — safe on a
     /// shared instance where a normal breakpoint could freeze a request thread. Read snapshots
-    /// with debug.get_traces.
+    /// with `debug.get_traces`.
     #[serde(default)]
     pub trace: bool,
     /// Only with `trace:true` — an expression to evaluate in the hit frame and record alongside
@@ -92,14 +91,14 @@ pub struct GetTracesArgs {
     pub clear: bool,
 }
 
-/// Arguments for debug.clear_breakpoint.
+/// Arguments for `debug.clear_breakpoint`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClearBreakpointArgs {
-    /// Breakpoint ID from debug.list_breakpoints.
+    /// Breakpoint ID from `debug.list_breakpoints`.
     pub breakpoint_id: String,
 }
 
-/// Arguments for debug.step_over / step_into / step_out.
+/// Arguments for `debug.step_over` / `step_into` / `step_out`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct StepArgs {
     /// Thread ID to step (optional; defaults to the last thread that hit a breakpoint).
@@ -107,7 +106,7 @@ pub struct StepArgs {
     pub thread_id: Option<String>,
 }
 
-/// Arguments for debug.get_stack.
+/// Arguments for `debug.get_stack`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetStackArgs {
     /// Thread ID (optional; defaults to the last thread that hit a breakpoint/step).
@@ -142,7 +141,7 @@ pub struct EvaluateArgs {
     pub max_result_length: usize,
 }
 
-/// Arguments for debug.list_threads.
+/// Arguments for `debug.list_threads`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListThreadsArgs {
     /// Only threads whose name contains this substring (case-insensitive), e.g. 'Avail' or 'task'.
@@ -156,7 +155,7 @@ pub struct ListThreadsArgs {
     pub limit: usize,
 }
 
-/// Arguments for debug.set_value.
+/// Arguments for `debug.set_value`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetValueArgs {
     /// What to write. Either a local variable name (`counter`), a static field

@@ -1,3 +1,16 @@
+// Throwaway JDWP protocol test harness (manual, ad-hoc) — not production code;
+// stdout / `unwrap` / indexing / panics are fine here.
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::panic_in_result_fn,
+    clippy::manual_unwrap_or_default
+)]
 // Test complete stack inspection flow
 
 use jdwp_client::{JdwpConnection, SuspendPolicy};
@@ -39,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   (Will check every 2 seconds for 30 seconds)\n");
 
     // Poll for suspended threads (simple approach - in real impl we'd listen for events)
-    for attempt in 1..=15 {
+    for _attempt in 1..=15 {
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
         // Get all threads

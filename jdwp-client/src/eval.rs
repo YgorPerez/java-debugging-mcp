@@ -15,6 +15,9 @@ const INVOKE_SINGLE_THREADED: i32 = 1;
 
 impl JdwpConnection {
     /// ReferenceType.Signature — JNI signature of a type, e.g. "Lbr/com/x/WSReserva;".
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_signature(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<String> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::SIGNATURE);
@@ -26,6 +29,9 @@ impl JdwpConnection {
     }
 
     /// ClassType.Superclass — direct superclass of a class (None for java.lang.Object).
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_superclass(&mut self, class_id: ClassId) -> JdwpResult<Option<ClassId>> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::CLASS_TYPE, CLASS_TYPE_SUPERCLASS);
@@ -38,6 +44,9 @@ impl JdwpConnection {
     }
 
     /// StackFrame.ThisObject — the `this` reference for a frame (0 = static method).
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_this_object(&mut self, thread_id: ThreadId, frame_id: FrameId) -> JdwpResult<ObjectId> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::STACK_FRAME, stack_frame_commands::THIS_OBJECT);
@@ -52,7 +61,10 @@ impl JdwpConnection {
 
     /// ObjectReference.InvokeMethod — invoke an instance method on a suspended thread.
     /// Returns (return value, exception object id) — exception id 0 means no exception.
-    /// Uses INVOKE_SINGLE_THREADED so only the target thread runs during the call.
+    /// Uses `INVOKE_SINGLE_THREADED` so only the target thread runs during the call.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn invoke_method(
         &mut self,
         object_id: ObjectId,
@@ -68,7 +80,7 @@ impl JdwpConnection {
         packet.data.put_u64(thread_id);
         packet.data.put_u64(class_id);
         packet.data.put_u64(method_id);
-        packet.data.put_i32(args.len() as i32);
+        packet.data.put_i32(i32::try_from(args.len()).unwrap_or(i32::MAX));
         for a in &args {
             write_tagged_value(&mut packet.data, a);
         }
@@ -107,7 +119,7 @@ pub(crate) fn write_untagged_value<B: BufMut>(buf: &mut B, v: &Value) {
         ValueData::Int(x) => buf.put_i32(*x),
         ValueData::Long(x) => buf.put_i64(*x),
         ValueData::Short(x) => buf.put_i16(*x),
-        ValueData::Boolean(x) => buf.put_u8(if *x { 1 } else { 0 }),
+        ValueData::Boolean(x) => buf.put_u8(u8::from(*x)),
         ValueData::Object(x) => buf.put_u64(*x),
         ValueData::Void => {}
     }
@@ -125,6 +137,6 @@ pub(crate) fn read_value_by_tag(tag: u8, buf: &mut &[u8]) -> JdwpResult<ValueDat
         90 => Ok(ValueData::Boolean(buf.get_u8() != 0)),
         86 => Ok(ValueData::Void),
         76 | 115 | 116 | 103 | 108 | 99 | 91 => Ok(ValueData::Object(read_u64(buf)?)),
-        _ => Err(JdwpError::Protocol(format!("Unknown value tag: {}", tag))),
+        _ => Err(JdwpError::Protocol(format!("Unknown value tag: {tag}"))),
     }
 }

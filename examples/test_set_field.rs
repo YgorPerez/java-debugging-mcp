@@ -1,3 +1,16 @@
+// Throwaway JDWP protocol test harness (manual, ad-hoc) — not production code;
+// stdout / `unwrap` / indexing / panics are fine here.
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::panic_in_result_fn,
+    clippy::manual_unwrap_or_default
+)]
 // End-to-end test of SETF-1 live field writes:
 //   ClassType.SetValues (statics) + ObjectReference.SetValues (instance), with untagged values.
 // Writes a static String, a static int, then instance fields (int/String/boolean) on a static

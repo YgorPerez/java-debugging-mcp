@@ -21,7 +21,7 @@ const MOD_STEP: u8 = 10;
 const ARRAY_LENGTH: u8 = 1;
 const ARRAY_GET_VALUES: u8 = 2;
 
-/// Step depth selector for set_step.
+/// Step depth selector for `set_step`.
 #[derive(Debug, Clone, Copy)]
 pub enum StepDepth {
     Into,
@@ -30,7 +30,10 @@ pub enum StepDepth {
 }
 
 impl JdwpConnection {
-    /// Set a breakpoint with optional Count (stop on Nth hit) and ThreadOnly filters.
+    /// Set a breakpoint with optional Count (stop on Nth hit) and `ThreadOnly` filters.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_breakpoint_ex(
         &mut self,
         class_id: ReferenceTypeId,
@@ -45,7 +48,7 @@ impl JdwpConnection {
         packet.data.put_u8(event_kinds::BREAKPOINT);
         packet.data.put_u8(suspend_policy as u8);
 
-        let n_mods = 1 + count.is_some() as i32 + thread.is_some() as i32;
+        let n_mods = 1 + i32::from(count.is_some()) + i32::from(thread.is_some());
         packet.data.put_i32(n_mods);
 
         // LocationOnly
@@ -70,8 +73,11 @@ impl JdwpConnection {
         read_i32(&mut data)
     }
 
-    /// Set a single-step request (EventRequest.Set, SINGLE_STEP). Returns the request id;
-    /// clear it with clear_step before resuming again, or stepping will run away.
+    /// Set a single-step request (EventRequest.Set, `SINGLE_STEP`). Returns the request id;
+    /// clear it with `clear_step` before resuming again, or stepping will run away.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_step(&mut self, thread: ThreadId, depth: StepDepth) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
@@ -92,7 +98,10 @@ impl JdwpConnection {
         read_i32(&mut data)
     }
 
-    /// Clear a single-step request (EventRequest.Clear, SINGLE_STEP).
+    /// Clear a single-step request (EventRequest.Clear, `SINGLE_STEP`).
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn clear_step(&mut self, request_id: i32) -> JdwpResult<()> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
@@ -104,6 +113,9 @@ impl JdwpConnection {
     }
 
     /// Clear all breakpoints (EventRequest.ClearAllBreakpoints).
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn clear_all_breakpoints(&mut self) -> JdwpResult<()> {
         let id = self.next_id();
         let packet = CommandPacket::new(
@@ -117,6 +129,9 @@ impl JdwpConnection {
     }
 
     /// ArrayReference.Length.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_array_length(&mut self, array_id: ObjectId) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::ARRAY_REFERENCE, ARRAY_LENGTH);
@@ -128,6 +143,9 @@ impl JdwpConnection {
     }
 
     /// ArrayReference.GetValues — returns `length` elements starting at `first`.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_array_values(
         &mut self,
         array_id: ObjectId,
@@ -148,7 +166,7 @@ impl JdwpConnection {
         let region_tag = read_u8(&mut data)?;
         let count = read_i32(&mut data)?;
         let is_object = matches!(region_tag, 76 | 115 | 116 | 103 | 108 | 99 | 91);
-        let mut out = Vec::with_capacity(count.max(0) as usize);
+        let mut out = Vec::with_capacity(usize::try_from(count.max(0)).unwrap_or(0));
         for _ in 0..count {
             if is_object {
                 let t = read_u8(&mut data)?;
@@ -161,11 +179,14 @@ impl JdwpConnection {
     }
 
     /// VirtualMachine.CreateString — mirror a string into the target VM, returning its id.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn create_string(&mut self, s: &str) -> JdwpResult<ObjectId> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::CREATE_STRING);
         let bytes = s.as_bytes();
-        packet.data.put_i32(bytes.len() as i32);
+        packet.data.put_i32(i32::try_from(bytes.len()).unwrap_or(i32::MAX));
         packet.data.put_slice(bytes);
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
@@ -174,6 +195,9 @@ impl JdwpConnection {
     }
 
     /// StackFrame.SetValues — set a single local variable slot to `value`.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_frame_value(
         &mut self,
         thread_id: ThreadId,
@@ -195,18 +219,23 @@ impl JdwpConnection {
 }
 
 /// Helper to build a primitive/object `Value` for invoke/set arguments.
-pub fn value_int(v: i32) -> Value {
+#[must_use]
+pub const fn value_int(v: i32) -> Value {
     Value { tag: 73, data: ValueData::Int(v) }
 }
-pub fn value_long(v: i64) -> Value {
+#[must_use]
+pub const fn value_long(v: i64) -> Value {
     Value { tag: 74, data: ValueData::Long(v) }
 }
-pub fn value_bool(v: bool) -> Value {
+#[must_use]
+pub const fn value_bool(v: bool) -> Value {
     Value { tag: 90, data: ValueData::Boolean(v) }
 }
-pub fn value_null() -> Value {
+#[must_use]
+pub const fn value_null() -> Value {
     Value { tag: 76, data: ValueData::Object(0) }
 }
-pub fn value_object(id: ObjectId) -> Value {
+#[must_use]
+pub const fn value_object(id: ObjectId) -> Value {
     Value { tag: 76, data: ValueData::Object(id) }
 }

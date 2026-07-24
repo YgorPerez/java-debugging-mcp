@@ -1,3 +1,16 @@
+// Throwaway JDWP protocol test harness (manual, ad-hoc) — not production code;
+// stdout / `unwrap` / indexing / panics are fine here.
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::panic_in_result_fn,
+    clippy::manual_unwrap_or_default
+)]
 // End-to-end test of the deferred (class-prepare) breakpoint machinery:
 //   set_class_prepare -> ClassPrepare parse -> arm real breakpoint on the just-loaded type ->
 //   resume_thread -> breakpoint actually fires.

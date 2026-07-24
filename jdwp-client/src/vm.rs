@@ -5,7 +5,7 @@
 use crate::commands::{command_sets, vm_commands};
 use crate::connection::JdwpConnection;
 use crate::protocol::{CommandPacket, JdwpResult};
-use crate::reader::{read_i32, read_string, read_u32, read_u8};
+use crate::reader::{read_i32, read_string, read_u8};
 use crate::types::ReferenceTypeId;
 use bytes::BufMut;
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ pub struct VmIdSizes {
     pub frame_id_size: i32,
 }
 
-/// Class information from ClassesBySignature
+/// Class information from `ClassesBySignature`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassInfo {
     pub ref_type_tag: u8,  // 1=class, 2=interface, 3=array
@@ -41,6 +41,9 @@ pub struct ClassInfo {
 
 impl JdwpConnection {
     /// Get JVM version information (VirtualMachine.Version command)
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_version(&mut self) -> JdwpResult<VmVersion> {
         let id = self.next_id();
         let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::VERSION);
@@ -67,6 +70,9 @@ impl JdwpConnection {
 
     /// Get ID sizes (VirtualMachine.IDSizes command)
     /// This tells us how many bytes are used for various ID types
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_id_sizes(&mut self) -> JdwpResult<VmIdSizes> {
         let id = self.next_id();
         let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::ID_SIZES);
@@ -93,13 +99,16 @@ impl JdwpConnection {
 
     /// Find classes by signature (VirtualMachine.ClassesBySignature command)
     /// Signature format: "Lcom/example/MyClass;" for classes
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn classes_by_signature(&mut self, signature: &str) -> JdwpResult<Vec<ClassInfo>> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::CLASSES_BY_SIGNATURE);
 
         // Write signature as JDWP string (4-byte length + UTF-8 bytes)
         let sig_bytes = signature.as_bytes();
-        packet.data.put_u32(sig_bytes.len() as u32);
+        packet.data.put_u32(u32::try_from(sig_bytes.len()).unwrap_or(u32::MAX));
         packet.data.extend_from_slice(sig_bytes);
 
         let reply = self.send_command(packet).await?;
@@ -109,7 +118,7 @@ impl JdwpConnection {
 
         // Read number of classes
         let classes_count = read_i32(&mut data)?;
-        let mut classes = Vec::with_capacity(classes_count as usize);
+        let mut classes = Vec::with_capacity(usize::try_from(classes_count).unwrap_or(0));
 
         for _ in 0..classes_count {
             let ref_type_tag = read_u8(&mut data)?;
@@ -132,6 +141,9 @@ impl JdwpConnection {
     /// Heavier than `classes_by_signature` (returns thousands of entries), but lets a caller
     /// resolve a class by *simple* name when the full package isn't known — e.g. match any
     /// signature ending in `/ConfigDefaultUtils;`.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn all_classes(&mut self) -> JdwpResult<Vec<ClassInfo>> {
         let id = self.next_id();
         let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::ALL_CLASSES);
@@ -142,7 +154,7 @@ impl JdwpConnection {
         let mut data = reply.data();
 
         let classes_count = read_i32(&mut data)?;
-        let mut classes = Vec::with_capacity(classes_count as usize);
+        let mut classes = Vec::with_capacity(usize::try_from(classes_count).unwrap_or(0));
 
         for _ in 0..classes_count {
             let ref_type_tag = read_u8(&mut data)?;

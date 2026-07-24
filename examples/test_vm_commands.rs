@@ -1,3 +1,16 @@
+// Throwaway JDWP protocol test harness (manual, ad-hoc) — not production code;
+// stdout / `unwrap` / indexing / panics are fine here.
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::panic_in_result_fn,
+    clippy::manual_unwrap_or_default
+)]
 // Test VirtualMachine commands (Version and IDSizes)
 
 use jdwp_client::JdwpConnection;

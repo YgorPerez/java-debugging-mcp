@@ -4,7 +4,7 @@
 
 use crate::eventloop::{spawn_event_loop, EventLoopHandle};
 use crate::events::EventSet;
-use crate::protocol::*;
+use crate::protocol::{JdwpResult, JDWP_HANDSHAKE, JdwpError, CommandPacket, ReplyPacket};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +19,9 @@ pub struct JdwpConnection {
 
 impl JdwpConnection {
     /// Connect to a JVM via JDWP
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the TCP connection or JDWP handshake fails.
     pub async fn connect(host: &str, port: u16) -> JdwpResult<Self> {
         info!("Connecting to JDWP at {}:{}", host, port);
 
@@ -59,6 +62,9 @@ impl JdwpConnection {
     }
 
     /// Send a command and wait for reply
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn send_command(&mut self, packet: CommandPacket) -> JdwpResult<ReplyPacket> {
         debug!("Sending command packet id={}", packet.id);
         self.event_loop.send_command(packet).await
@@ -97,6 +103,7 @@ impl JdwpConnection {
     }
 
     /// Generate next packet ID
+    #[must_use]
     pub fn next_id(&self) -> u32 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }

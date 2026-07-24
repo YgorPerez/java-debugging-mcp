@@ -28,6 +28,9 @@ pub struct LineTable {
 impl JdwpConnection {
     /// Get line table for a method (Method.LineTable command)
     /// Maps source code line numbers to bytecode positions
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_line_table(
         &mut self,
         ref_type_id: ReferenceTypeId,
@@ -51,7 +54,7 @@ impl JdwpConnection {
 
         // Read line table entries
         let lines_count = read_i32(&mut data)?;
-        let mut lines = Vec::with_capacity(lines_count as usize);
+        let mut lines = Vec::with_capacity(usize::try_from(lines_count).unwrap_or(0));
 
         for _ in 0..lines_count {
             let line_code_index = read_u64(&mut data)?;
@@ -68,6 +71,9 @@ impl JdwpConnection {
 
     /// Get variable table for a method (Method.VariableTable command)
     /// Returns info about local variables (names, types, slots)
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_variable_table(
         &mut self,
         ref_type_id: ReferenceTypeId,
@@ -90,7 +96,7 @@ impl JdwpConnection {
 
         // Read variables
         let vars_count = read_i32(&mut data)?;
-        let mut variables = Vec::with_capacity(vars_count as usize);
+        let mut variables = Vec::with_capacity(usize::try_from(vars_count).unwrap_or(0));
 
         for _ in 0..vars_count {
             let code_index = read_u64(&mut data)?;

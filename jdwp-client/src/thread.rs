@@ -6,7 +6,7 @@ use crate::commands::{command_sets, thread_commands};
 use crate::connection::JdwpConnection;
 use crate::protocol::{CommandPacket, JdwpResult};
 use crate::reader::{read_i32, read_string, read_u64};
-use crate::types::{FrameId, Location, MethodId, ReferenceTypeId, ThreadId};
+use crate::types::{FrameId, Location, ThreadId};
 use bytes::BufMut;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,9 @@ pub struct Frame {
 
 impl JdwpConnection {
     /// Get stack frames for a thread (ThreadReference.Frames command)
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_frames(
         &mut self,
         thread_id: ThreadId,
@@ -42,7 +45,7 @@ impl JdwpConnection {
 
         // Read number of frames
         let frames_count = read_i32(&mut data)?;
-        let mut frames = Vec::with_capacity(frames_count as usize);
+        let mut frames = Vec::with_capacity(usize::try_from(frames_count).unwrap_or(0));
 
         for _ in 0..frames_count {
             let frame_id = read_u64(&mut data)?;
@@ -68,6 +71,9 @@ impl JdwpConnection {
     }
 
     /// Get all threads (VirtualMachine.AllThreads)
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_all_threads(&mut self) -> JdwpResult<Vec<ThreadId>> {
         let id = self.next_id();
         let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, crate::commands::vm_commands::ALL_THREADS);
@@ -78,7 +84,7 @@ impl JdwpConnection {
         let mut data = reply.data();
 
         let threads_count = read_i32(&mut data)?;
-        let mut threads = Vec::with_capacity(threads_count as usize);
+        let mut threads = Vec::with_capacity(usize::try_from(threads_count).unwrap_or(0));
 
         for _ in 0..threads_count {
             threads.push(read_u64(&mut data)?);
@@ -88,6 +94,9 @@ impl JdwpConnection {
     }
 
     /// Get a thread's name (ThreadReference.Name).
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_thread_name(&mut self, thread_id: ThreadId) -> JdwpResult<String> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::NAME);
@@ -100,8 +109,11 @@ impl JdwpConnection {
         read_string(&mut data)
     }
 
-    /// Get a thread's (thread_status, suspend_status) (ThreadReference.Status).
-    /// suspend_status != 0 means the thread is currently suspended.
+    /// Get a thread's (`thread_status`, `suspend_status`) (ThreadReference.Status).
+    /// `suspend_status` != 0 means the thread is currently suspended.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_thread_status(&mut self, thread_id: ThreadId) -> JdwpResult<(i32, i32)> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::STATUS);
@@ -117,6 +129,9 @@ impl JdwpConnection {
     }
 
     /// Suspend all threads (VirtualMachine.Suspend)
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn suspend_all(&mut self) -> JdwpResult<()> {
         let id = self.next_id();
         let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, crate::commands::vm_commands::SUSPEND);
@@ -128,6 +143,9 @@ impl JdwpConnection {
     }
 
     /// Resume all threads (VirtualMachine.Resume)
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn resume_all(&mut self) -> JdwpResult<()> {
         let id = self.next_id();
         let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, crate::commands::vm_commands::RESUME);
@@ -140,8 +158,11 @@ impl JdwpConnection {
 
     /// Resume a single thread (ThreadReference.Resume) — decrements just that thread's suspend
     /// count, leaving other suspended threads alone. Used after arming a deferred breakpoint on the
-    /// thread that a ClassPrepare event suspended, so class init proceeds without disturbing any
+    /// thread that a `ClassPrepare` event suspended, so class init proceeds without disturbing any
     /// thread parked at a real breakpoint.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn resume_thread(&mut self, thread_id: ThreadId) -> JdwpResult<()> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::RESUME);
@@ -158,6 +179,9 @@ impl JdwpConnection {
     /// assignable to the method's declared return type — pass a `Void` value for a `void` method.
     /// Lets a caller short-circuit a method (e.g. make a rejecting `salvar` return `true`) without
     /// editing and redeploying code. Requires the JVM's `canForceEarlyReturn` capability.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn force_early_return(
         &mut self,
         thread_id: ThreadId,

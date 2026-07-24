@@ -8,10 +8,9 @@ use crate::protocol::{CommandPacket, JdwpResult};
 use crate::reader::{read_u64, read_u8};
 use crate::types::{FrameId, ThreadId, Value, ValueData};
 use bytes::{Buf, BufMut};
-use serde::{Deserialize, Serialize};
 
-/// Variable slot information for GetValues
-#[derive(Debug, Clone)]
+/// Variable slot information for `GetValues`
+#[derive(Debug, Clone, Copy)]
 pub struct VariableSlot {
     pub slot: i32,
     pub sig_byte: u8,
@@ -19,6 +18,9 @@ pub struct VariableSlot {
 
 impl JdwpConnection {
     /// Get values for variable slots in a frame (StackFrame.GetValues command)
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_frame_values(
         &mut self,
         thread_id: ThreadId,
@@ -33,7 +35,7 @@ impl JdwpConnection {
         packet.data.put_u64(frame_id);
 
         // Number of slots to retrieve
-        packet.data.put_i32(slots.len() as i32);
+        packet.data.put_i32(i32::try_from(slots.len()).unwrap_or(i32::MAX));
 
         // Write each slot
         for slot in &slots {
@@ -48,7 +50,7 @@ impl JdwpConnection {
 
         // Read number of values (should match slots.len())
         let values_count = crate::reader::read_i32(&mut data)?;
-        let mut values = Vec::with_capacity(values_count as usize);
+        let mut values = Vec::with_capacity(usize::try_from(values_count).unwrap_or(0));
 
         for _ in 0..values_count {
             let tag = read_u8(&mut data)?;
@@ -90,6 +92,6 @@ fn read_value_by_tag(tag: u8, buf: &mut &[u8]) -> JdwpResult<ValueData> {
             let object_id = read_u64(buf)?;
             Ok(ValueData::Object(object_id))
         }
-        _ => Err(crate::protocol::JdwpError::Protocol(format!("Unknown value tag: {}", tag))),
+        _ => Err(crate::protocol::JdwpError::Protocol(format!("Unknown value tag: {tag}"))),
     }
 }
