@@ -187,9 +187,10 @@ scripts/doctor.sh --verbose    # per-finding file:line detail
 scripts/doctor.sh --diff main  # only files changed vs main
 ```
 
-The same check runs in CI (`.github/workflows/rust-doctor.yml`, pinned to v0.2.0), gating on errors
-and posting a PR summary + SARIF. Installing the optional external tools (`cargo install cargo-audit
-cargo-deny cargo-machete cargo-geiger`) unlocks the dependency/unsafe passes it otherwise skips.
+The same check runs in CI (`.github/workflows/rust-doctor.yml`, pinned to 0.2.0): it gates on errors
+and uploads results to GitHub code scanning (SARIF). Installing the optional external tools
+(`cargo install cargo-audit cargo-deny cargo-machete cargo-geiger`) unlocks the dependency/unsafe
+passes it otherwise skips.
 
 ## Status
 

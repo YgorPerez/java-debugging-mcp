@@ -1,8 +1,12 @@
 name: rust-doctor
 
 # Code-health gate: runs rust-doctor (clippy + cargo-audit/deny/geiger + custom AST rules folded
-# into one 0–100 score). Pinned to the latest stable release (v0.2.0). The same tool runs locally
+# into one 0–100 score), pinned to the latest stable release (0.2.0). The same tool runs locally
 # via `scripts/doctor.sh`.
+#
+# We invoke the CLI directly rather than the official `arthjean/rust-doctor` composite action,
+# because that action's v0.2.0 action.yml currently fails to parse on the runner. `npx` fetches a
+# prebuilt binary (no source build); rust-doctor still shells out to the runner's `cargo clippy`.
 
 on:
   push:
@@ -12,8 +16,6 @@ on:
 permissions:
   contents: read
   security-events: write # upload SARIF to GitHub code scanning
-  pull-requests: write # sticky PR summary comment
-  statuses: write # commit status check
 
 concurrency:
   group: rust-doctor-${{ github.ref }}
@@ -25,11 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # rust-doctor resolves the PR base locally for changed/baseline scope
 
-      # rust-doctor shells out to `cargo clippy`; the action itself installs the rust-doctor
-      # binary via cargo (cached across runs). A recent stable toolchain clears its MSRV.
+      # rust-doctor shells out to `cargo clippy`, so the runner needs cargo + clippy.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,14 +37,14 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Rust Doctor
-        uses: arthjean/rust-doctor@v0.2.0
+      # --fail-on error gates the build on errors only (exit 3) so the current pedantic-clippy
+      # warnings don't break it; SARIF is written to the file either way and uploaded below.
+      - name: Run rust-doctor
+        run: npx -y rust-doctor@0.2.0 --sarif --fail-on error > rust-doctor.sarif
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
         with:
-          version: 0.2.0
-          scope: auto # changed files on PRs, full scan on push to main
-          blocking: error # gate the build on errors only for now; tighten to `warning` once clean
-          require-complete: false # don't fail when an optional analyzer (audit/deny/geiger) is absent
-          sarif: true
-          comment: true
-          commit-status: true
-          token: ${{ secrets.GITHUB_TOKEN }}
+          sarif_file: rust-doctor.sarif
+          category: rust-doctor
