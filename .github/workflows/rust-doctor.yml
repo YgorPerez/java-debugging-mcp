@@ -1,0 +1,51 @@
+name: rust-doctor
+
+# Code-health gate: runs rust-doctor (clippy + cargo-audit/deny/geiger + custom AST rules folded
+# into one 0–100 score). Pinned to the latest stable release (v0.2.0). The same tool runs locally
+# via `scripts/doctor.sh`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write # upload SARIF to GitHub code scanning
+  pull-requests: write # sticky PR summary comment
+  statuses: write # commit status check
+
+concurrency:
+  group: rust-doctor-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  health:
+    name: Health scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # rust-doctor resolves the PR base locally for changed/baseline scope
+
+      # rust-doctor shells out to `cargo clippy`; the action itself installs the rust-doctor
+      # binary via cargo (cached across runs). A recent stable toolchain clears its MSRV.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Rust Doctor
+        uses: arthjean/rust-doctor@v0.2.0
+        with:
+          version: 0.2.0
+          scope: auto # changed files on PRs, full scan on push to main
+          blocking: error # gate the build on errors only for now; tighten to `warning` once clean
+          require-complete: false # don't fail when an optional analyzer (audit/deny/geiger) is absent
+          sarif: true
+          comment: true
+          commit-status: true
+          token: ${{ secrets.GITHUB_TOKEN }}

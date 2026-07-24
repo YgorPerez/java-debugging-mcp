@@ -1,8 +1,13 @@
 # Rust
 /target/
+**/target/
 **/*.rs.bk
 *.pdb
 Cargo.lock
+
+# rust-doctor local cache
+.rust-doctor-cache.json
+**/.rust-doctor-cache.json
 
 # IDE
 .idea/
