@@ -57,13 +57,20 @@ pub enum EventKind {
         exception: ObjectId,
         catch_location: Option<Location>,
     },
-    MethodEntry {
-        thread: ThreadId,
-        location: Location,
-    },
+    /// A method is returning. `location` is the return site, so a method with several `return`
+    /// statements says which one was taken.
+    ///
+    /// There is deliberately no `MethodEntry`: a `METHOD_ENTRY` request with a `ClassMatch` fires on
+    /// every method of every matching class — the noisiest event in JDWP — and "what calls this?" is
+    /// now answered far more cheaply by a traced breakpoint's caller chain (TRACE-5). A decoded variant
+    /// nothing can arm only implies a capability that isn't there.
     MethodExit {
         thread: ThreadId,
         location: Location,
+        /// What the method is returning, present only when the request was armed as
+        /// `METHOD_EXIT_WITH_RETURN_VALUE` (kind 42). `None` for a plain `METHOD_EXIT` (kind 41),
+        /// which a JVM below JDWP 1.6 is all you can get.
+        return_value: Option<Value>,
     },
     /// A watched field was read.
     FieldAccess {
@@ -169,6 +176,8 @@ fn parse_event_details(kind: u8, buf: &mut &[u8]) -> JdwpResult<EventKind> {
         event_kinds::EXCEPTION => parse_exception_event(buf),
         event_kinds::FIELD_ACCESS => parse_field_access_event(buf),
         event_kinds::FIELD_MODIFICATION => parse_field_modification_event(buf),
+        event_kinds::METHOD_EXIT => parse_method_exit_event(buf, false),
+        event_kinds::METHOD_EXIT_WITH_RETURN_VALUE => parse_method_exit_event(buf, true),
         _ => {
             warn!("Unsupported event kind: {}", kind);
             Ok(EventKind::Unknown { kind })
@@ -254,6 +263,22 @@ fn parse_field_modification_event(buf: &mut &[u8]) -> JdwpResult<EventKind> {
     Ok(EventKind::FieldModification { field, new_value })
 }
 
+/// Parse a `METHOD_EXIT` (kind 41) or `METHOD_EXIT_WITH_RETURN_VALUE` (kind 42) event.
+///
+/// The two differ only by a trailing tagged value, so `with_return_value` decides whether to read it.
+/// Reading it when the request did not ask for it would consume the next event's bytes.
+fn parse_method_exit_event(buf: &mut &[u8], with_return_value: bool) -> JdwpResult<EventKind> {
+    let thread = read_u64(buf)?;
+    let location = read_location(buf)?;
+    let return_value = if with_return_value {
+        let tag = read_u8(buf)?;
+        Some(Value { tag, data: crate::reader::read_value_by_tag(tag, buf)? })
+    } else {
+        None
+    };
+    Ok(EventKind::MethodExit { thread, location, return_value })
+}
+
 /// Read a location from the buffer
 fn read_location(buf: &mut &[u8]) -> JdwpResult<Location> {
     let type_tag = read_u8(buf)?;
@@ -318,6 +343,58 @@ mod tests {
         out
     }
 
+    /// A `METHOD_EXIT` (41) or `METHOD_EXIT_WITH_RETURN_VALUE` (42) event. Kind 42 carries a trailing
+    /// tagged value; kind 41 does not, and reading one anyway would eat the next event's bytes.
+    fn method_exit_event(with_return_value: bool, returned: i32) -> Vec<u8> {
+        let mut out = vec![if with_return_value {
+            event_kinds::METHOD_EXIT_WITH_RETURN_VALUE
+        } else {
+            event_kinds::METHOD_EXIT
+        }];
+        out.extend_from_slice(&9i32.to_be_bytes()); // requestId
+        out.extend_from_slice(&0x1u64.to_be_bytes()); // thread
+        out.extend_from_slice(&location(0x55, 0x66, 12));
+        if with_return_value {
+            out.push(crate::reader::value_tags::INT);
+            out.extend_from_slice(&returned.to_be_bytes());
+        }
+        out
+    }
+
+    /// METH-1: kind 42 yields the returned value; kind 41 yields the return site with no value. Getting
+    /// this wrong is not a missing field but a desynchronised buffer — the value's bytes would be read
+    /// as the next event's header.
+    #[test]
+    fn method_exit_parses_with_and_without_a_return_value() {
+        let with = parse_event_packet(&packet(1, &[method_exit_event(true, 42)])).expect("well-formed");
+        match with.events.first().map(|e| &e.details) {
+            Some(EventKind::MethodExit { location, return_value: Some(v), .. }) => {
+                assert_eq!(location.method_id, 0x66, "the return site is the hit location");
+                assert!(matches!(v.data, crate::types::ValueData::Int(42)), "got {:?}", v.data);
+            }
+            other => panic!("expected a method exit with a value, got {other:?}"),
+        }
+
+        let without = parse_event_packet(&packet(1, &[method_exit_event(false, 0)])).expect("well-formed");
+        assert!(
+            matches!(
+                without.events.first().map(|e| &e.details),
+                Some(EventKind::MethodExit { return_value: None, .. })
+            ),
+            "kind 41 carries no value, got {:?}",
+            without.events.first().map(|e| &e.details)
+        );
+
+        // Two kind-42 events back to back: the second only parses if the first consumed its value and
+        // nothing more. This is the assertion that catches a length mistake in the tagged-value read.
+        let pair = parse_event_packet(&packet(
+            1,
+            &[method_exit_event(true, 7), method_exit_event(true, 8)],
+        ))
+        .expect("well-formed");
+        assert_eq!(pair.events.len(), 2, "the first event must consume exactly its own bytes");
+    }
+
     #[test]
     fn an_empty_event_set_parses_as_zero_events() {
         let set = parse_event_packet(&packet(2, &[])).expect("an empty set is well-formed");
@@ -369,7 +446,11 @@ mod tests {
     /// killing the whole debug session instead of reporting a malformed reply.
     #[test]
     fn every_truncation_of_a_packet_errors_instead_of_panicking() {
-        for event in [breakpoint_event(5, 0xabc), field_modification_event(42)] {
+        for event in [
+            breakpoint_event(5, 0xabc),
+            field_modification_event(42),
+            method_exit_event(true, 42),
+        ] {
             let wire = packet(1, &[event]);
             for keep in 0..wire.len() {
                 let short = &wire[..keep];

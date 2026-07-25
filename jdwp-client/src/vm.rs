@@ -30,6 +30,33 @@ pub struct VmIdSizes {
     pub frame_id_size: i32,
 }
 
+/// What the target JVM says it supports (`VirtualMachine.Capabilities`).
+///
+/// Only the seven original capabilities: they are the ones this crate's features actually depend on,
+/// and `CapabilitiesNew` adds nothing needed here. Note that JDI's `canGetMethodReturnValues` is **not**
+/// a capability bit at all — it is a JDWP *version* check (≥ 1.6), so [`get_version`](JdwpConnection::get_version)
+/// answers that one.
+///
+/// Worth asking before a feature that depends on one: a JVM without the capability answers
+/// `NOT_IMPLEMENTED` (99) to the actual command, and "this JVM can't tell us" is a far more useful
+/// report than a bare error code.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+// Seven bools because the JDWP reply is seven bools, in this order. This is a decoded wire structure,
+// not a parameter bag that wants splitting up — grouping them differently would only make the reader
+// map fields back onto the spec by hand.
+#[allow(clippy::struct_excessive_bools)]
+pub struct VmCapabilities {
+    pub can_watch_field_modification: bool,
+    pub can_watch_field_access: bool,
+    pub can_get_bytecodes: bool,
+    pub can_get_synthetic_attribute: bool,
+    /// Whether [`owned_monitors`](JdwpConnection::owned_monitors) will work.
+    pub can_get_owned_monitor_info: bool,
+    /// Whether [`current_contended_monitor`](JdwpConnection::current_contended_monitor) will work.
+    pub can_get_current_contended_monitor: bool,
+    pub can_get_monitor_info: bool,
+}
+
 /// Class information from `ClassesBySignature`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassInfo {
@@ -94,6 +121,33 @@ impl JdwpConnection {
             object_id_size,
             reference_type_id_size,
             frame_id_size,
+        })
+    }
+
+    /// Ask the JVM which optional capabilities it supports (VirtualMachine.Capabilities, command 12).
+    ///
+    /// Seven booleans, one byte each, in the order the spec lists them. Used to turn "the JVM refused"
+    /// into "this JVM cannot do that" — see [`VmCapabilities`].
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn capabilities(&mut self) -> JdwpResult<VmCapabilities> {
+        let id = self.next_id();
+        let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::CAPABILITIES);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let mut flag = || -> JdwpResult<bool> { Ok(read_u8(&mut data)? != 0) };
+        Ok(VmCapabilities {
+            can_watch_field_modification: flag()?,
+            can_watch_field_access: flag()?,
+            can_get_bytecodes: flag()?,
+            can_get_synthetic_attribute: flag()?,
+            can_get_owned_monitor_info: flag()?,
+            can_get_current_contended_monitor: flag()?,
+            can_get_monitor_info: flag()?,
         })
     }
 

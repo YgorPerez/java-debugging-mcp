@@ -69,6 +69,8 @@ pub struct DebugSession {
     pub exception_requests: HashMap<String, ExceptionRequestInfo>,
     /// Active field watchpoints (`FIELD_ACCESS` / `FIELD_MODIFICATION` requests), keyed by `watch_` id.
     pub watchpoints: HashMap<String, WatchpointInfo>,
+    /// Active method-exit requests (METH-1), keyed by their `mexit_` id.
+    pub method_exits: HashMap<String, MethodExitRequestInfo>,
     /// Ring buffer of trace/logpoint snapshots (see `TraceRecord`). Bounded by `MAX_TRACES`.
     pub traces: VecDeque<TraceRecord>,
     /// Monotonic sequence for trace records (survives ring-buffer eviction).
@@ -175,6 +177,14 @@ pub struct TraceRecord {
     pub line: Option<i32>,
     /// (name, rendered value) for each in-scope local/argument at the hit.
     pub args: Vec<(String, String)>,
+    /// The calling chain above the hit frame, nearest caller first, each as `class.method:line`
+    /// (TRACE-5). Empty when `trace_frames` was 0, or when the hit is already the outermost frame.
+    ///
+    /// **Locations only, deliberately.** The hit frame's locals are the payload; the callers are
+    /// context, and reading every frame's variable table would multiply the per-hit cost on a logpoint
+    /// that may fire hundreds of times. It also keeps the whole capture invocation-free, so caller
+    /// chains work in a read-only session (SAFE-6) — unlike object expansion.
+    pub callers: Vec<String>,
     /// (expression, rendered result) when the logpoint had a trace expression.
     pub expr: Option<(String, String)>,
     /// What kind of stop point this came from, and anything specific to it: for an exception, the
@@ -216,6 +226,8 @@ pub struct ExceptionRequestInfo {
     /// Remaining trace-hit budget (TRACE-3): each traced hit decrements it, and on reaching zero the
     /// request disarms itself so a hot throw site can't flood. `None` means unbounded.
     pub trace_budget: Option<u32>,
+    /// How many caller frames each traced throw records above the throwing frame (TRACE-5).
+    pub trace_frames: usize,
     /// Thread this request is filtered to (`ThreadOnly`), if any — for the `list_breakpoints` line (FILT-1).
     pub thread_filter: Option<u64>,
 }
@@ -253,7 +265,41 @@ pub struct WatchpointInfo {
     /// Remaining trace-hit budget (TRACE-3): each traced hit decrements it, and on reaching zero the
     /// watch disarms itself so a hot field can't flood the debuggee. `None` means unbounded.
     pub trace_budget: Option<u32>,
+    /// How many caller frames each traced hit records above the mutating frame (TRACE-5).
+    pub trace_frames: usize,
     /// Thread this watch is filtered to (`ThreadOnly`), if any — for the `list_breakpoints` line (FILT-1).
+    pub thread_filter: Option<u64>,
+}
+
+/// An active method-exit request (METH-1): a `METHOD_EXIT` / `METHOD_EXIT_WITH_RETURN_VALUE` request
+/// reporting what a method returned, keyed by its `mexit_` id.
+///
+/// Tracked like every other stop point so `list_breakpoints` shows it and `clear_breakpoint` / `panic` /
+/// `toggle_breakpoint` handle it. A stop point this tool can create but not clear would be a SAFE-class
+/// bug — and this is the kind least survivable if left armed, since a suspending method exit on a hot
+/// method freezes the VM faster than anything else here.
+#[derive(Debug, Clone)]
+pub struct MethodExitRequestInfo {
+    /// The `mexit_` id reported to the caller.
+    pub id: String,
+    /// The live JDWP request id, or `None` while disabled (BP-2).
+    pub request_id: Option<i32>,
+    pub enabled: bool,
+    /// Dotted class pattern the caller gave, kept so a disabled request can be re-armed.
+    pub class_pattern: String,
+    /// Method name to report on, filtered on OUR side: JDWP has no method-name modifier, so the request
+    /// fires for every method of a matching class and non-matching exits are dropped by the event pump.
+    /// `None` means every method — only allowed in trace mode.
+    pub method: Option<String>,
+    /// Whether this was armed as `METHOD_EXIT_WITH_RETURN_VALUE` (kind 42). Needed to clear it, since
+    /// JDWP keys requests by (eventKind, requestID); also says whether a hit can report a value at all.
+    pub with_return_value: bool,
+    /// Non-suspending trace mode — the default for this kind, and near-mandatory on a shared JVM.
+    pub trace: bool,
+    pub trace_expr: Option<String>,
+    pub trace_budget: Option<u32>,
+    /// Caller-frame depth for traced hits (TRACE-5).
+    pub trace_frames: usize,
     pub thread_filter: Option<u64>,
 }
 
@@ -281,6 +327,8 @@ pub struct PendingBreakpoint {
     pub trace_expr: Option<String>,
     /// Trace-hit budget carried through to the real breakpoint once the class loads (TRACE-3).
     pub trace_budget: Option<u32>,
+    /// Caller-frame depth carried through to the real breakpoint once the class loads (TRACE-5).
+    pub trace_frames: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +351,9 @@ pub struct BreakpointInfo {
     pub trace_expr: Option<String>,
     /// Remaining trace-hit budget (TRACE-3); `None` means unbounded.
     pub trace_budget: Option<u32>,
+    /// How many caller frames each traced hit records above the hit frame (TRACE-5). 0 restores the
+    /// original one-frame snapshot.
+    pub trace_frames: usize,
     /// Everything needed to re-arm this breakpoint at the same location after a `toggle_breakpoint`
     /// disable (BP-1). Kept for every armed breakpoint so disable→enable round-trips exactly.
     pub arm: BreakpointArm,
@@ -356,6 +407,7 @@ impl SessionManager {
             pending_breakpoints: Vec::new(),
             exception_requests: HashMap::new(),
             watchpoints: HashMap::new(),
+            method_exits: HashMap::new(),
             traces: VecDeque::new(),
             trace_seq: 0,
             stop_seq: 0,

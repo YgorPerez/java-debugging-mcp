@@ -825,6 +825,450 @@ fn traced_watchpoints_record_writes_without_suspending() {
     server.panic_reset();
 }
 
+/// TRACE-5: a traced hit records the calling chain, so a logpoint can say WHICH path reached it.
+///
+/// `CallerProbe.record` is reached from three different paths, and the assertion pairs each hit with
+/// its own chain via the `v` argument. That pairing is the whole test: a snapshot that captured one
+/// frame and reported a hardcoded or last-seen caller would satisfy any single-caller probe.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn traced_hits_record_which_caller_reached_them() {
+    let Some(jdk) = jdk_or_skip("traced_hits_record_which_caller_reached_them") else { return };
+    let probe = Probe::launch(&jdk, "CallerProbe").expect("launch CallerProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    let src = probe_source("CallerProbe");
+    let line = probe_line(&src, "// BP1");
+    // Depth 3 is DELIBERATELY deeper than the shallow paths reach: `record` under `alpha` sits on a
+    // 3-frame stack, so only 2 callers exist. JDWP fails a `Frames` request whose length exceeds the
+    // frames a thread has, and asking for the exact count lost the whole snapshot — locals included —
+    // on exactly those hits. A depth that every path could satisfy would not have caught it.
+    let set = server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({
+            "class_pattern": "CallerProbe", "line": line, "trace": true, "trace_frames": 3,
+        }),
+    );
+    assert_contains_all("traced logpoint with caller frames is armed", &set, &["bp_", "Caller frames: 3"]);
+
+    // The TRACE-2 discipline: reading caller frames must not leave the hit thread suspended. Only the
+    // probe's own output can prove that — the debugger reports success either way.
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
+            .is_some(),
+        "probe stopped ticking after a traced logpoint with caller frames — a hit left it suspended\n  output: {:?}",
+        probe.output(),
+    );
+
+    // Wait for the deepest path (record(3), reached via nested) so all three are certainly recorded.
+    let traces = server
+        .wait_for_traces("CallerProbe.nested:", EVENT_TIMEOUT)
+        .expect("no traced hit ever reported a caller chain");
+
+    // Each of the three paths must report ITS OWN caller chain, matched by the `v` it was called with.
+    // record(1) came via alpha, record(2) directly via beta, record(3) via nested (itself under beta).
+    // `depth` is how many callers that path really has, which for the first two is LESS than the 3
+    // requested — the shallow-stack case.
+    for (v, want_chain, depth) in [
+        (1, &["CallerProbe.alpha:", "CallerProbe.main:"][..], 2),
+        (2, &["CallerProbe.beta:", "CallerProbe.main:"][..], 2),
+        (3, &["CallerProbe.nested:", "CallerProbe.beta:", "CallerProbe.main:"][..], 3),
+    ] {
+        let hit = traces
+            .lines()
+            .find(|l| trace_int(l, "v") == Some(v))
+            .unwrap_or_else(|| panic!("no trace line for record({v}) in:\n{traces}"));
+        assert!(hit.contains("CallerProbe.record:"), "the hit frame is still record() itself: {hit}");
+        for want in want_chain {
+            assert!(hit.contains(want), "record({v}) should report `{want}` in its chain: {hit}");
+        }
+        // Exactly the callers that exist — not the requested 3 padded out, and not a truncation.
+        assert_eq!(
+            hit.matches(" ← ").count(),
+            depth,
+            "record({v}) has {depth} caller(s) above it: {hit}"
+        );
+        // The locals must survive alongside the chain. Losing them was the real cost of the
+        // over-long `Frames` request, and it was silent: the line still looked like a valid hit.
+        assert!(
+            hit.contains(&format!("{{v=(int) {v}}}")),
+            "record({v}) must still capture the hit frame's locals: {hit}"
+        );
+        // Caller frames carry LOCATIONS ONLY — one `{…}` group on the line, the hit frame's. A caller
+        // rendered with its variable table would add another.
+        assert_eq!(
+            hit.matches('{').count(),
+            1,
+            "only the hit frame's locals should be captured, not each caller's: {hit}"
+        );
+    }
+
+    // The depth is visible in the bookkeeping, so a slowed-down debuggee is explainable from a listing.
+    assert_contains_all(
+        "caller depth is listed",
+        &server.call("debug.list_breakpoints", serde_json::json!({})),
+        &["(trace)", "[+3 caller frame(s)]"],
+    );
+
+    server.panic_reset();
+}
+
+/// TRACE-5: `trace_frames: 0` is the pre-TRACE-5 one-frame snapshot, and the cap is enforced and
+/// reported rather than silently applied.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn trace_frames_zero_keeps_the_one_frame_snapshot_and_the_cap_is_reported() {
+    let Some(jdk) = jdk_or_skip("trace_frames_zero_keeps_the_one_frame_snapshot_and_the_cap_is_reported")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "CallerProbe").expect("launch CallerProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let src = probe_source("CallerProbe");
+    let line = probe_line(&src, "// BP1");
+
+    let zero = server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({
+            "class_pattern": "CallerProbe", "line": line, "trace": true, "trace_frames": 0,
+        }),
+    );
+    assert!(zero.contains("Caller frames: 0"), "depth 0 should say so: {zero}");
+
+    let traces = server.wait_for_traces("CallerProbe.record", EVENT_TIMEOUT).unwrap_or_default();
+    assert!(traces.contains("CallerProbe.record"), "the logpoint never fired: {traces}");
+    assert!(
+        !traces.contains(" ← "),
+        "trace_frames:0 must record no callers at all: {traces}"
+    );
+    // ...and with no callers there is nothing extra on the listing either.
+    assert!(
+        !server.call("debug.list_breakpoints", serde_json::json!({})).contains("caller frame(s)"),
+        "depth 0 should not advertise a caller depth"
+    );
+
+    // A request past the cap is clamped AND says so: a silently ignored argument would leave the
+    // caller believing they had a 99-frame chain.
+    let over = server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({
+            "class_pattern": "CallerProbe", "line": line, "trace": true, "trace_frames": 99,
+        }),
+    );
+    assert_contains_all("the cap is reported, not silent", &over, &["clamped to 20", "Caller frames: 20"]);
+
+    server.panic_reset();
+}
+
+/// DUMP-1: one call returns every thread's stack plus who holds what, and a real two-lock deadlock is
+/// readable off the output.
+///
+/// The cross-pairing is the assertion that matters: each thread must be shown holding ITS lock and
+/// waiting for the OTHER thread's, with the holder named. Reporting monitors per thread without
+/// correlating them would satisfy a laxer test and still leave a deadlock invisible.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn thread_dump_shows_stacks_and_the_deadlock_cycle() {
+    let Some(jdk) = jdk_or_skip("thread_dump_shows_stacks_and_the_deadlock_cycle") else { return };
+    let probe = Probe::launch(&jdk, "DeadlockProbe").expect("launch DeadlockProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // `armed=2` means both threads hold their first lock and are reaching for the second, so the cycle
+    // has formed. Dumping before that would race the deadlock into existence.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("armed=2"))
+        .unwrap_or_else(|| panic!("the probe never armed both locks\n  output: {:?}", probe.output()));
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    // Without suspend:true the running threads are unreadable — and the reply must SAY that rather than
+    // return an empty-looking dump that reads as "nothing is contended".
+    let running = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"name_filter": "deadlock", "monitors": true}),
+    );
+    assert_contains_all(
+        "a running VM explains why it can't be read",
+        &running,
+        &["deadlock-one", "JDWP can only read a suspended thread", "suspend:true"],
+    );
+    assert!(
+        !running.contains("waiting to enter"),
+        "nothing should be claimed about locks it could not read: {running}"
+    );
+
+    // The real dump: freeze briefly, read, resume, verify.
+    let dump = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"name_filter": "deadlock", "suspend": true, "max_frames": 6}),
+    );
+    assert_contains_all(
+        "the dump resumed the VM and says so",
+        &dump,
+        &["verified running", "Cost:", "JDWP packet(s)"],
+    );
+
+    // Each thread's own section, holding one lock and blocked on the other — with the holder named.
+    // Split on "\n0x" (a thread header, always at the start of a line): a bare "0x" also appears
+    // mid-line in the `← held by 0x…` annotation and inside JVM lambda class names.
+    let one = dump_section(&dump, "deadlock-one")
+        .unwrap_or_else(|| panic!("no deadlock-one section in:\n{dump}"));
+    let two = dump_section(&dump, "deadlock-two")
+        .unwrap_or_else(|| panic!("no deadlock-two section in:\n{dump}"));
+    let (one, two) = (one.as_str(), two.as_str());
+
+    assert!(one.contains("holds: DeadlockProbe$LockA@"), "deadlock-one must hold LockA:\n{one}");
+    assert!(
+        one.contains("waiting to enter: DeadlockProbe$LockB@"),
+        "deadlock-one must be blocked on LockB:\n{one}"
+    );
+    assert!(one.contains("held by"), "the blocking lock's holder must be named:\n{one}");
+    assert!(one.contains("deadlock-two"), "LockB is held by deadlock-two:\n{one}");
+
+    assert!(two.contains("holds: DeadlockProbe$LockB@"), "deadlock-two must hold LockB:\n{two}");
+    assert!(
+        two.contains("waiting to enter: DeadlockProbe$LockA@"),
+        "deadlock-two must be blocked on LockA:\n{two}"
+    );
+    assert!(two.contains("deadlock-one"), "LockA is held by deadlock-one:\n{two}");
+
+    // Stacks came back too — a dump without frames would be a monitor report, not a thread dump.
+    assert!(one.contains("DeadlockProbe.grab:"), "deadlock-one's stack must show grab():\n{one}");
+
+    // The load-bearing check, as everywhere else in this suite: the debuggee is still running. Only
+    // main can report that — the deadlocked pair never will.
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
+            .is_some(),
+        "the probe stopped ticking after a suspending thread dump — it was not resumed\n  output: {:?}",
+        probe.output(),
+    );
+
+    server.panic_reset();
+}
+
+/// DUMP-1 + SAFE-6: a thread dump reads only, so it must work in a read-only session — and it must not
+/// suspend anything unless asked, since silently pausing a shared VM is the SAFE-4 mistake.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn thread_dump_works_read_only_and_never_suspends_on_its_own() {
+    let Some(jdk) = jdk_or_skip("thread_dump_works_read_only_and_never_suspends_on_its_own") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "DeadlockProbe").expect("launch DeadlockProbe");
+    let mut server = Server::start_with_env(&[("JDWP_READONLY", "1")]).expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("armed=2")).expect("probe never armed");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    // Reading frames and monitors invokes nothing, so read-only must not refuse it — the guard is about
+    // executing code in the debuggee, and a wedged production JVM is exactly where a dump is needed.
+    let dump = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"name_filter": "deadlock", "suspend": true}),
+    );
+    assert!(!dump.contains("Read-only session"), "a dump invokes nothing, so read-only must allow it: {dump}");
+    assert_contains_all("the read-only dump still correlates the locks", &dump, &["holds: DeadlockProbe$Lock", "held by"]);
+
+    // A dump WITHOUT suspend:true must leave the VM running: no pause, so the ticks never stop.
+    server.call("debug.thread_dump", serde_json::json!({"limit": 5}));
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
+            .is_some(),
+        "a default thread dump must not suspend the VM\n  output: {:?}",
+        probe.output(),
+    );
+    // ...and the session must not think it is suspended either, or the watchdog would try to rescue it.
+    assert!(
+        !server.call("debug.list_sessions", serde_json::json!({})).contains("SUSPENDED"),
+        "a default thread dump must leave no suspension behind"
+    );
+
+    server.panic_reset();
+}
+
+/// METH-1: a method-exit request reports which `return` was taken AND what it returned.
+///
+/// `ReturnProbe.classify` has two returns and alternates between them, so the test can pair each hit's
+/// value with its return site. A probe with one return would pass even if the value were read from the
+/// wrong place, and a non-null-only probe would let a missing `null` look like a missing value.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn method_exit_reports_the_value_each_return_produced() {
+    let Some(jdk) = jdk_or_skip("method_exit_reports_the_value_each_return_produced") else { return };
+    let probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    // No `trace` given: this kind defaults to trace mode, unlike every other stop point.
+    let set = server.call(
+        "debug.set_method_breakpoint",
+        serde_json::json!({"class_pattern": "ReturnProbe", "method": "classify"}),
+    );
+    assert_contains_all(
+        "armed in trace mode by default",
+        &set,
+        &["mexit_", "trace (non-suspending)", "Method filter: classify"],
+    );
+
+    // The TRACE-2 discipline: the probe must keep printing.
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
+            .is_some(),
+        "probe stopped ticking after a traced method-exit request — a return left it suspended\n  output: {:?}",
+        probe.output(),
+    );
+
+    let traces = server
+        .wait_for_traces("returned=null", EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("the null-returning path was never reported"));
+
+    // Both values, from the two different `return` statements.
+    let ok = traces
+        .lines()
+        .find(|l| l.contains("returned=\"OK\""))
+        .unwrap_or_else(|| panic!("no \"OK\" return reported in:\n{traces}"));
+    let null = traces
+        .lines()
+        .find(|l| l.contains("returned=null"))
+        .unwrap_or_else(|| panic!("no null return reported in:\n{traces}"));
+
+    // Which `return` was taken: the two paths must report DIFFERENT lines, or the location is not
+    // actually the return site and "which path did it take" is unanswered.
+    let line_of = |s: &str| {
+        s.split("ReturnProbe.classify:").nth(1).and_then(|r| {
+            let end = r.find(|c: char| !c.is_ascii_digit()).unwrap_or(r.len());
+            r.get(..end).and_then(|d| d.parse::<i32>().ok())
+        })
+    };
+    let (ok_line, null_line) = (
+        line_of(ok).unwrap_or_else(|| panic!("no return site on: {ok}")),
+        line_of(null).unwrap_or_else(|| panic!("no return site on: {null}")),
+    );
+    assert_ne!(
+        ok_line, null_line,
+        "the two returns are different statements, so their return sites must differ:\n  {ok}\n  {null}"
+    );
+
+    // The method filter is real: `other()` also returns on every iteration, and JDWP's ClassMatch
+    // reported it to us — it must have been dropped rather than recorded.
+    assert!(
+        !traces.contains("ReturnProbe.other"),
+        "the method filter must drop other()'s returns:\n{traces}"
+    );
+
+    // The whole set of bookkeeping tools must know about this kind — a stop point that can be created
+    // but not listed or cleared would be a SAFE-class bug.
+    let listed = server.call("debug.list_breakpoints", serde_json::json!({}));
+    assert_contains_all(
+        "listed as a method-exit request",
+        &listed,
+        &["method-exit ReturnProbe.classify", "with return value", "(trace)"],
+    );
+    let mexit_id = grab_token(&listed, "mexit_").expect("no mexit id in the listing");
+
+    let off = server
+        .call("debug.toggle_breakpoint", serde_json::json!({"breakpoint_id": mexit_id, "enabled": false}));
+    assert_contains_all("toggle disables it", &off, &["Disabled", "method-exit"]);
+    let on = server
+        .call("debug.toggle_breakpoint", serde_json::json!({"breakpoint_id": mexit_id, "enabled": true}));
+    assert_contains_all("toggle re-arms it under the same id", &on, &["Re-armed", &mexit_id]);
+    let cleared = server.call("debug.clear_breakpoint", serde_json::json!({"breakpoint_id": mexit_id}));
+    assert_contains_all("clear removes it", &cleared, &["cleared", &mexit_id]);
+    assert!(
+        !server.call("debug.list_breakpoints", serde_json::json!({})).contains(&mexit_id),
+        "a cleared method-exit request must be gone from the listing"
+    );
+
+    server.panic_reset();
+}
+
+/// METH-1: the safety rule for the noisiest event kind in JDWP — a broad SUSPENDING method-exit request
+/// is refused outright, with the reason and the fix, and `panic` drops the ones that do get armed.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_broad_suspending_method_exit_is_refused_and_panic_clears_the_rest() {
+    let Some(jdk) = jdk_or_skip("a_broad_suspending_method_exit_is_refused_and_panic_clears_the_rest")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    // No method filter + suspending: this would freeze the VM on the first return of any method.
+    let no_method = server.call(
+        "debug.set_method_breakpoint",
+        serde_json::json!({"class_pattern": "ReturnProbe", "trace": false}),
+    );
+    assert_contains_all(
+        "a suspending request with no method filter is refused",
+        &no_method,
+        &["Refused", "no method filter", "trace:true"],
+    );
+
+    // A wildcard class is refused for the same reason even WITH a method name.
+    let wildcard = server.call(
+        "debug.set_method_breakpoint",
+        serde_json::json!({"class_pattern": "Return*", "method": "classify", "trace": false}),
+    );
+    assert_contains_all("a wildcard class is refused too", &wildcard, &["Refused", "Return*"]);
+
+    // Neither refusal may have armed anything — a refusal that half-armed would be worse than allowing it.
+    assert!(
+        !server.call("debug.list_breakpoints", serde_json::json!({})).contains("mexit_"),
+        "a refused request must not be armed"
+    );
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 1))
+            .is_some(),
+        "the probe must still be running after two refusals\n  output: {:?}",
+        probe.output(),
+    );
+
+    // The narrow form IS allowed: one concrete class, one method, explicitly suspending.
+    let narrow = server.call(
+        "debug.set_method_breakpoint",
+        serde_json::json!({"class_pattern": "ReturnProbe", "method": "classify", "trace": false}),
+    );
+    assert_contains_all("the narrow suspending form is allowed", &narrow, &["mexit_", "SUSPENDING"]);
+
+    // It suspends on a real return, and reports the value through the event path (not get_traces).
+    let ev = server
+        .wait_for_event("\"event\":\"method_exit\"", EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("a suspending method exit never fired"));
+    assert_contains_all("the event reports the return site and value", &ev, &["ReturnProbe", "returned"]);
+
+    // panic must drop it: resuming without clearing would re-freeze on the very next return, which for
+    // this kind is immediate.
+    let panicked = server.panic_reset();
+    assert!(panicked.contains("method-exit"), "panic must say it cleared the method-exit request: {panicked}");
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 3))
+            .is_some(),
+        "panic must leave the probe running — a method-exit request left armed re-freezes it at once\n  output: {:?}",
+        probe.output(),
+    );
+}
+
 /// EVT-1: a second hit must not erase the first. Before the event ring buffer, `last_event` was one
 /// slot, so the breakpoint below was silently gone by the time the step landed.
 #[test]
@@ -1063,6 +1507,14 @@ fn trace_int(line: &str, key: &str) -> Option<i64> {
     rest[..end].parse().ok()
 }
 
+/// The integer in a rendered `debug.evaluate` result like `n = (int) 3`.
+fn int_value(rendered: &str) -> Option<i64> {
+    let start = rendered.find("(int) ")? + "(int) ".len();
+    let rest = &rendered[start..];
+    let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
 /// Pull the ints out of `"old":"(int) 5"` / `"new":"(int) 6"` in an event line.
 fn parse_old_new(ev: &str) -> Option<(i64, i64)> {
     let grab = |key: &str| -> Option<i64> {
@@ -1251,6 +1703,26 @@ fn thread_hex_for(server: &mut Server, name_substr: &str) -> Option<String> {
         let t = l.trim();
         t.starts_with("0x").then(|| t.split_whitespace().next().map(str::to_string)).flatten()
     })
+}
+
+/// One thread's block from a `debug.thread_dump` reply, found by a substring of its header line.
+///
+/// Sections are delimited by a thread header at the start of a line (`0x<id> "<name>" […]`). Splitting
+/// on a bare `0x` would cut a section short, because `0x` also appears mid-line in the `← held by 0x…`
+/// annotation and inside JVM lambda class names (`DeadlockProbe$$Lambda.0x…`) — which is exactly how
+/// this helper's absence first showed up as a missing `holds:` line.
+fn dump_section(dump: &str, header_substr: &str) -> Option<String> {
+    let mut sections: Vec<String> = Vec::new();
+    for line in dump.lines() {
+        if line.starts_with("0x") {
+            sections.push(String::new());
+        }
+        if let Some(cur) = sections.last_mut() {
+            cur.push_str(line);
+            cur.push('\n');
+        }
+    }
+    sections.into_iter().find(|s| s.lines().next().is_some_and(|h| h.contains(header_substr)))
 }
 
 /// Count the trace records (lines beginning with `#`) in a `debug.get_traces` reply.
@@ -1610,9 +2082,19 @@ fn boolean_operators_in_predicates_and_conditions() {
     );
 
     // A compound breakpoint CONDITION: n and local are both the loop counter, so n>2 && local>2 first
-    // holds at n == 3. Reaching the suspend at all proves both clauses were evaluated. Swap the plain
-    // breakpoint (still suspended from the first hit) for the conditioned one WHILE suspended, then
-    // resume so the condition is evaluated afresh on later calls.
+    // holds at n == 3. Reaching the suspend at all proves both clauses were evaluated, and stopping at
+    // the FIRST qualifying iteration proves neither clause is off by one. Swap the plain breakpoint
+    // (still suspended from the first hit) for the conditioned one WHILE suspended, then resume so the
+    // condition is evaluated afresh on later calls.
+    //
+    // Which iteration that is depends on how far the loop had already run when we attached: the probe
+    // ticks every 150ms, so on a slow or loaded box the plain breakpoint can catch n == 3 or later and
+    // the first hit the condition can possibly see is the NEXT one. Hardcoding `n == 3` made this test
+    // fail for a reason that has nothing to do with `&&` — so anchor the expectation to the iteration
+    // we actually resumed from instead of to the clock.
+    let first_n = int_value(&server.evaluate("n")).expect("no int value for n at the plain hit");
+    let expect_n = std::cmp::max(3, first_n + 1);
+
     let listed = server.call("debug.list_breakpoints", serde_json::json!({}));
     let old_bp = grab_token(&listed, "bp_").expect("no bp to clear");
     server.call("debug.clear_breakpoint", serde_json::json!({"breakpoint_id": old_bp}));
@@ -1627,7 +2109,11 @@ fn boolean_operators_in_predicates_and_conditions() {
         .wait_for_event("\"event\":\"breakpoint\"", EVENT_TIMEOUT)
         .expect("compound condition never fired");
     assert!(hit.contains("[suspended] true"), "the compound condition should have suspended: {hit}");
-    assert_contains_all("condition held at n == 3", &server.evaluate("n"), &["(int) 3"]);
+    assert_contains_all(
+        &format!("condition held at the first qualifying iteration (n == {expect_n}, resumed from {first_n})"),
+        &server.evaluate("n"),
+        &[&format!("(int) {expect_n}")],
+    );
 
     server.panic_reset();
 }

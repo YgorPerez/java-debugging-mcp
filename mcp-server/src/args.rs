@@ -19,6 +19,8 @@ const fn default_trace_limit() -> usize { 50 }
 const fn default_event_limit() -> usize { 1 }
 const fn default_max_depth() -> usize { 2 }
 const fn default_max_children() -> usize { 16 }
+const fn default_trace_frames() -> usize { crate::handlers::DEFAULT_TRACE_FRAMES }
+const fn default_dump_frames() -> usize { 8 }
 
 /// Parse an optional hex thread id like "0x2" (or "2") into a raw id.
 pub fn parse_thread_id(s: Option<&str>) -> Option<u64> {
@@ -92,6 +94,13 @@ pub struct SetBreakpointArgs {
     /// a hot line can't flood the debuggee (defaults to 200). Pass 0 for no limit.
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
+    /// Only with `trace:true` — how many CALLER frames to record above the hit, so a snapshot says
+    /// **which path reached it**, not just that it fired (default 3; 0 for the hit frame alone, capped
+    /// at 20). Callers are recorded as `class.method:line` locations only — no locals, no invocation —
+    /// so this stays safe in a read-only session. Each frame costs JVM round trips on *every* hit, so
+    /// keep it small on a hot line and pair it with `trace_max_hits`.
+    #[serde(default = "default_trace_frames")]
+    pub trace_frames: usize,
     // NOTE: `session_id` is a cross-cutting argument handled uniformly by `resolve_session`
     // (from the raw arguments) for every tool, so it is intentionally not a typed field here.
 }
@@ -242,6 +251,46 @@ pub struct ListThreadsArgs {
     pub limit: usize,
 }
 
+/// Arguments for `debug.thread_dump` (DUMP-1).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ThreadDumpArgs {
+    /// Only threads whose name contains this substring (case-insensitive), e.g. 'default task' for
+    /// `WildFly`'s request pool. The cheapest way to cut the cost of a dump on a JVM with hundreds of
+    /// threads.
+    #[serde(default)]
+    pub name_filter: Option<String>,
+    /// Only threads that are already suspended. On a running VM those are the only ones whose stacks
+    /// can be read at all, so this is the way to get a dump with no unreadable entries in it.
+    #[serde(default)]
+    pub only_suspended: bool,
+    /// Max threads to include; the rest are reported as a hidden count (default 40).
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    /// Max frames per thread (default 8 — deliberately narrower than `debug.get_stack`, since this
+    /// multiplies by the thread count). The deepest frames are the ones dropped.
+    #[serde(default = "default_dump_frames")]
+    pub max_frames: usize,
+    /// Only show frames whose class name contains this substring (case-insensitive), e.g. your app
+    /// package; framework frames collapse into "… N frame(s) hidden" and cost no lookups. On a
+    /// `WildFly` stack this is the difference between 8 useful frames and 8 servlet-filter frames.
+    #[serde(default)]
+    pub package_filter: Option<String>,
+    /// Include each thread's held monitors and the monitor it is blocked on (default true) — the
+    /// "who holds the lock this thread is waiting for" half of a deadlock investigation. Skipped
+    /// automatically, with a note, on a JVM that lacks the capability.
+    #[serde(default = "default_true")]
+    pub monitors: bool,
+    /// Suspend the VM for the duration of the dump, then resume it and verify it is running again.
+    ///
+    /// Off by default, and that default is the point: JDWP can only read a **suspended** thread's stack
+    /// and locks, so a dump of a running VM reports every thread as unreadable — but silently pausing a
+    /// shared instance to make the output look better is exactly the mistake SAFE-4 was about. Pass
+    /// `true` to say explicitly "freeze it briefly, I accept that". A VM that is *already* suspended is
+    /// read as it is and left suspended, whatever this is set to.
+    #[serde(default)]
+    pub suspend: bool,
+}
+
 /// Arguments for `debug.set_value`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetValueArgs {
@@ -291,6 +340,13 @@ pub struct SetExceptionBreakpointArgs {
     /// so a hot throw site can't flood the debuggee (TRACE-3).
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
+    /// Only with `trace:true` — how many CALLER frames to record above the throw, so a swallowed
+    /// exception says **which request path reached the catch**, which is usually the whole question
+    /// (default 3; 0 for the throwing frame alone, capped at 20). Callers are recorded as
+    /// `class.method:line` locations only — no locals, no invocation — so this stays safe in a
+    /// read-only session. Each frame costs JVM round trips on every hit.
+    #[serde(default = "default_trace_frames")]
+    pub trace_frames: usize,
     /// Only report throws on this thread (hex id, e.g. `0x2a`). On a busy app server with hundreds of
     /// threads, restricting to your request thread is the single biggest noise reduction — get the id
     /// from `debug.list_threads {name_filter}` first, then arm, then trigger (FILT-1).
@@ -327,9 +383,53 @@ pub struct SetWatchpointArgs {
     /// so a hot field can't flood the debuggee (TRACE-3).
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
+    /// Only with `trace:true` — how many CALLER frames to record above the mutating frame, so "who
+    /// mutates this?" is answered with the path that got there, not just the innermost setter (default
+    /// 3; 0 for the mutating frame alone, capped at 20). Callers are recorded as `class.method:line`
+    /// locations only — no locals, no invocation — so this stays safe in a read-only session. Each
+    /// frame costs JVM round trips on every hit.
+    #[serde(default = "default_trace_frames")]
+    pub trace_frames: usize,
     /// Only report touches from this thread (hex id, e.g. `0x2a`). On a busy app server, restricting
     /// to your request thread is the single biggest noise reduction — get the id from
     /// `debug.list_threads {name_filter}` first, then arm, then trigger (FILT-1).
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
+
+/// Arguments for `debug.set_method_breakpoint` (METH-1).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetMethodBreakpointArgs {
+    /// Class whose method returns you want to see (e.g. `br.com.infotravel.IntegraSrv`), optionally
+    /// with a leading/trailing `*`. This is a JDWP `ClassMatch`, so it fires for **every method** of
+    /// every matching class — give `method` as well unless you really want all of them.
+    pub class_pattern: String,
+    /// Only report returns from this method name. Filtered on our side, because JDWP has no
+    /// method-name modifier — the JVM still reports every method of the class and non-matching exits
+    /// are dropped here. Overloads all match, since the name is all JDWP gives us to compare.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Logpoint mode: snapshot each return (location, thread, in-scope locals, the returned value) and
+    /// resume immediately WITHOUT suspending. **Defaults to true, unlike every other stop point** — a
+    /// suspending method exit on a hot method is the fastest way to freeze a shared JVM this tool
+    /// offers. Setting it false needs a concrete class and a `method`, or it is refused.
+    #[serde(default = "default_true")]
+    pub trace: bool,
+    /// Only with `trace:true` — an expression evaluated in the returning frame and recorded alongside
+    /// the snapshot.
+    #[serde(default)]
+    pub trace_expr: Option<String>,
+    /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit).
+    /// Method exits are the noisiest event in JDWP, so this budget matters more here than anywhere else.
+    #[serde(default)]
+    pub trace_max_hits: Option<u32>,
+    /// Only with `trace:true` — how many caller frames to record above the return, as
+    /// `class.method:line` (default 3; 0 for the returning frame alone, capped at 20).
+    #[serde(default = "default_trace_frames")]
+    pub trace_frames: usize,
+    /// Only report returns on this thread (hex id, e.g. `0x2a`). On a busy app server this is the
+    /// single biggest noise reduction for this event kind — get the id from `debug.list_threads`
+    /// or `debug.thread_dump` first.
     #[serde(default)]
     pub thread_id: Option<String>,
 }
@@ -368,6 +468,8 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(GetTracesArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(GetLastEventArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(ToggleBreakpointArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(ThreadDumpArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(SetMethodBreakpointArgs)).unwrap(),
         ];
         for s in schemas {
             assert_eq!(s.get("type").and_then(|t| t.as_str()), Some("object"));
@@ -387,6 +489,29 @@ mod tests {
         assert!(!st.expand_objects);
         assert_eq!(st.max_depth, 2);
         assert_eq!(st.max_children, 16);
+    }
+
+    // TRACE-5: all three traced stop points default to the SAME caller depth, and it is the documented
+    // one. A per-tool default would make "which path reached this?" depend on which tool you reached
+    // for, and the tool descriptions state the number.
+    #[test]
+    fn trace_frames_defaults_are_shared_and_documented() {
+        let bp: SetBreakpointArgs =
+            serde_json::from_value(serde_json::json!({"class_pattern": "C", "line": 1})).unwrap();
+        let exc: SetExceptionBreakpointArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        let watch: SetWatchpointArgs =
+            serde_json::from_value(serde_json::json!({"class_name": "C", "field_name": "f"})).unwrap();
+
+        assert_eq!(bp.trace_frames, 3);
+        assert_eq!(exc.trace_frames, bp.trace_frames);
+        assert_eq!(watch.trace_frames, bp.trace_frames);
+
+        // Explicit 0 must survive deserialization as 0, not fall back to the default — it is how a
+        // caller asks for the original one-frame snapshot.
+        let off: SetBreakpointArgs =
+            serde_json::from_value(serde_json::json!({"class_pattern": "C", "line": 1, "trace_frames": 0}))
+                .unwrap();
+        assert_eq!(off.trace_frames, 0);
     }
 
     // `get_last_event` gained a buffer (EVT-1) but must stay backward compatible: a bare call still

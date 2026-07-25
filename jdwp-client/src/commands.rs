@@ -121,7 +121,18 @@ pub mod stack_frame_commands {
     pub const POP_FRAMES: u8 = 4;
 }
 
-// Event kinds for EventRequest.Set
+// Event kinds for EventRequest.Set.
+//
+// This is the protocol's full table, so most entries are named but unrequested — that is deliberate, and
+// different from having decode paths for an event nothing can arm. Two worth knowing about:
+//
+// - `METHOD_ENTRY` (40) is named but intentionally NOT wired up. With a `ClassMatch` it fires on every
+//   method of every matching class — the noisiest event in JDWP — and "what calls this?" is answered
+//   far more cheaply by a traced breakpoint's caller chain (TRACE-5). `EventKind::MethodEntry` was
+//   removed for that reason (METH-1); this constant is a spec reference, not an oversight to fix.
+// - The `MONITOR_*` kinds (43-46) are the event-driven view of lock contention. The polling view —
+//   `owned_monitors` / `current_contended_monitor`, behind `debug.thread_dump` — is what DUMP-1 needed;
+//   these would only be worth arming for a live contention *detector*.
 pub mod event_kinds {
     pub const SINGLE_STEP: u8 = 1;
     pub const BREAKPOINT: u8 = 2;

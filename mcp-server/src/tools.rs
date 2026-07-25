@@ -4,7 +4,7 @@
 // advertised schema always matches what the handler deserializes. Tools with no arguments use an
 // empty object schema.
 
-use crate::args::{AttachArgs, SetBreakpointArgs, ClearBreakpointArgs, StepArgs, GetStackArgs, EvaluateArgs, GetLastEventArgs, ListThreadsArgs, SetValueArgs, GetTracesArgs, SetExceptionBreakpointArgs, SetWatchpointArgs, ForceReturnArgs, ToggleBreakpointArgs};
+use crate::args::{AttachArgs, SetBreakpointArgs, ClearBreakpointArgs, StepArgs, GetStackArgs, EvaluateArgs, GetLastEventArgs, ListThreadsArgs, SetValueArgs, GetTracesArgs, SetExceptionBreakpointArgs, SetWatchpointArgs, ForceReturnArgs, ToggleBreakpointArgs, ThreadDumpArgs, SetMethodBreakpointArgs};
 use crate::protocol::Tool;
 use serde_json::json;
 
@@ -57,18 +57,23 @@ fn stop_point_tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "debug.set_breakpoint".to_string(),
-            description: "Set a breakpoint at a location (class_pattern + line and/or method). Pass trace:true to make it a non-suspending logpoint that snapshots and resumes instead of freezing the thread — safe on the shared 8180; read snapshots with debug.get_traces.".to_string(),
+            description: "Set a breakpoint at a location (class_pattern + line and/or method). Pass trace:true to make it a non-suspending logpoint that snapshots and resumes instead of freezing the thread — safe on the shared 8180; read snapshots with debug.get_traces. A traced hit also records the calling chain (trace_frames, default 3) as class.method:line, so you can see which path reached it.".to_string(),
             input_schema: to_val(schemars::schema_for!(SetBreakpointArgs)),
         },
         Tool {
             name: "debug.set_exception_breakpoint".to_string(),
-            description: "Break when an exception is thrown. Give class_pattern (e.g. java.lang.NullPointerException or a custom ErrorException) to target one type + its subclasses — ideal for silent-catch bugs where a swallowed exception hides the failure. Omit class_pattern to catch ALL exceptions (noisy). caught/uncaught select which throws to report. The hit is reported via debug.get_last_event with the exception type + throw/catch location. Pass trace:true to collect throws WITHOUT suspending — required on a shared instance, where the default freezes every thread on each throw; read them with debug.get_traces.".to_string(),
+            description: "Break when an exception is thrown. Give class_pattern (e.g. java.lang.NullPointerException or a custom ErrorException) to target one type + its subclasses — ideal for silent-catch bugs where a swallowed exception hides the failure. Omit class_pattern to catch ALL exceptions (noisy). caught/uncaught select which throws to report. The hit is reported via debug.get_last_event with the exception type + throw/catch location. Pass trace:true to collect throws WITHOUT suspending — required on a shared instance, where the default freezes every thread on each throw; read them with debug.get_traces. A traced throw also records the calling chain (trace_frames, default 3), which is usually the actual question for a swallowed exception: which request path reached the catch.".to_string(),
             input_schema: to_val(schemars::schema_for!(SetExceptionBreakpointArgs)),
         },
         Tool {
             name: "debug.set_watchpoint".to_string(),
-            description: "Break when a field is read or written — answers \"who mutates this?\" for a field that changes behind your back (a config flag, an id, a status). Give class_name + field_name; modify:true (default) breaks on writes and reports the mutating location with old → new value, access:true also breaks on reads (noisy). The class must already be loaded — watchpoints can't be deferred. Hits come back via debug.get_last_event; pass trace:true to collect them WITHOUT suspending (required on a shared instance) and read them with debug.get_traces. A watched field can't be JIT-optimised, so clear it when done.".to_string(),
+            description: "Break when a field is read or written — answers \"who mutates this?\" for a field that changes behind your back (a config flag, an id, a status). Give class_name + field_name; modify:true (default) breaks on writes and reports the mutating location with old → new value, access:true also breaks on reads (noisy). The class must already be loaded — watchpoints can't be deferred. Hits come back via debug.get_last_event; pass trace:true to collect them WITHOUT suspending (required on a shared instance) and read them with debug.get_traces. A traced hit also records the calling chain (trace_frames, default 3), so \"who mutates this?\" is answered with the path that got there, not just the innermost setter. A watched field can't be JIT-optimised, so clear it when done.".to_string(),
             input_schema: to_val(schemars::schema_for!(SetWatchpointArgs)),
+        },
+        Tool {
+            name: "debug.set_method_breakpoint".to_string(),
+            description: "Report what a method actually RETURNED, without having to guess which `return` statement runs — for a method with several returns, or one whose value comes from a chain you can't easily break on. Each hit gives the return site (so you know which path was taken) plus the returned value. Give class_pattern + method; the method filter is applied our side because JDWP has no method-name modifier, so omitting it reports every method of the class. UNLIKE the other stop points, trace defaults to TRUE: a suspending method exit on a hot method is the fastest way to freeze a shared JVM, so trace:false is refused unless you name one concrete class AND one method. Read hits with debug.get_traces (trace) or debug.get_last_event (suspending). Composes with thread_id, trace_max_hits and trace_frames. A JVM below JDWP 1.6 degrades to the return site without the value, and says so.".to_string(),
+            input_schema: to_val(schemars::schema_for!(SetMethodBreakpointArgs)),
         },
         Tool {
             name: "debug.list_breakpoints".to_string(),
@@ -158,8 +163,13 @@ fn inspection_tools() -> Vec<Tool> {
             input_schema: to_val(schemars::schema_for!(ListThreadsArgs)),
         },
         Tool {
+            name: "debug.thread_dump".to_string(),
+            description: "Every thread's stack in ONE call, plus which monitors each thread holds and which one it is blocked entering — the \"it's wedged, who is blocked on what?\" question, which list_threads (names only) and get_stack (one thread) can't answer. A thread waiting on a lock someone else holds is annotated `← held by 0x<id> \"<name>\"`, so a deadlock cycle is readable off the output. IMPORTANT: JDWP can only read a SUSPENDED thread's stack and locks, so on a running VM every thread comes back unreadable — pass suspend:true to freeze it briefly (it is resumed and verified before the reply) or only_suspended:true to list just the readable ones. It never suspends on its own. Narrow the cost with name_filter / limit / max_frames / package_filter; the reply reports how many JDWP packets it spent. Works in a read-only session (it invokes nothing).".to_string(),
+            input_schema: to_val(schemars::schema_for!(ThreadDumpArgs)),
+        },
+        Tool {
             name: "debug.get_traces".to_string(),
-            description: "Return snapshots captured by non-suspending trace mode — debug.set_breakpoint, debug.set_exception_breakpoint or debug.set_watchpoint with trace:true. Each shows where it fired, the thread, in-scope locals/args, any trace_expr result, plus the exception type/catch site or the field's old → new value. Bounded ring buffer (most recent kept). Narrow with bp_id (one stop point), class_filter (substring), or since (only records newer than a #seq you already saw, for polling). Pass clear:true to empty the buffer after reading.".to_string(),
+            description: "Return snapshots captured by non-suspending trace mode — debug.set_breakpoint, debug.set_exception_breakpoint or debug.set_watchpoint with trace:true. Each shows where it fired, its calling chain as `← class.method:line` entries (nearest caller first, locations only), the thread, in-scope locals/args, any trace_expr result, plus the exception type/catch site or the field's old → new value. Bounded ring buffer (most recent kept). Narrow with bp_id (one stop point), class_filter (substring), or since (only records newer than a #seq you already saw, for polling). Pass clear:true to empty the buffer after reading.".to_string(),
             input_schema: to_val(schemars::schema_for!(GetTracesArgs)),
         },
     ]
@@ -183,6 +193,7 @@ mod tests {
             "debug.set_breakpoint",
             "debug.set_exception_breakpoint",
             "debug.set_watchpoint",
+            "debug.set_method_breakpoint",
             "debug.list_breakpoints",
             "debug.clear_breakpoint",
             "debug.toggle_breakpoint",
@@ -198,6 +209,7 @@ mod tests {
             "debug.get_stack",
             "debug.evaluate",
             "debug.list_threads",
+            "debug.thread_dump",
             "debug.get_traces",
         ] {
             assert!(names.contains(expected), "missing tool: {expected}");

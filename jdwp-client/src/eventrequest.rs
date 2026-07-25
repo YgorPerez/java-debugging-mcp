@@ -286,6 +286,92 @@ impl JdwpConnection {
         Ok(request_id)
     }
 
+    /// Report every return from a method of a class matching `class_pattern` (EventRequest.Set with a
+    /// `ClassMatch` modifier) — the primitive behind `debug.set_method_breakpoint`, answering "what did
+    /// this method actually return?" without having to guess which `return` statement runs.
+    ///
+    /// `with_return_value` picks `METHOD_EXIT_WITH_RETURN_VALUE` (kind 42), which carries the returned
+    /// value, over a plain `METHOD_EXIT` (kind 41), which only says a return happened. Kind 42 needs
+    /// JDWP ≥ 1.6 — ask [`can_get_method_return_values`](Self::can_get_method_return_values), because
+    /// unlike the monitor features this is **not** a capability bit, so an old JVM answers with a
+    /// protocol error rather than `NOT_IMPLEMENTED`.
+    ///
+    /// `class_pattern` is a dotted class name, optionally with a leading/trailing `*`. JDWP has **no
+    /// method-name modifier**, so a request on a class fires on every method of it; narrowing to one
+    /// method is the caller's job. `count` and `thread` add the `Count` and `ThreadOnly` modifiers, and
+    /// this event needs them more than any other: a suspending method exit on a hot method is the
+    /// fastest way to freeze a shared JVM this crate offers.
+    ///
+    /// Returns the request id.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn set_method_exit_request(
+        &mut self,
+        class_pattern: &str,
+        with_return_value: bool,
+        suspend_policy: SuspendPolicy,
+        count: Option<i32>,
+        thread: Option<ThreadId>,
+    ) -> JdwpResult<i32> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
+
+        packet.data.put_u8(method_exit_kind(with_return_value));
+        packet.data.put_u8(suspend_policy as u8);
+
+        // ClassMatch is always present; ThreadOnly and Count are added when asked for.
+        let n_mods = 1 + i32::from(count.is_some()) + i32::from(thread.is_some());
+        packet.data.put_i32(n_mods);
+
+        packet.data.put_u8(mod_kinds::CLASS_MATCH);
+        let pat = class_pattern.as_bytes();
+        packet.data.put_u32(u32::try_from(pat.len()).unwrap_or(u32::MAX));
+        packet.data.extend_from_slice(pat);
+
+        write_count_thread(&mut packet, count, thread);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let request_id = read_i32(&mut data)?;
+        Ok(request_id)
+    }
+
+    /// Clear a method-exit request by id (EventRequest.Clear command). `with_return_value` must match
+    /// what the request was armed with — JDWP keys requests by (eventKind, requestID), and kinds 41 and
+    /// 42 are different keys, so clearing with the wrong one silently leaves the request armed.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn clear_method_exit_request(
+        &mut self,
+        request_id: i32,
+        with_return_value: bool,
+    ) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
+        packet.data.put_u8(method_exit_kind(with_return_value));
+        packet.data.put_i32(request_id);
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+        Ok(())
+    }
+
+    /// Whether this JVM can report a method's return value (`METHOD_EXIT_WITH_RETURN_VALUE`).
+    ///
+    /// A JDWP **version** check, not a capability bit: JDI's `canGetMethodReturnValues()` is defined as
+    /// JDWP ≥ 1.6, and neither `Capabilities` nor `CapabilitiesNew` carries a flag for it. Getting this
+    /// wrong means looking for a bit that does not exist and concluding the JVM can't do it.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the version request fails or the reply cannot be parsed.
+    pub async fn can_get_method_return_values(&mut self) -> JdwpResult<bool> {
+        let v = self.get_version().await?;
+        Ok(v.jdwp_major > 1 || (v.jdwp_major == 1 && v.jdwp_minor >= 6))
+    }
+
     /// Clear a field watch by id (EventRequest.Clear command). `kind` must match the one the
     /// request was created with — JDWP keys requests by (eventKind, requestID).
     ///
@@ -314,6 +400,16 @@ fn write_count_thread(packet: &mut CommandPacket, count: Option<i32>, thread: Op
     if let Some(t) = thread {
         packet.data.put_u8(mod_kinds::THREAD_ONLY);
         packet.data.put_u64(t);
+    }
+}
+
+/// The JDWP event kind a method-exit request uses, for both Set and Clear. Kinds 41 and 42 are separate
+/// request keys, so the same answer has to serve both commands or a clear can miss its request.
+const fn method_exit_kind(with_return_value: bool) -> u8 {
+    if with_return_value {
+        event_kinds::METHOD_EXIT_WITH_RETURN_VALUE
+    } else {
+        event_kinds::METHOD_EXIT
     }
 }
 

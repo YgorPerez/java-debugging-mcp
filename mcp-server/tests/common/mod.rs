@@ -359,6 +359,22 @@ impl Server {
         self.call("debug.panic", serde_json::json!({}))
     }
 
+    /// Poll `debug.get_traces` until the reply contains `needle`, returning the whole reply.
+    ///
+    /// Traces arrive without suspending anything, so unlike `wait_for_event` there is no hit to
+    /// synchronise on — a test either polls or races the debuggee.
+    pub fn wait_for_traces(&mut self, needle: &str, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let traces = self.call("debug.get_traces", serde_json::json!({}));
+            if traces.contains(needle) {
+                return Some(traces);
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        None
+    }
+
     /// Poll `debug.get_last_event` until it reports something containing `needle`.
     ///
     /// `get_last_event` keeps returning the previous hit until a new one lands, so `needle` must be

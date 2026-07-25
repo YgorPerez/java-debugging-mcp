@@ -6,7 +6,7 @@ use crate::commands::{command_sets, thread_commands};
 use crate::connection::JdwpConnection;
 use crate::protocol::{CommandPacket, JdwpResult};
 use crate::reader::{read_i32, read_string, read_u64};
-use crate::types::{FrameId, Location, ThreadId};
+use crate::types::{FrameId, Location, ObjectId, ThreadId};
 use bytes::BufMut;
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +15,18 @@ use serde::{Deserialize, Serialize};
 pub struct Frame {
     pub frame_id: FrameId,
     pub location: Location,
+}
+
+/// One monitor (lock) object, as JDWP reports it in a tagged-objectID.
+///
+/// The `object_id` is the identity that matters: correlating "thread A holds this" with "thread B is
+/// waiting for this" is a comparison of these ids, and that comparison is the whole of deadlock
+/// detection by eye.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Monitor {
+    /// JDWP type tag of the monitor object (`'L'` for a plain object, `'['` for an array, …).
+    pub tag: u8,
+    pub object_id: ObjectId,
 }
 
 impl JdwpConnection {
@@ -68,6 +80,71 @@ impl JdwpConnection {
         }
 
         Ok(frames)
+    }
+
+    /// The monitors this thread currently **holds** (ThreadReference.OwnedMonitors, command 8).
+    ///
+    /// Half of what a deadlock investigation consists of; the other half is
+    /// [`current_contended_monitor`](Self::current_contended_monitor). Cross-referencing the two across
+    /// threads — A holds what B waits for, and vice versa — is what makes a lock cycle visible, which is
+    /// otherwise unanswerable through this tool.
+    ///
+    /// **The thread must be suspended.** A running thread's lock set is not a well-defined thing to
+    /// read, so the JVM answers `THREAD_NOT_SUSPENDED` (13) rather than a snapshot that was never true.
+    /// Requires the JVM's `canGetOwnedMonitorInfo` (see [`capabilities`](Self::capabilities)); without it
+    /// the answer is `NOT_IMPLEMENTED` (99).
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn owned_monitors(&mut self, thread_id: ThreadId) -> JdwpResult<Vec<Monitor>> {
+        let id = self.next_id();
+        let mut packet =
+            CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::OWNED_MONITORS);
+        packet.data.put_u64(thread_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let count = read_i32(&mut data)?;
+        let mut monitors = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        for _ in 0..count {
+            // Each entry is a tagged-objectID: one tag byte then the object id.
+            let tag = crate::reader::read_u8(&mut data)?;
+            let object_id = read_u64(&mut data)?;
+            monitors.push(Monitor { tag, object_id });
+        }
+        Ok(monitors)
+    }
+
+    /// The monitor this thread is **blocked waiting to enter**, if any
+    /// (ThreadReference.CurrentContendedMonitor, command 9).
+    ///
+    /// `None` means the thread is not contending for a lock — the common case, and not an error. A
+    /// thread parked in `Object.wait()` reports the monitor it will re-acquire.
+    ///
+    /// **The thread must be suspended**, and the JVM must report `canGetCurrentContendedMonitor`; see
+    /// [`owned_monitors`](Self::owned_monitors) for why both hold.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn current_contended_monitor(&mut self, thread_id: ThreadId) -> JdwpResult<Option<Monitor>> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(
+            id,
+            command_sets::THREAD_REFERENCE,
+            thread_commands::CURRENT_CONTENDED_MONITOR,
+        );
+        packet.data.put_u64(thread_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let tag = crate::reader::read_u8(&mut data)?;
+        let object_id = read_u64(&mut data)?;
+        // A null objectID (0) is how "not waiting on anything" comes back, whatever the tag says.
+        Ok((object_id != 0).then_some(Monitor { tag, object_id }))
     }
 
     /// Get all threads (VirtualMachine.AllThreads)

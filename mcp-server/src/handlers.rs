@@ -186,11 +186,13 @@ impl RequestHandler {
             "debug.get_stack" => self.handle_get_stack(args).await,
             "debug.evaluate" => self.handle_evaluate(args).await,
             "debug.list_threads" => self.handle_list_threads(args).await,
+            "debug.thread_dump" => self.handle_thread_dump(args).await,
             "debug.get_last_event" => self.handle_get_last_event(args).await,
             "debug.set_value" => self.handle_set_value(args).await,
             "debug.force_return" => self.handle_force_return(args).await,
             "debug.set_exception_breakpoint" => self.handle_set_exception_breakpoint(args).await,
             "debug.set_watchpoint" => self.handle_set_watchpoint(args).await,
+            "debug.set_method_breakpoint" => self.handle_set_method_breakpoint(args).await,
             "debug.get_traces" => self.handle_get_traces(args).await,
             _ => return None,
         })
@@ -284,6 +286,7 @@ impl RequestHandler {
             format!("L{};", class_pattern.replace('.', "/"))
         };
         let suspend_policy = suspend_policy_for(a.trace);
+        let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
         let spec = BreakpointSpec {
             class_pattern: class_pattern.to_string(),
             signature,
@@ -295,6 +298,7 @@ impl RequestHandler {
             trace: a.trace,
             trace_expr: a.trace_expr.clone(),
             trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
+            trace_frames,
             suspend_policy,
         };
 
@@ -318,13 +322,7 @@ impl RequestHandler {
             arm_and_insert(&mut session, class_type_id, &spec, bp_id).await?;
         drop(session);
 
-        let mut extra = String::new();
-        if spec.trace {
-            extra.push_str("\n   Mode: trace (non-suspending) — read hits with debug.get_traces");
-            if let Some(e) = &spec.trace_expr {
-                let _ = write!(extra, "\n   Trace expr: {e}");
-            }
-        }
+        let mut extra = describe_trace_mode(&spec, frames_note.as_deref());
         if let Some(c) = spec.hit_count {
             let _ = write!(extra, "\n   Stops on hit #{c}");
         }
@@ -349,6 +347,7 @@ impl RequestHandler {
 
         if session.breakpoints.is_empty() && session.pending_breakpoints.is_empty()
             && session.exception_requests.is_empty() && session.watchpoints.is_empty()
+            && session.method_exits.is_empty()
         {
             return Ok(session.last_watchdog_note.as_ref().map_or_else(
                 || "No breakpoints set".to_string(),
@@ -363,9 +362,9 @@ impl RequestHandler {
             let _ = writeln!(output, "⏰ {n}\n");
         }
         let _ = write!(output,
-            "📍 {} breakpoint(s), {} deferred, {} exception, {} watchpoint(s):\n\n",
+            "📍 {} breakpoint(s), {} deferred, {} exception, {} watchpoint(s), {} method-exit:\n\n",
             session.breakpoints.len(), session.pending_breakpoints.len(),
-            session.exception_requests.len(), session.watchpoints.len()
+            session.exception_requests.len(), session.watchpoints.len(), session.method_exits.len()
         );
 
         for (bp_id, bp) in &session.breakpoints {
@@ -382,6 +381,10 @@ impl RequestHandler {
 
         for (watch_id, wp) in &session.watchpoints {
             render_watchpoint_line(&mut output, watch_id, wp);
+        }
+
+        for me in session.method_exits.values() {
+            render_method_exit_line(&mut output, me);
         }
         drop(session);
 
@@ -415,6 +418,21 @@ impl RequestHandler {
             return Ok(format!(
                 "✅ Watchpoint cleared: {} ({}.{} {})",
                 bp_id, wp.class_name, wp.field_name, wp.kind.label()
+            ));
+        }
+
+        // A method-exit request lives in method_exits; Clear must name the same event kind it was armed
+        // with (41 vs 42), or JDWP looks up a different key and silently leaves the request armed —
+        // which for this kind means a possibly-suspending stop point nobody can find.
+        if let Some(me) = session.method_exits.remove(bp_id) {
+            if let Some(req) = me.request_id {
+                let _ = session.connection.clear_method_exit_request(req, me.with_return_value).await;
+            }
+            return Ok(format!(
+                "✅ Method-exit reporting cleared: {} ({}{})",
+                bp_id,
+                me.class_pattern,
+                me.method.map_or_else(|| ".*".to_string(), |m| format!(".{m}"))
             ));
         }
 
@@ -469,6 +487,8 @@ impl RequestHandler {
             e.enabled
         } else if let Some(w) = session.watchpoints.get(&id) {
             w.enabled
+        } else if let Some(m) = session.method_exits.get(&id) {
+            m.enabled
         } else if let Some(pb) = session.pending_breakpoints.iter().find(|p| p.bp_id == id) {
             // A deferred breakpoint isn't armed at all yet — it holds only a CLASS_PREPARE watch, so
             // there is no request to silence. Say that, rather than the misleading "not found" this
@@ -584,6 +604,7 @@ impl RequestHandler {
         let np = session.pending_breakpoints.len();
         let ne = session.exception_requests.len();
         let nw = session.watchpoints.len();
+        let nm = session.method_exits.len();
         let _ = session.connection.clear_all_breakpoints().await;
         session.breakpoints.clear();
         // Also drop deferred breakpoints' CLASS_PREPARE watches.
@@ -604,16 +625,26 @@ impl RequestHandler {
         for (req, kind) in watches {
             let _ = session.connection.clear_field_watch(req, kind).await;
         }
+        // Method-exit requests are the most important thing for panic to drop: a suspending one on a hot
+        // method re-freezes the VM on the very next return, so resuming without clearing them would be
+        // no rescue at all. `ClearAllBreakpoints` does not touch them either.
+        let mexits: Vec<(i32, bool)> = session.method_exits.drain()
+            .filter_map(|(_, m)| m.request_id.map(|r| (r, m.with_return_value)))
+            .collect();
+        for (req, with_value) in mexits {
+            let _ = session.connection.clear_method_exit_request(req, with_value).await;
+        }
         // The panic button's whole job is to leave the VM running, so it must clear a counted suspend
         // depth and report honestly if it couldn't (SAFE-7).
         let note = resume_and_verify(&mut session).await?;
         session.mark_resumed();
         drop(session);
 
-        Ok(format!("🧯 Panic: cleared {} breakpoint(s){}{}{} and resumed all threads.{}", n,
+        Ok(format!("🧯 Panic: cleared {} breakpoint(s){}{}{}{} and resumed all threads.{}", n,
             if np > 0 { format!(" + {np} deferred") } else { String::new() },
             if ne > 0 { format!(" + {ne} exception") } else { String::new() },
             if nw > 0 { format!(" + {nw} watchpoint") } else { String::new() },
+            if nm > 0 { format!(" + {nm} method-exit") } else { String::new() },
             note.map_or_else(String::new, |t| format!("\n   ⚠️  {t}"))))
     }
 
@@ -852,6 +883,92 @@ impl RequestHandler {
         }
 
         Ok(output)
+    }
+
+    /// DUMP-1: every thread's stack in one call, plus which monitors each thread holds and which one it
+    /// is blocked on — the "it's wedged, who is blocked on what?" question.
+    ///
+    /// Three things this deliberately does not do:
+    /// - **Suspend on its own.** JDWP can only read a suspended thread's frames and locks, so a dump of a
+    ///   running VM is mostly unreadable entries. Quietly pausing a shared instance to fix that is the
+    ///   SAFE-4 mistake, so it takes an explicit `suspend:true` — and then resumes and *verifies*.
+    /// - **Abort on one bad thread.** A thread that died mid-dump, or is running, is reported on its own
+    ///   line; the rest of the dump still arrives.
+    /// - **Invoke anything.** Frames, statuses and monitors are all plain reads, so this works in a
+    ///   read-only session (SAFE-6).
+    async fn handle_thread_dump(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::ThreadDumpArgs = crate::args::parse(&args)?;
+        let session_guard = self.resolve_session(&args).await
+            .ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+
+        let before = session.connection.packets_sent();
+        let all = session.connection.get_all_threads().await
+            .map_err(|e| format!("Failed to get threads: {e}"))?;
+        let total = all.len();
+        if all.is_empty() {
+            return Ok("No threads — the JVM reported none.".to_string());
+        }
+
+        // Only ask about the monitor capabilities when monitors were actually requested, so a dump that
+        // doesn't want them doesn't pay for the round trip.
+        let caps = if a.monitors {
+            session.connection.capabilities().await.ok()
+        } else {
+            None
+        };
+
+        // Suspension policy, decided ONCE up front so the resume half can't disagree with it.
+        //
+        // An already-suspended VM is read as it is and left alone: resuming it here would throw away
+        // the breakpoint state the caller is standing in, and re-suspending it would build a counted
+        // depth that one resume can't undo (SAFE-7).
+        let already = session.suspended_cause.is_some();
+        let suspend_now = a.suspend && !already;
+        if suspend_now {
+            session.connection.suspend_all().await
+                .map_err(|e| format!("Failed to suspend for the dump: {e}"))?;
+            // Arm the watchdog for the window we hold it: if this call dies before the resume below,
+            // something still un-freezes the VM (SAFE-4).
+            session.mark_suspended(crate::session::SuspendCause::ManualPause);
+        }
+
+        let rows = collect_dump_rows(&mut session.connection, &all, &a, caps.as_ref()).await;
+
+        // Resume before rendering, so the VM is held for the reads and not for our string building.
+        let mut resume_note = String::new();
+        if suspend_now {
+            let probe = rows.first().map_or_else(|| all.first().copied().unwrap_or(0), |r| r.id);
+            match session.connection.resume_all_fully(probe, MAX_RESUME_ATTEMPTS).await {
+                Ok((issued, 0)) => {
+                    session.mark_resumed();
+                    let _ = write!(
+                        resume_note,
+                        "▶️  Suspended for the dump and resumed again ({issued} resume(s)) — verified running."
+                    );
+                }
+                // Honesty over convenience: a resume that "succeeded" while the VM stayed stopped is
+                // the failure ADR-0003 exists for, so say so instead of reporting a clean dump.
+                Ok((issued, left)) => {
+                    let _ = write!(
+                        resume_note,
+                        "🛑 Suspended for the dump and the VM is STILL suspended after {issued} resume(s) \
+                         ({left} suspend(s) left on the probe thread) — something outside this session is \
+                         also holding it. Call debug.continue, or debug.panic."
+                    );
+                }
+                Err(e) => {
+                    let _ = write!(
+                        resume_note,
+                        "🛑 Suspended for the dump and the resume FAILED ({e}) — call debug.panic."
+                    );
+                }
+            }
+        }
+        let cost = session.connection.packets_sent().saturating_sub(before);
+        drop(session);
+
+        Ok(render_thread_dump(&rows, total, &a, caps.as_ref(), already, &resume_note, cost))
     }
 
     async fn handle_pause(&self, args: serde_json::Value) -> Result<String, String> {
@@ -1167,6 +1284,7 @@ impl RequestHandler {
         };
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
+        let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
 
         // A traced request suspends only the throwing thread, which the pump snapshots and resumes —
         // so a shared JVM keeps serving while you collect throws. An optional ThreadOnly restricts it
@@ -1190,6 +1308,7 @@ impl RequestHandler {
             trace: a.trace,
             trace_expr: a.trace_expr.clone(),
             trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
+            trace_frames,
             thread_filter,
         });
         drop(session);
@@ -1217,6 +1336,12 @@ impl RequestHandler {
         if let Some(b) = trace_budget_for(a.trace, a.trace_max_hits) {
             let _ = write!(extra, "\n   Auto-disarms after {b} trace hit(s)");
         }
+        extra.push_str(&describe_trace_frames(
+            a.trace,
+            trace_frames,
+            frames_note.as_deref(),
+            "throwing frame only — pass trace_frames to see which path reached the catch",
+        ));
         Ok(format!(
             "✅ Exception breakpoint set on {class_pattern} ({which})\n   Breakpoint ID: {exc_id}{mode}{noisy}{extra}"
         ))
@@ -1257,6 +1382,7 @@ impl RequestHandler {
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
+        let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
 
         let mut ids = Vec::with_capacity(kinds.len());
         for kind in kinds {
@@ -1283,6 +1409,7 @@ impl RequestHandler {
                 trace: a.trace,
                 trace_expr: a.trace_expr.clone(),
                 trace_budget,
+                trace_frames,
                 thread_filter,
             });
         }
@@ -1295,6 +1422,12 @@ impl RequestHandler {
         if let Some(b) = trace_budget {
             let _ = write!(extra, "\n   Auto-disarms after {b} trace hit(s)");
         }
+        extra.push_str(&describe_trace_frames(
+            a.trace,
+            trace_frames,
+            frames_note.as_deref(),
+            "mutating frame only — pass trace_frames to see who called it",
+        ));
         let kindness = if is_static { "static" } else { "instance" };
         let where_hits = if a.trace {
             "   Mode: trace (non-suspending) — each hit is snapshotted with the mutating location and old → new value, then the thread resumes; read them with debug.get_traces."
@@ -1307,6 +1440,107 @@ impl RequestHandler {
             field_name,
             decode_signature(&field.signature),
             ids.join(", "),
+        ))
+    }
+
+    /// METH-1: report what a method actually returned, without having to guess which `return` runs.
+    ///
+    /// Two things make this kind different from every other stop point here, and both are safety:
+    /// - **`trace` defaults to true.** A suspending `MethodExit` on a hot method is the fastest way to
+    ///   freeze a shared JVM this tool offers, so the safe mode is the default and the dangerous one is
+    ///   opt-in — the reverse of the other stop points.
+    /// - **A broad suspending request is refused outright**, naming what would make it acceptable. JDWP
+    ///   has no method-name modifier, so `ClassMatch` alone fires on *every method of every matching
+    ///   class*; suspending on that is not a thing anyone means to ask for.
+    async fn handle_set_method_breakpoint(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::SetMethodBreakpointArgs = crate::args::parse(&args)?;
+        let class_pattern = a.class_pattern.trim();
+        if class_pattern.is_empty() {
+            return Err("Provide a class_pattern (e.g. \"br.com.infotravel.IntegraSrv\").".to_string());
+        }
+        let method = a.method.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
+
+        // The refusal, before anything is armed.
+        refuse_broad_suspending_method_exit(a.trace, class_pattern, method.as_deref())?;
+
+        let session_guard = self.resolve_session(&args).await
+            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
+        let mut session = session_guard.lock().await;
+        check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
+
+        // Kind 42 (with the return value) when the JVM speaks JDWP >= 1.6, else plain kind 41. This is a
+        // version check, not a capability bit — there is no `canGetMethodReturnValues` flag to read.
+        let with_return_value =
+            session.connection.can_get_method_return_values().await.unwrap_or(false);
+
+        let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
+        let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
+        let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
+
+        let request_id = session.connection
+            .set_method_exit_request(
+                class_pattern, with_return_value, suspend_policy_for(a.trace), None, thread_filter,
+            )
+            .await
+            .map_err(|e| format!("Failed to set method-exit request on '{class_pattern}': {e}"))?;
+
+        let mexit_id = session.next_stop_id("mexit_");
+        session.method_exits.insert(mexit_id.clone(), crate::session::MethodExitRequestInfo {
+            id: mexit_id.clone(),
+            request_id: Some(request_id),
+            enabled: true,
+            class_pattern: class_pattern.to_string(),
+            method: method.clone(),
+            with_return_value,
+            trace: a.trace,
+            trace_expr: a.trace_expr.clone(),
+            trace_budget,
+            trace_frames,
+            thread_filter,
+        });
+        drop(session);
+
+        let mut extra = String::new();
+        let _ = match &method {
+            Some(m) => write!(extra, "\n   Method filter: {m} (all overloads — JDWP compares names only)"),
+            None => write!(
+                extra,
+                "\n   Method filter: none — EVERY method of every matching class reports its return. \
+                 Pass `method` to narrow it."
+            ),
+        };
+        if !with_return_value {
+            let _ = write!(
+                extra,
+                "\n   ⚠️  This JVM speaks JDWP < 1.6, so it cannot report return VALUES \
+                 (METHOD_EXIT_WITH_RETURN_VALUE). Degraded to a plain MethodExit: you get the return \
+                 site — which `return` was taken — but not the value."
+            );
+        }
+        if let Some(t) = thread_filter {
+            let _ = write!(extra, "\n   Thread filter: 0x{t:x} (only returns on this thread)");
+        }
+        if let Some(b) = trace_budget {
+            let _ = write!(extra, "\n   Auto-disarms after {b} trace hit(s)");
+        }
+        extra.push_str(&describe_trace_frames(
+            a.trace,
+            trace_frames,
+            frames_note.as_deref(),
+            "returning frame only",
+        ));
+        if a.trace {
+            if let Some(e) = &a.trace_expr {
+                let _ = write!(extra, "\n   Trace expr: {e}");
+            }
+        }
+        let mode = if a.trace {
+            "\n   Mode: trace (non-suspending) — each return is snapshotted with its value and the thread resumed; read them with debug.get_traces"
+        } else {
+            "\n   Mode: SUSPENDING — every matching return freezes all threads until you continue. Hits come back via debug.get_last_event.\n   ⚠️  On a shared JVM use trace:true (the default) instead."
+        };
+        Ok(format!(
+            "✅ Method-exit reporting armed on {class_pattern}\n   Breakpoint ID: {mexit_id}\n   JDWP Request ID: {request_id}{mode}{extra}"
         ))
     }
 
@@ -1345,13 +1579,14 @@ impl RequestHandler {
             crate::session::MAX_TRACES
         ));
         for rec in matched.into_iter().skip(start) {
+            let callers_s = format_trace_callers(rec);
             let detail_s = format_trace_detail(rec);
             let args_s = format_trace_args(rec);
             let expr_s = format_trace_expr(rec);
             lines.push(format!(
-                "#{} [{}] {}.{}:{} thread=0x{:x}{}{}{}",
-                rec.seq, rec.bp_id, rec.class, rec.method, rec.line.unwrap_or(-1), rec.thread,
-                detail_s, args_s, expr_s
+                "#{} [{}] {}.{}:{}{} thread=0x{:x}{}{}{}",
+                rec.seq, rec.bp_id, rec.class, rec.method, rec.line.unwrap_or(-1), callers_s,
+                rec.thread, detail_s, args_s, expr_s
             ));
         }
         // A stop point that hit its budget disarmed itself (TRACE-3) — say so, so a caller doesn't
@@ -1378,6 +1613,72 @@ impl RequestHandler {
         }
         Ok(lines.join("\n"))
     }
+}
+
+/// Refuse a SUSPENDING method-exit request that would report more than anyone can have meant to freeze
+/// on (METH-1): a wildcard class pattern, or no method name at all.
+///
+/// JDWP has no method-name modifier, so a `ClassMatch` fires for every method of every matching class.
+/// Suspending on that stops a shared VM faster than anything else this tool can do — so it is refused
+/// rather than warned about, and the message names the narrow form that *is* accepted. Trace mode is
+/// never refused: it snapshots and resumes, so breadth costs throughput, not availability.
+fn refuse_broad_suspending_method_exit(
+    trace: bool,
+    class_pattern: &str,
+    method: Option<&str>,
+) -> Result<(), String> {
+    if trace || !(class_pattern.contains('*') || method.is_none()) {
+        return Ok(());
+    }
+    Err(format!(
+        "🛑 Refused: a SUSPENDING method-exit request on `{class_pattern}`{} would freeze every thread \
+         on every matching return. JDWP has no method-name filter, so a ClassMatch fires for every \
+         method of every matching class — on a hot class that stops the VM faster than anything else \
+         this tool can do.\n   Either keep trace:true (the default — snapshots and resumes, read them \
+         with debug.get_traces), or narrow it to one concrete class AND one method: \
+         {{\"class_pattern\": \"pkg.Class\", \"method\": \"save\", \"trace\": false}}.",
+        if method.is_none() { " (no method filter)" } else { "" }
+    ))
+}
+
+/// The caller-depth lines shared by every traced stop point's arm reply (TRACE-5): the depth, and any
+/// clamp notice. `zero_hint` is the kind-specific "what you're missing at depth 0" wording.
+///
+/// One helper for all four kinds so the depth reads the same wherever it is reported — and because
+/// inlining these branches into each `handle_set_*` pushed them past the complexity gate.
+fn describe_trace_frames(trace: bool, frames: usize, note: Option<&str>, zero_hint: &str) -> String {
+    let mut out = String::new();
+    if !trace {
+        return out;
+    }
+    let _ = match frames {
+        0 => write!(out, "\n   Caller frames: 0 ({zero_hint})"),
+        n => write!(out, "\n   Caller frames: {n}"),
+    };
+    if let Some(n) = note {
+        let _ = write!(out, "\n   ⚠️  {n}");
+    }
+    out
+}
+
+/// The trace-mode lines of a `set_breakpoint` reply: mode, trace expression, caller depth, and any
+/// clamp notice. Empty for a suspending breakpoint, which has none of them.
+fn describe_trace_mode(spec: &BreakpointSpec, frames_note: Option<&str>) -> String {
+    let mut out = String::new();
+    if !spec.trace {
+        return out;
+    }
+    out.push_str("\n   Mode: trace (non-suspending) — read hits with debug.get_traces");
+    if let Some(e) = &spec.trace_expr {
+        let _ = write!(out, "\n   Trace expr: {e}");
+    }
+    out.push_str(&describe_trace_frames(
+        spec.trace,
+        spec.trace_frames,
+        frames_note,
+        "hit frame only — pass trace_frames to see who called it",
+    ));
+    out
 }
 
 /// The suspend policy a stop point should be armed with. Shared by all three kinds (line breakpoint,
@@ -1483,6 +1784,43 @@ fn expr_invokes(expr: &str) -> bool {
 /// per-hit work in the debuggee, not just our memory — `MAX_TRACES` caps the buffer, this caps the load.
 const DEFAULT_TRACE_BUDGET: u32 = 200;
 
+/// Default number of caller frames a traced hit records above itself (TRACE-5).
+///
+/// Not 0: a snapshot that can't say which path reached it fails the case trace mode exists for — a
+/// swallowed exception on a shared JVM, where the question is always "which request got here". Not
+/// large either: each frame is location lookups on *every* hit, so this is the smallest depth that
+/// distinguishes callers of a shared helper.
+pub const DEFAULT_TRACE_FRAMES: usize = 3;
+
+/// Hard ceiling on `trace_frames`, whatever the caller asks for.
+///
+/// Depth multiplies per-hit JDWP traffic against a possibly-shared JVM, which is the flooding hazard
+/// TRACE-3 exists for; 20 already matches `get_stack`'s default `max_frames`, so anything deeper is
+/// better served by a suspending breakpoint and a real `get_stack`. A clamp is reported, never silent.
+const MAX_TRACE_FRAMES: usize = 20;
+
+/// Clamp a requested caller depth to `MAX_TRACE_FRAMES`, returning `(depth, note)` where `note` is a
+/// sentence for the arm reply when the request was cut down — a silently ignored argument would leave a
+/// caller believing they had a deeper chain than they do.
+fn clamp_trace_frames(trace: bool, requested: usize) -> (usize, Option<String>) {
+    if !trace {
+        // A suspending stop point hands the caller a live thread; `debug.get_stack` gives the full
+        // stack with locals, so there is nothing for a snapshot depth to do.
+        return (0, None);
+    }
+    if requested > MAX_TRACE_FRAMES {
+        return (
+            MAX_TRACE_FRAMES,
+            Some(format!(
+                "trace_frames {requested} exceeds the {MAX_TRACE_FRAMES}-frame cap and was clamped to \
+                 {MAX_TRACE_FRAMES} — deeper chains cost JDWP round trips on every hit; use a \
+                 suspending breakpoint with debug.get_stack if you need the whole stack."
+            )),
+        );
+    }
+    (requested, None)
+}
+
 /// The trace-hit budget a stop point should arm with: the caller's `trace_max_hits` when tracing
 /// (default `DEFAULT_TRACE_BUDGET`), where `0` means unbounded; `None` for a non-trace stop point,
 /// which is unbounded because it suspends and so can't flood.
@@ -1548,13 +1886,14 @@ fn render_session_line(
 fn render_breakpoint_line(output: &mut String, bp_id: &str, bp: &crate::session::BreakpointInfo) {
     let _ = writeln!(
         output,
-        "  {} [{}] {}:{}{}{}{}",
+        "  {} [{}] {}:{}{}{}{}{}",
         if bp.enabled { "✓" } else { "✗" },
         bp_id,
         bp.class_pattern,
         bp.line,
         if bp.trace { " (trace)" } else { "" },
         trace_budget_tag(bp.trace, bp.trace_budget),
+        trace_frames_tag(bp.trace, bp.trace_frames),
         if bp.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
     );
     if let Some(method) = &bp.method {
@@ -1594,12 +1933,13 @@ fn render_exception_line(output: &mut String, er: &crate::session::ExceptionRequ
     };
     let _ = writeln!(
         output,
-        "  {} [{}] exception {} ({which}){}{}{}{}",
+        "  {} [{}] exception {} ({which}){}{}{}{}{}",
         if er.enabled { "⚡" } else { "✗" },
         er.id,
         er.class_pattern,
         if er.trace { " (trace)" } else { "" },
         trace_budget_tag(er.trace, er.trace_budget),
+        trace_frames_tag(er.trace, er.trace_frames),
         er.thread_filter.map_or_else(String::new, |t| format!(" thread=0x{t:x}")),
         if er.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
     );
@@ -1611,6 +1951,19 @@ fn trace_budget_tag(trace: bool, budget: Option<u32>) -> String {
     match (trace, budget) {
         (true, Some(n)) => format!(" [{n} hit(s) left]"),
         _ => String::new(),
+    }
+}
+
+/// The ` [+N caller frame(s)]` suffix for a traced stop point in `list_breakpoints` (TRACE-5).
+///
+/// Shown because the depth is what makes a traced hit cost more than one round trip: a debuggee that
+/// has slowed down should be explainable from the listing alone. Absent at depth 0, which is the
+/// one-frame snapshot that costs nothing extra.
+fn trace_frames_tag(trace: bool, frames: usize) -> String {
+    if trace && frames > 0 {
+        format!(" [+{frames} caller frame(s)]")
+    } else {
+        String::new()
     }
 }
 
@@ -1631,6 +1984,7 @@ async fn describe_event_into(
         obj.insert("line".to_string(), json!(line));
         describe_exception_event(conn, details, obj).await;
         describe_field_event(conn, details, obj).await;
+        describe_method_exit_event(conn, details, obj).await;
         return;
     }
     // Events with no location still name their thread, and a class-prepare names its class.
@@ -1667,6 +2021,39 @@ async fn describe_exception_event(
     if let Some(cl) = catch_location {
         let (cls, method, line) = describe_location(conn, cl).await;
         obj.insert("caught_at".to_string(), json!(format!("{}.{}:{}", cls, method, line.unwrap_or(-1))));
+    }
+}
+
+/// Add a method-exit hit's returned value to a `get_last_event` / trace entry (METH-1).
+///
+/// `returned` is the answer this stop point exists for: **which value came back**, without having to
+/// pick the right `return` statement first. The hit's own location already says which return was taken,
+/// so the pair together answers "which path, with what".
+///
+/// Rendered with `thread` None, so no `toString()` runs in the debuggee while it sits inside the event —
+/// the same discipline as the watchpoint describer. A `void` method reports `(void)`, which is a real
+/// answer and not an absence.
+///
+/// `return_value` is `None` when the request was armed as a plain `METHOD_EXIT` (a JVM below JDWP 1.6),
+/// and that is reported explicitly rather than omitted: silence would read as "returned nothing".
+async fn describe_method_exit_event(
+    conn: &mut jdwp_client::JdwpConnection,
+    details: &EventKind,
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let EventKind::MethodExit { return_value, .. } = details else {
+        return;
+    };
+    match return_value {
+        Some(v) => {
+            obj.insert("returned".to_string(), json!(render_value(conn, v, None, 200).await));
+        }
+        None => {
+            obj.insert(
+                "returned".to_string(),
+                json!("<not reported — this JVM speaks JDWP < 1.6>"),
+            );
+        }
     }
 }
 
@@ -1737,7 +2124,7 @@ async fn describe_field_event(
 fn render_watchpoint_line(output: &mut String, watch_id: &str, wp: &crate::session::WatchpointInfo) {
     let _ = writeln!(
         output,
-        "  {} [{}] watch {}.{} on {} ({}){}{}{}",
+        "  {} [{}] watch {}.{} on {} ({}){}{}{}{}",
         if wp.enabled { "👁" } else { "✗" },
         watch_id,
         wp.class_name,
@@ -1745,12 +2132,40 @@ fn render_watchpoint_line(output: &mut String, watch_id: &str, wp: &crate::sessi
         wp.kind.label(),
         if wp.is_static { "static" } else { "instance" },
         if wp.trace { " (trace)" } else { "" },
+        trace_frames_tag(wp.trace, wp.trace_frames),
         wp.thread_filter.map_or_else(String::new, |t| format!(" thread=0x{t:x}")),
         if wp.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
     );
     // Budget on its own line to keep the header stable; harmless when absent.
     if let Some(n) = wp.trace_budget {
         let _ = writeln!(output, "     Trace budget: {n} hit(s) left");
+    }
+}
+
+/// Format one method-exit request into the `debug.list_breakpoints` output (METH-1).
+///
+/// The `method` filter and the "returns values or not" fact both belong here: an unfiltered request is
+/// reporting every method of the class, and a request that can't read return values answers a different
+/// question from the one it was armed for. Neither should have to be re-derived from the arm reply.
+fn render_method_exit_line(output: &mut String, me: &crate::session::MethodExitRequestInfo) {
+    let _ = writeln!(
+        output,
+        "  {} [{}] method-exit {}{} ({}){}{}{}{}",
+        if me.enabled { "↩" } else { "✗" },
+        me.id,
+        me.class_pattern,
+        me.method.as_ref().map_or_else(|| ".* (every method)".to_string(), |m| format!(".{m}")),
+        if me.with_return_value { "with return value" } else { "no return value — JDWP < 1.6" },
+        if me.trace { " (trace)" } else { " ⚠️ SUSPENDING" },
+        trace_budget_tag(me.trace, me.trace_budget),
+        trace_frames_tag(me.trace, me.trace_frames),
+        if me.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
+    );
+    if let Some(t) = me.thread_filter {
+        let _ = writeln!(output, "     Thread filter: 0x{t:x}");
+    }
+    if let Some(e) = &me.trace_expr {
+        let _ = writeln!(output, "     Trace expr: {e}");
     }
 }
 
@@ -2660,6 +3075,7 @@ async fn try_arm_deferred_breakpoints(
                             trace: pend.trace,
                             trace_expr: pend.trace_expr,
                             trace_budget: pend.trace_budget,
+                            trace_frames: pend.trace_frames,
                             arm: crate::session::BreakpointArm {
                                 class_id: cp_ref,
                                 method_id: method.method_id,
@@ -2687,6 +3103,12 @@ struct TracedRequest {
     /// Only line breakpoints can carry one; an exception or field request has no condition.
     condition: Option<String>,
     trace_expr: Option<String>,
+    /// How many caller frames to record above the hit (TRACE-5).
+    trace_frames: usize,
+    /// Only a method-exit request has one (METH-1): the method name the caller asked for, which has to
+    /// be filtered on OUR side because JDWP's `ClassMatch` fires for every method of the class. A hit on
+    /// a different method is dropped without recording it and without charging the budget.
+    method_filter: Option<String>,
 }
 
 /// Find the traced stop point that a JDWP request id belongs to, across all three kinds.
@@ -2703,17 +3125,57 @@ fn find_traced_request(
             id: id.clone(),
             condition: b.condition.clone(),
             trace_expr: b.trace_expr.clone(),
+            trace_frames: b.trace_frames,
+            method_filter: None,
         });
     }
     if let Some((id, e)) =
         session.exception_requests.iter().find(|(_, e)| e.request_id == Some(req_id) && e.trace)
     {
-        return Some(TracedRequest { id: id.clone(), condition: None, trace_expr: e.trace_expr.clone() });
+        return Some(TracedRequest {
+            id: id.clone(),
+            condition: None,
+            trace_expr: e.trace_expr.clone(),
+            trace_frames: e.trace_frames,
+            method_filter: None,
+        });
     }
     if let Some((id, w)) = session.watchpoints.iter().find(|(_, w)| w.request_id == Some(req_id) && w.trace) {
-        return Some(TracedRequest { id: id.clone(), condition: None, trace_expr: w.trace_expr.clone() });
+        return Some(TracedRequest {
+            id: id.clone(),
+            condition: None,
+            trace_expr: w.trace_expr.clone(),
+            trace_frames: w.trace_frames,
+            method_filter: None,
+        });
+    }
+    if let Some((id, m)) = session.method_exits.iter().find(|(_, m)| m.request_id == Some(req_id) && m.trace) {
+        return Some(TracedRequest {
+            id: id.clone(),
+            condition: None,
+            trace_expr: m.trace_expr.clone(),
+            trace_frames: m.trace_frames,
+            method_filter: m.method.clone(),
+        });
     }
     None
+}
+
+/// Whether a hit's location is in the method a request was narrowed to (METH-1).
+///
+/// `None` filter matches everything. Compared by **name only**, so every overload of `save` matches —
+/// JDWP's `ClassMatch` gives us no signature to discriminate on, and a caller asking for `save` almost
+/// certainly means all of them.
+async fn method_name_matches(
+    conn: &mut jdwp_client::JdwpConnection,
+    filter: Option<&str>,
+    loc: &Location,
+) -> bool {
+    let Some(want) = filter else {
+        return true;
+    };
+    let (method, _, _) = frame_method_info(conn, loc, false).await;
+    method == want
 }
 
 /// Disarm the one stop point a JDWP request id belongs to — line breakpoint, exception request, or
@@ -2760,6 +3222,21 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
         }
         return Some(format!("watchpoint {id} ({}.{})", wp.class_name, wp.field_name));
     }
+    if let Some((id, me)) = session.method_exits.iter()
+        .find(|(_, m)| m.request_id == Some(req_id))
+        .map(|(k, v)| (k.clone(), v.clone()))
+    {
+        let _ = session.connection.clear_method_exit_request(req_id, me.with_return_value).await;
+        if let Some(m) = session.method_exits.get_mut(&id) {
+            m.request_id = None;
+            m.enabled = false;
+        }
+        return Some(format!(
+            "method-exit request {id} ({}{})",
+            me.class_pattern,
+            me.method.map_or_else(|| ".*".to_string(), |m| format!(".{m}"))
+        ));
+    }
     None
 }
 
@@ -2768,44 +3245,91 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
 ///
 /// Shares its "keep the definition" behaviour with [`disarm_request`], which is the automatic path
 /// (watchdog / trace budget); this is the explicit one, via `debug.toggle_breakpoint`.
+/// One disable per kind, mirroring how [`rearm_stop_point`] is split: each clears a different JDWP
+/// request type, and inlining all four made this branchy enough to trip the complexity gate.
 async fn disable_stop_point(
     session: &mut crate::session::DebugSession,
     id: &str,
 ) -> Result<String, String> {
     if let Some(bp) = session.breakpoints.get(id).cloned() {
-        if let Some(req) = bp.request_id {
-            session.connection.clear_breakpoint(req).await
-                .map_err(|e| format!("Failed to clear breakpoint request: {e}"))?;
-        }
-        if let Some(b) = session.breakpoints.get_mut(id) {
-            b.request_id = None;
-            b.enabled = false;
-        }
-        return Ok(format!("{}:{}", bp.class_pattern, bp.line));
+        return disable_line_breakpoint(session, id, &bp).await;
     }
     if let Some(er) = session.exception_requests.get(id).cloned() {
-        if let Some(req) = er.request_id {
-            session.connection.clear_exception_request(req).await
-                .map_err(|e| format!("Failed to clear exception request: {e}"))?;
-        }
-        if let Some(e) = session.exception_requests.get_mut(id) {
-            e.request_id = None;
-            e.enabled = false;
-        }
-        return Ok(format!("exception {}", er.class_pattern));
+        return disable_exception_request(session, id, &er).await;
     }
     if let Some(wp) = session.watchpoints.get(id).cloned() {
-        if let Some(req) = wp.request_id {
-            session.connection.clear_field_watch(req, wp.kind).await
-                .map_err(|e| format!("Failed to clear field watch: {e}"))?;
-        }
-        if let Some(w) = session.watchpoints.get_mut(id) {
-            w.request_id = None;
-            w.enabled = false;
-        }
-        return Ok(format!("watch {}.{}", wp.class_name, wp.field_name));
+        return disable_watchpoint(session, id, &wp).await;
+    }
+    if let Some(me) = session.method_exits.get(id).cloned() {
+        return disable_method_exit(session, id, &me).await;
     }
     Err(format!("Stop point not found: {id}"))
+}
+
+async fn disable_line_breakpoint(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+    bp: &crate::session::BreakpointInfo,
+) -> Result<String, String> {
+    if let Some(req) = bp.request_id {
+        session.connection.clear_breakpoint(req).await
+            .map_err(|e| format!("Failed to clear breakpoint request: {e}"))?;
+    }
+    if let Some(b) = session.breakpoints.get_mut(id) {
+        b.request_id = None;
+        b.enabled = false;
+    }
+    Ok(format!("{}:{}", bp.class_pattern, bp.line))
+}
+
+async fn disable_exception_request(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+    er: &crate::session::ExceptionRequestInfo,
+) -> Result<String, String> {
+    if let Some(req) = er.request_id {
+        session.connection.clear_exception_request(req).await
+            .map_err(|e| format!("Failed to clear exception request: {e}"))?;
+    }
+    if let Some(e) = session.exception_requests.get_mut(id) {
+        e.request_id = None;
+        e.enabled = false;
+    }
+    Ok(format!("exception {}", er.class_pattern))
+}
+
+async fn disable_watchpoint(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+    wp: &crate::session::WatchpointInfo,
+) -> Result<String, String> {
+    if let Some(req) = wp.request_id {
+        session.connection.clear_field_watch(req, wp.kind).await
+            .map_err(|e| format!("Failed to clear field watch: {e}"))?;
+    }
+    if let Some(w) = session.watchpoints.get_mut(id) {
+        w.request_id = None;
+        w.enabled = false;
+    }
+    Ok(format!("watch {}.{}", wp.class_name, wp.field_name))
+}
+
+/// Disabling a method-exit request must pass back the same `with_return_value` it was armed with: JDWP
+/// keys requests by (eventKind, requestID), so clearing kind 41 when 42 was armed leaves it live.
+async fn disable_method_exit(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+    me: &crate::session::MethodExitRequestInfo,
+) -> Result<String, String> {
+    if let Some(req) = me.request_id {
+        session.connection.clear_method_exit_request(req, me.with_return_value).await
+            .map_err(|e| format!("Failed to clear method-exit request: {e}"))?;
+    }
+    if let Some(m) = session.method_exits.get_mut(id) {
+        m.request_id = None;
+        m.enabled = false;
+    }
+    Ok(format!("method-exit {}", me.class_pattern))
 }
 
 /// Re-arm the disabled stop point with this caller-facing id from its stored definition, keeping the
@@ -2834,7 +3358,35 @@ async fn rearm_stop_point(
     if let Some(wp) = session.watchpoints.get(id).cloned() {
         return rearm_watchpoint(session, id, &wp).await;
     }
+    if let Some(me) = session.method_exits.get(id).cloned() {
+        return rearm_method_exit(session, id, &me).await;
+    }
     Err(format!("Stop point not found: {id}"))
+}
+
+/// Re-arm a method-exit request (METH-1).
+///
+/// Nothing to re-resolve by name, unlike the other three: a `ClassMatch` modifier is the *pattern
+/// string*, matched by the JVM as classes load, not a reference type id captured at arm time. So this is
+/// the one kind that is immune to the BP-4 staleness problem — and it re-arms across a redeploy without
+/// needing the class to be loaded at all.
+async fn rearm_method_exit(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+    me: &crate::session::MethodExitRequestInfo,
+) -> Result<String, String> {
+    let req = session.connection
+        .set_method_exit_request(
+            &me.class_pattern, me.with_return_value, suspend_policy_for(me.trace), None, me.thread_filter,
+        )
+        .await
+        .map_err(|e| format!("Failed to re-arm method-exit request: {e}"))?;
+    if let Some(m) = session.method_exits.get_mut(id) {
+        m.request_id = Some(req);
+        m.enabled = true;
+        m.trace_budget = refreshed_budget(m.trace_budget);
+    }
+    Ok(format!("method-exit {}", me.class_pattern))
 }
 
 /// A re-armed stop point's trace budget, refreshed: it was disarmed *because* the old one ran out, so
@@ -2971,17 +3523,24 @@ async fn try_record_trace(
     let Some(req) = find_traced_request(session, req_id) else {
         return false;
     };
-    // Honor a condition, if any: skip recording when it isn't true. Only a line breakpoint can have
-    // one, so for a traced exception/watch hit this is always false.
-    let skip = match &req.condition {
-        Some(cond) => !evaluate_condition_on_thread(&mut session.connection, thread, cond).await,
-        None => false,
-    };
+    // Two reasons to drop a hit without recording it, and neither charges the trace budget — so
+    // "exactly N traces, then it stops" still holds:
+    //  - a line breakpoint's `condition` isn't true;
+    //  - a method-exit request fired for a method other than the one asked for (METH-1), which is the
+    //    common case, since JDWP's ClassMatch reports every method of the class.
+    let wrong_method =
+        !method_name_matches(&mut session.connection, req.method_filter.as_deref(), &loc).await;
+    let skip = wrong_method
+        || match &req.condition {
+            Some(cond) => !evaluate_condition_on_thread(&mut session.connection, thread, cond).await,
+            None => false,
+        };
     let record = if skip {
         None
     } else {
         Some(capture_trace(
-            &mut session.connection, &req.id, req.trace_expr.as_deref(), thread, &loc, &details,
+            &mut session.connection, &req.id, req.trace_expr.as_deref(), req.trace_frames,
+            thread, &loc, &details,
         ).await)
     };
     let recorded = record.is_some();
@@ -3038,6 +3597,11 @@ fn decrement_trace_budget(session: &mut crate::session::DebugSession, req_id: i3
         w.trace_budget = Some(n);
         return Some(n);
     }
+    if let Some(m) = session.method_exits.values_mut().find(|m| m.request_id == Some(req_id)) {
+        let n = m.trace_budget?.saturating_sub(1);
+        m.trace_budget = Some(n);
+        return Some(n);
+    }
     None
 }
 
@@ -3048,17 +3612,31 @@ async fn store_reportable_event(
     event_set: jdwp_client::EventSet,
 ) {
     let mut skip = false;
-    if let (Some((thread, _)), Some(req_id)) = (
+    if let (Some((thread, loc)), Some(req_id)) = (
         event_set.events.first().and_then(|e| event_location(&e.details)),
         event_set.events.first().map(|e| e.request_id),
     ) {
+        // A suspending method-exit request narrowed to one method (METH-1) still receives every method of
+        // the class, so an exit from a different one must resume and be dropped — otherwise a request for
+        // `save` freezes the VM on the first unrelated getter that returns.
+        let method_filter = session.method_exits.values()
+            .find(|m| m.request_id == Some(req_id))
+            .and_then(|m| m.method.clone());
+        if method_filter.is_some()
+            && !method_name_matches(&mut session.connection, method_filter.as_deref(), &loc).await
+        {
+            let _ = session.connection.resume_all().await;
+            skip = true;
+        }
         let cond = session.breakpoints.values()
             .find(|b| b.request_id == Some(req_id))
             .and_then(|b| b.condition.clone());
-        if let Some(cond) = cond {
-            if !evaluate_condition_on_thread(&mut session.connection, thread, &cond).await {
-                let _ = session.connection.resume_all().await;
-                skip = true;
+        if !skip {
+            if let Some(cond) = cond {
+                if !evaluate_condition_on_thread(&mut session.connection, thread, &cond).await {
+                    let _ = session.connection.resume_all().await;
+                    skip = true;
+                }
             }
         }
     }
@@ -3215,6 +3793,8 @@ struct BreakpointSpec {
     trace: bool,
     trace_expr: Option<String>,
     trace_budget: Option<u32>,
+    /// Caller-frame depth for traced hits (TRACE-5), already clamped to `MAX_TRACE_FRAMES`.
+    trace_frames: usize,
     suspend_policy: jdwp_client::SuspendPolicy,
 }
 
@@ -3244,6 +3824,7 @@ async fn arm_and_insert(
         trace: spec.trace,
         trace_expr: spec.trace_expr.clone(),
         trace_budget: spec.trace_budget,
+        trace_frames: spec.trace_frames,
         arm: crate::session::BreakpointArm {
             class_id: class_type_id,
             method_id: method.method_id,
@@ -3294,6 +3875,7 @@ async fn register_deferred_breakpoint(
         trace: spec.trace,
         trace_expr: spec.trace_expr.clone(),
         trace_budget: spec.trace_budget,
+        trace_frames: spec.trace_frames,
     });
     let where_ = match (spec.line_opt, spec.method_hint.as_deref()) {
         (Some(l), _) => format!("line {l}"),
@@ -5452,7 +6034,7 @@ async fn validate_ref_assignable(
             let rt = conn.get_object_reference_type(id).await
                 .map_err(|e| format!("Failed to resolve the source value's type: {e}"))?;
             let ok = if declared_sig.starts_with('[') {
-                conn.get_signature(rt).await.map(|s| s.starts_with('[')).unwrap_or(false)
+                conn.get_signature(rt).await.is_ok_and(|s| s.starts_with('['))
             } else {
                 conn.implements_interface(rt, declared_sig).await.unwrap_or(false)
             };
@@ -5479,8 +6061,7 @@ fn event_location(d: &EventKind) -> Option<(u64, Location)> {
     match d {
         EventKind::Breakpoint { thread, location }
         | EventKind::Step { thread, location }
-        | EventKind::MethodEntry { thread, location }
-        | EventKind::MethodExit { thread, location }
+        | EventKind::MethodExit { thread, location, .. }
         | EventKind::Exception { thread, location, .. } => Some((*thread, location.clone())),
         EventKind::FieldAccess { field } | EventKind::FieldModification { field, .. } => {
             Some((field.thread, field.location.clone()))
@@ -5501,7 +6082,6 @@ fn event_suspends(es: &jdwp_client::EventSet) -> bool {
                 EventKind::Breakpoint { .. }
                     | EventKind::Step { .. }
                     | EventKind::Exception { .. }
-                    | EventKind::MethodEntry { .. }
                     | EventKind::MethodExit { .. }
                     | EventKind::FieldAccess { .. }
                     | EventKind::FieldModification { .. }
@@ -5514,7 +6094,6 @@ const fn event_type_name(d: &EventKind) -> &'static str {
         EventKind::Breakpoint { .. } => "breakpoint",
         EventKind::Step { .. } => "step",
         EventKind::Exception { .. } => "exception",
-        EventKind::MethodEntry { .. } => "method_entry",
         EventKind::MethodExit { .. } => "method_exit",
         EventKind::VMStart { .. } => "vm_start",
         EventKind::VMDeath => "vm_death",
@@ -5575,6 +6154,350 @@ async fn collect_thread_rows(
     rows
 }
 
+/// One thread's entry in a `debug.thread_dump` (DUMP-1).
+///
+/// `stack` is `Err(reason)` rather than empty when the frames could not be read, because "no frames"
+/// and "not readable" are completely different answers on a wedged JVM and collapsing them would make
+/// a running thread look idle.
+struct DumpRow {
+    id: u64,
+    name: String,
+    /// Short `threadStatus` label (`running` / `monitor` / `wait` / …).
+    status: &'static str,
+    /// Whether the debugger currently holds this thread suspended (`suspendStatus` != 0).
+    suspended: bool,
+    /// Rendered `#i class.method:line` frames, or why they couldn't be read.
+    stack: Result<Vec<String>, String>,
+    /// How many frames were dropped by `max_frames` / `package_filter`.
+    frames_hidden: usize,
+    /// Monitors this thread holds, as `(rendered, object id)`.
+    holds: Vec<(String, u64)>,
+    /// The monitor it is blocked entering, if any.
+    waiting_on: Option<(String, u64)>,
+    /// Set when monitors were asked for but the read failed on this thread.
+    monitor_note: Option<String>,
+}
+
+/// Read one `DumpRow` per thread, honouring the name/suspended filters and the thread limit.
+///
+/// Every per-thread read is allowed to fail on its own: a thread can die between `AllThreads` and the
+/// questions we ask about it, and on a running VM the frame read fails by design. One bad thread must
+/// not cost the rest of the dump (that is the difference between this and one `get_stack` per thread).
+async fn collect_dump_rows(
+    conn: &mut jdwp_client::JdwpConnection,
+    all: &[u64],
+    a: &crate::args::ThreadDumpArgs,
+    caps: Option<&jdwp_client::vm::VmCapabilities>,
+) -> Vec<DumpRow> {
+    let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
+    let package_filter = a.package_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
+    let limit = a.limit.max(1);
+    // Monitors need the JVM to support them; without the capability the commands answer
+    // NOT_IMPLEMENTED, so skip them rather than collect a per-thread error for every thread.
+    let want_monitors = a.monitors
+        && caps.is_some_and(|c| c.can_get_owned_monitor_info || c.can_get_current_contended_monitor);
+
+    let mut rows = Vec::new();
+    // Class names are shared across every thread in the dump — a request pool's stacks are largely the
+    // same frames, so this is where most of the lookup cost disappears.
+    let mut class_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let mut monitor_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+
+    for tid in all {
+        if rows.len() >= limit {
+            break;
+        }
+        let name = conn.get_thread_name(*tid).await.unwrap_or_default();
+        if name_filter.as_ref().is_some_and(|f| !name.to_lowercase().contains(f.as_str())) {
+            continue;
+        }
+        let (status, suspended) = match conn.get_thread_status(*tid).await {
+            Ok((ts, ss)) => (thread_status_name(ts), ss != 0),
+            // A thread that can't report its status has almost certainly died; skip it rather than
+            // showing a row of unknowns.
+            Err(_) => continue,
+        };
+        if a.only_suspended && !suspended {
+            continue;
+        }
+
+        let (stack, frames_hidden) = if suspended {
+            read_dump_stack(conn, *tid, a.max_frames, package_filter.as_deref(), &mut class_names).await
+        } else {
+            // Not a failure of ours to explain away: JDWP defines frames as readable only on a
+            // suspended thread. Say what would make it readable.
+            (
+                Err("running — JDWP can only read a suspended thread's stack; pass suspend:true".to_string()),
+                0,
+            )
+        };
+
+        // The "should we even ask?" guard lives inside the helper, so the loop body holds no
+        // per-iteration collection of its own.
+        let (holds, waiting_on, monitor_note) =
+            read_thread_monitors(conn, *tid, want_monitors && suspended, &mut monitor_names).await;
+
+        rows.push(DumpRow {
+            id: *tid,
+            name,
+            status,
+            suspended,
+            stack,
+            frames_hidden,
+            holds,
+            waiting_on,
+            monitor_note,
+        });
+    }
+    rows
+}
+
+/// Read one suspended thread's lock state, as `(monitors held, monitor blocked on, failure note)`.
+///
+/// `ask` false returns the empty answer without a round trip — monitors not requested, or a thread whose
+/// locks JDWP won't report because it is running.
+///
+/// Each half is allowed to fail independently: a JVM can support `canGetOwnedMonitorInfo` without
+/// `canGetCurrentContendedMonitor`, and a thread can die between the two calls. Either way the note is
+/// reported on that thread's line rather than aborting the dump.
+async fn read_thread_monitors(
+    conn: &mut jdwp_client::JdwpConnection,
+    tid: u64,
+    ask: bool,
+    names: &mut std::collections::HashMap<u64, String>,
+) -> (Vec<(String, u64)>, Option<(String, u64)>, Option<String>) {
+    let mut holds = Vec::new();
+    let mut waiting_on = None;
+    let mut note = None;
+    if !ask {
+        return (holds, waiting_on, note);
+    }
+    match conn.owned_monitors(tid).await {
+        Ok(ms) => {
+            for m in ms {
+                let rendered = monitor_label(conn, m.object_id, names).await;
+                holds.push((rendered, m.object_id));
+            }
+        }
+        Err(e) => note = Some(format!("owned monitors unreadable: {e}")),
+    }
+    match conn.current_contended_monitor(tid).await {
+        Ok(Some(m)) => {
+            let rendered = monitor_label(conn, m.object_id, names).await;
+            waiting_on = Some((rendered, m.object_id));
+        }
+        Ok(None) => {}
+        Err(e) => note = Some(format!("contended monitor unreadable: {e}")),
+    }
+    (holds, waiting_on, note)
+}
+
+/// Read and render one thread's frames for a dump, returning `(frames, hidden count)`.
+///
+/// `-1` (all frames) then truncate, for the same reason the trace capture does it: JDWP fails a
+/// `Frames` request whose length exceeds what the thread actually has.
+async fn read_dump_stack(
+    conn: &mut jdwp_client::JdwpConnection,
+    tid: u64,
+    max_frames: usize,
+    package_filter: Option<&str>,
+    class_names: &mut std::collections::HashMap<u64, String>,
+) -> (Result<Vec<String>, String>, usize) {
+    let frames = match conn.get_frames(tid, 0, -1).await {
+        Ok(f) => f,
+        Err(e) => return (Err(format!("stack unreadable: {e}")), 0),
+    };
+    let depth = frames.len();
+    let mut out = Vec::new();
+    let mut hidden = 0usize;
+    for (idx, f) in frames.iter().enumerate() {
+        if out.len() >= max_frames {
+            hidden = depth - out.len() - hidden;
+            break;
+        }
+        let class = resolve_class_name(conn, f.location.class_id, class_names).await;
+        // Filtered-out frames cost only the (cached) class name, never a method or line lookup.
+        if package_filter.is_some_and(|p| !class.to_lowercase().contains(p)) {
+            hidden += 1;
+            continue;
+        }
+        let (method, line, _) = frame_method_info(conn, &f.location, false).await;
+        out.push(line.map_or_else(
+            || format!("#{idx} {class}.{method}"),
+            |l| format!("#{idx} {class}.{method}:{l}"),
+        ));
+    }
+    (Ok(out), hidden)
+}
+
+/// Render a monitor object as `Type@<id>`, caching the type name by object id.
+///
+/// Cached because the interesting case is *the same lock* appearing on several threads — which is the
+/// whole point of the correlation — and each name otherwise costs two round trips.
+async fn monitor_label(
+    conn: &mut jdwp_client::JdwpConnection,
+    object_id: u64,
+    cache: &mut std::collections::HashMap<u64, String>,
+) -> String {
+    if let Some(n) = cache.get(&object_id) {
+        return n.clone();
+    }
+    let name = match conn.get_object_reference_type(object_id).await {
+        Ok(rt) => conn
+            .get_signature(rt)
+            .await
+            .ok()
+            .map(|s| decode_signature(&s))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "?".to_string()),
+        Err(_) => "?".to_string(),
+    };
+    let label = format!("{name}@{object_id:x}");
+    cache.insert(object_id, label.clone());
+    label
+}
+
+/// The `debug.thread_dump` header: what was asked for, what the suspension did, and every reason the
+/// dump might be less complete than it looks.
+///
+/// Each of those caveats is here because its absence would read as a positive answer — no lock lines as
+/// "nothing is contended", unreadable threads as "nothing to see".
+fn render_dump_header(
+    rows: &[DumpRow],
+    total: usize,
+    a: &crate::args::ThreadDumpArgs,
+    caps: Option<&jdwp_client::vm::VmCapabilities>,
+    already_suspended: bool,
+    resume_note: &str,
+) -> String {
+    let mut note = String::new();
+    if let Some(f) = a.name_filter.as_deref().filter(|s| !s.is_empty()) {
+        let _ = write!(note, " name~\"{f}\"");
+    }
+    if a.only_suspended {
+        note.push_str(" suspended-only");
+    }
+    if let Some(p) = a.package_filter.as_deref().filter(|s| !s.is_empty()) {
+        let _ = write!(note, " frames~\"{p}\"");
+    }
+
+    let mut out = format!("🧵 Thread dump — {}/{total} thread(s){note}\n", rows.len());
+    if already_suspended {
+        out.push_str("   VM was already suspended — read as it is, and left suspended.\n");
+    }
+    if !resume_note.is_empty() {
+        let _ = writeln!(out, "   {resume_note}");
+    }
+    // A JVM that can't answer the monitor questions must say so, rather than silently returning a dump
+    // with no locks in it — which reads as "nothing is contended".
+    if a.monitors {
+        match caps {
+            Some(c) if c.can_get_owned_monitor_info && c.can_get_current_contended_monitor => {}
+            Some(c) => {
+                let _ = writeln!(
+                    out,
+                    "   ⚠️  This JVM cannot report all monitor info (canGetOwnedMonitorInfo={}, \
+                     canGetCurrentContendedMonitor={}) — lock lines are limited to what it supports.",
+                    c.can_get_owned_monitor_info, c.can_get_current_contended_monitor
+                );
+            }
+            None => out.push_str("   ⚠️  Could not read this JVM's capabilities — monitors were skipped.\n"),
+        }
+    }
+    let unreadable = rows.iter().filter(|r| r.stack.is_err()).count();
+    if unreadable > 0 && !a.suspend {
+        let _ = writeln!(
+            out,
+            "   ℹ️  {unreadable} thread(s) are running, so their stacks and locks can't be read. Pass \
+             suspend:true to freeze the VM briefly for a full dump, or only_suspended:true to list just \
+             the readable ones."
+        );
+    }
+    out
+}
+
+/// One thread's block: header, lock lines, then frames (or why there are none).
+fn render_dump_row(
+    out: &mut String,
+    r: &DumpRow,
+    holder: &std::collections::HashMap<u64, (u64, &str)>,
+) {
+    let _ = write!(
+        out,
+        "\n0x{:x} \"{}\" [{}{}]\n",
+        r.id,
+        r.name,
+        r.status,
+        if r.suspended { ", suspended" } else { "" }
+    );
+    if let Some((label, oid)) = &r.waiting_on {
+        // The holder is looked up among the rows actually dumped, so a lock held by a thread that was
+        // filtered out or fell past `limit` is shown WITHOUT a holder rather than with a wrong one.
+        let by = holder
+            .get(oid)
+            .map_or_else(String::new, |(htid, hname)| format!(" ← held by 0x{htid:x} \"{hname}\""));
+        let _ = writeln!(out, "   waiting to enter: {label}{by}");
+    }
+    if !r.holds.is_empty() {
+        let labels: Vec<&str> = r.holds.iter().map(|(l, _)| l.as_str()).collect();
+        let _ = writeln!(out, "   holds: {}", labels.join(", "));
+    }
+    if let Some(n) = &r.monitor_note {
+        let _ = writeln!(out, "   ⚠️  {n}");
+    }
+    match &r.stack {
+        Ok(frames) if frames.is_empty() => out.push_str("   (no frames)\n"),
+        Ok(frames) => {
+            for f in frames {
+                let _ = writeln!(out, "   {f}");
+            }
+            if r.frames_hidden > 0 {
+                let _ = writeln!(out, "   … {} frame(s) hidden", r.frames_hidden);
+            }
+        }
+        // "Unreadable" and "idle" are opposite answers on a wedged JVM, so this never renders as
+        // `(no frames)`.
+        Err(why) => {
+            let _ = writeln!(out, "   ⚠️  {why}");
+        }
+    }
+}
+
+/// Format a whole `debug.thread_dump` reply.
+///
+/// The lock correlation — `← held by 0x2b "worker-2"` — is computed here from the rows already
+/// collected, costing nothing extra. It is the line that turns two separate facts ("A waits for L",
+/// "B holds L") into a visible cycle, which is what a deadlock investigation is looking for.
+fn render_thread_dump(
+    rows: &[DumpRow],
+    total: usize,
+    a: &crate::args::ThreadDumpArgs,
+    caps: Option<&jdwp_client::vm::VmCapabilities>,
+    already_suspended: bool,
+    resume_note: &str,
+    cost: u32,
+) -> String {
+    // object id -> the thread holding it, for the "held by" annotation.
+    let mut holder: std::collections::HashMap<u64, (u64, &str)> = std::collections::HashMap::new();
+    for r in rows {
+        for (_, oid) in &r.holds {
+            holder.insert(*oid, (r.id, r.name.as_str()));
+        }
+    }
+
+    let mut out = render_dump_header(rows, total, a, caps, already_suspended, resume_note);
+    for r in rows {
+        render_dump_row(&mut out, r, &holder);
+    }
+
+    let hidden = total.saturating_sub(rows.len());
+    if hidden > 0 {
+        let _ = writeln!(out, "\n… +{hidden} more thread(s) (raise limit, or narrow with name_filter)");
+    }
+    let _ = write!(out, "\nCost: {cost} JDWP packet(s).");
+    out
+}
+
 /// JDWP threadStatus code -> short label (see `types::ThreadStatus`).
 const fn thread_status_name(ts: i32) -> &'static str {
     match ts {
@@ -5616,12 +6539,18 @@ async fn describe_location(conn: &mut jdwp_client::JdwpConnection, loc: &Locatio
     (class, method, line)
 }
 
-/// Snapshot a trace/logpoint hit: source location, in-scope locals/args, the kind-specific detail
-/// (exception type + catch site, or a watched field's old → new pair), and any trace expression.
+/// Snapshot a trace/logpoint hit: source location, the calling chain above it, in-scope locals/args,
+/// the kind-specific detail (exception type + catch site, or a watched field's old → new pair), and
+/// any trace expression.
 ///
 /// The hit thread is suspended (`EventThread` policy) while this runs; the caller resumes it right
 /// after. Argument values are rendered WITHOUT invoking `toString()` (`thread_id` None), so tracing
 /// stays side-effect free; the explicit `trace_expr` may invoke methods since the user asked for it.
+///
+/// `trace_frames` caller frames are recorded above the hit (TRACE-5) as bare `class.method:line`
+/// locations — no locals — because they are context rather than payload, and a logpoint may fire
+/// hundreds of times. Asking for them costs no extra `Frames` round trip (the same call that fetches
+/// the hit frame fetches them), only the per-frame location lookups.
 ///
 /// The watchpoint detail must be captured HERE rather than at read time for the same reason
 /// `get_last_event` reports it inline: the old value is only readable while the pending store has not
@@ -5630,15 +6559,37 @@ async fn capture_trace(
     conn: &mut jdwp_client::JdwpConnection,
     bp_id: &str,
     trace_expr: Option<&str>,
+    trace_frames: usize,
     thread: u64,
     loc: &Location,
     details: &EventKind,
 ) -> crate::session::TraceRecord {
     let (class, method, line) = describe_location(conn, loc).await;
     let mut args: Vec<(String, String)> = Vec::new();
+    let mut callers: Vec<String> = Vec::new();
     let mut expr: Option<(String, String)> = None;
 
-    if let Ok(frames) = conn.get_frames(thread, 0, 1).await {
+    // The hit frame plus however many callers were asked for, in ONE `Frames` request.
+    //
+    // `-1` (all frames) rather than the exact count, then truncate: JDWP answers `INVALID_LENGTH` when
+    // `length` exceeds the frames a thread actually has, and a thread is routinely shallower than the
+    // requested depth (`main` is only two frames under a helper). Asking for the exact number failed
+    // the whole read on those hits — losing the LOCALS as well as the callers, silently, on precisely
+    // the shallow stacks a small depth was meant to cover. `get_stack` avoids it the same way.
+    let frames = if trace_frames == 0 {
+        // Depth 0 keeps the original single-frame request, so turning the feature off costs exactly
+        // what it did before: every live thread has at least one frame, so length 1 is always valid.
+        conn.get_frames(thread, 0, 1).await
+    } else {
+        conn.get_frames(thread, 0, -1).await.map(|mut f| {
+            f.truncate(1 + trace_frames);
+            f
+        })
+    };
+    if let Ok(frames) = frames {
+        // A thread may be shallower than the requested depth — that is normal (a request thread's
+        // entry point has no caller), not an error, so take whatever came back.
+        callers = describe_caller_chain(conn, frames.get(1..).unwrap_or_default()).await;
         if let Some(frame) = frames.first().cloned() {
             if let Ok(var_table) = conn.get_variable_table(loc.class_id, loc.method_id).await {
                 let ci = loc.index;
@@ -5678,11 +6629,40 @@ async fn capture_trace(
     let mut obj = serde_json::Map::new();
     describe_exception_event(conn, details, &mut obj).await;
     describe_field_event(conn, details, &mut obj).await;
+    describe_method_exit_event(conn, details, &mut obj).await;
     let detail = obj.into_iter().map(|(k, v)| (k, json_scalar_to_string(&v))).collect();
 
     crate::session::TraceRecord {
-        seq: 0, bp_id: bp_id.to_string(), thread, class, method, line, args, expr, detail,
+        seq: 0, bp_id: bp_id.to_string(), thread, class, method, line, args, callers, expr, detail,
     }
+}
+
+/// Render a run of caller frames as `class.method:line`, nearest caller first (TRACE-5).
+///
+/// Locations only — `frame_method_info` is called with `include_variables: false`, so no variable table
+/// is read and nothing is invoked. That is what keeps a caller chain usable in a read-only session
+/// (SAFE-6) and its per-hit cost proportional to the depth rather than to how many locals each caller
+/// happens to hold.
+///
+/// Class names are memoised **within this one call** (the same cache `get_stack` uses), since a caller
+/// chain often repeats a class — recursion, or a framework dispatching into itself. Deliberately not
+/// cached across hits: a reference type id is only stable while that type stays loaded, and a debugger
+/// that reports a stale source line after a redeploy is worse than one that costs a round trip (BP-4).
+async fn describe_caller_chain(
+    conn: &mut jdwp_client::JdwpConnection,
+    frames: &[jdwp_client::thread::Frame],
+) -> Vec<String> {
+    let mut class_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(frames.len());
+    for f in frames {
+        let class = resolve_class_name(conn, f.location.class_id, &mut class_names).await;
+        let (method, line, _) = frame_method_info(conn, &f.location, false).await;
+        out.push(line.map_or_else(
+            || format!("{class}.{method}"),
+            |l| format!("{class}.{method}:{l}"),
+        ));
+    }
+    out
 }
 
 /// Render a JSON scalar for a one-line trace record: strings unquoted (they are already rendered
@@ -5701,6 +6681,18 @@ fn json_scalar_to_string(v: &serde_json::Value) -> String {
 fn format_trace_detail(rec: &crate::session::TraceRecord) -> String {
     rec.detail.iter().fold(String::new(), |mut acc, (k, v)| {
         let _ = write!(acc, " {k}={v}");
+        acc
+    })
+}
+
+/// Format a traced hit's calling chain as ` ← caller ← caller` (empty when none was captured).
+///
+/// Placed immediately after the hit location rather than at the end of the line: it is a continuation
+/// of *where this fired*, so `Class.method:12 ← Caller.method:40` reads as one call chain, and it stays
+/// legible next to the location instead of trailing a long list of locals (TRACE-5).
+fn format_trace_callers(rec: &crate::session::TraceRecord) -> String {
+    rec.callers.iter().fold(String::new(), |mut acc, c| {
+        let _ = write!(acc, " ← {c}");
         acc
     })
 }
@@ -6126,6 +7118,169 @@ mod tests {
     #[test]
     fn a_plain_comparison_is_one_leaf() {
         assert_eq!(shape(&parse_bool_tree("qty > 3")), "qty > 3");
+    }
+
+    // TRACE-5: the caller depth is clamped, and a clamp is REPORTED rather than silently applied — an
+    // ignored argument would leave a caller believing they had a deeper chain than they do.
+    #[test]
+    fn trace_frames_are_clamped_and_the_clamp_is_reported() {
+        assert_eq!(clamp_trace_frames(true, 3), (3, None), "a depth within the cap passes through");
+        assert_eq!(clamp_trace_frames(true, 0), (0, None), "0 is the one-frame snapshot, not a default");
+        assert_eq!(
+            clamp_trace_frames(true, MAX_TRACE_FRAMES),
+            (MAX_TRACE_FRAMES, None),
+            "the cap itself is allowed, so the boundary is inclusive"
+        );
+
+        let (depth, note) = clamp_trace_frames(true, MAX_TRACE_FRAMES + 1);
+        assert_eq!(depth, MAX_TRACE_FRAMES);
+        let note = note.expect("exceeding the cap must produce a note, not silence");
+        assert!(note.contains("clamped"), "the note must say what happened: {note}");
+
+        // A suspending stop point hands over a live thread, so `debug.get_stack` is the full-stack
+        // answer and a snapshot depth has nothing to do.
+        assert_eq!(clamp_trace_frames(false, 5), (0, None), "depth is meaningless without trace mode");
+    }
+
+    // TRACE-5: the depth is visible in `list_breakpoints` (so a slowed debuggee is explainable), and
+    // absent when there is nothing to report.
+    #[test]
+    fn trace_frames_tag_shows_only_a_real_depth() {
+        assert_eq!(trace_frames_tag(true, 3), " [+3 caller frame(s)]");
+        assert_eq!(trace_frames_tag(true, 0), "", "depth 0 adds no cost, so it advertises nothing");
+        assert_eq!(trace_frames_tag(false, 3), "", "a non-traced stop point has no snapshot depth");
+    }
+
+    // TRACE-5: the chain renders as one readable run of arrows on the hit's own line, and adds nothing
+    // when no callers were captured — the pre-TRACE-5 line stays byte-for-byte the same.
+    #[test]
+    fn caller_chain_renders_inline_and_vanishes_when_empty() {
+        let mut rec = crate::session::TraceRecord {
+            seq: 1,
+            bp_id: "bp_1".to_string(),
+            thread: 1,
+            class: "Svc".to_string(),
+            method: "save".to_string(),
+            line: Some(10),
+            args: Vec::new(),
+            callers: Vec::new(),
+            expr: None,
+            detail: Vec::new(),
+        };
+        assert_eq!(format_trace_callers(&rec), "");
+
+        rec.callers = vec!["Ctl.post:40".to_string(), "Http.run:12".to_string()];
+        assert_eq!(format_trace_callers(&rec), " ← Ctl.post:40 ← Http.run:12");
+    }
+
+    /// A `DumpRow` with everything empty, for the render tests to fill in selectively.
+    fn dump_row(id: u64, name: &str) -> DumpRow {
+        DumpRow {
+            id,
+            name: name.to_string(),
+            status: "monitor",
+            suspended: true,
+            stack: Ok(vec!["#0 Svc.save:10".to_string()]),
+            frames_hidden: 0,
+            holds: Vec::new(),
+            waiting_on: None,
+            monitor_note: None,
+        }
+    }
+
+    fn dump_args(json: serde_json::Value) -> crate::args::ThreadDumpArgs {
+        serde_json::from_value(json).expect("valid ThreadDumpArgs")
+    }
+
+    const ALL_CAPS: jdwp_client::vm::VmCapabilities = jdwp_client::vm::VmCapabilities {
+        can_watch_field_modification: true,
+        can_watch_field_access: true,
+        can_get_bytecodes: true,
+        can_get_synthetic_attribute: true,
+        can_get_owned_monitor_info: true,
+        can_get_current_contended_monitor: true,
+        can_get_monitor_info: true,
+    };
+
+    // DUMP-1: the whole point of collecting monitors is the correlation — "A waits for L" plus "B holds
+    // L" has to render as one readable fact, or a deadlock stays invisible in a correct-looking dump.
+    #[test]
+    fn thread_dump_names_the_holder_of_a_contended_lock() {
+        let mut one = dump_row(0x8, "deadlock-one");
+        one.holds = vec![("LockA@d".to_string(), 0xd)];
+        one.waiting_on = Some(("LockB@f".to_string(), 0xf));
+        let mut two = dump_row(0x9, "deadlock-two");
+        two.holds = vec![("LockB@f".to_string(), 0xf)];
+        two.waiting_on = Some(("LockA@d".to_string(), 0xd));
+
+        let out = render_thread_dump(
+            &[one, two], 2, &dump_args(json!({})), Some(&ALL_CAPS), false, "", 44,
+        );
+        assert!(
+            out.contains("waiting to enter: LockB@f ← held by 0x9 \"deadlock-two\""),
+            "the cycle's first half must name its holder:\n{out}"
+        );
+        assert!(
+            out.contains("waiting to enter: LockA@d ← held by 0x8 \"deadlock-one\""),
+            "the cycle's second half must name its holder:\n{out}"
+        );
+        assert!(out.contains("Cost: 44 JDWP packet(s)"), "the round-trip cost is reported:\n{out}");
+    }
+
+    // A lock whose holder is not in the dump (filtered out, or past `limit`) must be reported WITHOUT a
+    // holder rather than with a wrong one — the annotation is only as good as the rows it was built from.
+    #[test]
+    fn thread_dump_omits_the_holder_when_it_is_not_in_the_dump() {
+        let mut one = dump_row(0x8, "deadlock-one");
+        one.waiting_on = Some(("LockB@f".to_string(), 0xf));
+        let out = render_thread_dump(
+            &[one], 9, &dump_args(json!({"limit": 1})), Some(&ALL_CAPS), false, "", 10,
+        );
+        assert!(out.contains("waiting to enter: LockB@f"), "the contended lock is still shown:\n{out}");
+        assert!(!out.contains("held by"), "no holder may be invented for a thread not dumped:\n{out}");
+        assert!(out.contains("+8 more thread(s)"), "the threads left out are counted:\n{out}");
+    }
+
+    // DUMP-1: a JVM that cannot answer the monitor questions must SAY so. A dump with no lock lines
+    // otherwise reads as "nothing is contended", which is the opposite of the truth.
+    #[test]
+    fn thread_dump_reports_a_jvm_that_cannot_do_monitors() {
+        let caps = jdwp_client::vm::VmCapabilities {
+            can_get_owned_monitor_info: false,
+            can_get_current_contended_monitor: false,
+            ..ALL_CAPS
+        };
+        let out = render_thread_dump(
+            &[dump_row(0x8, "worker")], 1, &dump_args(json!({})), Some(&caps), false, "", 5,
+        );
+        assert!(out.contains("cannot report all monitor info"), "the gap must be stated:\n{out}");
+        assert!(out.contains("canGetOwnedMonitorInfo=false"), "and named precisely:\n{out}");
+
+        // Capabilities unreadable is its own case, and must not silently look like "no locks held".
+        let unknown =
+            render_thread_dump(&[dump_row(0x8, "worker")], 1, &dump_args(json!({})), None, false, "", 5);
+        assert!(unknown.contains("monitors were skipped"), "an unknown capability set is stated:\n{unknown}");
+
+        // ...but a dump that never asked for monitors says nothing about them at all.
+        let off = render_thread_dump(
+            &[dump_row(0x8, "worker")], 1, &dump_args(json!({"monitors": false})), None, false, "", 5,
+        );
+        assert!(!off.contains("monitor info"), "monitors:false should not editorialise:\n{off}");
+    }
+
+    // SAFE-4: an unreadable thread is reported on its own line with what would fix it, and the reply
+    // must never imply the dump was complete. A running VM is the default case, so this is the norm.
+    #[test]
+    fn thread_dump_explains_an_unreadable_running_thread() {
+        let mut row = dump_row(0x8, "http-listener");
+        row.suspended = false;
+        row.status = "running";
+        row.stack = Err("running — JDWP can only read a suspended thread's stack".to_string());
+
+        let out = render_thread_dump(&[row], 1, &dump_args(json!({})), None, false, "", 4);
+        assert!(out.contains("1 thread(s) are running"), "the count of unreadable threads is stated:\n{out}");
+        assert!(out.contains("suspend:true"), "and how to get a full dump:\n{out}");
+        assert!(!out.contains("(no frames)"), "unreadable must not render as an idle thread:\n{out}");
     }
 
     // SAFE-3: an expression that calls a method is detected (so read-only can refuse it), and a `(`

@@ -21,8 +21,9 @@ Uncovered paths reviewed once, and the verdicts:
   build one. It is reachable only when something outside the session is also suspending, which is
   [#13](https://github.com/YgorPerez/java-debugging-mcp/issues/13) territory. Worth knowing that the
   honest-failure path of the safety fix is the untested one.
-- **`get_thread_status`** (`thread.rs:117`) — only used by `list_threads {only_suspended:true}`, which no
-  test passes. Small real gap; cheap to close.
+- **`get_thread_status`** (`thread.rs:117`) — was only used by `list_threads {only_suspended:true}`, which
+  no test passed. **Closed** by DUMP-1: `debug.thread_dump` reads it for every thread (it is how a
+  readable thread is told from a running one), and both dump tests exercise it.
 - **`Value::format`** (`types.rs:102`) — live (called from `handlers.rs:3396`, `:4707`) but only on a
   type-mismatch message and a render fallback. Not dead code.
 - **`get_version` / `get_id_sizes`** (`vm.rs:47`, `:76`) — JDWP conveniences the server never calls.
@@ -363,9 +364,120 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   (+ `examples/probes/ExcProbe.java`, a throw-and-swallow loop): each asserts the hits land in
   `get_traces` **and** that the probe's own tick line keeps advancing — the debugger reports success
   either way, so only the debuggee's output proves nothing was left suspended.
-  The `jdwp-trace` skill in the sibling repo is updated to match: Rule 0 now covers all three kinds,
-  site 2's step 2 is traced, and the one thing a trace genuinely can't give you (the calling stack) is
-  stated once, where the suspension discipline lives.
+  The `jdwp-trace` skill in the sibling repo is updated to match: Rule 0 now covers all three kinds and
+  site 2's step 2 is traced. (Its "the calling stack is the one thing a trace can't give you" note was
+  made wrong by TRACE-5 below, and has since been replaced there.)
+- **A traced hit records who called it (TRACE-5)** — `capture_trace` read exactly one frame, so a
+  logpoint could say where it fired and nothing about the path that reached it. That gap landed on the
+  exact use case trace mode exists for: when you catch a swallowed exception on the shared 8180, the
+  question is almost always *which request path got here*, and answering it meant giving up trace mode
+  for a suspending breakpoint — the thing trace mode was introduced to avoid.
+  `trace_frames` (default 3, cap 20) on all three traced stop points records that many callers above
+  the hit as `class.method:line`, rendered inline on the hit's own line: `Svc.save:34 ←
+  Ctl.post:40 ← Http.run:12`. **Locations only, deliberately** — the hit frame's locals are the
+  payload, the callers are context, and reading every caller's variable table would multiply the
+  per-hit cost on something that may fire hundreds of times. It also keeps the whole capture
+  invocation-free, so caller chains work in a read-only session (SAFE-6), unlike expansion. The depth
+  shows in `list_breakpoints` (`[+3 caller frame(s)]`) because it is what makes a hit cost more than one
+  round trip, so a slowed debuggee stays explainable from a listing; a request past the cap is clamped
+  **and says so**, since a silently ignored argument would leave a caller trusting a chain they never got.
+  Bug this surfaced, and the reason the test asks for a depth no path can satisfy: JDWP answers
+  `INVALID_LENGTH` when a `Frames` request's length exceeds the frames a thread actually has, and a
+  thread is routinely shallower than the requested depth (`main` is two frames under a helper). Asking
+  for the exact count failed the whole read on those hits — losing the **locals** as well as the
+  callers, silently, on precisely the shallow stacks a small depth was meant to cover. Fetching all
+  frames and truncating is how `get_stack` already avoided it. Only `traced_hits_record_which_caller_…`
+  asking for 3 callers where two paths have 2 caught it; a depth every path could satisfy passed.
+  Validated by `traced_hits_record_which_caller_reached_them` and
+  `trace_frames_zero_keeps_the_one_frame_snapshot_and_the_cap_is_reported` (+
+  `examples/probes/CallerProbe.java`, whose one traced line is reached from **three** different paths —
+  a single-caller probe would let a hardcoded frame pass). Each hit is paired with its own chain by the
+  argument it was called with, and the probe's tick line must keep advancing, per TRACE-2.
+  The `jdwp-trace` skill in the sibling `infotravel-dev-toolkit` is updated: Rule 0 now documents the
+  caller chain instead of claiming a trace can't give you one, site 2 no longer sends you to a suspension
+  for the originating stack, and `TECHNIQUES.md`'s "walk up the call chain one frame at a time" is gone.
+  It is explicit there that caller frames carry **locations only** — the chain replaces the search for the
+  next frame, not the reading of its value, which is the one way that advice could be misread.
+- **Method-exit reporting, and `MethodEntry` deleted (METH-1)** — the receiving half of method events was
+  built and unreachable: `EventKind::MethodEntry`/`MethodExit` existed and `handlers.rs` named both in
+  `event_type_name` / `event_location` / `event_suspends`, but no tool could arm one — and the wire
+  parser did not even dispatch to them, so the variants could never be constructed either. Half-built
+  plumbing that implied a capability nothing had.
+  Finished the useful half: `debug.set_method_breakpoint` answers **what did this method actually
+  return**, and from **which `return`**. `METHOD_EXIT_WITH_RETURN_VALUE` (kind 42) carries the value and
+  the hit location is the return site, so a method with several exits stops being a guessing game — the
+  `IntegraSrv.post`-style bug (a non-200 path returning `null`) is exactly "which return did it take, and
+  with what". Two real trace lines, from the same armed request:
+  ```
+  #1 [mexit_1] ReturnProbe.classify:30 ← ReturnProbe.main:42 thread=0x1 returned="OK" {n=(int) 38}
+  #2 [mexit_1] ReturnProbe.classify:32 ← ReturnProbe.main:43 thread=0x1 returned=null {n=(int) 39}
+  ```
+  Two return sites, two values, and `null` reported as `null` rather than as an absent field.
+  Deleted the other half: **there is no `MethodEntry`.** A `METHOD_ENTRY` request with a `ClassMatch`
+  fires on every method of every matching class — the noisiest event in JDWP — and "what calls this?" is
+  now answered far more cheaply by a traced breakpoint's caller chain (TRACE-5). Keeping a decoded
+  variant nothing can arm was the exact problem this item was raised about, so it went.
+  Two things make this kind's safety different from every other stop point here, and both are inverted
+  on purpose: **`trace` defaults to `true`** (a suspending `MethodExit` on a hot method is the fastest
+  way to freeze a shared JVM this tool offers, so the safe mode is the default and the dangerous one is
+  opt-in), and **a broad suspending request is refused outright** — wildcard pattern or no `method` name
+  — naming both the reason and the narrow form that would be accepted. `panic` clears method-exit
+  requests before resuming, which matters more here than anywhere else: resuming with one still armed
+  re-freezes the VM on the very next return.
+  JDWP has **no method-name modifier**, so `method` is filtered on our side: the JVM reports every method
+  of the class and non-matching exits are dropped — without recording and without charging the trace
+  budget, so "exactly N traces then it stops" still holds. Both the trace path and the suspending path
+  filter (the latter resuming what it drops, or a request for `save` would freeze on the first unrelated
+  getter that returns). Also recorded, because it is easy to get wrong: JDI's `canGetMethodReturnValues`
+  is **not** a capability bit — it is a JDWP version check (≥ 1.6) — so an older JVM degrades to a plain
+  `MethodExit` (return site, no value) and says so.
+  Validated by `method_exit_reports_the_value_each_return_produced` (+ `examples/probes/ReturnProbe.java`,
+  whose `classify` has two returns and alternates between them, with a second returning method beside it
+  so a filter that did nothing would be visible) and
+  `a_broad_suspending_method_exit_is_refused_and_panic_clears_the_rest`. The kind-41/42 wire split is
+  unit-tested, including two kind-42 events back to back — the second only parses if the first consumed
+  exactly its own bytes, which is what catches a length mistake in the tagged-value read.
+  The `jdwp-trace` skill leads site 1 (`IntegraSrv.post` returning `null`) with this tool now, because it
+  needs **no line number** — and that file's line numbers drift, which the skill already warned about.
+- **Thread dumps with lock ownership (DUMP-1)** — the recurring operational question about the shared
+  8180 is *"it's wedged, which threads are blocked on what?"*, and this debugger could not answer it:
+  `get_stack` took one `thread_id`, `list_threads` gave names and run status only, and the monitor
+  primitives were **declared and never implemented** (`OWNED_MONITORS = 8`,
+  `CURRENT_CONTENDED_MONITOR = 9` had no `pub async fn` behind them). So "who holds the lock this thread
+  is waiting on" — the one question a deadlock investigation consists of — was unanswerable.
+  `debug.thread_dump` returns every thread's stack in one call, plus per thread the monitors it holds
+  and the one it is blocked entering, and **names the holder** of that monitor: `waiting to enter:
+  LockB@f ← held by 0x9 "deadlock-two"`. That annotation is a free local correlation of data already
+  collected, and it is the difference between two true-but-separate facts and a visible cycle. A full
+  cycle *detector* can come later if it earns its place.
+  The suspension design is the load-bearing part. JDWP defines a thread's frames and locks as readable
+  only while it is **suspended**, so a dump of a running VM is honestly mostly unreadable — and quietly
+  pausing a shared instance to make the output look complete is the SAFE-4 mistake. So: it never
+  suspends on its own; `suspend:true` is an explicit request that freezes, reads, resumes via
+  `resume_all_fully` and **verifies** (reporting the ADR-0003 "still suspended" case rather than a clean
+  dump); a VM that is *already* suspended is read as it is and left that way, since resuming would
+  discard the breakpoint state the caller is standing in and re-suspending would build a counted depth
+  one resume can't undo (SAFE-7). A running thread gets its own line saying what would make it readable,
+  and never renders as `(no frames)` — "unreadable" and "idle" are opposite answers on a wedged JVM.
+  New in `jdwp-client`: `owned_monitors`, `current_contended_monitor`, and `capabilities`
+  (`VirtualMachine.Capabilities`) so a JVM lacking `canGetOwnedMonitorInfo` /
+  `canGetCurrentContendedMonitor` is reported as *"this JVM cannot"* rather than a bare
+  `NOT_IMPLEMENTED` — the `set_field_watch` precedent. Worth recording: JDI's `canGetMethodReturnValues`
+  is **not** a capability bit at all (it is a JDWP version check), which is why `CapabilitiesNew` is not
+  implemented.
+  Cost is reported (`Cost: N JDWP packet(s)`, via the PERF-1 instrument) because a dump is many round
+  trips by construction — 8 threads × 3 frames measured 76 packets — and bounded by `limit` (40),
+  `max_frames` (8, deliberately narrower than `get_stack`'s 20 since it multiplies by the thread count),
+  `name_filter` and `package_filter`. Class names are cached across the whole dump, which is where most
+  of the cost disappears on a request pool whose stacks are largely identical.
+  Validated by `thread_dump_shows_stacks_and_the_deadlock_cycle` (+ `examples/probes/DeadlockProbe.java`,
+  two threads taking two locks in opposite order behind a barrier so the cycle is guaranteed rather than
+  raced for — the locks are distinct *classes* so a backwards pairing can't pass) and
+  `thread_dump_works_read_only_and_never_suspends_on_its_own`. The probe's `main` keeps ticking
+  throughout, which is what proves a suspending dump really resumed: the deadlocked pair never could.
+  The capability-refusal paths are unit-tested against `render_thread_dump`, since no `HotSpot` will
+  exercise them. `jdwp-trace`'s `TECHNIQUES.md` gains a "8180 is wedged" entry and `run-infotravel` a
+  pointer, both with the narrowed 8180-safe invocation rather than a bare dump.
 - **One node budget per `get_stack` call (OBJ-3)** — `DEEP_NODE_BUDGET` was allocated fresh per
   `render_value_deep`, and `get_stack` called it once per local, so `expand_objects:true` on 20 frames
   × 20 locals could walk ~160k nodes against a possibly-shared JVM: a documented cap that bounded
