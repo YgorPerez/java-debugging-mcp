@@ -5,6 +5,32 @@ complete end-to-end capability — JDWP primitive(s) in `jdwp-client` + wiring/t
 a validation against a live probe — not a horizontal layer. A fresh session can grab any unblocked
 item and finish it.
 
+## The resume-honesty invariant (read this before touching a resume path)
+
+Five reviews in, **every round's most serious bug was in the previous round's safety work**, and the
+watchdog was wrong three times (SAFE-2 → SAFE-5 → SAFE-7). The shape never varied: a resume path was
+tested in the one state its author had in mind and broke in a state nobody enumerated.
+
+So there is now a test for the invariant itself, not another happy path
+(`mcp_integration.rs`, `*_is_honest_from_every_suspended_state`):
+
+> After **any** resume path, from **any** suspended state, the VM is genuinely running — or the reply
+> said out loud that it isn't.
+
+It is a matrix of 5 suspended states × 4 resume paths (`continue`, `panic`, watchdog, `disconnect`),
+asserted against the **probe's own output**, because every tool reports success either way — which is
+exactly how these bugs survived. Each of SAFE-1, SAFE-4 and SAFE-7 was reverted in turn to confirm the
+matrix names the offending `(state, path)` pair rather than passing anyway.
+
+**If you add a resume path, add it to `Resume`. If you find a new way to leave the VM suspended, add it to
+`Freeze`.** That is cheaper than the next review finding it, and it is the whole point of the matrix.
+
+Its scope is deliberately stated in the test: it covers *resume* honesty, not *disarm* honesty (a VM that
+resumes but is immediately re-frozen by a still-armed stop point — the SAFE-2/SAFE-5 harm). That half is
+covered by two tests that measure the probe's tick **rate** after a rescue. Folding them together needs a
+repeating-breakpoint state whose expectation differs per path, since `continue` may legitimately re-freeze
+and a rescue path may not.
+
 ## How to validate anything here (the house pattern)
 
 Two layers, two mechanisms. Pick by what the change touches.

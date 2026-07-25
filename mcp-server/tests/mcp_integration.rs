@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{assert_contains_all, jdk_or_skip, probe_line, probe_source, Probe, Server, EVENT_TIMEOUT};
+use common::{assert_contains_all, jdk_or_skip, probe_line, probe_source, Jdk, Probe, Server, EVENT_TIMEOUT};
 
 /// EVAL-1 / EVAL-2: static-method invocation and object arguments, through the real handlers.
 #[test]
@@ -2121,4 +2121,209 @@ fn rearming_reresolves_by_name_and_reports_a_missing_class() {
     assert_contains_all("still deferred", &deferred, &["Deferred"]);
 
     server.panic_reset();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The resume-honesty invariant
+//
+// Every safety bug in this project so far has been the same shape: a resume path was tested in the
+// one state its author had in mind, and broke in a state nobody enumerated.
+//
+//   SAFE-1  disconnect, from "suspended at a breakpoint"     → froze the JVM forever
+//   SAFE-4  the watchdog, from "suspended by debug.pause"    → never fired at all
+//   SAFE-7  any resume, from "suspended twice"               → reported a rescue it never made
+//
+// Each was fixed with its own test, and each time the *next* review found another state. So this
+// asserts the invariant itself rather than another happy path:
+//
+//   after any resume path, from any suspended state, the VM is genuinely running —
+//   or the reply said out loud that it isn't.
+//
+// The dangerous half is the silent one. A tool that admits "still suspended" is merely unhelpful; a
+// tool that claims success while the debuggee is frozen is what actually hurt, three times. Verified
+// load-bearing by reverting SAFE-1/SAFE-4/SAFE-7 in turn and watching the matrix name the exact
+// (state, path) pair that broke.
+//
+// SCOPE, stated so it isn't mistaken for broader than it is: this covers *resume* honesty, not *disarm*
+// honesty. SAFE-2/SAFE-5 were bugs where the VM genuinely resumed but the offending stop point stayed
+// armed and re-froze it — invisible here, because these cases use a one-shot breakpoint that cannot fire
+// twice. That half is asserted by `watchdog_disarms_even_after_the_events_were_drained` and
+// `pausing_at_a_breakpoint_keeps_the_disarm_target`, which measure the probe's tick *rate* after a
+// rescue. A future review wanting to fold the two together should add a repeating-breakpoint state whose
+// expectation differs per path (`continue` may legitimately re-freeze; a rescue path may not).
+// ---------------------------------------------------------------------------------------------
+
+/// A way to leave the VM suspended. Each entry is a state that has broken something historically.
+#[derive(Debug, Clone, Copy)]
+enum Freeze {
+    /// One-shot breakpoint hit (`hit_count: 1`, so it expires and can't re-freeze on resume).
+    Breakpoint,
+    /// A manual `debug.pause` — the state SAFE-4 found unguarded.
+    Pause,
+    /// A pause **on top of** a breakpoint: suspend depth 2, which SAFE-7 showed one resume can't clear.
+    BreakpointThenPause,
+    /// A breakpoint hit whose events were then drained — the state SAFE-5 found.
+    BreakpointDrained,
+    /// Suspended at the end of a single step, so a pending step request is armed.
+    Step,
+}
+
+/// A way we claim to un-freeze it.
+#[derive(Debug, Clone, Copy)]
+enum Resume {
+    Continue,
+    Panic,
+    Watchdog,
+    /// `debug.disconnect` — the SAFE-1 case, and the one whose name most implies it is safe.
+    Disconnect,
+}
+
+impl Freeze {
+    const ALL: [Self; 5] = [
+        Self::Breakpoint,
+        Self::Pause,
+        Self::BreakpointThenPause,
+        Self::BreakpointDrained,
+        Self::Step,
+    ];
+}
+
+/// Drive one (freeze, resume) pair and assert the invariant. Panics with the offending combination
+/// named, so a failure says which state broke which path.
+fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
+    // The watchdog must be ON for its own case and OFF for the others — otherwise it would rescue a
+    // broken `continue`/`panic` and the test would pass on someone else's work.
+    let watchdog = if matches!(resume, Resume::Watchdog) { "1" } else { "0" };
+    let probe = Probe::launch(jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server =
+        Server::start_with_env(&[("JDWP_WATCHDOG_SECS", watchdog)]).expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
+    let hit_once = serde_json::json!({"class_pattern": "WatchProbe", "line": line, "hit_count": 1});
+
+    // --- put the VM into the state under test ---
+    match freeze {
+        Freeze::Pause => {
+            server.call("debug.pause", serde_json::json!({}));
+        }
+        Freeze::Breakpoint | Freeze::BreakpointDrained | Freeze::BreakpointThenPause => {
+            server.call("debug.set_breakpoint", hit_once.clone());
+            server
+                .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+                .unwrap_or_else(|| panic!("{freeze:?}: breakpoint never fired"));
+            if matches!(freeze, Freeze::BreakpointDrained) {
+                server.call("debug.get_last_event", serde_json::json!({"drain": true}));
+            }
+            if matches!(freeze, Freeze::BreakpointThenPause) {
+                server.call("debug.pause", serde_json::json!({}));
+            }
+        }
+        Freeze::Step => {
+            server.call("debug.set_breakpoint", hit_once.clone());
+            server
+                .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+                .unwrap_or_else(|| panic!("{freeze:?}: breakpoint never fired"));
+            server.call("debug.step_over", serde_json::json!({}));
+            server
+                .wait_for_event("\"event\":\"step\"", EVENT_TIMEOUT)
+                .unwrap_or_else(|| panic!("{freeze:?}: step never landed"));
+        }
+    }
+
+    // The debuggee's own output is the only witness that matters — every tool reports success either
+    // way, which is precisely how these bugs survived.
+    let frozen_at = highest_tick(&probe).unwrap_or(-1);
+
+    // --- apply the resume path under test ---
+    let reply = match resume {
+        Resume::Continue => server.call("debug.continue", serde_json::json!({})),
+        Resume::Panic => server.call("debug.panic", serde_json::json!({})),
+        Resume::Disconnect => server.call("debug.disconnect", serde_json::json!({})),
+        // Nothing to call: the watchdog's whole point is that it acts without being asked.
+        Resume::Watchdog => String::new(),
+    };
+
+    // --- the invariant ---
+    let advanced = probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 2))
+        .is_some();
+
+    // Whatever the path says about itself, gathered after the fact: `continue`/`panic` answer inline,
+    // the watchdog leaves its note on list_breakpoints / get_last_event. After a disconnect there is no
+    // session left to ask, so the inline reply is all there is.
+    let said = if matches!(resume, Resume::Disconnect) {
+        reply.clone()
+    } else {
+        format!("{reply}\n{}\n{}",
+            server.call("debug.list_breakpoints", serde_json::json!({})),
+            server.last_event(),
+        )
+    };
+    let admitted_still_stuck = said.contains("STILL suspended");
+
+    assert!(
+        advanced || admitted_still_stuck,
+        "INVARIANT VIOLATED — {resume:?} from {freeze:?}: the probe did not advance past tick \
+         {frozen_at}, and nothing said the VM was still suspended. A resume path reported success \
+         while the debuggee stayed frozen.\n  said: {said}\n  probe output: {:?}",
+        probe.output(),
+    );
+
+    // The other half: it must not cry wolf either. Claiming "still suspended" while the VM is plainly
+    // running would send a caller hunting a freeze that isn't there.
+    assert!(
+        !(advanced && admitted_still_stuck),
+        "INVARIANT VIOLATED — {resume:?} from {freeze:?}: the VM resumed, but a reply claimed it was \
+         STILL suspended.\n  said: {said}"
+    );
+
+    if !advanced {
+        // Legitimate but worth seeing in the log: it failed honestly.
+        println!("note: {resume:?} from {freeze:?} did not resume, and said so (acceptable)");
+    }
+}
+
+/// Invariant: `debug.continue` either resumes the VM or says it didn't — from every suspended state.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn continue_is_honest_from_every_suspended_state() {
+    let Some(jdk) = jdk_or_skip("continue_is_honest_from_every_suspended_state") else { return };
+    for freeze in Freeze::ALL {
+        assert_resume_is_honest(&jdk, freeze, Resume::Continue);
+    }
+}
+
+/// Invariant: `debug.panic` — the escape hatch — either resumes the VM or says it didn't.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn panic_is_honest_from_every_suspended_state() {
+    let Some(jdk) = jdk_or_skip("panic_is_honest_from_every_suspended_state") else { return };
+    for freeze in Freeze::ALL {
+        assert_resume_is_honest(&jdk, freeze, Resume::Panic);
+    }
+}
+
+/// Invariant: the watchdog either resumes the VM or says it didn't. This is the one that matters most —
+/// it acts while nobody is watching, so a false success is invisible until the JVM is found frozen.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn the_watchdog_is_honest_from_every_suspended_state() {
+    let Some(jdk) = jdk_or_skip("the_watchdog_is_honest_from_every_suspended_state") else { return };
+    for freeze in Freeze::ALL {
+        assert_resume_is_honest(&jdk, freeze, Resume::Watchdog);
+    }
+}
+
+/// Invariant: `debug.disconnect` leaves the VM running from every suspended state. This is SAFE-1's bug
+/// generalised — walking away used to freeze the JVM permanently, and it is the tool whose name most
+/// suggests it is the safe way out.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn disconnect_is_honest_from_every_suspended_state() {
+    let Some(jdk) = jdk_or_skip("disconnect_is_honest_from_every_suspended_state") else { return };
+    for freeze in Freeze::ALL {
+        assert_resume_is_honest(&jdk, freeze, Resume::Disconnect);
+    }
 }
