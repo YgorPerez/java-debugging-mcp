@@ -1996,3 +1996,129 @@ fn read_only_refuses_mutation_but_allows_reads() {
 
 
 
+
+/// SAFE-7: JDWP counts suspends, so a second suspend needs a second resume. `debug.pause` is therefore
+/// idempotent, and `debug.continue` clears whatever depth exists — otherwise "pause twice" needed two
+/// continues, and the watchdog's single resume left the VM frozen while reporting it rescued.
+///
+/// Verified on a real JVM before the fix: two pauses then one continue left the probe at 0 ticks.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn pause_is_idempotent_and_continue_clears_any_suspend_depth() {
+    let Some(jdk) = jdk_or_skip("pause_is_idempotent_and_continue_clears_any_suspend_depth") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    // Watchdog off: this test is about the tools' own resume arithmetic, not the rescue.
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    server.call("debug.pause", serde_json::json!({}));
+    // The second pause must be a no-op, not a second suspend.
+    let second = server.call("debug.pause", serde_json::json!({}));
+    assert_contains_all("a second pause is refused as a no-op", &second, &["Already suspended", "no-op"]);
+
+    let frozen_at = highest_tick(&probe).expect("no tick before the pause");
+    server.call("debug.continue", serde_json::json!({}));
+
+    // ONE continue must be enough. Before the fix the probe sat at 0 ticks here.
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 3))
+            .is_some(),
+        "one debug.continue did not resume the VM after two pauses — suspends stacked up\n  output: {:?}",
+        probe.output(),
+    );
+}
+
+/// SAFE-7: pausing while already stopped at a breakpoint must not overwrite the `StopPoint` cause with
+/// `ManualPause` — doing so lost the SAFE-2 disarm, so the watchdog resumed and the breakpoint re-froze
+/// the VM on the next hit.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn pausing_at_a_breakpoint_keeps_the_disarm_target() {
+    let Some(jdk) = jdk_or_skip("pausing_at_a_breakpoint_keeps_the_disarm_target") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "5")]).expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
+    let set = server.call("debug.set_breakpoint", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
+    let bp_id = grab_token(&set, "bp_").expect("no bp id");
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint never fired");
+
+    // Pause while already suspended at the breakpoint. This is the call that used to clobber the cause.
+    server.call("debug.pause", serde_json::json!({}));
+    let frozen_at = highest_tick(&probe).expect("no tick before suspension");
+
+    // The watchdog must still disarm the breakpoint (not just resume), and the VM must STAY running —
+    // a lost disarm shows up as the probe re-freezing within ~150ms of the resume.
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at))
+            .is_some(),
+        "the VM was never resumed\n  output: {:?}",
+        probe.output(),
+    );
+    let resumed_at = highest_tick(&probe).expect("no tick after the resume");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let after = highest_tick(&probe).expect("no tick reading");
+    assert!(
+        after - resumed_at > 5,
+        "the probe advanced only {} tick(s) in 3s — it re-froze, so pausing at a breakpoint lost the \
+         disarm target (SAFE-7)",
+        after - resumed_at,
+    );
+    assert_contains_all(
+        "the breakpoint was still identified and disabled",
+        &server.call("debug.list_breakpoints", serde_json::json!({})),
+        &[&bp_id, "DISABLED"],
+    );
+
+    server.panic_reset();
+}
+
+/// BP-4: re-arming re-resolves the location by name, so a stop point whose class is no longer loaded is
+/// reported as such rather than re-armed against a stale JDWP id.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn rearming_reresolves_by_name_and_reports_a_missing_class() {
+    let Some(jdk) = jdk_or_skip("rearming_reresolves_by_name_and_reports_a_missing_class") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    // A traced watchpoint, so nothing freezes while we toggle it.
+    let set = server.call(
+        "debug.set_watchpoint",
+        serde_json::json!({"class_name": "WatchProbe", "field_name": "counter", "trace": true}),
+    );
+    let watch_id = grab_token(&set, "watch_modify_").expect("no watch id");
+
+    // Disable then re-arm: the re-arm must re-resolve WatchProbe.counter by name and fire again.
+    server.call("debug.toggle_breakpoint", serde_json::json!({"breakpoint_id": watch_id, "enabled": false}));
+    server.call("debug.get_traces", serde_json::json!({"clear": true}));
+    let on = server.call("debug.toggle_breakpoint", serde_json::json!({"breakpoint_id": watch_id, "enabled": true}));
+    assert_contains_all("re-armed by name", &on, &["Re-armed", "WatchProbe.counter"]);
+    assert!(
+        (0..40).any(|_| {
+            let got = count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))) > 0;
+            if !got { std::thread::sleep(std::time::Duration::from_millis(100)); }
+            got
+        }),
+        "the re-armed watchpoint never fired — re-resolution by name failed"
+    );
+
+    // A deferred breakpoint's class never loads; arming it is fine, but its class genuinely isn't there,
+    // which is the state BP-4 says must be reported rather than guessed at.
+    let deferred = server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({"class_pattern": "com.example.GoneAway", "line": 3}),
+    );
+    assert_contains_all("still deferred", &deferred, &["Deferred"]);
+
+    server.panic_reset();
+}

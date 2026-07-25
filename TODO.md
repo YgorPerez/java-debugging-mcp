@@ -317,7 +317,26 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## Backlog
 
-**Empty.** A **fourth** review (of the third batch) found five more and they have shipped too, tracked as
+**Empty.** A **fifth** review found three more, shipped as issues
+[#7–#9](https://github.com/YgorPerez/java-debugging-mcp/issues?q=is%3Aissue). The headline one was
+verified against a real JVM before being filed, not reasoned about:
+
+- **SAFE-7** (#7) — JDWP *counts* suspends, and nothing here knew that. `debug.pause` never checked
+  whether the VM was already stopped, so pausing at a breakpoint (or twice) built a depth that one
+  `resume_all` couldn't undo — and the watchdog then reported "auto-resumed", cleared `suspended_since`,
+  and never retried: **frozen permanently, reported rescued**. Measured on a real JVM: two pauses then one
+  continue left the probe at 0 ticks; the second continue released it (+14). `SuspendCount` (declared but
+  never implemented) now exists; `pause` is idempotent; `continue`/`panic`/watchdog resume until the VM
+  really runs and say so if they can't. Pausing at a breakpoint also no longer overwrites the
+  `StopPoint` cause, which had silently lost the SAFE-2 disarm.
+- **SAFE-8** (#8) — `trace_disarms` was the one unbounded buffer in a session. Harmless while an
+  auto-disarm deleted the stop point; BP-2/BP-3 made re-arming easy, so one logpoint can disarm
+  repeatedly. Repeats now collapse into a count, capped, with drops reported.
+- **BP-4** (#9) — re-arming trusted the JDWP ids captured when the stop point was first armed. Those are
+  only valid while the type stays loaded, and the realistic sequence on an app server is "disable,
+  redeploy, re-arm". Re-arm re-resolves by name now, and says so plainly when the class has gone.
+
+A **fourth** review (of the third batch) found five more, tracked as
 GitHub issues [#2–#6](https://github.com/YgorPerez/java-debugging-mcp/issues?q=is%3Aissue) rather than
 inline here. Three were gaps in the third batch itself, which is the useful part: the interesting bugs
 were in the safety features, and two of them had green tests.

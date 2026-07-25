@@ -516,12 +516,16 @@ impl RequestHandler {
         if let Some(req) = session.pending_step.take() {
             let _ = session.connection.clear_step(req).await;
         }
+        // "Continue" means the application actually runs again, so clear any counted suspend depth
+        // rather than issuing one resume and hoping (SAFE-7).
+        let note = resume_and_verify(&mut session).await?;
         session.mark_resumed();
-        session.connection.resume_all().await
-            .map_err(|e| format!("Failed to resume: {e}"))?;
         drop(session);
 
-        Ok("▶️  Execution resumed".to_string())
+        Ok(note.map_or_else(
+            || "▶️  Execution resumed".to_string(),
+            |n| format!("▶️  {n}"),
+        ))
     }
 
     async fn handle_step_over(&self, args: serde_json::Value) -> Result<String, String> {
@@ -600,15 +604,17 @@ impl RequestHandler {
         for (req, kind) in watches {
             let _ = session.connection.clear_field_watch(req, kind).await;
         }
+        // The panic button's whole job is to leave the VM running, so it must clear a counted suspend
+        // depth and report honestly if it couldn't (SAFE-7).
+        let note = resume_and_verify(&mut session).await?;
         session.mark_resumed();
-        session.connection.resume_all().await
-            .map_err(|e| format!("Failed to resume: {e}"))?;
         drop(session);
 
-        Ok(format!("🧯 Panic: cleared {} breakpoint(s){}{}{} and resumed all threads.", n,
+        Ok(format!("🧯 Panic: cleared {} breakpoint(s){}{}{} and resumed all threads.{}", n,
             if np > 0 { format!(" + {np} deferred") } else { String::new() },
             if ne > 0 { format!(" + {ne} exception") } else { String::new() },
-            if nw > 0 { format!(" + {nw} watchpoint") } else { String::new() }))
+            if nw > 0 { format!(" + {nw} watchpoint") } else { String::new() },
+            note.map_or_else(String::new, |t| format!("\n   ⚠️  {t}"))))
     }
 
     async fn handle_get_stack(&self, args: serde_json::Value) -> Result<String, String> {
@@ -853,6 +859,24 @@ impl RequestHandler {
             .ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
+
+        // Idempotent: suspending an already-suspended VM builds a counted suspend DEPTH that one resume
+        // can't undo, so the watchdog would resume once, believe it had succeeded, clear
+        // `suspended_since` and never retry — leaving the JVM frozen permanently while reporting it
+        // rescued. Re-suspending would also overwrite a `StopPoint` cause with `ManualPause` and lose
+        // the SAFE-2 disarm. So when it is already stopped, say so and change nothing (SAFE-7).
+        if let Some(cause) = session.suspended_cause {
+            let since = session.suspended_since.map_or(0, |t| t.elapsed().as_secs());
+            let how = match cause {
+                crate::session::SuspendCause::ManualPause => "by an earlier debug.pause",
+                crate::session::SuspendCause::StopPoint(_) => "at a stop point",
+            };
+            drop(session);
+            return Ok(format!(
+                "⏸️  Already suspended {how} ({since}s ago) — left as it is.\n   Suspending again would \
+                 need an extra debug.continue to undo, so this is a no-op. Use debug.continue to resume."
+            ));
+        }
 
         session.connection.suspend_all().await
             .map_err(|e| format!("Failed to suspend: {e}"))?;
@@ -1331,13 +1355,24 @@ impl RequestHandler {
             ));
         }
         // A stop point that hit its budget disarmed itself (TRACE-3) — say so, so a caller doesn't
-        // read the silence that follows as "no more hits". Kept until the buffer is cleared.
-        for note in &session.trace_disarms {
-            lines.push(format!("⏸  {note}"));
+        // read the silence that follows as "no more hits". Kept until the buffer is cleared. Repeats are
+        // collapsed into a count (SAFE-8), which is both bounded and easier to read.
+        for (note, times) in &session.trace_disarms {
+            match times {
+                1 => lines.push(format!("⏸  {note}")),
+                n => lines.push(format!("⏸  {note} (×{n})")),
+            }
+        }
+        if session.trace_disarms_dropped > 0 {
+            lines.push(format!(
+                "[dropped] {} further disarm notice(s) (cap {}) — read and clear them sooner",
+                session.trace_disarms_dropped, crate::session::MAX_TRACE_DISARMS
+            ));
         }
         if a.clear {
             session.traces.clear();
             session.trace_disarms.clear();
+            session.trace_disarms_dropped = 0;
             drop(session);
             lines.push("(buffer cleared)".to_string());
         }
@@ -2776,6 +2811,12 @@ async fn disable_stop_point(
 /// Re-arm the disabled stop point with this caller-facing id from its stored definition, keeping the
 /// same id (BP-3). Returns a short human description of what was re-armed.
 ///
+/// The location is **re-resolved by name**, not taken from the ids captured when it was first armed
+/// (BP-4). A `referenceTypeID`/`methodID`/`fieldID` is only valid while that type stays loaded, and the
+/// realistic sequence here is "disable the breakpoint, redeploy, re-arm it" on a long-lived app server —
+/// exactly when a cached id is stale and would fail obscurely or resolve somewhere unintended. A class
+/// that is no longer loaded is reported as that, which is a state the caller needs to know about.
+///
 /// A re-armed stop point gets a fresh trace budget: it was disarmed *because* the old one ran out, so
 /// re-arming with zero left would fire once and immediately disable itself again.
 async fn rearm_stop_point(
@@ -2783,7 +2824,7 @@ async fn rearm_stop_point(
     id: &str,
 ) -> Result<String, String> {
     if let Some(bp) = session.breakpoints.get(id).cloned() {
-        let arm = &bp.arm;
+        let arm = rearm_breakpoint_location(session, &bp).await?;
         let req = session.connection.set_breakpoint_ex(
             arm.class_id, arm.method_id, arm.bytecode_index, arm.suspend_policy,
             arm.hit_count, arm.thread_filter,
@@ -2791,34 +2832,88 @@ async fn rearm_stop_point(
         if let Some(b) = session.breakpoints.get_mut(id) {
             b.request_id = Some(req);
             b.enabled = true;
+            b.arm = arm;
             b.trace_budget = b.trace_budget.map(|n| if n == 0 { DEFAULT_TRACE_BUDGET } else { n });
         }
         return Ok(format!("{}:{}", bp.class_pattern, bp.line));
     }
     if let Some(er) = session.exception_requests.get(id).cloned() {
+        // "*" means "every exception", which was registered with no ref type at all — nothing to resolve.
+        let ref_type = if er.class_pattern == "*" {
+            None
+        } else {
+            Some(resolve_class_by_dotted(&mut session.connection, &er.class_pattern).await?
+                .ok_or_else(|| format!(
+                    "Cannot re-arm {id}: exception class '{}' is not loaded any more (was it redeployed? \
+                     trigger it once so the JVM loads it, then retry)", er.class_pattern
+                ))?)
+        };
         let req = session.connection.set_exception_request_ex(
-            er.ref_type, er.caught, er.uncaught, suspend_policy_for(er.trace), None, er.thread_filter,
+            ref_type, er.caught, er.uncaught, suspend_policy_for(er.trace), None, er.thread_filter,
         ).await.map_err(|e| format!("Failed to re-arm exception breakpoint: {e}"))?;
         if let Some(e) = session.exception_requests.get_mut(id) {
             e.request_id = Some(req);
             e.enabled = true;
+            e.ref_type = ref_type;
             e.trace_budget = e.trace_budget.map(|n| if n == 0 { DEFAULT_TRACE_BUDGET } else { n });
         }
         return Ok(format!("exception {}", er.class_pattern));
     }
     if let Some(wp) = session.watchpoints.get(id).cloned() {
-        let (decl, field_id) = wp.arm;
+        let type_id = resolve_class_by_dotted(&mut session.connection, &wp.class_name).await?
+            .ok_or_else(|| format!(
+                "Cannot re-arm {id}: class '{}' is not loaded any more (was it redeployed? exercise it \
+                 once so the JVM loads it, then retry)", wp.class_name
+            ))?;
+        let (declaring, field) =
+            find_field_info(&mut session.connection, type_id, &wp.field_name, None).await?
+                .ok_or_else(|| format!(
+                    "Cannot re-arm {id}: class '{}' no longer has a field '{}'",
+                    wp.class_name, wp.field_name
+                ))?;
         let req = session.connection.set_field_watch_ex(
-            decl, field_id, wp.kind, suspend_policy_for(wp.trace), None, wp.thread_filter,
+            declaring, field.field_id, wp.kind, suspend_policy_for(wp.trace), None, wp.thread_filter,
         ).await.map_err(|e| format!("Failed to re-arm watchpoint: {e}"))?;
         if let Some(w) = session.watchpoints.get_mut(id) {
             w.request_id = Some(req);
             w.enabled = true;
+            w.arm = (declaring, field.field_id);
             w.trace_budget = w.trace_budget.map(|n| if n == 0 { DEFAULT_TRACE_BUDGET } else { n });
         }
         return Ok(format!("watch {}.{}", wp.class_name, wp.field_name));
     }
     Err(format!("Stop point not found: {id}"))
+}
+
+/// Re-resolve a breakpoint's location from its class pattern and line/method (BP-4), returning fresh
+/// JDWP ids. Falls back to the stored ids only when the class *is* still loaded but the line can't be
+/// resolved, which keeps a working breakpoint working if a line table shifted underneath us.
+async fn rearm_breakpoint_location(
+    session: &mut crate::session::DebugSession,
+    bp: &crate::session::BreakpointInfo,
+) -> Result<crate::session::BreakpointArm, String> {
+    let signature = format!("L{};", bp.class_pattern.replace('.', "/"));
+    let classes = session.connection.classes_by_signature(&signature).await
+        .map_err(|e| format!("Failed to look up '{}': {e}", bp.class_pattern))?;
+    let Some(class) = classes.first() else {
+        return Err(format!(
+            "Cannot re-arm: class '{}' is not loaded any more (was it redeployed? trigger it once so \
+             the JVM loads it, then retry — or set a fresh breakpoint, which defers until it loads)",
+            bp.class_pattern
+        ));
+    };
+    let line_opt = i32::try_from(bp.line).ok();
+    match resolve_bp_location(&mut session.connection, class.type_id, line_opt, bp.method.as_deref()).await {
+        Ok((method, index, _line)) => Ok(crate::session::BreakpointArm {
+            class_id: class.type_id,
+            method_id: method.method_id,
+            bytecode_index: index,
+            ..bp.arm.clone()
+        }),
+        // The class is loaded but the location didn't resolve; the old ids are the best guess left, and
+        // they are valid as long as the type wasn't reloaded.
+        Err(_) => Ok(bp.arm.clone()),
+    }
 }
 
 /// A hit on a stop point marked `trace` — a line breakpoint, an exception breakpoint, or a field
@@ -2866,7 +2961,7 @@ async fn try_record_trace(
     // "exactly N traces, then it stops" contract holds even when a condition skips some.
     if recorded {
         if let Some(label) = charge_trace_budget(session, req_id).await {
-            session.trace_disarms.push(label);
+            session.note_trace_disarm(label);
         }
     }
     true
@@ -2946,6 +3041,40 @@ async fn store_reportable_event(
     }
 }
 
+/// Upper bound on resume attempts when clearing a suspend depth (SAFE-7). A depth above this means
+/// something is suspending in a loop, which is worth reporting rather than spinning on.
+const MAX_RESUME_ATTEMPTS: u32 = 8;
+
+/// Resume the VM and **verify it is actually running**, clearing a counted suspend depth (SAFE-7).
+///
+/// Returns `Ok(None)` when the VM is genuinely going again, or `Ok(Some(note))` describing what is still
+/// holding it — so a caller can report the truth instead of assuming one `resume_all` was enough.
+///
+/// JDWP counts suspends, so `pause`-twice (or `pause` while stopped at a breakpoint) needs two resumes.
+/// Verified on a real JVM: two suspends then one resume leaves the debuggee stopped while every command
+/// reports OK. A watchdog that trusted that reported a rescue it had not performed.
+///
+/// Falls back to a single plain `resume_all` when there is no thread to probe — nothing is known to be
+/// suspended in that case, so there is no depth to clear.
+async fn resume_and_verify(session: &mut crate::session::DebugSession) -> Result<Option<String>, String> {
+    let Some(probe) = session.last_thread else {
+        session.connection.resume_all().await.map_err(|e| format!("Failed to resume: {e}"))?;
+        return Ok(None);
+    };
+    let (issued, left) = session.connection
+        .resume_all_fully(probe, MAX_RESUME_ATTEMPTS).await
+        .map_err(|e| format!("Failed to resume: {e}"))?;
+    if left > 0 {
+        return Ok(Some(format!(
+            "the VM is STILL suspended after {issued} resume(s) — thread 0x{probe:x} has {left} \
+             suspend(s) left. Something is holding it beyond this session; call debug.continue again, or \
+             debug.panic"
+        )));
+    }
+    // Worth saying when it took more than one: it means the suspends had stacked up.
+    Ok((issued > 1).then(|| format!("cleared a suspend depth of {issued}")))
+}
+
 /// How long the VM may sit suspended before the watchdog resumes it: `JDWP_WATCHDOG_SECS`, default 120,
 /// `0` to disable. Read in one place so the tools can *report* the value they're promising.
 fn watchdog_secs() -> u64 {
@@ -2985,28 +3114,50 @@ fn spawn_watchdog(
                     // (SAFE-2). The cause was recorded when the VM suspended, so draining the event
                     // buffer can no longer hide it (SAFE-5), and a manual pause — which has no stop
                     // point to disarm — is reported as itself rather than as a failure (SAFE-4).
-                    let note = match s.suspended_cause {
-                        Some(crate::session::SuspendCause::ManualPause) => format!(
-                            "watchdog auto-resumed the VM after {secs}s suspended by debug.pause (a manual pause — no stop point to disarm)"
-                        ),
+                    let disarmed = match s.suspended_cause {
+                        Some(crate::session::SuspendCause::ManualPause) =>
+                            "suspended by debug.pause (a manual pause — no stop point to disarm)".to_string(),
                         Some(crate::session::SuspendCause::StopPoint(req)) => {
                             disarm_request(&mut s, req).await.map_or_else(
-                                || format!(
-                                    "watchdog auto-resumed the VM after {secs}s suspended (its stop point was already cleared, so there was nothing left to disarm)"
-                                ),
+                                || "(its stop point was already cleared, so there was nothing left to disarm)".to_string(),
                                 |what| format!(
-                                    "watchdog auto-resumed the VM after {secs}s suspended and disabled {what} so it can't re-freeze the VM — re-arm it with debug.toggle_breakpoint (or use trace:true) when ready"
+                                    "and disabled {what} so it can't re-freeze the VM — re-arm it with debug.toggle_breakpoint (or use trace:true) when ready"
                                 ),
                             )
                         }
-                        None => format!(
-                            "watchdog auto-resumed the VM after {secs}s suspended (cause unrecorded)"
-                        ),
+                        None => "(cause unrecorded)".to_string(),
                     };
-                    let _ = s.connection.resume_all().await;
-                    s.mark_resumed();
-                    info!("{note}");
-                    s.last_watchdog_note = Some(note);
+
+                    // Resume for REAL: a counted suspend depth (e.g. a pause on top of a breakpoint)
+                    // needs more than one resume, and reporting a rescue that didn't happen — then
+                    // clearing `suspended_since` so we never retry — is the worst thing this task can
+                    // do (SAFE-7). On failure, leave `suspended_since` set so the next tick tries again.
+                    match resume_and_verify(&mut s).await {
+                        Ok(None) => {
+                            s.mark_resumed();
+                            let note = format!("watchdog auto-resumed the VM after {secs}s {disarmed}");
+                            info!("{note}");
+                            s.last_watchdog_note = Some(note);
+                        }
+                        Ok(Some(detail)) if detail.starts_with("cleared") => {
+                            s.mark_resumed();
+                            let note = format!("watchdog auto-resumed the VM after {secs}s {disarmed} ({detail})");
+                            info!("{note}");
+                            s.last_watchdog_note = Some(note);
+                        }
+                        Ok(Some(problem)) => {
+                            // Deliberately NOT calling mark_resumed: the VM is still stopped, so the
+                            // watchdog must keep trying rather than going quiet on a false success.
+                            let note = format!("⚠️ watchdog tried to resume the VM after {secs}s {disarmed}, but {problem}");
+                            warn!("{note}");
+                            s.last_watchdog_note = Some(note);
+                        }
+                        Err(e) => {
+                            let note = format!("⚠️ watchdog could not resume the VM after {secs}s: {e}");
+                            warn!("{note}");
+                            s.last_watchdog_note = Some(note);
+                        }
+                    }
                     drop(s);
                 }
             }

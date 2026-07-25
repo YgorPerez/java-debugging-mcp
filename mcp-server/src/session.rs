@@ -45,9 +45,19 @@ pub struct DebugSession {
     /// What the watchdog last did, if anything — surfaced in `list_breakpoints` and `get_last_event`
     /// so a caller who was away learns the VM was auto-resumed and which stop point was disarmed (SAFE-2).
     pub last_watchdog_note: Option<String>,
-    /// Notes about traced stop points that disarmed themselves on reaching their hit budget (TRACE-3).
-    /// Surfaced by `get_traces` so silence is never mistaken for "no more hits"; cleared with `clear`.
-    pub trace_disarms: Vec<String>,
+    /// Traced stop points that disarmed themselves on reaching their hit budget (TRACE-3), as
+    /// `(note, times)` keyed by note text. Surfaced by `get_traces` so silence is never mistaken for
+    /// "no more hits"; cleared with `clear`.
+    ///
+    /// Repeats are **collapsed** rather than appended, and the map is capped (`MAX_TRACE_DISARMS`).
+    /// It was an unbounded `Vec`, which only looked harmless while an auto-disarm also deleted the stop
+    /// point: BP-2/BP-3 made re-arming easy, so one budgeted logpoint can now disarm over and over. Every
+    /// other buffer here is bounded, and "`watch_3` disarmed itself 12 times" beats identical lines
+    /// anyway (SAFE-8).
+    pub trace_disarms: std::collections::BTreeMap<String, u32>,
+    /// How many distinct disarm notes were dropped because the map was full — reported, like
+    /// `events_dropped`, so a full buffer never reads as a quiet one.
+    pub trace_disarms_dropped: u64,
     /// Read-only guard (SAFE-3): when set, method invocation, `set_value` and `force_return` are
     /// refused, so pointing the debugger at a production JVM can't accidentally mutate it. A guard
     /// against accident, NOT a security boundary — anyone who can reach the JDWP port can do anything.
@@ -73,6 +83,10 @@ pub struct DebugSession {
 
 /// Max trace snapshots retained per session; oldest are evicted (documented cap for TRACE-1).
 pub const MAX_TRACES: usize = 500;
+
+/// Max distinct self-disarm notes retained per session (SAFE-8). Small on purpose: these are notices to
+/// act on, not a log, and repeats of the same one are collapsed into a count rather than taking a slot.
+pub const MAX_TRACE_DISARMS: usize = 32;
 
 /// Max reportable events retained per session; oldest are evicted, counted in `events_dropped`.
 ///
@@ -123,6 +137,19 @@ impl DebugSession {
     pub fn mark_resumed(&mut self) {
         self.suspended_since = None;
         self.suspended_cause = None;
+    }
+
+    /// Record that a traced stop point disarmed itself (SAFE-8). Repeats of the same note increment a
+    /// count instead of adding an entry, and once `MAX_TRACE_DISARMS` distinct notes are held a new one
+    /// is dropped and counted rather than growing the map without bound.
+    pub fn note_trace_disarm(&mut self, note: String) {
+        if let Some(n) = self.trace_disarms.get_mut(&note) {
+            *n += 1;
+        } else if self.trace_disarms.len() < MAX_TRACE_DISARMS {
+            self.trace_disarms.insert(note, 1);
+        } else {
+            self.trace_disarms_dropped += 1;
+        }
     }
 
     /// Allocate the next caller-facing stop-point id, e.g. `next_stop_id("bp_")` → `bp_1`.
@@ -323,7 +350,8 @@ impl SessionManager {
             suspended_cause: None,
             watchdog_task: None,
             last_watchdog_note: None,
-            trace_disarms: Vec::new(),
+            trace_disarms: std::collections::BTreeMap::new(),
+            trace_disarms_dropped: 0,
             read_only,
             pending_breakpoints: Vec::new(),
             exception_requests: HashMap::new(),
@@ -437,6 +465,41 @@ mod tests {
         assert_eq!(next("exc_"), "exc_2");
         assert_eq!(next("watch_modify_"), "watch_modify_3");
         assert_eq!(next("bp_"), "bp_4", "ids must never be reused within a session");
+    }
+
+    /// Mirrors `DebugSession::note_trace_disarm` on bare state, so the bounding logic is testable
+    /// without a live JDWP connection to build a whole session around.
+    fn note_into(notes: &mut std::collections::BTreeMap<String, u32>, dropped: &mut u64, n: &str) {
+        if let Some(c) = notes.get_mut(n) {
+            *c += 1;
+        } else if notes.len() < MAX_TRACE_DISARMS {
+            notes.insert(n.to_string(), 1);
+        } else {
+            *dropped += 1;
+        }
+    }
+
+    // SAFE-8: the disarm-note buffer must be bounded, collapse repeats, and count what it dropped.
+    #[test]
+    fn trace_disarm_notes_collapse_repeats_and_stay_bounded() {
+        let mut notes: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        let mut dropped = 0u64;
+
+        // The same stop point disarming repeatedly must not grow the buffer — this is the case BP-2/BP-3
+        // made reachable, since a self-disarmed logpoint is now easy to re-arm.
+        for _ in 0..500 {
+            note_into(&mut notes, &mut dropped, "watch_3 stopped recording");
+        }
+        assert_eq!(notes.len(), 1, "repeats must collapse, not accumulate");
+        assert_eq!(notes["watch_3 stopped recording"], 500, "the count is what carries the repetition");
+        assert_eq!(dropped, 0);
+
+        // Distinct notes are capped, and the overflow is counted rather than silently discarded.
+        for i in 0..MAX_TRACE_DISARMS + 10 {
+            note_into(&mut notes, &mut dropped, &format!("bp_{i} stopped recording"));
+        }
+        assert_eq!(notes.len(), MAX_TRACE_DISARMS, "distinct notes must be capped");
+        assert!(dropped > 0, "overflow must be counted so a full buffer never reads as a quiet one");
     }
 
     // SAFE-4/SAFE-5: the two halves of "the VM is suspended" move together. Tracking them separately is

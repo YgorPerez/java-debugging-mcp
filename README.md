@@ -120,7 +120,10 @@ the last thread that hit a breakpoint.
 
 **Keeping a shared JVM safe.** A watchdog auto-resumes a VM left suspended for too long
 (`JDWP_WATCHDOG_SECS`, default 120; `0` disables) — whether a stop point or a `debug.pause` froze it —
-and *disables* whatever caused it, so it can't re-freeze on the next hit. Disabling keeps the
+and *disables* whatever caused it, so it can't re-freeze on the next hit. JDWP **counts** suspends, so
+resuming is treated as "make it actually run", not one Resume packet: `continue`, `panic` and the
+watchdog clear the whole suspend depth and verify it via `SuspendCount` before reporting success, and
+`debug.pause` is idempotent so a depth can't build up by accident. Disabling keeps the
 definition, so one `debug.toggle_breakpoint` re-arms it with its condition and `trace_expr` intact;
 the same applies when a `trace:true` stop point hits its `trace_max_hits` budget.
 `debug.disconnect` resumes the VM and clears every request on the way out, so it can never leave a
