@@ -6,7 +6,7 @@ use crate::commands::{command_sets, event_commands, event_kinds};
 use crate::connection::JdwpConnection;
 use crate::protocol::{CommandPacket, JdwpResult};
 use crate::reader::read_i32;
-use crate::types::{FieldId, MethodId, ReferenceTypeId};
+use crate::types::{FieldId, MethodId, ReferenceTypeId, ThreadId};
 use bytes::BufMut;
 
 /// Suspend policy for events
@@ -22,6 +22,8 @@ pub enum SuspendPolicy {
 /// misremember — `ClassOnly` and `FieldOnly` are four apart, and passing the wrong one gets an
 /// unhelpful `INTERNAL` (113) back rather than a complaint about the modifier — so name them.
 mod mod_kinds {
+    pub const COUNT: u8 = 1;
+    pub const THREAD_ONLY: u8 = 3;
     pub const CLASS_MATCH: u8 = 5;
     pub const LOCATION_ONLY: u8 = 7;
     pub const EXCEPTION_ONLY: u8 = 8;
@@ -160,18 +162,42 @@ impl JdwpConnection {
         uncaught: bool,
         suspend_policy: SuspendPolicy,
     ) -> JdwpResult<i32> {
+        self.set_exception_request_ex(ref_type, caught, uncaught, suspend_policy, None, None).await
+    }
+
+    /// As [`set_exception_request`](Self::set_exception_request), plus optional `ThreadOnly` (report
+    /// only throws on one thread — the single biggest noise reduction on a busy app server, FILT-1)
+    /// and `Count` (report at most every Nth throw, and — because `Count` auto-expires *inside the
+    /// JVM* — a self-disarming hit budget for trace mode so a hot throw site can't flood, TRACE-3).
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn set_exception_request_ex(
+        &mut self,
+        ref_type: Option<ReferenceTypeId>,
+        caught: bool,
+        uncaught: bool,
+        suspend_policy: SuspendPolicy,
+        count: Option<i32>,
+        thread: Option<ThreadId>,
+    ) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
 
         packet.data.put_u8(event_kinds::EXCEPTION);
         packet.data.put_u8(suspend_policy as u8);
 
-        // One modifier: ExceptionOnly — refType (0 = all), caught flag, uncaught flag.
-        packet.data.put_i32(1);
+        // ExceptionOnly is always present; ThreadOnly and Count are added when asked for.
+        let n_mods = 1 + i32::from(count.is_some()) + i32::from(thread.is_some());
+        packet.data.put_i32(n_mods);
+
+        // ExceptionOnly — refType (0 = all), caught flag, uncaught flag.
         packet.data.put_u8(mod_kinds::EXCEPTION_ONLY);
         packet.data.put_u64(ref_type.unwrap_or(0));
         packet.data.put_u8(u8::from(caught));
         packet.data.put_u8(u8::from(uncaught));
+
+        write_count_thread(&mut packet, count, thread);
 
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
@@ -216,17 +242,41 @@ impl JdwpConnection {
         kind: WatchKind,
         suspend_policy: SuspendPolicy,
     ) -> JdwpResult<i32> {
+        self.set_field_watch_ex(ref_type, field_id, kind, suspend_policy, None, None).await
+    }
+
+    /// As [`set_field_watch`](Self::set_field_watch), plus optional `ThreadOnly` (report only touches
+    /// from one thread, FILT-1) and `Count` (report at most every Nth touch — used as a self-disarming
+    /// hit budget for trace mode, since `Count` expires inside the JVM and stops sending, TRACE-3).
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed. A JVM
+    /// without the capability answers `NOT_IMPLEMENTED` (99).
+    pub async fn set_field_watch_ex(
+        &mut self,
+        ref_type: ReferenceTypeId,
+        field_id: FieldId,
+        kind: WatchKind,
+        suspend_policy: SuspendPolicy,
+        count: Option<i32>,
+        thread: Option<ThreadId>,
+    ) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
 
         packet.data.put_u8(kind.event_kind());
         packet.data.put_u8(suspend_policy as u8);
 
-        // One modifier: FieldOnly — the declaring type plus the field itself.
-        packet.data.put_i32(1);
+        // FieldOnly is always present; ThreadOnly and Count are added when asked for.
+        let n_mods = 1 + i32::from(count.is_some()) + i32::from(thread.is_some());
+        packet.data.put_i32(n_mods);
+
+        // FieldOnly — the declaring type plus the field itself.
         packet.data.put_u8(mod_kinds::FIELD_ONLY);
         packet.data.put_u64(ref_type);
         packet.data.put_u64(field_id);
+
+        write_count_thread(&mut packet, count, thread);
 
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
@@ -249,6 +299,21 @@ impl JdwpConnection {
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
         Ok(())
+    }
+}
+
+/// Append the optional `Count` and `ThreadOnly` modifiers to an `EventRequest.Set` packet, in that
+/// order. The count of modifiers must already have been written to account for whichever are present.
+/// `Count` is written before `ThreadOnly` to match the numbering the JVM expects, though the spec
+/// leaves modifier order free.
+fn write_count_thread(packet: &mut CommandPacket, count: Option<i32>, thread: Option<ThreadId>) {
+    if let Some(c) = count {
+        packet.data.put_u8(mod_kinds::COUNT);
+        packet.data.put_i32(c);
+    }
+    if let Some(t) = thread {
+        packet.data.put_u8(mod_kinds::THREAD_ONLY);
+        packet.data.put_u64(t);
     }
 }
 

@@ -166,6 +166,7 @@ impl RequestHandler {
             "debug.set_breakpoint" => self.handle_set_breakpoint(args).await,
             "debug.list_breakpoints" => self.handle_list_breakpoints(args).await,
             "debug.clear_breakpoint" => self.handle_clear_breakpoint(args).await,
+            "debug.toggle_breakpoint" => self.handle_toggle_breakpoint(args).await,
             "debug.continue" => self.handle_continue(args).await,
             "debug.step_over" => self.handle_step_over(args).await,
             "debug.step_into" => self.handle_step_into(args).await,
@@ -203,8 +204,11 @@ impl RequestHandler {
         let connection = jdwp_client::JdwpConnection::connect(host, port).await
             .map_err(|e| format!("Failed to connect: {e}"))?;
 
+        // Read-only when the caller asks for it OR the env forces it (a deploy-wide guard for a
+        // production JVM). Either source alone is enough — the env can't be relaxed per-attach (SAFE-3).
+        let read_only = a.read_only || env_readonly();
         let session_id = self.session_manager
-            .create_session(connection, format!("{host}:{port}"))
+            .create_session(connection, format!("{host}:{port}"), read_only)
             .await;
         // Get the session guard once so the listener/watchdog handles are stored before we return.
         let session_guard = self.resolve_session(&args).await
@@ -227,7 +231,12 @@ impl RequestHandler {
             ));
         }
 
-        Ok(format!("Connected to JVM at {host}:{port} (session: {session_id})"))
+        let ro = if read_only {
+            "\n   🔒 Read-only: method invocation, set_value and force_return are refused; collection expansion falls back to shallow. A guard against accident, not a security boundary."
+        } else {
+            ""
+        };
+        Ok(format!("Connected to JVM at {host}:{port} (session: {session_id}){ro}"))
     }
 
     /// List every live session, so a caller who lost a `session_id` can find it again.
@@ -278,6 +287,7 @@ impl RequestHandler {
             condition: a.condition.clone(),
             trace: a.trace,
             trace_expr: a.trace_expr.clone(),
+            trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
             suspend_policy,
         };
 
@@ -328,10 +338,19 @@ impl RequestHandler {
         if session.breakpoints.is_empty() && session.pending_breakpoints.is_empty()
             && session.exception_requests.is_empty() && session.watchpoints.is_empty()
         {
-            return Ok("No breakpoints set".to_string());
+            return Ok(session.last_watchdog_note.as_ref().map_or_else(
+                || "No breakpoints set".to_string(),
+                |n| format!("No breakpoints set\n⏰ {n}"),
+            ));
         }
 
-        let mut output = format!(
+        let mut output = String::new();
+        // Surface a watchdog auto-resume up front (SAFE-2): the caller was away, so the fact that a
+        // stop point was disarmed and the VM resumed is the most important thing on this listing.
+        if let Some(n) = &session.last_watchdog_note {
+            let _ = writeln!(output, "⏰ {n}\n");
+        }
+        let _ = write!(output,
             "📍 {} breakpoint(s), {} deferred, {} exception, {} watchpoint(s):\n\n",
             session.breakpoints.len(), session.pending_breakpoints.len(),
             session.exception_requests.len(), session.watchpoints.len()
@@ -395,9 +414,12 @@ impl RequestHandler {
             .ok_or_else(|| format!("Breakpoint not found: {bp_id}"))?
             .clone();
 
-        // Clear the breakpoint in the JVM
-        session.connection.clear_breakpoint(bp_info.request_id).await
-            .map_err(|e| format!("Failed to clear breakpoint: {e}"))?;
+        // Clear the breakpoint in the JVM — a disabled breakpoint has no live request, so there is
+        // nothing to clear there, only the stored definition to drop (BP-1).
+        if let Some(req) = bp_info.request_id {
+            session.connection.clear_breakpoint(req).await
+                .map_err(|e| format!("Failed to clear breakpoint: {e}"))?;
+        }
 
         // Remove from session
         session.breakpoints.remove(bp_id);
@@ -405,8 +427,68 @@ impl RequestHandler {
 
         Ok(format!(
             "✅ Breakpoint cleared: {} at {}:{}\n   JDWP Request ID: {}",
-            bp_id, bp_info.class_pattern, bp_info.line, bp_info.request_id
+            bp_id, bp_info.class_pattern, bp_info.line,
+            bp_info.request_id.map_or_else(|| "(disabled)".to_string(), |r| r.to_string())
         ))
+    }
+
+    /// Silence or re-arm a line breakpoint without losing its definition (BP-1). Disabling clears the
+    /// JDWP request but keeps the `BreakpointInfo` (`condition`, `trace_expr`, location) so enabling can
+    /// re-arm it at exactly the same place; enabling sets a fresh request from the stored `arm` and
+    /// keys the breakpoint under its new id.
+    async fn handle_toggle_breakpoint(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::ToggleBreakpointArgs = crate::args::parse(&args)?;
+        let bp_id = a.breakpoint_id.as_str();
+
+        let session_guard = self.resolve_session(&args).await
+            .ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+
+        let mut bp = session.breakpoints.get(bp_id)
+            .ok_or_else(|| {
+                if session.exception_requests.contains_key(bp_id) || session.watchpoints.contains_key(bp_id) {
+                    format!("{bp_id} is an exception breakpoint or watchpoint — toggle applies to line breakpoints (bp_…). Use clear_breakpoint to remove it.")
+                } else {
+                    format!("Breakpoint not found: {bp_id}")
+                }
+            })?
+            .clone();
+
+        // Omitted `enabled` flips the current state.
+        let want_enabled = a.enabled.unwrap_or(!bp.enabled);
+        if want_enabled == bp.enabled {
+            let state = if bp.enabled { "already armed" } else { "already disabled" };
+            return Ok(format!("No change: {bp_id} is {state}."));
+        }
+
+        if want_enabled {
+            // Re-arm from the stored location and modifiers. The request id changes, so the breakpoint
+            // is re-keyed under its new `bp_<id>` — mirroring how it was keyed when first armed.
+            let arm = bp.arm.clone();
+            let req = session.connection.set_breakpoint_ex(
+                arm.class_id, arm.method_id, arm.bytecode_index, arm.suspend_policy,
+                arm.hit_count, arm.thread_filter,
+            ).await.map_err(|e| format!("Failed to re-arm breakpoint: {e}"))?;
+            session.breakpoints.remove(bp_id);
+            bp.request_id = Some(req);
+            bp.enabled = true;
+            let new_id = format!("bp_{req}");
+            let (cls, line) = (bp.class_pattern.clone(), bp.line);
+            session.breakpoints.insert(new_id.clone(), bp);
+            drop(session);
+            Ok(format!("✅ Re-armed {bp_id} at {cls}:{line} (new id {new_id}, since re-arming assigns a fresh JDWP request)."))
+        } else {
+            // Disable: clear the live request but keep the definition so it can be re-armed.
+            if let Some(req) = bp.request_id.take() {
+                session.connection.clear_breakpoint(req).await
+                    .map_err(|e| format!("Failed to clear breakpoint request: {e}"))?;
+            }
+            bp.enabled = false;
+            let (cls, line) = (bp.class_pattern.clone(), bp.line);
+            session.breakpoints.insert(bp_id.to_string(), bp);
+            drop(session);
+            Ok(format!("🔕 Disabled {bp_id} at {cls}:{line} — its condition/trace_expr are kept; toggle it back on to re-arm."))
+        }
     }
 
     async fn handle_continue(&self, args: serde_json::Value) -> Result<String, String> {
@@ -523,6 +605,10 @@ impl RequestHandler {
         let thread_id = crate::args::parse_thread_id(a.thread_id.as_deref());
         let max_frames = a.max_frames;
         let include_variables = a.include_variables;
+        // Read-only: object expansion invokes toArray/toString in the debuggee, so it falls back to the
+        // shallow `Type (id=…)` rendering rather than being refused outright (SAFE-3).
+        let read_only = session.read_only;
+        let expand_objects = a.expand_objects && !read_only;
 
         let last_thread = session.last_thread;
         let target_thread =
@@ -559,7 +645,7 @@ impl RequestHandler {
         // ONE node budget for the whole call — see STACK_NODE_BUDGET. Deep expansion invokes methods
         // in the debuggee, which needs the suspended thread, so `deep` is Some only when asked for;
         // the default path stays cheap and side-effect-free (no toString() per local).
-        let mut deep = a.expand_objects.then(|| {
+        let mut deep = expand_objects.then(|| {
             (
                 DeepOpts {
                     depth_limit: a.max_depth,
@@ -569,6 +655,9 @@ impl RequestHandler {
                 DeepState::new(STACK_NODE_BUDGET),
             )
         });
+        if a.expand_objects && read_only {
+            let _ = writeln!(output, "🔒 read-only: showing shallow values — expand_objects invokes methods in the debuggee, which is refused here.");
+        }
 
         for (idx, frame) in frames.iter().enumerate() {
             let class_id = frame.location.class_id;
@@ -627,6 +716,18 @@ impl RequestHandler {
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
+        // Read-only: refuse an expression that calls a method (any invocation could mutate the target),
+        // and fall back to shallow rendering because expansion also invokes (SAFE-3). Field/local/static
+        // reads and array indexing need no invocation and still work.
+        let read_only = session.read_only;
+        if read_only && expr_invokes(expression) {
+            return Err(
+                "🔒 Read-only session: this expression calls a method, which is refused (any invocation \
+                 could mutate the JVM). Reads that need no invocation still work — locals, fields, \
+                 statics, arrays, get_stack. Attach without read_only (or unset JDWP_READONLY) to invoke."
+                    .to_string(),
+            );
+        }
         // A thread/frame is only needed to read locals or invoke methods. A pure static-field read
         // (Class.FIELD) works on a running VM, so a missing/un-suspended thread is not fatal here —
         // resolve_expression falls back to the static path when there's no frame.
@@ -646,7 +747,7 @@ impl RequestHandler {
         };
 
         let resolved = resolve_expression_multi(conn, thread_id, frame.as_ref(), expression).await?;
-        let deep = a.expand_objects.then(|| DeepOpts {
+        let deep = (a.expand_objects && !read_only).then(|| DeepOpts {
             depth_limit: a.max_depth,
             child_limit: a.max_children.max(1),
             text_len: max_len,
@@ -676,7 +777,12 @@ impl RequestHandler {
             }
         };
         drop(session);
-        Ok(format!("{} = {}", expression.trim(), rendered))
+        let ro_note = if a.expand_objects && read_only {
+            "🔒 read-only: shallow rendering (expand_objects invokes methods)\n"
+        } else {
+            ""
+        };
+        Ok(format!("{ro_note}{} = {}", expression.trim(), rendered))
     }
 
     async fn handle_list_threads(&self, args: serde_json::Value) -> Result<String, String> {
@@ -749,13 +855,50 @@ impl RequestHandler {
             Some(s) => Some(s.to_string()),
             None => self.session_manager.get_current_session_id().await,
         };
+        let Some(session_id) = target else {
+            return Err("No active debug session to disconnect".to_string());
+        };
 
-        if let Some(session_id) = target {
-            self.session_manager.remove_session(&session_id).await;
-            Ok(format!("✅ Disconnected from debug session: {session_id}"))
+        // Leave the JVM RUNNING with nothing armed BEFORE dropping the session. A bare disconnect
+        // used to abort the watchdog and drop the session without resuming — so disconnecting while
+        // suspended at a breakpoint froze every thread forever, with nothing left alive to rescue it,
+        // produced by the tool whose name sounds like the safe way out (SAFE-1). VirtualMachine.Dispose
+        // is the JVM's own answer: it clears every event request and resumes every thread in one round
+        // trip, and can't leave a request behind the way clearing our tracked set one by one might.
+        let safety = if let Some(guard) = self.session_manager.get_session_by_id(&session_id).await {
+            let mut session = guard.lock().await;
+            let was_suspended = session.suspended_since.is_some();
+            let stops = session.breakpoints.len() + session.pending_breakpoints.len()
+                + session.exception_requests.len() + session.watchpoints.len();
+            if let Some(req) = session.pending_step.take() {
+                let _ = session.connection.clear_step(req).await;
+            }
+            let note = if session.connection.dispose().await.is_ok() {
+                format!("cleared {stops} stop point(s) and resumed all threads")
+            } else {
+                // A half-dead socket is exactly the case this matters for: fall back to clearing what
+                // we track and resuming, best effort, so a live-but-unresponsive Dispose still leaves
+                // the VM as unfrozen as we can manage.
+                let _ = session.connection.clear_all_breakpoints().await;
+                let _ = session.connection.resume_all().await;
+                format!("Dispose failed — best-effort cleared breakpoints and resumed ({stops} stop point(s))")
+            };
+            session.suspended_since = None;
+            drop(session);
+            Some((note, was_suspended))
         } else {
-            Err("No active debug session to disconnect".to_string())
-        }
+            None
+        };
+
+        self.session_manager.remove_session(&session_id).await;
+
+        Ok(match safety {
+            Some((note, was_suspended)) => format!(
+                "✅ Disconnected from debug session: {session_id}\n   {note}{}",
+                if was_suspended { "\n   The VM was suspended at a stop point — it is now running." } else { "" }
+            ),
+            None => format!("✅ Disconnected from debug session: {session_id}"),
+        })
     }
 
     async fn handle_get_last_event(&self, args: serde_json::Value) -> Result<String, String> {
@@ -795,9 +938,15 @@ impl RequestHandler {
         if a.drain {
             session.events.clear();
         }
+        let watchdog_note = session.last_watchdog_note.clone();
         drop(session);
 
         lines.push(format!("[suspended] {suspended}"));
+        // If the watchdog auto-resumed while the caller was away, they'd otherwise read a stale
+        // "suspended" state — tell them the VM was rescued and which stop point was disarmed (SAFE-2).
+        if let Some(n) = watchdog_note {
+            lines.push(format!("[watchdog] {n}"));
+        }
         // Only when there is something to catch up on: silence means "you have seen everything".
         if unshown > 0 {
             lines.push(format!(
@@ -822,6 +971,9 @@ impl RequestHandler {
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
+        if session.read_only {
+            return Err(readonly_refusal("set_value writes to the JVM"));
+        }
         let thread_opt = crate::args::parse_thread_id(a.thread_id.as_deref()).or(session.last_thread);
         let conn = &mut session.connection;
 
@@ -875,7 +1027,7 @@ impl RequestHandler {
         };
 
         // Static-field attempt: treat the container as a dotted class name.
-        if let Some(msg) = set_static_field(conn, &container_expr, &field_name, value_str).await? {
+        if let Some(msg) = set_static_field(conn, thread_opt, frame_index, &container_expr, &field_name, value_str).await? {
             return Ok(msg);
         }
 
@@ -896,6 +1048,9 @@ impl RequestHandler {
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
+        if session.read_only {
+            return Err(readonly_refusal("force_return changes what the JVM does"));
+        }
         let thread_id = crate::args::parse_thread_id(a.thread_id.as_deref()).or(session.last_thread)
             .ok_or_else(|| "No thread. Pass thread_id, or hit a breakpoint first.".to_string())?;
         let conn = &mut session.connection;
@@ -962,10 +1117,14 @@ impl RequestHandler {
             None => None,
         };
 
+        let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
+
         // A traced request suspends only the throwing thread, which the pump snapshots and resumes —
-        // so a shared JVM keeps serving while you collect throws.
+        // so a shared JVM keeps serving while you collect throws. An optional ThreadOnly restricts it
+        // to one thread (FILT-1); the trace budget lives on our side (see try_record_trace) rather
+        // than as a JDWP Count, because Count reports only the *Nth* throw, not the first N.
         let request_id = session.connection
-            .set_exception_request(ref_type, a.caught, a.uncaught, suspend_policy_for(a.trace))
+            .set_exception_request_ex(ref_type, a.caught, a.uncaught, suspend_policy_for(a.trace), None, thread_filter)
             .await
             .map_err(|e| format!("Failed to set exception breakpoint: {e}"))?;
 
@@ -979,6 +1138,8 @@ impl RequestHandler {
             uncaught: a.uncaught,
             trace: a.trace,
             trace_expr: a.trace_expr.clone(),
+            trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
+            thread_filter,
         });
         drop(session);
 
@@ -998,8 +1159,15 @@ impl RequestHandler {
         } else {
             "\n   Hits are reported via debug.get_last_event.\n   ⚠️  Suspends ALL threads on each throw — on a shared JVM use trace:true instead."
         };
+        let mut extra = String::new();
+        if let Some(t) = thread_filter {
+            let _ = write!(extra, "\n   Thread filter: 0x{t:x} (only throws on this thread)");
+        }
+        if let Some(b) = trace_budget_for(a.trace, a.trace_max_hits) {
+            let _ = write!(extra, "\n   Auto-disarms after {b} trace hit(s)");
+        }
         Ok(format!(
-            "✅ Exception breakpoint set on {class_pattern} ({which})\n   Breakpoint ID: {exc_id}{mode}{noisy}"
+            "✅ Exception breakpoint set on {class_pattern} ({which})\n   Breakpoint ID: {exc_id}{mode}{noisy}{extra}"
         ))
     }
 
@@ -1035,10 +1203,15 @@ impl RequestHandler {
             kinds.push(jdwp_client::WatchKind::Access);
         }
 
+        let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
+        let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
+
         let mut ids = Vec::with_capacity(kinds.len());
         for kind in kinds {
+            // ThreadOnly restricts hits to one thread (FILT-1); the trace budget is enforced on our
+            // side (try_record_trace), since a JDWP Count reports only the Nth touch, not the first N.
             let request_id = session.connection
-                .set_field_watch(declaring_type, field.field_id, kind, suspend_policy_for(a.trace))
+                .set_field_watch_ex(declaring_type, field.field_id, kind, suspend_policy_for(a.trace), None, thread_filter)
                 .await
                 .map_err(|e| format!(
                     "Failed to set {} watchpoint: {e} (error 99 NOT_IMPLEMENTED means this JVM lacks canWatchField{})",
@@ -1055,10 +1228,19 @@ impl RequestHandler {
                 is_static,
                 trace: a.trace,
                 trace_expr: a.trace_expr.clone(),
+                trace_budget,
+                thread_filter,
             });
         }
         drop(session);
 
+        let mut extra = String::new();
+        if let Some(t) = thread_filter {
+            let _ = write!(extra, "\n   Thread filter: 0x{t:x} (only touches on this thread)");
+        }
+        if let Some(b) = trace_budget {
+            let _ = write!(extra, "\n   Auto-disarms after {b} trace hit(s)");
+        }
         let kindness = if is_static { "static" } else { "instance" };
         let where_hits = if a.trace {
             "   Mode: trace (non-suspending) — each hit is snapshotted with the mutating location and old → new value, then the thread resumes; read them with debug.get_traces."
@@ -1066,7 +1248,7 @@ impl RequestHandler {
             "   Hits are reported via debug.get_last_event with the mutating location and old → new value.\n   ⚠️  Suspends ALL threads on each hit — on a shared JVM use trace:true instead."
         };
         Ok(format!(
-            "✅ Watchpoint set on {}.{} ({kindness} {})\n   Breakpoint ID(s): {}\n{where_hits}\n   ⚠️  A watched field can't be JIT-optimised — expect the debuggee to slow down; clear it when done.",
+            "✅ Watchpoint set on {}.{} ({kindness} {})\n   Breakpoint ID(s): {}{extra}\n{where_hits}\n   ⚠️  A watched field can't be JIT-optimised — expect the debuggee to slow down; clear it when done.",
             class_name,
             field_name,
             decode_signature(&field.signature),
@@ -1080,18 +1262,35 @@ impl RequestHandler {
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
-        if session.traces.is_empty() {
+        if session.traces.is_empty() && session.trace_disarms.is_empty() {
             return Ok("No trace snapshots yet. Set a breakpoint with trace:true and trigger it.".to_string());
         }
+
+        // Filter first (TRACE-4), so the "showing X of Y" counts and the `limit` tail both reflect what
+        // the caller asked for rather than the whole buffer.
         let total = session.traces.len();
-        let take = a.limit.min(total);
-        let start = total - take;
-        let mut lines = Vec::with_capacity(take + 2);
+        let class_filter = a.class_filter.as_deref().map(str::to_lowercase);
+        let matched: Vec<&crate::session::TraceRecord> = session.traces.iter()
+            .filter(|r| a.bp_id.as_ref().is_none_or(|id| &r.bp_id == id))
+            .filter(|r| a.since.is_none_or(|s| r.seq > s))
+            .filter(|r| class_filter.as_ref().is_none_or(|c| r.class.to_lowercase().contains(c.as_str())))
+            .collect();
+        let n_matched = matched.len();
+        let take = a.limit.min(n_matched);
+        let start = n_matched - take;
+
+        let filtered = a.bp_id.is_some() || a.class_filter.is_some() || a.since.is_some();
+        let scope = if filtered {
+            format!("{n_matched} matching of {total}")
+        } else {
+            format!("{total}")
+        };
+        let mut lines = Vec::with_capacity(take + 3);
         lines.push(format!(
-            "📢 {} trace snapshot(s) (showing {}, buffer cap {}):",
-            total, take, crate::session::MAX_TRACES
+            "📢 {scope} trace snapshot(s) (showing {take}, buffer cap {}):",
+            crate::session::MAX_TRACES
         ));
-        for rec in session.traces.iter().skip(start) {
+        for rec in matched.into_iter().skip(start) {
             let detail_s = format_trace_detail(rec);
             let args_s = format_trace_args(rec);
             let expr_s = format_trace_expr(rec);
@@ -1101,8 +1300,14 @@ impl RequestHandler {
                 detail_s, args_s, expr_s
             ));
         }
+        // A stop point that hit its budget disarmed itself (TRACE-3) — say so, so a caller doesn't
+        // read the silence that follows as "no more hits". Kept until the buffer is cleared.
+        for note in &session.trace_disarms {
+            lines.push(format!("⏸  {note}"));
+        }
         if a.clear {
             session.traces.clear();
+            session.trace_disarms.clear();
             drop(session);
             lines.push("(buffer cleared)".to_string());
         }
@@ -1121,6 +1326,64 @@ const fn suspend_policy_for(trace: bool) -> jdwp_client::SuspendPolicy {
         jdwp_client::SuspendPolicy::EventThread
     } else {
         jdwp_client::SuspendPolicy::All
+    }
+}
+
+/// Whether `JDWP_READONLY` forces read-only mode for every session (SAFE-3). Truthy = `1`/`true`/`yes`
+/// (case-insensitive); anything else, or unset, is off.
+fn env_readonly() -> bool {
+    std::env::var("JDWP_READONLY")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// The refusal a read-only session returns for a mutating tool (SAFE-3). Names what was refused and
+/// how to lift the guard, and is explicit that it is a guard against accident, not a security boundary.
+fn readonly_refusal(action: &str) -> String {
+    format!(
+        "🔒 Read-only session: {action}, which is refused. Reattach without read_only (or unset \
+         JDWP_READONLY) to allow it. This is a guard against accident, not a security boundary."
+    )
+}
+
+/// Whether an expression calls a method — a `(` at string-quote depth 0. Used to refuse invocation in
+/// a read-only session (SAFE-3). A false positive only over-refuses (a `(` inside a would-be read),
+/// which is the safe direction; a `(` inside a string literal is correctly ignored.
+fn expr_invokes(expr: &str) -> bool {
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in expr.chars() {
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_str = true;
+        } else if c == '(' {
+            return true;
+        }
+    }
+    false
+}
+
+/// Default number of hits a traced stop point records before disarming itself (TRACE-3). Bounds
+/// per-hit work in the debuggee, not just our memory — `MAX_TRACES` caps the buffer, this caps the load.
+const DEFAULT_TRACE_BUDGET: u32 = 200;
+
+/// The trace-hit budget a stop point should arm with: the caller's `trace_max_hits` when tracing
+/// (default `DEFAULT_TRACE_BUDGET`), where `0` means unbounded; `None` for a non-trace stop point,
+/// which is unbounded because it suspends and so can't flood.
+const fn trace_budget_for(trace: bool, trace_max_hits: Option<u32>) -> Option<u32> {
+    if !trace {
+        return None;
+    }
+    match trace_max_hits {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(DEFAULT_TRACE_BUDGET),
     }
 }
 
@@ -1148,11 +1411,12 @@ fn render_session_line(
         + s.exception_requests.len()
         + s.watchpoints.len();
     let mut line = format!(
-        "  {} [{}] {} — {}, {} stop point(s), {} JDWP packet(s)",
+        "  {} [{}] {} — {}{}, {} stop point(s), {} JDWP packet(s)",
         if is_current { "▶" } else { " " },
         sid,
         s.endpoint,
         state,
+        if s.read_only { " 🔒 read-only" } else { "" },
         stops,
         s.connection.packets_sent(),
     );
@@ -1174,15 +1438,23 @@ fn render_session_line(
 fn render_breakpoint_line(output: &mut String, bp_id: &str, bp: &crate::session::BreakpointInfo) {
     let _ = writeln!(
         output,
-        "  {} [{}] {}:{}{}",
+        "  {} [{}] {}:{}{}{}{}",
         if bp.enabled { "✓" } else { "✗" },
         bp_id,
         bp.class_pattern,
         bp.line,
         if bp.trace { " (trace)" } else { "" },
+        trace_budget_tag(bp.trace, bp.trace_budget),
+        if bp.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
     );
     if let Some(method) = &bp.method {
         let _ = writeln!(output, "     Method: {method}");
+    }
+    if let Some(t) = bp.arm.thread_filter {
+        let _ = writeln!(output, "     Thread filter: 0x{t:x}");
+    }
+    if let Some(c) = &bp.condition {
+        let _ = writeln!(output, "     Condition: {c}");
     }
     if let Some(e) = &bp.trace_expr {
         let _ = writeln!(output, "     Trace expr: {e}");
@@ -1212,11 +1484,22 @@ fn render_exception_line(output: &mut String, er: &crate::session::ExceptionRequ
     };
     let _ = writeln!(
         output,
-        "  ⚡ [{}] exception {} ({which}){}",
+        "  ⚡ [{}] exception {} ({which}){}{}{}",
         er.id,
         er.class_pattern,
         if er.trace { " (trace)" } else { "" },
+        trace_budget_tag(er.trace, er.trace_budget),
+        er.thread_filter.map_or_else(String::new, |t| format!(" thread=0x{t:x}")),
     );
+}
+
+/// The ` [N hit(s) left]` budget suffix for a traced stop point in `list_breakpoints`, kept separate
+/// from the `(trace)` marker so the marker stays a stable substring (TRACE-3).
+fn trace_budget_tag(trace: bool, budget: Option<u32>) -> String {
+    match (trace, budget) {
+        (true, Some(n)) => format!(" [{n} hit(s) left]"),
+        _ => String::new(),
+    }
 }
 
 /// Describe one event into a `get_last_event` entry: where it happened, plus whatever is specific to
@@ -1342,14 +1625,19 @@ async fn describe_field_event(
 fn render_watchpoint_line(output: &mut String, watch_id: &str, wp: &crate::session::WatchpointInfo) {
     let _ = writeln!(
         output,
-        "  👁  [{}] watch {}.{} on {} ({}){}",
+        "  👁  [{}] watch {}.{} on {} ({}){}{}",
         watch_id,
         wp.class_name,
         wp.field_name,
         wp.kind.label(),
         if wp.is_static { "static" } else { "instance" },
         if wp.trace { " (trace)" } else { "" },
+        wp.thread_filter.map_or_else(String::new, |t| format!(" thread=0x{t:x}")),
     );
+    // Budget on its own line to keep the header stable; harmless when absent.
+    if let Some(n) = wp.trace_budget {
+        let _ = writeln!(output, "     Trace budget: {n} hit(s) left");
+    }
 }
 
 /// Resolve a frame's class name, using and populating a per-call cache (recursion / same-class
@@ -2248,7 +2536,7 @@ async fn try_arm_deferred_breakpoints(
                         session.pending_breakpoints.retain(|p| p.bp_id != pend.bp_id);
                         info!("Armed deferred breakpoint {} on {} (line {})", pend.bp_id, pend.class_pattern, line);
                         session.breakpoints.insert(pend.bp_id, crate::session::BreakpointInfo {
-                            request_id: req_id,
+                            request_id: Some(req_id),
                             class_pattern: pend.class_pattern,
                             line: u32::try_from(line).unwrap_or(0),
                             method: Some(method.name),
@@ -2257,6 +2545,15 @@ async fn try_arm_deferred_breakpoints(
                             condition: pend.condition,
                             trace: pend.trace,
                             trace_expr: pend.trace_expr,
+                            trace_budget: pend.trace_budget,
+                            arm: crate::session::BreakpointArm {
+                                class_id: cp_ref,
+                                method_id: method.method_id,
+                                bytecode_index: index,
+                                suspend_policy: sp,
+                                hit_count: pend.hit_count,
+                                thread_filter: pend.thread_filter,
+                            },
                         });
                     }
                     Err(e) => warn!("Failed to arm deferred breakpoint {}: {}", pend.bp_id, e),
@@ -2287,7 +2584,7 @@ fn find_traced_request(
     session: &crate::session::DebugSession,
     req_id: i32,
 ) -> Option<TracedRequest> {
-    if let Some((id, b)) = session.breakpoints.iter().find(|(_, b)| b.request_id == req_id && b.trace) {
+    if let Some((id, b)) = session.breakpoints.iter().find(|(_, b)| b.request_id == Some(req_id) && b.trace) {
         return Some(TracedRequest {
             id: id.clone(),
             condition: b.condition.clone(),
@@ -2301,6 +2598,39 @@ fn find_traced_request(
     }
     if let Some((id, w)) = session.watchpoints.iter().find(|(_, w)| w.request_id == req_id && w.trace) {
         return Some(TracedRequest { id: id.clone(), condition: None, trace_expr: w.trace_expr.clone() });
+    }
+    None
+}
+
+/// Clear the one stop point a JDWP request id belongs to — line breakpoint, exception request, or
+/// field watch — removing it from the session's bookkeeping and the JVM. Returns a human label for
+/// what was disarmed, or `None` if no tracked stop point matched (e.g. a single-step, which the caller
+/// clears separately, or an already-cleared request). Used by the watchdog to disarm exactly the stop
+/// point that froze the VM (SAFE-2) and by the trace-budget path to auto-disarm (TRACE-3).
+async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32) -> Option<String> {
+    if let Some((id, bp)) = session.breakpoints.iter()
+        .find(|(_, b)| b.request_id == Some(req_id))
+        .map(|(k, v)| (k.clone(), v.clone()))
+    {
+        let _ = session.connection.clear_breakpoint(req_id).await;
+        session.breakpoints.remove(&id);
+        return Some(format!("breakpoint {id} at {}:{}", bp.class_pattern, bp.line));
+    }
+    if let Some((id, er)) = session.exception_requests.iter()
+        .find(|(_, e)| e.request_id == req_id)
+        .map(|(k, v)| (k.clone(), v.clone()))
+    {
+        let _ = session.connection.clear_exception_request(req_id).await;
+        session.exception_requests.remove(&id);
+        return Some(format!("exception breakpoint {id} ({})", er.class_pattern));
+    }
+    if let Some((id, wp)) = session.watchpoints.iter()
+        .find(|(_, w)| w.request_id == req_id)
+        .map(|(k, v)| (k.clone(), v.clone()))
+    {
+        let _ = session.connection.clear_field_watch(req_id, wp.kind).await;
+        session.watchpoints.remove(&id);
+        return Some(format!("watchpoint {id} ({}.{})", wp.class_name, wp.field_name));
     }
     None
 }
@@ -2335,6 +2665,7 @@ async fn try_record_trace(
             &mut session.connection, &req.id, req.trace_expr.as_deref(), thread, &loc, &details,
         ).await)
     };
+    let recorded = record.is_some();
     if let Some(mut rec) = record {
         session.trace_seq += 1;
         rec.seq = session.trace_seq;
@@ -2344,7 +2675,51 @@ async fn try_record_trace(
         session.traces.push_back(rec);
     }
     let _ = session.connection.resume_thread(thread).await;
+    // TRACE-3: charge the hit against this stop point's budget and disarm it once it runs out, so a
+    // hot throw/field can't keep flooding the debuggee. Only a recorded hit is charged, so the
+    // "exactly N traces, then it stops" contract holds even when a condition skips some.
+    if recorded {
+        if let Some(label) = charge_trace_budget(session, req_id).await {
+            session.trace_disarms.push(label);
+        }
+    }
     true
+}
+
+/// Charge one hit against a traced stop point's budget (TRACE-3). When the budget reaches zero, disarm
+/// the request and return a note for `get_traces`; otherwise decrement in place and return `None`. A
+/// stop point with no budget (`None`) is unbounded and is never charged.
+async fn charge_trace_budget(session: &mut crate::session::DebugSession, req_id: i32) -> Option<String> {
+    let remaining = decrement_trace_budget(session, req_id)?;
+    if remaining == 0 {
+        let what = disarm_request(session, req_id).await?;
+        Some(format!(
+            "{what} stopped recording — reached its trace-hit budget and disarmed itself. Re-arm with a higher trace_max_hits if you need more."
+        ))
+    } else {
+        None
+    }
+}
+
+/// Decrement the matching stop point's trace budget in place, returning the count left afterwards, or
+/// `None` when the request has no budget (unbounded) or isn't found.
+fn decrement_trace_budget(session: &mut crate::session::DebugSession, req_id: i32) -> Option<u32> {
+    if let Some(b) = session.breakpoints.values_mut().find(|b| b.request_id == Some(req_id)) {
+        let n = b.trace_budget?.saturating_sub(1);
+        b.trace_budget = Some(n);
+        return Some(n);
+    }
+    if let Some(e) = session.exception_requests.values_mut().find(|e| e.request_id == req_id) {
+        let n = e.trace_budget?.saturating_sub(1);
+        e.trace_budget = Some(n);
+        return Some(n);
+    }
+    if let Some(w) = session.watchpoints.values_mut().find(|w| w.request_id == req_id) {
+        let n = w.trace_budget?.saturating_sub(1);
+        w.trace_budget = Some(n);
+        return Some(n);
+    }
+    None
 }
 
 /// Evaluate a conditional breakpoint on the hit thread and auto-resume (without reporting) when the
@@ -2359,7 +2734,7 @@ async fn store_reportable_event(
         event_set.events.first().map(|e| e.request_id),
     ) {
         let cond = session.breakpoints.values()
-            .find(|b| b.request_id == req_id)
+            .find(|b| b.request_id == Some(req_id))
             .and_then(|b| b.condition.clone());
         if let Some(cond) = cond {
             if !evaluate_condition_on_thread(&mut session.connection, thread, &cond).await {
@@ -2402,13 +2777,34 @@ fn spawn_watchdog(
             let mut s = g.lock().await;
             if let Some(since) = s.suspended_since {
                 if since.elapsed().as_secs() >= secs {
+                    // A pending single-step must be cleared before the resume, or the next resume
+                    // re-fires it.
                     if let Some(req) = s.pending_step.take() {
                         let _ = s.connection.clear_step(req).await;
                     }
+                    // Disarm the stop point that caused the suspension, not just resume — otherwise the
+                    // cycle is freeze → 120s → resume → freeze again on the very next hit, indefinitely
+                    // (SAFE-2). Surgical: the newest event names the request that suspended the VM, so
+                    // clear only that one and leave any other careful setup intact.
+                    let offending = s.events.back()
+                        .and_then(|rec| rec.set.events.first().map(|e| e.request_id));
+                    let disarmed = match offending {
+                        Some(req) => disarm_request(&mut s, req).await,
+                        None => None,
+                    };
                     let _ = s.connection.resume_all().await;
                     s.suspended_since = None;
+                    let note = disarmed.as_ref().map_or_else(
+                        || format!(
+                            "watchdog auto-resumed the VM after {secs}s suspended (could not identify the stop point to disarm — it may have already been cleared)"
+                        ),
+                        |what| format!(
+                            "watchdog auto-resumed the VM after {secs}s suspended and disarmed {what} so it can't re-freeze the VM — re-arm it (or use trace:true) when ready"
+                        ),
+                    );
+                    info!("{note}");
+                    s.last_watchdog_note = Some(note);
                     drop(s);
-                    info!("watchdog auto-resumed VM after {}s suspended", secs);
                 }
             }
         }
@@ -2426,6 +2822,7 @@ struct BreakpointSpec {
     condition: Option<String>,
     trace: bool,
     trace_expr: Option<String>,
+    trace_budget: Option<u32>,
     suspend_policy: jdwp_client::SuspendPolicy,
 }
 
@@ -2444,7 +2841,7 @@ async fn arm_and_insert(
     ).await.map_err(|e| format!("Failed to set breakpoint: {e}"))?;
     let bp_id = format!("bp_{request_id}");
     session.breakpoints.insert(bp_id.clone(), crate::session::BreakpointInfo {
-        request_id,
+        request_id: Some(request_id),
         class_pattern: spec.class_pattern.clone(),
         line: u32::try_from(line).unwrap_or(0),
         method: Some(method.name.clone()),
@@ -2453,6 +2850,15 @@ async fn arm_and_insert(
         condition: spec.condition.clone(),
         trace: spec.trace,
         trace_expr: spec.trace_expr.clone(),
+        trace_budget: spec.trace_budget,
+        arm: crate::session::BreakpointArm {
+            class_id: class_type_id,
+            method_id: method.method_id,
+            bytecode_index: index,
+            suspend_policy: spec.suspend_policy,
+            hit_count: spec.hit_count,
+            thread_filter: spec.thread_filter,
+        },
     });
     Ok((bp_id, line, method.name, request_id))
 }
@@ -2494,6 +2900,7 @@ async fn register_deferred_breakpoint(
         condition: spec.condition.clone(),
         trace: spec.trace,
         trace_expr: spec.trace_expr.clone(),
+        trace_budget: spec.trace_budget,
     });
     let where_ = match (spec.line_opt, spec.method_hint.as_deref()) {
         (Some(l), _) => format!("line {l}"),
@@ -2630,7 +3037,7 @@ async fn set_local_variable(
         .or_else(|| vars.iter().find(|v| &v.name == name))
         .ok_or_else(|| format!("Unknown local variable '{name}' (for a static/instance field use Class.field or obj.field)"))?;
     let sig_byte = *var.signature.as_bytes().first().ok_or_else(|| "Bad signature".to_string())?;
-    let value = literal_to_value(conn, value_str, sig_byte).await?;
+    let value = value_to_write(conn, Some(thread_id), frame_index, value_str, &var.signature).await?;
     if !tag_compatible(sig_byte, value.tag) {
         return Err(type_mismatch_err(name, &var.signature, &value));
     }
@@ -2701,9 +3108,9 @@ async fn set_element(
         .ok_or_else(|| format!("'{container_expr}' is null or a primitive, so it has no elements"))?;
 
     if container.tag == 91 {
-        return set_array_element(conn, id, container_expr, key, raw_value).await;
+        return set_array_element(conn, tid, frame_index, id, container_expr, key, raw_value).await;
     }
-    set_collection_element(conn, tid, frame.as_ref(), id, container_expr, key, raw_value).await
+    set_collection_element(conn, tid, frame_index, frame.as_ref(), id, container_expr, key, raw_value).await
 }
 
 /// Write one element of a `List` (via `set(index, value)`) or a `Map` (via `put(key, value)`).
@@ -2715,6 +3122,7 @@ async fn set_element(
 async fn set_collection_element(
     conn: &mut jdwp_client::JdwpConnection,
     tid: u64,
+    frame_index: usize,
     frame: Option<&jdwp_client::thread::Frame>,
     id: u64,
     container_expr: &str,
@@ -2747,9 +3155,8 @@ async fn set_collection_element(
     // The value parameter's declared type drives the literal's coercion; for `set(int, E)` and
     // `put(K, V)` that is a reference, so `coerce_args` boxes a primitive into its wrapper.
     let params = sig_param_types(&m.signature);
-    let value_sig = params.get(1).map_or("Ljava/lang/Object;", String::as_str);
-    let sig_byte = *value_sig.as_bytes().first().unwrap_or(&b'L');
-    let new_value = literal_to_value(conn, raw_value, sig_byte).await?;
+    let value_sig = params.get(1).map_or("Ljava/lang/Object;", String::as_str).to_string();
+    let new_value = value_to_write(conn, Some(tid), frame_index, raw_value, &value_sig).await?;
     let args = coerce_args(conn, tid, &m.signature, vec![key_value, new_value]).await?;
 
     let (ret, exc) = conn.invoke_method(id, tid, decl, m.method_id, args).await
@@ -2767,6 +3174,8 @@ async fn set_collection_element(
 /// component type. No invocation, so — unlike the collection path — it has no side effects.
 async fn set_array_element(
     conn: &mut jdwp_client::JdwpConnection,
+    thread_opt: u64,
+    frame_index: usize,
     id: u64,
     container_expr: &str,
     key: &ArgLit,
@@ -2789,7 +3198,7 @@ async fn set_array_element(
     let sig_byte = *component.as_bytes().first().unwrap_or(&b'L');
 
     let old = conn.get_array_values(id, *i, 1).await.ok().and_then(|v| v.into_iter().next());
-    let value = literal_to_value(conn, raw_value, sig_byte).await?;
+    let value = value_to_write(conn, Some(thread_opt), frame_index, raw_value, &component).await?;
     if !tag_compatible(sig_byte, value.tag) {
         return Err(format!(
             "'{container_expr}[{i}]' is {} — a {} literal can't be written to it",
@@ -2838,7 +3247,7 @@ async fn set_instance_field(
     let (_, f) = find_field_info(conn, type_id, field_name, Some(false)).await?
         .ok_or_else(|| format!("No instance field '{field_name}' on the resolved object"))?;
     let sig_byte = *f.signature.as_bytes().first().ok_or_else(|| "Bad field signature".to_string())?;
-    let value = literal_to_value(conn, value_str, sig_byte).await?;
+    let value = value_to_write(conn, Some(thread_id), frame_index, value_str, &f.signature).await?;
     if !tag_compatible(sig_byte, value.tag) {
         return Err(type_mismatch_err(field_name, &f.signature, &value));
     }
@@ -2851,6 +3260,8 @@ async fn set_instance_field(
 /// `Ok(None)` means the container isn't a loaded class (caller falls through to its final error).
 async fn set_static_field(
     conn: &mut jdwp_client::JdwpConnection,
+    thread_opt: Option<u64>,
+    frame_index: usize,
     container_expr: &str,
     field_name: &str,
     value_str: &str,
@@ -2861,7 +3272,7 @@ async fn set_static_field(
     let (_, f) = find_field_info(conn, class_id, field_name, Some(true)).await?
         .ok_or_else(|| format!("class '{container_expr}' has no static field '{field_name}'"))?;
     let sig_byte = *f.signature.as_bytes().first().ok_or_else(|| "Bad field signature".to_string())?;
-    let value = literal_to_value(conn, value_str, sig_byte).await?;
+    let value = value_to_write(conn, thread_opt, frame_index, value_str, &f.signature).await?;
     if !tag_compatible(sig_byte, value.tag) {
         return Err(type_mismatch_err(field_name, &f.signature, &value));
     }
@@ -3359,8 +3770,11 @@ async fn apply_filter(
     })
 }
 
-/// A filter predicate with everything that does not depend on the element already resolved.
+/// A prepared filter predicate (EVAL-4): a boolean tree whose comparison leaves have their
+/// element-independent right side already resolved, so scanning re-resolves only the per-element half.
 enum Predicate {
+    Or(Vec<Self>),
+    And(Vec<Self>),
     /// `lhs OP rhs`: `lhs` is re-resolved against each element, `rhs` was resolved once.
     Compare { lhs: String, op: String, rhs: PredRhs },
     /// A boolean chain evaluated against each element.
@@ -3373,52 +3787,102 @@ enum PredRhs {
     Value(jdwp_client::types::Value),
 }
 
-/// Split a predicate and resolve its element-independent half.
+/// Parse a predicate and resolve every comparison leaf's element-independent right side **once**,
+/// before any element is read (EVAL-4 keeps the OBJ-2 optimisation, per leaf).
 ///
-/// The left side is deliberately kept as text: it is resolved *against each element*, which is what
-/// lets `orders[?status == "OPEN"]` work without an element variable.
+/// Each leaf's left side is deliberately kept as text: it is resolved *against each element*, which is
+/// what lets `orders[?status == "OPEN" && qty > 3]` work without an element variable.
 async fn prepare_predicate(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: Option<u64>,
     frame: Option<&jdwp_client::thread::Frame>,
     predicate: &str,
 ) -> Result<Predicate, String> {
-    let Some((lhs, op, rhs)) = split_comparison(predicate) else {
-        return Ok(Predicate::Bool(predicate.to_string()));
-    };
-    let rhs = match parse_lit(rhs.trim())? {
-        ArgLit::Expr(e) => PredRhs::Value(resolve_expression(conn, thread_id, frame, &e).await?),
-        lit => PredRhs::Lit(lit),
-    };
-    Ok(Predicate::Compare { lhs, op, rhs })
+    prepare_pred_tree(conn, thread_id, frame, &parse_bool_tree(predicate)).await
 }
 
-/// Evaluate a prepared predicate against one element.
+/// Recursively prepare a predicate from a parsed boolean tree. Boxed because the tree is recursive.
+fn prepare_pred_tree<'a>(
+    conn: &'a mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&'a jdwp_client::thread::Frame>,
+    tree: &'a BoolTree,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Predicate, String>> + Send + 'a>> {
+    Box::pin(async move {
+        match tree {
+            BoolTree::Or(branches) => {
+                let mut out = Vec::with_capacity(branches.len());
+                for b in branches {
+                    out.push(prepare_pred_tree(conn, thread_id, frame, b).await?);
+                }
+                Ok(Predicate::Or(out))
+            }
+            BoolTree::And(branches) => {
+                let mut out = Vec::with_capacity(branches.len());
+                for b in branches {
+                    out.push(prepare_pred_tree(conn, thread_id, frame, b).await?);
+                }
+                Ok(Predicate::And(out))
+            }
+            BoolTree::Leaf(leaf) => {
+                let Some((lhs, op, rhs)) = split_comparison(leaf) else {
+                    return Ok(Predicate::Bool(leaf.clone()));
+                };
+                let rhs = match parse_lit(rhs.trim())? {
+                    ArgLit::Expr(e) => PredRhs::Value(resolve_expression(conn, thread_id, frame, &e).await?),
+                    lit => PredRhs::Lit(lit),
+                };
+                Ok(Predicate::Compare { lhs, op, rhs })
+            }
+        }
+    })
+}
+
+/// Evaluate a prepared predicate against one element (short-circuit).
 ///
 /// Takes no frame: by this point every frame-dependent part is already a value, and the element's own
-/// fields and methods are reached through its object id, which invocation does not invalidate.
-async fn eval_predicate_on(
-    conn: &mut jdwp_client::JdwpConnection,
+/// fields and methods are reached through its object id, which invocation does not invalidate. Boxed
+/// because the predicate tree is recursive.
+fn eval_predicate_on<'a>(
+    conn: &'a mut jdwp_client::JdwpConnection,
     thread_id: Option<u64>,
-    element: &jdwp_client::types::Value,
-    pred: &Predicate,
-) -> Result<bool, String> {
-    match pred {
-        Predicate::Compare { lhs, op, rhs } => {
-            let lv = resolve_relative(conn, thread_id, None, element, lhs).await?;
-            match rhs {
-                PredRhs::Value(rv) => compare_resolved(conn, &lv, op, rv).await,
-                PredRhs::Lit(lit) => compare_values(conn, &lv, op, lit).await,
+    element: &'a jdwp_client::types::Value,
+    pred: &'a Predicate,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>> {
+    Box::pin(async move {
+        match pred {
+            Predicate::Or(branches) => {
+                for p in branches {
+                    if eval_predicate_on(conn, thread_id, element, p).await? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Predicate::And(branches) => {
+                for p in branches {
+                    if !eval_predicate_on(conn, thread_id, element, p).await? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Predicate::Compare { lhs, op, rhs } => {
+                let lv = resolve_relative(conn, thread_id, None, element, lhs).await?;
+                match rhs {
+                    PredRhs::Value(rv) => compare_resolved(conn, &lv, op, rv).await,
+                    PredRhs::Lit(lit) => compare_values(conn, &lv, op, lit).await,
+                }
+            }
+            Predicate::Bool(expr) => {
+                let v = resolve_relative(conn, thread_id, None, element, expr).await?;
+                match v.data {
+                    jdwp_client::types::ValueData::Boolean(b) => Ok(b),
+                    _ => Err(format!("Predicate '{expr}' did not evaluate to a boolean")),
+                }
             }
         }
-        Predicate::Bool(expr) => {
-            let v = resolve_relative(conn, thread_id, None, element, expr).await?;
-            match v.data {
-                jdwp_client::types::ValueData::Boolean(b) => Ok(b),
-                _ => Err(format!("Predicate '{expr}' did not evaluate to a boolean")),
-            }
-        }
-    }
+    })
 }
 
 /// Resolve a chain (`status`, `customer.name`, `getTotal()`) starting from `base` rather than from a
@@ -4546,6 +5010,76 @@ async fn literal_to_value(
     })
 }
 
+/// Resolve the value a `set_value` write should store (SETF-2): a literal coerced to `declared_sig`
+/// (the existing path), OR a live expression whose value is copied by reference.
+///
+/// An expression's runtime type is validated against the target's declared reference type — the
+/// EVAL-3 assignability check, interfaces included — and a mismatch is refused, because a reference
+/// store is exactly what the JVM does NOT type-check for you (see the EVAL-3 SIGSEGV note): writing a
+/// value of the wrong type would corrupt the field silently. Primitive targets defer to the caller's
+/// existing `tag_compatible` guard.
+async fn value_to_write(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_opt: Option<u64>,
+    frame_index: usize,
+    value_str: &str,
+    declared_sig: &str,
+) -> Result<jdwp_client::types::Value, String> {
+    let sig_byte = declared_sig.as_bytes().first().copied().unwrap_or(b'L');
+    match parse_lit(value_str.trim())? {
+        ArgLit::Expr(e) => {
+            let tid = thread_opt.ok_or_else(|| format!(
+                "Copying the live value '{e}' needs a suspended thread — pause one or hit a breakpoint first"
+            ))?;
+            let frame = conn.get_frames(tid, 0, -1).await.ok()
+                .and_then(|f| f.get(frame_index).cloned().or_else(|| f.first().cloned()));
+            let v = resolve_expression(conn, Some(tid), frame.as_ref(), &e).await?;
+            validate_ref_assignable(conn, declared_sig, &v).await?;
+            Ok(v)
+        }
+        _ => literal_to_value(conn, value_str, sig_byte).await,
+    }
+}
+
+/// Refuse an expression-sourced write whose runtime type isn't assignable to a reference target
+/// (SETF-2). A primitive target returns `Ok` and leaves the check to the caller's `tag_compatible`;
+/// `null` fits any reference; an array target accepts any array; otherwise the source's runtime type
+/// must be the target type, a subtype, or an implementer (`implements_interface` answers all three).
+async fn validate_ref_assignable(
+    conn: &mut jdwp_client::JdwpConnection,
+    declared_sig: &str,
+    v: &jdwp_client::types::Value,
+) -> Result<(), String> {
+    if !(declared_sig.starts_with('L') || declared_sig.starts_with('[')) {
+        return Ok(()); // primitive target — the caller's tag_compatible guard applies
+    }
+    match v.data {
+        jdwp_client::types::ValueData::Object(0) => Ok(()), // null fits any reference
+        jdwp_client::types::ValueData::Object(id) => {
+            let rt = conn.get_object_reference_type(id).await
+                .map_err(|e| format!("Failed to resolve the source value's type: {e}"))?;
+            let ok = if declared_sig.starts_with('[') {
+                conn.get_signature(rt).await.map(|s| s.starts_with('[')).unwrap_or(false)
+            } else {
+                conn.implements_interface(rt, declared_sig).await.unwrap_or(false)
+            };
+            if ok {
+                Ok(())
+            } else {
+                let actual = decode_signature(&conn.get_signature(rt).await.unwrap_or_default());
+                Err(format!(
+                    "Type mismatch: the source is {actual}, but the target is {} — a reference of the wrong type is refused, because the JVM would not catch it.",
+                    decode_signature(declared_sig)
+                ))
+            }
+        }
+        _ => Err(format!(
+            "The target is {} (a reference), but the source resolved to a primitive.",
+            decode_signature(declared_sig)
+        )),
+    }
+}
+
 // ----- event / thread / location helpers -----
 
 fn event_location(d: &EventKind) -> Option<(u64, Location)> {
@@ -4815,6 +5349,91 @@ async fn evaluate_condition_on_thread(
     eval_condition(conn, thread_id, &frame, condition).await.unwrap_or(true)
 }
 
+/// Split a boolean expression on a doubled operator (`&&` or `||`, given `op` = `'&'` or `'|'`) at
+/// bracket/paren/quote depth 0 (EVAL-4). Returns the whole string as one part when the operator is
+/// absent, so a plain comparison flows through unchanged.
+fn split_bool(s: &str, op: char) -> Vec<String> {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut last = 0usize;
+    let mut k = 0usize;
+    while let Some(&(i, c)) = chars.get(k) {
+        match c {
+            '"' => in_str = !in_str,
+            '(' | '[' if !in_str => depth += 1,
+            ')' | ']' if !in_str => depth -= 1,
+            _ if !in_str && depth == 0 && c == op && chars.get(k + 1).is_some_and(|n| n.1 == op) => {
+                parts.push(s.get(last..i).unwrap_or("").trim().to_string());
+                last = chars.get(k + 1).map_or(i, |n| n.0) + op.len_utf8();
+                k += 2;
+                continue;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    parts.push(s.get(last..).unwrap_or("").trim().to_string());
+    parts
+}
+
+/// A parsed boolean expression (EVAL-4): a tree of `||`/`&&` over comparison/bool leaf strings.
+enum BoolTree {
+    Or(Vec<Self>),
+    And(Vec<Self>),
+    Leaf(String),
+}
+
+/// Parse a boolean expression into a [`BoolTree`]: `||` is lowest precedence and `&&` binds tighter,
+/// so `a || b && c` parses as `a || (b && c)` — documented and tested — and parentheses regroup, so
+/// `(a || b) && c` nests the other way. Recursive, so a parenthesised sub-expression is parsed in full.
+fn parse_bool_tree(s: &str) -> BoolTree {
+    let s = strip_enclosing_parens(s.trim());
+    let ors = split_bool(s, '|');
+    if ors.len() > 1 {
+        return BoolTree::Or(ors.iter().map(|p| parse_bool_tree(p)).collect());
+    }
+    let ands = split_bool(s, '&');
+    if ands.len() > 1 {
+        return BoolTree::And(ands.iter().map(|p| parse_bool_tree(p)).collect());
+    }
+    BoolTree::Leaf(s.to_string())
+}
+
+/// Whether `s` is wholly wrapped in one matching pair of parens, so they can be stripped before
+/// splitting a comparison inside them (`(total > 100)`).
+fn parens_enclose(s: &str) -> bool {
+    if !(s.starts_with('(') && s.ends_with(')')) {
+        return false;
+    }
+    let mut depth = 0i32;
+    let mut in_str = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => in_str = !in_str,
+            '(' if !in_str => depth += 1,
+            ')' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    return i == s.len() - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Strip any layers of fully-enclosing parens from a boolean leaf, so `((a == b))` splits like `a == b`.
+fn strip_enclosing_parens(s: &str) -> &str {
+    let mut t = s.trim();
+    while parens_enclose(t) {
+        t = t[1..t.len() - 1].trim();
+    }
+    t
+}
+
 /// Split a condition into `left OP right` at the top level (outside parens/quotes).
 fn split_comparison(cond: &str) -> Option<(String, String, String)> {
     let ops = ["==", "!=", "<=", ">=", "<", ">"];
@@ -4848,7 +5467,50 @@ async fn eval_condition(
     frame: &jdwp_client::thread::Frame,
     condition: &str,
 ) -> Result<bool, String> {
-    if let Some((lhs, op, rhs)) = split_comparison(condition) {
+    eval_bool_tree_on_frame(conn, thread_id, frame, &parse_bool_tree(condition)).await
+}
+
+/// Evaluate a boolean tree against a frame, short-circuiting (EVAL-4): `||` stops at the first true
+/// branch, `&&` at the first false — so a later, possibly more expensive clause isn't resolved unless
+/// it's actually needed. Boxed because the tree is recursive.
+fn eval_bool_tree_on_frame<'a>(
+    conn: &'a mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    frame: &'a jdwp_client::thread::Frame,
+    tree: &'a BoolTree,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>> {
+    Box::pin(async move {
+        match tree {
+            BoolTree::Or(branches) => {
+                for b in branches {
+                    if eval_bool_tree_on_frame(conn, thread_id, frame, b).await? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            BoolTree::And(branches) => {
+                for b in branches {
+                    if !eval_bool_tree_on_frame(conn, thread_id, frame, b).await? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            BoolTree::Leaf(leaf) => eval_condition_leaf(conn, thread_id, frame, leaf).await,
+        }
+    })
+}
+
+/// Evaluate one leaf of a condition (a comparison or a boolean expression) on a frame — the original
+/// single-clause condition logic, now a leaf so `&&`/`||` can compose several (EVAL-4).
+async fn eval_condition_leaf(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    frame: &jdwp_client::thread::Frame,
+    leaf: &str,
+) -> Result<bool, String> {
+    if let Some((lhs, op, rhs)) = split_comparison(leaf) {
         let lv = resolve_expression(conn, Some(thread_id), Some(frame), &lhs).await?;
         // A non-literal right-hand side (`other.id`, `this.limit`) is resolved in the same frame and
         // compared value-to-value; literals keep their existing coercion path.
@@ -4860,7 +5522,7 @@ async fn eval_condition(
             rlit => compare_values(conn, &lv, &op, &rlit).await,
         }
     } else {
-        let v = resolve_expression(conn, Some(thread_id), Some(frame), condition).await?;
+        let v = resolve_expression(conn, Some(thread_id), Some(frame), leaf).await?;
         match v.data {
             jdwp_client::types::ValueData::Boolean(b) => Ok(b),
             _ => Err("Condition did not evaluate to a boolean".to_string()),
@@ -5020,5 +5682,91 @@ async fn compare_object(
             }
         }
         _ => Err("Unsupported comparison (numbers, booleans, null, or String value compares only)".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Render a parsed boolean tree as a flat string so precedence/grouping can be asserted.
+    fn shape(t: &BoolTree) -> String {
+        match t {
+            BoolTree::Or(v) => format!("OR({})", v.iter().map(shape).collect::<Vec<_>>().join(", ")),
+            BoolTree::And(v) => format!("AND({})", v.iter().map(shape).collect::<Vec<_>>().join(", ")),
+            BoolTree::Leaf(s) => s.clone(),
+        }
+    }
+
+    // EVAL-4: `||` is lower precedence than `&&`, so `a || b && c` is `a || (b && c)`.
+    #[test]
+    fn boolean_precedence_puts_and_below_or() {
+        assert_eq!(shape(&parse_bool_tree("a == 1 && b == 2")), "AND(a == 1, b == 2)");
+        assert_eq!(shape(&parse_bool_tree("a == 1 || b == 2")), "OR(a == 1, b == 2)");
+        assert_eq!(
+            shape(&parse_bool_tree("a == 1 || b == 2 && c == 3")),
+            "OR(a == 1, AND(b == 2, c == 3))"
+        );
+    }
+
+    // Parentheses regroup, overriding the default precedence.
+    #[test]
+    fn parentheses_regroup_a_boolean_expression() {
+        assert_eq!(
+            shape(&parse_bool_tree("(a == 1 || b == 2) && c == 3")),
+            "AND(OR(a == 1, b == 2), c == 3)"
+        );
+        // A wholly-enclosed expression is unwrapped, not treated as a leaf.
+        assert_eq!(shape(&parse_bool_tree("((a == 1))")), "a == 1");
+    }
+
+    // A splitter must ignore operators inside strings, parens and brackets.
+    #[test]
+    fn boolean_split_respects_quotes_and_brackets() {
+        // The `||` lives inside a string literal, so it is not a top-level operator.
+        assert_eq!(shape(&parse_bool_tree("name == \"a || b\"")), "name == \"a || b\"");
+        // The `&&` is inside a subscript predicate, so the outer split leaves it alone.
+        assert_eq!(shape(&parse_bool_tree("tags[?x && y] == 1")), "tags[?x && y] == 1");
+    }
+
+    // A plain comparison is a single leaf — the common case is unchanged by EVAL-4.
+    #[test]
+    fn a_plain_comparison_is_one_leaf() {
+        assert_eq!(shape(&parse_bool_tree("qty > 3")), "qty > 3");
+    }
+
+    // SAFE-3: an expression that calls a method is detected (so read-only can refuse it), and a `(`
+    // inside a string literal is not mistaken for a call.
+    #[test]
+    fn expr_invokes_detects_method_calls_only() {
+        assert!(expr_invokes("order.getQty()"));
+        assert!(expr_invokes("a.b(c)"));
+        assert!(!expr_invokes("order.status"));
+        assert!(!expr_invokes("order.lines[0].sku"));
+        assert!(!expr_invokes("name == \"(not a call)\""));
+    }
+
+    // TRACE-3: the budget defaults to 200 when tracing, `0` means unbounded, and a non-trace stop
+    // point is always unbounded (it suspends, so it can't flood).
+    #[test]
+    fn trace_budget_defaults_and_zero_means_unbounded() {
+        assert_eq!(trace_budget_for(true, None), Some(DEFAULT_TRACE_BUDGET));
+        assert_eq!(trace_budget_for(true, Some(5)), Some(5));
+        assert_eq!(trace_budget_for(true, Some(0)), None);
+        assert_eq!(trace_budget_for(false, Some(5)), None);
+    }
+
+    // SAFE-3: JDWP_READONLY parsing accepts the common truthy spellings and nothing else.
+    #[test]
+    fn env_readonly_parsing() {
+        for v in ["1", "true", "TRUE", "yes", " Yes "] {
+            std::env::set_var("JDWP_READONLY", v);
+            assert!(env_readonly(), "{v:?} should be truthy");
+        }
+        for v in ["0", "false", "no", ""] {
+            std::env::set_var("JDWP_READONLY", v);
+            assert!(!env_readonly(), "{v:?} should be falsey");
+        }
+        std::env::remove_var("JDWP_READONLY");
     }
 }

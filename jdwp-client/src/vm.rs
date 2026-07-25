@@ -97,6 +97,28 @@ impl JdwpConnection {
         })
     }
 
+    /// Dispose of the debugger connection (VirtualMachine.Dispose command).
+    ///
+    /// The JVM's own clean exit from a debug session: it clears **every** event request this
+    /// connection set and resumes **every** thread it suspended, then invalidates the connection.
+    /// That "resume everything, leave no request armed" guarantee is exactly what a safe disconnect
+    /// needs — a `resume_all` alone would leave breakpoints armed to re-freeze the next request, and
+    /// clearing our tracked requests one by one could still miss one the JVM knows about and we don't.
+    ///
+    /// The connection is unusable afterwards; drop it. Fire-and-forget by design: if the socket is
+    /// already half-dead (the case a disconnect most needs to handle), there is nothing better to do
+    /// than try and move on.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn dispose(&mut self) -> JdwpResult<()> {
+        let id = self.next_id();
+        let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::DISPOSE);
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+        Ok(())
+    }
+
     /// Find classes by signature (VirtualMachine.ClassesBySignature command)
     /// Signature format: "Lcom/example/MyClass;" for classes
     ///

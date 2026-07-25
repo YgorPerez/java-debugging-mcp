@@ -264,7 +264,17 @@ impl Server {
     /// Spawn the server binary Cargo just built for this test run (so it can never be a stale
     /// binary, which is the trap the example-based harnesses had) and complete `initialize`.
     pub fn start() -> Result<Self, String> {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_jdwp-mcp"))
+        Self::start_with_env(&[])
+    }
+
+    /// Like [`start`](Self::start), but with extra environment variables set on the server process —
+    /// e.g. `JDWP_WATCHDOG_SECS=1` for the watchdog tests or `JDWP_READONLY=1` for read-only mode.
+    pub fn start_with_env(env: &[(&str, &str)]) -> Result<Self, String> {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_jdwp-mcp"));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

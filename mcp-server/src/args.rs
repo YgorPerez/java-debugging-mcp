@@ -45,6 +45,13 @@ pub struct AttachArgs {
     /// JDWP port (e.g. 5005 or 8787).
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Open the session read-only: method invocation, `set_value` and `force_return` are refused, so
+    /// pointing at a production JVM can't accidentally mutate it. Reads (locals, fields, statics,
+    /// arrays, `get_stack`, watchpoint/exception reporting) still work; collection expansion and
+    /// `toString()` rendering fall back to shallow, because they invoke methods in the debuggee. A
+    /// guard against accident, NOT a security boundary. Also forced on by the `JDWP_READONLY` env var.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// Arguments for `debug.set_breakpoint`.
@@ -81,8 +88,23 @@ pub struct SetBreakpointArgs {
     /// the snapshot (e.g. `reserva.getStatus()`).
     #[serde(default)]
     pub trace_expr: Option<String>,
+    /// Only with `trace:true` — disarm this logpoint automatically after recording this many hits, so
+    /// a hot line can't flood the debuggee (defaults to 200). Pass 0 for no limit.
+    #[serde(default)]
+    pub trace_max_hits: Option<u32>,
     // NOTE: `session_id` is a cross-cutting argument handled uniformly by `resolve_session`
     // (from the raw arguments) for every tool, so it is intentionally not a typed field here.
+}
+
+/// Arguments for `debug.toggle_breakpoint` (BP-1).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ToggleBreakpointArgs {
+    /// Breakpoint ID (`bp_…`) from `debug.list_breakpoints`.
+    pub breakpoint_id: String,
+    /// Desired state: `false` clears the JDWP request but keeps the definition (`condition`,
+    /// `trace_expr`) so it can be re-armed later; `true` re-arms it. Omit to flip the current state.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// Arguments for `debug.get_traces`.
@@ -94,6 +116,17 @@ pub struct GetTracesArgs {
     /// Clear the trace buffer after returning it.
     #[serde(default)]
     pub clear: bool,
+    /// Only snapshots from this stop point id (`bp_…` / `exc_…` / `watch_…`) — read "the throws from
+    /// `exc_4`" without eyeballing everything (TRACE-4).
+    #[serde(default)]
+    pub bp_id: Option<String>,
+    /// Only snapshots whose class contains this substring (case-insensitive).
+    #[serde(default)]
+    pub class_filter: Option<String>,
+    /// Only snapshots newer than this sequence number, so a poller can ask for just what's new since
+    /// its last read (the `#seq` shown on each record).
+    #[serde(default)]
+    pub since: Option<u64>,
 }
 
 /// Arguments for `debug.get_last_event`.
@@ -254,6 +287,15 @@ pub struct SetExceptionBreakpointArgs {
     /// the snapshot (e.g. `this.getStatus()`).
     #[serde(default)]
     pub trace_expr: Option<String>,
+    /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit),
+    /// so a hot throw site can't flood the debuggee (TRACE-3).
+    #[serde(default)]
+    pub trace_max_hits: Option<u32>,
+    /// Only report throws on this thread (hex id, e.g. `0x2a`). On a busy app server with hundreds of
+    /// threads, restricting to your request thread is the single biggest noise reduction — get the id
+    /// from `debug.list_threads {name_filter}` first, then arm, then trigger (FILT-1).
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 /// Arguments for `debug.set_watchpoint`.
@@ -281,6 +323,15 @@ pub struct SetWatchpointArgs {
     /// the snapshot.
     #[serde(default)]
     pub trace_expr: Option<String>,
+    /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit),
+    /// so a hot field can't flood the debuggee (TRACE-3).
+    #[serde(default)]
+    pub trace_max_hits: Option<u32>,
+    /// Only report touches from this thread (hex id, e.g. `0x2a`). On a busy app server, restricting
+    /// to your request thread is the single biggest noise reduction — get the id from
+    /// `debug.list_threads {name_filter}` first, then arm, then trigger (FILT-1).
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 /// Arguments for `debug.force_return`.
@@ -316,6 +367,7 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(ForceReturnArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(GetTracesArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(GetLastEventArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(ToggleBreakpointArgs)).unwrap(),
         ];
         for s in schemas {
             assert_eq!(s.get("type").and_then(|t| t.as_str()), Some("object"));

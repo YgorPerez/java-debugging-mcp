@@ -317,13 +317,98 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## Backlog
 
+**Empty.** The third review's ten items — the "shared-JVM safety was the least-finished part" batch —
+have all shipped. Each is recorded in **✅ Shipped (context)** above with a `path`/test citation, and
+each ships with an automated test (unit for the pure logic, MCP-level integration for the runtime
+behaviour) driven against a real probe JVM the way `docs/agents/domain.md` and the house pattern
+require. The former backlog entries are preserved below, collapsed, as the record of what was asked for
+versus what was built.
+
 Priority key: **P1** = highest payoff for the infotravel/integraWS investigations (shared 8180 +
 silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
 
-> The first ten items shipped, then a review of that work produced ten more, which also shipped
-> (TRACE-2, OBJ-3, EVT-1, SESS-1, EVAL-3, OBJ-4, PERF-1, TEST-2, DOC-2, TEST-3). The items below came out
-> of a second review, and they share a theme worth stating plainly: **the parts meant to keep a shared
-> JVM safe are the least finished parts.** Each was verified against the code, not suspected.
+> The first ten items shipped, then a review produced ten more (TRACE-2, OBJ-3, EVT-1, SESS-1, EVAL-3,
+> OBJ-4, PERF-1, TEST-2, DOC-2, TEST-3), which also shipped. A **third** review produced the ten below —
+> and they shared a theme worth stating plainly: **the parts meant to keep a shared JVM safe were the
+> least finished parts.** All ten have now shipped too; the theme is closed.
+
+### ✅ SAFE-1 — `debug.disconnect` no longer leaves the JVM frozen  · P1 · S
+
+`handle_disconnect` now resumes the VM and clears every event request **before** dropping the session,
+via the new `JdwpConnection::dispose()` (VirtualMachine.Dispose, cmd set 1 cmd 6) — the JVM's own
+"resume all, clear all" — with a fallback to `clear_all_breakpoints` + `resume_all` on a half-dead
+socket. The reply says what it resumed/cleared and whether the VM had been suspended. Validated by
+`disconnect_resumes_and_clears_instead_of_freezing` (watchdog disabled, so only the disconnect can
+rescue the VM; the probe's own ticks resuming is the proof).
+
+### ✅ SAFE-2 — the watchdog disarms the offending stop point  · P1 · S
+
+On timeout the watchdog now identifies the request that suspended the VM (the newest buffered event's
+`request_id`), disarms **only** that stop point (`disarm_request`, `handlers.rs`), and records a note
+surfaced in `list_breakpoints` and the next `get_last_event` — so the cycle is no longer freeze → 120s →
+resume → freeze again. Unrelated stop points survive. Validated by
+`watchdog_auto_resumes_and_disarms_the_offending_breakpoint`.
+
+### ✅ TEST-4 — the watchdog has tests  · P1 · S
+
+Three MCP-level tests with `JDWP_WATCHDOG_SECS=1`/`0`: auto-resume proven by the probe's own output
+(`watchdog_auto_resumes_and_disarms_the_offending_breakpoint`), `=0` disables it
+(`watchdog_zero_disables_the_auto_resume`), and a pending single-step is cleared by the resume
+(`watchdog_clears_a_pending_single_step`).
+
+### ✅ TRACE-3 — a traced hot stop point can't flood the debuggee  · P1 · M
+
+Every traced stop point carries a hit budget (`trace_max_hits`, default 200; `0` = unbounded). Each
+recorded hit decrements it (`charge_trace_budget`), and on reaching zero the request disarms itself and
+`get_traces` says so — silence never reads as "no hits". `list_breakpoints` shows the remaining budget.
+(Server-side counting rather than JDWP's `Count` modifier, because `Count` reports only the *Nth*
+occurrence, not the first N.) Validated by `trace_budget_disarms_and_get_traces_filters`.
+
+### ✅ FILT-1 — thread filter on exception breakpoints and watchpoints  · P1 · M
+
+`set_exception_request_ex` / `set_field_watch_ex` accept an optional `ThreadOnly` (modKind 3) modifier;
+`set_exception_breakpoint` and `set_watchpoint` take a `thread_id`, honoured by the JVM and composing
+with `trace:true`. The tool descriptions document the `list_threads {name_filter}` → arm → trigger flow.
+Validated by `thread_filter_reports_only_the_chosen_thread` (a two-thread probe; only the filtered
+thread's throws are recorded, and the other keeps running).
+
+### ✅ EVAL-4 — `&&` / `||` in conditions and predicates  · P2 · M
+
+Both breakpoint conditions and `[?…]` predicates parse into a boolean tree (`parse_bool_tree`) with `||`
+lower precedence than `&&`, parentheses regrouping, and short-circuit evaluation; the OBJ-2
+"resolve the element-independent side once" optimisation is kept per leaf. Validated by
+`boolean_operators_in_predicates_and_conditions` (incl. an `a || b && c` precedence case and a
+parenthesised regroup) and unit tests for the parser.
+
+### ✅ BP-1 — `debug.toggle_breakpoint` implements `enabled`  · P2 · S
+
+`enabled` is now real: disabling clears the JDWP request but keeps the definition (condition, trace_expr,
+resolved location in a `BreakpointArm`), and enabling re-arms at the same place. `list_breakpoints` marks
+a disabled breakpoint. Validated by `toggle_breakpoint_disables_and_rearms`.
+
+### ✅ TRACE-4 — `get_traces` can be filtered  · P2 · S
+
+`get_traces` gained `bp_id`, `class_filter`, and `since` (sequence number, for polling); the header still
+reports total vs shown. Validated by `trace_budget_disarms_and_get_traces_filters`.
+
+### ✅ SETF-2 — `set_value` writes expressions, not just literals  · P2 · M
+
+`value_to_write` resolves an expression right-hand side (`this.a = other.b`) and validates its runtime
+type against the target's declared type (the EVAL-3 `implements_interface` assignability check, interfaces
+included); a mismatch is refused, naming both types. Literals are unchanged. Validated by
+`set_value_copies_a_live_reference_and_refuses_a_mismatch`.
+
+### ✅ SAFE-3 — read-only mode  · P2 · S
+
+`JDWP_READONLY=1` (or `read_only:true` on `attach`) refuses `set_value`, `force_return`, and method
+invocation in `evaluate`; reads that need no invocation still work, and `expand_objects` falls back to
+shallow with a note. `list_sessions` flags read-only sessions. Documented as a guard against accident,
+not a security boundary. Validated by `read_only_refuses_mutation_but_allows_reads`.
+
+---
+
+<details>
+<summary>Original third-review backlog entries (all shipped — kept as the record of ask vs. build)</summary>
 
 ### SAFE-1 — `debug.disconnect` can leave the JVM frozen forever  · P1 · S
 
@@ -551,6 +636,8 @@ in the refusal rather than pretending nothing is lost.
 
 **Blocked by**
 None.
+
+</details>
 
 ---
 

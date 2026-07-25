@@ -1235,6 +1235,530 @@ fn packets_sent(server: &mut Server) -> u32 {
         .unwrap_or_else(|| panic!("unparseable packet count in: {line}"))
 }
 
+/// Grab the first token starting with `prefix` (an id like `bp_5`, `watch_modify_2`, `exc_7`) out of a
+/// tool reply — the token runs until the first character that isn't alphanumeric or `_`.
+fn grab_token(text: &str, prefix: &str) -> Option<String> {
+    let at = text.find(prefix)?;
+    let rest = &text[at..];
+    let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// The hex thread id (`0x…`) of the first thread whose name contains `name_substr`, via `list_threads`.
+fn thread_hex_for(server: &mut Server, name_substr: &str) -> Option<String> {
+    let listed = server.call("debug.list_threads", serde_json::json!({"name_filter": name_substr}));
+    listed.lines().find_map(|l| {
+        let t = l.trim();
+        t.starts_with("0x").then(|| t.split_whitespace().next().map(str::to_string)).flatten()
+    })
+}
+
+/// Count the trace records (lines beginning with `#`) in a `debug.get_traces` reply.
+fn count_trace_records(traces: &str) -> usize {
+    traces.lines().filter(|l| l.trim_start().starts_with('#')).count()
+}
+
+/// TEST-4 + SAFE-2: the watchdog is the project's primary safety mechanism and had no coverage. With
+/// `JDWP_WATCHDOG_SECS=1`, a breakpoint that leaves the VM suspended must be auto-resumed — proven by
+/// the probe's OWN output starting to advance again — and the offending breakpoint disarmed, so it
+/// doesn't just re-freeze on the next hit.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn watchdog_auto_resumes_and_disarms_the_offending_breakpoint() {
+    let Some(jdk) = jdk_or_skip("watchdog_auto_resumes_and_disarms_the_offending_breakpoint") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "1")]).expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    // A plain (suspending) breakpoint on the only writer of `counter`: on hit it freezes the whole VM,
+    // so the probe stops ticking — exactly the forgotten-breakpoint hazard the watchdog exists for.
+    let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
+    server.call("debug.set_breakpoint", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in bumpCounter never fired");
+    let frozen_at = highest_tick(&probe).expect("no tick before suspension");
+
+    // The watchdog must resume the VM AND disarm the breakpoint. The debuggee's own tick line is the
+    // only thing that proves it really resumed (the debugger would report success either way), and a
+    // tick well past the freeze point proves it didn't just re-freeze on the next bump.
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 3))
+            .is_some(),
+        "probe never resumed ticking after the watchdog window — it was left frozen\n  output: {:?}",
+        probe.output(),
+    );
+
+    // The disarm is discoverable, in list_breakpoints and in the next get_last_event.
+    let listed = server.call("debug.list_breakpoints", serde_json::json!({}));
+    assert_contains_all("watchdog action is surfaced", &listed, &["watchdog auto-resumed", "disarmed"]);
+    assert!(
+        server.last_event().contains("[watchdog]"),
+        "get_last_event should carry the watchdog note so a returning caller sees the VM was rescued"
+    );
+
+    server.panic_reset();
+}
+
+/// TEST-4: `JDWP_WATCHDOG_SECS=0` disables the watchdog — documented behaviour that was unverified.
+/// A suspended VM must stay suspended (the probe stops ticking and stays stopped).
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn watchdog_zero_disables_the_auto_resume() {
+    let Some(jdk) = jdk_or_skip("watchdog_zero_disables_the_auto_resume") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
+    server.call("debug.set_breakpoint", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in bumpCounter never fired");
+
+    let frozen_at = highest_tick(&probe).expect("no tick before suspension");
+    // Far longer than the disabled watchdog's old default poll — if it were going to resume, it would
+    // have by now. The VM must still be frozen.
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let still = highest_tick(&probe).expect("no tick reading");
+    assert_eq!(
+        still, frozen_at,
+        "watchdog=0 must not auto-resume, but the probe advanced from {frozen_at} to {still}"
+    );
+
+    server.panic_reset(); // unfreeze the VM ourselves, since the watchdog won't
+}
+
+/// TEST-4: the watchdog's resume must clear a pending single-step, or the resume re-fires the step and
+/// re-suspends. With only a step armed (the breakpoint cleared), the probe running freely afterwards
+/// proves the step was cleared.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn watchdog_clears_a_pending_single_step() {
+    let Some(jdk) = jdk_or_skip("watchdog_clears_a_pending_single_step") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "1")]).expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
+    let set = server.call("debug.set_breakpoint", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
+    let bp_id = grab_token(&set, "bp_").expect("no bp id in set reply");
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint never fired");
+
+    // Arm a step (sets pending_step), then clear the breakpoint so ONLY the step remains as the reason
+    // the VM is suspended. Now the watchdog's step-clearing is the only thing that can free the probe.
+    server.call("debug.step_over", serde_json::json!({}));
+    server.call("debug.clear_breakpoint", serde_json::json!({"breakpoint_id": bp_id}));
+    let frozen_at = highest_tick(&probe).unwrap_or(0);
+
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 2))
+            .is_some(),
+        "probe never resumed — the watchdog did not clear the pending step\n  output: {:?}",
+        probe.output(),
+    );
+
+    server.panic_reset();
+}
+
+/// SAFE-1: `debug.disconnect` must leave the JVM RUNNING with nothing armed. A bare disconnect used to
+/// drop the session (and its watchdog) without resuming, freezing a VM suspended at a breakpoint
+/// forever. Proven, per the TRACE-2 pattern, by the probe's own output resuming after the disconnect.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn disconnect_resumes_and_clears_instead_of_freezing() {
+    let Some(jdk) = jdk_or_skip("disconnect_resumes_and_clears_instead_of_freezing") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    // Watchdog disabled, so ONLY the disconnect can rescue the VM — otherwise the watchdog could be
+    // what resumes it and the test would pass without disconnect doing its job.
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    let attach = server.attach(probe.port);
+    let sid = session_id_from(&attach).expect("no session id");
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
+    server.call("debug.set_breakpoint", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint never fired");
+    let frozen_at = highest_tick(&probe).expect("no tick before suspension");
+
+    let bye = server.call("debug.disconnect", serde_json::json!({"session_id": sid}));
+    assert_contains_all(
+        "disconnect reports it left the VM safe",
+        &bye,
+        &["Disconnected", "resumed all threads"],
+    );
+
+    // The debuggee's own ticks resuming is the only proof the VM was actually left running.
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 3))
+            .is_some(),
+        "probe never resumed after disconnect — the VM was left frozen\n  output: {:?}",
+        probe.output(),
+    );
+}
+
+/// TRACE-3 + TRACE-4: a traced stop point disarms itself after its hit budget, so a hot field can't
+/// flood the debuggee; get_traces says it stopped and why; and its output can be filtered by id,
+/// `since`, and class.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn trace_budget_disarms_and_get_traces_filters() {
+    let Some(jdk) = jdk_or_skip("trace_budget_disarms_and_get_traces_filters") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    let set = server.call(
+        "debug.set_watchpoint",
+        serde_json::json!({"class_name": "WatchProbe", "field_name": "counter", "trace": true, "trace_max_hits": 3}),
+    );
+    assert_contains_all("budget is reported", &set, &["Auto-disarms after 3"]);
+    let watch_id = grab_token(&set, "watch_modify_").expect("no watch id");
+
+    // Poll until it disarms itself. `counter` is bumped every tick, so it reaches 3 quickly.
+    let mut traces = String::new();
+    for _ in 0..50 {
+        traces = server.call("debug.get_traces", serde_json::json!({}));
+        if traces.contains("stopped recording") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    assert_contains_all(
+        "the disarm is announced, so silence isn't read as 'no hits'",
+        &traces,
+        &["stopped recording", "trace-hit budget"],
+    );
+
+    // Exactly the budget was recorded — not more (it kept flooding), not fewer (it stopped early).
+    let by_id = server.call("debug.get_traces", serde_json::json!({"bp_id": watch_id}));
+    assert_eq!(
+        count_trace_records(&by_id), 3,
+        "a budget of 3 must record exactly 3, filtered to this stop point:\n{by_id}"
+    );
+
+    // `since` returns only newer records — a poller asking "what's new since seq 2" gets just #3.
+    let since2 = server.call("debug.get_traces", serde_json::json!({"since": 2}));
+    assert!(since2.contains("#3") && !since2.contains("#1"), "since:2 should show only #3:\n{since2}");
+    // class_filter narrows by class substring.
+    let by_class = server.call("debug.get_traces", serde_json::json!({"class_filter": "WatchProbe"}));
+    assert_eq!(count_trace_records(&by_class), 3, "all 3 records are in WatchProbe:\n{by_class}");
+    let none = server.call("debug.get_traces", serde_json::json!({"class_filter": "NoSuchClass"}));
+    assert_eq!(count_trace_records(&none), 0, "a non-matching class_filter shows nothing:\n{none}");
+
+    // The watch disarmed itself, so it is gone from the listing…
+    let listed = server.call("debug.list_breakpoints", serde_json::json!({}));
+    assert!(!listed.contains(&watch_id), "a self-disarmed watch must not still be listed:\n{listed}");
+    // …and the probe keeps running (it never suspended, and now records nothing either).
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 4)).is_some(),
+        "probe stopped ticking after a budgeted trace watch"
+    );
+
+    server.panic_reset();
+}
+
+/// FILT-1: a thread-filtered exception breakpoint reports throws from only the chosen thread, and the
+/// other thread keeps running — proving the filter, and that it composes with trace mode.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn thread_filter_reports_only_the_chosen_thread() {
+    let Some(jdk) = jdk_or_skip("thread_filter_reports_only_the_chosen_thread") else { return };
+    let probe = Probe::launch(&jdk, "ThreadProbe").expect("launch ThreadProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // Both threads must be running (so both are throwing, and the exception class is loaded) before we
+    // can read their ids or arm a filter.
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("alpha throw")).expect("alpha never threw");
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("beta throw")).expect("beta never threw");
+
+    let alpha = thread_hex_for(&mut server, "alpha-worker").expect("no alpha-worker thread");
+    let beta = thread_hex_for(&mut server, "beta-worker").expect("no beta-worker thread");
+    assert_ne!(alpha, beta, "the two workers must have distinct ids");
+
+    let set = server.call(
+        "debug.set_exception_breakpoint",
+        serde_json::json!({
+            "class_pattern": "ThreadProbe$FilterException", "caught": true, "uncaught": false,
+            "trace": true, "thread_id": alpha,
+        }),
+    );
+    assert_contains_all("filter + trace are reported", &set, &["Thread filter", "trace (non-suspending)"]);
+
+    // Collect a handful of throws.
+    let mut traces = String::new();
+    for _ in 0..40 {
+        traces = server.call("debug.get_traces", serde_json::json!({}));
+        if count_trace_records(&traces) >= 3 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    assert!(count_trace_records(&traces) >= 3, "no throws were recorded at all:\n{traces}");
+
+    // Every recorded throw is on the filtered (alpha) thread; the other thread's id never appears.
+    let alpha_tag = format!("thread={alpha}");
+    let beta_tag = format!("thread={beta}");
+    for rec in traces.lines().filter(|l| l.trim_start().starts_with('#')) {
+        assert!(rec.contains(&alpha_tag), "a throw was recorded off the filtered thread: {rec}");
+        assert!(!rec.contains(&beta_tag), "the beta thread must be filtered out: {rec}");
+    }
+    // beta must never have been suspended by the filter — it keeps printing.
+    let beta_before = probe.output().iter().filter(|l| l.starts_with("beta throw")).count();
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| {
+                l.starts_with("beta throw")
+                    && l.rsplit(' ').next().and_then(|n| n.parse::<i64>().ok()).is_some_and(|n| n as usize > beta_before)
+            })
+            .is_some(),
+        "the unfiltered beta thread stopped printing — it was wrongly suspended"
+    );
+
+    server.panic_reset();
+}
+
+/// EVAL-4: `&&` / `||` in filter predicates and in breakpoint conditions, with `||` lower precedence
+/// than `&&`, short-circuiting, and a failing clause surfaced rather than silently false.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn boolean_operators_in_predicates_and_conditions() {
+    let Some(jdk) = jdk_or_skip("boolean_operators_in_predicates_and_conditions") else { return };
+    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let line = probe_line(&probe_source("DeepProbe"), "// BP1");
+    server.call("debug.set_breakpoint", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in DeepProbe.inspect never fired");
+
+    // lines: aa(1,paid) bb(5) cc(2,paid) dd(9) ee(4). `&&`: qty>3 AND unpaid -> bb, dd, ee.
+    assert_contains_all(
+        "AND predicate",
+        &server.evaluate("order.lines[?qty > 3 && paid == false]"),
+        &["3 of 5 matched", "Line(bb,5,false)", "Line(dd,9,false)", "Line(ee,4,false)"],
+    );
+    // `||`: paid OR qty>8 -> aa, cc (paid) + dd (qty 9).
+    let or = server.evaluate("order.lines[?paid == true || qty > 8]");
+    assert_contains_all("OR predicate", &or, &["3 of 5 matched", "Line(aa,1,true)", "Line(cc,2,true)", "Line(dd,9,false)"]);
+    assert!(!or.contains("Line(bb"), "bb is unpaid and qty 5 (<=8), so must not match:\n{or}");
+
+    // Precedence: `a || b && c` is `a || (b && c)`, NOT `(a || b) && c`.
+    //   paid==true || qty>3 && paid==false  ==  paid  OR  (qty>3 AND unpaid)  == all five.
+    //   the wrong grouping (a||b)&&c would be (paid OR qty>3) AND unpaid == bb,dd,ee == three.
+    assert_contains_all(
+        "|| is lower precedence than &&",
+        &server.evaluate("order.lines[?paid == true || qty > 3 && paid == false]"),
+        &["5 of 5 matched"],
+    );
+    // Parentheses override precedence, giving the other grouping.
+    assert_contains_all(
+        "parentheses regroup",
+        &server.evaluate("order.lines[?(paid == true || qty > 3) && paid == false]"),
+        &["3 of 5 matched"],
+    );
+
+    // A clause that can't evaluate is surfaced (as errored elements), not silently treated as false.
+    // For the paid lines (aa, cc) the second clause runs and errors; the unpaid ones short-circuit.
+    assert_contains_all(
+        "a broken clause is reported",
+        &server.evaluate("order.lines[?paid == true && nosuchfield == 1]"),
+        &["errored"],
+    );
+
+    // A compound breakpoint CONDITION: n and local are both the loop counter, so n>2 && local>2 first
+    // holds at n == 3. Reaching the suspend at all proves both clauses were evaluated. Swap the plain
+    // breakpoint (still suspended from the first hit) for the conditioned one WHILE suspended, then
+    // resume so the condition is evaluated afresh on later calls.
+    let listed = server.call("debug.list_breakpoints", serde_json::json!({}));
+    let old_bp = grab_token(&listed, "bp_").expect("no bp to clear");
+    server.call("debug.clear_breakpoint", serde_json::json!({"breakpoint_id": old_bp}));
+    server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({"class_pattern": "DeepProbe", "line": line, "condition": "n > 2 && local > 2"}),
+    );
+    server.call("debug.continue", serde_json::json!({}));
+    server.call("debug.get_last_event", serde_json::json!({"drain": true})); // discard the first hit
+
+    let hit = server
+        .wait_for_event("\"event\":\"breakpoint\"", EVENT_TIMEOUT)
+        .expect("compound condition never fired");
+    assert!(hit.contains("[suspended] true"), "the compound condition should have suspended: {hit}");
+    assert_contains_all("condition held at n == 3", &server.evaluate("n"), &["(int) 3"]);
+
+    server.panic_reset();
+}
+
+/// BP-1: `toggle_breakpoint` silences and re-arms a breakpoint without losing its definition. Tested
+/// on a trace breakpoint so the probe never freezes: disabled -> no new snapshots; re-enabled -> they
+/// resume.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn toggle_breakpoint_disables_and_rearms() {
+    let Some(jdk) = jdk_or_skip("toggle_breakpoint_disables_and_rearms") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
+    let set = server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({"class_pattern": "WatchProbe", "line": line, "trace": true}),
+    );
+    let bp_id = grab_token(&set, "bp_").expect("no bp id");
+
+    // It fires while enabled.
+    assert!(
+        (0..40).any(|_| {
+            let got = count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))) > 0;
+            if !got { std::thread::sleep(std::time::Duration::from_millis(100)); }
+            got
+        }),
+        "the trace breakpoint never recorded while enabled"
+    );
+
+    // Disable: the JDWP request is cleared but the definition kept.
+    let off = server.call("debug.toggle_breakpoint", serde_json::json!({"breakpoint_id": bp_id, "enabled": false}));
+    assert_contains_all("disable keeps the definition", &off, &["Disabled", "re-arm"]);
+    assert_contains_all(
+        "a disabled breakpoint stays listed",
+        &server.call("debug.list_breakpoints", serde_json::json!({})),
+        &[&bp_id, "DISABLED"],
+    );
+
+    // Nothing new is recorded while disabled.
+    server.call("debug.get_traces", serde_json::json!({"clear": true}));
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    assert_eq!(
+        count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))), 0,
+        "a disabled breakpoint must not fire"
+    );
+
+    // Re-enable: re-armed at the same location (with a fresh id), and snapshots resume.
+    let on = server.call("debug.toggle_breakpoint", serde_json::json!({"breakpoint_id": bp_id, "enabled": true}));
+    assert_contains_all("enable re-arms", &on, &["Re-armed"]);
+    assert!(
+        (0..40).any(|_| {
+            let got = count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))) > 0;
+            if !got { std::thread::sleep(std::time::Duration::from_millis(100)); }
+            got
+        }),
+        "re-enabling did not re-arm the breakpoint"
+    );
+
+    server.panic_reset();
+}
+
+/// SETF-2: `set_value` can copy a live reference (`this.a = other.b`), not just a literal — validating
+/// the source's runtime type against the target's declared type, and refusing a mismatch.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn set_value_copies_a_live_reference_and_refuses_a_mismatch() {
+    let Some(jdk) = jdk_or_skip("set_value_copies_a_live_reference_and_refuses_a_mismatch") else { return };
+    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let line = probe_line(&probe_source("DeepProbe"), "// BP1");
+    server.call("debug.set_breakpoint", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in DeepProbe.inspect never fired");
+
+    // Copy a live String reference: order.status (a String field) <- order.customer.name ("Ana").
+    let copied = server.call(
+        "debug.set_value",
+        serde_json::json!({"target": "order.status", "value": "order.customer.name"}),
+    );
+    assert!(!copied.contains("not a literal"), "an expression value must be accepted now: {copied}");
+    assert_contains_all("the live value was copied", &server.evaluate("order.status"), &["\"Ana\""]);
+
+    // A type-incompatible source is refused, naming both types (Customer field <- String value).
+    let refused = server.call(
+        "debug.set_value",
+        serde_json::json!({"target": "order.customer", "value": "order.status"}),
+    );
+    assert_contains_all(
+        "a mismatched reference is refused",
+        &refused,
+        &["mismatch", "java.lang.String"],
+    );
+
+    // Literals still work unchanged.
+    server.call("debug.set_value", serde_json::json!({"target": "order.status", "value": "\"DONE\""}));
+    assert_contains_all("literals still work", &server.evaluate("order.status"), &["\"DONE\""]);
+
+    server.panic_reset();
+}
+
+/// SAFE-3: a read-only session refuses mutation (set_value, force_return, method invocation) while
+/// still allowing reads, and is flagged in list_sessions. A guard against accident, not a security
+/// boundary.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn read_only_refuses_mutation_but_allows_reads() {
+    let Some(jdk) = jdk_or_skip("read_only_refuses_mutation_but_allows_reads") else { return };
+    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut server = Server::start_with_env(&[("JDWP_READONLY", "1")]).expect("start server");
+    server.attach(probe.port);
+
+    assert_contains_all(
+        "read-only is flagged in list_sessions",
+        &server.call("debug.list_sessions", serde_json::json!({})),
+        &["read-only"],
+    );
+
+    let line = probe_line(&probe_source("DeepProbe"), "// BP1");
+    server.call("debug.set_breakpoint", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in DeepProbe.inspect never fired");
+
+    // Reads that need no invocation still work.
+    assert_contains_all("a field read still works", &server.evaluate("order.status"), &["\"OPEN\""]);
+    assert_contains_all("an array index still works", &server.evaluate("order.numbers[2]"), &["(int) 3"]);
+    assert_contains_all("get_stack still works", &server.call("debug.get_stack", serde_json::json!({})), &["inspect"]);
+
+    // Mutations and invocation are refused.
+    assert_contains_all(
+        "set_value is refused",
+        &server.call("debug.set_value", serde_json::json!({"target": "order.status", "value": "\"X\""})),
+        &["Read-only"],
+    );
+    assert_contains_all(
+        "force_return is refused",
+        &server.call("debug.force_return", serde_json::json!({"value": "true"})),
+        &["Read-only"],
+    );
+    assert_contains_all(
+        "a method call in evaluate is refused",
+        &server.evaluate("order.lines[0].getQty()"),
+        &["Read-only"],
+    );
+    // And the value is unchanged, since set_value never ran.
+    assert_contains_all("the write really didn't happen", &server.evaluate("order.status"), &["\"OPEN\""]);
+
+    server.panic_reset();
+}
+
 
 
 
