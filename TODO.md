@@ -5,6 +5,28 @@ complete end-to-end capability — JDWP primitive(s) in `jdwp-client` + wiring/t
 a validation against a live probe — not a horizontal layer. A fresh session can grab any unblocked
 item and finish it.
 
+## `cargo clippy` does not lint the integration tests — run `scripts/doctor.sh`
+
+The lint policy lives as `#![warn(clippy::pedantic, …)]` crate attributes in `jdwp-client/src/lib.rs`
+and `mcp-server/src/main.rs` (see the note in `Cargo.toml`). Those apply to **those crates**.
+`mcp-server/tests/mcp_integration.rs` is a *separate* crate with no such attributes, so
+`cargo clippy --workspace --all-targets` reports **zero** warnings on it however bad it is.
+
+rust-doctor passes the lint flags on the command line instead, so it *does* cover the test crate. That
+difference hid nine real warnings in test code that had been reported as "clippy clean" across several
+commits (`i64 as usize` casts, redundant clones, missing doc backticks).
+
+**So: `cargo clippy` is not the gate. `scripts/doctor.sh` is.** Run it before claiming a change is clean,
+and `scripts/doctor.sh --diff main` to see only what you changed.
+
+Two warnings are known and deliberately left:
+
+- **`multiple versions for dependency syn` (2)** — `schemars` pulls `syn 3`, `serde_derive` pulls `syn 2`.
+  Not fixable without dropping one of them; harmless build-time duplication.
+- **4 handlers over the cyclomatic-complexity threshold** (`handle_get_stack` 16, `handle_set_value`,
+  `handle_set_watchpoint`, `handle_set_exception_breakpoint`) — all pre-existing and unchanged by recent
+  work, verified by scoring `main` separately. Worth splitting one day; not a regression to chase now.
+
 ## The resume-honesty invariant (read this before touching a resume path)
 
 Five reviews in, **every round's most serious bug was in the previous round's safety work**, and the

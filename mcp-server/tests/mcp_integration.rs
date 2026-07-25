@@ -1414,7 +1414,7 @@ fn disconnect_resumes_and_clears_instead_of_freezing() {
 }
 
 /// TRACE-3 + TRACE-4: a traced stop point disarms itself after its hit budget, so a hot field can't
-/// flood the debuggee; get_traces says it stopped and why; and its output can be filtered by id,
+/// flood the debuggee; `get_traces` says it stopped and why; and its output can be filtered by id,
 /// `since`, and class.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
@@ -1548,7 +1548,9 @@ fn thread_filter_reports_only_the_chosen_thread() {
         probe
             .wait_for_line(EVENT_TIMEOUT, |l| {
                 l.starts_with("beta throw")
-                    && l.rsplit(' ').next().and_then(|n| n.parse::<i64>().ok()).is_some_and(|n| n as usize > beta_before)
+                    && l.rsplit(' ').next()
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .is_some_and(|n| n > beta_before)
             })
             .is_some(),
         "the unfiltered beta thread stopped printing — it was wrongly suspended"
@@ -1943,8 +1945,8 @@ fn set_value_copies_a_live_reference_and_refuses_a_mismatch() {
     server.panic_reset();
 }
 
-/// SAFE-3: a read-only session refuses mutation (set_value, force_return, method invocation) while
-/// still allowing reads, and is flagged in list_sessions. A guard against accident, not a security
+/// SAFE-3: a read-only session refuses mutation (`set_value`, `force_return`, method invocation) while
+/// still allowing reads, and is flagged in `list_sessions`. A guard against accident, not a security
 /// boundary.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
@@ -2201,7 +2203,10 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
     let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
-    let hit_once = serde_json::json!({"class_pattern": "WatchProbe", "line": line, "hit_count": 1});
+    // `hit_count: 1` on purpose: the breakpoint expires after one hit, so it cannot re-freeze the VM
+    // after a resume. That keeps this test about resume honesty rather than about disarming (see the
+    // SCOPE note above). Built per use, since `Server::call` takes its arguments by value.
+    let hit_once = || serde_json::json!({"class_pattern": "WatchProbe", "line": line, "hit_count": 1});
 
     // --- put the VM into the state under test ---
     match freeze {
@@ -2209,7 +2214,7 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
             server.call("debug.pause", serde_json::json!({}));
         }
         Freeze::Breakpoint | Freeze::BreakpointDrained | Freeze::BreakpointThenPause => {
-            server.call("debug.set_breakpoint", hit_once.clone());
+            server.call("debug.set_breakpoint", hit_once());
             server
                 .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
                 .unwrap_or_else(|| panic!("{freeze:?}: breakpoint never fired"));
@@ -2221,7 +2226,7 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
             }
         }
         Freeze::Step => {
-            server.call("debug.set_breakpoint", hit_once.clone());
+            server.call("debug.set_breakpoint", hit_once());
             server
                 .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
                 .unwrap_or_else(|| panic!("{freeze:?}: breakpoint never fired"));
@@ -2251,10 +2256,10 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
         .is_some();
 
     // Whatever the path says about itself, gathered after the fact: `continue`/`panic` answer inline,
-    // the watchdog leaves its note on list_breakpoints / get_last_event. After a disconnect there is no
-    // session left to ask, so the inline reply is all there is.
+    // the watchdog leaves its note on `list_breakpoints` / `get_last_event`. After a disconnect there is
+    // no session left to ask, so the inline reply is all there is.
     let said = if matches!(resume, Resume::Disconnect) {
-        reply.clone()
+        reply
     } else {
         format!("{reply}\n{}\n{}",
             server.call("debug.list_breakpoints", serde_json::json!({})),

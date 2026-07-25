@@ -2823,66 +2823,104 @@ async fn rearm_stop_point(
     session: &mut crate::session::DebugSession,
     id: &str,
 ) -> Result<String, String> {
+    // One arm per kind, each in its own function: the resolution steps differ (a location, a class, a
+    // field) and inlining all three made this branchy enough to trip the complexity gate.
     if let Some(bp) = session.breakpoints.get(id).cloned() {
-        let arm = rearm_breakpoint_location(session, &bp).await?;
-        let req = session.connection.set_breakpoint_ex(
-            arm.class_id, arm.method_id, arm.bytecode_index, arm.suspend_policy,
-            arm.hit_count, arm.thread_filter,
-        ).await.map_err(|e| format!("Failed to re-arm breakpoint: {e}"))?;
-        if let Some(b) = session.breakpoints.get_mut(id) {
-            b.request_id = Some(req);
-            b.enabled = true;
-            b.arm = arm;
-            b.trace_budget = b.trace_budget.map(|n| if n == 0 { DEFAULT_TRACE_BUDGET } else { n });
-        }
-        return Ok(format!("{}:{}", bp.class_pattern, bp.line));
+        return rearm_line_breakpoint(session, id, &bp).await;
     }
     if let Some(er) = session.exception_requests.get(id).cloned() {
-        // "*" means "every exception", which was registered with no ref type at all — nothing to resolve.
-        let ref_type = if er.class_pattern == "*" {
-            None
-        } else {
-            Some(resolve_class_by_dotted(&mut session.connection, &er.class_pattern).await?
-                .ok_or_else(|| format!(
-                    "Cannot re-arm {id}: exception class '{}' is not loaded any more (was it redeployed? \
-                     trigger it once so the JVM loads it, then retry)", er.class_pattern
-                ))?)
-        };
-        let req = session.connection.set_exception_request_ex(
-            ref_type, er.caught, er.uncaught, suspend_policy_for(er.trace), None, er.thread_filter,
-        ).await.map_err(|e| format!("Failed to re-arm exception breakpoint: {e}"))?;
-        if let Some(e) = session.exception_requests.get_mut(id) {
-            e.request_id = Some(req);
-            e.enabled = true;
-            e.ref_type = ref_type;
-            e.trace_budget = e.trace_budget.map(|n| if n == 0 { DEFAULT_TRACE_BUDGET } else { n });
-        }
-        return Ok(format!("exception {}", er.class_pattern));
+        return rearm_exception_request(session, id, &er).await;
     }
     if let Some(wp) = session.watchpoints.get(id).cloned() {
-        let type_id = resolve_class_by_dotted(&mut session.connection, &wp.class_name).await?
-            .ok_or_else(|| format!(
-                "Cannot re-arm {id}: class '{}' is not loaded any more (was it redeployed? exercise it \
-                 once so the JVM loads it, then retry)", wp.class_name
-            ))?;
-        let (declaring, field) =
-            find_field_info(&mut session.connection, type_id, &wp.field_name, None).await?
-                .ok_or_else(|| format!(
-                    "Cannot re-arm {id}: class '{}' no longer has a field '{}'",
-                    wp.class_name, wp.field_name
-                ))?;
-        let req = session.connection.set_field_watch_ex(
-            declaring, field.field_id, wp.kind, suspend_policy_for(wp.trace), None, wp.thread_filter,
-        ).await.map_err(|e| format!("Failed to re-arm watchpoint: {e}"))?;
-        if let Some(w) = session.watchpoints.get_mut(id) {
-            w.request_id = Some(req);
-            w.enabled = true;
-            w.arm = (declaring, field.field_id);
-            w.trace_budget = w.trace_budget.map(|n| if n == 0 { DEFAULT_TRACE_BUDGET } else { n });
-        }
-        return Ok(format!("watch {}.{}", wp.class_name, wp.field_name));
+        return rearm_watchpoint(session, id, &wp).await;
     }
     Err(format!("Stop point not found: {id}"))
+}
+
+/// A re-armed stop point's trace budget, refreshed: it was disarmed *because* the old one ran out, so
+/// re-arming with zero left would fire once and immediately disable itself again.
+const fn refreshed_budget(current: Option<u32>) -> Option<u32> {
+    match current {
+        Some(0) => Some(DEFAULT_TRACE_BUDGET),
+        other => other,
+    }
+}
+
+/// Re-arm a line breakpoint, re-resolving its location by name first (BP-4).
+async fn rearm_line_breakpoint(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+    bp: &crate::session::BreakpointInfo,
+) -> Result<String, String> {
+    let arm = rearm_breakpoint_location(session, bp).await?;
+    let req = session.connection.set_breakpoint_ex(
+        arm.class_id, arm.method_id, arm.bytecode_index, arm.suspend_policy,
+        arm.hit_count, arm.thread_filter,
+    ).await.map_err(|e| format!("Failed to re-arm breakpoint: {e}"))?;
+    if let Some(b) = session.breakpoints.get_mut(id) {
+        b.request_id = Some(req);
+        b.enabled = true;
+        b.arm = arm;
+        b.trace_budget = refreshed_budget(b.trace_budget);
+    }
+    Ok(format!("{}:{}", bp.class_pattern, bp.line))
+}
+
+/// Re-arm an exception breakpoint, re-resolving its exception class by name first (BP-4).
+async fn rearm_exception_request(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+    er: &crate::session::ExceptionRequestInfo,
+) -> Result<String, String> {
+    // "*" means "every exception", which was registered with no ref type at all — nothing to resolve.
+    let ref_type = if er.class_pattern == "*" {
+        None
+    } else {
+        Some(resolve_class_by_dotted(&mut session.connection, &er.class_pattern).await?
+            .ok_or_else(|| format!(
+                "Cannot re-arm {id}: exception class '{}' is not loaded any more (was it redeployed? \
+                 trigger it once so the JVM loads it, then retry)", er.class_pattern
+            ))?)
+    };
+    let req = session.connection.set_exception_request_ex(
+        ref_type, er.caught, er.uncaught, suspend_policy_for(er.trace), None, er.thread_filter,
+    ).await.map_err(|e| format!("Failed to re-arm exception breakpoint: {e}"))?;
+    if let Some(e) = session.exception_requests.get_mut(id) {
+        e.request_id = Some(req);
+        e.enabled = true;
+        e.ref_type = ref_type;
+        e.trace_budget = refreshed_budget(e.trace_budget);
+    }
+    Ok(format!("exception {}", er.class_pattern))
+}
+
+/// Re-arm a field watchpoint, re-resolving its declaring type and field by name first (BP-4).
+async fn rearm_watchpoint(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+    wp: &crate::session::WatchpointInfo,
+) -> Result<String, String> {
+    let type_id = resolve_class_by_dotted(&mut session.connection, &wp.class_name).await?
+        .ok_or_else(|| format!(
+            "Cannot re-arm {id}: class '{}' is not loaded any more (was it redeployed? exercise it \
+             once so the JVM loads it, then retry)", wp.class_name
+        ))?;
+    let (declaring, field) =
+        find_field_info(&mut session.connection, type_id, &wp.field_name, None).await?
+            .ok_or_else(|| format!(
+                "Cannot re-arm {id}: class '{}' no longer has a field '{}'",
+                wp.class_name, wp.field_name
+            ))?;
+    let req = session.connection.set_field_watch_ex(
+        declaring, field.field_id, wp.kind, suspend_policy_for(wp.trace), None, wp.thread_filter,
+    ).await.map_err(|e| format!("Failed to re-arm watchpoint: {e}"))?;
+    if let Some(w) = session.watchpoints.get_mut(id) {
+        w.request_id = Some(req);
+        w.enabled = true;
+        w.arm = (declaring, field.field_id);
+        w.trace_budget = refreshed_budget(w.trace_budget);
+    }
+    Ok(format!("watch {}.{}", wp.class_name, wp.field_name))
 }
 
 /// Re-resolve a breakpoint's location from its class pattern and line/method (BP-4), returning fresh
