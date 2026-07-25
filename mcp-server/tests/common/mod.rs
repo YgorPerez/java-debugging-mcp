@@ -255,7 +255,9 @@ fn pump<R: std::io::Read + Send + 'static>(
 /// A live `jdwp-mcp` child process spoken to over stdio JSON-RPC.
 pub struct Server {
     child: Child,
-    stdin: ChildStdin,
+    /// `Option` so `Drop` can *close* it (by dropping it) to shut the server down cleanly, rather than
+    /// reaching for `kill()`. See the `Drop` impl for why that matters.
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: i64,
 }
@@ -282,7 +284,7 @@ impl Server {
             .map_err(|e| format!("failed to start jdwp-mcp: {e}"))?;
         let stdin = child.stdin.take().ok_or("server has no stdin")?;
         let stdout = BufReader::new(child.stdout.take().ok_or("server has no stdout")?);
-        let mut server = Self { child, stdin, stdout, next_id: 1 };
+        let mut server = Self { child, stdin: Some(stdin), stdout, next_id: 1 };
         server.request(
             "initialize",
             serde_json::json!({
@@ -304,8 +306,9 @@ impl Server {
         let id = self.next_id;
         self.next_id += 1;
         let req = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        writeln!(self.stdin, "{req}").map_err(|e| format!("server stdin: {e}"))?;
-        self.stdin.flush().map_err(|e| format!("server flush: {e}"))?;
+        let stdin = self.stdin.as_mut().ok_or("server stdin already closed")?;
+        writeln!(stdin, "{req}").map_err(|e| format!("server stdin: {e}"))?;
+        stdin.flush().map_err(|e| format!("server flush: {e}"))?;
         let mut line = String::new();
         loop {
             line.clear();
@@ -376,9 +379,31 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        // Best-effort: unfreeze the debuggee before walking away, so a killed server can't leave a
+        // Best-effort: unfreeze the debuggee before walking away, so a dying server can't leave a
         // suspended JVM behind.
         let _ = self.request("tools/call", serde_json::json!({"name": "debug.panic", "arguments": {}}));
+
+        // Shut down by CLOSING STDIN, not by SIGKILL. The server's message loop breaks on EOF
+        // (`main.rs`: `Ok(0) => break`), so this is a normal exit — which matters for two reasons:
+        //
+        //  1. Coverage. Under `cargo llvm-cov` the spawned binary is instrumented, but profile counters
+        //     are flushed by an `atexit` handler. SIGKILL skips that, so every one of these processes
+        //     wrote no `.profraw` and the integration suite contributed NOTHING to coverage —
+        //     `handlers.rs` measured 3.75% while 35 tests were driving it. The number looked like a
+        //     plausible low result rather than a broken instrument.
+        //  2. It exercises the real shutdown path instead of stepping around it.
+        //
+        // `kill()` remains the fallback for a server that has wedged, so a hung binary can't hang the
+        // suite.
+        drop(self.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return, // exited cleanly; counters flushed
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                _ => break,
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

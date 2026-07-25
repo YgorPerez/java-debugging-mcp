@@ -39,6 +39,10 @@ exception breakpoints, field watchpoints, live field writes, `force_return`, mul
 
 ## Decisions worth remembering
 
+> The opt-in-expansion decision is also recorded as [ADR-0006](adr/0006-object-expansion-is-opt-in.md), so
+> it is findable from the ADR index; the detail below is the fuller account.
+
+
 The plan's Open Questions, as answered by the implementation.
 
 **How deep should objects auto-expand?** They don't — expansion is **opt-in**. The plan assumed

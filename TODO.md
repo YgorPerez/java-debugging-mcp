@@ -5,6 +5,40 @@ complete end-to-end capability — JDWP primitive(s) in `jdwp-client` + wiring/t
 a validation against a live probe — not a horizontal layer. A fresh session can grab any unblocked
 item and finish it.
 
+## Coverage: `scripts/coverage.sh`, and the gaps reviewed once
+
+**83% region / 78% line**, unit + integration together. Read it with one caveat in mind: the number is only
+meaningful because the harness now shuts the server down by closing stdin rather than `kill()`ing it.
+Coverage counters flush in an `atexit` handler, which SIGKILL skips — so before that fix the entire
+integration suite contributed **nothing**, and `handlers.rs` measured 3.75% while 35 tests drove it. The
+broken instrument produced a plausible-looking low number, not an error.
+
+Uncovered paths reviewed once, and the verdicts:
+
+- **`resume_all_fully`'s exhaustion tail** (`jdwp-client/src/thread.rs:223`) — the branch that reports "the
+  VM is STILL suspended" after `MAX_RESUME_ATTEMPTS`. **A deliberate gap**: reaching it needs a suspend
+  depth above 8, and now that `debug.pause` is idempotent (ADR-0003) no sequence of *this tool's* calls can
+  build one. It is reachable only when something outside the session is also suspending, which is
+  [#13](https://github.com/YgorPerez/java-debugging-mcp/issues/13) territory. Worth knowing that the
+  honest-failure path of the safety fix is the untested one.
+- **`get_thread_status`** (`thread.rs:117`) — only used by `list_threads {only_suspended:true}`, which no
+  test passes. Small real gap; cheap to close.
+- **`Value::format`** (`types.rs:102`) — live (called from `handlers.rs:3396`, `:4707`) but only on a
+  type-mismatch message and a render fallback. Not dead code.
+- **`get_version` / `get_id_sizes`** (`vm.rs:47`, `:76`) — JDWP conveniences the server never calls.
+  Unused, not broken.
+
+There is deliberately **no coverage percentage gate**. The value was the branch list, and it paid for
+itself on the first run.
+
+## Settled decisions live in `docs/adr/`
+
+Why read-only is enforced at the wire boundary, why the trace budget isn't JDWP's `Count`, why suspends have
+to be counted, why an auto-disarm disables rather than deletes, why stop-point ids aren't request ids, why
+expansion is opt-in, and why `doctor.sh` is the lint gate — each with the rejected alternative and the
+evidence. See [`docs/adr/`](docs/adr/README.md). The two sections below are the operational summaries; the
+ADRs are the reasoning.
+
 ## `cargo clippy` does not lint the integration tests — run `scripts/doctor.sh`
 
 The lint policy lives as `#![warn(clippy::pedantic, …)]` crate attributes in `jdwp-client/src/lib.rs`

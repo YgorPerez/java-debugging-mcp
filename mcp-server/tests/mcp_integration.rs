@@ -2332,3 +2332,82 @@ fn disconnect_is_honest_from_every_suspended_state() {
         assert_resume_is_honest(&jdk, freeze, Resume::Disconnect);
     }
 }
+
+/// TEST-6 / BP-4, approximated locally: re-arming after the target class has been **reloaded through a new
+/// classloader** — the shape of a redeploy, which is the case BP-4's by-name re-resolution exists for.
+///
+/// `ReloadProbe` loads `Worker` through a throwaway `URLClassLoader`, exercises it, then drops it and loads
+/// it again through a fresh loader. The second copy is a genuinely different reference type with different
+/// JDWP ids, so a re-arm that trusted the ids captured at first arm would target a type that no longer
+/// exists. What this does NOT reproduce is `WildFly`'s own module/deployment machinery — see issue #13.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn rearming_survives_a_classloader_reload() {
+    let Some(jdk) = jdk_or_skip("rearming_survives_a_classloader_reload") else { return };
+    let probe = Probe::launch(&jdk, "ReloadProbe").expect("launch ReloadProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // Wait until Worker exists at all (it is compiled and loaded at runtime).
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick ")).expect("probe never ticked");
+
+    // A traced watchpoint on the reloadable class's own static field, so nothing freezes while we work.
+    let set = server.call(
+        "debug.set_watchpoint",
+        serde_json::json!({"class_name": "Worker", "field_name": "calls", "trace": true}),
+    );
+    assert_contains_all("watchpoint armed on the reloadable class", &set, &["watch_modify_"]);
+    let watch_id = grab_token(&set, "watch_modify_").expect("no watch id");
+
+    // It fires against the CURRENT generation.
+    assert!(
+        (0..40).any(|_| {
+            let got = count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))) > 0;
+            if !got { std::thread::sleep(std::time::Duration::from_millis(100)); }
+            got
+        }),
+        "the watchpoint never fired before the reload"
+    );
+
+    // Disable it, then wait for the probe to swap classloaders — this is the "disable, redeploy" half.
+    server.call("debug.toggle_breakpoint", serde_json::json!({"breakpoint_id": watch_id, "enabled": false}));
+    let reloaded = probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("reloaded gen "))
+        .expect("probe never reloaded its worker class");
+    println!("observed: {reloaded}");
+
+    // Re-arm. The stored (declaringType, fieldId) pair now refers to a discarded type; only a by-name
+    // re-resolve can find the live one.
+    server.call("debug.get_traces", serde_json::json!({"clear": true}));
+    let on = server.call("debug.toggle_breakpoint", serde_json::json!({"breakpoint_id": watch_id, "enabled": true}));
+    assert!(
+        on.contains("Re-armed") || on.contains("not loaded any more"),
+        "a re-arm after a reload must either succeed or say the class is gone — got: {on}"
+    );
+
+    // If it claimed success, it has to actually work against the NEW generation. A stale-id re-arm that
+    // the JVM happens to accept would report success here and then never fire, which is the failure this
+    // test exists to catch.
+    if on.contains("Re-armed") {
+        assert!(
+            (0..60).any(|_| {
+                let got = count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))) > 0;
+                if !got { std::thread::sleep(std::time::Duration::from_millis(100)); }
+                got
+            }),
+            "the re-armed watchpoint reported success but never fired against the reloaded class — \
+             it was re-armed against the discarded type (BP-4)"
+        );
+    }
+
+    // Whatever happened to the watchpoint, the debuggee must still be running.
+    let now = probe.output().iter().filter(|l| l.starts_with("tick ")).count();
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick "))
+            .is_some() && now > 0,
+        "the probe stopped running during the reload test"
+    );
+
+    server.panic_reset();
+}
