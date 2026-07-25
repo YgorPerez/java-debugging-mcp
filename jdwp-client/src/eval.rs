@@ -80,7 +80,9 @@ impl JdwpConnection {
     /// Uses `INVOKE_SINGLE_THREADED` so only the target thread runs during the call.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed, or
+    /// [`JdwpError::ReadOnly`] if the connection refuses invocation
+    /// ([`set_read_only`](Self::set_read_only)).
     pub async fn invoke_method(
         &mut self,
         object_id: ObjectId,
@@ -89,6 +91,7 @@ impl JdwpConnection {
         method_id: MethodId,
         args: Vec<Value>,
     ) -> JdwpResult<(Value, ObjectId)> {
+        self.guard_invocation("an instance method")?;
         let id = self.next_id();
         let mut packet =
             CommandPacket::new(id, command_sets::OBJECT_REFERENCE, object_reference_commands::INVOKE_METHOD);
@@ -115,7 +118,9 @@ impl JdwpConnection {
     /// the target thread runs during the call.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed, or
+    /// [`JdwpError::ReadOnly`] if the connection refuses invocation
+    /// ([`set_read_only`](Self::set_read_only)).
     pub async fn invoke_static_method(
         &mut self,
         class_id: ClassId,
@@ -123,6 +128,7 @@ impl JdwpConnection {
         method_id: MethodId,
         args: Vec<Value>,
     ) -> JdwpResult<(Value, ObjectId)> {
+        self.guard_invocation("a static method")?;
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::CLASS_TYPE, CLASS_TYPE_INVOKE_METHOD);
         packet.data.put_u64(class_id);

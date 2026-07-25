@@ -98,7 +98,7 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | `debug.get_traces` | Read snapshots captured by any `trace:true` stop point — line, exception or watchpoint (bounded ring buffer; narrow with `bp_id` / `class_filter` / `since`, optional `clear`) |
 | `debug.list_breakpoints` | List active breakpoints (line, deferred, exception, watchpoint) with trace budgets and thread filters |
 | `debug.clear_breakpoint` | Remove a breakpoint (line, deferred, exception, or watchpoint) |
-| `debug.toggle_breakpoint` | Silence or re-arm a line breakpoint (`bp_…`) without losing its `condition`/`trace_expr` |
+| `debug.toggle_breakpoint` | Silence or re-arm any stop point (`bp_…` / `exc_…` / `watch_…`) without losing its `condition`/`trace_expr`; the id stays the same across the round trip |
 | `debug.continue` | Resume execution |
 | `debug.step_over` | Step over current line (defaults to last-hit thread) |
 | `debug.step_into` | Step into a method call |
@@ -110,18 +110,31 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | `debug.force_return` | Force the current method to return a given value, skipping the rest of its body |
 | `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line, exception type, watched field's old → new) + `[suspended]`; events are buffered, so `limit` reads a backlog and `drain` discards it |
 | `debug.list_threads` | List threads by name; filter with `name_filter` / `only_suspended` / `limit` |
-| `debug.pause` | Pause execution (suspend all threads) |
+| `debug.pause` | Pause execution (suspend all threads) — watchdog-covered, so a forgotten pause can't freeze the JVM |
 | `debug.panic` | Safety: clear all breakpoints and resume all threads |
 | `debug.list_sessions` | List live sessions — `host:port`, which is current, suspended or DEAD, and how many stop points/traces/events each holds |
 | `debug.disconnect` | End the debug session |
 
 Most tools take `thread_id` as an optional hex string (e.g. `"0x2"`); when omitted they default to
-the last thread that hit a breakpoint. A watchdog auto-resumes a VM left suspended for too long
-(`JDWP_WATCHDOG_SECS`, default 120; `0` disables) and disarms the stop point that caused it, so it
-can't just re-freeze on the next hit. `debug.disconnect` resumes the VM and clears every request on
-the way out, so it can never leave a shared JVM frozen. Set `JDWP_READONLY=1` (or `read_only:true` on
-`debug.attach`) to open a session that refuses method invocation, `set_value` and `force_return` — a
-guard against accidentally mutating a production JVM, not a security boundary.
+the last thread that hit a breakpoint.
+
+**Keeping a shared JVM safe.** A watchdog auto-resumes a VM left suspended for too long
+(`JDWP_WATCHDOG_SECS`, default 120; `0` disables) — whether a stop point or a `debug.pause` froze it —
+and *disables* whatever caused it, so it can't re-freeze on the next hit. Disabling keeps the
+definition, so one `debug.toggle_breakpoint` re-arms it with its condition and `trace_expr` intact;
+the same applies when a `trace:true` stop point hits its `trace_max_hits` budget.
+`debug.disconnect` resumes the VM and clears every request on the way out, so it can never leave a
+shared JVM frozen.
+
+**Read-only sessions.** Set `JDWP_READONLY=1` (or `read_only:true` on `debug.attach`) to refuse
+everything that would execute code in the target: method invocation, writes, and `force_return`.
+Enforced on the connection itself rather than by inspecting expressions, so the indirect paths are
+covered too — `toString()` rendering, `List`/`Map` subscripts, and breakpoint `condition`/`trace_expr`
+(refused when you arm them, not silently on each hit). The honest cost is shallower output: objects
+render as `Type (id=0x…)`, because pretty-printing one means invoking it. Reads that need no
+invocation are unaffected — locals, fields, statics, array indexing, `get_stack`, and
+watchpoint/exception reporting. A guard against accidentally mutating a production JVM, **not** a
+security boundary: anyone who can reach the JDWP port can open their own connection without it.
 
 ## Example: Debugging with kubectl port-forward
 

@@ -32,8 +32,15 @@ pub struct DebugSession {
     pub last_thread: Option<u64>,
     /// Active single-step request id (must be cleared before the next resume).
     pub pending_step: Option<i32>,
-    /// When the VM last suspended on an event; cleared on resume. Drives the watchdog.
+    /// When the VM last suspended; cleared on resume. Drives the watchdog.
     pub suspended_since: Option<std::time::Instant>,
+    /// **Why** the VM is suspended, recorded at suspension time and cleared on resume.
+    ///
+    /// The watchdog used to re-derive the offending stop point from the newest buffered event, which
+    /// `get_last_event {drain:true}` could erase — so the polling caller `drain` exists for was exactly
+    /// the one whose freeze never got disarmed (SAFE-5). One authoritative field instead of two sources
+    /// of truth, and it also lets a manual `debug.pause` be told apart from a stop-point hit (SAFE-4).
+    pub suspended_cause: Option<SuspendCause>,
     pub watchdog_task: Option<JoinHandle<()>>,
     /// What the watchdog last did, if anything — surfaced in `list_breakpoints` and `get_last_event`
     /// so a caller who was away learns the VM was auto-resumed and which stop point was disarmed (SAFE-2).
@@ -56,6 +63,12 @@ pub struct DebugSession {
     pub traces: VecDeque<TraceRecord>,
     /// Monotonic sequence for trace records (survives ring-buffer eviction).
     pub trace_seq: u64,
+    /// Monotonic counter behind caller-facing stop-point ids (`bp_`/`exc_`/`watch_`).
+    ///
+    /// Ids used to embed the JDWP request id, so re-arming a disabled stop point gave it a *new* id and
+    /// silently broke any id the caller had stored — the thing that made `toggle_breakpoint` awkward to
+    /// script (BP-3). The request id is an internal detail now: still reported, never the identity.
+    pub stop_seq: u64,
 }
 
 /// Max trace snapshots retained per session; oldest are evicted (documented cap for TRACE-1).
@@ -75,6 +88,17 @@ pub struct EventRecord {
     pub set: EventSet,
 }
 
+/// Why the VM is currently suspended — what the watchdog needs to act correctly on a timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendCause {
+    /// A stop point suspended it, carrying the JDWP request id that fired — the thing to disarm so the
+    /// VM isn't re-frozen on the very next hit (SAFE-2).
+    StopPoint(i32),
+    /// `debug.pause` suspended every thread by hand. There is **no** stop point to disarm, so a
+    /// watchdog resume here must not claim it failed to identify one (SAFE-4).
+    ManualPause,
+}
+
 impl DebugSession {
     /// Push a reportable event, evicting the oldest if the buffer is full. Returns the assigned seq.
     pub fn push_event(&mut self, set: EventSet) -> u64 {
@@ -85,6 +109,29 @@ impl DebugSession {
         }
         self.events.push_back(EventRecord { seq: self.event_seq, set });
         self.event_seq
+    }
+
+    /// Record that the VM is now suspended, and why. Paired with [`mark_resumed`](Self::mark_resumed) so
+    /// the timestamp and the cause can't drift apart — the bug SAFE-5 fixed came from tracking them
+    /// separately.
+    pub fn mark_suspended(&mut self, cause: SuspendCause) {
+        self.suspended_since = Some(std::time::Instant::now());
+        self.suspended_cause = Some(cause);
+    }
+
+    /// Record that the VM is running again. Every resume path calls this, so neither field is left stale.
+    pub fn mark_resumed(&mut self) {
+        self.suspended_since = None;
+        self.suspended_cause = None;
+    }
+
+    /// Allocate the next caller-facing stop-point id, e.g. `next_stop_id("bp_")` → `bp_1`.
+    ///
+    /// Stable for the life of the stop point, so disabling and re-arming it keeps the id the caller
+    /// already has (BP-3).
+    pub fn next_stop_id(&mut self, prefix: &str) -> String {
+        self.stop_seq += 1;
+        format!("{prefix}{}", self.stop_seq)
     }
 }
 
@@ -116,11 +163,20 @@ pub struct TraceRecord {
 /// exception is thrown. Tracked so it shows in `list_breakpoints` and is cleared by
 /// `clear_breakpoint` / panic, like a normal breakpoint.
 #[derive(Debug, Clone)]
+// Four bools, and each is an independent property of the JDWP request as the protocol defines it
+// (armed / caught / uncaught / traced) rather than a parameter bag that wants splitting up.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ExceptionRequestInfo {
     /// The `exc_` id reported to the caller.
     pub id: String,
-    /// The JDWP EXCEPTION event-request id.
-    pub request_id: i32,
+    /// The live JDWP EXCEPTION event-request id, or `None` while disabled (BP-2): an auto-disarm keeps
+    /// the definition — notably `trace_expr` — so it can be re-armed without retyping it.
+    pub request_id: Option<i32>,
+    /// Whether this request is currently armed in the JVM.
+    pub enabled: bool,
+    /// The resolved exception ref type, kept so a disabled request can be re-armed (BP-2). `None` means
+    /// "all exceptions", which is how it was registered.
+    pub ref_type: Option<u64>,
     /// Dotted class pattern the caller gave, or "*" for all exceptions.
     pub class_pattern: String,
     pub caught: bool,
@@ -142,8 +198,15 @@ pub struct ExceptionRequestInfo {
 /// normal breakpoint — `ClearAllBreakpoints` does not touch it.
 #[derive(Debug, Clone)]
 pub struct WatchpointInfo {
-    /// The JDWP event-request id.
-    pub request_id: i32,
+    /// The live JDWP event-request id, or `None` while disabled (BP-2).
+    pub request_id: Option<i32>,
+    /// Whether this watch is currently armed in the JVM.
+    pub enabled: bool,
+    /// The declaring type and field id, kept **only** so a disabled watch can be re-armed (BP-2).
+    ///
+    /// Reporting a hit deliberately does not use these — a hit carries its own declaring type and field,
+    /// so `get_last_event` can still describe a hit whose watchpoint has already been cleared.
+    pub arm: (u64, u64),
     /// Which event kind this was registered as — `Clear` needs the same kind back.
     pub kind: jdwp_client::WatchKind,
     /// Dotted class name the caller gave, for messages.
@@ -151,9 +214,9 @@ pub struct WatchpointInfo {
     pub field_name: String,
     /// Whether the field is static, for the `list_breakpoints` line.
     ///
-    /// The declaring type, field id, and signature are deliberately NOT kept here: a hit carries all
-    /// three itself, so `get_last_event` resolves them from the event and can still describe a hit
-    /// whose watchpoint has already been cleared.
+    /// Hit *reporting* deliberately does not read the declaring type or field id from here (see `arm`):
+    /// a hit carries all of it, so `get_last_event` resolves them from the event and can still describe
+    /// a hit whose watchpoint has already been cleared.
     pub is_static: bool,
     /// Non-suspending trace mode: armed with `EventThread`, each hit is snapshotted (including the
     /// old → new pair) into the trace ring buffer and the thread resumed (TRACE-2).
@@ -257,6 +320,7 @@ impl SessionManager {
             last_thread: None,
             pending_step: None,
             suspended_since: None,
+            suspended_cause: None,
             watchdog_task: None,
             last_watchdog_note: None,
             trace_disarms: Vec::new(),
@@ -266,6 +330,7 @@ impl SessionManager {
             watchpoints: HashMap::new(),
             traces: VecDeque::new(),
             trace_seq: 0,
+            stop_seq: 0,
         };
 
         let mut sessions = self.sessions.lock().await;
@@ -351,5 +416,35 @@ mod uuid {
             .as_millis();
 
         format!("{timestamp:x}{counter:x}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // BP-3: ids are stable and unique per stop point, and independent of any JDWP request id — which is
+    // what lets a disable → re-arm keep the id the caller is holding.
+    #[test]
+    fn stop_ids_are_sequential_and_prefixed() {
+        let mut seq = 0u64;
+        // Mirrors `next_stop_id` without needing a live connection to build a DebugSession.
+        let mut next = |prefix: &str| {
+            seq += 1;
+            format!("{prefix}{seq}")
+        };
+        assert_eq!(next("bp_"), "bp_1");
+        assert_eq!(next("exc_"), "exc_2");
+        assert_eq!(next("watch_modify_"), "watch_modify_3");
+        assert_eq!(next("bp_"), "bp_4", "ids must never be reused within a session");
+    }
+
+    // SAFE-4/SAFE-5: the two halves of "the VM is suspended" move together. Tracking them separately is
+    // what let a manual pause record no cause at all, and a drain erase the offender.
+    #[test]
+    fn suspend_cause_distinguishes_a_stop_point_from_a_manual_pause() {
+        assert_ne!(SuspendCause::ManualPause, SuspendCause::StopPoint(7));
+        assert_eq!(SuspendCause::StopPoint(7), SuspendCause::StopPoint(7));
+        assert_ne!(SuspendCause::StopPoint(7), SuspendCause::StopPoint(8));
     }
 }

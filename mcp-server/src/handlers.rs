@@ -206,7 +206,14 @@ impl RequestHandler {
 
         // Read-only when the caller asks for it OR the env forces it (a deploy-wide guard for a
         // production JVM). Either source alone is enough — the env can't be relaxed per-attach (SAFE-3).
+        //
+        // Set on the CONNECTION, so it is enforced where invocation and writes actually happen rather
+        // than by inspecting expression text up here (SAFE-6). The flag is shared with every clone,
+        // including the event pump's — which is what evaluates a condition or `trace_expr` on a hit.
         let read_only = a.read_only || env_readonly();
+        if read_only {
+            connection.set_read_only(true);
+        }
         let session_id = self.session_manager
             .create_session(connection, format!("{host}:{port}"), read_only)
             .await;
@@ -294,16 +301,21 @@ impl RequestHandler {
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
+        check_readonly_exprs(session.read_only, spec.condition.as_deref(), spec.trace_expr.as_deref())?;
+
+        // One id for this breakpoint's whole life, allocated before we know whether it arms now or is
+        // deferred — and kept across any later disable/re-arm (BP-3).
+        let bp_id = session.next_stop_id("bp_");
 
         let classes = session.connection.classes_by_signature(&spec.signature).await
             .map_err(|e| format!("Failed to find class: {e}"))?;
         let Some(first_class) = classes.first() else {
-            return register_deferred_breakpoint(&mut session, &spec).await;
+            return register_deferred_breakpoint(&mut session, &spec, bp_id).await;
         };
         let class_type_id = first_class.type_id;
 
         let (bp_id, line, method_name, request_id) =
-            arm_and_insert(&mut session, class_type_id, &spec).await?;
+            arm_and_insert(&mut session, class_type_id, &spec, bp_id).await?;
         drop(session);
 
         let mut extra = String::new();
@@ -385,16 +397,21 @@ impl RequestHandler {
 
         let mut session = session_guard.lock().await;
 
-        // An exception breakpoint lives in exception_requests as an EXCEPTION event request.
+        // An exception breakpoint lives in exception_requests as an EXCEPTION event request. A disabled
+        // one has no live request, so there is only the stored definition to drop.
         if let Some(er) = session.exception_requests.remove(bp_id) {
-            let _ = session.connection.clear_exception_request(er.request_id).await;
+            if let Some(req) = er.request_id {
+                let _ = session.connection.clear_exception_request(req).await;
+            }
             return Ok(format!("✅ Exception breakpoint cleared: {} ({})", bp_id, er.class_pattern));
         }
 
         // A watchpoint lives in watchpoints as a FIELD_ACCESS / FIELD_MODIFICATION request; Clear
         // must name the same event kind the request was created with.
         if let Some(wp) = session.watchpoints.remove(bp_id) {
-            let _ = session.connection.clear_field_watch(wp.request_id, wp.kind).await;
+            if let Some(req) = wp.request_id {
+                let _ = session.connection.clear_field_watch(req, wp.kind).await;
+            }
             return Ok(format!(
                 "✅ Watchpoint cleared: {} ({}.{} {})",
                 bp_id, wp.class_name, wp.field_name, wp.kind.label()
@@ -432,63 +449,61 @@ impl RequestHandler {
         ))
     }
 
-    /// Silence or re-arm a line breakpoint without losing its definition (BP-1). Disabling clears the
-    /// JDWP request but keeps the `BreakpointInfo` (`condition`, `trace_expr`, location) so enabling can
-    /// re-arm it at exactly the same place; enabling sets a fresh request from the stored `arm` and
-    /// keys the breakpoint under its new id.
+    /// Silence or re-arm a stop point without losing its definition (BP-1), for any of the three kinds
+    /// (BP-2): disabling clears the JDWP request but keeps the entry — location, `condition`,
+    /// `trace_expr`, thread filter — and enabling re-arms it from that stored definition.
+    ///
+    /// The caller-facing id is stable across the round trip (BP-3), so the id you hold keeps working.
     async fn handle_toggle_breakpoint(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::ToggleBreakpointArgs = crate::args::parse(&args)?;
-        let bp_id = a.breakpoint_id.as_str();
+        let id = a.breakpoint_id.trim().to_string();
 
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
-        let mut bp = session.breakpoints.get(bp_id)
-            .ok_or_else(|| {
-                if session.exception_requests.contains_key(bp_id) || session.watchpoints.contains_key(bp_id) {
-                    format!("{bp_id} is an exception breakpoint or watchpoint — toggle applies to line breakpoints (bp_…). Use clear_breakpoint to remove it.")
-                } else {
-                    format!("Breakpoint not found: {bp_id}")
-                }
-            })?
-            .clone();
+        // Current state, whichever map owns this id.
+        let current = if let Some(b) = session.breakpoints.get(&id) {
+            b.enabled
+        } else if let Some(e) = session.exception_requests.get(&id) {
+            e.enabled
+        } else if let Some(w) = session.watchpoints.get(&id) {
+            w.enabled
+        } else if let Some(pb) = session.pending_breakpoints.iter().find(|p| p.bp_id == id) {
+            // A deferred breakpoint isn't armed at all yet — it holds only a CLASS_PREPARE watch, so
+            // there is no request to silence. Say that, rather than the misleading "not found" this
+            // used to return for an id `list_breakpoints` was showing (BP-3).
+            return Err(format!(
+                "{id} is a deferred breakpoint waiting for {} to load — it holds no active breakpoint \
+                 request yet, so there is nothing to toggle. Use debug.clear_breakpoint to drop it, or \
+                 toggle it once the class loads and it arms.",
+                pb.class_pattern
+            ));
+        } else {
+            return Err(format!("Stop point not found: {id}"));
+        };
 
         // Omitted `enabled` flips the current state.
-        let want_enabled = a.enabled.unwrap_or(!bp.enabled);
-        if want_enabled == bp.enabled {
-            let state = if bp.enabled { "already armed" } else { "already disabled" };
-            return Ok(format!("No change: {bp_id} is {state}."));
+        let want = a.enabled.unwrap_or(!current);
+        if want == current {
+            return Ok(format!(
+                "No change: {id} is already {}.",
+                if current { "armed" } else { "disabled" }
+            ));
         }
 
-        if want_enabled {
-            // Re-arm from the stored location and modifiers. The request id changes, so the breakpoint
-            // is re-keyed under its new `bp_<id>` — mirroring how it was keyed when first armed.
-            let arm = bp.arm.clone();
-            let req = session.connection.set_breakpoint_ex(
-                arm.class_id, arm.method_id, arm.bytecode_index, arm.suspend_policy,
-                arm.hit_count, arm.thread_filter,
-            ).await.map_err(|e| format!("Failed to re-arm breakpoint: {e}"))?;
-            session.breakpoints.remove(bp_id);
-            bp.request_id = Some(req);
-            bp.enabled = true;
-            let new_id = format!("bp_{req}");
-            let (cls, line) = (bp.class_pattern.clone(), bp.line);
-            session.breakpoints.insert(new_id.clone(), bp);
-            drop(session);
-            Ok(format!("✅ Re-armed {bp_id} at {cls}:{line} (new id {new_id}, since re-arming assigns a fresh JDWP request)."))
+        let what = if want {
+            rearm_stop_point(&mut session, &id).await?
         } else {
-            // Disable: clear the live request but keep the definition so it can be re-armed.
-            if let Some(req) = bp.request_id.take() {
-                session.connection.clear_breakpoint(req).await
-                    .map_err(|e| format!("Failed to clear breakpoint request: {e}"))?;
-            }
-            bp.enabled = false;
-            let (cls, line) = (bp.class_pattern.clone(), bp.line);
-            session.breakpoints.insert(bp_id.to_string(), bp);
-            drop(session);
-            Ok(format!("🔕 Disabled {bp_id} at {cls}:{line} — its condition/trace_expr are kept; toggle it back on to re-arm."))
-        }
+            disable_stop_point(&mut session, &id).await?
+        };
+        drop(session);
+
+        Ok(if want {
+            format!("✅ Re-armed {id} ({what}) — same id, so anything holding it keeps working.")
+        } else {
+            format!("🔕 Disabled {id} ({what}) — its definition is kept; toggle it back on to re-arm.")
+        })
     }
 
     async fn handle_continue(&self, args: serde_json::Value) -> Result<String, String> {
@@ -501,7 +516,7 @@ impl RequestHandler {
         if let Some(req) = session.pending_step.take() {
             let _ = session.connection.clear_step(req).await;
         }
-        session.suspended_since = None;
+        session.mark_resumed();
         session.connection.resume_all().await
             .map_err(|e| format!("Failed to resume: {e}"))?;
         drop(session);
@@ -543,7 +558,7 @@ impl RequestHandler {
         let req = session.connection.set_step(thread_id, depth).await
             .map_err(|e| format!("Failed to set step: {e}"))?;
         session.pending_step = Some(req);
-        session.suspended_since = None;
+        session.mark_resumed();
         session.connection.resume_all().await
             .map_err(|e| format!("Failed to resume for step: {e}"))?;
         drop(session);
@@ -572,19 +587,20 @@ impl RequestHandler {
         for req in pend {
             let _ = session.connection.clear_class_prepare(req).await;
         }
-        // ClearAllBreakpoints only removes BREAKPOINT requests — clear exception requests too.
-        let excs: Vec<i32> = session.exception_requests.drain().map(|(_, e)| e.request_id).collect();
+        // ClearAllBreakpoints only removes BREAKPOINT requests — clear exception requests too. A
+        // disabled one holds no live request, so there is nothing to clear in the JVM for it.
+        let excs: Vec<i32> = session.exception_requests.drain().filter_map(|(_, e)| e.request_id).collect();
         for req in excs {
             let _ = session.connection.clear_exception_request(req).await;
         }
         // Field watches are likewise untouched by ClearAllBreakpoints, and leaving one armed keeps
         // the debuggee de-optimised — so panic must drop them too.
         let watches: Vec<(i32, jdwp_client::WatchKind)> =
-            session.watchpoints.drain().map(|(_, w)| (w.request_id, w.kind)).collect();
+            session.watchpoints.drain().filter_map(|(_, w)| w.request_id.map(|r| (r, w.kind))).collect();
         for (req, kind) in watches {
             let _ = session.connection.clear_field_watch(req, kind).await;
         }
-        session.suspended_since = None;
+        session.mark_resumed();
         session.connection.resume_all().await
             .map_err(|e| format!("Failed to resume: {e}"))?;
         drop(session);
@@ -716,18 +732,11 @@ impl RequestHandler {
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
-        // Read-only: refuse an expression that calls a method (any invocation could mutate the target),
-        // and fall back to shallow rendering because expansion also invokes (SAFE-3). Field/local/static
-        // reads and array indexing need no invocation and still work.
+        // Read-only: invocation is refused by the connection itself (SAFE-6), so nothing here needs to
+        // guess from the expression text — which used to miss `List.get` subscripts and `toString()`
+        // rendering entirely. Deep expansion is still switched off up front so the reply can say why,
+        // rather than expanding to a wall of refusals.
         let read_only = session.read_only;
-        if read_only && expr_invokes(expression) {
-            return Err(
-                "🔒 Read-only session: this expression calls a method, which is refused (any invocation \
-                 could mutate the JVM). Reads that need no invocation still work — locals, fields, \
-                 statics, arrays, get_stack. Attach without read_only (or unset JDWP_READONLY) to invoke."
-                    .to_string(),
-            );
-        }
         // A thread/frame is only needed to read locals or invoke methods. A pure static-field read
         // (Class.FIELD) works on a running VM, so a missing/un-suspended thread is not fatal here —
         // resolve_expression falls back to the static path when there's no frame.
@@ -746,7 +755,9 @@ impl RequestHandler {
             None => None,
         };
 
-        let resolved = resolve_expression_multi(conn, thread_id, frame.as_ref(), expression).await?;
+        let resolved = resolve_expression_multi(conn, thread_id, frame.as_ref(), expression)
+            .await
+            .map_err(explain_readonly)?;
         let deep = (a.expand_objects && !read_only).then(|| DeepOpts {
             depth_limit: a.max_depth,
             child_limit: a.max_children.max(1),
@@ -845,9 +856,22 @@ impl RequestHandler {
 
         session.connection.suspend_all().await
             .map_err(|e| format!("Failed to suspend: {e}"))?;
+        // Arm the watchdog for a MANUAL pause too. This used to suspend every thread and record
+        // nothing, so `suspended_since` stayed None and the watchdog — the one thing that makes
+        // attaching to a shared JVM defensible — never fired. A forgotten `debug.pause` froze the VM
+        // permanently, the same hazard SAFE-1 fixed for disconnect (SAFE-4).
+        session.mark_suspended(crate::session::SuspendCause::ManualPause);
+        let secs = watchdog_secs();
         drop(session);
 
-        Ok("⏸️  Execution paused (all threads suspended)".to_string())
+        Ok(format!(
+            "⏸️  Execution paused (all threads suspended){}",
+            if secs == 0 {
+                " — ⚠️ the watchdog is disabled (JDWP_WATCHDOG_SECS=0), so nothing will auto-resume this. Call debug.continue.".to_string()
+            } else {
+                format!(" — the watchdog will auto-resume it after {secs}s if you don't. Call debug.continue when done.")
+            }
+        ))
     }
 
     async fn handle_disconnect(&self, args: serde_json::Value) -> Result<String, String> {
@@ -883,7 +907,7 @@ impl RequestHandler {
                 let _ = session.connection.resume_all().await;
                 format!("Dispose failed — best-effort cleared breakpoints and resumed ({stops} stop point(s))")
             };
-            session.suspended_since = None;
+            session.mark_resumed();
             drop(session);
             Some((note, was_suspended))
         } else {
@@ -1101,6 +1125,7 @@ impl RequestHandler {
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
+        check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
 
         // Resolve the target exception class to a ref type id (None => all exceptions). The class
         // must be loaded; unlike a line breakpoint we don't defer, because an exception request
@@ -1129,10 +1154,12 @@ impl RequestHandler {
             .map_err(|e| format!("Failed to set exception breakpoint: {e}"))?;
 
         let class_pattern = pattern.unwrap_or("*").to_string();
-        let exc_id = format!("exc_{request_id}");
+        let exc_id = session.next_stop_id("exc_");
         session.exception_requests.insert(exc_id.clone(), crate::session::ExceptionRequestInfo {
             id: exc_id.clone(),
-            request_id,
+            request_id: Some(request_id),
+            enabled: true,
+            ref_type,
             class_pattern: class_pattern.clone(),
             caught: a.caught,
             uncaught: a.uncaught,
@@ -1182,6 +1209,7 @@ impl RequestHandler {
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
+        check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
 
         // A watchpoint needs a concrete fieldID up front, so — unlike a line breakpoint — it can't
         // be deferred until the class loads.
@@ -1218,10 +1246,12 @@ impl RequestHandler {
                     kind.label(),
                     if kind == jdwp_client::WatchKind::Access { "Access" } else { "Modification" },
                 ))?;
-            let watch_id = format!("watch_{}_{request_id}", kind.label());
+            let watch_id = session.next_stop_id(&format!("watch_{}_", kind.label()));
             ids.push(format!("{watch_id} ({})", kind.label()));
             session.watchpoints.insert(watch_id, crate::session::WatchpointInfo {
-                request_id,
+                request_id: Some(request_id),
+                enabled: true,
+                arm: (declaring_type, field.field_id),
                 kind,
                 class_name: class_name.to_string(),
                 field_name: field_name.to_string(),
@@ -1346,9 +1376,54 @@ fn readonly_refusal(action: &str) -> String {
     )
 }
 
-/// Whether an expression calls a method — a `(` at string-quote depth 0. Used to refuse invocation in
-/// a read-only session (SAFE-3). A false positive only over-refuses (a `(` inside a would-be read),
-/// which is the safe direction; a `(` inside a string literal is correctly ignored.
+/// Refuse a `condition` / `trace_expr` that would invoke, at ARM time, in a read-only session.
+///
+/// The connection guard would refuse it anyway — but on every hit, deep inside the event pump where the
+/// caller never sees it, and a condition that fails to evaluate keeps the VM suspended. Failing once,
+/// here, is the difference between a clear error and a stop point that quietly doesn't work.
+fn check_readonly_exprs(
+    read_only: bool,
+    condition: Option<&str>,
+    trace_expr: Option<&str>,
+) -> Result<(), String> {
+    if !read_only {
+        return Ok(());
+    }
+    for (what, expr) in [("condition", condition), ("trace_expr", trace_expr)] {
+        if let Some(e) = expr.filter(|e| expr_invokes(e)) {
+            return Err(format!(
+                "🔒 Read-only session: the {what} `{e}` calls a method, which would have to execute code \
+                 in the debuggee on every hit — refused. Use a comparison over fields instead (e.g. \
+                 `status == \"OPEN\"`), or attach without read_only."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Turn a read-only refusal raised deep in the resolver (by the connection's invocation guard) into an
+/// explanation the caller can act on. Anything else passes through unchanged.
+///
+/// The refusal can come from further away than the expression suggests — a `List` subscript invokes
+/// `get`, and rendering an object invokes `toString()` — so the message names what still works.
+fn explain_readonly(e: String) -> String {
+    if e.contains("read-only connection") {
+        format!(
+            "🔒 Read-only session: {e}\n   This expression needs to execute code in the debuggee \
+             (a method call, a List/Map subscript, or boxing), which read-only refuses.\n   \
+             Reads that need no invocation still work: locals, fields, statics, array indexing, \
+             get_stack, and watchpoint/exception reporting.\n   Attach without read_only (or unset \
+             JDWP_READONLY) if you need to invoke."
+        )
+    } else {
+        e
+    }
+}
+
+/// Whether an expression calls a method — a `(` at string-quote depth 0. Used to refuse an invoking
+/// `condition`/`trace_expr` at ARM time in a read-only session, so it fails once where the caller is
+/// looking instead of on every hit (the connection guard is the actual enforcement — SAFE-6).
+/// A false positive only over-refuses, which is the safe direction; a `(` inside a string is ignored.
 fn expr_invokes(expr: &str) -> bool {
     let mut in_str = false;
     let mut escaped = false;
@@ -1484,12 +1559,14 @@ fn render_exception_line(output: &mut String, er: &crate::session::ExceptionRequ
     };
     let _ = writeln!(
         output,
-        "  ⚡ [{}] exception {} ({which}){}{}{}",
+        "  {} [{}] exception {} ({which}){}{}{}{}",
+        if er.enabled { "⚡" } else { "✗" },
         er.id,
         er.class_pattern,
         if er.trace { " (trace)" } else { "" },
         trace_budget_tag(er.trace, er.trace_budget),
         er.thread_filter.map_or_else(String::new, |t| format!(" thread=0x{t:x}")),
+        if er.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
     );
 }
 
@@ -1625,7 +1702,8 @@ async fn describe_field_event(
 fn render_watchpoint_line(output: &mut String, watch_id: &str, wp: &crate::session::WatchpointInfo) {
     let _ = writeln!(
         output,
-        "  👁  [{}] watch {}.{} on {} ({}){}{}",
+        "  {} [{}] watch {}.{} on {} ({}){}{}{}",
+        if wp.enabled { "👁" } else { "✗" },
         watch_id,
         wp.class_name,
         wp.field_name,
@@ -1633,6 +1711,7 @@ fn render_watchpoint_line(output: &mut String, watch_id: &str, wp: &crate::sessi
         if wp.is_static { "static" } else { "instance" },
         if wp.trace { " (trace)" } else { "" },
         wp.thread_filter.map_or_else(String::new, |t| format!(" thread=0x{t:x}")),
+        if wp.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
     );
     // Budget on its own line to keep the header stable; harmless when absent.
     if let Some(n) = wp.trace_budget {
@@ -2592,47 +2671,154 @@ fn find_traced_request(
         });
     }
     if let Some((id, e)) =
-        session.exception_requests.iter().find(|(_, e)| e.request_id == req_id && e.trace)
+        session.exception_requests.iter().find(|(_, e)| e.request_id == Some(req_id) && e.trace)
     {
         return Some(TracedRequest { id: id.clone(), condition: None, trace_expr: e.trace_expr.clone() });
     }
-    if let Some((id, w)) = session.watchpoints.iter().find(|(_, w)| w.request_id == req_id && w.trace) {
+    if let Some((id, w)) = session.watchpoints.iter().find(|(_, w)| w.request_id == Some(req_id) && w.trace) {
         return Some(TracedRequest { id: id.clone(), condition: None, trace_expr: w.trace_expr.clone() });
     }
     None
 }
 
-/// Clear the one stop point a JDWP request id belongs to — line breakpoint, exception request, or
-/// field watch — removing it from the session's bookkeeping and the JVM. Returns a human label for
-/// what was disarmed, or `None` if no tracked stop point matched (e.g. a single-step, which the caller
-/// clears separately, or an already-cleared request). Used by the watchdog to disarm exactly the stop
-/// point that froze the VM (SAFE-2) and by the trace-budget path to auto-disarm (TRACE-3).
+/// Disarm the one stop point a JDWP request id belongs to — line breakpoint, exception request, or
+/// field watch — clearing its request in the JVM but **keeping its definition** so it can be re-armed
+/// with `debug.toggle_breakpoint`. Returns a human label for what was disarmed, or `None` if no tracked
+/// stop point matched (e.g. a single-step, which the caller clears separately, or an already-disarmed
+/// request).
+///
+/// Used by the watchdog to disarm exactly the stop point that froze the VM (SAFE-2) and by the
+/// trace-budget path to auto-disarm (TRACE-3). Both are *automatic*, so deleting the entry would
+/// silently destroy a condition or `trace_expr` the user typed by hand — the very setup SAFE-2's design
+/// note said not to throw away. Disabling keeps it recoverable in one call (BP-2).
 async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32) -> Option<String> {
     if let Some((id, bp)) = session.breakpoints.iter()
         .find(|(_, b)| b.request_id == Some(req_id))
         .map(|(k, v)| (k.clone(), v.clone()))
     {
         let _ = session.connection.clear_breakpoint(req_id).await;
-        session.breakpoints.remove(&id);
+        if let Some(b) = session.breakpoints.get_mut(&id) {
+            b.request_id = None;
+            b.enabled = false;
+        }
         return Some(format!("breakpoint {id} at {}:{}", bp.class_pattern, bp.line));
     }
     if let Some((id, er)) = session.exception_requests.iter()
-        .find(|(_, e)| e.request_id == req_id)
+        .find(|(_, e)| e.request_id == Some(req_id))
         .map(|(k, v)| (k.clone(), v.clone()))
     {
         let _ = session.connection.clear_exception_request(req_id).await;
-        session.exception_requests.remove(&id);
+        if let Some(e) = session.exception_requests.get_mut(&id) {
+            e.request_id = None;
+            e.enabled = false;
+        }
         return Some(format!("exception breakpoint {id} ({})", er.class_pattern));
     }
     if let Some((id, wp)) = session.watchpoints.iter()
-        .find(|(_, w)| w.request_id == req_id)
+        .find(|(_, w)| w.request_id == Some(req_id))
         .map(|(k, v)| (k.clone(), v.clone()))
     {
         let _ = session.connection.clear_field_watch(req_id, wp.kind).await;
-        session.watchpoints.remove(&id);
+        if let Some(w) = session.watchpoints.get_mut(&id) {
+            w.request_id = None;
+            w.enabled = false;
+        }
         return Some(format!("watchpoint {id} ({}.{})", wp.class_name, wp.field_name));
     }
     None
+}
+
+/// Disable the stop point with this caller-facing id: clear its JDWP request, keep its definition.
+/// Returns a short human description of what was disabled.
+///
+/// Shares its "keep the definition" behaviour with [`disarm_request`], which is the automatic path
+/// (watchdog / trace budget); this is the explicit one, via `debug.toggle_breakpoint`.
+async fn disable_stop_point(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+) -> Result<String, String> {
+    if let Some(bp) = session.breakpoints.get(id).cloned() {
+        if let Some(req) = bp.request_id {
+            session.connection.clear_breakpoint(req).await
+                .map_err(|e| format!("Failed to clear breakpoint request: {e}"))?;
+        }
+        if let Some(b) = session.breakpoints.get_mut(id) {
+            b.request_id = None;
+            b.enabled = false;
+        }
+        return Ok(format!("{}:{}", bp.class_pattern, bp.line));
+    }
+    if let Some(er) = session.exception_requests.get(id).cloned() {
+        if let Some(req) = er.request_id {
+            session.connection.clear_exception_request(req).await
+                .map_err(|e| format!("Failed to clear exception request: {e}"))?;
+        }
+        if let Some(e) = session.exception_requests.get_mut(id) {
+            e.request_id = None;
+            e.enabled = false;
+        }
+        return Ok(format!("exception {}", er.class_pattern));
+    }
+    if let Some(wp) = session.watchpoints.get(id).cloned() {
+        if let Some(req) = wp.request_id {
+            session.connection.clear_field_watch(req, wp.kind).await
+                .map_err(|e| format!("Failed to clear field watch: {e}"))?;
+        }
+        if let Some(w) = session.watchpoints.get_mut(id) {
+            w.request_id = None;
+            w.enabled = false;
+        }
+        return Ok(format!("watch {}.{}", wp.class_name, wp.field_name));
+    }
+    Err(format!("Stop point not found: {id}"))
+}
+
+/// Re-arm the disabled stop point with this caller-facing id from its stored definition, keeping the
+/// same id (BP-3). Returns a short human description of what was re-armed.
+///
+/// A re-armed stop point gets a fresh trace budget: it was disarmed *because* the old one ran out, so
+/// re-arming with zero left would fire once and immediately disable itself again.
+async fn rearm_stop_point(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+) -> Result<String, String> {
+    if let Some(bp) = session.breakpoints.get(id).cloned() {
+        let arm = &bp.arm;
+        let req = session.connection.set_breakpoint_ex(
+            arm.class_id, arm.method_id, arm.bytecode_index, arm.suspend_policy,
+            arm.hit_count, arm.thread_filter,
+        ).await.map_err(|e| format!("Failed to re-arm breakpoint: {e}"))?;
+        if let Some(b) = session.breakpoints.get_mut(id) {
+            b.request_id = Some(req);
+            b.enabled = true;
+            b.trace_budget = b.trace_budget.map(|n| if n == 0 { DEFAULT_TRACE_BUDGET } else { n });
+        }
+        return Ok(format!("{}:{}", bp.class_pattern, bp.line));
+    }
+    if let Some(er) = session.exception_requests.get(id).cloned() {
+        let req = session.connection.set_exception_request_ex(
+            er.ref_type, er.caught, er.uncaught, suspend_policy_for(er.trace), None, er.thread_filter,
+        ).await.map_err(|e| format!("Failed to re-arm exception breakpoint: {e}"))?;
+        if let Some(e) = session.exception_requests.get_mut(id) {
+            e.request_id = Some(req);
+            e.enabled = true;
+            e.trace_budget = e.trace_budget.map(|n| if n == 0 { DEFAULT_TRACE_BUDGET } else { n });
+        }
+        return Ok(format!("exception {}", er.class_pattern));
+    }
+    if let Some(wp) = session.watchpoints.get(id).cloned() {
+        let (decl, field_id) = wp.arm;
+        let req = session.connection.set_field_watch_ex(
+            decl, field_id, wp.kind, suspend_policy_for(wp.trace), None, wp.thread_filter,
+        ).await.map_err(|e| format!("Failed to re-arm watchpoint: {e}"))?;
+        if let Some(w) = session.watchpoints.get_mut(id) {
+            w.request_id = Some(req);
+            w.enabled = true;
+            w.trace_budget = w.trace_budget.map(|n| if n == 0 { DEFAULT_TRACE_BUDGET } else { n });
+        }
+        return Ok(format!("watch {}.{}", wp.class_name, wp.field_name));
+    }
+    Err(format!("Stop point not found: {id}"))
 }
 
 /// A hit on a stop point marked `trace` — a line breakpoint, an exception breakpoint, or a field
@@ -2709,12 +2895,12 @@ fn decrement_trace_budget(session: &mut crate::session::DebugSession, req_id: i3
         b.trace_budget = Some(n);
         return Some(n);
     }
-    if let Some(e) = session.exception_requests.values_mut().find(|e| e.request_id == req_id) {
+    if let Some(e) = session.exception_requests.values_mut().find(|e| e.request_id == Some(req_id)) {
         let n = e.trace_budget?.saturating_sub(1);
         e.trace_budget = Some(n);
         return Some(n);
     }
-    if let Some(w) = session.watchpoints.values_mut().find(|w| w.request_id == req_id) {
+    if let Some(w) = session.watchpoints.values_mut().find(|w| w.request_id == Some(req_id)) {
         let n = w.trace_budget?.saturating_sub(1);
         w.trace_budget = Some(n);
         return Some(n);
@@ -2748,24 +2934,36 @@ async fn store_reportable_event(
             session.last_thread = Some(tid);
         }
         if event_suspends(&event_set) {
-            session.suspended_since = Some(std::time::Instant::now());
+            // Record WHICH request suspended us, here and now. The watchdog used to re-derive this from
+            // the newest buffered event, which `get_last_event {drain:true}` erases (SAFE-5).
+            let cause = event_set.events.first().map_or(
+                crate::session::SuspendCause::ManualPause,
+                |e| crate::session::SuspendCause::StopPoint(e.request_id),
+            );
+            session.mark_suspended(cause);
         }
         session.push_event(event_set);
     }
 }
 
-/// Spawn the watchdog: auto-resume the VM if a breakpoint leaves it suspended past
-/// `JDWP_WATCHDOG_SECS` (default 120; `0` disables), so a forgotten breakpoint can't freeze a
-/// request thread on a shared instance.
+/// How long the VM may sit suspended before the watchdog resumes it: `JDWP_WATCHDOG_SECS`, default 120,
+/// `0` to disable. Read in one place so the tools can *report* the value they're promising.
+fn watchdog_secs() -> u64 {
+    std::env::var("JDWP_WATCHDOG_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120)
+}
+
+/// Spawn the watchdog: auto-resume the VM if anything leaves it suspended past `JDWP_WATCHDOG_SECS`
+/// (default 120; `0` disables), so a forgotten breakpoint — or a forgotten `debug.pause` — can't freeze
+/// a request thread on a shared instance.
 fn spawn_watchdog(
     session_manager: SessionManager,
     sid: crate::session::SessionId,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let secs: u64 = std::env::var("JDWP_WATCHDOG_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(120);
+        let secs = watchdog_secs();
         if secs == 0 {
             return;
         }
@@ -2782,26 +2980,31 @@ fn spawn_watchdog(
                     if let Some(req) = s.pending_step.take() {
                         let _ = s.connection.clear_step(req).await;
                     }
-                    // Disarm the stop point that caused the suspension, not just resume — otherwise the
+                    // Disarm whatever caused the suspension rather than only resuming — otherwise the
                     // cycle is freeze → 120s → resume → freeze again on the very next hit, indefinitely
-                    // (SAFE-2). Surgical: the newest event names the request that suspended the VM, so
-                    // clear only that one and leave any other careful setup intact.
-                    let offending = s.events.back()
-                        .and_then(|rec| rec.set.events.first().map(|e| e.request_id));
-                    let disarmed = match offending {
-                        Some(req) => disarm_request(&mut s, req).await,
-                        None => None,
+                    // (SAFE-2). The cause was recorded when the VM suspended, so draining the event
+                    // buffer can no longer hide it (SAFE-5), and a manual pause — which has no stop
+                    // point to disarm — is reported as itself rather than as a failure (SAFE-4).
+                    let note = match s.suspended_cause {
+                        Some(crate::session::SuspendCause::ManualPause) => format!(
+                            "watchdog auto-resumed the VM after {secs}s suspended by debug.pause (a manual pause — no stop point to disarm)"
+                        ),
+                        Some(crate::session::SuspendCause::StopPoint(req)) => {
+                            disarm_request(&mut s, req).await.map_or_else(
+                                || format!(
+                                    "watchdog auto-resumed the VM after {secs}s suspended (its stop point was already cleared, so there was nothing left to disarm)"
+                                ),
+                                |what| format!(
+                                    "watchdog auto-resumed the VM after {secs}s suspended and disabled {what} so it can't re-freeze the VM — re-arm it with debug.toggle_breakpoint (or use trace:true) when ready"
+                                ),
+                            )
+                        }
+                        None => format!(
+                            "watchdog auto-resumed the VM after {secs}s suspended (cause unrecorded)"
+                        ),
                     };
                     let _ = s.connection.resume_all().await;
-                    s.suspended_since = None;
-                    let note = disarmed.as_ref().map_or_else(
-                        || format!(
-                            "watchdog auto-resumed the VM after {secs}s suspended (could not identify the stop point to disarm — it may have already been cleared)"
-                        ),
-                        |what| format!(
-                            "watchdog auto-resumed the VM after {secs}s suspended and disarmed {what} so it can't re-freeze the VM — re-arm it (or use trace:true) when ready"
-                        ),
-                    );
+                    s.mark_resumed();
                     info!("{note}");
                     s.last_watchdog_note = Some(note);
                     drop(s);
@@ -2826,12 +3029,14 @@ struct BreakpointSpec {
     suspend_policy: jdwp_client::SuspendPolicy,
 }
 
-/// Resolve the location on a loaded class, set the JDWP breakpoint, and record it in the session.
+/// Resolve the location on a loaded class, set the JDWP breakpoint, and record it in the session under
+/// the caller-facing `bp_id` (allocated by the caller so it survives a later disable/re-arm — BP-3).
 /// Returns `(bp_id, resolved source line, method name, JDWP request id)`.
 async fn arm_and_insert(
     session: &mut crate::session::DebugSession,
     class_type_id: u64,
     spec: &BreakpointSpec,
+    bp_id: String,
 ) -> Result<(String, i32, String, i32), String> {
     let (method, index, line) = resolve_bp_location(
         &mut session.connection, class_type_id, spec.line_opt, spec.method_hint.as_deref(),
@@ -2839,7 +3044,6 @@ async fn arm_and_insert(
     let request_id = session.connection.set_breakpoint_ex(
         class_type_id, method.method_id, index, spec.suspend_policy, spec.hit_count, spec.thread_filter,
     ).await.map_err(|e| format!("Failed to set breakpoint: {e}"))?;
-    let bp_id = format!("bp_{request_id}");
     session.breakpoints.insert(bp_id.clone(), crate::session::BreakpointInfo {
         request_id: Some(request_id),
         class_pattern: spec.class_pattern.clone(),
@@ -2870,6 +3074,7 @@ async fn arm_and_insert(
 async fn register_deferred_breakpoint(
     session: &mut crate::session::DebugSession,
     spec: &BreakpointSpec,
+    bp_id: String,
 ) -> Result<String, String> {
     let cp_req = session.connection
         .set_class_prepare(&spec.class_pattern, jdwp_client::SuspendPolicy::EventThread).await
@@ -2879,7 +3084,7 @@ async fn register_deferred_breakpoint(
     if let Some(c) = recheck.first() {
         let ctid = c.type_id;
         let _ = session.connection.clear_class_prepare(cp_req).await;
-        let (bp_id, line, method_name, _req) = arm_and_insert(session, ctid, spec).await?;
+        let (bp_id, line, method_name, _req) = arm_and_insert(session, ctid, spec, bp_id).await?;
         return Ok(format!(
             "✅ {} set at {}:{} (class had just loaded)\n   Method: {}\n   Breakpoint ID: {}",
             if spec.trace { "Trace breakpoint" } else { "Breakpoint" },
@@ -2887,7 +3092,6 @@ async fn register_deferred_breakpoint(
         ));
     }
 
-    let bp_id = format!("bp_{cp_req}");
     session.pending_breakpoints.push(crate::session::PendingBreakpoint {
         bp_id: bp_id.clone(),
         class_prepare_request_id: cp_req,
@@ -5754,6 +5958,34 @@ mod tests {
         assert_eq!(trace_budget_for(true, Some(5)), Some(5));
         assert_eq!(trace_budget_for(true, Some(0)), None);
         assert_eq!(trace_budget_for(false, Some(5)), None);
+    }
+
+    // SAFE-6: an invoking condition/trace_expr is refused at arm time, but only in a read-only session
+    // and only when it actually invokes — a field comparison must still be allowed.
+    #[test]
+    fn readonly_refuses_invoking_conditions_at_arm_time() {
+        assert!(check_readonly_exprs(true, Some("order.getTotal() > 1"), None).is_err());
+        assert!(check_readonly_exprs(true, None, Some("this.toString()")).is_err());
+        // A comparison over plain fields invokes nothing, so it is fine even read-only.
+        assert!(check_readonly_exprs(true, Some("status == \"OPEN\""), None).is_ok());
+        // Nothing is restricted when the session is writable.
+        assert!(check_readonly_exprs(false, Some("order.getTotal() > 1"), None).is_ok());
+        // The message names which of the two was at fault, so the caller knows what to change.
+        let e = check_readonly_exprs(true, None, Some("x.y()")).unwrap_err();
+        assert!(e.contains("trace_expr"), "should name the offending field: {e}");
+    }
+
+    // SAFE-6: a read-only refusal from the wire is turned into an actionable explanation; anything
+    // else passes through untouched.
+    #[test]
+    fn readonly_errors_are_explained_and_others_are_not() {
+        let explained = explain_readonly(
+            "invoke toString() failed: read-only connection: refusing to invoke an instance method".into(),
+        );
+        assert!(explained.contains("Read-only session"));
+        assert!(explained.contains("locals, fields, statics"), "must say what still works: {explained}");
+        let untouched = explain_readonly("Unknown local variable 'foo'".to_string());
+        assert_eq!(untouched, "Unknown local variable 'foo'");
     }
 
     // SAFE-3: JDWP_READONLY parsing accepts the common truthy spellings and nothing else.

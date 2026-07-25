@@ -8,7 +8,7 @@ use crate::protocol::{JdwpResult, JDWP_HANDSHAKE, JdwpError, CommandPacket, Repl
 use crate::reftype::{FieldInfo, MethodInfo};
 use crate::types::{ClassId, ReferenceTypeId};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -21,6 +21,10 @@ pub struct JdwpConnection {
     /// Shared across clones on purpose — the event-pump clone and the request path describe the same
     /// JVM, so they should warm one cache rather than two.
     types: Arc<TypeCache>,
+    /// Read-only guard: when set, the invocation primitives refuse instead of executing code in the
+    /// debuggee. `Arc` so it is shared with every clone — including the event pump's, which is what
+    /// evaluates a breakpoint condition or a `trace_expr` on a hit.
+    read_only: Arc<AtomicBool>,
 }
 
 impl JdwpConnection {
@@ -44,7 +48,36 @@ impl JdwpConnection {
             event_loop,
             next_id: Arc::new(AtomicU32::new(1)),
             types: Arc::new(TypeCache::default()),
+            read_only: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Refuse every invocation on this connection from now on (and on every clone of it).
+    ///
+    /// This is the enforcement point for read-only debugging: `invoke_method` /
+    /// `invoke_static_method` return [`JdwpError::ReadOnly`] instead of running code in the target. It
+    /// deliberately does **not** restrict reads — fields, locals, arrays and type metadata are all
+    /// plain JDWP reads and keep working.
+    ///
+    /// A guard against accident, **not** a security boundary: anyone who can reach the JDWP port can
+    /// open their own connection without it.
+    pub fn set_read_only(&self, read_only: bool) {
+        self.read_only.store(read_only, Ordering::SeqCst);
+    }
+
+    /// Whether this connection refuses invocation.
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::SeqCst)
+    }
+
+    /// Fail with [`JdwpError::ReadOnly`] if invocation is not allowed. `what` names the call site for
+    /// the message (e.g. `"toString()"`, `"List.get(int)"`).
+    pub(crate) fn guard_invocation(&self, what: &str) -> JdwpResult<()> {
+        if self.is_read_only() {
+            return Err(JdwpError::ReadOnly(what.to_string()));
+        }
+        Ok(())
     }
 
     /// Perform JDWP handshake

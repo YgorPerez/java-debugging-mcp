@@ -317,7 +317,37 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## Backlog
 
-**Empty.** The third review's ten items — the "shared-JVM safety was the least-finished part" batch —
+**Empty.** A **fourth** review (of the third batch) found five more and they have shipped too, tracked as
+GitHub issues [#2–#6](https://github.com/YgorPerez/java-debugging-mcp/issues?q=is%3Aissue) rather than
+inline here. Three were gaps in the third batch itself, which is the useful part: the interesting bugs
+were in the safety features, and two of them had green tests.
+
+- **SAFE-4** (#2) — `debug.pause` suspended every thread and recorded nothing, so `suspended_since`
+  stayed `None` and the watchdog never fired. A forgotten pause froze the JVM permanently — the same
+  hazard SAFE-1 fixed for disconnect, in the tool whose name sounds harmless. Predated the batch.
+- **SAFE-5** (#3) — the watchdog re-derived the offending stop point from the newest buffered event,
+  which `get_last_event {drain:true}` erases; so the polling caller `drain` exists for was exactly the
+  one whose freeze was resumed but never disarmed. The cause is recorded at suspension time now
+  (`SuspendCause`), which also lets a manual pause be told apart from a hit.
+- **SAFE-6** (#4) — read-only was enforced by inspecting expression text, which missed every indirect
+  invocation: `toString()` rendering (so `evaluate {"order"}` ran debuggee code), `List`/`Map`
+  subscripts, `valueOf` boxing, conditions and `trace_expr`. Now enforced on the **connection**, so a
+  new expression form can't bypass it. The old test passed because it only tried field reads and an
+  explicit call.
+- **BP-2** (#5) — an automatic disarm (watchdog or trace budget) deleted the stop point, destroying the
+  condition/`trace_expr` it was meant to protect. It disables instead, for all three kinds, so one
+  toggle re-arms it.
+- **BP-3** (#6) — stop-point ids embedded the JDWP request id, so re-arming minted a new id and broke
+  any id the caller held; and toggling a deferred breakpoint said "not found" for an id
+  `list_breakpoints` was displaying. Ids come from a per-session counter now.
+
+Two of the new tests were only load-bearing after being made so: the SAFE-4 test was verified to fail
+without its fix, and the SAFE-5 test passed against the bug twice — first because the watchdog raced
+ahead of the drain, then because the still-armed breakpoint re-froze and a *second* watchdog cycle
+disarmed it, making the listing look identical. It now asserts the probe's tick *rate* after the resume,
+which is the only thing that separates "disarmed" from "re-froze and got disarmed later".
+
+The third review's ten items — the "shared-JVM safety was the least-finished part" batch —
 have all shipped. Each is recorded in **✅ Shipped (context)** above with a `path`/test citation, and
 each ships with an automated test (unit for the pure logic, MCP-level integration for the runtime
 behaviour) driven against a real probe JVM the way `docs/agents/domain.md` and the house pattern

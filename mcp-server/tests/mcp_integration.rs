@@ -1292,9 +1292,14 @@ fn watchdog_auto_resumes_and_disarms_the_offending_breakpoint() {
         probe.output(),
     );
 
-    // The disarm is discoverable, in list_breakpoints and in the next get_last_event.
+    // The disarm is discoverable, in list_breakpoints and in the next get_last_event — and per BP-2 the
+    // breakpoint is *disabled*, not deleted, so its definition survived and it can be re-armed.
     let listed = server.call("debug.list_breakpoints", serde_json::json!({}));
-    assert_contains_all("watchdog action is surfaced", &listed, &["watchdog auto-resumed", "disarmed"]);
+    assert_contains_all(
+        "watchdog action is surfaced, and the stop point is kept as disabled",
+        &listed,
+        &["watchdog auto-resumed", "disabled", "DISABLED"],
+    );
     assert!(
         server.last_event().contains("[watchdog]"),
         "get_last_event should carry the watchdog note so a returning caller sees the VM was rescued"
@@ -1460,13 +1465,32 @@ fn trace_budget_disarms_and_get_traces_filters() {
     let none = server.call("debug.get_traces", serde_json::json!({"class_filter": "NoSuchClass"}));
     assert_eq!(count_trace_records(&none), 0, "a non-matching class_filter shows nothing:\n{none}");
 
-    // The watch disarmed itself, so it is gone from the listing…
+    // The watch disarmed itself but is still LISTED as disabled (BP-2) — an automatic disarm must not
+    // destroy a definition the user typed, so it stays recoverable in one call.
     let listed = server.call("debug.list_breakpoints", serde_json::json!({}));
-    assert!(!listed.contains(&watch_id), "a self-disarmed watch must not still be listed:\n{listed}");
+    assert_contains_all(
+        "a self-disarmed watch stays listed as disabled",
+        &listed,
+        &[&watch_id, "DISABLED"],
+    );
     // …and the probe keeps running (it never suspended, and now records nothing either).
     assert!(
         probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 4)).is_some(),
         "probe stopped ticking after a budgeted trace watch"
+    );
+
+    // BP-2: re-arming the self-disarmed watch works, keeps the same id, and records again — which is
+    // only possible because the definition survived the auto-disarm.
+    let on = server.call("debug.toggle_breakpoint", serde_json::json!({"breakpoint_id": watch_id, "enabled": true}));
+    assert_contains_all("a self-disarmed watch can be re-armed", &on, &["Re-armed", &watch_id]);
+    server.call("debug.get_traces", serde_json::json!({"clear": true}));
+    assert!(
+        (0..40).any(|_| {
+            let got = count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))) > 0;
+            if !got { std::thread::sleep(std::time::Duration::from_millis(100)); }
+            got
+        }),
+        "the re-armed watch never recorded again — its budget was not restored"
     );
 
     server.panic_reset();
@@ -1662,6 +1686,216 @@ fn toggle_breakpoint_disables_and_rearms() {
             got
         }),
         "re-enabling did not re-arm the breakpoint"
+    );
+
+    // BP-3: the id is STABLE across the round trip, so the id the caller holds keeps working. It used
+    // to be re-keyed to `bp_<new request id>`, silently breaking any stored id.
+    assert_contains_all(
+        "the id survives disable → enable",
+        &server.call("debug.list_breakpoints", serde_json::json!({})),
+        &[&bp_id],
+    );
+    let again = server.call("debug.toggle_breakpoint", serde_json::json!({"breakpoint_id": bp_id, "enabled": false}));
+    assert_contains_all("the original id still resolves after a re-arm", &again, &["Disabled", &bp_id]);
+
+    server.panic_reset();
+}
+
+/// SAFE-4: `debug.pause` used to suspend every thread and record nothing, so the watchdog — the whole
+/// reason attaching to a shared JVM is defensible — never fired and the VM stayed frozen. A manual pause
+/// must be covered too, and reported as a pause rather than as a stop point the watchdog couldn't find.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn watchdog_rescues_a_manual_pause() {
+    let Some(jdk) = jdk_or_skip("watchdog_rescues_a_manual_pause") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "1")]).expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    // No breakpoint anywhere — the freeze comes purely from debug.pause.
+    let paused = server.call("debug.pause", serde_json::json!({}));
+    assert_contains_all("pause says the watchdog covers it", &paused, &["paused", "watchdog"]);
+    let frozen_at = highest_tick(&probe).expect("no tick before the pause");
+
+    // The probe's own ticks resuming is the only proof the VM was really let go.
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 3))
+            .is_some(),
+        "a manual debug.pause was never auto-resumed — the VM was left frozen with no watchdog cover\n  output: {:?}",
+        probe.output(),
+    );
+
+    // And it is reported honestly: a manual pause has no stop point, so the note must say that rather
+    // than claim it failed to identify one.
+    let note = server.call("debug.list_breakpoints", serde_json::json!({}));
+    assert_contains_all("the pause resume is reported as a pause", &note, &["watchdog auto-resumed", "debug.pause"]);
+    assert!(
+        !note.contains("could not identify"),
+        "a manual pause must not be reported as an unidentifiable stop point: {note}"
+    );
+}
+
+/// SAFE-5: the watchdog identified the offending stop point from the newest buffered event, which
+/// `get_last_event {drain:true}` erases — so the polling caller `drain` exists for was exactly the one
+/// whose freeze never got disarmed. The cause is recorded at suspension time now.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn watchdog_disarms_even_after_the_events_were_drained() {
+    let Some(jdk) = jdk_or_skip("watchdog_disarms_even_after_the_events_were_drained") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    // 5s, not 1s: the drain has to land BEFORE the watchdog fires, or the watchdog reads the event it
+    // was always going to read and the test proves nothing. (Measured: with 1s it passed even against
+    // the old `events.back()` derivation, because the resume raced ahead of the drain.)
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "5")]).expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
+    let set = server.call("debug.set_breakpoint", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
+    let bp_id = grab_token(&set, "bp_").expect("no bp id");
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint never fired");
+    let frozen_at = highest_tick(&probe).expect("no tick before suspension");
+
+    // Read AND DRAIN the events — the normal polling pattern EVT-1 added `drain` for. This is what used
+    // to erase the watchdog's only record of which request froze the VM.
+    let drained = server.call("debug.get_last_event", serde_json::json!({"drain": true}));
+    assert!(drained.contains("breakpoint"), "expected the breakpoint hit before draining: {drained}");
+
+    // The VM must be resumed…
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at))
+            .is_some(),
+        "probe never resumed after the watchdog window\n  output: {:?}",
+        probe.output(),
+    );
+
+    // …and STAY resumed. This is the assertion that actually discriminates: if the watchdog resumed
+    // without disarming (because the drain erased the only record of the offender), the still-armed
+    // breakpoint re-freezes within ~150ms and the probe sits still until the *next* watchdog cycle.
+    // Checking "was it disarmed" alone can't tell the two apart — a second cycle eventually disarms it
+    // and the listing looks identical. Tick rate over a window shorter than one watchdog period can.
+    let resumed_at = highest_tick(&probe).expect("no tick after the resume");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let after = highest_tick(&probe).expect("no tick reading");
+    assert!(
+        after - resumed_at > 5,
+        "the probe advanced only {} tick(s) in 3s after the watchdog resume — it re-froze, so the \
+         offending breakpoint was resumed but never disarmed (SAFE-5)",
+        after - resumed_at,
+    );
+
+    let listed = server.call("debug.list_breakpoints", serde_json::json!({}));
+    assert_contains_all(
+        "the offender is still identified and disabled after a drain",
+        &listed,
+        &[&bp_id, "DISABLED", "watchdog auto-resumed"],
+    );
+
+    server.panic_reset();
+}
+
+/// SAFE-6: read-only is enforced at the invocation boundary, so the paths a text-level guard missed —
+/// `toString()` rendering, a `List` subscript, a condition/`trace_expr` — are all refused too.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn read_only_blocks_every_invocation_path() {
+    let Some(jdk) = jdk_or_skip("read_only_blocks_every_invocation_path") else { return };
+    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut server = Server::start_with_env(&[("JDWP_READONLY", "1")]).expect("start server");
+    server.attach(probe.port);
+
+    let line = probe_line(&probe_source("DeepProbe"), "// BP1");
+    server.call("debug.set_breakpoint", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in DeepProbe.inspect never fired");
+
+    // 1. toString() rendering. `order` has a `toString()`, and this expression contains no parentheses,
+    //    so the old text-level guard let it through and the debuggee ran arbitrary code. It must now
+    //    render from the type name and id instead — no invocation.
+    let obj = server.evaluate("order");
+    assert!(
+        obj.contains("(id=0x"),
+        "a read-only object render must fall back to Type (id=0x…) rather than invoking toString(): {obj}"
+    );
+
+    // 2. A List subscript invokes List.get(int) — also parenthesis-free, also previously missed.
+    let sub = server.evaluate("order.lines[0]");
+    assert_contains_all("a List subscript is refused", &sub, &["Read-only"]);
+
+    // 3. An explicit call is still refused (it always was).
+    assert_contains_all("an explicit call is refused", &server.evaluate("order.lines[0].getQty()"), &["Read-only"]);
+
+    // 4. Reads needing no invocation keep working — the honest cost is shallower output, not no output.
+    assert_contains_all("a field read still works", &server.evaluate("order.status"), &["\"OPEN\""]);
+    assert_contains_all("an array index still works", &server.evaluate("order.numbers[2]"), &["(int) 3"]);
+    assert_contains_all("a nested field read still works", &server.evaluate("order.customer.name"), &["\"Ana\""]);
+    assert_contains_all("get_stack still works", &server.call("debug.get_stack", serde_json::json!({})), &["inspect"]);
+
+    // 5. An invoking condition / trace_expr is refused at ARM time, so it fails once where the caller is
+    //    looking instead of silently on every hit inside the event pump.
+    let cond = server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({"class_pattern": "DeepProbe", "line": line, "condition": "order.getTotal() > 1"}),
+    );
+    assert_contains_all("an invoking condition is refused at arm time", &cond, &["Read-only", "condition"]);
+    let texpr = server.call(
+        "debug.set_watchpoint",
+        serde_json::json!({"class_name": "DeepProbe", "field_name": "threshold", "trace": true, "trace_expr": "order.toString()"}),
+    );
+    assert_contains_all("an invoking trace_expr is refused at arm time", &texpr, &["Read-only", "trace_expr"]);
+
+    // 6. Writes are refused at the wire too, not just by the handler.
+    assert_contains_all(
+        "set_value is refused",
+        &server.call("debug.set_value", serde_json::json!({"target": "order.status", "value": "\"X\""})),
+        &["Read-only"],
+    );
+    assert_contains_all("the write really didn't happen", &server.evaluate("order.status"), &["\"OPEN\""]);
+
+    server.panic_reset();
+}
+
+/// BP-3: a deferred breakpoint is listed, so toggling one must explain itself rather than claiming the
+/// id doesn't exist.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn toggling_a_deferred_breakpoint_explains_itself() {
+    let Some(jdk) = jdk_or_skip("toggling_a_deferred_breakpoint_explains_itself") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // A class the probe will never load, so the breakpoint stays deferred.
+    let set = server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({"class_pattern": "com.example.NeverLoaded", "line": 10}),
+    );
+    assert_contains_all("the breakpoint is deferred", &set, &["Deferred", "bp_"]);
+    let bp_id = grab_token(&set, "bp_").expect("no bp id in deferred reply");
+
+    // It IS listed, so "not found" would be a lie.
+    assert_contains_all(
+        "a deferred breakpoint is listed",
+        &server.call("debug.list_breakpoints", serde_json::json!({})),
+        &[&bp_id],
+    );
+
+    let toggled = server.call("debug.toggle_breakpoint", serde_json::json!({"breakpoint_id": bp_id, "enabled": false}));
+    assert_contains_all(
+        "toggling a deferred breakpoint names its deferred state",
+        &toggled,
+        &["deferred", "NeverLoaded"],
+    );
+    assert!(
+        !toggled.contains("not found"),
+        "a listed breakpoint must never be reported as not found: {toggled}"
     );
 
     server.panic_reset();

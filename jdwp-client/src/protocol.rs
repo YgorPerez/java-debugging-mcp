@@ -26,6 +26,15 @@ pub enum JdwpError {
 
     #[error("Connection closed")]
     ConnectionClosed,
+
+    /// The connection is in read-only mode and something tried to execute code in the debuggee.
+    ///
+    /// Enforced at the point of invocation rather than by inspecting expressions up in the MCP layer,
+    /// because invocation is reached from many directions — a `toString()` render, a `List.get`
+    /// subscript, `valueOf` boxing, a breakpoint condition — and a text-level guard misses whichever
+    /// one nobody thought of.
+    #[error("read-only connection: refusing to invoke {0} in the debuggee")]
+    ReadOnly(String),
 }
 
 // JDWP handshake string
