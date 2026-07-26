@@ -1056,6 +1056,165 @@ fn thread_dump_shows_stacks_and_the_deadlock_cycle() {
     server.panic_reset();
 }
 
+/// EVAL-5: a `toString()` that will not return must be abandoned within its budget and **reported**, not
+/// waited out and then rendered as though it had cost nothing.
+///
+/// Measured against a real WildFly before the fix: 30–40 seconds of frozen VM (the event loop's generic
+/// reply timeout, swept every 10s) followed by a reply byte-identical to the free shallow render. The whole
+/// bug was the indistinguishability, so that is what this asserts.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_tostring_that_never_returns_is_bounded_and_reported() {
+    let Some(jdk) = jdk_or_skip("a_tostring_that_never_returns_is_bounded_and_reported") else { return };
+    let probe = Probe::launch(&jdk, "SlowToStringProbe").expect("launch SlowToStringProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let line = probe_line(&probe_source("SlowToStringProbe"), "// BP1");
+    server.call(
+        "debug.set_breakpoint",
+        serde_json::json!({"class_pattern": "SlowToStringProbe", "line": line}),
+    );
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in SlowToStringProbe.inspect never fired");
+
+    // Order matters here, and it is the fix's own consequence that dictates it: JDWP cannot cancel an
+    // invocation, so a timed-out render leaves that thread still executing toString() and its frames
+    // unreadable. Everything needing the frame therefore runs BEFORE the pathological value.
+
+    // 1. An ordinary value is unaffected — the budget must not tax values that answer promptly.
+    let fast = server.evaluate("fast");
+    assert!(fast.contains("Quick(42)"), "a prompt toString() must still render normally: {fast}");
+    assert!(
+        !fast.contains("did not return"),
+        "a prompt toString() must not be reported as timed out: {fast}"
+    );
+
+    // 2. The documented escape hatch, on the pathological value: expansion reads fields and invokes
+    // nothing, so it answers where toString() cannot. This is the inversion EVAL-5 recorded — the
+    // "expensive" opt-in mode is the cheap one here.
+    let expanded = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "slow", "expand_objects": true, "max_depth": 1}),
+    );
+    assert!(
+        expanded.contains("id") && !expanded.contains("did not return"),
+        "expand_objects must read fields rather than invoking toString(): {expanded}"
+    );
+
+    // 3. The pathological render itself: bounded, and the reply says why it is shallow.
+    let started = std::time::Instant::now();
+    let slow = server.evaluate("slow");
+    let elapsed = started.elapsed();
+    assert_contains_all(
+        "a budget expiry is reported, not hidden behind a shallow render",
+        &slow,
+        &["SlowToStringProbe$Blocker", "toString() did not return", "expand_objects"],
+    );
+    // The load-bearing assertion: bounded. The pre-fix behaviour was 30-40s of frozen VM.
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "rendering must be bounded by the invocation budget, took {elapsed:?}"
+    );
+    // The reply must also warn that the thread is still busy, since that is why the frame stops working.
+    assert!(
+        slow.contains("STILL executing"),
+        "the reply must say the invocation is still running, or the next confusing error is unexplained: {slow}"
+    );
+
+    server.panic_reset();
+}
+
+/// FILT-2: when the pool retires the thread a `ThreadOnly` filter is pinned to, the stop point must say so
+/// rather than presenting itself as armed.
+///
+/// Before the fix, `list_breakpoints` showed a healthy `⚡` for a request pinned to a thread that no longer
+/// existed, and `get_traces` returned an empty buffer — so silence read as "the bug did not reproduce".
+/// `PoolProbe`'s `quiesce` / `resume` cues exist to reproduce it: the pool retires every idle worker, then
+/// rebuilds with fresh ids.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_filter_pinned_to_a_retired_thread_reports_itself_as_dead() {
+    let Some(jdk) = jdk_or_skip("a_filter_pinned_to_a_retired_thread_reports_itself_as_dead") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "PoolProbe").expect("launch PoolProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    let threads = server.call(
+        "debug.list_threads",
+        serde_json::json!({"name_filter": "pool-worker", "limit": 400}),
+    );
+    let target = threads
+        .lines()
+        .find(|l| l.trim_start().starts_with("0x") && l.contains("pool-worker"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no pool worker id in:\n{threads}"))
+        .to_string();
+
+    let armed = server.call(
+        "debug.set_exception_breakpoint",
+        serde_json::json!({
+            "class_pattern": "PoolProbe$PoolException",
+            "trace": true, "trace_max_hits": 0, "thread_id": target,
+        }),
+    );
+    assert!(armed.contains("exc_"), "filtered arm failed: {armed}");
+    // It works to begin with — otherwise the assertions below would pass for the wrong reason.
+    server
+        .wait_for_traces("PoolProbe.doWork", EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("the filtered stop point never fired while its thread was alive"));
+
+    // Retire the whole pool, so the filter's thread stops existing.
+    probe.send_line("quiesce").expect("send quiesce");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("quiesced"))
+        .unwrap_or_else(|| panic!("the pool never quiesced\n  output: {:?}", probe.output()));
+    probe.send_line("resume").expect("send resume");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("resumed"))
+        .expect("the pool never resumed");
+
+    // The pool is serving again on brand-new threads, so the filter can never match.
+    let listed = server.call("debug.list_breakpoints", serde_json::json!({}));
+    assert_contains_all(
+        "a dead filter must be reported, not shown as armed",
+        &listed,
+        &["FILTER THREAD", "IS GONE", "no longer exists"],
+    );
+
+    // And the place a caller looks when nothing is arriving must say why it is quiet.
+    server.call("debug.get_traces", serde_json::json!({"clear": true}));
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    assert!(
+        traces.contains("cannot record anything") || traces.contains("no longer exists"),
+        "an empty trace buffer must explain a dead filter rather than reading as \"no hits\":\n{traces}"
+    );
+
+    // Arming afresh with the same stale id is refused, naming the real cause.
+    let refused = server.call(
+        "debug.set_exception_breakpoint",
+        serde_json::json!({
+            "class_pattern": "PoolProbe$PoolException", "trace": true, "thread_id": target,
+        }),
+    );
+    assert_contains_all(
+        "a stale thread id is refused at arm time, not as INVALID_OBJECT",
+        &refused,
+        &["not a live thread", "per-connection"],
+    );
+    assert!(
+        !refused.contains("INVALID_OBJECT"),
+        "the bare JDWP code must not be what the caller sees: {refused}"
+    );
+
+    server.panic_reset();
+}
+
 /// TEST-6 assumption 1: the `ThreadOnly` filter holds against a **real thread pool** — 200 busy workers
 /// reused across thousands of tasks, all running the same throw site.
 ///

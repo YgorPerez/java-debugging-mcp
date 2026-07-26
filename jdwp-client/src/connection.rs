@@ -8,11 +8,18 @@ use crate::protocol::{JdwpResult, JDWP_HANDSHAKE, JdwpError, CommandPacket, Repl
 use crate::reftype::{FieldInfo, MethodInfo};
 use crate::types::{ClassId, ReferenceTypeId};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
+
+/// Default budget for a debuggee invocation, in milliseconds.
+///
+/// A `toString()` that cannot answer in two seconds is not worth freezing a shared JVM for, and the
+/// alternative measured 30-40s against a real `WildFly` before the event loop's generic reply timeout gave
+/// up. Deliberately far below that timeout so an invocation is bounded by *this* budget, not by it.
+pub const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 2000;
 
 #[derive(Clone, Debug)]
 pub struct JdwpConnection {
@@ -25,6 +32,13 @@ pub struct JdwpConnection {
     /// debuggee. `Arc` so it is shared with every clone — including the event pump's, which is what
     /// evaluates a breakpoint condition or a `trace_expr` on a hit.
     read_only: Arc<AtomicBool>,
+    /// How long a debuggee invocation may take before it is abandoned, in milliseconds.
+    ///
+    /// Separate from the event loop's generic reply timeout, which is 30s and swept every 10s — far too
+    /// long for a `toString()` used to render a value, and measured freezing a real `WildFly` for 30-40s
+    /// when the invoked method could never complete. `Arc` for the same reason as `read_only`: the event
+    /// pump's clone renders trace snapshots and must obey the same budget.
+    invoke_timeout_ms: Arc<AtomicU64>,
 }
 
 impl JdwpConnection {
@@ -49,6 +63,7 @@ impl JdwpConnection {
             next_id: Arc::new(AtomicU32::new(1)),
             types: Arc::new(TypeCache::default()),
             read_only: Arc::new(AtomicBool::new(false)),
+            invoke_timeout_ms: Arc::new(AtomicU64::new(DEFAULT_INVOKE_TIMEOUT_MS)),
         })
     }
 
@@ -78,6 +93,33 @@ impl JdwpConnection {
             return Err(JdwpError::ReadOnly(what.to_string()));
         }
         Ok(())
+    }
+
+    /// Set how long a debuggee invocation may take before it is abandoned. `0` disables the budget.
+    pub fn set_invoke_timeout_ms(&self, ms: u64) {
+        self.invoke_timeout_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// The current invocation budget in milliseconds; `0` means unbounded.
+    #[must_use]
+    pub fn invoke_timeout_ms(&self) -> u64 {
+        self.invoke_timeout_ms.load(Ordering::SeqCst)
+    }
+
+    /// Send an invocation command under the invocation budget.
+    ///
+    /// On expiry this returns [`JdwpError::InvokeTimeout`] and stops waiting — it does **not** cancel the
+    /// call, because JDWP has no way to. The debuggee thread stays where it is until something resumes the
+    /// VM. What this buys is that the *caller* gets control back in a bounded time and can say why, instead
+    /// of blocking for 30-40s and then reporting a value that looks like it cost nothing.
+    pub(crate) async fn send_invoke(&mut self, packet: CommandPacket) -> JdwpResult<ReplyPacket> {
+        let ms = self.invoke_timeout_ms();
+        if ms == 0 {
+            return self.send_command(packet).await;
+        }
+        tokio::time::timeout(std::time::Duration::from_millis(ms), self.send_command(packet))
+            .await
+            .map_or(Err(JdwpError::InvokeTimeout(ms)), |reply| reply)
     }
 
     /// Perform JDWP handshake

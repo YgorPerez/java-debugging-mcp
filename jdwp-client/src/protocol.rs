@@ -33,6 +33,16 @@ pub enum JdwpError {
     /// because invocation is reached from many directions — a `toString()` render, a `List.get`
     /// subscript, `valueOf` boxing, a breakpoint condition — and a text-level guard misses whichever
     /// one nobody thought of.
+    /// A debuggee invocation did not return within its budget.
+    ///
+    /// Distinct from a lost reply on purpose. `INVOKE_SINGLE_THREADED` runs only the target thread, so a
+    /// method needing a monitor held by one of the *other* (still suspended) threads cannot finish — the
+    /// classic debugger-invocation deadlock. That is not a protocol failure and not something the caller
+    /// did wrong, and it must be reported as itself rather than folded into a generic error, because the
+    /// right response is different: render shallowly and move on.
+    #[error("invocation did not return within {0}ms (the debuggee thread may be blocked on a monitor held by another suspended thread)")]
+    InvokeTimeout(u64),
+
     #[error("read-only connection: refusing to invoke {0} in the debuggee")]
     ReadOnly(String),
 }

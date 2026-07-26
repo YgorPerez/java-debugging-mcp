@@ -306,6 +306,7 @@ impl RequestHandler {
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
         check_readonly_exprs(session.read_only, spec.condition.as_deref(), spec.trace_expr.as_deref())?;
+        check_thread_filter(&mut session.connection, spec.thread_filter).await?;
 
         // One id for this breakpoint's whole life, allocated before we know whether it arms now or is
         // deferred — and kept across any later disable/re-arm (BP-3).
@@ -343,7 +344,7 @@ impl RequestHandler {
         let session_guard = self.resolve_session(&args).await
             .ok_or_else(|| "No active debug session".to_string())?;
 
-        let session = session_guard.lock().await;
+        let mut session = session_guard.lock().await;
 
         if session.breakpoints.is_empty() && session.pending_breakpoints.is_empty()
             && session.exception_requests.is_empty() && session.watchpoints.is_empty()
@@ -354,6 +355,10 @@ impl RequestHandler {
                 |n| format!("No breakpoints set\n⏰ {n}"),
             ));
         }
+
+        // FILT-2: a filter pinned to a dead thread can never fire again, so establish that BEFORE
+        // rendering anything as armed. One round trip per distinct filter thread, none without a filter.
+        let dead = dead_filter_threads(&mut session).await;
 
         let mut output = String::new();
         // Surface a watchdog auto-resume up front (SAFE-2): the caller was away, so the fact that a
@@ -368,23 +373,33 @@ impl RequestHandler {
         );
 
         for (bp_id, bp) in &session.breakpoints {
-            render_breakpoint_line(&mut output, bp_id, bp);
+            render_breakpoint_line(&mut output, bp_id, bp, &dead);
         }
 
         for pb in &session.pending_breakpoints {
-            render_pending_line(&mut output, pb);
+            render_pending_line(&mut output, pb, &dead);
         }
 
         for er in session.exception_requests.values() {
-            render_exception_line(&mut output, er);
+            render_exception_line(&mut output, er, &dead);
         }
 
         for (watch_id, wp) in &session.watchpoints {
-            render_watchpoint_line(&mut output, watch_id, wp);
+            render_watchpoint_line(&mut output, watch_id, wp, &dead);
         }
 
         for me in session.method_exits.values() {
-            render_method_exit_line(&mut output, me);
+            render_method_exit_line(&mut output, me, &dead);
+        }
+        if !dead.is_empty() {
+            let _ = write!(
+                output,
+                "\n⚠️  {} stop point(s) above are filtered to a thread that no longer exists. A pool that \
+                 retires idle workers (which is what a thread filter is usually for) invalidates the id, \
+                 and the stop point then reports nothing at all — silence that reads like \"no hits\". \
+                 Re-read debug.list_threads for a live id and re-arm.\n",
+                dead.len()
+            );
         }
         drop(session);
 
@@ -1302,6 +1317,7 @@ impl RequestHandler {
         };
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
+        check_thread_filter(&mut session.connection, thread_filter).await?;
         let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
 
         // A traced request suspends only the throwing thread, which the pump snapshots and resumes —
@@ -1399,6 +1415,7 @@ impl RequestHandler {
         }
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
+        check_thread_filter(&mut session.connection, thread_filter).await?;
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
         let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
 
@@ -1492,6 +1509,7 @@ impl RequestHandler {
             session.connection.can_get_method_return_values().await.unwrap_or(false);
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
+        check_thread_filter(&mut session.connection, thread_filter).await?;
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
         let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
 
@@ -1568,8 +1586,25 @@ impl RequestHandler {
             .ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
+        // FILT-2: the reader of an empty (or quiet) trace buffer is exactly who needs telling that a
+        // filter is pinned to a dead thread — "no snapshots" and "this can never fire again" look
+        // identical from here otherwise.
+        let dead = dead_filter_threads(&mut session).await;
+        let dead_note = if dead.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n⚠️  {} stop point(s) are filtered to a thread that no longer exists, so they cannot \
+                 record anything — this silence is not \"no hits\". See debug.list_breakpoints, and re-arm \
+                 with a live thread_id from debug.list_threads.",
+                dead.len()
+            )
+        };
+
         if session.traces.is_empty() && session.trace_disarms.is_empty() {
-            return Ok("No trace snapshots yet. Set a breakpoint with trace:true and trigger it.".to_string());
+            return Ok(format!(
+                "No trace snapshots yet. Set a breakpoint with trace:true and trigger it.{dead_note}"
+            ));
         }
 
         // Filter first (TRACE-4), so the "showing X of Y" counts and the `limit` tail both reflect what
@@ -1629,7 +1664,7 @@ impl RequestHandler {
             drop(session);
             lines.push("(buffer cleared)".to_string());
         }
-        Ok(lines.join("\n"))
+        Ok(format!("{}{dead_note}", lines.join("\n")))
     }
 }
 
@@ -1912,7 +1947,12 @@ fn render_session_line(
 }
 
 /// Format one active breakpoint into the `debug.list_breakpoints` output. `bp_id` is its map key.
-fn render_breakpoint_line(output: &mut String, bp_id: &str, bp: &crate::session::BreakpointInfo) {
+fn render_breakpoint_line(
+    output: &mut String,
+    bp_id: &str,
+    bp: &crate::session::BreakpointInfo,
+    dead: &std::collections::BTreeSet<u64>,
+) {
     let _ = writeln!(
         output,
         "  {} [{}] {}:{}{}{}{}{}",
@@ -1925,6 +1965,10 @@ fn render_breakpoint_line(output: &mut String, bp_id: &str, bp: &crate::session:
         trace_frames_tag(bp.trace, bp.trace_frames),
         if bp.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
     );
+    let tag = dead_filter_tag(bp.arm.thread_filter, dead);
+    if !tag.is_empty() {
+        let _ = writeln!(output, "   {tag}");
+    }
     if let Some(method) = &bp.method {
         let _ = writeln!(output, "     Method: {method}");
     }
@@ -1943,17 +1987,29 @@ fn render_breakpoint_line(output: &mut String, bp_id: &str, bp: &crate::session:
 }
 
 /// Format one deferred (class-prepare) breakpoint into the `debug.list_breakpoints` output.
-fn render_pending_line(output: &mut String, pb: &crate::session::PendingBreakpoint) {
+fn render_pending_line(
+    output: &mut String,
+    pb: &crate::session::PendingBreakpoint,
+    dead: &std::collections::BTreeSet<u64>,
+) {
     let where_ = match (pb.line, &pb.method) {
         (Some(l), _) => format!("line {l}"),
         (None, Some(m)) => format!("method {m}"),
         _ => "?".to_string(),
     };
-    let _ = writeln!(output, "  ⏳ [{}] {} ({}) — waiting for class load", pb.bp_id, pb.class_pattern, where_);
+    let _ = writeln!(
+        output,
+        "  ⏳ [{}] {} ({}) — waiting for class load{}",
+        pb.bp_id, pb.class_pattern, where_, dead_filter_tag(pb.thread_filter, dead)
+    );
 }
 
 /// Format one exception breakpoint into the `debug.list_breakpoints` output.
-fn render_exception_line(output: &mut String, er: &crate::session::ExceptionRequestInfo) {
+fn render_exception_line(
+    output: &mut String,
+    er: &crate::session::ExceptionRequestInfo,
+    dead: &std::collections::BTreeSet<u64>,
+) {
     let which = match (er.caught, er.uncaught) {
         (true, true) => "caught+uncaught",
         (true, false) => "caught",
@@ -1972,6 +2028,10 @@ fn render_exception_line(output: &mut String, er: &crate::session::ExceptionRequ
         er.thread_filter.map_or_else(String::new, |t| format!(" thread=0x{t:x}")),
         if er.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
     );
+    let tag = dead_filter_tag(er.thread_filter, dead);
+    if !tag.is_empty() {
+        let _ = writeln!(output, "   {tag}");
+    }
 }
 
 /// The ` [N hit(s) left]` budget suffix for a traced stop point in `list_breakpoints`, kept separate
@@ -2150,7 +2210,12 @@ async fn describe_field_event(
     }
 }
 
-fn render_watchpoint_line(output: &mut String, watch_id: &str, wp: &crate::session::WatchpointInfo) {
+fn render_watchpoint_line(
+    output: &mut String,
+    watch_id: &str,
+    wp: &crate::session::WatchpointInfo,
+    dead: &std::collections::BTreeSet<u64>,
+) {
     let _ = writeln!(
         output,
         "  {} [{}] watch {}.{} on {} ({}){}{}{}{}",
@@ -2169,6 +2234,10 @@ fn render_watchpoint_line(output: &mut String, watch_id: &str, wp: &crate::sessi
     if let Some(n) = wp.trace_budget {
         let _ = writeln!(output, "     Trace budget: {n} hit(s) left");
     }
+    let tag = dead_filter_tag(wp.thread_filter, dead);
+    if !tag.is_empty() {
+        let _ = writeln!(output, "   {tag}");
+    }
 }
 
 /// Format one method-exit request into the `debug.list_breakpoints` output (METH-1).
@@ -2176,7 +2245,11 @@ fn render_watchpoint_line(output: &mut String, watch_id: &str, wp: &crate::sessi
 /// The `method` filter and the "returns values or not" fact both belong here: an unfiltered request is
 /// reporting every method of the class, and a request that can't read return values answers a different
 /// question from the one it was armed for. Neither should have to be re-derived from the arm reply.
-fn render_method_exit_line(output: &mut String, me: &crate::session::MethodExitRequestInfo) {
+fn render_method_exit_line(
+    output: &mut String,
+    me: &crate::session::MethodExitRequestInfo,
+    dead: &std::collections::BTreeSet<u64>,
+) {
     let _ = writeln!(
         output,
         "  {} [{}] method-exit {}{} ({}){}{}{}{}",
@@ -2195,6 +2268,10 @@ fn render_method_exit_line(output: &mut String, me: &crate::session::MethodExitR
     }
     if let Some(e) = &me.trace_expr {
         let _ = writeln!(output, "     Trace expr: {e}");
+    }
+    let tag = dead_filter_tag(me.thread_filter, dead);
+    if !tag.is_empty() {
+        let _ = writeln!(output, "   {tag}");
     }
 }
 
@@ -3188,6 +3265,91 @@ fn find_traced_request(
         });
     }
     None
+}
+
+/// Refuse a `thread_id` that is already dead or was never valid on this connection (FILT-2).
+///
+/// Checked at ARM time, where the caller is looking, instead of letting the JVM answer
+/// `INVALID_OBJECT (20)` — a bare protocol code that says nothing about the actual cause. And the cause is
+/// almost always the same one: **thread ids are per-connection and do not survive a reattach**, so an id
+/// copied from earlier notes, or from a previous session, is meaningless here.
+async fn check_thread_filter(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_filter: Option<u64>,
+) -> Result<(), String> {
+    let Some(tid) = thread_filter else {
+        return Ok(());
+    };
+    if thread_is_alive(conn, tid).await {
+        return Ok(());
+    }
+    Err(format!(
+        "🛑 thread_id 0x{tid:x} is not a live thread on this connection, so a stop point filtered to it \
+         could never fire.\n   JDWP thread ids are **per-connection** and are not stable across a \
+         reattach — an id from an earlier session, or from notes, will not work. A pooled request thread \
+         can also simply have been retired since you read it.\n   Re-read debug.list_threads (or \
+         debug.thread_dump) for a current id, then arm."
+    ))
+}
+
+/// JDWP `threadStatus` for a thread that has finished. Its `Thread` **object** outlives it, so this is what
+/// "dead" looks like from the wire — not an error.
+const THREAD_STATUS_ZOMBIE: i32 = 0;
+
+/// Whether a thread id still refers to a live thread (FILT-2).
+///
+/// Two distinct failures, and both matter:
+/// - the request **errors** — the id was never valid on this connection (ids are per-connection, so one
+///   copied from a previous session lands here);
+/// - the request succeeds with `ZOMBIE` — the id was valid and the thread has since finished.
+///
+/// The second is the one that cost a debugging session: a retired pool worker is gone from `AllThreads`,
+/// but the debugger still holds a reference to its `Thread` object, so `Status` answers perfectly happily.
+/// A first version of this check tested only `is_ok()` and therefore never fired — caught by
+/// `a_filter_pinned_to_a_retired_thread_reports_itself_as_dead`, which is why that test retires a real pool
+/// rather than trusting a plausible-looking predicate.
+async fn thread_is_alive(conn: &mut jdwp_client::JdwpConnection, tid: u64) -> bool {
+    matches!(conn.get_thread_status(tid).await, Ok((status, _)) if status != THREAD_STATUS_ZOMBIE)
+}
+
+/// The `ThreadOnly` filter threads that have died, across every kind of stop point (FILT-2).
+///
+/// Checked once per **distinct** thread rather than once per stop point, since several stop points are
+/// commonly filtered to the same request thread. Stop points with no filter cost nothing.
+///
+/// This exists because a filter pinned to a dead thread can never match again: the stop point reports
+/// nothing and, before this, still listed itself as armed. On a pool that reaps idle workers — which is
+/// exactly where FILT-1 recommends the filter — that silence read as "the bug didn't reproduce".
+async fn dead_filter_threads(
+    session: &mut crate::session::DebugSession,
+) -> std::collections::BTreeSet<u64> {
+    let mut filters: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    filters.extend(session.breakpoints.values().filter_map(|b| b.arm.thread_filter));
+    filters.extend(session.exception_requests.values().filter_map(|e| e.thread_filter));
+    filters.extend(session.watchpoints.values().filter_map(|w| w.thread_filter));
+    filters.extend(session.method_exits.values().filter_map(|m| m.thread_filter));
+    filters.extend(session.pending_breakpoints.iter().filter_map(|p| p.thread_filter));
+
+    let mut dead = std::collections::BTreeSet::new();
+    for tid in filters {
+        if !thread_is_alive(&mut session.connection, tid).await {
+            dead.insert(tid);
+        }
+    }
+    dead
+}
+
+/// The ` ⚠️ FILTER THREAD 0x… IS GONE` marker for a stop point whose `ThreadOnly` thread has died.
+///
+/// Deliberately loud, and deliberately replaces nothing else on the line: the point is that a caller
+/// scanning a listing for "is this working?" cannot miss it.
+fn dead_filter_tag(thread_filter: Option<u64>, dead: &std::collections::BTreeSet<u64>) -> String {
+    match thread_filter {
+        Some(t) if dead.contains(&t) => format!(
+            " ⚠️  FILTER THREAD 0x{t:x} IS GONE — this can never fire again; re-arm with a live thread_id"
+        ),
+        _ => String::new(),
+    }
 }
 
 /// Whether a hit's location is in the method a request was narrowed to (METH-1).
@@ -5924,8 +6086,16 @@ async fn render_object(
     }
     // best-effort toString() when we have a thread to run it on
     if let Some(tid) = thread_id {
-        if let Some(rendered) = render_via_tostring(conn, id, type_id, tid, &name, max_len).await {
-            return rendered;
+        match render_via_tostring(conn, id, type_id, tid, &name, max_len).await {
+            ToStringOutcome::Rendered(rendered) => return rendered,
+            // Say so. Before this the reply was byte-identical to the free shallow render below, so a
+            // caller had no way to know the VM had just been frozen for the whole budget (EVAL-5).
+            ToStringOutcome::TimedOut(ms) => {
+                return format!(
+                    "{name} (id=0x{id:x}) ⚠️ toString() did not return within {ms}ms — value not rendered.                      JDWP cannot cancel an invocation, so that thread is STILL executing it and its frames                      are unreadable until it finishes or you debug.continue. Use expand_objects:true                      instead, which reads fields and invokes nothing."
+                );
+            }
+            ToStringOutcome::Unavailable => {}
         }
     }
     format!("{name} (id=0x{id:x})")
@@ -5953,23 +6123,45 @@ async fn render_via_tostring(
     tid: u64,
     name: &str,
     max_len: usize,
-) -> Option<String> {
-    let (decl, m) = find_method_arity(conn, type_id, "toString", 0).await.ok()??;
+) -> ToStringOutcome {
+    let Ok(Some((decl, m))) = find_method_arity(conn, type_id, "toString", 0).await else {
+        return ToStringOutcome::Unavailable;
+    };
     if m.signature != "()Ljava/lang/String;" {
-        return None;
+        return ToStringOutcome::Unavailable;
     }
-    let (ret, exc) = conn.invoke_method(id, tid, decl, m.method_id, vec![]).await.ok()?;
+    let (ret, exc) = match conn.invoke_method(id, tid, decl, m.method_id, vec![]).await {
+        Ok(pair) => pair,
+        // EVAL-5: a budget expiry is not the same as "this type has no toString". Reporting them the same
+        // way is what made a 40-second freeze indistinguishable from a free shallow render.
+        Err(jdwp_client::JdwpError::InvokeTimeout(ms)) => return ToStringOutcome::TimedOut(ms),
+        Err(_) => return ToStringOutcome::Unavailable,
+    };
     if exc != 0 {
-        return None;
+        return ToStringOutcome::Unavailable;
     }
     let jdwp_client::types::ValueData::Object(sid) = ret.data else {
-        return None;
+        return ToStringOutcome::Unavailable;
     };
     if sid == 0 {
-        return None;
+        return ToStringOutcome::Unavailable;
     }
-    let s = conn.get_string_value(sid).await.ok()?;
-    Some(format!("{} \"{}\"", name, truncate(&s, max_len)))
+    conn.get_string_value(sid).await.map_or(ToStringOutcome::Unavailable, |s| {
+        ToStringOutcome::Rendered(format!("{} \"{}\"", name, truncate(&s, max_len)))
+    })
+}
+
+/// What happened when a value's `toString()` was tried (EVAL-5).
+///
+/// Three outcomes, and the middle one is the whole point of this enum: a value whose `toString()` blew the
+/// invocation budget must not render identically to one that never had a `toString()` to call.
+enum ToStringOutcome {
+    Rendered(String),
+    /// The invocation budget expired — the debuggee thread is very likely blocked on a monitor held by
+    /// another suspended thread, and is still blocked now.
+    TimedOut(u64),
+    /// No usable `toString()`, or it threw. Nothing was spent worth reporting.
+    Unavailable,
 }
 
 /// Convert a literal string to a Value, coercing int literals to the slot's primitive type.

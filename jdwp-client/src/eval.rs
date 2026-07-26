@@ -105,7 +105,8 @@ impl JdwpConnection {
         }
         packet.data.put_i32(INVOKE_SINGLE_THREADED);
 
-        let reply = self.send_command(packet).await?;
+        // Under the invocation budget, not the generic reply timeout — see `send_invoke`.
+        let reply = self.send_invoke(packet).await?;
         reply.check_error()?;
         read_invoke_reply(reply.data())
     }
@@ -140,7 +141,8 @@ impl JdwpConnection {
         }
         packet.data.put_i32(INVOKE_SINGLE_THREADED);
 
-        let reply = self.send_command(packet).await?;
+        // Under the invocation budget, not the generic reply timeout — see `send_invoke`.
+        let reply = self.send_invoke(packet).await?;
         reply.check_error()?;
         read_invoke_reply(reply.data())
     }
