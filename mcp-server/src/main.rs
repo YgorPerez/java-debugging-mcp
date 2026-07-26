@@ -103,6 +103,18 @@ fn error_response(code: i32, message: &str) -> JsonRpcResponse {
     }
 }
 
+/// Name a JSON value's kind for an error message — what arrived instead of an object.
+const fn kind_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 /// Write one framed JSON-RPC message (line + newline) to stdout and flush.
 async fn write_message<W: AsyncWriteExt + Unpin>(stdout: &mut W, message: &str) -> Result<()> {
     debug!("Sending: {}", message);
@@ -127,6 +139,23 @@ async fn process_line<W: AsyncWriteExt + Unpin>(
             return write_message(stdout, &response).await;
         }
     };
+
+    // A top-level value that is not an object is neither a request nor a notification, and the
+    // distinction matters because of what the two silences mean. A notification is *supposed* to get no
+    // reply, so the branch below stays quiet for anything object-shaped without an `id`. A bare scalar or
+    // array has no `id` either, and used to fall into that same branch — parsed as a notification,
+    // failed, logged to stderr, answered with nothing. So `42` or `"hello"` (both valid JSON, so not a
+    // parse error) left a client waiting forever on a reply that was never coming, which is the one
+    // outcome worse than an error. JSON-RPC 2.0's own example for a non-object is an Invalid Request with
+    // a null id; found by TEST-9 (#25) while covering these arms.
+    if !value.is_object() {
+        error!("Not a JSON-RPC message: expected an object, got {}", kind_of(&value));
+        let response = serde_json::to_string(&error_response(
+            INVALID_REQUEST,
+            "Invalid request: a JSON-RPC message must be an object",
+        ))?;
+        return write_message(stdout, &response).await;
+    }
 
     // Requests carry an id; notifications don't.
     if value.get("id").is_some() {

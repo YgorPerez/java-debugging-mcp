@@ -12,6 +12,11 @@
 //     scripts/integration-test.sh          # or: cargo test --test mcp_integration -- --ignored
 //
 // They are `#[ignore]`d because they spawn JVMs and take seconds, not milliseconds.
+//
+// One exception, and it is deliberate: `stdio_protocol.rs` uses the [`Server`] half alone to drive the
+// process's JSON-RPC front door with malformed input. No `Probe`, no JVM, no `#[ignore]` — those tests
+// run in the default suite, because a test that needs no JDK must not be hidden behind the flag that
+// exists for tests that do (TEST-9, #25).
 
 #![allow(dead_code)] // each test file uses a subset of this harness
 
@@ -333,6 +338,68 @@ impl Server {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue };
             if v.get("id").and_then(serde_json::Value::as_i64) == Some(id) {
                 return Ok(v);
+            }
+        }
+    }
+
+    /// Write one **raw** line to the server's stdin, exactly as given, and do not wait for anything.
+    ///
+    /// The counterpart to [`request`](Self::request), which can only send well-formed JSON-RPC because it
+    /// serialises the request itself. Malformed input is the whole point here: the read loop's parse and
+    /// validation arms are the process's front door, and every other test in this harness comes through
+    /// it holding a valid request (TEST-9, #25).
+    pub fn send_raw(&mut self, line: &str) -> Result<(), String> {
+        let stdin = self.stdin.as_mut().ok_or("server stdin already closed")?;
+        writeln!(stdin, "{line}").map_err(|e| format!("server stdin: {e}"))?;
+        stdin.flush().map_err(|e| format!("server flush: {e}"))
+    }
+
+    /// Like [`send_raw`](Self::send_raw), but **without** the trailing newline — a stream that ends
+    /// mid-message, which is what a client killed halfway through a write leaves behind.
+    pub fn send_raw_unterminated(&mut self, text: &str) -> Result<(), String> {
+        let stdin = self.stdin.as_mut().ok_or("server stdin already closed")?;
+        stdin.write_all(text.as_bytes()).map_err(|e| format!("server stdin: {e}"))?;
+        stdin.flush().map_err(|e| format!("server flush: {e}"))
+    }
+
+    /// Read the **next** line the server writes and parse it as JSON, without skipping anything.
+    ///
+    /// Unlike [`request`](Self::request), which skips lines until the id matches, this insists on
+    /// whatever comes next — which is what makes "the server answered nothing at all" testable: send a
+    /// notification, then a request, and assert the next line is the request's reply.
+    ///
+    /// Blocks until a line arrives or stdout closes.
+    pub fn read_reply(&mut self) -> Result<serde_json::Value, String> {
+        let mut line = String::new();
+        match self.stdout.read_line(&mut line) {
+            Ok(0) => Err("server closed stdout without replying".to_string()),
+            Ok(_) => serde_json::from_str(line.trim())
+                .map_err(|e| format!("server wrote a non-JSON line ({e}): {line:?}")),
+            Err(e) => Err(format!("server stdout: {e}")),
+        }
+    }
+
+    /// Send a raw line and read the single reply it produces.
+    pub fn raw(&mut self, line: &str) -> Result<serde_json::Value, String> {
+        self.send_raw(line)?;
+        self.read_reply()
+    }
+
+    /// Close stdin and wait for the server to exit on its own, returning its status.
+    ///
+    /// EOF is the *normal* shutdown path (`main.rs`: `Ok(0) => break`) and the one the `Drop` impl below
+    /// relies on for coverage counters, so it is worth asserting directly rather than only using it
+    /// (TEST-9, #25). `Err` on timeout, which is the failure that matters: a server that hangs on EOF
+    /// leaks a process per session.
+    pub fn close_stdin_and_wait(&mut self, timeout: Duration) -> Result<std::process::ExitStatus, String> {
+        drop(self.stdin.take());
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Ok(None) => return Err(format!("server still running {timeout:?} after EOF on stdin")),
+                Err(e) => return Err(format!("waiting for server: {e}")),
             }
         }
     }
