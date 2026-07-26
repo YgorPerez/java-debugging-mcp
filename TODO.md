@@ -481,6 +481,29 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   Recorded as **ADR-0009**, including that this reads #15's "does not suspend as a side effect" as "does
   not suspend *silently*" — issue and code otherwise appear to disagree, and the interpretation is the
   load-bearing part of the design.
+- **TEST-6 closed against a real WildFly (#13)** — all six assumptions accounted for, run against WildFly
+  21.0.2 with a deployed servlet rather than stand-in probes. **Validated**: the thread filter against a
+  24-thread `default task` pool (400 records, exactly one thread), and BP-4's by-name re-resolve across a real
+  WAR redeploy — a new module classloader, so every id captured at arm time was stale, and `evaluate` resolved
+  to the *new* generation. **Measured**: `thread_dump` costs 223ms held / 1,559 packets at its worst, so #17's
+  provisional 2000ms budget has ~9× headroom on loopback; and trace capture costs ~0.86ms per hit, which is a
+  ~720–1,160 hits/s *ceiling* rather than a percentage, because capture is serialised through one connection.
+  Assumption 2 is **unreachable by design**, now tested rather than reasoned: `dt_socket server=y` accepts one
+  connection per JVM lifetime, and `debug.pause` is idempotent precisely so a depth cannot accumulate through
+  this tool's own front door (ADR-0003). A proposed workaround — building depth from concurrent `All`-policy
+  hits — was tried and defeats itself: the VM freezes on the *first* hit, so no second thread reaches the
+  breakpoint (40 concurrent requests → 1 event, 1 continue). `resume_all_fully`'s exhaustion tail is untested
+  because a safety property makes it unreachable, not because coverage was missed.
+  Assumption 5 (the 120s watchdog default) got evidence that **changed the conclusion**: a minimal
+  investigation freezes the VM for 2–4ms and a typical one for ~55ms, but a thorough one ranged 709ms–39.4s —
+  and nearly all of the outlier is one call. 120s is therefore **not** generous; it has ~3× headroom over a
+  single `evaluate` on a framework object, and is currently absorbing EVAL-5 rather than accommodating human
+  think-time.
+  Three findings filed, none reachable with stand-in probes: **#21** (a thread-filtered stop point dies
+  silently with its thread), **#22** (the trace ceiling, and that "safe on a shared instance" means unfrozen
+  rather than undegraded), **#23** (`evaluate` froze a real VM for 40s in `toString()` and returned something
+  indistinguishable from the cheap path — with the node budget making the *shallower* expansion 65× slower
+  than the deeper one, because only the deeper one tripped it).
 - **The thread filter, verified against a real pool (#13 assumption 1)** — `ThreadOnly` was only ever
   checked against `ThreadProbe`'s two dedicated, immortal threads, which leaves the interesting cases
   untested: a filter competing with *hundreds* of siblings rather than one, and a thread id that outlives
