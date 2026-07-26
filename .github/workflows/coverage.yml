@@ -1,0 +1,97 @@
+name: coverage
+
+# Region/line coverage over BOTH layers — unit tests and the MCP-level integration tests — via
+# scripts/coverage.sh, the same script run locally.
+#
+# This exists in CI because the local story is bad: `-C instrument-coverage` needs the profiler
+# runtime, and rustup ships no `profiler_builtins` for `x86_64-pc-windows-gnu`, so a Windows dev box
+# cannot produce a report at all (the msvc toolchain has the runtime but needs the Visual Studio C++
+# build tools for link.exe). Linux has both, and a JDK for the probes. TEST-7 (#19) stalled on exactly
+# that, so the measurement lives here instead of depending on who has the right machine.
+#
+# There is deliberately NO percentage gate — the standing decision in TODO.md, and the reason is that
+# a coverage percentage rises with tests that assert nothing. The job still FAILS when the suite fails
+# or when nothing ran, because a report generated from a suite that did not execute is the failure mode
+# TEST-5 found (llvm-cov flushes counters in an atexit handler that SIGKILL skips, so the whole
+# integration suite once contributed nothing while `handlers.rs` measured 3.75%). coverage.sh keeps that
+# guard: no .profraw files, or a SKIP line, and it refuses to report.
+#
+# Not run on every PR: an instrumented build plus ~47 JVM-launching tests is slow, and with no gate the
+# per-PR signal would be noise nobody reads. Push-to-main gives the trend, and workflow_dispatch covers
+# "I want the number now".
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Region + line coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # llvm-tools-preview carries llvm-profdata/llvm-cov, which cargo-llvm-cov shells out to.
+      # Unpinned `stable` on purpose, unlike rust-doctor.yml: that one is pinned because it gates on
+      # warnings and a new clippy lint would break untouched code. Nothing here gates on a number, so a
+      # toolchain bump can only change the figure, which is the thing we want current anyway.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Prebuilt binary — `cargo install cargo-llvm-cov` from source costs several minutes.
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # javac, not just a JRE: the harness compiles examples/probes/*.java at test time. Without it every
+      # integration test SKIPs and coverage.sh fails rather than reporting a plausible low number.
+      - name: Install JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # `shell: bash` for pipefail — see the note in tests.yml. Without it a failing suite would exit
+      # into `tee` and leave this step green.
+      - name: Run coverage (unit + integration)
+        shell: bash
+        run: scripts/coverage.sh --uncovered 2>&1 | tee coverage.log
+
+      # The summary is the point of the run, so put it where it is read without opening logs.
+      - name: Publish the summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Coverage — unit + integration'
+            echo ''
+            echo 'No percentage gate (see TODO.md). The per-file region column is the list worth reading:'
+            echo 'the branch nobody reaches is where the untested *states* hide.'
+            echo ''
+            echo '```'
+            sed -n '/^Filename/,$p' coverage.log || cat coverage.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lcov + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            target/coverage/lcov.info
+            coverage.log
+          if-no-files-found: warn

@@ -46,7 +46,13 @@ jobs:
 
       # Scoped to --test mcp_integration on purpose: a bare `cargo test -- --ignored` also un-ignores
       # jdwp-client's illustrative ```ignore doctests, which were never meant to compile.
+      #
+      # `shell: bash` is load-bearing, not decoration. A `run:` step without it gets `bash -e` and NO
+      # pipefail, so in `script | tee log` the pipeline's status is TEE's — and a failing test suite
+      # exited 1 into a tee that exited 0, leaving this step green. The SKIP grep below would not have
+      # caught it either: that looks for skips, not failures. Naming the shell turns on pipefail.
       - name: Integration tests
+        shell: bash
         run: scripts/integration-test.sh 2>&1 | tee integration.log
 
       - name: Fail if any integration test was skipped
