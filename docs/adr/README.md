@@ -16,6 +16,9 @@ these lazily, when decisions actually get resolved; that point arrived.
 | [0005](0005-stop-point-ids-are-not-jdwp-request-ids.md) | Caller-facing stop-point ids are independent of JDWP request ids |
 | [0006](0006-object-expansion-is-opt-in.md) | Object expansion is opt-in, because expanding invokes code in the debuggee |
 | [0007](0007-doctor-not-clippy-is-the-lint-gate.md) | `scripts/doctor.sh`, not `cargo clippy`, is the lint gate |
+| [0008](0008-caller-frames-fetch-the-whole-stack-and-truncate.md) | Caller frames are read by fetching the whole stack and truncating |
+| [0009](0009-thread-dump-suspends-only-when-asked.md) | `thread_dump` suspends only when asked, and verifies the resume |
 
-A root `CONTEXT.md` deliberately does not exist yet. The decisions were what had accumulated value; a
-glossary had not.
+The root [`CONTEXT.md`](../../CONTEXT.md) now exists — the glossary reached the same point these did once
+TRACE-5, DUMP-1 and METH-1 forced `stop point`, `snapshot`, and the `suspended` / `blocked` distinction to be
+pinned down. It is a glossary only; decisions live here.

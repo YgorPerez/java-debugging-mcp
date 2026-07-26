@@ -1056,6 +1056,72 @@ fn thread_dump_shows_stacks_and_the_deadlock_cycle() {
     server.panic_reset();
 }
 
+/// #17: the dump reports how long it held the VM, and a suspension budget bounds that window —
+/// truncating loudly rather than silently.
+///
+/// The held duration is the number that matters on a shared instance and the one the first version did
+/// not report. The budget is proven by making it impossible to meet: 1ms against 60 parked workers cannot
+/// finish, so the early exit is exercised deterministically rather than hoped for.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_dump_reports_how_long_it_held_the_vm_and_a_budget_bounds_it() {
+    let Some(jdk) = jdk_or_skip("a_dump_reports_how_long_it_held_the_vm_and_a_budget_bounds_it") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "ManyThreadsProbe").expect("launch ManyThreadsProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    // A budget that cannot be met: 60 workers, three frames each, in 1ms.
+    let truncated = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"suspend": true, "max_suspend_ms": 1, "limit": 60}),
+    );
+    assert_contains_all(
+        "an exhausted budget says so, and says the dump is incomplete",
+        &truncated,
+        &["Stopped early", "suspension budget ran out", "INCOMPLETE", "max_suspend_ms"],
+    );
+    assert!(truncated.contains("Held the VM suspended for"), "the held duration is reported: {truncated}");
+    // Truncation and the resume are separate facts — stopping early must not read as failing to resume.
+    assert!(
+        truncated.contains("verified running"),
+        "a truncated dump must still resume and verify (ADR-0003): {truncated}"
+    );
+
+    // The VM really was released, which only the probe's own output can show.
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
+            .is_some(),
+        "the probe stopped ticking after a budget-truncated dump — it was not resumed\n  output: {:?}",
+        probe.output(),
+    );
+
+    // A generous budget on a narrow dump completes, so the budget bounds rather than merely caps.
+    let complete = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"suspend": true, "max_suspend_ms": 0, "limit": 3, "max_frames": 2}),
+    );
+    assert!(complete.contains("Held the VM suspended for"), "duration is reported here too: {complete}");
+    assert!(
+        !complete.contains("Stopped early"),
+        "an unbounded budget on 3 threads must not truncate: {complete}"
+    );
+
+    // A dump that never suspends owns no freeze, so it must claim none.
+    let running = server.call("debug.thread_dump", serde_json::json!({"limit": 3}));
+    assert!(
+        !running.contains("Held the VM suspended"),
+        "a non-suspending dump must not report a held duration: {running}"
+    );
+
+    server.panic_reset();
+}
+
 /// DUMP-1 + SAFE-6: a thread dump reads only, so it must work in a read-only session — and it must not
 /// suspend anything unless asked, since silently pausing a shared VM is the SAFE-4 mistake.
 #[test]

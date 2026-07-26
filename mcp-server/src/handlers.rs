@@ -933,7 +933,17 @@ impl RequestHandler {
             session.mark_suspended(crate::session::SuspendCause::ManualPause);
         }
 
-        let rows = collect_dump_rows(&mut session.connection, &all, &a, caps.as_ref()).await;
+        // The held window starts here and ends at the resume below — measured around the reads only, so
+        // our own string building can never inflate the number we report (#17).
+        let held_from = std::time::Instant::now();
+        // The budget bounds the SUSPENSION, so it only applies when we are the ones holding the VM. A
+        // non-suspending dump reads whatever it can with no clock on it, and a VM someone else suspended
+        // is not ours to hurry.
+        let deadline = (suspend_now && a.max_suspend_ms > 0)
+            .then(|| held_from + std::time::Duration::from_millis(a.max_suspend_ms));
+        let dump = collect_dump_rows(&mut session.connection, &all, &a, caps.as_ref(), deadline).await;
+        let rows = dump.rows;
+        let held = suspend_now.then(|| held_from.elapsed());
 
         // Resume before rendering, so the VM is held for the reads and not for our string building.
         let mut resume_note = String::new();
@@ -968,7 +978,15 @@ impl RequestHandler {
         let cost = session.connection.packets_sent().saturating_sub(before);
         drop(session);
 
-        Ok(render_thread_dump(&rows, total, &a, caps.as_ref(), already, &resume_note, cost))
+        let meta = DumpMeta {
+            total,
+            already_suspended: already,
+            resume_note: &resume_note,
+            cost,
+            held,
+            unread: dump.unread,
+        };
+        Ok(render_thread_dump(&rows, &a, caps.as_ref(), &meta))
     }
 
     async fn handle_pause(&self, args: serde_json::Value) -> Result<String, String> {
@@ -1783,6 +1801,17 @@ fn expr_invokes(expr: &str) -> bool {
 /// Default number of hits a traced stop point records before disarming itself (TRACE-3). Bounds
 /// per-hit work in the debuggee, not just our memory — `MAX_TRACES` caps the buffer, this caps the load.
 const DEFAULT_TRACE_BUDGET: u32 = 200;
+
+/// Default ceiling on how long `debug.thread_dump` may hold the VM suspended, in milliseconds (#17).
+///
+/// A dump freezes the debuggee for every round trip it makes, so the freeze grows with the thread count
+/// and frame depth and is latency-bound on a remote JVM. 2s is chosen to bound the pathological case
+/// without truncating a reasonable dump: a narrowed dump finishes well inside it, while "every frame of
+/// every thread on a pool of hundreds" does not — which is the case that should have to ask.
+///
+/// **Provisional.** It is picked from loopback measurements, where a round trip is sub-millisecond; the
+/// real per-thread cost against the shared instance is unmeasured, and calibrating this is part of #13.
+pub const DEFAULT_MAX_SUSPEND_MS: u64 = 2000;
 
 /// Default number of caller frames a traced hit records above itself (TRACE-5).
 ///
@@ -6178,17 +6207,46 @@ struct DumpRow {
     monitor_note: Option<String>,
 }
 
+/// What a dump collected, and what the suspension budget stopped it from collecting (#17).
+struct DumpOutcome {
+    rows: Vec<DumpRow>,
+    /// Matching threads left unread because the budget expired. `0` means the dump is complete.
+    unread: usize,
+}
+
+/// The reporting context a dump reply needs beyond the rows themselves.
+///
+/// Grouped rather than passed one by one: the held duration and the unread count pushed
+/// `render_thread_dump` past the argument-count lint, and every field here is *about* the dump rather
+/// than part of it.
+struct DumpMeta<'a> {
+    /// Threads the JVM reported, before any filter.
+    total: usize,
+    already_suspended: bool,
+    resume_note: &'a str,
+    cost: u32,
+    /// How long the VM was actually held. `None` when this dump did not suspend it — a default dump, or
+    /// one reading a VM someone else already stopped, owns no freeze to report.
+    held: Option<std::time::Duration>,
+    unread: usize,
+}
+
 /// Read one `DumpRow` per thread, honouring the name/suspended filters and the thread limit.
 ///
 /// Every per-thread read is allowed to fail on its own: a thread can die between `AllThreads` and the
 /// questions we ask about it, and on a running VM the frame read fails by design. One bad thread must
 /// not cost the rest of the dump (that is the difference between this and one `get_stack` per thread).
+///
+/// `deadline` bounds the **suspension**, not the call (#17): it is checked between threads, so the loop
+/// stops at a thread boundary rather than leaving a half-read row, and the caller resumes immediately
+/// after. Threads not reached are counted, never silently dropped.
 async fn collect_dump_rows(
     conn: &mut jdwp_client::JdwpConnection,
     all: &[u64],
     a: &crate::args::ThreadDumpArgs,
     caps: Option<&jdwp_client::vm::VmCapabilities>,
-) -> Vec<DumpRow> {
+    deadline: Option<std::time::Instant>,
+) -> DumpOutcome {
     let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
     let package_filter = a.package_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
     let limit = a.limit.max(1);
@@ -6203,8 +6261,16 @@ async fn collect_dump_rows(
     let mut class_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     let mut monitor_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
 
-    for tid in all {
+    let mut unread = 0usize;
+    for (seen, tid) in all.iter().enumerate() {
         if rows.len() >= limit {
+            break;
+        }
+        // Checked at the thread boundary, before spending anything on this one: the budget bounds how
+        // long the VM is frozen, so stopping mid-thread would hold it longer to produce a partial row.
+        // Everything still unexamined is counted so the reply can say what it skipped.
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            unread = all.len().saturating_sub(seen);
             break;
         }
         let name = conn.get_thread_name(*tid).await.unwrap_or_default();
@@ -6249,7 +6315,7 @@ async fn collect_dump_rows(
             monitor_note,
         });
     }
-    rows
+    DumpOutcome { rows, unread }
 }
 
 /// Read one suspended thread's lock state, as `(monitors held, monitor blocked on, failure note)`.
@@ -6364,12 +6430,11 @@ async fn monitor_label(
 /// "nothing is contended", unreadable threads as "nothing to see".
 fn render_dump_header(
     rows: &[DumpRow],
-    total: usize,
     a: &crate::args::ThreadDumpArgs,
     caps: Option<&jdwp_client::vm::VmCapabilities>,
-    already_suspended: bool,
-    resume_note: &str,
+    meta: &DumpMeta<'_>,
 ) -> String {
+    let (total, already_suspended, resume_note) = (meta.total, meta.already_suspended, meta.resume_note);
     let mut note = String::new();
     if let Some(f) = a.name_filter.as_deref().filter(|s| !s.is_empty()) {
         let _ = write!(note, " name~\"{f}\"");
@@ -6387,6 +6452,22 @@ fn render_dump_header(
     }
     if !resume_note.is_empty() {
         let _ = writeln!(out, "   {resume_note}");
+    }
+    // How long the VM was actually frozen (#17). Reported even on a fast dump, because the useful thing
+    // is the trend on a shared instance, not only the times it went wrong.
+    if let Some(held) = meta.held {
+        let _ = writeln!(out, "   ⏱  Held the VM suspended for {}ms.", held.as_millis());
+    }
+    // The budget stopped it. Separate from the resume note on purpose: "I stopped early" and "I could not
+    // resume" are different problems, and a truncated dump must never read as a complete one.
+    if meta.unread > 0 {
+        let _ = writeln!(
+            out,
+            "   ✂️  Stopped early — the {}ms suspension budget ran out with {} thread(s) still \
+             unexamined, so this dump is INCOMPLETE. Raise max_suspend_ms for a deeper dump, or narrow \
+             with name_filter / limit / max_frames / package_filter, which costs nothing.",
+            a.max_suspend_ms, meta.unread
+        );
     }
     // A JVM that can't answer the monitor questions must say so, rather than silently returning a dump
     // with no locks in it — which reads as "nothing is contended".
@@ -6417,6 +6498,12 @@ fn render_dump_header(
 }
 
 /// One thread's block: header, lock lines, then frames (or why there are none).
+///
+/// The header keeps the two states **visually apart**, because they are independent axes and reading them
+/// as one list gets the important one backwards. `monitor` is the application's own state — this thread is
+/// blocked on a lock — while `debugger-suspended` means we are holding it, which is the only reason its
+/// stack is readable at all. `[monitor, suspended]` invited the reading "suspended at a monitor", which
+/// attributes the freeze to the application instead of to us.
 fn render_dump_row(
     out: &mut String,
     r: &DumpRow,
@@ -6424,11 +6511,11 @@ fn render_dump_row(
 ) {
     let _ = write!(
         out,
-        "\n0x{:x} \"{}\" [{}{}]\n",
+        "\n0x{:x} \"{}\" [{}]{}\n",
         r.id,
         r.name,
         r.status,
-        if r.suspended { ", suspended" } else { "" }
+        if r.suspended { " debugger-suspended" } else { "" }
     );
     if let Some((label, oid)) = &r.waiting_on {
         // The holder is looked up among the rows actually dumped, so a lock held by a thread that was
@@ -6470,12 +6557,9 @@ fn render_dump_row(
 /// "B holds L") into a visible cycle, which is what a deadlock investigation is looking for.
 fn render_thread_dump(
     rows: &[DumpRow],
-    total: usize,
     a: &crate::args::ThreadDumpArgs,
     caps: Option<&jdwp_client::vm::VmCapabilities>,
-    already_suspended: bool,
-    resume_note: &str,
-    cost: u32,
+    meta: &DumpMeta<'_>,
 ) -> String {
     // object id -> the thread holding it, for the "held by" annotation.
     let mut holder: std::collections::HashMap<u64, (u64, &str)> = std::collections::HashMap::new();
@@ -6485,16 +6569,18 @@ fn render_thread_dump(
         }
     }
 
-    let mut out = render_dump_header(rows, total, a, caps, already_suspended, resume_note);
+    let mut out = render_dump_header(rows, a, caps, meta);
     for r in rows {
         render_dump_row(&mut out, r, &holder);
     }
 
-    let hidden = total.saturating_sub(rows.len());
+    // "Not shown" covers both causes — the thread limit and the suspension budget — but they are
+    // different states, so the budget's own line above says which one applied.
+    let hidden = meta.total.saturating_sub(rows.len());
     if hidden > 0 {
         let _ = writeln!(out, "\n… +{hidden} more thread(s) (raise limit, or narrow with name_filter)");
     }
-    let _ = write!(out, "\nCost: {cost} JDWP packet(s).");
+    let _ = write!(out, "\nCost: {} JDWP packet(s).", meta.cost);
     out
 }
 
@@ -7192,6 +7278,19 @@ mod tests {
         serde_json::from_value(json).expect("valid ThreadDumpArgs")
     }
 
+    /// A `DumpMeta` for a dump that suspended nothing and completed — the fields each test varies are
+    /// overridden at the call site, so a test only states what it is actually about.
+    fn dump_meta(total: usize, cost: u32) -> DumpMeta<'static> {
+        DumpMeta {
+            total,
+            already_suspended: false,
+            resume_note: "",
+            cost,
+            held: None,
+            unread: 0,
+        }
+    }
+
     const ALL_CAPS: jdwp_client::vm::VmCapabilities = jdwp_client::vm::VmCapabilities {
         can_watch_field_modification: true,
         can_watch_field_access: true,
@@ -7214,7 +7313,7 @@ mod tests {
         two.waiting_on = Some(("LockA@d".to_string(), 0xd));
 
         let out = render_thread_dump(
-            &[one, two], 2, &dump_args(json!({})), Some(&ALL_CAPS), false, "", 44,
+            &[one, two], &dump_args(json!({})), Some(&ALL_CAPS), &dump_meta(2, 44),
         );
         assert!(
             out.contains("waiting to enter: LockB@f ← held by 0x9 \"deadlock-two\""),
@@ -7234,7 +7333,7 @@ mod tests {
         let mut one = dump_row(0x8, "deadlock-one");
         one.waiting_on = Some(("LockB@f".to_string(), 0xf));
         let out = render_thread_dump(
-            &[one], 9, &dump_args(json!({"limit": 1})), Some(&ALL_CAPS), false, "", 10,
+            &[one], &dump_args(json!({"limit": 1})), Some(&ALL_CAPS), &dump_meta(9, 10),
         );
         assert!(out.contains("waiting to enter: LockB@f"), "the contended lock is still shown:\n{out}");
         assert!(!out.contains("held by"), "no holder may be invented for a thread not dumped:\n{out}");
@@ -7251,21 +7350,80 @@ mod tests {
             ..ALL_CAPS
         };
         let out = render_thread_dump(
-            &[dump_row(0x8, "worker")], 1, &dump_args(json!({})), Some(&caps), false, "", 5,
+            &[dump_row(0x8, "worker")], &dump_args(json!({})), Some(&caps), &dump_meta(1, 5),
         );
         assert!(out.contains("cannot report all monitor info"), "the gap must be stated:\n{out}");
         assert!(out.contains("canGetOwnedMonitorInfo=false"), "and named precisely:\n{out}");
 
         // Capabilities unreadable is its own case, and must not silently look like "no locks held".
         let unknown =
-            render_thread_dump(&[dump_row(0x8, "worker")], 1, &dump_args(json!({})), None, false, "", 5);
+            render_thread_dump(&[dump_row(0x8, "worker")], &dump_args(json!({})), None, &dump_meta(1, 5));
         assert!(unknown.contains("monitors were skipped"), "an unknown capability set is stated:\n{unknown}");
 
         // ...but a dump that never asked for monitors says nothing about them at all.
         let off = render_thread_dump(
-            &[dump_row(0x8, "worker")], 1, &dump_args(json!({"monitors": false})), None, false, "", 5,
+            &[dump_row(0x8, "worker")], &dump_args(json!({"monitors": false})), None, &dump_meta(1, 5),
         );
         assert!(!off.contains("monitor info"), "monitors:false should not editorialise:\n{off}");
+    }
+
+    // #17: the held duration is reported whenever this dump owned the freeze, and NOT when it didn't —
+    // a dump that suspended nothing must not appear to have frozen the VM for 0ms, which reads as a
+    // measurement rather than an absence.
+    #[test]
+    fn thread_dump_reports_the_held_duration_only_when_it_held_the_vm() {
+        let mut meta = dump_meta(1, 5);
+        meta.held = Some(std::time::Duration::from_millis(137));
+        let held = render_thread_dump(&[dump_row(0x8, "worker")], &dump_args(json!({})), None, &meta);
+        assert!(held.contains("Held the VM suspended for 137ms"), "the real number is reported:\n{held}");
+
+        let not_held =
+            render_thread_dump(&[dump_row(0x8, "worker")], &dump_args(json!({})), None, &dump_meta(1, 5));
+        assert!(
+            !not_held.contains("Held the VM"),
+            "a dump that suspended nothing must claim no freeze:\n{not_held}"
+        );
+    }
+
+    // #17: an exhausted budget is announced, names what it skipped, and says the dump is INCOMPLETE.
+    // Silence here would be the worst outcome — a truncated dump reads as "these are all the threads".
+    #[test]
+    fn thread_dump_announces_a_budget_truncation_and_never_implies_completeness() {
+        let mut meta = dump_meta(60, 900);
+        meta.held = Some(std::time::Duration::from_millis(2001));
+        meta.unread = 47;
+        let out = render_thread_dump(
+            &[dump_row(0x8, "worker-0")], &dump_args(json!({"suspend": true})), None, &meta,
+        );
+        assert!(out.contains("Stopped early"), "the truncation must be stated:\n{out}");
+        assert!(out.contains("47 thread(s) still"), "and name how many it skipped:\n{out}");
+        assert!(out.contains("INCOMPLETE"), "and refuse to look complete:\n{out}");
+        assert!(out.contains("max_suspend_ms"), "and say which knob to turn:\n{out}");
+
+        // A completed dump says none of it.
+        let mut done = dump_meta(1, 5);
+        done.held = Some(std::time::Duration::from_millis(12));
+        let complete = render_thread_dump(&[dump_row(0x8, "worker")], &dump_args(json!({})), None, &done);
+        assert!(!complete.contains("Stopped early"), "a complete dump must not warn:\n{complete}");
+    }
+
+    // The two thread states are independent axes, and the row must not run them together: `monitor` is
+    // the application blocking on a lock, `debugger-suspended` is us holding it. `[monitor, suspended]`
+    // invited "suspended at a monitor", which credits the freeze to the wrong party.
+    #[test]
+    fn a_dump_row_keeps_blocked_and_debugger_suspended_apart() {
+        let out = render_thread_dump(
+            &[dump_row(0x8, "deadlock-one")], &dump_args(json!({})), None, &dump_meta(1, 5),
+        );
+        assert!(out.contains("[monitor] debugger-suspended"), "the axes must read separately:\n{out}");
+        assert!(!out.contains("[monitor, suspended]"), "the old ambiguous form must be gone:\n{out}");
+
+        let mut running = dump_row(0x9, "http-listener");
+        running.suspended = false;
+        running.status = "running";
+        let out = render_thread_dump(&[running], &dump_args(json!({})), None, &dump_meta(1, 5));
+        assert!(out.contains("[running]"), "an unsuspended thread shows only its own state:\n{out}");
+        assert!(!out.contains("debugger-suspended"), "and is not labelled as held:\n{out}");
     }
 
     // SAFE-4: an unreadable thread is reported on its own line with what would fix it, and the reply
@@ -7277,7 +7435,7 @@ mod tests {
         row.status = "running";
         row.stack = Err("running — JDWP can only read a suspended thread's stack".to_string());
 
-        let out = render_thread_dump(&[row], 1, &dump_args(json!({})), None, false, "", 4);
+        let out = render_thread_dump(&[row], &dump_args(json!({})), None, &dump_meta(1, 4));
         assert!(out.contains("1 thread(s) are running"), "the count of unreadable threads is stated:\n{out}");
         assert!(out.contains("suspend:true"), "and how to get a full dump:\n{out}");
         assert!(!out.contains("(no frames)"), "unreadable must not render as an idle thread:\n{out}");

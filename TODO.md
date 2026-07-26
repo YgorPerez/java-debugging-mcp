@@ -478,6 +478,36 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   The capability-refusal paths are unit-tested against `render_thread_dump`, since no `HotSpot` will
   exercise them. `jdwp-trace`'s `TECHNIQUES.md` gains a "8180 is wedged" entry and `run-infotravel` a
   pointer, both with the narrowed 8180-safe invocation rather than a bare dump.
+  Recorded as **ADR-0009**, including that this reads #15's "does not suspend as a side effect" as "does
+  not suspend *silently*" — issue and code otherwise appear to disagree, and the interpretation is the
+  load-bearing part of the design.
+- **The dump's suspension window is bounded and reported (#17, items 1–2)** — DUMP-1 made the suspension
+  explicit, which was the important half, and left its *magnitude* unbounded and unreported: `suspend:true`
+  held the VM for the whole collection loop, and the reply gave the packet cost but never the duration. So
+  the one number that matters on a shared instance — what this diagnostic cost everyone else — was the one
+  missing, inferable only from a packet count and a guess at round-trip latency.
+  The reply now states the **held duration**, measured around the suspend/resume pair alone so our own
+  string building can never inflate it (rendering happens after the resume, deliberately). `max_suspend_ms`
+  (default 2000, `0` = unbounded) bounds the freeze: checked at the *thread boundary* so stopping never
+  leaves a half-read row or holds the VM longer to finish one, and on exhaustion the dump resumes at once,
+  returns what it has, and reports **`INCOMPLETE`** with the count it skipped and which knob to turn. Same
+  shape as ADR-0002's trace budget — counted server-side, charged per unit of work, stop announced.
+  Truncation and the resume outcome stay separate facts, because "I stopped early" and "I could not resume"
+  are different problems; a truncated dump still resumes via `resume_all_fully` and still verifies, so
+  ADR-0003 holds on the new early-exit path.
+  Also fixed here, same renderer: a row read `[monitor, suspended]`, running two **independent axes**
+  together — `monitor` is the application blocked on a lock, `suspended` is us holding it. As one
+  comma-separated list it invited "suspended at a monitor", crediting the freeze to the application rather
+  than to the debugger, which is exactly backwards for the state DUMP-1's readability logic keys off. Now
+  `[monitor] debugger-suspended`.
+  The default is **provisional**: 2000ms is picked from loopback, where a dump measured 5–10ms held and a
+  round trip is sub-millisecond. Calibrating it against a real pool is part of #13, which this adds a sixth
+  assumption to.
+  Validated by `a_dump_reports_how_long_it_held_the_vm_and_a_budget_bounds_it` (+
+  `examples/probes/ManyThreadsProbe.java`, 60 parked workers three frames deep). The budget is proven by
+  making it *impossible to meet* — 1ms against 60 threads — rather than by hoping a dump was slow, and
+  `main` is deliberately not one of the workers, since it is the only thread that can show a
+  budget-truncated dump still resumed the VM. Remaining from #17: the monitors-only cheap mode.
 - **One node budget per `get_stack` call (OBJ-3)** — `DEEP_NODE_BUDGET` was allocated fresh per
   `render_value_deep`, and `get_stack` called it once per local, so `expand_objects:true` on 20 frames
   × 20 locals could walk ~160k nodes against a possibly-shared JVM: a documented cap that bounded

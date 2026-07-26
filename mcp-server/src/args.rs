@@ -21,6 +21,7 @@ const fn default_max_depth() -> usize { 2 }
 const fn default_max_children() -> usize { 16 }
 const fn default_trace_frames() -> usize { crate::handlers::DEFAULT_TRACE_FRAMES }
 const fn default_dump_frames() -> usize { 8 }
+const fn default_max_suspend_ms() -> u64 { crate::handlers::DEFAULT_MAX_SUSPEND_MS }
 
 /// Parse an optional hex thread id like "0x2" (or "2") into a raw id.
 pub fn parse_thread_id(s: Option<&str>) -> Option<u64> {
@@ -280,6 +281,17 @@ pub struct ThreadDumpArgs {
     /// automatically, with a note, on a JVM that lacks the capability.
     #[serde(default = "default_true")]
     pub monitors: bool,
+    /// Cap how long the VM may be held **suspended** while collecting, in milliseconds (default 2000;
+    /// `0` = unbounded). Only meaningful with `suspend:true`.
+    ///
+    /// A dump is many round trips by construction, and the VM stays frozen for all of them — so the
+    /// freeze grows with the thread count and frame depth, and on a remote JVM it is round-trip-latency
+    /// bound rather than fast. When the budget runs out the dump resumes the VM immediately, returns what
+    /// it gathered, and **says which threads it did not read** — a truncated dump is never presented as a
+    /// complete one. Raise it for a deliberately deep dump, or narrow with `name_filter` / `limit` /
+    /// `max_frames` / `package_filter` instead, which costs nothing.
+    #[serde(default = "default_max_suspend_ms")]
+    pub max_suspend_ms: u64,
     /// Suspend the VM for the duration of the dump, then resume it and verify it is running again.
     ///
     /// Off by default, and that default is the point: JDWP can only read a **suspended** thread's stack
