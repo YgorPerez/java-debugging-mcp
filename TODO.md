@@ -7,9 +7,14 @@ item and finish it.
 
 ## Coverage: `scripts/coverage.sh`, and the gaps reviewed once
 
-**85.28% region / 86.64% line / 79.62% functions**, unit + integration together — 47/47 tests, zero skips
-(TEST-7, #19). Up from 83%/78% at TEST-5, across roughly 1,500 lines added by TRACE-5, DUMP-1, DUMP-2,
-METH-1 and #17.
+**86.19% region / 87.70% line / 80.43% functions**, unit + integration together — 55 unit + 6 doc + 7 stdio
++ 48 integration tests, zero skips (TRACE-7/TEST-9/CLEAN-1). Up from **85.28% / 86.64% / 79.62%** at TEST-7
+(#19), and from 83%/78% at TEST-5.
+
+The move worth naming is not the total: **`main.rs` went from 65.38% region / 66.25% line to 90.07% /
+95.88%**, which was TEST-9's whole point — it was the one uncovered path #19 judged a real gap. The new
+`mcp-server/tests/stdio_protocol.rs` needs **no JDK**, so unlike everything in `mcp_integration.rs` it runs
+in the default `cargo test`.
 
 Measured **in CI**, by `.github/workflows/coverage.yml`, and that is now the only place it can be measured:
 `-C instrument-coverage` needs the profiler runtime, and rustup ships no `profiler_builtins` for
@@ -26,12 +31,12 @@ broken instrument produced a plausible-looking low number, not an error.
 
 ### Read the function column with care — async breaks it
 
-`handlers.rs` reports **188 of 746 functions "missed"**, which reads as a great deal of dead code and is
+`handlers.rs` reports **186 of 754 functions "missed"**, which reads as a great deal of dead code and is
 mostly an artifact. For an `async fn`, llvm-cov attributes hits to the *generator* the compiler produces,
-while the elided outer shell that merely builds the future records **zero**. So `handle_thread_dump`,
-`handle_attach` and even `main` all appear as never-executed while 47 tests drive them. Judge a function
-by the max hit count across *all* its entries (shell plus closures), not by the shell. The region and line
-columns are unaffected.
+while the elided outer shell that merely builds the future records **zero**. So `handle_thread_dump` and
+`handle_attach` appear as never-executed while 48 tests drive them. Judge a function by the max hit count
+across *all* its entries (shell plus closures), not by the shell. The region and line columns are
+unaffected.
 
 Worth writing down because it is the same trap in a new costume: a number that reads as a finding and is
 an instrument artifact.
@@ -61,15 +66,18 @@ is what was intended. Hit counts from the run:
 - **`Value::format`** (`types.rs:102`) — **51 hits, not dead code**, confirming the earlier verdict. Note
   `types.rs` still shows 16.67% region: the file is one big match over value kinds and most arms are for
   types the probes never produce. Low percentage, not a finding.
-- **`get_id_sizes`** (`vm.rs:76`) — **0 hits. Genuinely never executed**, the only named function in this
-  review that is. Dead as far as this server is concerned: nothing calls it, and nothing needs to, since
-  the id sizes are assumed 8-byte. Keep or delete; it is not a test gap.
-- **`get_version`** (`vm.rs:47`) — **now reached** (2 hits, via attach). The old verdict paired it with
-  `get_id_sizes` as "conveniences the server never calls"; that has since stopped being true for one of
-  the pair. Recorded because a stale verdict is worse than none.
+- **`get_id_sizes`** (`vm.rs:76`) — **0 hits, genuinely never executed**, the only named function in this
+  review that was. **Deleted** by CLEAN-1 (#27): nothing called it and nothing needed to, since the reader
+  assumes 8-byte ids outright. The one caller that existed was `examples/test_vm_commands.rs`, an ad-hoc
+  manual harness nothing runs — which is why the coverage run measured zero, and is not a use. The
+  assumption it nominally guarded is now stated where the reader actually makes it (the header of
+  `reader.rs`), because an uncalled `IDSizes` wrapper made the widths look *checked* when they are not.
+- **`get_version`** (`vm.rs:47`) — **now reached** (2 hits, via attach). TEST-5 paired the two as
+  "conveniences the server never calls", and that verdict has now expired in both directions: this one is
+  reached, and the other one is gone. Recorded because a stale verdict is worse than none.
 - **`main.rs` at 65.38%** — the stdio read loop and its malformed-message arms. **A real gap**, and the one
-  worth taking next: it is reachable through the process's own front door, so a test that writes junk JSON
-  to stdin would close most of it.
+  taken next: closed by TEST-9 (#25) with `mcp-server/tests/stdio_protocol.rs`, seven tests that need no
+  JDK. It found a hang, not a percentage — see the shipped entry below.
 
 There is deliberately **no coverage percentage gate** — the standing decision, and the reason is that a
 percentage rises with tests that assert nothing. The value is the list above — and it paid for itself on
@@ -79,8 +87,8 @@ the first run, which found a broken instrument rather than a low number.
 
 Why read-only is enforced at the wire boundary, why the trace budget isn't JDWP's `Count`, why suspends have
 to be counted, why an auto-disarm disables rather than deletes, why stop-point ids aren't request ids, why
-expansion is opt-in, and why `doctor.sh` is the lint gate — each with the rejected alternative and the
-evidence. See [`docs/adr/`](docs/adr/README.md). The two sections below are the operational summaries; the
+expansion is opt-in, why `doctor.sh` is the lint gate, and why a traced stop point times its capture window
+and nothing else — each with the rejected alternative and the evidence. See [`docs/adr/`](docs/adr/README.md). The two sections below are the operational summaries; the
 ADRs are the reasoning.
 
 ## `cargo clippy` does not lint the integration tests — run `scripts/doctor.sh`
@@ -733,21 +741,65 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   instead of per frame, and a filtered map's surviving keys are moved out of the scan rather than cloned
   from a shared vector per match. Moving an allocation somewhere the heuristic cannot see it would have
   scored the same and fixed nothing.
+- **A traced stop point reports what it actually costs (TRACE-7, #26)** — item 4 of #22, the observation
+  half of what that issue documented. #22 put ~0.86 ms per hit and a ~720 hits/s ceiling in the tool
+  descriptions; true figures, from one measurement, on one machine, against one endpoint. What a caller
+  needs is what **their** stop point on **their** site costs, and the debugger was the only thing that could
+  answer — it already counted hits for `trace_max_hits`, so it only lacked a clock. `list_stop_points` now
+  reports, per traced stop point: mean capture, the rate it could sustain before hits queue (1/mean, the
+  observed counterpart of the documented ceiling), the rate hits are **arriving** at, and the share of the
+  window spent capturing — which is the number that answers "is this hurting the instance?", since a cheap
+  capture on a hot line and a costly one on a quiet line are not the same problem. Same move #17 made for
+  `thread_dump`'s held duration, and measured the same way: the timer wraps the **capture only**, never the
+  budget arithmetic or the resume, so our own bookkeeping cannot inflate the price we then blame on
+  tracing. A traced stop point with no hits reports UNMEASURED rather than `0.00ms` — a rounded-down zero
+  would read as free. A suspending one reports nothing at all, because it captures nothing; its price is the
+  freeze. Re-arming resets the figures (a disabled gap would otherwise dilute the arrival rate into
+  nonsense). Recorded as **ADR-0010**, with the rejected alternatives — timing the whole pump iteration,
+  acting on the number rather than reporting it, and a separate `debug.trace_cost` tool.
+  Validated by `a_traced_stop_point_reports_its_observed_capture_cost` against `CallerProbe`, which reaches
+  the traced line **three times per ~150 ms iteration** — so the arrival rate is known independently and the
+  test asserts the reported numbers land on it (~20/s) rather than merely being present. It measured
+  **1.65 ms mean / ~608 hits/s / 20.5 hits/s arriving / 3.4% of the window** here, which corroborates #22's
+  ~1.39 ms and ~720/s on slower hardware — the first time those figures have been checked by anything but
+  the measurement that produced them.
+- **The stdio front door, covered — and it was hiding a hang (TEST-9, #25)** — `main.rs` sat at 65% region
+  because every test in the suite constructed a **valid** request, so the parsing between a buggy client and
+  the debugger was the one thing nothing drove. `mcp-server/tests/stdio_protocol.rs` drives it with input a
+  client should never send. The find was not a percentage: a top-level JSON value that is **not an object**
+  — `42`, `"hello"`, a batch array — has no `id`, so it fell into the notification branch, failed to parse
+  as one, and was answered with **nothing at all**. Valid JSON, so not a parse error; not an object, so not
+  a request. A client waited forever for a reply that was never coming, which is worse than any error code.
+  It now answers `INVALID_REQUEST` with a null id, as JSON-RPC 2.0's own example for a non-object does,
+  while a genuine notification's silence — which is *correct* — is left alone.
+  Seven tests, and each asserts the property that actually matters: an error came back **and the server is
+  still serving**, because one bad line must not end the session. They cover unparseable JSON, a
+  non-object, an object with no `method`, a non-string `method`, an unknown method, an odd-but-legal `id`
+  shape, notifications and blank lines (proved silent by ordering, not by a timeout), EOF as a clean exit,
+  and a final request with no trailing newline — which is answered *at* EOF, since `read_line` holds a
+  partial line until the newline or the close. **No JDK needed**, so they are not `#[ignore]`d: hiding them
+  behind the flag that exists for JVM tests would put them behind a gate they don't need.
+- **`get_id_sizes` deleted (CLEAN-1, #27)** — the only function in the #19 coverage review with **zero hits
+  anywhere**. Its one caller was `examples/test_vm_commands.rs`, a manual harness nothing runs, which is
+  why it measured zero. Deleting it was the point: the reader assumes 8-byte ids outright, and an uncalled
+  `IDSizes` wrapper made that assumption look **checked** when nothing checked it. The assumption is now
+  stated where the reader relies on it, explicitly as unvalidated, along with what a real check would have
+  to be (a refusal at attach time) and what a mismatch would look like without one (misaligned reads
+  surfacing as garbled values, not as a clear error). `vm_commands::ID_SIZES` stays: it is one row of a
+  complete spec-derived constant table, most of which is unused by design.
 
 ---
 
 ## Backlog
 
-**Five open, all filed from evidence produced by closing #17–#22** rather than from review — the work
-itself is what surfaced them. Tracked as GitHub issues, not here:
+**Two open.** Three of the five filed from #17–#22's evidence have shipped (#25, #26, #27 — see above);
+what is left is what an agent cannot do, and for the stated reason in each case. Tracked as GitHub issues,
+not here:
 
-| issue | why it exists |
-| --- | --- |
-| [#24](https://github.com/YgorPerez/java-debugging-mcp/issues/24) TEST-8 · P1 | Successor to the closed TEST-6/#13. Every shared-instance default (`max_suspend_ms` 2000, `limit` 40, `max_frames` 8) was calibrated on loopback against probes, and the monitors-only saving was measured at 3 frames deep. Needs the real 8180. |
-| [#25](https://github.com/YgorPerez/java-debugging-mcp/issues/25) TEST-9 · P2 | `main.rs`'s stdio loop at 65% — the only uncovered path #19 judged a *real* gap. Needs no JVM. |
-| [#26](https://github.com/YgorPerez/java-debugging-mcp/issues/26) TRACE-7 · P2 | Item 4 of #22: report a trace's *observed* cost in `list_stop_points`, the way the dump now reports its held duration. |
-| [#27](https://github.com/YgorPerez/java-debugging-mcp/issues/27) CLEAN-1 · P3 | `get_id_sizes` — the one function in the #19 review with zero hits anywhere. |
-| [#28](https://github.com/YgorPerez/java-debugging-mcp/issues/28) LINT-2 · P2 | The #18 gate's maintenance debt: a pinned toolchain with no bump trigger, and per-crate `clippy.toml` that a third crate would not have. |
+| issue | why it exists | why it is still open |
+| --- | --- | --- |
+| [#24](https://github.com/YgorPerez/java-debugging-mcp/issues/24) TEST-8 · P1 | Successor to the closed TEST-6/#13. Every shared-instance default (`max_suspend_ms` 2000, `limit` 40, `max_frames` 8) was calibrated on loopback against probes, and the monitors-only saving was measured at 3 frames deep. | Needs the real 8180 — an instance other people are using — and a judgment call about how long it is acceptable to freeze it. |
+| [#28](https://github.com/YgorPerez/java-debugging-mcp/issues/28) LINT-2 · P2 | The #18 gate's maintenance debt: a pinned toolchain with no bump trigger, and per-crate `clippy.toml` that a third crate would not have. | Item 1 is a policy call about cadence and noise tolerance; item 2's best fix depends on the answer. |
 
 A **fifth** review found three more, shipped as issues
 [#7–#9](https://github.com/YgorPerez/java-debugging-mcp/issues?q=is%3Aissue). The headline one was
