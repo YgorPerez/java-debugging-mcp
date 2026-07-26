@@ -42,7 +42,7 @@ pub struct DebugSession {
     /// of truth, and it also lets a manual `debug.pause` be told apart from a stop-point hit (SAFE-4).
     pub suspended_cause: Option<SuspendCause>,
     pub watchdog_task: Option<JoinHandle<()>>,
-    /// What the watchdog last did, if anything — surfaced in `list_breakpoints` and `get_last_event`
+    /// What the watchdog last did, if anything — surfaced in `list_stop_points` and `get_last_event`
     /// so a caller who was away learns the VM was auto-resumed and which stop point was disarmed (SAFE-2).
     pub last_watchdog_note: Option<String>,
     /// Traced stop points that disarmed themselves on reaching their hit budget (TRACE-3), as
@@ -78,7 +78,7 @@ pub struct DebugSession {
     /// Monotonic counter behind caller-facing stop-point ids (`bp_`/`exc_`/`watch_`).
     ///
     /// Ids used to embed the JDWP request id, so re-arming a disabled stop point gave it a *new* id and
-    /// silently broke any id the caller had stored — the thing that made `toggle_breakpoint` awkward to
+    /// silently broke any id the caller had stored — the thing that made `toggle_stop_point` awkward to
     /// script (BP-3). The request id is an internal detail now: still reported, never the identity.
     pub stop_seq: u64,
 }
@@ -197,8 +197,8 @@ pub struct TraceRecord {
 }
 
 /// An active exception breakpoint: an EXCEPTION event request that fires when a matching
-/// exception is thrown. Tracked so it shows in `list_breakpoints` and is cleared by
-/// `clear_breakpoint` / panic, like a normal breakpoint.
+/// exception is thrown. Tracked so it shows in `list_stop_points` and is cleared by
+/// `clear_stop_point` / panic, like a normal breakpoint.
 #[derive(Debug, Clone)]
 // Four bools, and each is an independent property of the JDWP request as the protocol defines it
 // (armed / caught / uncaught / traced) rather than a parameter bag that wants splitting up.
@@ -228,12 +228,12 @@ pub struct ExceptionRequestInfo {
     pub trace_budget: Option<u32>,
     /// How many caller frames each traced throw records above the throwing frame (TRACE-5).
     pub trace_frames: usize,
-    /// Thread this request is filtered to (`ThreadOnly`), if any — for the `list_breakpoints` line (FILT-1).
+    /// Thread this request is filtered to (`ThreadOnly`), if any — for the `list_stop_points` line (FILT-1).
     pub thread_filter: Option<u64>,
 }
 
 /// An active field watchpoint: a `FIELD_ACCESS` or `FIELD_MODIFICATION` event request on one field.
-/// Tracked so it shows in `list_breakpoints` and is cleared by `clear_breakpoint` / panic like a
+/// Tracked so it shows in `list_stop_points` and is cleared by `clear_stop_point` / panic like a
 /// normal breakpoint — `ClearAllBreakpoints` does not touch it.
 #[derive(Debug, Clone)]
 pub struct WatchpointInfo {
@@ -251,7 +251,7 @@ pub struct WatchpointInfo {
     /// Dotted class name the caller gave, for messages.
     pub class_name: String,
     pub field_name: String,
-    /// Whether the field is static, for the `list_breakpoints` line.
+    /// Whether the field is static, for the `list_stop_points` line.
     ///
     /// Hit *reporting* deliberately does not read the declaring type or field id from here (see `arm`):
     /// a hit carries all of it, so `get_last_event` resolves them from the event and can still describe
@@ -267,15 +267,15 @@ pub struct WatchpointInfo {
     pub trace_budget: Option<u32>,
     /// How many caller frames each traced hit records above the mutating frame (TRACE-5).
     pub trace_frames: usize,
-    /// Thread this watch is filtered to (`ThreadOnly`), if any — for the `list_breakpoints` line (FILT-1).
+    /// Thread this watch is filtered to (`ThreadOnly`), if any — for the `list_stop_points` line (FILT-1).
     pub thread_filter: Option<u64>,
 }
 
 /// An active method-exit request (METH-1): a `METHOD_EXIT` / `METHOD_EXIT_WITH_RETURN_VALUE` request
 /// reporting what a method returned, keyed by its `mexit_` id.
 ///
-/// Tracked like every other stop point so `list_breakpoints` shows it and `clear_breakpoint` / `panic` /
-/// `toggle_breakpoint` handle it. A stop point this tool can create but not clear would be a SAFE-class
+/// Tracked like every other stop point so `list_stop_points` shows it and `clear_stop_point` / `panic` /
+/// `toggle_stop_point` handle it. A stop point this tool can create but not clear would be a SAFE-class
 /// bug — and this is the kind least survivable if left armed, since a suspending method exit on a hot
 /// method freezes the VM faster than anything else here.
 #[derive(Debug, Clone)]
@@ -354,7 +354,7 @@ pub struct BreakpointInfo {
     /// How many caller frames each traced hit records above the hit frame (TRACE-5). 0 restores the
     /// original one-frame snapshot.
     pub trace_frames: usize,
-    /// Everything needed to re-arm this breakpoint at the same location after a `toggle_breakpoint`
+    /// Everything needed to re-arm this breakpoint at the same location after a `toggle_stop_point`
     /// disable (BP-1). Kept for every armed breakpoint so disable→enable round-trips exactly.
     pub arm: BreakpointArm,
 }

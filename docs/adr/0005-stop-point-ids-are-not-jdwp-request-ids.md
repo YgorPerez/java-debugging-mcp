@@ -6,7 +6,7 @@ Stop points were keyed by their JDWP request id: `bp_<request_id>`, `exc_<reques
 `watch_<kind>_<request_id>`. That was fine while a stop point was armed exactly once and then cleared.
 
 ADR-0004 made disable/re-arm a normal operation, and re-arming assigns a **new** JDWP request. So the id
-changed underneath the caller: `toggle_breakpoint {bp_5, enabled:true}` returned a breakpoint now called
+changed underneath the caller: `toggle_stop_point {bp_5, enabled:true}` returned a breakpoint now called
 `bp_9`, and a caller repeating their original call got "not found". Any stored id died on the first
 disable→enable round trip — in the tool whose whole purpose is to be scripted.
 

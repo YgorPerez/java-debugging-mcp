@@ -29,18 +29,31 @@ jobs:
       - uses: actions/checkout@v4
 
       # rust-doctor shells out to `cargo clippy`, so the runner needs cargo + clippy.
+      #
+      # PINNED, deliberately (LINT-1, #18). The gate below fails on warnings, so an unpinned `stable`
+      # would let a new pedantic lint in a future clippy break CI on code nobody touched — which is how
+      # the earlier `--fail-on error` compromise came about in the first place. Pinning moves that from
+      # a surprise into a scheduled bump: raise this number, fix what the new clippy finds, commit both
+      # together. rust-doctor itself is already pinned (0.2.0, below and in scripts/doctor.sh).
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.1"
           components: clippy
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      # --fail-on error gates the build on errors only (exit 3) so the current pedantic-clippy
-      # warnings don't break it; SARIF is written to the file either way and uploaded below.
+      # --fail-on warning gates the build on warnings as well as errors (exit 3). It used to gate on
+      # errors only, because there was a backlog of pedantic-clippy warnings to work through; that
+      # backlog was cleared in 7253499 and then drifted back to 7 over 24 commits, because nothing
+      # enforced it and the regression was mistaken for pre-existing debt. Zero is only zero if
+      # something checks. See ADR-0007 and #18.
+      #
+      # SARIF is written to the file either way and uploaded below (`if: always()`), so a failing gate
+      # still publishes the findings to code scanning rather than hiding them.
       - name: Run rust-doctor
-        run: npx -y rust-doctor@0.2.0 --sarif --fail-on error > rust-doctor.sarif
+        run: npx -y rust-doctor@0.2.0 --sarif --fail-on warning > rust-doctor.sarif
 
       - name: Upload SARIF to code scanning
         if: always()

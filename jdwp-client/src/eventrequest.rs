@@ -151,7 +151,7 @@ impl JdwpConnection {
     /// subclasses*; pass `None` (or 0) to catch every exception — noisy, since a live JVM throws
     /// and catches exceptions internally all the time, so prefer a concrete type. `caught` /
     /// `uncaught` select which throws to report (at least one should be true). Returns the request
-    /// id. This is the primitive behind `debug.set_exception_breakpoint`.
+    /// id. This is the primitive behind `debug.set_exception_stop`.
     ///
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
@@ -222,7 +222,7 @@ impl JdwpConnection {
     }
 
     /// Watch one field (EventRequest.Set with a `FieldOnly` modifier) — the primitive behind
-    /// `debug.set_watchpoint`, answering "who touches this field?".
+    /// `debug.set_field_stop`, answering "who touches this field?".
     ///
     /// `kind` picks [`WatchKind::Modify`] (`FIELD_MODIFICATION` — fires *before* the store commits,
     /// so the field still reads as its old value) or [`WatchKind::Access`] (`FIELD_ACCESS`, every
@@ -287,7 +287,7 @@ impl JdwpConnection {
     }
 
     /// Report every return from a method of a class matching `class_pattern` (EventRequest.Set with a
-    /// `ClassMatch` modifier) — the primitive behind `debug.set_method_breakpoint`, answering "what did
+    /// `ClassMatch` modifier) — the primitive behind `debug.set_method_exit_stop`, answering "what did
     /// this method actually return?" without having to guess which `return` statement runs.
     ///
     /// `with_return_value` picks `METHOD_EXIT_WITH_RETURN_VALUE` (kind 42), which carries the returned

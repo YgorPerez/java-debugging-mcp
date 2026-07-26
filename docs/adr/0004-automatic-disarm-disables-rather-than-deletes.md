@@ -13,7 +13,7 @@ threw away the offender's setup.
 ## Decision
 
 `disarm_request` clears the JDWP request and marks the stop point **disabled** (`request_id: None`,
-`enabled: false`), keeping the definition. One `debug.toggle_breakpoint` re-arms it. This applies to all
+`enabled: false`), keeping the definition. One `debug.toggle_stop_point` re-arms it. This applies to all
 three kinds — line breakpoints, exception requests and watchpoints — so exception requests and watchpoints
 gained a disabled state and the re-arm information to go with it.
 
@@ -25,7 +25,7 @@ built conditional breakpoint on a timeout is hostile in exactly the situation wh
 
 ## Consequences
 
-- `list_breakpoints` shows disabled entries with a `✗` and an explanation, so a disarmed stop point is
+- `list_stop_points` shows disabled entries with a `✗` and an explanation, so a disarmed stop point is
   visible rather than mysteriously absent.
 - A re-armed stop point gets a **fresh trace budget** — it was disarmed *because* the old one ran out, so
   re-arming with zero left would fire once and immediately disable itself again.

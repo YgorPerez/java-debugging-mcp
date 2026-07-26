@@ -7,8 +7,27 @@ item and finish it.
 
 ## Coverage: `scripts/coverage.sh`, and the gaps reviewed once
 
-**83% region / 78% line**, unit + integration together. Read it with one caveat in mind: the number is only
-meaningful because the harness now shuts the server down by closing stdin rather than `kill()`ing it.
+> **These figures are STALE and were not re-measured (TEST-7, #19 — still open).** They predate TRACE-5,
+> DUMP-1, DUMP-2, METH-1 and #17, which added roughly 1,500 lines to `handlers.rs` plus new `jdwp-client`
+> primitives. The re-run is **blocked on this host, not skipped**: `-C instrument-coverage` needs the
+> profiler runtime, and rustup ships no `profiler_builtins` for `x86_64-pc-windows-gnu`. The
+> `stable-x86_64-pc-windows-msvc` toolchain *does* have it but has no `link.exe` (no Visual Studio C++
+> build tools), so neither toolchain on this machine can produce a report. `coverage.sh` now detects this
+> up front and says so, instead of dying ninety seconds into a build with a bare `error[E0463]: can't find
+> crate for profiler_builtins`.
+>
+> **To finish #19: run `scripts/coverage.sh --uncovered` on Linux** (what CI uses), and replace the numbers
+> and the verdict list below. The uneven split #19 describes is the thing to check — several functions
+> (`collect_dump_rows`, `read_dump_stack`, `read_thread_monitors`, `monitor_label`,
+> `describe_caller_chain`, `method_name_matches`) have **no unit test by design** and are covered only via
+> integration; "the right seam" and "actually reached" are different claims, and only a run tells them
+> apart. One thing that *was* settled meanwhile: those integration tests genuinely execute now — they had
+> never run on Windows at all (see Shipped), so any earlier local reading of this file was measuring a
+> suite that launched no JVMs.
+
+**83% region / 78% line**, unit + integration together, as of TEST-5. Read it with one caveat in mind: the
+number is only meaningful because the harness now shuts the server down by closing stdin rather than
+`kill()`ing it.
 Coverage counters flush in an `atexit` handler, which SIGKILL skips — so before that fix the entire
 integration suite contributed **nothing**, and `handlers.rs` measured 3.75% while 35 tests drove it. The
 broken instrument produced a plausible-looking low number, not an error.
@@ -54,13 +73,32 @@ commits (`i64 as usize` casts, redundant clones, missing doc backticks).
 **So: `cargo clippy` is not the gate. `scripts/doctor.sh` is.** Run it before claiming a change is clean,
 and `scripts/doctor.sh --diff main` to see only what you changed.
 
-Two warnings are known and deliberately left:
+**The gate fails on warnings, on a pinned toolchain** (LINT-1, #18). It used to gate on errors only, and
+the zero-warning state reached in `7253499` drifted back to seven over twenty-four commits — then got
+described as pre-existing debt rather than as the regression it was. Warnings are back to **0**, and CI
+now enforces it (`--fail-on warning`, pinned to Rust 1.97.1 so a new upstream lint becomes a scheduled
+bump rather than a broken build on code nobody touched). The reasoning and the rejected options are in
+[ADR-0007](docs/adr/0007-doctor-not-clippy-is-the-lint-gate.md).
+
+The five findings that had drifted back in were all mechanical, and were fixed the way the previous batch
+fixed its own: by extraction. `render_dump_header` → `dump_filter_note` + `dump_monitor_caveats`;
+`handle_set_field_stop` → `watch_kinds` + `arm_one_field_watch` + `render_field_stop_reply`;
+`handle_set_exception_stop` → `render_exception_stop_reply`; `handle_get_stack` → `render_stack_frame`
+over a `StackWalk`/`StackWalkState` pair; `handle_set_value` → `set_field_by_path`. The three
+`.clone()`-in-a-loop findings were restructured rather than relocated — the exhausted-local name is now
+copied once on the way out instead of per frame, and a filtered map's surviving keys are moved out of the
+scan rather than cloned out of a shared vector per match.
+
+One warning is known and deliberately left, and it is a *dependency* finding rather than a code one:
 
 - **`multiple versions for dependency syn` (2)** — `schemars` pulls `syn 3`, `serde_derive` pulls `syn 2`.
-  Not fixable without dropping one of them; harmless build-time duplication.
-- **4 handlers over the cyclomatic-complexity threshold** (`handle_get_stack` 16, `handle_set_value`,
-  `handle_set_watchpoint`, `handle_set_exception_breakpoint`) — all pre-existing and unchanged by recent
-  work, verified by scoring `main` separately. Worth splitting one day; not a regression to chase now.
+  Not fixable without dropping one of them; harmless build-time duplication. It scores as info, so the
+  warning gate does not trip on it.
+
+On a `windows-gnu` toolchain doctor also reports **one error** that is environmental rather than a code
+problem: its isolated `target/rust-doctor` build fails to link (`ld.exe: cannot find \symbols.o`, path
+mangling in that separate build dir). `cargo build` and `cargo clippy` are clean, and CI runs on Linux.
+Read the warning count locally and ignore that error.
 
 ## The resume-honesty invariant (read this before touching a resume path)
 
@@ -141,7 +179,7 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   Primitive `force_early_return` (ThreadReference.ForceEarlyReturn). Now runtime-verified: the test
   forces boolean/String/int returns and reads the probe's OWN stdout to confirm the caller received
   the forced value, not just that the debugger reported success.
-- **Exception breakpoints (EXC-1)** — `debug.set_exception_breakpoint {class_pattern, caught,
+- **Exception breakpoints (EXC-1)** — `debug.set_exception_stop {class_pattern, caught,
   uncaught}` breaks on a thrown exception (type + subclasses), reported via `debug.get_last_event`
   with the exception type + caught/uncaught + catch location. Primitives: `Exception` wire-decode,
   `set_exception_request`/`clear_exception_request`. `list`/`clear`/`panic` are aware. Validated
@@ -212,7 +250,7 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   Gotcha found: `Class.getMethod` only sees *public* methods, so reflecting into a package-private
   probe method throws `NoSuchMethodException` — and because the harness was discarding the probe's
   stderr, that surfaced as a bare timeout. The harness now folds stderr into the captured output.
-- **Field watchpoints (WATCH-1)** — `debug.set_watchpoint {class_name, field_name, modify, access}`
+- **Field watchpoints (WATCH-1)** — `debug.set_field_stop {class_name, field_name, modify, access}`
   breaks when a field is written (or read), answering "who mutates this?". A write hit reports the
   mutating `class.method:line`, the field, whether it's static, the owning instance, and the
   **old → new** pair — the old value is read while the thread sits suspended *before* the pending
@@ -349,7 +387,7 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   the output.
 - **Non-suspending exception breakpoints and watchpoints (TRACE-2)** — `trace:true` now works on
   **all three** kinds of stop point, not just line breakpoints:
-  `debug.set_exception_breakpoint {…, trace:true}` and `debug.set_watchpoint {…, trace:true}` arm with
+  `debug.set_exception_stop {…, trace:true}` and `debug.set_field_stop {…, trace:true}` arm with
   `EventThread`, snapshot the hit, and resume that thread — so the two tools you most want on the
   shared 8180 (silent catches; "who mutates this?") no longer freeze other people's requests. A traced
   throw records the exception type + caught/catch location; a traced write records the **old → new**
@@ -358,7 +396,7 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   `watchpoints` — deliberately three small scans rather than a fourth map keyed by request id, which
   would be a second source of truth that could outlive the entry it points at. `get_last_event`'s
   exception/field describers are now shared with the trace capture, so a traced hit reports exactly
-  what a suspending one would. `list_breakpoints` marks traced entries, and both tool descriptions now
+  what a suspending one would. `list_stop_points` marks traced entries, and both tool descriptions now
   say that the default suspends everything.
   Validated by `traced_exception_breakpoints_…` and `traced_watchpoints_…` in `mcp_integration.rs`
   (+ `examples/probes/ExcProbe.java`, a throw-and-swallow loop): each asserts the hits land in
@@ -378,7 +416,7 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   payload, the callers are context, and reading every caller's variable table would multiply the
   per-hit cost on something that may fire hundreds of times. It also keeps the whole capture
   invocation-free, so caller chains work in a read-only session (SAFE-6), unlike expansion. The depth
-  shows in `list_breakpoints` (`[+3 caller frame(s)]`) because it is what makes a hit cost more than one
+  shows in `list_stop_points` (`[+3 caller frame(s)]`) because it is what makes a hit cost more than one
   round trip, so a slowed debuggee stays explainable from a listing; a request past the cap is clamped
   **and says so**, since a silently ignored argument would leave a caller trusting a chain they never got.
   Bug this surfaced, and the reason the test asks for a depth no path can satisfy: JDWP answers
@@ -403,7 +441,7 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   `event_type_name` / `event_location` / `event_suspends`, but no tool could arm one — and the wire
   parser did not even dispatch to them, so the variants could never be constructed either. Half-built
   plumbing that implied a capability nothing had.
-  Finished the useful half: `debug.set_method_breakpoint` answers **what did this method actually
+  Finished the useful half: `debug.set_method_exit_stop` answers **what did this method actually
   return**, and from **which `return`**. `METHOD_EXIT_WITH_RETURN_VALUE` (kind 42) carries the value and
   the hit location is the return site, so a method with several exits stops being a guessing game — the
   `IntegraSrv.post`-style bug (a non-200 path returning `null`) is exactly "which return did it take, and
@@ -521,7 +559,7 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   the pool is saturated before asserting anything about the filter, because "the filter excluded the
   others" proves almost nothing against a handful of threads.
   **This found a real bug** — [#21](https://github.com/YgorPerez/java-debugging-mcp/issues/21) (FILT-2): a
-  filtered stop point stops reporting when its thread dies and `list_breakpoints` still shows it armed with
+  filtered stop point stops reporting when its thread dies and `list_stop_points` still shows it armed with
   `⚡`. Unreachable with an immortal-thread probe, and routine on a pool that reaps idle workers.
 - **The dump's suspension window is bounded and reported (#17, items 1–2)** — DUMP-1 made the suspension
   explicit, which was the important half, and left its *magnitude* unbounded and unreported: `suspend:true`
@@ -549,7 +587,8 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   `examples/probes/ManyThreadsProbe.java`, 60 parked workers three frames deep). The budget is proven by
   making it *impossible to meet* — 1ms against 60 threads — rather than by hoping a dump was slow, and
   `main` is deliberately not one of the workers, since it is the only thread that can show a
-  budget-truncated dump still resumed the VM. Remaining from #17: the monitors-only cheap mode.
+  budget-truncated dump still resumed the VM. The monitors-only cheap mode, item 3 of #17, followed —
+  see below.
 - **One node budget per `get_stack` call (OBJ-3)** — `DEEP_NODE_BUDGET` was allocated fresh per
   `render_value_deep`, and `get_stack` called it once per local, so `expand_objects:true` on 20 frames
   × 20 locals could walk ~160k nodes against a possibly-shared JVM: a documented cap that bounded
@@ -572,12 +611,83 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   up; `limit` reads the backlog oldest-first, `drain` discards what it returned. Validated by
   `events_are_buffered_so_a_second_hit_doesnt_erase_the_first` — a breakpoint then a step, both still
   retrievable, which is exactly what the single slot lost.
-- **Non-suspending trace breakpoints / logpoints (TRACE-1)** — `debug.set_breakpoint {…,
+- **Non-suspending trace breakpoints / logpoints (TRACE-1)** — `debug.set_line_stop {…,
   trace:true, trace_expr}` captures a snapshot (location, thread, in-scope locals/args, optional
   expression) and resumes just the hit thread (EventThread policy) — never freezes the VM. Bounded
   ring buffer (cap 500), read via `debug.get_traces {limit, clear}`. Validated — a probe looping a
   method yields N snapshots with args, loop counter strictly increasing (never frozen)
   (`examples/test_trace_bp.rs`).
+- **Monitors-only thread dump (DUMP-2, #17)** — the deadlock question ("who holds what, who waits on
+  whom") needs the lock graph, not the stacks, but reading every frame of every thread was the only way
+  to get it. `monitors_only:true` reads the monitors and skips the frames: **245 packets / 33 ms held
+  against 770 / 117 ms** for the same 60-thread dump. The point is the held time, not the packets — it is
+  the window in which nobody else's request runs.
+  What made this more than a flag: an omitted stack must not read as an *absent* stack. Frames now have
+  **three** states, not two — read, unreadable (thread running), and deliberately not requested — and the
+  third is stated once in the header rather than as an empty stack per row. An empty monitor set says
+  "not requested", never "idle", because a dump that showed no contention would otherwise be evidence of
+  no deadlock. `monitors_only` with `monitors:false` asks for neither locks nor stacks and is **refused**
+  rather than silently corrected into one of them, and a `package_filter`/`max_frames` passed alongside it
+  is reported as ignored instead of quietly having no effect.
+  Validated by `thread_dump_monitors_only_omits_stacks_without_claiming_there_are_none`,
+  `…_on_a_jvm_without_monitors_says_it_has_no_payload` and `…_reports_a_frame_filter_as_ignored`.
+- **Stop-point vocabulary (VOCAB-1, #20)** — `breakpoint` named three different scopes depending on the
+  tool: one source location in `set_breakpoint`, two things that were not locations in
+  `set_exception_breakpoint` / `set_method_breakpoint`, and all four kinds in `clear_breakpoint` /
+  `list_breakpoints` / `toggle_breakpoint` — while `set_watchpoint` was a stop point the word did not
+  cover at all. The tools now follow `CONTEXT.md`, where **stop point** is the umbrella and
+  **breakpoint** means a line breakpoint: `set_line_stop`, `set_exception_stop`, `set_field_stop`,
+  `set_method_exit_stop`, `clear_stop_point`, `list_stop_points`, `toggle_stop_point`.
+  This is a **breaking rename** with no aliases, taken deliberately while nothing scripted against the old
+  names; arguments and the `bp_…` / `exc_…` / `watch_…` / `mexit_…` id prefixes are unchanged, so only the
+  tool names move. The JDWP-level primitives (`conn.set_breakpoint`, `set_breakpoint_ex`) keep their names
+  — there `breakpoint` is precise. README carries a migration note listing every old name.
+- **Trace mode's throughput ceiling (TRACE-6, #22)** — the tool descriptions said trace mode was "safe on
+  the shared 8180", which callers could read as free. It is *unfrozen*, not *undegraded*: capture is
+  serialised, so a traced stop point tops out at **~720 hits/s** (~1160 with `trace_frames:0`) and hits
+  past that queue. The descriptions now say so, with the number and what it means — a few hundred hits/s
+  is nearly free, `trace_max_hits` (default 200) keeps even a hot line to a sub-second blip, and
+  `trace_max_hits:0` makes the degradation sustained rather than bounded. Documentation only; no
+  behaviour change.
+  `an_unbounded_trace_budget_is_warned_about_rather_than_passed_over` covers the `trace_max_hits:0` case,
+  since an unbounded budget is the one way to turn a blip into a permanent slowdown.
+- **The test harness could not find a Windows JDK (test integrity)** — `Jdk::find` built
+  `$JAVA_HOME/bin/java` with no extension and then asked the filesystem whether it existed. On Windows the
+  files are `java.exe` / `javac.exe`, so the check always failed, `find` returned `None`, and because a
+  missing JDK **skips rather than fails**, the entire `--ignored` suite reported `ok` in **0.00s while
+  running nothing**. The same shape as the SIGKILL coverage bug TEST-5 found: a green run that proves
+  nothing. `Jdk::in_bin` now appends the platform suffix for the existence check, while the bare `java` /
+  `javac` PATH fallback deliberately stays unsuffixed because it goes through `CreateProcessW`/`execvp`,
+  which resolve the extension themselves. With this fixed, **47/47 pass in 195s** serially
+  (`--test-threads=1`) against real JVMs — the duration is the tell, so check it and the absence of
+  `SKIP` lines before believing a green run. `scripts/integration-test.sh` no longer leaves that to the
+  reader: a `SKIP …no JDK found` line is now a hard failure there, matching the guard `coverage.sh`
+  already had.
+  A **second** green-run-of-nothing turned up immediately afterwards, in that script's own usage line.
+  It already supplies libtest's `--`, so the documented `integration-test.sh -- --test-threads=1` made
+  libtest read the bare `--` as a test-name *filter*: `0 passed; 47 filtered out`, exit 0. Usage line
+  fixed, and "0 tests ran" is now a hard failure too — an empty selection is a failed request, not a
+  pass. Three ways to get a green run that executed nothing, all found in one sitting: SIGKILL'd counters
+  (TEST-5), an undetectable JDK, and a filter that matches no tests.
+- **Zero doctor warnings, and a gate that keeps them there (LINT-1, #18)** — `7253499` reached 0 warnings
+  deliberately; twenty-four commits later `main` reported 7, and the four over-threshold handlers were
+  described as pre-existing debt the new work merely "matched" rather than as the regression they were.
+  Nothing enforced the zero, so nothing noticed — and what decayed first was the memory of having paid
+  for it. Back to **0** (score 100), and CI now gates on `--fail-on warning` with a **pinned** toolchain,
+  because an unpinned `stable` plus a warning gate means a future clippy breaks the build on code nobody
+  touched — which is exactly how the `--fail-on error` compromise arose. ADR-0007 records the rejected
+  options, including the deliberate contrast with the standing decision *not* to gate on coverage: a
+  coverage percentage rises with tests that assert nothing, whereas a doctor warning is a specific finding
+  at a specific line.
+  The five findings were fixed by extraction, the way the previous batch fixed its own — `StackWalk` /
+  `render_stack_frame` out of `handle_get_stack`, `set_field_by_path` out of `handle_set_value`,
+  `watch_kinds` / `arm_one_field_watch` / `render_field_stop_reply` out of `handle_set_field_stop`,
+  `render_exception_stop_reply` out of its handler, and `dump_filter_note` / `dump_monitor_caveats` out of
+  `render_dump_header` (which this batch had itself pushed to 20). The three `.clone()`-in-a-loop findings
+  were **restructured rather than relocated**: the exhausted-local name is copied once on the way out
+  instead of per frame, and a filtered map's surviving keys are moved out of the scan rather than cloned
+  from a shared vector per match. Moving an allocation somewhere the heuristic cannot see it would have
+  scored the same and fixed nothing.
 
 ---
 
@@ -624,7 +734,7 @@ were in the safety features, and two of them had green tests.
   toggle re-arms it.
 - **BP-3** (#6) — stop-point ids embedded the JDWP request id, so re-arming minted a new id and broke
   any id the caller held; and toggling a deferred breakpoint said "not found" for an id
-  `list_breakpoints` was displaying. Ids come from a per-session counter now.
+  `list_stop_points` was displaying. Ids come from a per-session counter now.
 
 Two of the new tests were only load-bearing after being made so: the SAFE-4 test was verified to fail
 without its fix, and the SAFE-5 test passed against the bug twice — first because the watchdog raced
@@ -660,7 +770,7 @@ rescue the VM; the probe's own ticks resuming is the proof).
 
 On timeout the watchdog now identifies the request that suspended the VM (the newest buffered event's
 `request_id`), disarms **only** that stop point (`disarm_request`, `handlers.rs`), and records a note
-surfaced in `list_breakpoints` and the next `get_last_event` — so the cycle is no longer freeze → 120s →
+surfaced in `list_stop_points` and the next `get_last_event` — so the cycle is no longer freeze → 120s →
 resume → freeze again. Unrelated stop points survive. Validated by
 `watchdog_auto_resumes_and_disarms_the_offending_breakpoint`.
 
@@ -675,14 +785,14 @@ Three MCP-level tests with `JDWP_WATCHDOG_SECS=1`/`0`: auto-resume proven by the
 
 Every traced stop point carries a hit budget (`trace_max_hits`, default 200; `0` = unbounded). Each
 recorded hit decrements it (`charge_trace_budget`), and on reaching zero the request disarms itself and
-`get_traces` says so — silence never reads as "no hits". `list_breakpoints` shows the remaining budget.
+`get_traces` says so — silence never reads as "no hits". `list_stop_points` shows the remaining budget.
 (Server-side counting rather than JDWP's `Count` modifier, because `Count` reports only the *Nth*
 occurrence, not the first N.) Validated by `trace_budget_disarms_and_get_traces_filters`.
 
 ### ✅ FILT-1 — thread filter on exception breakpoints and watchpoints  · P1 · M
 
 `set_exception_request_ex` / `set_field_watch_ex` accept an optional `ThreadOnly` (modKind 3) modifier;
-`set_exception_breakpoint` and `set_watchpoint` take a `thread_id`, honoured by the JVM and composing
+`set_exception_stop` and `set_field_stop` take a `thread_id`, honoured by the JVM and composing
 with `trace:true`. The tool descriptions document the `list_threads {name_filter}` → arm → trigger flow.
 Validated by `thread_filter_reports_only_the_chosen_thread` (a two-thread probe; only the filtered
 thread's throws are recorded, and the other keeps running).
@@ -695,11 +805,11 @@ lower precedence than `&&`, parentheses regrouping, and short-circuit evaluation
 `boolean_operators_in_predicates_and_conditions` (incl. an `a || b && c` precedence case and a
 parenthesised regroup) and unit tests for the parser.
 
-### ✅ BP-1 — `debug.toggle_breakpoint` implements `enabled`  · P2 · S
+### ✅ BP-1 — `debug.toggle_stop_point` implements `enabled`  · P2 · S
 
 `enabled` is now real: disabling clears the JDWP request but keeps the definition (condition, trace_expr,
-resolved location in a `BreakpointArm`), and enabling re-arms at the same place. `list_breakpoints` marks
-a disabled breakpoint. Validated by `toggle_breakpoint_disables_and_rearms`.
+resolved location in a `BreakpointArm`), and enabling re-arms at the same place. `list_stop_points` marks
+a disabled breakpoint. Validated by `toggle_stop_point_disables_and_rearms`.
 
 ### ✅ TRACE-4 — `get_traces` can be filtered  · P2 · S
 
@@ -770,7 +880,7 @@ away a careful setup.
 
 **Acceptance criteria**
 - [ ] After a watchdog resume, the offending stop point no longer suspends the VM
-- [ ] What was disarmed is discoverable — in `list_breakpoints` and in the next `get_last_event`/log line
+- [ ] What was disarmed is discoverable — in `list_stop_points` and in the next `get_last_event`/log line
 - [ ] Unrelated stop points survive
 - [ ] Integration test with `JDWP_WATCHDOG_SECS=1`: a probe hitting a breakpoint in a loop keeps running
       after one watchdog cycle instead of re-freezing
@@ -817,7 +927,7 @@ only the location and skips the frame walk.
 - [ ] `get_traces` says a stop point stopped recording, and why — silence must not read as "no hits"
 - [ ] Integration test: a probe writing a field in a tight loop yields exactly N traces, then the probe
       **speeds back up** (measurable from its own output rate)
-- [ ] `list_breakpoints` shows the remaining budget
+- [ ] `list_stop_points` shows the remaining budget
 
 **Blocked by**
 None.
@@ -837,7 +947,7 @@ combination the infotravel investigations want: catch only the throws from the r
 event, so document the flow (`list_threads {name_filter}` → arm → trigger).
 
 **Acceptance criteria**
-- [ ] `thread_id` on `set_exception_breakpoint` and `set_watchpoint`, honoured by the JVM
+- [ ] `thread_id` on `set_exception_stop` and `set_field_stop`, honoured by the JVM
 - [ ] A probe throwing on two threads reports only the filtered one
 - [ ] Composes with `trace:true`
 - [ ] The tool descriptions explain how to get a thread id first
@@ -874,7 +984,7 @@ None.
 mutated, yet `render_breakpoint_line` prints `✓`/`✗` from it — so the `✗` branch cannot happen and the
 tick mark carries no information.
 
-Either implement it (`debug.toggle_breakpoint`, which is genuinely useful — silence a breakpoint without
+Either implement it (`debug.toggle_stop_point`, which is genuinely useful — silence a breakpoint without
 losing its condition/trace_expr and having to retype them) or delete the field and the marker.
 
 **Acceptance criteria**
@@ -930,7 +1040,7 @@ None. Wants EVAL-3's `assignable`, which has shipped.
 ### SAFE-3 — no read-only mode  · P2 · S
 
 **What to build**
-`debug.evaluate` can invoke any method on the target, and `set_value` / `force_return` / `set_watchpoint`
+`debug.evaluate` can invoke any method on the target, and `set_value` / `force_return` / `set_field_stop`
 all mutate it. Nothing distinguishes "let me look" from "let me change things", so pointing this at a
 production JVM means trusting every future caller — including an agent — not to call something
 destructive. `deleteAll()` is a valid expression today.

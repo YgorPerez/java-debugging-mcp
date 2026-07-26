@@ -38,12 +38,13 @@ impl Jdk {
     /// snap-installed `IntelliJ`, which is the only JDK on some dev boxes here.
     pub fn find() -> Option<Self> {
         if let Some(home) = std::env::var_os("JAVA_HOME") {
-            let base = PathBuf::from(home).join("bin");
-            let jdk = Self { java: base.join("java"), javac: base.join("javac") };
+            let jdk = Self::in_bin(&PathBuf::from(home).join("bin"));
             if jdk.is_usable() {
                 return Some(jdk);
             }
         }
+        // No suffix here on purpose: this goes through `CreateProcessW`/`execvp` rather than an
+        // existence check, and both resolve the platform's executable extension themselves.
         let on_path = Self { java: PathBuf::from("java"), javac: PathBuf::from("javac") };
         if Command::new(&on_path.javac).arg("-version").output().is_ok_and(|o| o.status.success()) {
             return Some(on_path);
@@ -53,9 +54,21 @@ impl Jdk {
         candidates.sort();
         candidates.reverse();
         candidates.into_iter().find_map(|bin| {
-            let jdk = Self { java: bin.join("java"), javac: bin.join("javac") };
+            let jdk = Self::in_bin(&bin);
             jdk.is_usable().then_some(jdk)
         })
+    }
+
+    /// The `java`/`javac` pair inside a JDK's `bin`, with the platform's executable suffix.
+    ///
+    /// The suffix is load-bearing rather than cosmetic: `is_usable` asks the filesystem, and on Windows
+    /// the files are `java.exe` and `javac.exe`, so an unsuffixed path never exists. That made
+    /// `Jdk::find` return `None` on a machine with a perfectly good JDK at `JAVA_HOME`, and because a
+    /// missing JDK skips rather than fails, the entire `--ignored` suite reported `ok` in 0.00s while
+    /// running nothing — the same shape as the SIGKILL coverage bug TEST-5 found.
+    fn in_bin(bin: &std::path::Path) -> Self {
+        const EXE: &str = if cfg!(windows) { ".exe" } else { "" };
+        Self { java: bin.join(format!("java{EXE}")), javac: bin.join(format!("javac{EXE}")) }
     }
 
     fn is_usable(&self) -> bool {

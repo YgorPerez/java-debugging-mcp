@@ -23,6 +23,22 @@ every safety default, because freezing it stalls other people's requests.
 Anything armed in the debuggee that reports when execution reaches it. The umbrella over all four kinds.
 _Avoid_: breakpoint (when you mean any kind rather than a line breakpoint specifically)
 
+The **tool names follow this**, as of VOCAB-1 (#20): `debug.set_line_stop`, `debug.set_exception_stop`,
+`debug.set_field_stop`, `debug.set_method_exit_stop`, and `debug.clear_stop_point` /
+`debug.list_stop_points` / `debug.toggle_stop_point` across all four. Before that, `breakpoint` named
+three different scopes depending on where you read it — one source location in `set_breakpoint`, two
+things that were not source locations in `set_exception_breakpoint` and `set_method_breakpoint`, all four
+kinds in `clear_breakpoint` / `list_breakpoints` / `toggle_breakpoint`, and `set_watchpoint` was a stop
+point that the word did not cover at all. The renames were taken while nothing scripted against them yet;
+the window for doing it cheaply does not reopen.
+
+Two things deliberately did **not** change, so this is not re-filed as an inconsistency: the caller-facing
+argument names (`breakpoint_id` on clear/toggle, `bp_id` on `get_traces`) and the ids themselves, which are
+still `bp_1` / `exc_2` / `watch_modify_3` / `mexit_4` — see **Stop-point id**; and the internal type names
+(`BreakpointInfo`, `SetBreakpointArgs`, …), which can follow the glossary whenever someone is in there
+anyway. Renaming an argument breaks callers for no gain the tool name has not already delivered.
+The *concepts* below keep their own names: a line breakpoint is still a breakpoint.
+
 **Line breakpoint**:
 A stop point at one source location. The only kind that can carry a condition, and the only kind that can
 be deferred.

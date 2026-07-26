@@ -32,6 +32,6 @@ to forget.
 - Only a **recorded** hit is charged, so the "exactly N traces then it stops" contract holds even when a
   condition skips some.
 - `get_traces` must announce the self-disarm, or the silence afterwards reads as "no more hits".
-- `list_breakpoints` shows the remaining budget.
+- `list_stop_points` shows the remaining budget.
 - `Count` is still the right tool for `hit_count` ("stop on the Nth hit"), which is exactly what it means,
   and that is where `set_breakpoint_ex` uses it.

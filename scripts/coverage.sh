@@ -31,6 +31,27 @@ if ! cargo llvm-cov --version >/dev/null 2>&1; then
   exit 1
 fi
 
+# `-C instrument-coverage` needs the profiler runtime, which rustup ships as part of the target's std —
+# and NOT for every target. On `x86_64-pc-windows-gnu` it is absent, so the run dies ~90 seconds in with
+# `error[E0463]: can't find crate for profiler_builtins` buried under a full rustc command line, which
+# names the missing crate but not the cause or the fix. Checked up front instead: the tool is not
+# installable on this host, and finding that out before a two-minute build is the whole point.
+HOST_TARGET="$(rustc -vV | awk '/^host: /{print $2}')"
+SYSROOT="$(rustc --print sysroot)"
+if ! ls "$SYSROOT/lib/rustlib/$HOST_TARGET/lib/"libprofiler_builtins-*.rlib >/dev/null 2>&1; then
+  echo "error: this toolchain has no profiler runtime, so coverage cannot be instrumented here." >&2
+  echo "       host target: $HOST_TARGET" >&2
+  echo "       (looked for libprofiler_builtins-*.rlib in \$SYSROOT/lib/rustlib/$HOST_TARGET/lib/)" >&2
+  echo "" >&2
+  echo "  Known case: x86_64-pc-windows-gnu ships no profiler_builtins. Either" >&2
+  echo "    - run this on Linux (what CI uses), or" >&2
+  echo "    - switch to the msvc toolchain, which does have it:" >&2
+  echo "        rustup toolchain install stable-x86_64-pc-windows-msvc" >&2
+  echo "      note msvc also needs the Visual Studio 'C++ build tools' workload for link.exe;" >&2
+  echo "      without it the toolchain has the profiler runtime but cannot link at all." >&2
+  exit 1
+fi
+
 MODE="${1:-summary}"
 LCOV="target/coverage/lcov.info"
 LOG="target/coverage/run.log"

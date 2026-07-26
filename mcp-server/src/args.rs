@@ -57,7 +57,7 @@ pub struct AttachArgs {
     pub read_only: bool,
 }
 
-/// Arguments for `debug.set_breakpoint`.
+/// Arguments for `debug.set_line_stop`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetBreakpointArgs {
     /// Class name pattern (e.g. "com.example.MyClass").
@@ -93,6 +93,16 @@ pub struct SetBreakpointArgs {
     pub trace_expr: Option<String>,
     /// Only with `trace:true` — disarm this logpoint automatically after recording this many hits, so
     /// a hot line can't flood the debuggee (defaults to 200). Pass 0 for no limit.
+    ///
+    /// **This bound is load-bearing, not a formality.** Capture is serialised through the single JDWP
+    /// connection and one event pump, so a traced stop point tops out at roughly **720 hits/s** with the
+    /// default 3 caller frames, or **~1160/s** with `trace_frames: 0`. Past that the debugger — not the
+    /// application — is the bottleneck, and every further hit queues behind the ones being captured. At
+    /// the default 200 the exposure is a sub-second blip, which is most of the reason trace mode is safe
+    /// to leave armed at all. **`0` on a site that fires thousands of times a second turns that blip into
+    /// sustained throttling**: it is the single setting that removes the protection, so choose it
+    /// knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures
+    /// move with hardware, the existence of a hits/s ceiling does not.
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
     /// Only with `trace:true` — how many CALLER frames to record above the hit, so a snapshot says
@@ -100,16 +110,22 @@ pub struct SetBreakpointArgs {
     /// at 20). Callers are recorded as `class.method:line` locations only — no locals, no invocation —
     /// so this stays safe in a read-only session. Each frame costs JVM round trips on *every* hit, so
     /// keep it small on a hot line and pair it with `trace_max_hits`.
+    ///
+    /// The measured price of that depth: capture costs ~0.86ms per hit before any callers, and the
+    /// default 3 frames add ~0.53ms on top (**+62%**), lowering the ceiling from ~1160 to ~720 hits/s.
+    /// Kept at 3 regardless, because the chain is usually the answer rather than context — but
+    /// `trace_frames: 0` is the cheap mode when the site is hot and you only need that it fired.
+    /// Loopback measurement against a trivial `WildFly` endpoint (#22).
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
     // NOTE: `session_id` is a cross-cutting argument handled uniformly by `resolve_session`
     // (from the raw arguments) for every tool, so it is intentionally not a typed field here.
 }
 
-/// Arguments for `debug.toggle_breakpoint` (BP-1).
+/// Arguments for `debug.toggle_stop_point` (BP-1).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ToggleBreakpointArgs {
-    /// Breakpoint ID (`bp_…`) from `debug.list_breakpoints`.
+    /// Stop-point ID (`bp_…`) from `debug.list_stop_points`.
     pub breakpoint_id: String,
     /// Desired state: `false` clears the JDWP request but keeps the definition (`condition`,
     /// `trace_expr`) so it can be re-armed later; `true` re-arms it. Omit to flip the current state.
@@ -152,10 +168,10 @@ pub struct GetLastEventArgs {
     pub drain: bool,
 }
 
-/// Arguments for `debug.clear_breakpoint`.
+/// Arguments for `debug.clear_stop_point`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClearBreakpointArgs {
-    /// Breakpoint ID from `debug.list_breakpoints`.
+    /// Stop-point ID from `debug.list_stop_points`.
     pub breakpoint_id: String,
 }
 
@@ -253,6 +269,10 @@ pub struct ListThreadsArgs {
 }
 
 /// Arguments for `debug.thread_dump` (DUMP-1).
+// The bools are independent MCP arguments a caller passes by name, not a parameter bag that wants
+// splitting up: suspend, only_suspended and monitors_only each answer a different question about how
+// much of the VM to touch, and grouping them would only make callers assemble a nested object.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ThreadDumpArgs {
     /// Only threads whose name contains this substring (case-insensitive), e.g. 'default task' for
@@ -281,6 +301,24 @@ pub struct ThreadDumpArgs {
     /// automatically, with a note, on a JVM that lacks the capability.
     #[serde(default = "default_true")]
     pub monitors: bool,
+    /// Read **only** the lock state — the monitors each thread holds and the one it is blocked
+    /// entering — and skip the frames entirely (default false). The cheap way to ask "who is blocked on
+    /// what".
+    ///
+    /// Measured against a 60-thread probe: **245 packets and 33ms of suspension, against 770 and 117ms**
+    /// for the same dump with stacks. The lock state costs a flat ~4 JDWP packets per thread, while each
+    /// frame read adds ~3 more (method and line; class names are cached across the dump) — so the saving
+    /// grows with real stack depth, and against `WildFly`-depth stacks at the default `max_frames: 8` it
+    /// is far wider than the 3x measured on shallow probe threads.
+    ///
+    /// For a deadlock the lock graph *is* the answer and the stacks are only context. The holder of a
+    /// contended lock is still named.
+    ///
+    /// Composes with `name_filter`, `only_suspended` and `limit`. `max_frames` and `package_filter` do
+    /// nothing here, since no frames are read. Requires `monitors` (the default) — asking for neither
+    /// locks nor stacks is refused rather than answered with empty rows.
+    #[serde(default)]
+    pub monitors_only: bool,
     /// Cap how long the VM may be held **suspended** while collecting, in milliseconds (default 2000;
     /// `0` = unbounded). Only meaningful with `suspend:true`.
     ///
@@ -323,7 +361,7 @@ pub struct SetValueArgs {
     pub frame_index: usize,
 }
 
-/// Arguments for `debug.set_exception_breakpoint`.
+/// Arguments for `debug.set_exception_stop`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetExceptionBreakpointArgs {
     /// Exception class to break on (e.g. "java.lang.NullPointerException" or
@@ -350,6 +388,16 @@ pub struct SetExceptionBreakpointArgs {
     pub trace_expr: Option<String>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit),
     /// so a hot throw site can't flood the debuggee (TRACE-3).
+    ///
+    /// **This bound is load-bearing, not a formality.** Capture is serialised through the single JDWP
+    /// connection and one event pump, so a traced stop point tops out at roughly **720 hits/s** with the
+    /// default 3 caller frames, or **~1160/s** with `trace_frames: 0`. Past that the debugger — not the
+    /// application — is the bottleneck, and every further hit queues behind the ones being captured. At
+    /// the default 200 the exposure is a sub-second blip, which is most of the reason trace mode is safe
+    /// to leave armed at all. **`0` on a site that fires thousands of times a second turns that blip into
+    /// sustained throttling**: it is the single setting that removes the protection, so choose it
+    /// knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures
+    /// move with hardware, the existence of a hits/s ceiling does not.
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
     /// Only with `trace:true` — how many CALLER frames to record above the throw, so a swallowed
@@ -357,6 +405,12 @@ pub struct SetExceptionBreakpointArgs {
     /// (default 3; 0 for the throwing frame alone, capped at 20). Callers are recorded as
     /// `class.method:line` locations only — no locals, no invocation — so this stays safe in a
     /// read-only session. Each frame costs JVM round trips on every hit.
+    ///
+    /// The measured price of that depth: capture costs ~0.86ms per hit before any callers, and the
+    /// default 3 frames add ~0.53ms on top (**+62%**), lowering the ceiling from ~1160 to ~720 hits/s.
+    /// Kept at 3 regardless, because the chain is usually the answer rather than context — but
+    /// `trace_frames: 0` is the cheap mode when the site is hot and you only need that it fired.
+    /// Loopback measurement against a trivial `WildFly` endpoint (#22).
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
     /// Only report throws on this thread (hex id, e.g. `0x2a`). On a busy app server with hundreds of
@@ -366,7 +420,7 @@ pub struct SetExceptionBreakpointArgs {
     pub thread_id: Option<String>,
 }
 
-/// Arguments for `debug.set_watchpoint`.
+/// Arguments for `debug.set_field_stop`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetWatchpointArgs {
     /// Class declaring the field (e.g. `ConfigDefaultUtils` or a fully-qualified
@@ -393,6 +447,16 @@ pub struct SetWatchpointArgs {
     pub trace_expr: Option<String>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit),
     /// so a hot field can't flood the debuggee (TRACE-3).
+    ///
+    /// **This bound is load-bearing, not a formality.** Capture is serialised through the single JDWP
+    /// connection and one event pump, so a traced stop point tops out at roughly **720 hits/s** with the
+    /// default 3 caller frames, or **~1160/s** with `trace_frames: 0`. Past that the debugger — not the
+    /// application — is the bottleneck, and every further hit queues behind the ones being captured. At
+    /// the default 200 the exposure is a sub-second blip, which is most of the reason trace mode is safe
+    /// to leave armed at all. **`0` on a site that fires thousands of times a second turns that blip into
+    /// sustained throttling**: it is the single setting that removes the protection, so choose it
+    /// knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures
+    /// move with hardware, the existence of a hits/s ceiling does not.
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
     /// Only with `trace:true` — how many CALLER frames to record above the mutating frame, so "who
@@ -400,6 +464,12 @@ pub struct SetWatchpointArgs {
     /// 3; 0 for the mutating frame alone, capped at 20). Callers are recorded as `class.method:line`
     /// locations only — no locals, no invocation — so this stays safe in a read-only session. Each
     /// frame costs JVM round trips on every hit.
+    ///
+    /// The measured price of that depth: capture costs ~0.86ms per hit before any callers, and the
+    /// default 3 frames add ~0.53ms on top (**+62%**), lowering the ceiling from ~1160 to ~720 hits/s.
+    /// Kept at 3 regardless, because the chain is usually the answer rather than context — but
+    /// `trace_frames: 0` is the cheap mode when the site is hot and you only need that it fired.
+    /// Loopback measurement against a trivial `WildFly` endpoint (#22).
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
     /// Only report touches from this thread (hex id, e.g. `0x2a`). On a busy app server, restricting
@@ -409,7 +479,7 @@ pub struct SetWatchpointArgs {
     pub thread_id: Option<String>,
 }
 
-/// Arguments for `debug.set_method_breakpoint` (METH-1).
+/// Arguments for `debug.set_method_exit_stop` (METH-1).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetMethodBreakpointArgs {
     /// Class whose method returns you want to see (e.g. `br.com.infotravel.IntegraSrv`), optionally
@@ -433,10 +503,26 @@ pub struct SetMethodBreakpointArgs {
     pub trace_expr: Option<String>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit).
     /// Method exits are the noisiest event in JDWP, so this budget matters more here than anywhere else.
+    ///
+    /// **This bound is load-bearing, not a formality.** Capture is serialised through the single JDWP
+    /// connection and one event pump, so a traced stop point tops out at roughly **720 hits/s** with the
+    /// default 3 caller frames, or **~1160/s** with `trace_frames: 0`. Past that the debugger — not the
+    /// application — is the bottleneck, and every further hit queues behind the ones being captured. At
+    /// the default 200 the exposure is a sub-second blip, which is most of the reason trace mode is safe
+    /// to leave armed at all. **`0` on a site that fires thousands of times a second turns that blip into
+    /// sustained throttling**: it is the single setting that removes the protection, so choose it
+    /// knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures
+    /// move with hardware, the existence of a hits/s ceiling does not.
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
     /// Only with `trace:true` — how many caller frames to record above the return, as
     /// `class.method:line` (default 3; 0 for the returning frame alone, capped at 20).
+    ///
+    /// The measured price of that depth: capture costs ~0.86ms per hit before any callers, and the
+    /// default 3 frames add ~0.53ms on top (**+62%**), lowering the ceiling from ~1160 to ~720 hits/s.
+    /// Kept at 3 regardless, because the chain is usually the answer rather than context — but
+    /// `trace_frames: 0` is the cheap mode when the site is hot and you only need that it fired.
+    /// Loopback measurement against a trivial `WildFly` endpoint (#22).
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
     /// Only report returns on this thread (hex id, e.g. `0x2a`). On a busy app server this is the

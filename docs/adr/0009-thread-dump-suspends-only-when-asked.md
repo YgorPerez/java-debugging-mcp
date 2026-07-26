@@ -39,6 +39,20 @@ The same principle inverts a default elsewhere: for **method-exit requests**, `t
 broad suspending request is refused outright. Where the unsafe mode can freeze a shared instance fastest, the
 safe mode is the default and the dangerous one is opt-in.
 
+A fifth property followed from the fourth once the duration was visible: **ask for less**. `monitors_only`
+(#17 item 3) skips the frame read and its per-frame lookups, which is where a dump's cost lives — measured at
+245 packets / 33ms held against 770 / 117ms on a 60-thread dump, widening with real stack depth. Bounding a
+freeze and shortening it are different levers, and for the question this tool exists for — which threads are
+blocked on what — the lock graph is the answer and the stacks are context.
+
+That mode forced a distinction the reply could not previously make. Frames were `Result<frames, why>`, and
+"not requested" is neither: as an error it reports a healthy VM as unreadable, as an empty list it reports
+every thread as idle. Both are findings, and this is not one — so `DumpStack` carries three states, and the
+header attributes the omission rather than leaving it to be interpreted. For the same reason
+`monitors_only` with `monitors:false` is **refused** rather than silently corrected: it asks for neither
+locks nor stacks, so every row would come back empty, which is exactly the output that reads as "nothing is
+contended".
+
 ## Rejected alternatives
 
 **Never suspending** — the literal reading of the issue. Every thread reports as unreadable on the one JVM

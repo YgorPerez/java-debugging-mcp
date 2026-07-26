@@ -15,7 +15,7 @@
 //   set_breakpoint_ex(SuspendPolicy::EventThread) -> on hit, snapshot the top frame's args ->
 //   resume_thread(hit thread only) -> the probe's loop keeps advancing, yielding N snapshots and
 //   never leaving anything frozen. (The mcp-server event pump wraps exactly this into
-//   debug.set_breakpoint{trace:true} + debug.get_traces.)
+//   debug.set_line_stop{trace:true} + debug.get_traces.)
 // Usage: cargo run --release --example test_trace_bp -- [port] [Class] [method]
 // Defaults: 8790 TraceProbe tick  (pair with the TraceProbe probe, compiled with -g).
 

@@ -28,16 +28,22 @@ natural language.
   **`lines[?qty > 3]`** (filter, with the left side resolved against each element). Filtering a `Map`
   keeps the keys (`key → value`), and a single element can be **written** as well as read
 - **Set Values**: a local, a static or instance field, or one element of an array / `List` / `Map`
-- **Field Watchpoints**: break when a field is read or written — `debug.set_watchpoint` reports the
+- **Field Watchpoints**: break when a field is read or written — `debug.set_field_stop` reports the
   mutating location with the **old → new** value, for "who changes this behind my back?"
-- **Method return values**: `debug.set_method_breakpoint` reports **what a method returned and from
+- **Method return values**: `debug.set_method_exit_stop` reports **what a method returned and from
   which `return`**, so a method with several exits (or one whose value comes from a chain you can't
   break on) stops being a guessing game. Trace mode is the default for this one
 - **Non-suspending trace mode**: `trace:true` on a breakpoint, an **exception breakpoint** or a
   **watchpoint** snapshots the hit and resumes the thread immediately instead of freezing the VM —
   the only safe way to use any of them on a shared instance. Each snapshot carries the **calling
   chain** above the hit (`trace_frames`, default 3), so a logpoint answers *which path reached this*.
-  Read the snapshots with `debug.get_traces`
+  Read the snapshots with `debug.get_traces`.
+  It does **not freeze** the VM, which is not the same as not **slowing** it: capture is serialised
+  through one connection, so a traced stop point tops out at ~**720 hits/s** (~1160 at
+  `trace_frames: 0`) and hits past that queue. Under a few hundred hits/s that is effectively free, and
+  `trace_max_hits` (default 200) keeps even a hot site to a sub-second blip — `trace_max_hits: 0` is
+  the one setting that removes that bound, and the arm reply warns when you use it
+  *(loopback figures against a trivial endpoint; the ceiling is the durable part, not the percentage)*
 - **Thread Management**: tools default to the last thread that hit a breakpoint
 - **Thread dumps with lock ownership**: `debug.thread_dump` answers "it's wedged — which threads are
   blocked on what?" in one call: every thread's stack, the monitors it holds, the one it is blocked
@@ -100,12 +106,12 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | Tool | Description |
 |------|-------------|
 | `debug.attach` | Connect to a JVM via JDWP |
-| `debug.set_breakpoint` | Set a breakpoint by class+line, or by method name; optional `hit_count`, thread filter, `condition` (with `&&`/`||`), or `trace:true` (non-suspending logpoint, with `trace_max_hits` and `trace_frames`) |
-| `debug.set_exception_breakpoint` | Break when an exception (of a class + its subclasses, or all) is thrown; `caught`/`uncaught` selectable, an optional `thread_id` filter, or `trace:true` (with `trace_max_hits` / `trace_frames`) to collect throws without suspending |
+| `debug.set_line_stop` | Set a breakpoint by class+line, or by method name; optional `hit_count`, thread filter, `condition` (with `&&`/`||`), or `trace:true` (non-suspending logpoint, with `trace_max_hits` and `trace_frames`) |
+| `debug.set_exception_stop` | Break when an exception (of a class + its subclasses, or all) is thrown; `caught`/`uncaught` selectable, an optional `thread_id` filter, or `trace:true` (with `trace_max_hits` / `trace_frames`) to collect throws without suspending |
 | `debug.get_traces` | Read snapshots captured by any `trace:true` stop point — line, exception or watchpoint, each with the caller chain above it (bounded ring buffer; narrow with `bp_id` / `class_filter` / `since`, optional `clear`) |
-| `debug.list_breakpoints` | List active breakpoints (line, deferred, exception, watchpoint) with trace budgets and thread filters |
-| `debug.clear_breakpoint` | Remove a breakpoint (line, deferred, exception, or watchpoint) |
-| `debug.toggle_breakpoint` | Silence or re-arm any stop point (`bp_…` / `exc_…` / `watch_…`) without losing its `condition`/`trace_expr`; the id stays the same across the round trip |
+| `debug.list_stop_points` | List active stop points (line, deferred, exception, watchpoint, method-exit) with trace budgets and thread filters |
+| `debug.clear_stop_point` | Remove a stop point (line, deferred, exception, watchpoint, or method-exit) |
+| `debug.toggle_stop_point` | Silence or re-arm any stop point (`bp_…` / `exc_…` / `watch_…` / `mexit_…`) without losing its `condition`/`trace_expr`; the id stays the same across the round trip |
 | `debug.continue` | Resume execution |
 | `debug.step_over` | Step over current line (defaults to last-hit thread) |
 | `debug.step_into` | Step into a method call |
@@ -113,16 +119,25 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | `debug.get_stack` | Stack frames, compact `#i class.method:line` with typed locals indented |
 | `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods, object arguments, `[i]`/`["k"]`/`[a..b]`/`[?pred]` subscripts (predicates support `&&`/`||`), and `expand_objects` for a deep field tree |
 | `debug.set_value` | Write a local variable, a static field (`Class.field`), an instance field (`this.field`), or one element (`xs[0]`, `counts["k"]`) — from a literal or a copied live reference (`this.a = other.b`) |
-| `debug.set_watchpoint` | Break when a field is written (or read) — reports the mutating location + old → new value; optional `thread_id` filter; `trace:true` (with `trace_max_hits` / `trace_frames`) collects hits without suspending |
-| `debug.set_method_breakpoint` | Report what a method **returned**, and from which `return` — for a method with several exits, or a value from a chain you can't break on. `class_pattern` + `method`; `trace` defaults to **true** here (a suspending method exit on a hot method freezes a VM fastest), and a broad suspending request is refused with the reason |
+| `debug.set_field_stop` | Break when a field is written (or read) — reports the mutating location + old → new value; optional `thread_id` filter; `trace:true` (with `trace_max_hits` / `trace_frames`) collects hits without suspending |
+| `debug.set_method_exit_stop` | Report what a method **returned**, and from which `return` — for a method with several exits, or a value from a chain you can't break on. `class_pattern` + `method`; `trace` defaults to **true** here (a suspending method exit on a hot method freezes a VM fastest), and a broad suspending request is refused with the reason |
 | `debug.force_return` | Force the current method to return a given value, skipping the rest of its body |
 | `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line, exception type, watched field's old → new) + `[suspended]`; events are buffered, so `limit` reads a backlog and `drain` discards it |
 | `debug.list_threads` | List threads by name; filter with `name_filter` / `only_suspended` / `limit` |
-| `debug.thread_dump` | Every thread's stack in one call **plus** the monitors each holds and the one it is blocked entering, with the blocker named (`← held by 0x<id> "<name>"`) — a deadlock cycle is readable straight off it. JDWP can only read a *suspended* thread, so pass `suspend:true` (freeze, read, resume, verify) or `only_suspended:true`; it never suspends on its own. Bound the cost with `name_filter` / `limit` / `max_frames` / `package_filter`, and the freeze with `max_suspend_ms` (default 2000) — the reply reports how long it held the VM, the packets it spent, and any threads a budget made it skip |
+| `debug.thread_dump` | Every thread's stack in one call **plus** the monitors each holds and the one it is blocked entering, with the blocker named (`← held by 0x<id> "<name>"`) — a deadlock cycle is readable straight off it. JDWP can only read a *suspended* thread, so pass `suspend:true` (freeze, read, resume, verify) or `only_suspended:true`; it never suspends on its own. Bound the cost with `name_filter` / `limit` / `max_frames` / `package_filter`, and the freeze with `max_suspend_ms` (default 2000) — the reply reports how long it held the VM, the packets it spent, and any threads a budget made it skip. `monitors_only:true` reads the lock graph without the stacks for a fraction of the freeze (measured: 245 packets / 33 ms against 770 / 117 ms on a 60-thread dump) |
 | `debug.pause` | Pause execution (suspend all threads) — watchdog-covered, so a forgotten pause can't freeze the JVM |
-| `debug.panic` | Safety: clear all breakpoints and resume all threads |
+| `debug.panic` | Safety: clear all stop points and resume all threads |
 | `debug.list_sessions` | List live sessions — `host:port`, which is current, suspended or DEAD, and how many stop points/traces/events each holds |
 | `debug.disconnect` | End the debug session |
+
+> **Renamed in VOCAB-1 (#20).** The stop-point tools were called `set_breakpoint`,
+> `set_exception_breakpoint`, `set_watchpoint`, `set_method_breakpoint`, `clear_breakpoint`,
+> `list_breakpoints` and `toggle_breakpoint`. "Breakpoint" named three different scopes across them —
+> one source location, two things that were not locations, and all four kinds — while `set_watchpoint`
+> was a stop point the word did not cover at all. The names above follow `CONTEXT.md`, where **stop
+> point** is the umbrella and **breakpoint** means a line breakpoint. Arguments are unchanged —
+> `breakpoint_id` on clear/toggle, `bp_id` on `get_traces`, and the `bp_…` / `exc_…` / `watch_…` /
+> `mexit_…` id prefixes all keep their names.
 
 Most tools take `thread_id` as an optional hex string (e.g. `"0x2"`); when omitted they default to
 the last thread that hit a breakpoint.
@@ -133,7 +148,7 @@ and *disables* whatever caused it, so it can't re-freeze on the next hit. JDWP *
 resuming is treated as "make it actually run", not one Resume packet: `continue`, `panic` and the
 watchdog clear the whole suspend depth and verify it via `SuspendCount` before reporting success, and
 `debug.pause` is idempotent so a depth can't build up by accident. Disabling keeps the
-definition, so one `debug.toggle_breakpoint` re-arms it with its condition and `trace_expr` intact;
+definition, so one `debug.toggle_stop_point` re-arms it with its condition and `trace_expr` intact;
 the same applies when a `trace:true` stop point hits its `trace_max_hits` budget.
 `debug.disconnect` resumes the VM and clears every request on the way out, so it can never leave a
 shared JVM frozen.

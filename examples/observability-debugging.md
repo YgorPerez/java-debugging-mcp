@@ -32,7 +32,7 @@ java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:8813 -cp . 
 
 ```
 debug.attach {host:"localhost", port:8813}
-debug.set_breakpoint {class_pattern:"MetricsProbe$HelloController", method:"hello"}
+debug.set_line_stop {class_pattern:"MetricsProbe$HelloController", method:"hello"}
 ```
 
 For a real app, break in the controller method that touches the counter (or in the `@Bean` method that
@@ -138,7 +138,7 @@ The registry not containing it moves the question upstream to registration. Two 
   breakpoint on a not-yet-loaded class **defers** and arms itself when the class loads, so you don't
   have to race the startup.
 - **Watch the registry field** to catch whoever replaces it:
-  `debug.set_watchpoint {class_name:"…HelloController", field_name:"meterRegistry", trace:true}`
+  `debug.set_field_stop {class_name:"…HelloController", field_name:"meterRegistry", trace:true}`
   reports the mutating `class.method:line` with the old → new value. Clear it when done — a watched
   field can't be JIT-optimised.
 
@@ -152,7 +152,7 @@ differs — every command works the same once you are pointed at the right objec
 already walks it, and a method name is enough — no line number to go stale:
 
 ```
-debug.set_breakpoint {class_pattern:"org.springframework.boot.actuate.metrics.MetricsEndpoint",
+debug.set_line_stop {class_pattern:"org.springframework.boot.actuate.metrics.MetricsEndpoint",
                       method:"listNames"}
 … curl http://host:port/<context>/actuator/metrics …
 ```
