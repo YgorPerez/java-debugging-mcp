@@ -9,7 +9,9 @@
         "claude-code",
         "--project-from-cwd"
       ],
-      "env": {}
+      "env": {
+        "SERENA_RUST_READY_TIMEOUT": "300"
+      }
     }
   }
 }

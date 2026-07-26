@@ -297,15 +297,35 @@ What that means in practice:
 | `find_referencing_symbols` and other semantic queries | empty before ~152s, **correct after** |
 | after quiescence | ~30ms–3s per query, including cross-crate references |
 
-So the workaround is simply to give it time, or to re-run a query that came back empty. Disabling
-`cachePriming` and `check` via rust-analyzer settings was measured and saves only ~5s, so it is not worth
-configuring.
+**Raising the wait fixes it**, and is worth doing: at the default the first semantic query burns two
+minutes *and* returns an empty result, whereas with a longer wait it takes ~152s and is correct.
 
-Two consequences for setup:
+The limit is a hard-coded local in Serena (`_SERVER_READY_TIMEOUT = 120.0` in
+`solidlsp/language_servers/rust_analyzer.py`) with no env var or config key, so it takes a one-line patch
+to make it configurable:
+
+```bash
+scripts/serena-ready-timeout.sh            # apply (rewrites the constant to read an env var)
+scripts/serena-ready-timeout.sh --check    # report status; exit 1 if not applied
+scripts/serena-ready-timeout.sh --revert   # restore the original line
+```
+
+It keeps `120` as the default and reads `SERENA_RUST_READY_TIMEOUT`, which `.mcp.json` sets to `300` for
+this repo. It is idempotent and refuses to run if the upstream line has changed — **re-run it after
+`uv tool upgrade serena-agent`**, which replaces the file. `--check` is a useful thing to run if semantic
+queries start coming back empty again.
+
+Without the patch, nothing is broken; just re-run a query that came back empty.
+
+Two other setup notes:
 
 - **`export MCP_TIMEOUT=300000`.** Serena's docs suggest `60000`; that is not enough here.
 - **Don't conclude "no references" from an early empty result.** That is the one genuinely misleading
   behaviour, and it is a timing artefact rather than a limitation.
+
+Tuning rust-analyzer instead was measured and does not help: disabling `cachePriming` and `check` saves
+only ~5s of the 152s, and the settings that *would* help (`procMacro.enable: false`,
+`buildScripts.enable: false`) would break analysis of the derive macros this codebase is full of.
 
 Serena's own docs note that Claude Code's built-in tool descriptions bias the model strongly toward
 internal tools. The committed hooks are their recommended mitigation; they also suggest launching with
