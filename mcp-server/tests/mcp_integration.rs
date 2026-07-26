@@ -968,6 +968,173 @@ fn trace_frames_zero_keeps_the_one_frame_snapshot_and_the_cap_is_reported() {
     server.panic_reset();
 }
 
+/// TRACE-7: a traced stop point reports what it has ACTUALLY cost, not what #22 measured elsewhere.
+///
+/// The figures are asserted against the probe's known firing rate rather than merely checked for
+/// presence, because "present" is satisfied by any number — including the constants from #22's one-off
+/// measurement, which is exactly what this replaces. `CallerProbe` reaches the traced line three times
+/// per ~150ms iteration, so ~20 hits/s is the arrival rate the debugger has to arrive at on its own.
+///
+/// The zero-hit case is asserted on a stop point that CANNOT fire — the same line, pinned to a JVM
+/// housekeeping thread that never runs probe code — rather than by racing the first hit. A traced stop
+/// point with nothing captured must read as unmeasured, and a race that lost would have it read as
+/// measured-at-zero, which is precisely the failure being guarded against.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_traced_stop_point_reports_its_observed_capture_cost() {
+    let Some(jdk) = jdk_or_skip("a_traced_stop_point_reports_its_observed_capture_cost") else { return };
+    let probe = Probe::launch(&jdk, "CallerProbe").expect("launch CallerProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    let src = probe_source("CallerProbe");
+    let line = probe_line(&src, "// BP1");
+
+    // A live thread that cannot reach probe code: HotSpot's own Reference Handler. Pinning a stop point
+    // to it makes "never fires" a property of the JVM rather than of the test's timing. It must be alive,
+    // or FILT-2 refuses the filter — which would fail loudly here rather than pass quietly.
+    let idle_thread = thread_hex_for(&mut server, "Reference Handler")
+        .expect("no Reference Handler thread — expected in every HotSpot");
+
+    // Traced, and unable to fire: the zero-capture case.
+    let never = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "CallerProbe", "line": line, "trace": true, "thread_id": idle_thread,
+        }),
+    );
+    let quiet_id = stop_id(&never, "bp_").expect("no bp_ id in the filtered arm reply");
+
+    // Suspending, and also unable to fire — so arming it cannot freeze the probe. It performs no capture,
+    // so it must report no capture cost at all: an absence, not a zero.
+    let suspending = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "CallerProbe", "line": line, "trace": false, "thread_id": idle_thread,
+        }),
+    );
+    let suspending_id = stop_id(&suspending, "bp_").expect("no bp_ id in the suspending arm reply");
+    assert_ne!(quiet_id, suspending_id, "two arms must be two stop points");
+
+    // A budget high enough that it cannot disarm mid-test: a self-disarm is correct behaviour but would
+    // stop the clock partway and make the rate a function of the test's own timing.
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "CallerProbe", "line": line, "trace": true,
+            "trace_frames": 3, "trace_max_hits": 5000,
+        }),
+    );
+    let hot_id = stop_id(&armed, "bp_").expect("no bp_ id in the arm reply");
+
+    // Before any hit lands anywhere, the stop point that cannot fire must say it is unmeasured.
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    let quiet = trace_cost_line(&listed, &quiet_id)
+        .unwrap_or_else(|| panic!("no cost line for the never-firing trace {quiet_id} in:\n{listed}"));
+    assert!(quiet.contains("nothing captured yet"), "a trace with no hits must say so: {quiet}");
+    assert!(quiet.contains("UNMEASURED"), "unmeasured must not read as free: {quiet}");
+    assert!(
+        trace_cost_line(&listed, &suspending_id).is_none(),
+        "a suspending stop point has no capture cost to report:\n{listed}"
+    );
+
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    // Let it run long enough for the arrival rate to mean something: ~20 hits/s, so 30 captures spans
+    // several iterations rather than one burst of three.
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+    let hot = loop {
+        let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+        let cost = trace_cost_line(&listed, &hot_id).unwrap_or_default();
+        if number_before(&cost, " capture(s)").is_some_and(|n| n >= 30.0) {
+            break cost;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the traced logpoint never reported 30 captures\n  last: {cost:?}\n  probe: {:?}",
+            probe.output()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    };
+
+    // TRACE-2 discipline: the probe must still be advancing, since only its own output can show that no
+    // hit was left suspended — and a cost measurement is worth nothing if taking it froze the debuggee.
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 1)).is_some(),
+        "probe stopped ticking while its trace cost was being measured\n  output: {:?}",
+        probe.output()
+    );
+
+    let mean_ms = number_before(&hot, "ms mean").unwrap_or_else(|| panic!("no mean capture in: {hot}"));
+    let sustainable =
+        number_before(&hot, " hit(s)/s").unwrap_or_else(|| panic!("no sustainable rate in: {hot}"));
+    let rate = number_before(&hot, "/s (").unwrap_or_else(|| panic!("no arrival rate in: {hot}"));
+    let share = number_before(&hot, "% of the window").unwrap_or_else(|| panic!("no share in: {hot}"));
+
+    // Order of magnitude, not a hardcoded figure. A capture reads a frame, a variable table and three
+    // caller locations over loopback: sub-millisecond to a few ms. Below 1µs would mean nothing was
+    // timed; above 100ms would mean this is not the capture being measured.
+    assert!(
+        (0.001..100.0).contains(&mean_ms),
+        "implausible mean capture of {mean_ms}ms — is the capture window really what is timed? {hot}"
+    );
+    // The ceiling is 1/mean by definition, so it must agree with the mean it was derived from.
+    let expected_ceiling = 1000.0 / mean_ms;
+    assert!(
+        (sustainable - expected_ceiling).abs() < expected_ceiling * 0.02 + 1.0,
+        "the sustainable rate ({sustainable}/s) disagrees with the {mean_ms}ms mean it comes from: {hot}"
+    );
+    // Three hits per ~150ms iteration ⇒ ~20/s. Wide bounds, because the JVM's own scheduling and the
+    // capture cost itself both stretch the iteration — but not wide enough to accept "one per loop"
+    // (~7/s) or a rate derived from the capture window instead of the arrivals (hundreds/s).
+    assert!(
+        (8.0..80.0).contains(&rate),
+        "expected ~20 hits/s from CallerProbe's three calls per 150ms iteration, got {rate}/s: {hot}"
+    );
+    // And the share must be the product of the two, which is the number that answers "is this hurting?".
+    let expected_share = rate * mean_ms / 10.0; // (hits/s × s/hit) as a percentage
+    assert!(
+        (share - expected_share).abs() < expected_share * 0.05 + 0.1,
+        "the reported {share}% does not match {rate}/s × {mean_ms}ms: {hot}"
+    );
+    assert!(share < 100.0, "a serialised capture cannot occupy more than the window itself: {hot}");
+
+    server.panic_reset();
+}
+
+/// The `bp_`/`exc_`/`mexit_` id out of an arm reply.
+fn stop_id(reply: &str, prefix: &str) -> Option<String> {
+    let at = reply.find(prefix)?;
+    let rest = reply.get(at + prefix.len()..)?;
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let digits = rest.get(..end)?;
+    (!digits.is_empty()).then(|| format!("{prefix}{digits}"))
+}
+
+/// The `⏱  Trace cost:` line belonging to one stop point in a `debug.list_stop_points` listing.
+///
+/// Rows start at two spaces plus a glyph and their detail lines are indented further, so a row's details
+/// are exactly the following lines that begin with three spaces. Matching on the whole listing instead
+/// would credit one stop point with another's cost.
+fn trace_cost_line(listing: &str, id: &str) -> Option<String> {
+    let header = format!("[{id}]");
+    let mut lines = listing.lines().skip_while(|l| !l.contains(&header));
+    lines.next()?; // the row itself
+    lines
+        .take_while(|l| l.starts_with("   "))
+        .find(|l| l.contains("Trace cost:"))
+        .map(str::to_string)
+}
+
+/// The number immediately before `suffix`, e.g. `number_before("1.23ms mean", "ms mean") == Some(1.23)`.
+fn number_before(line: &str, suffix: &str) -> Option<f64> {
+    let head = line.split(suffix).next()?;
+    let start = head.rfind(|c: char| !c.is_ascii_digit() && c != '.').map_or(0, |i| i + 1);
+    head.get(start..)?.parse().ok()
+}
+
 /// DUMP-1: one call returns every thread's stack plus who holds what, and a real two-lock deadlock is
 /// readable off the output.
 ///

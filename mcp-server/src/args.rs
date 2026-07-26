@@ -102,7 +102,10 @@ pub struct SetBreakpointArgs {
     /// to leave armed at all. **`0` on a site that fires thousands of times a second turns that blip into
     /// sustained throttling**: it is the single setting that removes the protection, so choose it
     /// knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures
-    /// move with hardware, the existence of a hits/s ceiling does not.
+    /// move with hardware, the existence of a hits/s ceiling does not. **You do not have to trust those
+    /// figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture and the
+    /// ceiling measured on the JVM you are actually attached to, plus the rate hits are arriving at
+    /// (TRACE-7).
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
     /// Only with `trace:true` — how many CALLER frames to record above the hit, so a snapshot says
@@ -115,7 +118,8 @@ pub struct SetBreakpointArgs {
     /// default 3 frames add ~0.53ms on top (**+62%**), lowering the ceiling from ~1160 to ~720 hits/s.
     /// Kept at 3 regardless, because the chain is usually the answer rather than context — but
     /// `trace_frames: 0` is the cheap mode when the site is hot and you only need that it fired.
-    /// Loopback measurement against a trivial `WildFly` endpoint (#22).
+    /// Loopback measurement against a trivial `WildFly` endpoint (#22); `debug.list_stop_points` reports
+    /// what the depth you chose is costing on *your* JVM once hits have landed.
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
     // NOTE: `session_id` is a cross-cutting argument handled uniformly by `resolve_session`
@@ -397,7 +401,10 @@ pub struct SetExceptionBreakpointArgs {
     /// to leave armed at all. **`0` on a site that fires thousands of times a second turns that blip into
     /// sustained throttling**: it is the single setting that removes the protection, so choose it
     /// knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures
-    /// move with hardware, the existence of a hits/s ceiling does not.
+    /// move with hardware, the existence of a hits/s ceiling does not. **You do not have to trust those
+    /// figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture and the
+    /// ceiling measured on the JVM you are actually attached to, plus the rate hits are arriving at
+    /// (TRACE-7).
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
     /// Only with `trace:true` — how many CALLER frames to record above the throw, so a swallowed
@@ -410,7 +417,8 @@ pub struct SetExceptionBreakpointArgs {
     /// default 3 frames add ~0.53ms on top (**+62%**), lowering the ceiling from ~1160 to ~720 hits/s.
     /// Kept at 3 regardless, because the chain is usually the answer rather than context — but
     /// `trace_frames: 0` is the cheap mode when the site is hot and you only need that it fired.
-    /// Loopback measurement against a trivial `WildFly` endpoint (#22).
+    /// Loopback measurement against a trivial `WildFly` endpoint (#22); `debug.list_stop_points` reports
+    /// what the depth you chose is costing on *your* JVM once hits have landed.
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
     /// Only report throws on this thread (hex id, e.g. `0x2a`). On a busy app server with hundreds of
@@ -456,7 +464,10 @@ pub struct SetWatchpointArgs {
     /// to leave armed at all. **`0` on a site that fires thousands of times a second turns that blip into
     /// sustained throttling**: it is the single setting that removes the protection, so choose it
     /// knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures
-    /// move with hardware, the existence of a hits/s ceiling does not.
+    /// move with hardware, the existence of a hits/s ceiling does not. **You do not have to trust those
+    /// figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture and the
+    /// ceiling measured on the JVM you are actually attached to, plus the rate hits are arriving at
+    /// (TRACE-7).
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
     /// Only with `trace:true` — how many CALLER frames to record above the mutating frame, so "who
@@ -469,7 +480,8 @@ pub struct SetWatchpointArgs {
     /// default 3 frames add ~0.53ms on top (**+62%**), lowering the ceiling from ~1160 to ~720 hits/s.
     /// Kept at 3 regardless, because the chain is usually the answer rather than context — but
     /// `trace_frames: 0` is the cheap mode when the site is hot and you only need that it fired.
-    /// Loopback measurement against a trivial `WildFly` endpoint (#22).
+    /// Loopback measurement against a trivial `WildFly` endpoint (#22); `debug.list_stop_points` reports
+    /// what the depth you chose is costing on *your* JVM once hits have landed.
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
     /// Only report touches from this thread (hex id, e.g. `0x2a`). On a busy app server, restricting
@@ -512,7 +524,10 @@ pub struct SetMethodBreakpointArgs {
     /// to leave armed at all. **`0` on a site that fires thousands of times a second turns that blip into
     /// sustained throttling**: it is the single setting that removes the protection, so choose it
     /// knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures
-    /// move with hardware, the existence of a hits/s ceiling does not.
+    /// move with hardware, the existence of a hits/s ceiling does not. **You do not have to trust those
+    /// figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture and the
+    /// ceiling measured on the JVM you are actually attached to, plus the rate hits are arriving at
+    /// (TRACE-7).
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
     /// Only with `trace:true` — how many caller frames to record above the return, as
@@ -522,7 +537,8 @@ pub struct SetMethodBreakpointArgs {
     /// default 3 frames add ~0.53ms on top (**+62%**), lowering the ceiling from ~1160 to ~720 hits/s.
     /// Kept at 3 regardless, because the chain is usually the answer rather than context — but
     /// `trace_frames: 0` is the cheap mode when the site is hot and you only need that it fired.
-    /// Loopback measurement against a trivial `WildFly` endpoint (#22).
+    /// Loopback measurement against a trivial `WildFly` endpoint (#22); `debug.list_stop_points` reports
+    /// what the depth you chose is costing on *your* JVM once hits have landed.
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
     /// Only report returns on this thread (hex id, e.g. `0x2a`). On a busy app server this is the

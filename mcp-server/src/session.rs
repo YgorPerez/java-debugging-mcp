@@ -164,6 +164,76 @@ impl DebugSession {
     }
 }
 
+/// What a traced stop point has actually cost, measured hit by hit (TRACE-7).
+///
+/// #22 established the *typical* price of a traced hit — ~0.86 ms plus ~0.53 ms for the caller chain,
+/// so roughly 720 hits/s — from one measurement, on one machine, against one endpoint. Those figures are
+/// in the tool descriptions, and they are the best a document can do. What a caller actually needs to
+/// know is what **this** stop point, on **their** site, is costing right now, and the debugger is the
+/// only thing that can answer that: it already counts hits for `trace_max_hits`, so it only lacked the
+/// clock. Same move #17 made for `thread_dump`, which used to report its packet count and now reports the
+/// duration it held the VM.
+///
+/// Only the **capture** window is timed — the snapshot and caller-chain read — not the whole event-pump
+/// iteration. Our own bookkeeping (budget arithmetic, the resume, this struct) must not inflate the
+/// number we then report as the cost of tracing.
+#[derive(Debug, Clone, Default)]
+pub struct TraceCost {
+    /// Captures recorded. Hits dropped by a condition or a method filter are **not** counted, for the
+    /// same reason they don't charge the budget: nothing was captured, so nothing was paid.
+    pub captures: u64,
+    /// Summed capture windows.
+    pub total: std::time::Duration,
+    /// When the first and most recent capture began. The gap between them is the observation window, and
+    /// it is what separates "fires constantly" from "fired twice an hour ago".
+    first: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+}
+
+impl TraceCost {
+    /// Record one capture that began at `started` and took `took`.
+    pub fn record(&mut self, started: std::time::Instant, took: std::time::Duration) {
+        self.captures += 1;
+        self.total = self.total.saturating_add(took);
+        self.first.get_or_insert(started);
+        self.last = Some(started);
+    }
+
+    /// Mean cost of one capture, or `None` before anything has been captured.
+    pub fn mean_capture(&self) -> Option<std::time::Duration> {
+        (self.captures > 0).then(|| self.total / u32::try_from(self.captures).unwrap_or(u32::MAX))
+    }
+
+    /// Hits per second **this stop point could sustain** at its measured cost — the observed counterpart
+    /// of #22's documented ~720/s ceiling. Capture is serialised, so this is the rate past which hits
+    /// queue, and it reflects the capture window only: idle time between hits cannot flatter it.
+    #[allow(clippy::cast_precision_loss)] // a capture count that overflows f64's mantissa is not reachable
+    pub fn sustainable_rate(&self) -> Option<f64> {
+        let mean = self.mean_capture()?.as_secs_f64();
+        (mean > 0.0).then(|| 1.0 / mean)
+    }
+
+    /// Hits per second actually **arriving**, over the window from the first capture to the last.
+    ///
+    /// `None` until there are two captures: one hit establishes no interval, and dividing by a window of
+    /// zero would report an infinite rate for the quietest possible trace.
+    #[allow(clippy::cast_precision_loss)] // as above
+    pub fn observed_rate(&self) -> Option<f64> {
+        let (first, last) = (self.first?, self.last?);
+        let window = last.duration_since(first).as_secs_f64();
+        // N captures span N-1 intervals; using N would inflate the rate of an infrequent trace.
+        (self.captures >= 2 && window > 0.0).then(|| (self.captures - 1) as f64 / window)
+    }
+
+    /// The fraction of the observation window spent capturing — arrival rate × cost per hit.
+    ///
+    /// This is the number that answers "is this trace hurting the instance?", which neither figure does
+    /// alone: a cheap capture on a hot line and an expensive one on a quiet line can cost the same.
+    pub fn capture_share(&self) -> Option<f64> {
+        Some(self.observed_rate()? * self.mean_capture()?.as_secs_f64())
+    }
+}
+
 /// One captured hit of a trace/logpoint breakpoint: where it fired, on which thread, the in-scope
 /// locals/args at that point, and an optional evaluated expression. Recorded without leaving the
 /// thread suspended.
@@ -228,6 +298,8 @@ pub struct ExceptionRequestInfo {
     pub trace_budget: Option<u32>,
     /// How many caller frames each traced throw records above the throwing frame (TRACE-5).
     pub trace_frames: usize,
+    /// Observed capture cost, reported by `list_stop_points` (TRACE-7).
+    pub trace_cost: TraceCost,
     /// Thread this request is filtered to (`ThreadOnly`), if any — for the `list_stop_points` line (FILT-1).
     pub thread_filter: Option<u64>,
 }
@@ -267,6 +339,8 @@ pub struct WatchpointInfo {
     pub trace_budget: Option<u32>,
     /// How many caller frames each traced hit records above the mutating frame (TRACE-5).
     pub trace_frames: usize,
+    /// Observed capture cost, reported by `list_stop_points` (TRACE-7).
+    pub trace_cost: TraceCost,
     /// Thread this watch is filtered to (`ThreadOnly`), if any — for the `list_stop_points` line (FILT-1).
     pub thread_filter: Option<u64>,
 }
@@ -300,6 +374,8 @@ pub struct MethodExitRequestInfo {
     pub trace_budget: Option<u32>,
     /// Caller-frame depth for traced hits (TRACE-5).
     pub trace_frames: usize,
+    /// Observed capture cost, reported by `list_stop_points` (TRACE-7).
+    pub trace_cost: TraceCost,
     pub thread_filter: Option<u64>,
 }
 
@@ -354,6 +430,8 @@ pub struct BreakpointInfo {
     /// How many caller frames each traced hit records above the hit frame (TRACE-5). 0 restores the
     /// original one-frame snapshot.
     pub trace_frames: usize,
+    /// Observed capture cost, reported by `list_stop_points` (TRACE-7).
+    pub trace_cost: TraceCost,
     /// Everything needed to re-arm this breakpoint at the same location after a `toggle_stop_point`
     /// disable (BP-1). Kept for every armed breakpoint so disable→enable round-trips exactly.
     pub arm: BreakpointArm,
@@ -552,6 +630,58 @@ mod tests {
         }
         assert_eq!(notes.len(), MAX_TRACE_DISARMS, "distinct notes must be capped");
         assert!(dropped > 0, "overflow must be counted so a full buffer never reads as a quiet one");
+    }
+
+    // TRACE-7: a traced stop point that has captured nothing must be distinguishable from one that
+    // captured for free. Every figure is absent, so the renderer has nothing to round down to 0.00ms.
+    #[test]
+    fn an_untouched_trace_cost_reports_no_figures_at_all() {
+        let cost = TraceCost::default();
+        assert_eq!(cost.captures, 0);
+        assert!(cost.mean_capture().is_none(), "no captures means no mean, not a zero mean");
+        assert!(cost.sustainable_rate().is_none());
+        assert!(cost.observed_rate().is_none());
+        assert!(cost.capture_share().is_none());
+    }
+
+    // One capture prices a hit but establishes no interval, so there is a cost and no arrival rate. The
+    // guard matters: dividing by a zero-width window would report an infinite rate for the quietest
+    // possible trace.
+    #[test]
+    fn one_capture_gives_a_cost_but_no_arrival_rate() {
+        let mut cost = TraceCost::default();
+        let t0 = std::time::Instant::now();
+        cost.record(t0, std::time::Duration::from_micros(800));
+        assert_eq!(cost.mean_capture(), Some(std::time::Duration::from_micros(800)));
+        // 0.8ms per capture ⇒ ~1250/s sustainable, the observed counterpart of #22's documented ceiling.
+        let sustainable = cost.sustainable_rate().expect("a cost implies a ceiling");
+        assert!((sustainable - 1250.0).abs() < 1.0, "expected ~1250/s, got {sustainable}");
+        assert!(cost.observed_rate().is_none(), "one capture spans no interval");
+        assert!(cost.capture_share().is_none());
+    }
+
+    // The two rates answer different questions and must not be conflated: 10 captures 100ms apart is an
+    // arrival rate of 10/s, while each costing 1ms means the stop point could sustain ~1000/s — so it is
+    // spending 1% of the window capturing. That product is the "is this hurting the instance?" number.
+    #[test]
+    fn arrival_rate_and_capture_share_are_measured_over_the_observed_window() {
+        let mut cost = TraceCost::default();
+        let t0 = std::time::Instant::now();
+        for i in 0..10u32 {
+            cost.record(t0 + std::time::Duration::from_millis(u64::from(i) * 100), std::time::Duration::from_millis(1));
+        }
+        assert_eq!(cost.captures, 10);
+        assert_eq!(cost.mean_capture(), Some(std::time::Duration::from_millis(1)));
+
+        // 10 captures span NINE 100ms intervals — 900ms, not a full second.
+        let rate = cost.observed_rate().expect("ten captures span nine intervals");
+        assert!((rate - 10.0).abs() < 0.01, "expected 10/s, got {rate}");
+
+        let sustainable = cost.sustainable_rate().expect("a cost implies a ceiling");
+        assert!((sustainable - 1000.0).abs() < 1.0, "expected ~1000/s, got {sustainable}");
+
+        let share = cost.capture_share().expect("both figures are present");
+        assert!((share - 0.01).abs() < 0.0005, "expected ~1% of the window, got {share}");
     }
 
     // SAFE-4/SAFE-5: the two halves of "the VM is suspended" move together. Tracking them separately is

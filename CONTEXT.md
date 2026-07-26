@@ -88,6 +88,12 @@ _Avoid_: stack, backtrace (both imply the whole stack, with locals)
 How many hits a traced stop point will record before disarming itself. Bounds work done in the debuggee,
 not memory.
 
+**Capture**:
+The work one traced hit costs: reading the hit frame's snapshot and the caller chain, between the JVM
+reporting the hit and the thread being resumed. The unit the reported trace cost is measured in — deliberately
+narrower than "handling a hit", which also covers the condition check, the resume and our own bookkeeping.
+_Avoid_: hit (a hit is the event; a capture is the work), snapshot (that is the capture's *output*)
+
 ### Arming and disarming
 
 These three are distinct on purpose, and conflating them loses a caller's typed-in condition.

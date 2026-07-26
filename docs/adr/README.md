@@ -18,6 +18,7 @@ these lazily, when decisions actually get resolved; that point arrived.
 | [0007](0007-doctor-not-clippy-is-the-lint-gate.md) | `scripts/doctor.sh`, not `cargo clippy`, is the lint gate |
 | [0008](0008-caller-frames-fetch-the-whole-stack-and-truncate.md) | Caller frames are read by fetching the whole stack and truncating |
 | [0009](0009-thread-dump-suspends-only-when-asked.md) | `thread_dump` suspends only when asked, and verifies the resume |
+| [0010](0010-a-traced-stop-point-reports-its-own-measured-cost.md) | A traced stop point reports its own measured cost, and the timer wraps the capture only |
 
 The root [`CONTEXT.md`](../../CONTEXT.md) now exists — the glossary reached the same point these did once
 TRACE-5, DUMP-1 and METH-1 forced `stop point`, `snapshot`, and the `suspended` / `blocked` distinction to be

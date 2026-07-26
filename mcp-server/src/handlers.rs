@@ -1297,6 +1297,7 @@ impl RequestHandler {
             trace_expr: a.trace_expr.clone(),
             trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
             trace_frames,
+            trace_cost: crate::session::TraceCost::default(),
             thread_filter,
         });
         drop(session);
@@ -1415,6 +1416,7 @@ impl RequestHandler {
             trace_expr: a.trace_expr.clone(),
             trace_budget,
             trace_frames,
+            trace_cost: crate::session::TraceCost::default(),
             thread_filter,
         });
         drop(session);
@@ -1894,6 +1896,7 @@ async fn arm_one_field_watch(
         trace_expr: spec.trace_expr.map(str::to_string),
         trace_budget: spec.trace_budget,
         trace_frames: spec.trace_frames,
+        trace_cost: crate::session::TraceCost::default(),
         thread_filter: spec.thread_filter,
     });
     Ok(label)
@@ -2114,6 +2117,7 @@ fn render_breakpoint_line(
     if bp.hit_count > 0 {
         let _ = writeln!(output, "     Hits: {}", bp.hit_count);
     }
+    render_trace_cost(output, bp.trace, &bp.trace_cost);
 }
 
 /// Format one deferred (class-prepare) breakpoint into the `debug.list_stop_points` output.
@@ -2162,6 +2166,7 @@ fn render_exception_line(
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
+    render_trace_cost(output, er.trace, &er.trace_cost);
 }
 
 /// The ` [N hit(s) left]` budget suffix for a traced stop point in `list_stop_points`, kept separate
@@ -2171,6 +2176,51 @@ fn trace_budget_tag(trace: bool, budget: Option<u32>) -> String {
         (true, Some(n)) => format!(" [{n} hit(s) left]"),
         _ => String::new(),
     }
+}
+
+/// What a traced stop point has cost so far, on its own line under the stop point (TRACE-7).
+///
+/// Three numbers, because no one of them answers the question on its own:
+///  - **mean capture** — the observed version of #22's documented ~0.86 ms, on this machine and this site;
+///  - **sustains ~N/s** — the rate past which hits queue, since capture is serialised. The observed
+///    counterpart of the documented ~720/s ceiling, and it reflects the capture window only;
+///  - **arriving at N/s**, with the share of the window spent capturing — what the site is *actually*
+///    doing. A cheap capture on a hot line and a costly one on a quiet line both matter, and only the
+///    product tells them apart.
+///
+/// A traced stop point with **no** hits says so explicitly. "0.00 ms" would read as free, and unmeasured
+/// is not free — the same silence-is-not-a-finding rule the rest of this tool follows.
+///
+/// Nothing at all for a suspending stop point: it does no capture, so it has no capture cost. Its price
+/// is the freeze, which the watchdog and `thread_dump` report.
+fn render_trace_cost(output: &mut String, trace: bool, cost: &crate::session::TraceCost) {
+    if !trace {
+        return;
+    }
+    let Some(mean) = cost.mean_capture() else {
+        let _ = writeln!(
+            output,
+            "     ⏱  Trace cost: nothing captured yet — no hits recorded, so this is UNMEASURED rather \
+             than free. If you expected hits, check the thread filter and that the line is reached."
+        );
+        return;
+    };
+    let mut line = format!(
+        "     ⏱  Trace cost: {} capture(s), {:.2}ms mean",
+        cost.captures,
+        mean.as_secs_f64() * 1000.0
+    );
+    if let Some(ceiling) = cost.sustainable_rate() {
+        let _ = write!(line, " → sustains ~{ceiling:.0} hit(s)/s before hits queue");
+    }
+    match (cost.observed_rate(), cost.capture_share()) {
+        (Some(rate), Some(share)) => {
+            let _ = write!(line, "; arriving at {:.1}/s ({:.1}% of the window spent capturing)", rate, share * 100.0);
+        }
+        // One capture establishes a cost but no interval, so there is no arrival rate to report yet.
+        _ => line.push_str("; one capture so far, so no arrival rate yet"),
+    }
+    let _ = writeln!(output, "{line}");
 }
 
 /// The ` [+N caller frame(s)]` suffix for a traced stop point in `list_stop_points` (TRACE-5).
@@ -2368,6 +2418,7 @@ fn render_watchpoint_line(
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
+    render_trace_cost(output, wp.trace, &wp.trace_cost);
 }
 
 /// Format one method-exit request into the `debug.list_stop_points` output (METH-1).
@@ -2403,6 +2454,7 @@ fn render_method_exit_line(
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
+    render_trace_cost(output, me.trace, &me.trace_cost);
 }
 
 /// Resolve a frame's class name, using and populating a per-call cache (recursion / same-class
@@ -3385,6 +3437,7 @@ async fn try_arm_deferred_breakpoints(
                             trace_expr: pend.trace_expr,
                             trace_budget: pend.trace_budget,
                             trace_frames: pend.trace_frames,
+                            trace_cost: crate::session::TraceCost::default(),
                             arm: crate::session::BreakpointArm {
                                 class_id: cp_ref,
                                 method_id: method.method_id,
@@ -3779,8 +3832,19 @@ async fn rearm_method_exit(
         m.request_id = Some(req);
         m.enabled = true;
         m.trace_budget = refreshed_budget(m.trace_budget);
+        reset_trace_cost(&mut m.trace_cost);
     }
     Ok(format!("method-exit {}", me.class_pattern))
+}
+
+/// A re-armed traced stop point starts its cost observation from scratch (TRACE-7).
+///
+/// The alternative — carrying the old figures over — reports an arrival rate diluted by however long the
+/// stop point sat disabled, since that gap falls inside the observation window while producing no hits. A
+/// self-disarmed logpoint that is re-armed minutes later would look far quieter than the site it is on.
+/// The measurement describes the current arming, the same way the budget does.
+fn reset_trace_cost(cost: &mut crate::session::TraceCost) {
+    *cost = crate::session::TraceCost::default();
 }
 
 /// A re-armed stop point's trace budget, refreshed: it was disarmed *because* the old one ran out, so
@@ -3808,6 +3872,7 @@ async fn rearm_line_breakpoint(
         b.enabled = true;
         b.arm = arm;
         b.trace_budget = refreshed_budget(b.trace_budget);
+        reset_trace_cost(&mut b.trace_cost);
     }
     Ok(format!("{}:{}", bp.class_pattern, bp.line))
 }
@@ -3836,6 +3901,7 @@ async fn rearm_exception_request(
         e.enabled = true;
         e.ref_type = ref_type;
         e.trace_budget = refreshed_budget(e.trace_budget);
+        reset_trace_cost(&mut e.trace_cost);
     }
     Ok(format!("exception {}", er.class_pattern))
 }
@@ -3865,6 +3931,7 @@ async fn rearm_watchpoint(
         w.enabled = true;
         w.arm = (declaring, field.field_id);
         w.trace_budget = refreshed_budget(w.trace_budget);
+        reset_trace_cost(&mut w.trace_cost);
     }
     Ok(format!("watch {}.{}", wp.class_name, wp.field_name))
 }
@@ -3929,6 +3996,11 @@ async fn try_record_trace(
             Some(cond) => !evaluate_condition_on_thread(&mut session.connection, thread, cond).await,
             None => false,
         };
+    // TRACE-7: time the capture and nothing else. The condition evaluation above, the resume below and
+    // the budget arithmetic after it are all ours, and charging them to "what a traced hit costs" would
+    // report our own bookkeeping as the debuggee's price — the same reason #17 measured the dump's
+    // suspend/resume pair rather than the whole call.
+    let started = std::time::Instant::now();
     let record = if skip {
         None
     } else {
@@ -3937,7 +4009,11 @@ async fn try_record_trace(
             thread, &loc, &details,
         ).await)
     };
+    let took = started.elapsed();
     let recorded = record.is_some();
+    if recorded {
+        record_trace_cost(session, req_id, started, took);
+    }
     if let Some(mut rec) = record {
         session.trace_seq += 1;
         rec.seq = session.trace_seq;
@@ -3970,6 +4046,28 @@ async fn charge_trace_budget(session: &mut crate::session::DebugSession, req_id:
         ))
     } else {
         None
+    }
+}
+
+/// Record one capture's cost against whichever traced stop point owns `req_id` (TRACE-7).
+///
+/// Four maps scanned in the same order as [`decrement_trace_budget`], and for the same reason: each kind
+/// owns its own bookkeeping, and a parallel index keyed by request id would be a second source of truth
+/// that could outlive the entry it points at.
+fn record_trace_cost(
+    session: &mut crate::session::DebugSession,
+    req_id: i32,
+    started: std::time::Instant,
+    took: std::time::Duration,
+) {
+    if let Some(b) = session.breakpoints.values_mut().find(|b| b.request_id == Some(req_id)) {
+        b.trace_cost.record(started, took);
+    } else if let Some(e) = session.exception_requests.values_mut().find(|e| e.request_id == Some(req_id)) {
+        e.trace_cost.record(started, took);
+    } else if let Some(w) = session.watchpoints.values_mut().find(|w| w.request_id == Some(req_id)) {
+        w.trace_cost.record(started, took);
+    } else if let Some(m) = session.method_exits.values_mut().find(|m| m.request_id == Some(req_id)) {
+        m.trace_cost.record(started, took);
     }
 }
 
@@ -4219,6 +4317,7 @@ async fn arm_and_insert(
         trace_expr: spec.trace_expr.clone(),
         trace_budget: spec.trace_budget,
         trace_frames: spec.trace_frames,
+        trace_cost: crate::session::TraceCost::default(),
         arm: crate::session::BreakpointArm {
             class_id: class_type_id,
             method_id: method.method_id,
@@ -7719,6 +7818,49 @@ mod tests {
         assert_eq!(trace_frames_tag(true, 3), " [+3 caller frame(s)]");
         assert_eq!(trace_frames_tag(true, 0), "", "depth 0 adds no cost, so it advertises nothing");
         assert_eq!(trace_frames_tag(false, 3), "", "a non-traced stop point has no snapshot depth");
+    }
+
+    // TRACE-7: the three states of a cost line. The middle one matters most — a traced stop point with no
+    // hits must not render as one that costs nothing.
+    #[test]
+    fn trace_cost_reports_hits_absence_and_nothing_for_a_suspending_stop_point() {
+        // A suspending stop point does no capture, so it has no capture cost to report.
+        let mut out = String::new();
+        render_trace_cost(&mut out, false, &crate::session::TraceCost::default());
+        assert!(out.is_empty(), "a suspending stop point must report no capture cost: {out:?}");
+
+        // Traced but never hit: unmeasured, and said so in those terms.
+        let mut out = String::new();
+        render_trace_cost(&mut out, true, &crate::session::TraceCost::default());
+        assert!(out.contains("nothing captured yet"), "silence must not read as free: {out}");
+        assert!(out.contains("UNMEASURED"), "the distinction has to be explicit: {out}");
+        assert!(!out.contains("0.00ms"), "an unmeasured cost must not render as a zero one: {out}");
+
+        // Ten captures of 1ms, 100ms apart: 1.00ms mean, ~1000/s sustainable, arriving at 10/s, so 1% of
+        // the window went on capturing.
+        let mut cost = crate::session::TraceCost::default();
+        let t0 = std::time::Instant::now();
+        for i in 0..10u32 {
+            cost.record(
+                t0 + std::time::Duration::from_millis(u64::from(i) * 100),
+                std::time::Duration::from_millis(1),
+            );
+        }
+        let mut out = String::new();
+        render_trace_cost(&mut out, true, &cost);
+        for want in
+            ["10 capture(s)", "1.00ms mean", "sustains ~1000", "arriving at 10.0/s", "(1.0% of the window"]
+        {
+            assert!(out.contains(want), "missing {want:?} in: {out}");
+        }
+
+        // A single capture prices a hit but cannot price a rate, and says which is missing.
+        let mut one = crate::session::TraceCost::default();
+        one.record(std::time::Instant::now(), std::time::Duration::from_millis(1));
+        let mut out = String::new();
+        render_trace_cost(&mut out, true, &one);
+        assert!(out.contains("1 capture(s)"), "{out}");
+        assert!(out.contains("no arrival rate yet"), "one hit must not imply a rate: {out}");
     }
 
     // TRACE-5: the chain renders as one readable run of arrows on the hit's own line, and adds nothing
