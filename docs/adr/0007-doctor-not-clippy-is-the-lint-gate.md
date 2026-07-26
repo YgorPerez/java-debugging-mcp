@@ -65,7 +65,27 @@ at a specific line that is either fixed or not.
 upstream lints are found on a bump rather than on the day they ship. That is the trade — a gate that holds,
 against warnings arriving later.
 
-**Environmental caveat:** on a `windows-gnu` toolchain, doctor's isolated `target/rust-doctor` build fails
-to link (`ld.exe: cannot find \symbols.o` — path mangling in that separate build dir) and reports one
-`error`. The normal `cargo build` and `cargo clippy` are clean, and CI runs on Linux and does not hit it.
-Locally on Windows, read the warning count and ignore that error.
+**On `windows-gnu`, a local doctor run cannot verify the warning count — do not trust it.**
+
+Doctor's isolated `target/rust-doctor` build fails to link there (`ld.exe: cannot find \symbols.o` — path
+mangling in that separate build dir). It was first recorded as one cosmetic `error` to be read past. That
+was wrong, and the first gated CI run proved it: **a build that cannot link is a clippy pass that cannot
+run**, so a Windows doctor run reports only the custom AST rules (complexity, clone-in-loop) and silently
+contributes *zero* clippy findings. It says "0 warnings" because it did not look, which is this repo's
+recurring failure shape — an instrument reading healthy because it is measuring nothing.
+
+What it cost: LINT-1 was verified locally at 0 warnings and pushed, and CI immediately failed the new
+gate on three clippy findings that had been invisible on Windows — a `doc_markdown` in the integration
+test crate (the exact blind spot this ADR is about) and `multiple_crate_versions` twice.
+
+**Verify the clippy half locally with `cargo clippy` and doctor's own flags**, which works fine on
+`windows-gnu` because it uses the normal target dir:
+
+```
+cargo clippy --workspace --all-targets -- -W clippy::pedantic -W clippy::nursery -W clippy::cargo
+```
+
+`--all-targets` is the load-bearing part — it is what reaches `tests/mcp_integration.rs`, and
+`-W clippy::cargo` is what surfaces `multiple_crate_versions`. Neither is on by default, which is why
+plain `cargo clippy` looked clean throughout. Run `scripts/doctor.sh` as well for the custom rules; on
+Windows take the clippy findings from the command above and the rest from doctor.

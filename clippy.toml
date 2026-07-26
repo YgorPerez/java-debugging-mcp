@@ -1,0 +1,15 @@
+# Workspace clippy configuration.
+#
+# `allowed-duplicate-crates` exists for one entry, and it is the one warning this repo has always known
+# about and always left: `schemars` pulls `syn 3`, `serde_derive` pulls `syn 2`, and both are needed. It
+# cannot be resolved without dropping a dependency, and it costs build time rather than correctness.
+#
+# It is declared here rather than tolerated because the doctor gate now fails on warnings (LINT-1, #18),
+# and a known-accepted duplication must not be the thing that turns the gate off for everyone. Recorded
+# as an explicit allowance so the *next* duplicate — which would be a real finding — still fails the
+# build instead of hiding behind this one.
+#
+# Note `cargo clippy` alone does not surface this: `multiple_crate_versions` is in the `clippy::cargo`
+# group, which the crate-level `#![warn(clippy::pedantic, clippy::nursery)]` attributes do not enable.
+# rust-doctor passes the group on the command line, which is the ADR-0007 difference all over again.
+allowed-duplicate-crates = ["syn"]

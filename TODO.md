@@ -7,49 +7,73 @@ item and finish it.
 
 ## Coverage: `scripts/coverage.sh`, and the gaps reviewed once
 
-> **These figures are STALE and were not re-measured (TEST-7, #19 — still open).** They predate TRACE-5,
-> DUMP-1, DUMP-2, METH-1 and #17, which added roughly 1,500 lines to `handlers.rs` plus new `jdwp-client`
-> primitives. The re-run is **blocked on this host, not skipped**: `-C instrument-coverage` needs the
-> profiler runtime, and rustup ships no `profiler_builtins` for `x86_64-pc-windows-gnu`. The
-> `stable-x86_64-pc-windows-msvc` toolchain *does* have it but has no `link.exe` (no Visual Studio C++
-> build tools), so neither toolchain on this machine can produce a report. `coverage.sh` now detects this
-> up front and says so, instead of dying ninety seconds into a build with a bare `error[E0463]: can't find
-> crate for profiler_builtins`.
->
-> **To finish #19: run `scripts/coverage.sh --uncovered` on Linux** (what CI uses), and replace the numbers
-> and the verdict list below. The uneven split #19 describes is the thing to check — several functions
-> (`collect_dump_rows`, `read_dump_stack`, `read_thread_monitors`, `monitor_label`,
-> `describe_caller_chain`, `method_name_matches`) have **no unit test by design** and are covered only via
-> integration; "the right seam" and "actually reached" are different claims, and only a run tells them
-> apart. One thing that *was* settled meanwhile: those integration tests genuinely execute now — they had
-> never run on Windows at all (see Shipped), so any earlier local reading of this file was measuring a
-> suite that launched no JVMs.
+**85.28% region / 86.64% line / 79.62% functions**, unit + integration together — 47/47 tests, zero skips
+(TEST-7, #19). Up from 83%/78% at TEST-5, across roughly 1,500 lines added by TRACE-5, DUMP-1, DUMP-2,
+METH-1 and #17.
 
-**83% region / 78% line**, unit + integration together, as of TEST-5. Read it with one caveat in mind: the
-number is only meaningful because the harness now shuts the server down by closing stdin rather than
-`kill()`ing it.
+Measured **in CI**, by `.github/workflows/coverage.yml`, and that is now the only place it can be measured:
+`-C instrument-coverage` needs the profiler runtime, and rustup ships no `profiler_builtins` for
+`x86_64-pc-windows-gnu`; the msvc toolchain has the runtime but needs the Visual Studio C++ build tools for
+`link.exe`. A Windows dev box cannot produce a report at all, which is why the figures sat stale for so
+long. `coverage.sh` detects that up front now rather than dying ninety seconds into a build on a bare
+`error[E0463]`. Push to `main` or run the workflow by hand; the summary lands in the job summary.
+
+Read it with one caveat in mind: the number is only meaningful because the harness now shuts the server
+down by closing stdin rather than `kill()`ing it.
 Coverage counters flush in an `atexit` handler, which SIGKILL skips — so before that fix the entire
 integration suite contributed **nothing**, and `handlers.rs` measured 3.75% while 35 tests drove it. The
 broken instrument produced a plausible-looking low number, not an error.
 
-Uncovered paths reviewed once, and the verdicts:
+### Read the function column with care — async breaks it
 
-- **`resume_all_fully`'s exhaustion tail** (`jdwp-client/src/thread.rs:223`) — the branch that reports "the
-  VM is STILL suspended" after `MAX_RESUME_ATTEMPTS`. **A deliberate gap**: reaching it needs a suspend
-  depth above 8, and now that `debug.pause` is idempotent (ADR-0003) no sequence of *this tool's* calls can
-  build one. It is reachable only when something outside the session is also suspending, which is
-  [#13](https://github.com/YgorPerez/java-debugging-mcp/issues/13) territory. Worth knowing that the
-  honest-failure path of the safety fix is the untested one.
-- **`get_thread_status`** (`thread.rs:117`) — was only used by `list_threads {only_suspended:true}`, which
-  no test passed. **Closed** by DUMP-1: `debug.thread_dump` reads it for every thread (it is how a
-  readable thread is told from a running one), and both dump tests exercise it.
-- **`Value::format`** (`types.rs:102`) — live (called from `handlers.rs:3396`, `:4707`) but only on a
-  type-mismatch message and a render fallback. Not dead code.
-- **`get_version` / `get_id_sizes`** (`vm.rs:47`, `:76`) — JDWP conveniences the server never calls.
-  Unused, not broken.
+`handlers.rs` reports **188 of 746 functions "missed"**, which reads as a great deal of dead code and is
+mostly an artifact. For an `async fn`, llvm-cov attributes hits to the *generator* the compiler produces,
+while the elided outer shell that merely builds the future records **zero**. So `handle_thread_dump`,
+`handle_attach` and even `main` all appear as never-executed while 47 tests drive them. Judge a function
+by the max hit count across *all* its entries (shell plus closures), not by the shell. The region and line
+columns are unaffected.
 
-There is deliberately **no coverage percentage gate**. The value was the branch list, and it paid for
-itself on the first run.
+Worth writing down because it is the same trap in a new costume: a number that reads as a finding and is
+an instrument artifact.
+
+### Uncovered paths reviewed, and the verdicts
+
+The question #19 raised — several functions have **no unit test by design** and are covered only through
+integration, and "the right seam" and "actually reached" are different claims. Now measured, and the split
+is what was intended. Hit counts from the run:
+
+- **The integration-only dump/trace helpers — all genuinely reached.** `describe_caller_chain` 56,
+  `collect_dump_rows` 48, `method_name_matches` 45, `read_dump_stack` 29, `read_thread_monitors` 24,
+  `monitor_label` 21. **No gap.** These need a live JVM by nature, and the integration tests do reach them.
+- **The new `jdwp-client` primitives — all reached.** `capabilities` 70, `owned_monitors` 14,
+  `current_contended_monitor` 14, `set_method_exit_request` 3, `clear_method_exit_request` 3,
+  `can_get_method_return_values` 2. The error arms of the last three are thin at 2–3 calls; **a real but
+  low-value gap**, since each is a JDWP failure path that a healthy `HotSpot` will not produce on demand.
+- **`resume_all_fully`'s exhaustion tail** (`thread.rs:223`) — the function itself is now the most-exercised
+  path in the client (**91** hits), but the branch reporting "the VM is STILL suspended" after
+  `MAX_RESUME_ATTEMPTS` is **still unreached**, and still **a deliberate gap**: reaching it needs a suspend
+  depth above 8, and with `debug.pause` idempotent (ADR-0003) no sequence of *this tool's own calls* can
+  build one. **Unreachable through the tool's own API** — only something outside the session suspending
+  concurrently gets there, which is [#13](https://github.com/YgorPerez/java-debugging-mcp/issues/13)
+  territory. The honest-failure path of the safety fix remains the untested one.
+- **`get_thread_status`** (`thread.rs:117`) — **closed, confirmed by measurement.** 39 hits. TEST-5 recorded
+  it as covered-by-prediction once DUMP-1 landed; the prediction was right.
+- **`Value::format`** (`types.rs:102`) — **51 hits, not dead code**, confirming the earlier verdict. Note
+  `types.rs` still shows 16.67% region: the file is one big match over value kinds and most arms are for
+  types the probes never produce. Low percentage, not a finding.
+- **`get_id_sizes`** (`vm.rs:76`) — **0 hits. Genuinely never executed**, the only named function in this
+  review that is. Dead as far as this server is concerned: nothing calls it, and nothing needs to, since
+  the id sizes are assumed 8-byte. Keep or delete; it is not a test gap.
+- **`get_version`** (`vm.rs:47`) — **now reached** (2 hits, via attach). The old verdict paired it with
+  `get_id_sizes` as "conveniences the server never calls"; that has since stopped being true for one of
+  the pair. Recorded because a stale verdict is worse than none.
+- **`main.rs` at 65.38%** — the stdio read loop and its malformed-message arms. **A real gap**, and the one
+  worth taking next: it is reachable through the process's own front door, so a test that writes junk JSON
+  to stdin would close most of it.
+
+There is deliberately **no coverage percentage gate** — the standing decision, and the reason is that a
+percentage rises with tests that assert nothing. The value is the list above — and it paid for itself on
+the first run, which found a broken instrument rather than a low number.
 
 ## Settled decisions live in `docs/adr/`
 
@@ -89,16 +113,32 @@ over a `StackWalk`/`StackWalkState` pair; `handle_set_value` → `set_field_by_p
 copied once on the way out instead of per frame, and a filtered map's surviving keys are moved out of the
 scan rather than cloned out of a shared vector per match.
 
-One warning is known and deliberately left, and it is a *dependency* finding rather than a code one:
+One finding is known and deliberately allowed, and it is a *dependency* issue rather than a code one:
 
-- **`multiple versions for dependency syn` (2)** — `schemars` pulls `syn 3`, `serde_derive` pulls `syn 2`.
-  Not fixable without dropping one of them; harmless build-time duplication. It scores as info, so the
-  warning gate does not trip on it.
+- **`multiple versions for dependency syn`** — `schemars` pulls `syn 3`, `serde_derive` pulls `syn 2`.
+  Not fixable without dropping one of them; costs build time, not correctness. Now declared in
+  `clippy.toml` as `allowed-duplicate-crates = ["syn"]` rather than tolerated, so the *next* duplicate —
+  which would be a real finding — still fails the build instead of hiding behind this one. It was
+  previously recorded here as scoring "info, so the warning gate does not trip on it", which was simply
+  **wrong**: it is a warning, once per crate, and it failed the first gated CI run.
 
-On a `windows-gnu` toolchain doctor also reports **one error** that is environmental rather than a code
-problem: its isolated `target/rust-doctor` build fails to link (`ld.exe: cannot find \symbols.o`, path
-mangling in that separate build dir). `cargo build` and `cargo clippy` are clean, and CI runs on Linux.
-Read the warning count locally and ignore that error.
+**On `windows-gnu`, `scripts/doctor.sh` cannot verify the warning count — don't trust a local 0.** Its
+isolated `target/rust-doctor` build fails to link (`ld.exe: cannot find \symbols.o`), and a build that
+cannot link is a **clippy pass that cannot run**. So a Windows doctor run reports only the custom AST
+rules and contributes zero clippy findings — it says 0 because it did not look. That is how LINT-1 was
+verified clean locally and then failed CI on three clippy findings, one of them a `doc_markdown` in the
+integration-test crate, which is precisely the blind spot ADR-0007 exists to describe.
+
+Locally on Windows, get the clippy half from `cargo clippy` with doctor's own flags — that path uses the
+normal target dir and works fine:
+
+```
+cargo clippy --workspace --all-targets -- -W clippy::pedantic -W clippy::nursery -W clippy::cargo
+```
+
+`--all-targets` is what reaches `tests/mcp_integration.rs`, and `-W clippy::cargo` is what surfaces
+`multiple_crate_versions`. Neither is on by default, which is why plain `cargo clippy` looked clean the
+whole time. Then run `scripts/doctor.sh` for the custom rules.
 
 ## The resume-honesty invariant (read this before touching a resume path)
 

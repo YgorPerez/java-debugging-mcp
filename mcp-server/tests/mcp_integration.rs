@@ -1158,7 +1158,7 @@ fn a_monitors_only_dump_finds_the_cycle_for_a_fraction_of_the_packets() {
 /// EVAL-5: a `toString()` that will not return must be abandoned within its budget and **reported**, not
 /// waited out and then rendered as though it had cost nothing.
 ///
-/// Measured against a real WildFly before the fix: 30–40 seconds of frozen VM (the event loop's generic
+/// Measured against a real `WildFly` before the fix: 30–40 seconds of frozen VM (the event loop's generic
 /// reply timeout, swept every 10s) followed by a reply byte-identical to the free shallow render. The whole
 /// bug was the indistinguishability, so that is what this asserts.
 #[test]
