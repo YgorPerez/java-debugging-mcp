@@ -481,6 +481,25 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   Recorded as **ADR-0009**, including that this reads #15's "does not suspend as a side effect" as "does
   not suspend *silently*" — issue and code otherwise appear to disagree, and the interpretation is the
   load-bearing part of the design.
+- **The thread filter, verified against a real pool (#13 assumption 1)** — `ThreadOnly` was only ever
+  checked against `ThreadProbe`'s two dedicated, immortal threads, which leaves the interesting cases
+  untested: a filter competing with *hundreds* of siblings rather than one, and a thread id that outlives
+  many units of work. `examples/probes/PoolProbe.java` is a real request pool — 200 workers, saturated and
+  reused across thousands of tasks, all running the same throw site — and
+  `a_thread_filter_holds_against_a_real_pool_of_reused_threads` requires a filtered stop point to report
+  **exactly one** thread out of the 200, with the other 199 still making progress. Assumption 1's local half
+  is closed; `WildFly`'s own pool under real traffic still is not.
+  Getting the load shape right was most of the work, and two earlier shapes failed **quietly** — the probe
+  ran, looked healthy, and reproduced something other than a loaded pool. Submitting one task every 20ms
+  left 199 of 200 threads idle and churned 300+ threads in five seconds; switching to one task per
+  `Thread.sleep(1)` was meant to fix it, but Windows rounds a 1ms sleep to ~15ms, so the real rate was
+  ~65/s, the pool settled at 55 of 200, and ~500 threads had been created and retired within ten seconds.
+  Submitting a batch per iteration decouples the load from the host's timer granularity. The test asserts
+  the pool is saturated before asserting anything about the filter, because "the filter excluded the
+  others" proves almost nothing against a handful of threads.
+  **This found a real bug** — [#21](https://github.com/YgorPerez/java-debugging-mcp/issues/21) (FILT-2): a
+  filtered stop point stops reporting when its thread dies and `list_breakpoints` still shows it armed with
+  `⚡`. Unreachable with an immortal-thread probe, and routine on a pool that reaps idle workers.
 - **The dump's suspension window is bounded and reported (#17, items 1–2)** — DUMP-1 made the suspension
   explicit, which was the important half, and left its *magnitude* unbounded and unreported: `suspend:true`
   held the VM for the whole collection loop, and the reply gave the packet cost but never the duration. So

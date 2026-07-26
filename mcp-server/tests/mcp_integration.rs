@@ -1056,6 +1056,86 @@ fn thread_dump_shows_stacks_and_the_deadlock_cycle() {
     server.panic_reset();
 }
 
+/// TEST-6 assumption 1: the `ThreadOnly` filter holds against a **real thread pool** — 200 busy workers
+/// reused across thousands of tasks, all running the same throw site.
+///
+/// `thread_filter_reports_only_the_chosen_thread` verifies the same property against two dedicated,
+/// immortal threads. That leaves the interesting cases untested: a filter competing with hundreds of
+/// siblings rather than one, and a thread id that outlives many units of work. This closes the local half
+/// of #13's first assumption; what it still cannot reproduce is `WildFly`'s own pool under real traffic.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_thread_filter_holds_against_a_real_pool_of_reused_threads() {
+    let Some(jdk) = jdk_or_skip("a_thread_filter_holds_against_a_real_pool_of_reused_threads") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "PoolProbe").expect("launch PoolProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // The pool pre-starts every core thread, so waiting for one heartbeat is enough for all 200 to exist.
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    let threads = server.call(
+        "debug.list_threads",
+        serde_json::json!({"name_filter": "pool-worker", "limit": 400}),
+    );
+    // The premise of the test: if the pool were not saturated this would be a handful of threads, and
+    // "the filter excluded the others" would prove almost nothing.
+    let pool_size = threads.lines().filter(|l| l.contains("pool-worker")).count();
+    assert!(
+        pool_size >= 100,
+        "the pool must be saturated for this test to mean anything, saw {pool_size} worker(s):\n{threads}"
+    );
+    let target = threads
+        .lines()
+        .find_map(|l| l.strip_prefix("0x").map(|_| l.split_whitespace().next().unwrap_or("")))
+        .filter(|t| t.starts_with("0x"))
+        .unwrap_or_else(|| panic!("no pool worker id in:\n{threads}"))
+        .to_string();
+
+    let armed = server.call(
+        "debug.set_exception_breakpoint",
+        serde_json::json!({
+            "class_pattern": "PoolProbe$PoolException",
+            "trace": true, "trace_max_hits": 0, "thread_id": target,
+        }),
+    );
+    assert!(armed.contains("exc_"), "filtered exception breakpoint failed to arm: {armed}");
+
+    let traces = server
+        .wait_for_traces("PoolProbe.doWork", EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("the filtered stop point never recorded a throw"));
+
+    // The assertion that matters: exactly ONE thread reported, out of 200 running the same code.
+    let seen: std::collections::BTreeSet<&str> = traces
+        .lines()
+        .filter_map(|l| l.split("thread=").nth(1))
+        .map(|r| r.split_whitespace().next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        seen.len(),
+        1,
+        "a thread-filtered stop point must report exactly one thread; saw {seen:?} among {pool_size} workers"
+    );
+    assert!(
+        seen.contains(target.as_str()),
+        "the one thread reported must be the one asked for ({target}), saw {seen:?}"
+    );
+
+    // And the other 199 kept working — the filter must not have suspended anything.
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
+            .is_some(),
+        "the pool stopped making progress under a filtered trace\n  output: {:?}",
+        probe.output().len(),
+    );
+
+    server.panic_reset();
+}
+
 /// #17: the dump reports how long it held the VM, and a suspension budget bounds that window —
 /// truncating loudly rather than silently.
 ///
