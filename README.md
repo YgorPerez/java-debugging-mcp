@@ -279,19 +279,33 @@ Committed here, so nothing else is needed: `.mcp.json` (the server registration,
 under `examples/probes/` are fixtures and get no language server), and `.claude/settings.json`
 (Serena's hooks).
 
-**Two things worth knowing before you rely on it**, both measured on this workspace:
+**One thing worth knowing before you rely on it**, measured on this workspace by tracing the LSP traffic:
 
-- **The first semantic query in a session costs ~120s.** Serena waits for rust-analyzer to report
-  `quiescent`, gives up after a hard-coded 120s and proceeds anyway. Warm `initialize` is ~4s, and
-  `find_symbol` is ~30ms once loaded — so it is a one-off stall per server process, not per query.
-  Serena's docs suggest `MCP_TIMEOUT=60000`; that is **not enough here** — use `export MCP_TIMEOUT=300000`
-  or Serena may fail to connect.
-- **`find_referencing_symbols` returns nothing on this project.** Verified against a free function, a
-  method and a struct that all have references confirmed by grep, before and after loading the file, warm
-  and cold. `find_symbol` and `get_symbols_overview` are accurate and fast; reference lookup is not
-  usable, so keep using ripgrep for "who calls this". Worth reporting upstream — the two facts above are
-  probably the same root cause (analysis never completes, and references need it where document symbols
-  do not).
+**Semantic queries return empty for the first ~2.5 minutes of a session, then work correctly.**
+
+rust-analyzer signals `quiescent` after about **152s** here — it spends that time on `Fetching`,
+`Building compile-time-deps`, `Building CrateGraph` and `Loading proc-macros` for the dependency tree.
+Serena stops waiting at a **hard-coded 120s** (`_SERVER_READY_TIMEOUT` in its `rust_analyzer.py`) and
+proceeds anyway, so a query in that ~30s gap is sent to a server that is not ready: rust-analyzer answers
+`[]` and the tool reports `{}`.
+
+What that means in practice:
+
+| | behaviour |
+| --- | --- |
+| `find_symbol`, `get_symbols_overview` | work immediately — document symbols only need parsing |
+| `find_referencing_symbols` and other semantic queries | empty before ~152s, **correct after** |
+| after quiescence | ~30ms–3s per query, including cross-crate references |
+
+So the workaround is simply to give it time, or to re-run a query that came back empty. Disabling
+`cachePriming` and `check` via rust-analyzer settings was measured and saves only ~5s, so it is not worth
+configuring.
+
+Two consequences for setup:
+
+- **`export MCP_TIMEOUT=300000`.** Serena's docs suggest `60000`; that is not enough here.
+- **Don't conclude "no references" from an early empty result.** That is the one genuinely misleading
+  behaviour, and it is a timing artefact rather than a limitation.
 
 Serena's own docs note that Claude Code's built-in tool descriptions bias the model strongly toward
 internal tools. The committed hooks are their recommended mitigation; they also suggest launching with
