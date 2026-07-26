@@ -44,6 +44,20 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      # Clippy only re-lints what it rebuilds, so a warm cache makes this gate check ONLY the crates that
+      # changed — a pre-existing warning in an untouched crate is silently absent from the report and
+      # cannot fail the build. Observed directly across three runs: f35c6cc and ee8ecb2 reported findings
+      # from mcp-server alone, and jdwp-client's three `clippy::panic` findings appeared only in 617cb0e,
+      # the first commit that happened to touch that crate. "0 warnings" from an incremental lint means
+      # "0 in the crates I rebuilt", which is not what a gate is for.
+      #
+      # Evicting just the workspace crates keeps every dependency artifact cached (the expensive part)
+      # while forcing ours to be linted from scratch every run. `|| true` because there is nothing to
+      # clean on the first run, before the target dir exists.
+      - name: Force a full re-lint of the workspace crates
+        shell: bash
+        run: cargo clean -p jdwp-client -p jdwp-mcp --target-dir target/rust-doctor || true
+
       # --fail-on warning gates the build on warnings as well as errors (exit 3). It used to gate on
       # errors only, because there was a backlog of pedantic-clippy warnings to work through; that
       # backlog was cleared in 7253499 and then drifted back to 7 over 24 commits, because nothing
@@ -55,9 +69,39 @@ jobs:
       - name: Run rust-doctor
         run: npx -y rust-doctor@0.2.0 --sarif --fail-on warning > rust-doctor.sarif
 
+      # A failing gate prints nothing useful: --sarif sends every finding to the file, so the step log
+      # ends at "exit code 3" and the findings are only readable via the code-scanning API. Print them,
+      # so the reason a build failed is in the build that failed.
+      - name: Show the findings that failed the gate
+        if: failure()
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          with open("rust-doctor.sarif") as f: s = json.load(f)
+          rows = [(r.get("level","?"), r.get("ruleId","?"),
+                   (r.get("locations") or [{}])[0].get("physicalLocation",{}).get("artifactLocation",{}).get("uri","?"),
+                   (r.get("locations") or [{}])[0].get("physicalLocation",{}).get("region",{}).get("startLine","?"),
+                   r.get("message",{}).get("text","")[:120])
+                  for run in s.get("runs",[]) for r in run.get("results",[])
+                  if r.get("level") in ("warning","error")]
+          print("## rust-doctor gate failed —", len(rows), "warning/error finding(s)\n")
+          for lvl, rule, path, line, msg in rows:
+              print(f"- **{lvl}** `{rule}` — `{path}:{line}`\n  {msg}")
+          PY
+          cat "$GITHUB_STEP_SUMMARY"
+
       - name: Upload SARIF to code scanning
         if: always()
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: rust-doctor.sarif
           category: rust-doctor
+
+      - name: Upload SARIF as an artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-doctor-sarif
+          path: rust-doctor.sarif
+          if-no-files-found: warn
