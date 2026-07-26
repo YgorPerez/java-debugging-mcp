@@ -11,7 +11,12 @@
     clippy::panic_in_result_fn,
     clippy::manual_unwrap_or_default
 )]
-// Test VirtualMachine commands (Version and IDSizes)
+// Test VirtualMachine commands (Version)
+//
+// This checked `IDSizes` too, until CLEAN-1 (#27) deleted that wrapper: the id widths are assumed
+// 8-byte by the reader and never consulted (see the header of `jdwp-client/src/reader.rs`). This
+// harness was its only caller — which is not a use, since nothing runs it in the suite; that is why the
+// coverage run measured the command at zero hits.
 
 use jdwp_client::JdwpConnection;
 
@@ -34,19 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  JDWP: {}.{}", version.jdwp_major, version.jdwp_minor);
     println!("  VM Version: {}", version.vm_version);
     println!("  VM Name: {}", version.vm_name);
-    println!();
 
-    // Get ID sizes
-    println!("Fetching ID sizes...");
-    let id_sizes = connection.get_id_sizes().await?;
-    println!("✓ ID sizes received:");
-    println!("  Field ID: {} bytes", id_sizes.field_id_size);
-    println!("  Method ID: {} bytes", id_sizes.method_id_size);
-    println!("  Object ID: {} bytes", id_sizes.object_id_size);
-    println!("  ReferenceType ID: {} bytes", id_sizes.reference_type_id_size);
-    println!("  Frame ID: {} bytes", id_sizes.frame_id_size);
-
-    println!("\n🎉 All VM commands working!");
+    println!("\n🎉 VM version command working!");
 
     Ok(())
 }

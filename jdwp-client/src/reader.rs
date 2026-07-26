@@ -4,6 +4,20 @@
 // and these run inside the event-loop task: a panic there kills the connection instead of surfacing
 // as an error the caller can report. A truncated or malformed reply is not hypothetical — it is what
 // a version-skewed JVM, a half-closed socket, or a bug in our own request framing produces.
+//
+// # Every JDWP id is read as 8 bytes, and that is ASSUMED — nothing checks it
+//
+// `objectID`, `referenceTypeID`, `methodID`, `fieldID` and `frameID` are all read with [`read_u64`],
+// and [`value_width`] gives every reference tag a width of 8. The JDWP spec does not fix those widths:
+// a VM declares them in `VirtualMachine.IDSizes`, and this crate never asks. It holds on every 64-bit
+// `HotSpot`, which is what this tool attaches to.
+//
+// The assumption is deliberate and **unvalidated**. A wrapper for `IDSizes` existed and was deleted by
+// CLEAN-1 (#27) precisely because it was never called: an uncalled command made the widths look
+// checked. On a VM that reported narrower ids, every read after the first id would be misaligned and
+// the failure would surface as garbled values or an `Unknown value tag`, not as a clear mismatch. If
+// that ever needs guarding, the fix is a real check at attach time that refuses the session — not a
+// function nobody calls.
 
 use bytes::Buf;
 use crate::protocol::{JdwpError, JdwpResult};

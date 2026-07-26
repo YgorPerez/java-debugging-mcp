@@ -20,16 +20,6 @@ pub struct VmVersion {
     pub vm_name: String,
 }
 
-/// ID sizes used by the JVM
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VmIdSizes {
-    pub field_id_size: i32,
-    pub method_id_size: i32,
-    pub object_id_size: i32,
-    pub reference_type_id_size: i32,
-    pub frame_id_size: i32,
-}
-
 /// What the target JVM says it supports (`VirtualMachine.Capabilities`).
 ///
 /// Only the seven original capabilities: they are the ones this crate's features actually depend on,
@@ -95,34 +85,12 @@ impl JdwpConnection {
         })
     }
 
-    /// Get ID sizes (VirtualMachine.IDSizes command)
-    /// This tells us how many bytes are used for various ID types
-    ///
-    /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
-    pub async fn get_id_sizes(&mut self) -> JdwpResult<VmIdSizes> {
-        let id = self.next_id();
-        let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::ID_SIZES);
-
-        let reply = self.send_command(packet).await?;
-        reply.check_error()?;
-
-        let mut data = reply.data();
-
-        let field_id_size = read_i32(&mut data)?;
-        let method_id_size = read_i32(&mut data)?;
-        let object_id_size = read_i32(&mut data)?;
-        let reference_type_id_size = read_i32(&mut data)?;
-        let frame_id_size = read_i32(&mut data)?;
-
-        Ok(VmIdSizes {
-            field_id_size,
-            method_id_size,
-            object_id_size,
-            reference_type_id_size,
-            frame_id_size,
-        })
-    }
+    // `VirtualMachine.IDSizes` (command 7) used to be wrapped here and was deleted by CLEAN-1 (#27):
+    // the #19 coverage run measured it at **0 hits**, the only function in that review never executed at
+    // all. Nothing called it and nothing needed to, because the reader assumes 8-byte ids outright —
+    // see the note at the top of `reader.rs`. An uncalled wire command that *looks* like it validates
+    // that assumption is worse than none, since it makes the assumption read as checked. If the widths
+    // are ever worth verifying, that is a check at attach time, built deliberately.
 
     /// Ask the JVM which optional capabilities it supports (VirtualMachine.Capabilities, command 12).
     ///
