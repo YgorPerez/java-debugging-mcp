@@ -1,0 +1,66 @@
+{
+  "$comment": [
+    "Serena hooks (https://github.com/oraios/serena). Recommended by Serena's own docs, which report",
+    "that Claude Code's built-in tool descriptions take ~16k tokens and bias Opus strongly toward",
+    "internal tools -- strongly enough that the agent will often not reach for Serena at all, or will",
+    "forget to during a long session (agent drift).",
+    "",
+    "Serena calls hooks an ALPHA feature. Each is opt-in; delete any you do not want.",
+    "  remind       nudges the agent toward Serena's symbolic tools after several consecutive",
+    "               grep/read_file calls with no Serena tool in between.",
+    "  activate     asks the agent to activate the project and read Serena's instructions at",
+    "               session start.",
+    "  auto-approve auto-approves Serena tool calls ONLY when Claude Code is already in a permissive",
+    "               permission mode (acceptEdits or auto), so an existing blanket approval also covers",
+    "               Serena's destructive tools (replace_symbol_body, rename_symbol) instead of",
+    "               prompting per call. It grants nothing the chosen mode does not already grant.",
+    "  cleanup      discards hook session state when the session ends.",
+    "",
+    "These require the `serena-hooks` executable on PATH (installed with serena-agent). If Serena is",
+    "not installed the hooks fail harmlessly, but see README.md for the one-time setup."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "serena-hooks remind --client=claude-code"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__serena__*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "serena-hooks auto-approve --client=claude-code"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "serena-hooks activate --client=claude-code"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "serena-hooks cleanup --client=claude-code"
+          }
+        ]
+      }
+    ]
+  }
+}

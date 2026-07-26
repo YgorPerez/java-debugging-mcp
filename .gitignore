@@ -9,6 +9,17 @@ Cargo.lock
 .rust-doctor-cache.json
 **/.rust-doctor-cache.json
 
+# Serena (https://github.com/oraios/serena)
+# `.serena/project.yml` IS versioned — it is the shared project configuration. Serena writes its own
+# `.serena/.gitignore` covering the symbol cache and local overrides, so those are not repeated here.
+#
+# Memories are the one deliberate departure from Serena's defaults. Serena can share them across
+# sessions and users, but this repo already keeps its curated knowledge in CONTEXT.md, docs/adr/ and
+# TODO.md — committing an agent-written store beside those would give the same facts two sources of
+# truth, which is exactly what the glossary and ADRs exist to prevent. Serena is pointed at the
+# curated docs through `initial_prompt` in project.yml instead.
+.serena/memories/
+
 # IDE
 .idea/
 .vscode/

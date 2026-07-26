@@ -253,6 +253,60 @@ and uploads results to GitHub code scanning (SARIF). Installing the optional ext
 (`cargo install cargo-audit cargo-deny cargo-machete cargo-geiger`) unlocks the dependency/unsafe
 passes it otherwise skips.
 
+### Serena (semantic code navigation for agents)
+
+[Serena](https://github.com/oraios/serena) is registered as an MCP server for this repo, giving an agent
+symbol-level navigation over the Rust workspace instead of grep-and-read. The repo carries the shared
+configuration; each machine needs a one-time install.
+
+**One-time setup:**
+
+```bash
+# uv (Serena is a Python tool), then Serena itself
+winget install astral-sh.uv            # or: curl -LsSf https://astral.sh/uv/install.sh | sh
+uv tool install -p 3.13 serena-agent
+serena init
+
+# Rust support uses rust-analyzer from your rustup toolchain
+rustup component add rust-analyzer
+
+# Build the symbol cache once (a few seconds; it is gitignored)
+serena project index .
+```
+
+Committed here, so nothing else is needed: `.mcp.json` (the server registration, using
+`--project-from-cwd` so it contains no absolute paths), `.serena/project.yml` (Rust only — the Java files
+under `examples/probes/` are fixtures and get no language server), and `.claude/settings.json`
+(Serena's hooks).
+
+**Two things worth knowing before you rely on it**, both measured on this workspace:
+
+- **The first semantic query in a session costs ~120s.** Serena waits for rust-analyzer to report
+  `quiescent`, gives up after a hard-coded 120s and proceeds anyway. Warm `initialize` is ~4s, and
+  `find_symbol` is ~30ms once loaded — so it is a one-off stall per server process, not per query.
+  Serena's docs suggest `MCP_TIMEOUT=60000`; that is **not enough here** — use `export MCP_TIMEOUT=300000`
+  or Serena may fail to connect.
+- **`find_referencing_symbols` returns nothing on this project.** Verified against a free function, a
+  method and a struct that all have references confirmed by grep, before and after loading the file, warm
+  and cold. `find_symbol` and `get_symbols_overview` are accurate and fast; reference lookup is not
+  usable, so keep using ripgrep for "who calls this". Worth reporting upstream — the two facts above are
+  probably the same root cause (analysis never completes, and references need it where document symbols
+  do not).
+
+Serena's own docs note that Claude Code's built-in tool descriptions bias the model strongly toward
+internal tools. The committed hooks are their recommended mitigation; they also suggest launching with
+
+```bash
+claude --system-prompt="$(serena prompts print-cc-system-prompt-override)"
+```
+
+which is left to you, since it changes how you start Claude Code rather than anything in this repo.
+
+Serena's **memories are deliberately not versioned** (see `.gitignore`). This repo keeps its curated
+knowledge in `CONTEXT.md`, `docs/adr/` and `TODO.md`; an agent-written store beside those would give the
+same facts two sources of truth. `.serena/project.yml`'s `initial_prompt` points Serena at those files
+instead.
+
 ## Status
 
 ✅ **Functionally complete** — 16 debug tools, integrated and validated against a live JVM.
