@@ -738,7 +738,18 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## Backlog
 
-**Empty.** A **fifth** review found three more, shipped as issues
+**Five open, all filed from evidence produced by closing #17–#22** rather than from review — the work
+itself is what surfaced them. Tracked as GitHub issues, not here:
+
+| issue | why it exists |
+| --- | --- |
+| [#24](https://github.com/YgorPerez/java-debugging-mcp/issues/24) TEST-8 · P1 | Successor to the closed TEST-6/#13. Every shared-instance default (`max_suspend_ms` 2000, `limit` 40, `max_frames` 8) was calibrated on loopback against probes, and the monitors-only saving was measured at 3 frames deep. Needs the real 8180. |
+| [#25](https://github.com/YgorPerez/java-debugging-mcp/issues/25) TEST-9 · P2 | `main.rs`'s stdio loop at 65% — the only uncovered path #19 judged a *real* gap. Needs no JVM. |
+| [#26](https://github.com/YgorPerez/java-debugging-mcp/issues/26) TRACE-7 · P2 | Item 4 of #22: report a trace's *observed* cost in `list_stop_points`, the way the dump now reports its held duration. |
+| [#27](https://github.com/YgorPerez/java-debugging-mcp/issues/27) CLEAN-1 · P3 | `get_id_sizes` — the one function in the #19 review with zero hits anywhere. |
+| [#28](https://github.com/YgorPerez/java-debugging-mcp/issues/28) LINT-2 · P2 | The #18 gate's maintenance debt: a pinned toolchain with no bump trigger, and per-crate `clippy.toml` that a third crate would not have. |
+
+A **fifth** review found three more, shipped as issues
 [#7–#9](https://github.com/YgorPerez/java-debugging-mcp/issues?q=is%3Aissue). The headline one was
 verified against a real JVM before being filed, not reasoned about:
 
