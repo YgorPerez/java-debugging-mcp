@@ -381,6 +381,31 @@ fn deferred_breakpoint_arms_when_its_class_loads() {
 
 /// TEST-1: `force_return` must change what the CALLER receives, not merely report success. Proven by
 /// reading the probe's own stdout.
+///
+/// **Why the failure text is so loud, and why nothing else here changed (TEST-16, #45).** This test was
+/// reported failing about 1 run in 24 with the output never captured, so the first job was to reproduce
+/// it. It would not. 25 full-suite runs and 1,166 solo runs — 3,573 `force_return` cycles — on JDK 11 and
+/// JDK 25, at 32 and 64 synthetic CPU hogs on a 16-core box, and with two whole suites racing each other
+/// for JVMs, produced not one failure of this test. That is the load that reproduces TEST-19 (#54) at
+/// will, and the same runs did knock over two *other* tests, so the sampling was not too gentle — it was
+/// aimed at the wrong property. Nothing was tuned, because tuning a test nobody has watched fail is how
+/// a test stops being able to fail at all.
+///
+/// What was worth doing instead is making the next occurrence pay for itself, and the three ways this
+/// goes red each used to throw away the one fact that decides between their causes:
+///
+///   - *"never fired"* said nothing about whether the breakpoint had **armed** — an armed-but-unhit
+///     breakpoint, one still `⏳ Deferred` because `ForceProbe` had not loaded, and a probe that is not
+///     running at all are three different bugs with one message. It now prints the arm reply, the stop
+///     point listing, the newest event and the probe's tail.
+///   - *"caller never observed the forced value"* reads as an accusation against `force_return`, but a VM
+///     that was never resumed is silent in exactly the same way. The probe's line count is now taken
+///     across the resume, so the message says which of the two happened and names the panic's own reply
+///     (`resume_and_verify` reports a suspend depth it could not clear, and that report used to be
+///     discarded on the floor).
+///   - the control assertion now quotes the line that broke it.
+///
+/// If it fires in CI, that output is the bug report this issue never got.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn force_return_changes_what_the_caller_receives() {
@@ -402,16 +427,28 @@ fn force_return_changes_what_the_caller_receives() {
         let line = probe_line(&source, marker);
         server.panic_reset();
         // The probe never prints this by itself, so anything found before we force is a bug in the
-        // test, not a pass.
+        // test, not a pass. Name the line that broke the control: the useful question then is whether
+        // the probe changed or whether an earlier case leaked into this one.
+        let leaked = probe.output().into_iter().find(|l| l.contains(expected_output));
         assert!(
-            !probe.output().iter().any(|l| l.contains(expected_output)),
-            "probe printed {expected_output} before force_return — the probe is not a valid control"
+            leaked.is_none(),
+            "probe printed {expected_output} before force_return — the probe is not a valid control \
+             (the offending line was {leaked:?})"
         );
 
-        server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "ForceProbe", "line": line}));
-        server
-            .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
-            .unwrap_or_else(|| panic!("breakpoint at ForceProbe:{line} never fired"));
+        let armed = server
+            .call("debug.set_line_stop", serde_json::json!({"class_pattern": "ForceProbe", "line": line}));
+        assert!(
+            server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).is_some(),
+            "breakpoint at ForceProbe:{line} ({marker}) never fired.\n  \
+             set_line_stop said: {armed}\n  \
+             stop points now: {}\n  \
+             newest event: {}\n  \
+             probe's last 8 lines (empty or frozen means it is not running): {:?}",
+            server.call("debug.list_stop_points", serde_json::json!({})),
+            server.last_event(),
+            probe.output().iter().rev().take(8).collect::<Vec<_>>(),
+        );
 
         let forced_reply = server.call("debug.force_return", serde_json::json!({"value": forced}));
         assert!(
@@ -421,13 +458,31 @@ fn force_return_changes_what_the_caller_receives() {
 
         // Clear first: leaving the breakpoint armed would re-suspend on the next iteration before
         // main() gets to print, and the test would time out waiting for its own effect.
-        server.panic_reset();
+        //
+        // Count the probe's lines across the resume. Absence of `expected_output` alone cannot tell
+        // "force_return reported success and lied" from "we never let the debuggee run again", and
+        // those are a debugger bug and a harness bug respectively — TEST-19 (#54)'s lesson that a
+        // panic message which cannot separate its own two causes sends the next reader the wrong way.
+        let printed_before = probe.output().len();
+        let resumed = server.panic_reset();
         let seen = probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains(expected_output));
+        let printed_after = probe.output().len();
         assert!(
             seen.is_some(),
             "caller never observed the forced value: expected a line containing {expected_output}, \
-             force_return said: {forced_reply}\n  recent output: {:?}",
-            probe.output().iter().rev().take(8).collect::<Vec<_>>()
+             force_return said: {forced_reply}\n  \
+             the panic that had to resume the VM said: {resumed}\n  \
+             the probe printed {delta} line(s) in the {EVENT_TIMEOUT:?} after that resume, so {verdict}\n  \
+             recent output: {:?}",
+            probe.output().iter().rev().take(8).collect::<Vec<_>>(),
+            delta = printed_after - printed_before,
+            verdict = if printed_after == printed_before {
+                "it never ran again — read this as a resume/liveness failure (or a dead probe), NOT as \
+                 force_return returning the wrong value"
+            } else {
+                "it DID run and still never produced the forced value — force_return reported success \
+                 without changing what the caller received, which is exactly what this test exists to catch"
+            },
         );
     }
 
