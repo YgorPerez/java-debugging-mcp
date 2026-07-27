@@ -4250,3 +4250,128 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
 
     server.panic_reset();
 }
+
+/// A dump section's own thread id — the `0x…` that opens its header line.
+fn section_thread_id(section: &str) -> Option<&str> {
+    section.lines().next()?.split_whitespace().next()
+}
+
+/// The single monitor a `holds:` line names, e.g. `ContendedProbe$Lock2@3f`.
+fn sole_held_lock(section: &str) -> Option<&str> {
+    let held = section.lines().find_map(|l| l.trim().strip_prefix("holds: "))?;
+    (!held.contains(", ")).then_some(held)
+}
+
+/// TEST-10 (#35): with four locks and forty-eight waiters in one dump, the holder each waiter is told
+/// about has to be the RIGHT one.
+///
+/// `thread_dump_shows_stacks_and_the_deadlock_cycle` already proves the correlation exists, and
+/// `DeadlockProbe` is the right shape for that: a cross-pairing that a report merely listing monitors per
+/// thread would get backwards. What two threads and two locks cannot show is whether the correlation
+/// still picks the right holder when there is a choice — with one other thread in the dump, `← held by
+/// 0x…` is right by construction, and every wrong answer is also the right one.
+///
+/// Here every waiter is on a lock that three other threads in the same dump are each holding one of, so
+/// naming the holder means finding the one row out of four whose `holds` list contains this waiter's
+/// contended monitor. The expected string is built from the dump's OWN answers — the label off the
+/// holder's `holds:` line and the id off its header — rather than from anything this test assumes, so
+/// what is checked is that the two halves agree, not that both match a guess.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_contended_lock_names_its_real_holder_out_of_four() {
+    let Some(jdk) = jdk_or_skip("a_contended_lock_names_its_real_holder_out_of_four") else { return };
+    let probe = Probe::launch(&jdk, "ContendedProbe").expect("launch ContendedProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // The probe polls every waiter's own `getState()` and only says `armed` once all 48 report BLOCKED,
+    // so this is the JVM's answer rather than a sleep long enough to look like one.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("armed"))
+        .unwrap_or_else(|| panic!("the probe never got all waiters blocked\n  output: {:?}", probe.output()));
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    // monitors_only: the lock graph is the entire question here, and 52 stacks would be another test's
+    // worth of suspension for nothing this one reads.
+    let dump = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"limit": 200, "suspend": true, "monitors_only": true}),
+    );
+    assert_contains_all("the dump completed and resumed the VM", &dump, &["verified running", "Cost:"]);
+
+    // The premise, checked before anything is concluded from it. If the contention had not formed, every
+    // assertion below would pass vacuously on a dump with no `waiting to enter` lines in it at all.
+    let waiting = dump.lines().filter(|l| l.contains("waiting to enter:")).count();
+    assert_eq!(
+        waiting, 48,
+        "this test is about contention at scale, so all 48 waiters must be queued in the dump it \
+         reads:\n{}",
+        head_of(&dump)
+    );
+
+    let mut locks_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for k in 0..4 {
+        let holder_name = format!("holder-{k}");
+        let holder = dump_section(&dump, &format!("\"{holder_name}\""))
+            .unwrap_or_else(|| panic!("no {holder_name} section in:\n{dump}"));
+        // One lock, and the right one. A holder that had released it — `Object.wait()` does, which is how
+        // every other parking probe here waits — would show no `holds:` line, and the test would be
+        // measuring nothing.
+        let lock = sole_held_lock(&holder).unwrap_or_else(|| {
+            panic!("{holder_name} must hold exactly one lock and nothing else:\n{holder}")
+        });
+        assert!(
+            lock.starts_with(&format!("ContendedProbe$Lock{k}@")),
+            "{holder_name} must hold Lock{k} — a bare java.lang.Object here could be paired any way at \
+             all and still look right: {lock}"
+        );
+        let holder_id = section_thread_id(&holder)
+            .unwrap_or_else(|| panic!("no thread id on {holder_name}'s header:\n{holder}"));
+        locks_seen.insert(lock.to_string());
+
+        // Every one of this lock's twelve waiters, not just the first: a correlation that resolved the
+        // holder once and reused it would pass a spot check on waiter 0 and be wrong for the other 47.
+        let expected = format!("waiting to enter: {lock} ← held by {holder_id} \"{holder_name}\"");
+        for i in 0..12 {
+            let waiter_name = format!("waiter-{k}-{i}");
+            let waiter = dump_section(&dump, &format!("\"{waiter_name}\""))
+                .unwrap_or_else(|| panic!("no {waiter_name} section in:\n{dump}"));
+            assert!(
+                waiter.contains(&expected),
+                "{waiter_name} must be shown blocked on the lock {holder_name} is actually holding, named \
+                 by that thread's own id — expected `{expected}`:\n{waiter}"
+            );
+        }
+    }
+
+    // Four distinct monitor objects, or "the right one out of four" was never a choice: if two locks
+    // shared an object id, naming either holder would satisfy every assertion above.
+    assert_eq!(locks_seen.len(), 4, "the four locks must be four distinct objects, saw {locks_seen:?}");
+
+    // And nobody was handed a holder that holds a different lock. The loop above proves each waiter got
+    // the right annotation; this proves the dump contains no other kind, including on rows the loop never
+    // named.
+    let wrong: Vec<&str> = dump
+        .lines()
+        .filter(|l| l.contains("waiting to enter:"))
+        .filter(|l| {
+            let (before, after) = l.split_once(" ← held by ").unwrap_or((l, ""));
+            // `…$Lock2@3f ← … "holder-2"` — the digit in the lock's class name must be the digit in the
+            // holder's name, so a swapped pair is visible without trusting the loop above.
+            let lock_k = before.split("$Lock").nth(1).and_then(|s| s.chars().next());
+            let holder_k = after.split("\"holder-").nth(1).and_then(|s| s.chars().next());
+            lock_k.is_none() || holder_k.is_none() || lock_k != holder_k
+        })
+        .collect();
+    assert!(wrong.is_empty(), "every contended lock must name its own holder; these do not: {wrong:?}");
+
+    // TRACE-2 discipline: only the debuggee can report that the suspension ended, and the 52 wedged
+    // threads never will.
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
+        "the probe stopped ticking after a dump of 52 contended threads\n  output: {:?}",
+        probe.output(),
+    );
+
+    server.panic_reset();
+}
