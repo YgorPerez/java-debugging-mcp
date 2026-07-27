@@ -1099,6 +1099,15 @@ impl Probe {
     /// suppressed by the agent's `quiet=y` option, which is exactly why [`launch_built_by`] owns the agent
     /// argument and does not pass it.
     ///
+    /// **That earliness cost a red `main` the same day, and the lesson is worth more than the incident.**
+    /// The old connect poll slept 100ms between attempts, so it returned tens of milliseconds after the
+    /// port came up and handed every test slack it had never asked for. Two tests were living on it:
+    /// they armed a watchpoint — which [cannot be deferred](crate::handlers) — against a class the JVM had
+    /// not loaded yet, and only won because of the delay. They now say what they need via
+    /// [`launch_running`](Self::launch_running). If a test of yours starts failing with *"is not loaded
+    /// yet"*, this is why, and the fix is to state the dependency rather than to slow readiness back down:
+    /// a timing accident that makes a test pass is not the test passing.
+    ///
     /// One thing it can do that a connect cannot: a connect proves only that **something** answers on that
     /// port, and [`free_port`] documents that something else may have taken it before the JVM got there.
     /// This reads the port out of *this* JVM's own banner, so a probe whose agent lost that race now waits

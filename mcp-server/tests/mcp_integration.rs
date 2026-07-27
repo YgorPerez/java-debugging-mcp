@@ -186,7 +186,13 @@ fn evaluate_static_methods_and_object_arguments() {
 #[allow(clippy::too_many_lines)]
 fn watchpoints_report_field_writes_and_reads() {
     let Some(jdk) = jdk_or_skip("watchpoints_report_field_writes_and_reads") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    // Running, not merely listening: a watchpoint cannot be deferred, so arming one against a class the
+    // JVM has not loaded is refused outright. This test passed for months on borrowed time — readiness
+    // used to poll the port on a 100ms tick, which handed every test ~50ms of slack it never asked for,
+    // and TEST-20 (#55) removed that when it stopped dialling the port. The dependency was always here;
+    // only the accident that hid it is gone. Saying it out loud is #49's fix, one test further on.
+    let probe =
+        Probe::launch_running(&jdk, "WatchProbe", |l| tick_index(l).is_some()).expect("launch WatchProbe");
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
 
@@ -2506,7 +2512,12 @@ fn list_sessions_names_every_attachment_and_flags_a_dead_one() {
     );
 
     // Two probes, so the listing has to distinguish them — and the second attach becomes current.
-    let first = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    // `first` must be *running*: the stop point below is a watchpoint, which cannot be deferred, and a
+    // refused arm would leave this session's count at zero and fail the listing assertion for a reason
+    // that has nothing to do with sessions. Same accidental-slack story as
+    // `watchpoints_report_field_writes_and_reads` (TEST-20, #55).
+    let first =
+        Probe::launch_running(&jdk, "WatchProbe", |l| tick_index(l).is_some()).expect("launch WatchProbe");
     let attach_first = server.attach(first.port);
     let first_id = session_id_from(&attach_first).expect("no session id in attach reply");
     let second = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
