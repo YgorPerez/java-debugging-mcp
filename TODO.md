@@ -896,14 +896,40 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## Backlog
 
-**Two open, one of them nearly closed.** Three of the five filed from #17–#22's evidence have shipped
+**Eight open, from two sources.** Tracked as GitHub issues, not here.
+
+**From #17–#22's evidence — two open, one of them nearly closed.** Three of the five have shipped
 (#25, #26, #27), and most of #24 turned out not to need what it said it needed — see the shipped entries
-above. Tracked as GitHub issues, not here:
+above.
 
 | issue | why it exists | what is actually left |
 | --- | --- | --- |
 | [#24](https://github.com/YgorPerez/java-debugging-mcp/issues/24) TEST-8 · P1 | Successor to the closed TEST-6/#13. Every shared-instance default (`max_suspend_ms` 2000, `limit` 40, `max_frames` 8) was calibrated on loopback against probes, and the monitors-only saving was measured at 3 frames deep. | **Done except for taking the reading.** Thread count and stack depth are debuggee properties (`PoolShapeProbe`), latency is injectable (`LatencyRelay`), the 13× packet waste that made the defaults look wrong is fixed, all three defaults were reviewed and kept with measurements, and the dump now reports its own per-packet cost and what a truncation would have needed — so the calibration step is a normal dump rather than an exercise (ADR-0011). Left: run one against the real 8180 and confirm the freeze policy against what it says. |
 | [#28](https://github.com/YgorPerez/java-debugging-mcp/issues/28) LINT-2 · P2 | The #18 gate's maintenance debt: a pinned toolchain with no bump trigger, and per-crate `clippy.toml` that a third crate would not have. | Item 1 is a policy call about cadence and noise tolerance; item 2's best fix depends on the answer. |
+
+**From a tool-surface comparison against [`d4n-sec/jdb-mcp`](https://github.com/d4n-sec/jdb-mcp)
+(2026-07-26) — six open.** A JDI-based Java debugger MCP server; the first batch here not produced by
+reviewing this codebase. Eleven candidate features, six real gaps, and they share a theme worth stating
+plainly: **every stop point in this server is addressed by a name the caller has no way to look up.**
+Two of the six are the same shape METH-1/#16 found — implemented in `jdwp-client` and unreachable from
+MCP. Each carries an agent brief.
+
+| issue | why it exists | what is actually left |
+| --- | --- | --- |
+| [#29](https://github.com/YgorPerez/java-debugging-mcp/issues/29) DISC-1 · P1 · S | No class discovery. On the shared 8180 a generated proxy or a shaded class is not findable from the source tree at all — only the debuggee knows what it loaded. | `all_classes` is implemented and reachable only from `examples/test_find_class.rs`. Left: the tool, JNI-signature-to-FQN rendering, and bounding the output on a server with thousands of loaded types. |
+| [#30](https://github.com/YgorPerez/java-debugging-mcp/issues/30) DISC-2 · P2 · S | No method listing, so a caller composing `debug.evaluate` cannot see the parameter lists they are trying to satisfy — the most intricate part of this server, driven blind. | `ReferenceType.Methods` is implemented and already consumed internally by overload resolution. Left: the tool, and rendering JVM signatures as Java source types. |
+| [#31](https://github.com/YgorPerez/java-debugging-mcp/issues/31) DISC-3 · P2 · M | A stop point reports `class.method:412` and nothing can read line 412 — or confirm the local checkout is the deployed build, which is the assumption that wastes an hour mid-investigation. | All of it. No `ReferenceType.SourceFile` command exists; `Method.LineTable` gives numbers only. Two halves — ask the debuggee what it compiled from, then read it from source roots. |
+| [#32](https://github.com/YgorPerez/java-debugging-mcp/issues/32) EVT-2 · P2 · M | Hits are discoverable only by polling, so the watchdog's 120s budget burns while nobody is looking. MCP already has the mechanism. | The buffer stays regardless — notifications are best-effort. Constraints in the brief: suspension only (a traced hit at ~720/s would flood the transport), bounded repeats per SAFE-8/#8, and the watchdog's auto-disarm is worth pushing too. |
+| [#33](https://github.com/YgorPerez/java-debugging-mcp/issues/33) TRANS-1 · P3 · M | stdio-only. | **`needs-triage`, not agent-ready.** An HTTP listener has no trust boundary and this server executes code in the debuggee. Prior question is what it is *for* — `kubectl port-forward` already covers the remote case on the JDWP port, and a negative answer closes it. |
+| [#34](https://github.com/YgorPerez/java-debugging-mcp/issues/34) REL-1 · P3 · S | Installing needs a Rust toolchain, which hands back most of the no-JVM argument for writing JDWP natively — a Java developer is the person least likely to have `cargo`. | All of it. No release workflow exists; `Cargo.toml` already carries the metadata. Should reuse the existing toolchain pinning rather than adding a second, per LINT-2/#28. |
+
+The comparison also produced one **rejection**, recorded in `.out-of-scope/method-entry-events.md`
+rather than filed: `METHOD_ENTRY` stays unarmed for the reasons METH-1/#16 settled — it fires on every
+method of every matching class, and the caller chain from TRACE-5/#14 answers the same question at one
+site without suspending. Four other candidates were checked against the code and not filed at all:
+`smartStep` (already the last-hit-thread default), JDK 7 support (n/a on the wire protocol),
+`get_output`/`send_input` (no process handle on an attach-only connection — dead code upstream too),
+and bilingual docs.
 
 A **fifth** review found three more, shipped as issues
 [#7–#9](https://github.com/YgorPerez/java-debugging-mcp/issues?q=is%3Aissue). The headline one was
