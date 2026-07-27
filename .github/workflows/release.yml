@@ -60,6 +60,9 @@ jobs:
   # Re-running the gates costs a few minutes and buys the guarantee the acceptance criteria ask for: the
   # release is bound to the gate's verdict for THIS commit, not to whatever happened to be green on main
   # when the tag was cut.
+  # tests.yml is a JDK matrix as of TEST-11 (#36), so this one `needs:` now waits on every leg — 11, 17
+  # and 21 — not on a single job. A called workflow succeeds only when all of its jobs do, and its
+  # `fail-fast: false` only keeps the other legs running to report; it does not let a red leg through.
   gate-tests:
     name: Gate (tests)
     needs: version

@@ -1,13 +1,21 @@
 name: tests
 
 # Two layers, both gating:
-#   - unit tests (fast, no JVM)
+#   - unit tests (fast, no JVM), once
 #   - MCP-level integration tests: the real `jdwp-mcp` binary driven over JSON-RPC against probe JVMs
-#     that the harness compiles, launches and reaps itself (mcp-server/tests/mcp_integration.rs).
+#     that the harness compiles, launches and reaps itself (mcp-server/tests/mcp_integration.rs), once
+#     per JDK in the matrix below
 #
-# The integration tests need a JDK — WITHOUT one they print `SKIP` and pass, which would make this job
+# The integration tests need a JDK — WITHOUT one they print `SKIP` and pass, which would make the job
 # green while testing nothing. That is why a JDK is installed explicitly and why the step below fails
 # the build if it sees a SKIP line.
+#
+# The two layers are separate JOBS, which they did not used to be, and the reason is attribution rather
+# than speed. Once the integration side is a matrix, a single "Unit + integration" job would report a
+# broken unit test as three simultaneous red JDK legs — which reads as "the debugger is broken on every
+# JVM" and is the exact misreading TEST-11 (#36) asked to prevent. Split, a red `Unit` means the code and
+# a red `Integration (JDK 11)` means that JDK. The unit tests are also JDK-independent, so running them
+# once instead of once per leg costs nothing to say.
 
 on:
   push:
@@ -15,18 +23,27 @@ on:
   pull_request:
   # Callable so release.yml can gate a tag on this suite. A tag ref matches neither trigger above, so
   # without this the release would be relying on a run that happened on a different ref (REL-1, #34).
+  #
+  # A called workflow succeeds only when EVERY job in it succeeds, so the caller's single `needs:
+  # gate-tests` now waits on the whole matrix rather than on one job. That is the behaviour release.yml
+  # wants and it needed no change there — worth stating because `fail-fast: false` below makes a partial
+  # matrix look survivable, and it is not: one red leg still blocks the release.
   workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
+  # Unaffected by the matrix: concurrency is per workflow RUN, not per job, so all legs live inside one
+  # group entry and cancel together when the ref is pushed again. Under `workflow_call` this is evaluated
+  # in the caller's context — `refs/tags/vX.Y.Z` for a release — which is a different group from
+  # release.yml's own, so a release cannot cancel the gate it is waiting on.
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Unit + integration
+  unit:
+    name: Unit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,34 +51,113 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # `shared-key` rather than the default, and it is the same string in the integration job below.
+      # rust-cache keys on the JOB name by default, so splitting one job into four would have turned one
+      # cargo build into four cold ones — and the JDK a leg installs changes nothing about the Rust
+      # artifacts, so there is no reason for them to be different entries.
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests
+
+      # No JDK step here on purpose. Everything `cargo test` runs is either JVM-free or `#[ignore]`d —
+      # including mcp-server/tests/stdio_protocol.rs, which drives the real binary's front door with
+      # malformed input and needs no JDK precisely so it is not hidden behind the ignore flag that exists
+      # for tests that do (TEST-9, #25).
+      - name: Unit tests
+        run: cargo test
+
+  integration:
+    name: Integration (JDK ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    strategy:
+      # One JDK failing must not hide whether the others would have passed: with a version matrix the
+      # useful finding is almost always *which* versions broke, and fail-fast throws that away. It does
+      # not weaken the release gate — see the `workflow_call` note above.
+      fail-fast: false
+      matrix:
+        # Why these three, and why the suite ran on one for so long.
+        #
+        # 11 is the leg that matters. The shared 8180 is a WildFly 21 and the maintainer confirmed it runs
+        # JDK 11 (#36), so every green run before this one validated the debugger against a JVM generation
+        # the actual target is not. That was not hypothetical: the first local run on 11 failed 50 of 53
+        # tests — not a JDWP difference but `javac` reading source in the platform charset before JEP 400,
+        # so every probe comment containing an em dash failed to compile and no probe would start. Fixed in
+        # a16bb90 by compiling with `-encoding UTF-8`. This leg is what stops that returning.
+        #
+        # 21 stays because it is what developers run locally, and 17 is the generation between them for one
+        # runner's worth of cost.
+        #
+        # 8 is deliberately absent. Nothing in the estate runs it, and with the 8180 answered as 11 an
+        # 8 leg would gate the build on a JVM nobody here debugs.
+        #
+        # What the matrix does NOT buy, so nobody expects it: it cannot reach the `JDWP < 1.6` degradation
+        # path. JDWP's version tracks the JDK, so even 8 would speak 1.8. That path needs `FaultRelay`
+        # (7db6318) rewriting the `Version` reply, or a recorded cassette (#37).
+        #
+        # The finding as of TEST-11: 11, 17 and 21 are all green with the same 56 tests, so no test needs a
+        # version-gated skip and none has one. If that changes, skip it explicitly with the reason rather
+        # than narrowing the matrix — a leg quietly removed is indistinguishable from a leg that passes.
+        java: ['11', '17', '21']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Shared with the `unit` job on purpose — see the note there.
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests
 
       # javac is required, not just a JRE: the harness compiles examples/probes/*.java at test time.
-      - name: Install JDK
+      - name: Install JDK ${{ matrix.java }}
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: ${{ matrix.java }}
 
-      - name: Unit tests
-        run: cargo test
+      # A leg that silently tested the WRONG JDK is the same class of failure as a leg that tested nothing:
+      # green, and evidence-free. The runner image ships several JDKs of its own and `Jdk::find` falls back
+      # to PATH, so if setup-java ever stopped exporting the version it was asked for, the suite would still
+      # find *a* javac, still pass, and this matrix would quietly be three copies of one leg. Assert against
+      # $JAVA_HOME specifically, because that is the first thing `Jdk::find` reads.
+      #
+      # If a JDK 8 leg is ever added, this comparison needs widening first: 8's javac reports itself as
+      # `javac 1.8.0_xxx`, so an `8` entry would fail the assert rather than the tests.
+      - name: Confirm this leg is on JDK ${{ matrix.java }}
+        shell: bash
+        run: |
+          version="$("$JAVA_HOME/bin/javac" -version 2>&1 | awk '{print $2}')"
+          case "$version" in
+            ${{ matrix.java }} | ${{ matrix.java }}.*) echo "JAVA_HOME=$JAVA_HOME is javac $version" ;;
+            *)
+              echo "::error::This leg asked for JDK ${{ matrix.java }} but JAVA_HOME holds javac $version — it would have tested the wrong JVM and passed."
+              exit 1
+              ;;
+          esac
 
       # Scoped to --test mcp_integration on purpose: a bare `cargo test -- --ignored` also un-ignores
       # jdwp-client's illustrative ```ignore doctests, which were never meant to compile.
       #
-      # `shell: bash` is load-bearing, not decoration. A `run:` step without it gets `bash -e` and NO
-      # pipefail, so in `script | tee log` the pipeline's status is TEE's — and a failing test suite
-      # exited 1 into a tee that exited 0, leaving this step green. The SKIP grep below would not have
-      # caught it either: that looks for skips, not failures. Naming the shell turns on pipefail.
+      # `shell: bash` is load-bearing, not decoration, and it has to survive into EVERY leg. A `run:` step
+      # without it gets `bash -e` and NO pipefail, so in `script | tee log` the pipeline's status is TEE's
+      # — and a failing test suite exited 1 into a tee that exited 0, leaving this step green. The SKIP grep
+      # below would not have caught it either: that looks for skips, not failures. Naming the shell turns on
+      # pipefail.
       - name: Integration tests
         shell: bash
         run: scripts/integration-test.sh 2>&1 | tee integration.log
 
+      # Runs per leg, which is the point: a leg whose JDK failed to install must go red, never
+      # green-with-zero-tests. The message names the JDK so the failure is attributable to a version rather
+      # than to the code.
       - name: Fail if any integration test was skipped
+        shell: bash
         run: |
           if grep -q 'SKIP .*no JDK found' integration.log; then
-            echo "::error::Integration tests skipped (no JDK found) — this job would be green without testing anything:"
+            echo "::error::Integration tests skipped on JDK ${{ matrix.java }} (no JDK found) — this leg would be green without testing anything:"
             grep 'SKIP .*no JDK found' integration.log
             exit 1
           fi
