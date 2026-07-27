@@ -41,9 +41,12 @@ safe mode is the default and the dangerous one is opt-in.
 
 A fifth property followed from the fourth once the duration was visible: **ask for less**. `monitors_only`
 (#17 item 3) skips the frame read and its per-frame lookups, which is where a dump's cost lives — measured at
-245 packets / 33ms held against 770 / 117ms on a 60-thread dump, widening with real stack depth. Bounding a
-freeze and shortening it are different levers, and for the question this tool exists for — which threads are
-blocked on what — the lock graph is the answer and the stacks are context.
+245 packets / 33ms held against 770 / 117ms on a 60-thread dump. Bounding a freeze and shortening it are
+different levers, and for the question this tool exists for — which threads are blocked on what — the lock
+graph is the answer and the stacks are context.
+
+That saving was predicted to *widen* with real stack depth. Measured against a real WildFly it does not —
+see the consequence below. The mode is still worth having; the reason is the lock graph, not the arithmetic.
 
 That mode forced a distinction the reply could not previously make. Frames were `Result<frames, why>`, and
 "not requested" is neither: as an error it reports a healthy VM as unreadable, as an empty list it reports
@@ -88,3 +91,21 @@ Reading it as-is and leaving it is the only option that neither destroys nor acc
   21,364, and it completes within the existing 2000 ms. See
   [ADR-0011](0011-line-tables-are-cached-per-dump-not-per-connection.md), which also records why the
   rejection below now applies only to caching *across* dumps.
+- **The budget has now been read against a real WildFly, and 2000 ms stands** (TEST-8/#24, 2026-07-27). A
+  WildFly 21 running a real war, loaded to 267 threads with request workers a median 328 frames deep, cost
+  **332 packets / 38–144 ms held** for a default dump and **2,173 packets / 273–573 ms** for the widest dump
+  anyone would ask for — roughly 3.5× inside the budget at its worst. Packet counts are debuggee properties
+  and do not move with the wire, so they are the durable figure: at 2 ms round trip the default dump still
+  fits, past ~5 ms it truncates, and a full dump truncates from 1 ms upward. That is the shape a safety
+  default should have — it binds exactly when a dump is genuinely expensive — and it is the argument for
+  keeping the number rather than raising it. The reading was taken on a **local isolated instance**, so it
+  measures a WildFly-shaped pool, **not** the question of how long it is acceptable to freeze a VM other
+  people are using; that remains a policy call rather than a measurement.
+- **`monitors_only`'s saving is real under load and inverts when idle.** Same instance: loaded, it cut the
+  full dump from 467 ms to 198 ms and the default from 144 ms to 35 ms (1.6–2.4×). **Idle, it was
+  *slower*** — 114 ms against the full dump's 87 ms, and 545 ms against 394 ms — despite using ~40% fewer
+  packets, because monitor reads are per-thread JVM work rather than cheap round trips, and with no deep
+  stacks to skip there is nothing to save. So the prediction that the saving would widen with stack depth
+  was wrong in both directions: at WildFly depth it is **narrower** than the 3× measured on probes, and
+  without load it is negative. Reach for the mode because the lock graph is what you want, not because it
+  is always cheaper.

@@ -370,10 +370,22 @@ pub struct ThreadDumpArgs {
     #[serde(default)]
     pub only_suspended: bool,
     /// Max threads to include; the rest are reported as a hidden count (default 40).
+    ///
+    /// **Known trap, being fixed in DUMP-3 (#43): this is a position, not just a size.** Threads are read
+    /// in JDWP `AllThreads` order, which is *creation* order, and an app server creates its request pool
+    /// last — so on a loaded `WildFly` the default 40 were measured to be entirely JVM internals, the
+    /// service container and Undertow selectors, with **no application threads at all**, while 13 request
+    /// workers sat 328 frames deep (TEST-8, #24). Until that is fixed, reach for `name_filter` (e.g.
+    /// `'default task'`) rather than a bigger `limit`, which mostly buys more selectors.
     #[serde(default = "default_limit")]
     pub limit: usize,
     /// Max frames per thread (default 8 — deliberately narrower than `debug.get_stack`, since this
     /// multiplies by the thread count). The deepest frames are the ones dropped.
+    ///
+    /// Kept at 8 after measuring a real `WildFly` (TEST-8, #24), where 180 of 264 threads exceeded it and a
+    /// working request thread showed 8 of ~328 frames. Frame #0 is the innermost, so those 8 are *where the
+    /// thread actually is*, which is the useful end — and raising the default multiplies by the thread
+    /// count. For a deep read, narrow with `name_filter` and raise this, rather than widening the default.
     #[serde(default = "default_dump_frames")]
     pub max_frames: usize,
     /// Only show frames whose class name contains this substring (case-insensitive), e.g. your app
@@ -392,9 +404,15 @@ pub struct ThreadDumpArgs {
     ///
     /// Measured against a 60-thread probe: **245 packets and 33ms of suspension, against 770 and 117ms**
     /// for the same dump with stacks. The lock state costs a flat ~4 JDWP packets per thread, while each
-    /// frame read adds ~3 more (method and line; class names are cached across the dump) — so the saving
-    /// grows with real stack depth, and against `WildFly`-depth stacks at the default `max_frames: 8` it
-    /// is far wider than the 3x measured on shallow probe threads.
+    /// frame read adds ~3 more (method and line; class names are cached across the dump).
+    ///
+    /// That saving was predicted to widen against `WildFly`-depth stacks. **It does not** (TEST-8, #24). On
+    /// a real WildFly loaded to 267 threads it cut the full dump from 467ms to 198ms and the default from
+    /// 144ms to 35ms — 1.6–2.4x, *narrower* than the 3x on probes. On the **same VM idle it was slower**:
+    /// 114ms against the full dump's 87ms, despite ~40% fewer packets. Monitor reads are per-thread JVM
+    /// work, not just round trips, so with no deep stacks to skip there is nothing to save and the monitor
+    /// queries dominate. Ask for this mode because the lock graph is the answer you want — not on the
+    /// assumption that it is always the cheaper dump.
     ///
     /// For a deadlock the lock graph *is* the answer and the stacks are only context. The holder of a
     /// contended lock is still named.
