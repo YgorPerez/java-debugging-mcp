@@ -336,10 +336,20 @@ scripts/doctor.sh --verbose    # per-finding file:line detail
 scripts/doctor.sh --diff main  # only files changed vs main
 ```
 
-The same check runs in CI (`.github/workflows/rust-doctor.yml`, pinned to 0.2.0): it gates on errors
-and uploads results to GitHub code scanning (SARIF). Installing the optional external tools
-(`cargo install cargo-audit cargo-deny cargo-machete cargo-geiger`) unlocks the dependency/unsafe
-passes it otherwise skips.
+The same check runs in CI (`.github/workflows/rust-doctor.yml`, pinned to 0.2.0): it **gates on
+warnings** — a finding fails the build (#18) — and uploads results to GitHub code scanning (SARIF).
+Installing the optional external tools (`cargo install cargo-audit cargo-deny cargo-machete
+cargo-geiger`) unlocks the dependency/unsafe passes it otherwise skips.
+
+Because it gates on warnings, the Rust toolchain there is pinned, so a new pedantic lint in a future
+clippy cannot break a build on code nobody touched. `.github/workflows/toolchain-pin.yml` runs the same
+scan against `stable` once a month **without gating**, and opens an issue when the pin is behind — the
+bump is scheduled work rather than a surprise. See ADR-0007.
+
+One `clippy.toml`, at the workspace root, covers every crate; adding a workspace member needs nothing.
+It only applies because `scripts/doctor.sh` and the workflows set `CLIPPY_CONF_DIR` — rust-doctor drops
+a temporary `clippy.toml` into any member that lacks one, which would otherwise shadow it. The file
+says the rest.
 
 ### Serena (semantic code navigation for agents)
 

@@ -1,0 +1,30 @@
+# ONE clippy config for the whole workspace. There used to be two — `jdwp-client/clippy.toml` and
+# `mcp-server/clippy.toml`, hand-kept in sync — and a third crate would have arrived with neither
+# (LINT-2, #28).
+#
+# `schemars` pulls one major of `syn` and `serde_derive` pulls the other. Both are needed, so the
+# duplication is not resolvable; it costs build time, not correctness. Declared as an explicit
+# allowance rather than tolerated, because the doctor gate fails on warnings now (LINT-1, #18) and a
+# known-accepted finding must not become the reason to turn the gate off. Listing `syn` by name keeps
+# the NEXT duplicate — which would be a real finding — failing the build instead of hiding behind it.
+#
+# WHY THIS FILE ONLY WORKS ALONGSIDE `CLIPPY_CONF_DIR`, which `scripts/doctor.sh` and the workflows set:
+#
+# The twin files carried a note saying a workspace-root clippy.toml "works for `cargo clippy` but NOT
+# for rust-doctor's invocation", inferred from CI reporting the lint against `<crate>/clippy.toml:1`.
+# The symptom was real; the explanation was not, and the difference matters because it is what makes
+# one file possible. Observed by shimming `cargo` under a rust-doctor 0.2.0 run: **rust-doctor writes
+# its own `<crate>/clippy.toml` into any member that has none** — seven `allow-*-in-tests` keys — runs
+# clippy, then deletes it. Clippy stops at the first config it finds walking up from the crate, so that
+# temporary file shadows this one and the `syn` allowance never applies. `<crate>/clippy.toml:1` was
+# not a path clippy failed to find. It was a file that existed for the length of the run.
+#
+# `CLIPPY_CONF_DIR` points clippy at a directory instead of making it walk, so the injected file is
+# never consulted and this one always is — for every member, including ones that do not exist yet.
+# It also means rust-doctor's own test allowances no longer apply, which changes nothing: the twin
+# files already shadowed them, so the gate keeps exactly the strictness it had.
+#
+# If some future invocation forgets to set it, the failure is loud and in the safe direction — the
+# `syn` duplication comes back as two warnings and fails the gate. It cannot go quietly green.
+allowed-duplicate-crates = ["syn"]
+allow-panic-in-tests = true

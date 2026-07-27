@@ -25,6 +25,14 @@ fi
 # Run from the repo root regardless of the caller's cwd.
 cd "$(dirname "$0")/.."
 
+# One clippy.toml, at the root, and this is what makes rust-doctor read it (LINT-2, #28). rust-doctor
+# writes its own temporary `<crate>/clippy.toml` into any workspace member that has none, and clippy
+# stops at the first config it finds walking up from the crate — so the injected file shadows ours, and
+# the `syn` duplication this repo has already accepted comes back as a warning per crate. Pointing
+# clippy at a directory skips the walk. Without it a local run disagrees with the gate in the noisy
+# direction, which is at least the direction you notice. See clippy.toml.
+export CLIPPY_CONF_DIR="$PWD"
+
 # The gate runs on a PINNED toolchain, and clippy's lint set changes between releases — so a local run on
 # a different rustc reports a different answer, and the direction is the dangerous one: an OLDER toolchain
 # simply does not have the newer lints, so it prints "0 warnings" for code the gate will fail on.

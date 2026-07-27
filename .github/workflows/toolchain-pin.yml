@@ -1,0 +1,199 @@
+name: toolchain-pin
+
+# Who bumps the pin, and on what trigger (LINT-2, #28).
+#
+# `rust-doctor.yml` gates on warnings against Rust 1.97.1, pinned so that a new pedantic lint in a
+# future clippy cannot break a build on code nobody touched (LINT-1, #18). The cost of that pin is the
+# other kind of drift: the repo lints against one clippy until somebody raises the number, and nothing
+# was scheduled to. The longer the gap, the bigger the batch of new lints when it finally moves.
+#
+# So: once a month, run the same scan against whatever `stable` is now, and gate on NOTHING. A newer
+# clippy's findings arrive as a notification instead of a red build, which is the exact property the
+# pin was chosen for.
+#
+# It cannot gate anything, by construction as well as by intent. `schedule:` runs only on the default
+# branch, produces no check run on any pull request, and so can never be a required status check;
+# `release.yml` calls `tests.yml` and `rust-doctor.yml` by name and does not call this. Nothing depends
+# on this workflow's conclusion.
+#
+# WHICH IS ALSO THE PROBLEM, and why the last step files an issue. A scheduled job that goes red in a
+# tab nobody opens is the same silent staleness this workflow exists to fix — and the two things GitHub
+# offers instead are both weak here: the run summary is only visible to someone who already went
+# looking, and the failure email for a scheduled run goes to whoever last edited the cron, which is not
+# a role anyone holds. This repo's tracker is GitHub issues (`docs/agents/issue-tracker.md`), so the
+# finding is delivered there, where the rest of the work already lives. One issue per new stable, keyed
+# on the version in the title so a re-run does not open a second one: at most a handful a year, each
+# closed by the commit that raises the pin.
+#
+# Two things to know about scheduled workflows before trusting this to run forever. It takes effect
+# only once it is on the default branch, so a change here is untested until merged — hence
+# `workflow_dispatch`, which runs it on demand from any branch. And GitHub disables scheduled
+# workflows after 60 days without repository activity, emailing the owner; that is a real gap, and a
+# repo quiet for two months has a staler pin than this job can fix.
+
+on:
+  schedule:
+    # 06:23 UTC on the 2nd of each month — off the hour, because the top of the hour is when everyone
+    # else's cron queues and GitHub delays scheduled runs under load. Rust ships stable every six
+    # weeks, so monthly polling finds each release within about a month of it landing.
+    - cron: "23 6 2 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write # the last step files the bump as an issue; that IS the notification
+
+concurrency:
+  group: toolchain-pin
+  cancel-in-progress: false
+
+jobs:
+  next-stable:
+    # The job name is the whole message for anyone who does look at the Actions tab: this one is
+    # advisory, so a red run here is news rather than a broken build.
+    name: Doctor on next stable (advisory — gates nothing)
+    runs-on: ubuntu-latest
+
+    env:
+      # Same reason as rust-doctor.yml: rust-doctor injects a temporary `<crate>/clippy.toml` into any
+      # member that has none, which shadows the workspace-root config. See clippy.toml (LINT-2, #28).
+      CLIPPY_CONF_DIR: ${{ github.workspace }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Read BOTH pins out of the gate's own workflow rather than repeating the numbers here. A second
+      # copy of "1.97.1" is a second thing to remember to bump, which is the maintenance hazard this
+      # issue is about; release.yml declines to carry one for the same reason. The rust-doctor version
+      # matters just as much: an advisory scan run by a different tool than the gate answers a question
+      # nobody asked. scripts/doctor.sh reads the toolchain with the identical sed.
+      - name: Compare stable against the pin
+        id: pin
+        shell: bash
+        run: |
+          gate=.github/workflows/rust-doctor.yml
+          pinned="$(sed -n 's/.*toolchain: *"\([0-9][0-9.]*\)".*/\1/p' "$gate" | head -1)"
+          doctor="$(sed -n 's/.*rust-doctor@\([0-9][0-9.]*\).*/\1/p' "$gate" | head -1)"
+          stable="$(rustc -vV | sed -n 's/^release: *//p')"
+          if [ -z "$pinned" ] || [ -z "$doctor" ]; then
+            echo "::error::could not read the pinned toolchain ('$pinned') and rust-doctor version ('$doctor') out of $gate — the seds that read them no longer match the file"
+            exit 1
+          fi
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "doctor=$doctor" >> "$GITHUB_OUTPUT"
+          echo "stable=$stable" >> "$GITHUB_OUTPUT"
+          if [ "$pinned" = "$stable" ]; then
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+            echo "## The pin is current" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`rust-doctor.yml\` is pinned to \`$pinned\`, which is stable. Nothing to do." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "behind=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # No cargo cache, deliberately, and no `cargo clean -p` either. The gate needs both because a warm
+      # cache makes clippy re-lint only what it rebuilds; this job runs monthly on a cold runner, so
+      # every crate is linted from scratch anyway. A cache would buy minutes and cost the completeness
+      # that is the entire point of the run.
+      #
+      # `--fail-on none` is what makes this advisory: rust-doctor always exits 0, so a new lint in a
+      # newer clippy cannot turn this job red. The findings are read out of the SARIF below.
+      - name: Run rust-doctor against stable, gating on nothing
+        if: steps.pin.outputs.behind == 'true'
+        run: npx -y "rust-doctor@${{ steps.pin.outputs.doctor }}" --sarif --fail-on none > rust-doctor-stable.sarif
+
+      - name: Read the findings
+        id: findings
+        if: steps.pin.outputs.behind == 'true'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os
+          with open("rust-doctor-stable.sarif") as f:
+              sarif = json.load(f)
+          rows = [(r.get("level", "?"), r.get("ruleId", "?"),
+                   (r.get("locations") or [{}])[0].get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "?"),
+                   (r.get("locations") or [{}])[0].get("physicalLocation", {}).get("region", {}).get("startLine", "?"),
+                   r.get("message", {}).get("text", "")[:200])
+                  for run in sarif.get("runs", []) for r in run.get("results", [])
+                  if r.get("level") in ("warning", "error")]
+
+          pinned, stable = os.environ["PINNED"], os.environ["STABLE"]
+          lines = []
+          if rows:
+              lines.append(f"Rust **{stable}** is out. `.github/workflows/rust-doctor.yml` is pinned to "
+                           f"**{pinned}**, and the gate's own scan on {stable} reports "
+                           f"**{len(rows)} warning/error finding(s)** that the pinned clippy does not:\n")
+              # Capped, because a body over GitHub's 65k limit is a 422 and no notification at all —
+              # and a batch this size is already the answer. The SARIF artifact has every one.
+              for lvl, rule, path, line, msg in rows[:50]:
+                  lines.append(f"- **{lvl}** `{rule}` — `{path}:{line}`\n  {msg}")
+              if len(rows) > 50:
+                  lines.append(f"\n…and {len(rows) - 50} more. The full list is in the "
+                               f"`rust-doctor-stable-sarif` artifact on this run.")
+              lines.append("\nRaising the pin means fixing these first. Do both in one commit, so the "
+                           "toolchain and the code that satisfies it land together.")
+          else:
+              lines.append(f"Rust **{stable}** is out and the gate's scan on it is **clean**. "
+                           f"`.github/workflows/rust-doctor.yml` is pinned to **{pinned}**; raising it to "
+                           f"{stable} costs one line and no cleanup.")
+          lines.append("\n---\n")
+          lines.append(f"Filed by `.github/workflows/toolchain-pin.yml` (LINT-2, #28), which runs "
+                       f"monthly against stable and gates on nothing. Close this by bumping the pin — "
+                       f"or by deciding not to, and saying so here.")
+          body = "\n".join(lines)
+
+          with open("bump-issue-body.md", "w") as f:
+              f.write(body + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"## Rust {stable} vs the pinned {pinned}\n\n{body}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"count={len(rows)}\n")
+          PY
+        env:
+          PINNED: ${{ steps.pin.outputs.pinned }}
+          STABLE: ${{ steps.pin.outputs.stable }}
+
+      # The version is in the title so the search below is an exact key: re-running this month, or next
+      # month before a new stable lands, finds the open issue and adds nothing. A second issue only
+      # appears when a second stable does.
+      #
+      # Clean scan -> `ready-for-agent`, because a one-line bump with nothing to fix is exactly what
+      # that label is for. Findings -> `needs-triage`, because someone has to decide whether the new
+      # lints are worth fixing before the number moves.
+      - name: Open the bump issue, unless it is already open
+        if: steps.pin.outputs.behind == 'true'
+        shell: bash
+        run: |
+          title="chore: bump the rust-doctor toolchain pin to ${{ steps.pin.outputs.stable }}"
+          existing="$(gh issue list --state open --search "in:title \"$title\"" --json number,title \
+                       --jq ".[] | select(.title == \"$title\") | .number" | head -1)"
+          if [ -n "$existing" ]; then
+            echo "Already tracked as #$existing — not filing a duplicate."
+            echo "Already tracked as #$existing." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "${{ steps.findings.outputs.count }}" = "0" ]; then
+            label="ready-for-agent"
+          else
+            label="needs-triage"
+          fi
+          gh issue create --title "$title" --body-file bump-issue-body.md --label "$label"
+
+      - name: Upload the stable SARIF as an artifact
+        if: always() && steps.pin.outputs.behind == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-doctor-stable-sarif
+          path: rust-doctor-stable.sarif
+          if-no-files-found: warn
+      # Deliberately NOT uploaded to code scanning. The `rust-doctor` category there is the gate's
+      # output, and publishing a different toolchain's findings under it would make code scanning show
+      # alerts no build enforces — an instrument reading something other than what it claims to measure,
+      # which is this repo's recurring failure shape. The artifact and the issue are the record.

@@ -129,11 +129,13 @@ One finding is known and deliberately allowed, and it is a *dependency* issue ra
   real finding — still fails the build instead of hiding behind this one. It was previously recorded here
   as scoring "info, so the warning gate does not trip on it", which was simply **wrong**: it is a
   warning, once per crate, and it failed the first gated CI run.
-  The allowance lives in `jdwp-client/clippy.toml` and `mcp-server/clippy.toml`, **per crate rather than
-  at the workspace root**, and that took two attempts. A root `clippy.toml` satisfies `cargo clippy`,
-  which walks up from `CARGO_MANIFEST_DIR` — it went clean locally — but not rust-doctor's invocation,
-  which is the gate that counts. CI named the path it looked in and did not find: `<crate>/clippy.toml:1`.
-  Keep the two files in sync.
+  The allowance now lives in **one `clippy.toml` at the workspace root** (LINT-2, #28). It was per-crate
+  for two releases, on the reading that a root file "satisfies `cargo clippy`, which walks up from
+  `CARGO_MANIFEST_DIR`, but not rust-doctor's invocation — CI named the path it looked in and did not
+  find: `<crate>/clippy.toml:1`". The symptom was real; the reading was not. rust-doctor *writes* a
+  temporary `<crate>/clippy.toml` into any member that has none, which shadows the root file for the
+  length of the run — so `CLIPPY_CONF_DIR`, which `scripts/doctor.sh` and the workflows now set, fixes
+  it with one file and nothing to keep in sync. See ADR-0007's LINT-2 amendment for the evidence.
 
 **On `windows-gnu`, `scripts/doctor.sh` cannot verify the warning count — don't trust a local 0.** Its
 isolated `target/rust-doctor` build fails to link (`ld.exe: cannot find \symbols.o`), and a build that
