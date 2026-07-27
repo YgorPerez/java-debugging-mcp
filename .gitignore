@@ -3,7 +3,10 @@
 **/target/
 **/*.rs.bk
 *.pdb
-Cargo.lock
+# Cargo.lock is COMMITTED, deliberately. The default template ignores it, which is the right call for a
+# library and the wrong one here: this workspace ships a binary, and REL-1's release job builds with
+# `--locked` so a tagged build resolves exactly what the gates tested. Without the lockfile in the repo
+# that flag fails outright, which would have broken the first release the first time it ran.
 
 # rust-doctor local cache
 .rust-doctor-cache.json
