@@ -4118,6 +4118,11 @@ fn source_says_when_a_loaded_class_carries_no_source_file_attribute() {
         return;
     };
     let probe = Probe::launch_stripped(&jdk, "StrippedProbe").expect("launch StrippedProbe");
+    // Wait for it to actually be RUNNING, not merely accepting a JDWP connection. The agent listens
+    // before the main class is loaded, and this test's entire premise is the difference between "loaded
+    // but stripped" and "not loaded" — so racing the class load turns the assertion into a coin flip that
+    // reports the wrong finding when it loses. It lost on CI's JDK 11 leg while passing everywhere else.
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("StrippedProbe never ticked");
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
 
@@ -4184,6 +4189,10 @@ fn source_reports_the_smap_when_the_class_was_translated_from_another_file() {
         return;
     };
     let probe = Probe::launch_with_smap(&jdk, "SmapProbe").expect("launch SmapProbe");
+    // Same race as the stripped probe above: the agent listens before the classes are loaded. Waiting for
+    // a tick settles both at once — the heartbeat prints `Neighbour.touched`, so a tick proves the control
+    // class is loaded too, and the control is the whole reason a passing SMAP assertion means anything.
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("SmapProbe never ticked");
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
 
