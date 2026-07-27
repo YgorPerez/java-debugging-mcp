@@ -1004,7 +1004,7 @@ impl RequestHandler {
 
         let mut output = format!("{shown}/{matched} method(s) on {class_name}{note}:\n");
         for (owner, rendered) in rows.iter().take(limit) {
-            let _ = if a.inherited && owner != class_name {
+            let _ = if a.inherited && &**owner != class_name {
                 writeln!(output, "{rendered}  [from {owner}]")
             } else {
                 writeln!(output, "{rendered}")
@@ -3214,11 +3214,14 @@ async fn collect_method_rows(
     start: u64,
     inherited: bool,
     name_filter: Option<&str>,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(std::sync::Arc<str>, String)>, String> {
     let mut rows = Vec::new();
     let mut current = Some(start);
     while let Some(type_id) = current {
-        let owner = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+        // `Arc<str>`, not `String`: every method of a class repeats its declaring class, so a plain
+        // clone per row re-heap-allocates the same name once for each method — a refcount bump instead.
+        let owner: std::sync::Arc<str> =
+            std::sync::Arc::from(decode_signature(&conn.get_signature(type_id).await.unwrap_or_default()).as_str());
         let methods = conn.get_methods(type_id).await
             .map_err(|e| format!("Failed to read the methods of {owner}: {e}"))?;
         for m in &methods {
@@ -3230,7 +3233,7 @@ async fn collect_method_rows(
             if name_filter.is_some_and(|f| !m.name.to_lowercase().contains(f)) {
                 continue;
             }
-            rows.push((owner.clone(), render_method(&m.name, &m.signature, m.mod_bits)));
+            rows.push((std::sync::Arc::clone(&owner), render_method(&m.name, &m.signature, m.mod_bits)));
         }
         if !inherited {
             break;
@@ -4851,39 +4854,42 @@ fn spawn_watchdog(
                     // the caller cannot discover by asking — the VM they left suspended is no longer
                     // suspended, and a stop point they armed is now disabled. Pushed as well as
                     // recorded, so a caller who walked away is told rather than finding out later.
-                    let pushed = match resume_and_verify(&mut s).await {
+                    // Each arm stores the note and yields only its severity. Carrying the text back out
+                    // too would mean cloning a String on every watchdog tick for no gain — the note is
+                    // already on the session, and that copy is the one to alert from.
+                    let level = match resume_and_verify(&mut s).await {
                         Ok(None) => {
                             s.mark_resumed();
                             let note = format!("watchdog auto-resumed the VM after {secs}s {disarmed}");
                             info!("{note}");
-                            s.last_watchdog_note = Some(note.clone());
-                            Some(("warning", note))
+                            s.last_watchdog_note = Some(note);
+                            "warning"
                         }
                         Ok(Some(detail)) if detail.starts_with("cleared") => {
                             s.mark_resumed();
                             let note = format!("watchdog auto-resumed the VM after {secs}s {disarmed} ({detail})");
                             info!("{note}");
-                            s.last_watchdog_note = Some(note.clone());
-                            Some(("warning", note))
+                            s.last_watchdog_note = Some(note);
+                            "warning"
                         }
                         Ok(Some(problem)) => {
                             // Deliberately NOT calling mark_resumed: the VM is still stopped, so the
                             // watchdog must keep trying rather than going quiet on a false success.
                             let note = format!("⚠️ watchdog tried to resume the VM after {secs}s {disarmed}, but {problem}");
                             warn!("{note}");
-                            s.last_watchdog_note = Some(note.clone());
-                            Some(("error", note))
+                            s.last_watchdog_note = Some(note);
+                            // A still-frozen VM is an `error`: nothing the caller does next will work
+                            // until it runs, which is a different thing from "we rescued it for you".
+                            "error"
                         }
                         Err(e) => {
                             let note = format!("⚠️ watchdog could not resume the VM after {secs}s: {e}");
                             warn!("{note}");
-                            s.last_watchdog_note = Some(note.clone());
-                            Some(("error", note))
+                            s.last_watchdog_note = Some(note);
+                            "error"
                         }
                     };
-                    // A still-frozen VM is an `error`: nothing the caller does next will work until it
-                    // is running, which is a different thing from "we rescued it for you".
-                    if let Some((level, note)) = pushed {
+                    if let Some(note) = &s.last_watchdog_note {
                         s.alerter.alert(level, &json!({ "watchdog": note }));
                     }
                     drop(s);
