@@ -127,6 +127,16 @@ data that is about the JVM the caller asked about.
   lengthened a dump of `ChurnProbe` by ~60%, which pushed the churn population's reads past death *plus* a
   GC interval and made TEST-10's `[zombie]` state unreachable. `LIFE_MS` went 300 → 600 to put the deaths
   back inside the window. Recorded because it will bite again the next time the probe grows.
+
+  **It bit again, and the coupling is gone rather than re-tuned** (TEST-19,
+  [#54](https://github.com/YgorPerez/java-debugging-mcp/issues/54)). Not because the probe
+  grew but because the *host* did: on a loaded JDK 11 the same dump costs ~950ms instead of ~500ms, every
+  worker the list named is collected by the time it is read, and the `[zombie]` state was unreachable
+  again — 8 of 12 paired runs. `ChurnProbe` now **holds** every second retirement's `Thread`, so half the
+  population stays resolvable after it finishes and half does not, by construction and not by GC timing.
+  A slower dump now overlaps more deaths and finds more of *both* states, which inverts the failure mode:
+  load is the condition the observation is easiest under rather than the one that loses it. `LIFE_MS` was
+  not touched, and no longer claims to be tuned against the clock.
 - **A dump of a small JVM is unchanged.** Nothing is withheld, so no ordering line is printed and the rows
   are in the order they always were.
 - **`limit` is documented as a rule rather than a size**, and the reply repeats it. The acceptance
