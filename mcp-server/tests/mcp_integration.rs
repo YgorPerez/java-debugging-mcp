@@ -1992,6 +1992,18 @@ fn dump_thread_counts(dump: &str) -> Option<(u64, u64)> {
     Some((read.trim().parse().ok()?, total.parse().ok()?))
 }
 
+/// `(threads shown, threads total)` from a `debug.list_threads` header — `40/103 thread(s):`.
+///
+/// Its own parser rather than the dump's, because the two headers are deliberately different sentences
+/// about the same arithmetic, and a test that could not tell them apart would let one tool's reply pass
+/// for the other's.
+fn list_thread_counts(listed: &str) -> Option<(u64, u64)> {
+    let head = listed.lines().next()?;
+    let (shown, rest) = head.split_once('/')?;
+    let total: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some((shown.trim().parse().ok()?, total.parse().ok()?))
+}
+
 /// The `Cost: N JDWP packet(s).` figure a dump reports.
 fn dump_packet_cost(dump: &str) -> Option<u64> {
     let at = dump.find("Cost: ")? + "Cost: ".len();
@@ -5010,8 +5022,8 @@ fn dump_held_ms(dump: &str) -> Option<u64> {
     dump.get(at..)?.split_once("ms").and_then(|(n, _)| n.trim().parse().ok())
 }
 
-/// DUMP-3 (#43): the threads a caller came to look at are the ones a server starts LAST, so the default
-/// dump has to reach them.
+/// DUMP-3 (#43) and DUMP-5 (#51): the threads a caller came to look at are the ones a server starts LAST,
+/// so the default dump — and the default listing that decides what to dump — have to reach them.
 ///
 /// Measured against a real `WildFly` 21 (TEST-8, #24), a default `debug.thread_dump` of a 267-thread loaded
 /// instance returned **zero application threads**. All 40 slots went to JVM internals, MSC service
@@ -5028,14 +5040,24 @@ fn dump_held_ms(dump: &str) -> Option<u64> {
 /// **Reversing the walk is not the fix, and this probe is why.** Newest-first would return churn workers,
 /// which are created continuously and forever. The rule has to be about *what* the threads are, from data
 /// the dump already reads (the name), not about where they sit in the list.
+///
+/// **`debug.list_threads` is read here too, against the same probe and the same attach (DUMP-5, #51).** It
+/// kept the creation-order truncation for as long as the dump had it fixed, which is the worse half of the
+/// two whatever its packet cost says: it is the call someone runs *first*, precisely to decide what to
+/// dump. Reading both in one test is the only way to assert the thing #51 was actually about — that the
+/// cheap call and the expensive one select the same population — and it costs one JVM rather than two,
+/// which matters on a suite whose neighbouring test is timing-sensitive about a pool that churns.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
-// One probe, one attach, three readings that only mean something together: the default dump reaches the
-// pool, it says how it chose, and the wider selection is still bounded by the suspension budget. Split up,
-// each half would be asserting against a debuggee the others never proved was in the state that matters.
+// One probe, one attach, five readings that only mean something together: the default dump reaches the
+// pool, the default LISTING reaches the same pool for a stated price, both say how they chose, and the
+// wider selection is still bounded by the suspension budget. Split up, each part would be asserting
+// against a debuggee the others never proved was in the state that matters.
 #[allow(clippy::too_many_lines)]
-fn a_default_dump_reaches_a_pool_the_debuggee_started_last() {
-    let Some(jdk) = jdk_or_skip("a_default_dump_reaches_a_pool_the_debuggee_started_last") else {
+fn a_default_dump_and_a_default_listing_reach_a_pool_the_debuggee_started_last() {
+    let Some(jdk) =
+        jdk_or_skip("a_default_dump_and_a_default_listing_reach_a_pool_the_debuggee_started_last")
+    else {
         return;
     };
     let probe = Probe::launch(&jdk, "ChurnProbe").expect("launch ChurnProbe");
@@ -5093,6 +5115,77 @@ fn a_default_dump_reaches_a_pool_the_debuggee_started_last() {
          seeing', and 227 of them being one pool is the answer:\n{dump}"
     );
 
+    // --- the CHEAP call, on the same debuggee, in the same state (DUMP-5, #51) ---
+    let listed = server.call("debug.list_threads", serde_json::json!({}));
+    let (shown, listed_total) = list_thread_counts(&listed)
+        .unwrap_or_else(|| panic!("no `N/M thread(s)` header in:\n{}", head_of(&listed)));
+    assert!(
+        listed_total > shown,
+        "the listing must be truncated or there is no selection to test: {shown}/{listed_total}"
+    );
+    let listed_stable = listed.lines().filter(|l| l.contains("stable-worker-")).count();
+    assert_eq!(
+        listed_stable, 8,
+        "a default listing reached {listed_stable} of the 8 threads this debuggee started LAST. Before \
+         #51 it reached 0, for the same reason the dump did: forty slots spent on the least interesting \
+         end of a list that is in creation order.\n{listed}"
+    );
+    // The whole of #51 in one assertion: a caller lists, picks a thread, then dumps. If the two tools
+    // chose by different rules the thread they picked would not be in the dump.
+    assert_eq!(
+        listed_stable, stable,
+        "the cheap call and the expensive one must select the same population:\n{listed}"
+    );
+    assert_contains_all(
+        "a truncated listing states its rule in the DUMP's words — one wording, because two would be how \
+         the two tools start meaning different things",
+        &listed,
+        &["by NAME FAMILY", "printed in creation order"],
+    );
+    assert!(
+        listed.contains("… +") && listed.contains("more (raise limit"),
+        "the withheld remainder is still counted:\n{listed}"
+    );
+    assert!(
+        listed.contains("churn-worker-#"),
+        "the listing's footer must name the groups it withheld too:\n{listed}"
+    );
+
+    // --- what choosing cost the cheap call, which is the criterion #51 set for it ---
+    let listed_cost = dump_packet_cost(&listed)
+        .unwrap_or_else(|| panic!("a truncated listing must report what it spent:\n{listed}"));
+    // One packet per thread NAME plus the thread list itself. A rate rather than an absolute, because the
+    // probe's population is only approximately fixed — but the rate IS the property being defended: a dump
+    // reads ~8 packets per thread it shows, and a selection pass that made the reconnaissance call as
+    // expensive as the dump would have missed the point of having it.
+    assert!(
+        listed_cost <= listed_total + 2,
+        "choosing by family must cost one packet per thread name and no more: {listed_cost} packets for \
+         {listed_total} threads\n{listed}"
+    );
+    let dump_cost = dump_packet_cost(&dump).unwrap_or_else(|| panic!("no cost line in:\n{}", head_of(&dump)));
+    // Against the CHEAPEST dump there is — this one suspended nothing, so it read two packets a thread and
+    // no frames at all. A listing that read every name in the JVM still spends less than that.
+    assert!(
+        listed_cost < dump_cost,
+        "the whole point of list_threads is being the cheap call: it spent {listed_cost} packets against \
+         the {dump_cost} of a dump that read no stacks at all\n{listed}"
+    );
+
+    // A narrowed listing is untouched by any of this: one family, so the round-robin IS creation order,
+    // and a rule that changed nothing must not announce itself.
+    let narrowed =
+        server.call("debug.list_threads", serde_json::json!({"name_filter": "stable-worker", "limit": 8}));
+    assert!(
+        !narrowed.contains("NAME FAMILY"),
+        "a listing that withheld nothing must not explain a rule that changed nothing:\n{narrowed}"
+    );
+    assert_eq!(
+        narrowed.lines().filter(|l| l.contains("stable-worker-")).count(),
+        8,
+        "the filter still finds all eight:\n{narrowed}"
+    );
+
     // --- the cost of choosing stays inside the budget, and is still reported ---
     let frozen = server.call(
         "debug.thread_dump",
@@ -5117,6 +5210,24 @@ fn a_default_dump_reaches_a_pool_the_debuggee_started_last() {
         frozen.contains("ChurnProbe.park:"),
         "the frozen default dump must have read a stable worker's real stack, not merely listed it:\n{}",
         head_of(&frozen)
+    );
+
+    // The listing against a dump that actually read stacks — the comparison the cost line's "~8 packets
+    // per thread shown" is making, now that there is one in hand. Printed as well as asserted: these
+    // numbers ARE #51's acceptance criterion, and a run that proves them should not leave the next reader
+    // to re-derive them. Measured ~3.7× on this probe (103 against 381 on JDK 11, 104 against 385 on JDK
+    // 25); asserted at 2× because the multiple depends on how deep the stacks happen to be, and the claim
+    // being defended is "the cheap call is still the cheap call", not a particular ratio.
+    let frozen_cost =
+        dump_packet_cost(&frozen).unwrap_or_else(|| panic!("no cost line in:\n{}", head_of(&frozen)));
+    eprintln!(
+        "DUMP-5 cost on {listed_total} threads: listing {listed_cost}, dump reading no stacks \
+         {dump_cost}, dump reading stacks {frozen_cost}"
+    );
+    assert!(
+        listed_cost * 2 < frozen_cost,
+        "a listing must stay materially cheaper than the dump it is reconnaissance FOR: {listed_cost} \
+         against {frozen_cost}\n{listed}"
     );
 
     // A budget that cannot be met has to bind on the *choosing* too. If the name pass ran to completion

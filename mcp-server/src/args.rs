@@ -312,7 +312,17 @@ pub struct ListThreadsArgs {
     /// Only threads currently suspended (also appends each thread's run status).
     #[serde(default)]
     pub only_suspended: bool,
-    /// Max threads to return; the rest are reported as a hidden count.
+    /// Max threads to return; the rest are reported as a hidden count (default 40).
+    ///
+    /// **Which 40 you get is a rule, and the reply states it** — the same rule `debug.thread_dump` uses,
+    /// in the same words (ADR-0013; DUMP-5, #51). One thread from each distinct name with its digits
+    /// ignored (`task-7` and `task-91` are one family) before a second from any, printed in creation
+    /// order, with the biggest withheld groups named in the footer.
+    ///
+    /// It is **not** the first 40 the JVM listed: `AllThreads` order is *creation* order, and an app
+    /// server creates its request pool last, so on a loaded `WildFly` the first 40 were measured to
+    /// contain no application threads at all. Choosing costs one packet per thread NAME — the reply
+    /// reports the figure — which is why raising `limit` is cheap here and still not the answer.
     #[serde(default = "default_limit")]
     pub limit: usize,
 }

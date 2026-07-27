@@ -164,7 +164,7 @@ fn inspection_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.list_threads".to_string(),
-            description: "List threads by name (one `0x<id> <name>` line each). A JVM like WildFly has hundreds of threads — filter with name_filter, and note the last thread that hit a breakpoint is already reported by debug.get_last_event.".to_string(),
+            description: "List threads by name (one `0x<id> <name>` line each). A JVM like WildFly has hundreds of threads — filter with name_filter, and note the last thread that hit a breakpoint is already reported by debug.get_last_event. When there are more threads than `limit`, the ones shown are chosen the same way debug.thread_dump chooses them: by NAME FAMILY (the name with digits collapsed, so `task-3` and `task-91` are one family), one thread from each family before a second from any, so no single pool spends every slot. NOT the order the JVM lists them in, which is CREATION order — an app server starts its request pool last, so on a real WildFly the first 40 in that order were all JVM internals and selectors and not one application thread. The reply states the rule when it truncated, names the biggest groups it left out, and reports what it spent: one packet per thread NAME, against a dump's ~8 per thread it shows, so this is still the cheap call to run FIRST to decide what to dump.".to_string(),
             input_schema: to_val(schemars::schema_for!(ListThreadsArgs)),
         },
         Tool {
