@@ -95,7 +95,7 @@ pub struct LoggingCapability {}
 /// Sized by the same reasoning as `MAX_EVENTS`: a *suspending* hit holds a thread, so these arrive at
 /// human pace, not at trace speed. A client would have to stop reading stdout entirely to reach this,
 /// and the drop counter covers that case honestly rather than letting the queue grow.
-pub const NOTIFY_CAPACITY: usize = 64;
+pub const ALERT_CAPACITY: usize = 64;
 
 /// The outbound half of the stdio transport (EVT-2).
 ///
@@ -109,7 +109,7 @@ pub const NOTIFY_CAPACITY: usize = 64;
 /// that stalls its own event loop because the client is slow is worse than one that drops a hint the
 /// caller can still read with `debug.get_last_event`.
 #[derive(Clone, Debug)]
-pub struct Notifier {
+pub struct Alerter {
     tx: tokio::sync::mpsc::Sender<String>,
     /// Set once the client has sent `notifications/initialized`. A hit can arrive while `debug.attach`
     /// is still in flight, and emitting before the handshake completes is protocol-illegal.
@@ -119,7 +119,7 @@ pub struct Notifier {
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
-impl Notifier {
+impl Alerter {
     pub fn new(tx: tokio::sync::mpsc::Sender<String>) -> Self {
         Self {
             tx,
@@ -138,10 +138,10 @@ impl Notifier {
     /// Returns whether it was queued, which is what the tests assert on — the caller has nothing
     /// useful to do with the answer, since every failure here is already handled.
     // `data` by reference, not by value: the armed/enabled guard below returns before it would be
-    // consumed, and a disarmed notifier is the common case for the whole pre-handshake window.
-    pub fn notify(&self, level: &str, data: &serde_json::Value) -> bool {
+    // consumed, and a disarmed alerter is the common case for the whole pre-handshake window.
+    pub fn alert(&self, level: &str, data: &serde_json::Value) -> bool {
         use std::sync::atomic::Ordering;
-        if !self.armed.load(Ordering::Relaxed) || !notifications_enabled() {
+        if !self.armed.load(Ordering::Relaxed) || !alerts_enabled() {
             return false;
         }
 
@@ -174,10 +174,10 @@ impl Notifier {
     }
 }
 
-/// `JDWP_NOTIFICATIONS=0` turns push notifications off entirely, leaving `debug.get_last_event` as the
+/// `JDWP_ALERTS=0` turns push notifications off entirely, leaving `debug.get_last_event` as the
 /// only way to learn about a hit. Same spelling convention as `JDWP_READONLY` / `JDWP_WATCHDOG_SECS`.
-pub fn notifications_enabled() -> bool {
-    std::env::var("JDWP_NOTIFICATIONS")
+pub fn alerts_enabled() -> bool {
+    std::env::var("JDWP_ALERTS")
         .map_or(true, |v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
 }
 
@@ -185,9 +185,9 @@ pub fn notifications_enabled() -> bool {
 mod tests {
     use super::*;
 
-    fn notifier_with_capacity(n: usize) -> (Notifier, tokio::sync::mpsc::Receiver<String>) {
+    fn notifier_with_capacity(n: usize) -> (Alerter, tokio::sync::mpsc::Receiver<String>) {
         let (tx, rx) = tokio::sync::mpsc::channel(n);
-        (Notifier::new(tx), rx)
+        (Alerter::new(tx), rx)
     }
 
     // EVT-2: a hit can land while `debug.attach` is still in flight, and pushing before the client has
@@ -195,12 +195,12 @@ mod tests {
     #[test]
     fn nothing_is_pushed_before_the_handshake_completes() {
         let (n, mut rx) = notifier_with_capacity(4);
-        assert!(!n.notify("warning", &json!({"event": "breakpoint"})), "must not push unarmed");
+        assert!(!n.alert("warning", &json!({"event": "breakpoint"})), "must not push unarmed");
         assert!(rx.try_recv().is_err(), "nothing should have been queued");
 
         n.arm();
-        assert!(n.notify("warning", &json!({"event": "breakpoint"})));
-        let line = rx.try_recv().expect("armed notifier should queue");
+        assert!(n.alert("warning", &json!({"event": "breakpoint"})));
+        let line = rx.try_recv().expect("armed alerter should queue");
         assert!(line.contains("notifications/message"), "{line}");
         assert!(line.contains("\"logger\":\"jdwp-mcp\""), "{line}");
         assert!(line.contains("\"event\":\"breakpoint\""), "payload must survive: {line}");
@@ -214,33 +214,33 @@ mod tests {
     fn a_full_queue_drops_and_reports_what_it_dropped() {
         let (n, mut rx) = notifier_with_capacity(2);
         n.arm();
-        assert!(n.notify("warning", &json!({"i": 1})));
-        assert!(n.notify("warning", &json!({"i": 2})));
+        assert!(n.alert("warning", &json!({"i": 1})));
+        assert!(n.alert("warning", &json!({"i": 2})));
         // Full now: these are dropped, not queued, and above all they do not block.
-        assert!(!n.notify("warning", &json!({"i": 3})));
-        assert!(!n.notify("warning", &json!({"i": 4})));
+        assert!(!n.alert("warning", &json!({"i": 3})));
+        assert!(!n.alert("warning", &json!({"i": 4})));
 
         // Drain, freeing capacity, and the next one through must own up to the two that were lost.
         let _ = rx.try_recv().expect("first");
         let _ = rx.try_recv().expect("second");
-        assert!(n.notify("warning", &json!({"i": 5})));
+        assert!(n.alert("warning", &json!({"i": 5})));
         let recovered = rx.try_recv().expect("fifth");
         assert!(recovered.contains("\"droppedSinceLast\":2"), "must report the gap: {recovered}");
 
         // And the count resets, so the next clean notification does not re-report old losses.
-        assert!(n.notify("warning", &json!({"i": 6})));
+        assert!(n.alert("warning", &json!({"i": 6})));
         let clean = rx.try_recv().expect("sixth");
         assert!(!clean.contains("droppedSinceLast"), "drop count must reset: {clean}");
     }
 
     // The receiver going away is a normal shutdown ordering, not a panic — and it must still be
-    // counted, so a later notifier on a live channel does not under-report.
+    // counted, so a later alerter on a live channel does not under-report.
     #[test]
     fn a_dead_writer_is_survivable() {
         let (n, rx) = notifier_with_capacity(2);
         n.arm();
         drop(rx);
-        assert!(!n.notify("warning", &json!({"i": 1})), "must report failure, not panic");
+        assert!(!n.alert("warning", &json!({"i": 1})), "must report failure, not panic");
     }
 }
 

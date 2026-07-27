@@ -93,7 +93,7 @@ pub struct DebugSession {
     ///
     /// It never replaces the `events` buffer above. A notification is best-effort and a client may
     /// never read one, so `debug.get_last_event` has to remain sufficient on its own.
-    pub notifier: crate::protocol::Notifier,
+    pub alerter: crate::protocol::Alerter,
 }
 
 /// Max trace snapshots retained per session; oldest are evicted (documented cap for TRACE-1).
@@ -466,15 +466,15 @@ pub struct SessionManager {
     current_session: Arc<Mutex<Option<SessionId>>>,
     /// Handed to every session it creates (EVT-2), so the event pump and the watchdog can push
     /// without a path back to the request handler.
-    notifier: crate::protocol::Notifier,
+    alerter: crate::protocol::Alerter,
 }
 
 impl SessionManager {
-    pub fn new(notifier: crate::protocol::Notifier) -> Self {
+    pub fn new(alerter: crate::protocol::Alerter) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             current_session: Arc::new(Mutex::new(None)),
-            notifier,
+            alerter,
         }
     }
 
@@ -511,7 +511,7 @@ impl SessionManager {
             traces: VecDeque::new(),
             trace_seq: 0,
             stop_seq: 0,
-            notifier: self.notifier.clone(),
+            alerter: self.alerter.clone(),
         };
 
         let mut sessions = self.sessions.lock().await;

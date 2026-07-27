@@ -24,14 +24,14 @@ pub struct RequestHandler {
     session_manager: SessionManager,
     /// Outbound push channel (EVT-2). Held here so the handshake can arm it; sessions get their own
     /// clone at creation so the event pump and watchdog can reach it without going through here.
-    notifier: crate::protocol::Notifier,
+    alerter: crate::protocol::Alerter,
 }
 
 impl RequestHandler {
-    pub fn new(notifier: crate::protocol::Notifier) -> Self {
+    pub fn new(alerter: crate::protocol::Alerter) -> Self {
         Self {
-            session_manager: SessionManager::new(notifier.clone()),
-            notifier,
+            session_manager: SessionManager::new(alerter.clone()),
+            alerter,
         }
     }
 
@@ -82,7 +82,7 @@ impl RequestHandler {
                 // Only now may the server push (EVT-2). A stop point can be armed and hit while the
                 // handshake is still in flight, and a notification sent before this point is a
                 // protocol violation rather than a helpful early warning.
-                self.notifier.arm();
+                self.alerter.arm();
             }
             "notifications/cancelled" => {
                 debug!("Request cancelled");
@@ -106,7 +106,7 @@ impl RequestHandler {
             capabilities: ServerCapabilities {
                 tools: ToolsCapability {},
                 // EVT-2. Declared unconditionally: whether anything is actually pushed depends on
-                // JDWP_NOTIFICATIONS, but the capability describes what this server can do, not how
+                // JDWP_ALERTS, but the capability describes what this server can do, not how
                 // it happens to be configured — and a client that sees it may still ignore every
                 // notification, which is exactly what best-effort means here.
                 logging: Some(crate::protocol::LoggingCapability {}),
@@ -4721,7 +4721,7 @@ async fn store_reportable_event(
 /// Cost: the VM is already frozen by the time this runs, and the location lookups hit the type and
 /// line-table caches, so this adds nothing the debuggee was not paying already.
 async fn notify_suspension(session: &mut crate::session::DebugSession, seq: u64) {
-    let notifier = session.notifier.clone();
+    let alerter = session.alerter.clone();
     let Some(rec) = session.events.back().cloned() else { return };
     let Some(ev) = rec.set.events.first() else { return };
 
@@ -4738,7 +4738,7 @@ async fn notify_suspension(session: &mut crate::session::DebugSession, seq: u64)
     }
     // `warning`, not `info`: on a shared instance a freeze is something to act on, and a client
     // filtering its log level should not have this fall below the line.
-    notifier.notify("warning", &serde_json::Value::Object(obj));
+    alerter.alert("warning", &serde_json::Value::Object(obj));
 }
 
 /// The caller-facing stop-point id behind a JDWP request id, across all four kinds (BP-3's ids).
@@ -4884,7 +4884,7 @@ fn spawn_watchdog(
                     // A still-frozen VM is an `error`: nothing the caller does next will work until it
                     // is running, which is a different thing from "we rescued it for you".
                     if let Some((level, note)) = pushed {
-                        s.notifier.notify(level, &json!({ "watchdog": note }));
+                        s.alerter.alert(level, &json!({ "watchdog": note }));
                     }
                     drop(s);
                 }

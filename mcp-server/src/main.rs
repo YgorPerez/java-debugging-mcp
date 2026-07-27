@@ -36,12 +36,12 @@ mod session;
 mod tools;
 
 use handlers::RequestHandler;
-use protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, INVALID_REQUEST, JsonRpcNotification, Notifier, PARSE_ERROR, NOTIFY_CAPACITY};
+use protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, INVALID_REQUEST, JsonRpcNotification, Alerter, PARSE_ERROR, ALERT_CAPACITY};
 use tokio::sync::mpsc;
 
 /// How long to let the writer task drain after stdin closes, before giving up on it (EVT-2).
 ///
-/// Bounded rather than a plain join: the event pump and watchdog tasks hold `Notifier` clones and are
+/// Bounded rather than a plain join: the event pump and watchdog tasks hold `Alerter` clones and are
 /// not guaranteed to have stopped, so waiting for the channel to close outright could hang a process
 /// that is already shutting down.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -59,16 +59,16 @@ async fn main() -> Result<()> {
     info!("Starting JDWP MCP Server...");
 
     // EVT-2: ONE task owns stdout, and every outbound line goes through this channel to reach it —
-    // responses from the loop below, notifications from the JDWP event pump and the watchdog. That
+    // responses from the loop below, alerts from the JDWP event pump and the watchdog. That
     // single writer is the whole interleaving guarantee: a hit landing mid-response cannot split it,
     // because the pump does not write, it queues.
     //
     // The two producers use different disciplines on purpose. A response is sent with `.await`, so a
-    // slow stdout applies backpressure and nothing is ever lost. A notification uses `try_send` and is
+    // slow stdout applies backpressure and nothing is ever lost. An alert uses `try_send` and is
     // dropped (and counted) when the queue is full, because making the debuggee's event pump wait on
     // how fast an MCP client drains its pipe would be a far worse failure than a missed hint the
     // caller can still read with `debug.get_last_event`.
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(NOTIFY_CAPACITY);
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(ALERT_CAPACITY);
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         while let Some(line) = out_rx.recv().await {
@@ -79,8 +79,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    let notifier = Notifier::new(out_tx.clone());
-    let handler = RequestHandler::new(notifier);
+    let alerter = Alerter::new(out_tx.clone());
+    let handler = RequestHandler::new(alerter);
 
     let mut reader = BufReader::new(tokio::io::stdin());
 
@@ -160,8 +160,8 @@ async fn write_message<W: AsyncWriteExt + Unpin>(stdout: &mut W, message: &str) 
 /// Queue one outbound line for the writer task.
 ///
 /// `.await`s for capacity rather than dropping: this path carries **responses**, and a dropped
-/// response leaves a client waiting on a reply that will never come. Notifications take the
-/// try-send path in [`Notifier`] instead, where dropping is the correct behaviour.
+/// response leaves a client waiting on a reply that will never come. Alerts take the
+/// try-send path in [`Alerter`] instead, where dropping is the correct behaviour.
 async fn send_message(out: &mpsc::Sender<String>, message: String) -> Result<()> {
     out.send(message).await.map_err(|_| anyhow::anyhow!("stdout writer task has gone away"))
 }

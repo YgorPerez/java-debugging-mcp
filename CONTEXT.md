@@ -17,6 +17,18 @@ _Avoid_: target, remote, server (the last belongs to the MCP server, which is th
 The `WildFly` instance several people use at once. Not an environment name — the constraint that decides
 every safety default, because freezing it stalls other people's requests.
 
+**Loaded**:
+Present in the debuggee, as opposed to present in a source tree. A class loads on first use, so an
+untouched code path contributes none of its classes, and the debuggee is the only authority on the
+question. Load-bearing because JDWP can only report what is loaded: "not loaded" and "no such class" are
+indistinguishable from outside, so a tool must offer both readings rather than pick one.
+_Avoid_: exists, defined (both invite the source tree as the authority)
+
+**Source drift**:
+The checkout in front of you not being the build that is running. A finding, not an error — the debuggee
+reports which file a class was compiled from, and a mismatch is the answer to a question rather than a
+failure to answer it.
+
 ### Stop points
 
 **Stop point**:
@@ -67,7 +79,18 @@ One occurrence of a stop point being reached. What happens next depends on wheth
 becomes either an event or a snapshot, never both.
 
 **Event**:
-A hit that suspended the debuggee and is reported to the caller, who is expected to resume it.
+A hit that suspended the debuggee and is reported to the caller, who is expected to resume it. Reported
+**two** ways, and both always happen: recorded in a bounded buffer the caller polls, and pushed as an
+alert. The buffer is the record; the alert is a hint that one exists.
+
+**Alert**:
+Something the debugger says without being asked, because the debuggee's state changed under the caller —
+a stop point suspending the VM, or the watchdog resuming it and disarming whatever froze it. Best-effort
+by definition: an alert may be dropped, and everything one carries is also readable by asking, so nothing
+depends on one arriving.
+_Avoid_: notification (JSON-RPC's word for any id-less message, including the inbound ones this server
+receives — the wire method stays `notifications/message` because that name belongs to the protocol, not
+to this concept)
 
 **Snapshot**:
 A hit that was recorded without suspending: its location, thread, in-scope locals, caller chain, and
