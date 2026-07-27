@@ -21,7 +21,7 @@ these lazily, when decisions actually get resolved; that point arrived.
 | [0010](0010-a-traced-stop-point-reports-its-own-measured-cost.md) | A traced stop point reports its own measured cost, and the timer wraps the capture only |
 | [0011](0011-line-tables-are-cached-per-dump-not-per-connection.md) | Line tables are cached per dump, not per connection — and the budget stays at 2000 ms |
 | [0012](0012-one-task-owns-stdout.md) | One task owns stdout |
-| [0013](0013-a-default-dump-selects-by-name-family-not-creation-order.md) | A default dump selects by name family, not by creation order |
+| [0013](0013-a-default-dump-selects-by-name-family-not-creation-order.md) | A default dump — and, since #51, a default `list_threads` — selects by name family, not by creation order |
 | [0014](0014-a-cassette-is-keyed-by-the-request-and-a-miss-is-loud.md) | A recorded JDWP cassette is keyed by the request, and a miss is loud |
 
 The root [`CONTEXT.md`](../../CONTEXT.md) now exists — the glossary reached the same point these did once

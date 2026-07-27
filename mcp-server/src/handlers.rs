@@ -872,26 +872,24 @@ impl RequestHandler {
         let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
         let only_suspended = a.only_suspended;
         let limit = a.limit.max(1);
-        let filtering = name_filter.is_some() || only_suspended;
 
+        // Counted from before the thread list, so the cost line below covers every packet this call
+        // spent — including the names it read only in order to choose (DUMP-5, #51).
+        let before = session.connection.packets_sent();
+        let wire_from = std::time::Instant::now();
         let all =
             session.connection.get_all_threads().await.map_err(|e| format!("Failed to get threads: {e}"))?;
         let total = all.len();
 
-        let rows = collect_thread_rows(
-            &mut session.connection,
-            &all,
-            filtering,
-            limit,
-            name_filter.as_deref(),
-            only_suspended,
-        )
-        .await;
+        let ThreadListing { rows, selection } =
+            collect_thread_rows(&mut session.connection, &all, limit, name_filter.as_deref(), only_suspended)
+                .await;
+        let cost = session.connection.packets_sent().saturating_sub(before);
+        let wire = wire_from.elapsed();
         drop(session);
 
-        let shown = rows.len().min(limit);
-        let hidden =
-            if filtering { rows.len().saturating_sub(shown) } else { total.saturating_sub(rows.len()) };
+        let shown = rows.len();
+        let hidden = selection.eligible.saturating_sub(shown);
 
         let mut note = String::new();
         if let Some(f) = &name_filter {
@@ -902,14 +900,22 @@ impl RequestHandler {
         }
 
         let mut output = format!("{shown}/{total} thread(s){note}:\n");
-        for (tid, name, status) in rows.iter().take(limit) {
+        output.push_str(&family_order_note(shown, &selection));
+        for (tid, name, status) in &rows {
             let _ = match status {
                 Some(s) => writeln!(output, "0x{tid:x} {name} [{s}]"),
                 None => writeln!(output, "0x{tid:x} {name}"),
             };
         }
         if hidden > 0 {
-            let _ = writeln!(output, "… +{hidden} more (raise limit or use name_filter)");
+            let _ = writeln!(
+                output,
+                "… +{hidden} more (raise limit or use name_filter){}",
+                withheld_note(&selection.withheld)
+            );
+            // Only on a truncated listing, because that is the only shape that paid anything extra: a
+            // listing that showed every thread read exactly the names it printed.
+            output.push_str(&list_cost_note(cost, wire, shown, name_filter.is_some() || only_suspended));
         }
 
         Ok(output)
@@ -7615,22 +7621,54 @@ fn flush_hidden(output: &mut String, hidden: &mut usize) {
     }
 }
 
-/// Collect `(id, name, status label)` rows for `debug.list_threads`. One JVM round-trip per thread
-/// for the name, plus one for the status only when `only_suspended` is set. With no filter we stop
-/// scanning once we have `limit` rows so a 300-thread `WildFly` doesn't cost 300 round-trips for a peek.
+/// One `debug.list_threads` row: the id, the name, and the status label — the last only when
+/// `only_suspended` made us read it.
+type ThreadRow = (u64, String, Option<String>);
+
+/// What a `debug.list_threads` call read, and how it chose the rows it kept.
+struct ThreadListing {
+    /// The kept rows, in creation order — selection and presentation are separate jobs (ADR-0013).
+    rows: Vec<ThreadRow>,
+    /// Which threads the `limit` was spent on and which groups it passed over, so the reply can say.
+    selection: FamilySelection,
+}
+
+/// Collect the rows for `debug.list_threads`, choosing them by name family rather than by the order the
+/// JVM listed them in (DUMP-5, #51).
+///
+/// **It used to stop at `limit` while walking `AllThreads`, and that is creation order.** The JVM's own
+/// threads exist first, the container's next, and the request pool a caller came to look at exists
+/// **last**, because an application server does not start it until everything it depends on is up. On a
+/// real `WildFly` at 267 threads the first 40 in that order contained *zero* application threads (#24).
+/// `debug.thread_dump` was fixed in #43 and this tool was left doing the old thing, which is worse than
+/// it sounds: `list_threads` is the *cheap reconnaissance call*, the one you run to decide what to dump,
+/// so being systematically wrong here aims the expensive call at the wrong threads. It is ADR-0013's rule,
+/// applied by ADR-0013's code — `family_round_robin`, `candidates_by_family`, `family_order_note` — rather
+/// than a second rule of its own, because two truncation rules across one tool surface would be worse
+/// than the bug.
+///
+/// **The cost, which is the reason this was ever in doubt.** Choosing needs every thread's name, so this
+/// reads `threads` names where the old loop read `limit` of them: 268 packets rather than 41 on that
+/// `WildFly`, ~6.5×. It stays the cheap call all the same — a name is *one* packet where a dump's row is
+/// ~8, so the whole 267-thread listing costs a third of what the same JVM's truncated default dump does
+/// (~790, ADR-0013), and the reply prints the figure so nobody has to take that on trust. Nothing is paid
+/// on the shapes that never truncate: a listing whose `limit` covers the JVM, or one already narrowed by
+/// `name_filter`, reads exactly the names the old loop read, thread for thread.
+///
+/// Unlike the dump this holds no suspension, so there is no budget on the pass: the only thing it spends
+/// is the caller's own latency, and it is linear in a number the reply states.
 async fn collect_thread_rows(
     conn: &mut jdwp_client::JdwpConnection,
     all: &[u64],
-    filtering: bool,
     limit: usize,
     name_filter: Option<&str>,
     only_suspended: bool,
-) -> Vec<(u64, String, Option<String>)> {
-    let mut rows: Vec<(u64, String, Option<String>)> = Vec::new();
+) -> ThreadListing {
+    // Every thread that could take a slot, in creation order. The `status` read is skipped unless
+    // `only_suspended` asked for it — one packet per thread rather than the dump's two, because a
+    // listing shows no status it did not already have to fetch to filter on.
+    let mut candidates: Vec<ThreadRow> = Vec::new();
     for tid in all {
-        if !filtering && rows.len() >= limit {
-            break;
-        }
         let name = conn.get_thread_name(*tid).await.unwrap_or_default();
         if let Some(f) = name_filter {
             if !name.to_lowercase().contains(f) {
@@ -7645,14 +7683,34 @@ async fn collect_thread_rows(
                     }
                     Some(thread_status_name(ts).to_string())
                 }
+                // The read failing is how a thread that died under us announces itself. Skipped rather
+                // than shown as a row of unknowns, exactly as the dump's triage does.
                 Err(_) => continue,
             }
         } else {
             None
         };
-        rows.push((*tid, name, status));
+        candidates.push((*tid, name, status));
     }
-    rows
+
+    let eligible = candidates.len();
+    let tally = candidates_by_family(candidates.iter().map(|(_, n, _)| n.as_str()));
+    let (order, families) = {
+        let names: Vec<&str> = candidates.iter().map(|(_, n, _)| n.as_str()).collect();
+        family_round_robin(&names)
+    };
+    // Chosen by family, then sorted back into the order the JVM listed them: the caller asked what threads
+    // this JVM has, not what order the debugger decided to ask in, and an untruncated listing is therefore
+    // byte-for-byte what it always was.
+    let mut picked: Vec<usize> = order.into_iter().take(limit).collect();
+    picked.sort_unstable();
+    let rows: Vec<ThreadRow> = picked
+        .into_iter()
+        .filter_map(|i| candidates.get_mut(i).map(|c| (c.0, std::mem::take(&mut c.1), c.2.take())))
+        .collect();
+
+    let withheld = withheld_by_family(tally, rows.iter().map(|(_, n, _)| n.as_str()));
+    ThreadListing { rows, selection: FamilySelection { eligible, families, withheld } }
 }
 
 /// One thread's entry in a `debug.thread_dump` (DUMP-1).
@@ -7708,20 +7766,25 @@ struct DumpOutcome {
     /// nothing about.
     vanished: usize,
     /// How the `limit` was spent, for the header to state (DUMP-3).
-    selection: DumpSelection,
+    selection: FamilySelection,
 }
 
-/// How a dump chose which threads to spend its `limit` on, so the reply can say (DUMP-3, #43).
+/// How a reply chose which threads to spend its `limit` on, so it can say (DUMP-3, #43; DUMP-5, #51).
 ///
 /// Carried out of the collection rather than recomputed at render time: the rows that survived are not
 /// enough to reconstruct what was passed over, and "what am I NOT seeing" is the question a truncated
-/// dump has to answer. A header that says `40/267 thread(s)` and nothing else reads as a sample.
-struct DumpSelection {
+/// reply has to answer. A header that says `40/267 thread(s)` and nothing else reads as a sample.
+///
+/// Shared by `debug.thread_dump` and `debug.list_threads` on purpose, and it is the same struct rather
+/// than two similar ones because the two tools must not be able to drift apart: a caller runs the cheap
+/// list to decide what to dump, and if the list's population were chosen by a different rule than the
+/// dump's, the reconnaissance would send the expensive call after the wrong threads (#51).
+struct FamilySelection {
     /// Threads that passed `name_filter` and were therefore in the running for a slot.
     eligible: usize,
     /// Distinct name families among them — the number of independent things the pool is made of.
     families: usize,
-    /// Per family, how many eligible threads never made it into the dump. Biggest first.
+    /// Per family, how many eligible threads never made it into the reply. Biggest first.
     withheld: Vec<(String, usize)>,
 }
 
@@ -7885,11 +7948,15 @@ async fn triage_dump_threads(
 /// How many candidates each name family has, before any of them have been printed.
 ///
 /// Taken before the read loop rather than after, because that loop *moves* each name into the row it
-/// builds — a thread name is used exactly once, so handing it over beats cloning it per row.
-fn candidates_by_family(candidates: &[DumpCandidate]) -> std::collections::HashMap<String, usize> {
+/// builds — a thread name is used exactly once, so handing it over beats cloning it per row. Over names
+/// rather than over candidates so `debug.list_threads`, whose rows are not `DumpRow`s, tallies with the
+/// same code as the dump (#51).
+fn candidates_by_family<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> std::collections::HashMap<String, usize> {
     let mut tally = std::collections::HashMap::new();
-    for c in candidates {
-        *tally.entry(thread_name_family(&c.name)).or_default() += 1;
+    for n in names {
+        *tally.entry(thread_name_family(n)).or_default() += 1;
     }
     tally
 }
@@ -7898,12 +7965,12 @@ fn candidates_by_family(candidates: &[DumpCandidate]) -> std::collections::HashM
 ///
 /// Counted against the candidates rather than against `limit`, so it covers every reason a row is
 /// missing: the limit, and the suspension budget stopping the read pass part way.
-fn withheld_by_family(
+fn withheld_by_family<'a>(
     mut tally: std::collections::HashMap<String, usize>,
-    shown: &[DumpRow],
+    shown: impl IntoIterator<Item = &'a str>,
 ) -> Vec<(String, usize)> {
-    for r in shown {
-        if let Some(n) = tally.get_mut(&thread_name_family(&r.name)) {
+    for name in shown {
+        if let Some(n) = tally.get_mut(&thread_name_family(name)) {
             *n = n.saturating_sub(1);
         }
     }
@@ -7941,7 +8008,7 @@ struct DumpMeta<'a> {
     /// count it blames on `limit`.
     vanished: usize,
     /// Which threads the `limit` was spent on, and which groups it passed over (DUMP-3).
-    selection: &'a DumpSelection,
+    selection: &'a FamilySelection,
 }
 
 /// Read one `DumpRow` per thread, honouring the name/suspended filters and the thread limit.
@@ -7979,7 +8046,7 @@ async fn collect_dump_rows(
     let DumpTriage { mut candidates, untriaged, vanished } =
         triage_dump_threads(conn, all, a, name_filter.as_deref(), deadline).await;
     let eligible = candidates.len();
-    let tally = candidates_by_family(&candidates);
+    let tally = candidates_by_family(candidates.iter().map(|c| c.name.as_str()));
     let (order, families) = {
         let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
         family_round_robin(&names)
@@ -8062,7 +8129,11 @@ async fn collect_dump_rows(
     }
     rows.sort_by_key(|(seen, _)| *seen);
     let rows: Vec<DumpRow> = rows.into_iter().map(|(_, r)| r).collect();
-    let selection = DumpSelection { eligible, families, withheld: withheld_by_family(tally, &rows) };
+    let selection = FamilySelection {
+        eligible,
+        families,
+        withheld: withheld_by_family(tally, rows.iter().map(|r| r.name.as_str())),
+    };
     DumpOutcome { rows, unread, vanished, selection }
 }
 
@@ -8215,7 +8286,7 @@ fn render_dump_header(
 ) -> String {
     let mut out =
         format!("🧵 Thread dump — {}/{} thread(s){}\n", rows.len(), meta.total, dump_filter_note(a));
-    out.push_str(&dump_order_note(rows.len(), meta.selection));
+    out.push_str(&family_order_note(rows.len(), meta.selection));
     if meta.already_suspended {
         out.push_str("   VM was already suspended — read as it is, and left suspended.\n");
     }
@@ -8257,7 +8328,7 @@ fn render_dump_header(
     out
 }
 
-/// The line that says WHICH threads a shortened dump chose, and on what rule (DUMP-3, #43).
+/// The line that says WHICH threads a shortened reply chose, and on what rule (DUMP-3, #43).
 ///
 /// Printed only when something was left out, because that is the only time the rule changes what you see.
 /// It exists because the alternative is a header that reads as a representative sample: a default dump of
@@ -8266,9 +8337,12 @@ fn render_dump_header(
 /// unread. Nothing in that reply said so, which is this repo's recurring failure — a check that reports
 /// success without having looked.
 ///
-/// Silent on a single-family dump: `name_filter: "default task"` narrows to one pool, round-robin over one
+/// Silent on a single-family reply: `name_filter: "default task"` narrows to one pool, round-robin over one
 /// family IS creation order, and announcing a rule that did nothing is noise.
-fn dump_order_note(shown: usize, sel: &DumpSelection) -> String {
+///
+/// Printed word for word by `debug.thread_dump` and `debug.list_threads` (DUMP-5, #51) — one function,
+/// because the two tools stating the same rule in two wordings is how they start meaning different things.
+fn family_order_note(shown: usize, sel: &FamilySelection) -> String {
     if shown >= sel.eligible || sel.families < 2 {
         return String::new();
     }
@@ -8307,12 +8381,39 @@ fn withheld_note(withheld: &[(String, usize)]) -> String {
 /// and the term that changes on a real instance is the round trip. A caller who can read what their own
 /// connection costs never has to wonder whether a documented number applies to them. Suppressed below two
 /// packets, where a mean is not a measurement.
-fn per_packet_note(meta: &DumpMeta<'_>) -> String {
-    if meta.cost < 2 {
+fn per_packet_note(cost: u32, wire: std::time::Duration) -> String {
+    if cost < 2 {
         return String::new();
     }
-    let per = meta.wire.as_secs_f64() * 1000.0 / f64::from(meta.cost);
+    let per = wire.as_secs_f64() * 1000.0 / f64::from(cost);
     format!(", {per:.2}ms each (round trip + our own processing)")
+}
+
+/// What a truncated `debug.list_threads` spent, and what the rule it now selects by added (DUMP-5, #51).
+///
+/// Stated in the reply rather than only in the docs, because this tool's whole value is being cheap and a
+/// claim about cost that the caller cannot check is exactly the kind this repo keeps having to withdraw.
+/// The counterfactual is the honest comparison and it is arithmetic, not an estimate: the loop this
+/// replaced read one name per row it printed and then stopped, so `shown + 1` (the thread list, plus a
+/// name each) is precisely what the old behaviour would have cost on this same call.
+///
+/// **Offered only when it is true.** A listing narrowed by `name_filter` or `only_suspended` already had
+/// to read every name to apply the filter, so selection added nothing to it and claiming a saving would be
+/// inventing one.
+fn list_cost_note(cost: u32, wire: std::time::Duration, shown: usize, filtering: bool) -> String {
+    let comparison = if filtering {
+        " — one per thread NAME. A filtered listing always read every name to apply the filter, so \
+         choosing by family costs it nothing extra."
+            .to_string()
+    } else {
+        format!(
+            " — one per thread NAME, because choosing by family has to read them all: taking the first \
+             {shown} in list order would have cost {}, and would have been the wrong {shown}. Still one \
+             packet per thread, against a dump's ~8 per thread it shows.",
+            shown + 1
+        )
+    };
+    format!("💸 Cost: {cost} JDWP packet(s){}{comparison}\n", per_packet_note(cost, wire))
 }
 
 /// What the threads a truncated dump never reached would have cost, extrapolated from the ones it did
@@ -8529,7 +8630,7 @@ fn render_thread_dump(
              later dump will simply not list them."
         );
     }
-    let _ = write!(out, "\nCost: {} JDWP packet(s){}.", meta.cost, per_packet_note(meta));
+    let _ = write!(out, "\nCost: {} JDWP packet(s){}.", meta.cost, per_packet_note(meta.cost, meta.wire));
     out
 }
 
@@ -9374,9 +9475,9 @@ mod tests {
         serde_json::from_value(json).expect("valid ThreadDumpArgs")
     }
 
-    /// A selection that left nothing out, so `dump_order_note` stays silent — the render tests that are
+    /// A selection that left nothing out, so `family_order_note` stays silent — the render tests that are
     /// not about DUMP-3 keep the output they were written against.
-    static WHOLE_POOL: DumpSelection = DumpSelection { eligible: 0, families: 0, withheld: Vec::new() };
+    static WHOLE_POOL: FamilySelection = FamilySelection { eligible: 0, families: 0, withheld: Vec::new() };
 
     /// A `DumpMeta` for a dump that suspended nothing and completed — the fields each test varies are
     /// overridden at the call site, so a test only states what it is actually about.
@@ -9493,18 +9594,42 @@ mod tests {
     // and must not be told about a rule that changed nothing.
     #[test]
     fn a_dump_states_its_selection_rule_only_when_the_rule_mattered() {
-        let truncated = DumpSelection { eligible: 267, families: 25, withheld: Vec::new() };
-        let note = dump_order_note(40, &truncated);
+        let truncated = FamilySelection { eligible: 267, families: 25, withheld: Vec::new() };
+        let note = family_order_note(40, &truncated);
         assert!(note.contains("Chose 40 of 267"), "the note states the arithmetic: {note}");
         assert!(note.contains("NAME FAMILY"), "and the rule: {note}");
         assert!(note.contains("printed in creation order"), "and how to read the rows: {note}");
 
         // Nothing was left out, so there is no "which forty" to answer.
-        let whole = DumpSelection { eligible: 12, families: 5, withheld: Vec::new() };
-        assert_eq!(dump_order_note(12, &whole), "");
+        let whole = FamilySelection { eligible: 12, families: 5, withheld: Vec::new() };
+        assert_eq!(family_order_note(12, &whole), "");
         // One family: round-robin over it is creation order, so announcing it would be noise.
-        let narrowed = DumpSelection { eligible: 300, families: 1, withheld: Vec::new() };
-        assert_eq!(dump_order_note(40, &narrowed), "");
+        let narrowed = FamilySelection { eligible: 300, families: 1, withheld: Vec::new() };
+        assert_eq!(family_order_note(40, &narrowed), "");
+    }
+
+    // DUMP-5 (#51): `list_threads` now reads every thread's name before choosing, and the criterion for
+    // that change was never "is it fair" alone — it was "is it still the CHEAP call". A reply that widened
+    // its reads and did not say so would be asking to be trusted about the one property this tool is for.
+    #[test]
+    fn a_truncated_listing_reports_what_choosing_by_family_cost_it() {
+        let wire = std::time::Duration::from_millis(112);
+        let note = list_cost_note(268, wire, 40, false);
+        assert!(note.contains("268 JDWP packet(s)"), "the number it actually spent: {note}");
+        assert!(note.contains("0.42ms each"), "priced on THIS connection, not on loopback: {note}");
+        // The counterfactual is arithmetic, not an estimate: the loop this replaced read one name per row
+        // it printed, so 41 is exactly what the old behaviour would have cost on the same call.
+        assert!(note.contains("would have cost 41"), "and what the old rule would have cost: {note}");
+        assert!(note.contains("wrong 40"), "a cost is only half the trade — say what it bought: {note}");
+
+        // A filtered listing always read every name to apply the filter, so selection added nothing to
+        // it. Offering the same saving here would be inventing one.
+        let filtered = list_cost_note(268, wire, 40, true);
+        assert!(filtered.contains("costs it nothing extra"), "{filtered}");
+        assert!(!filtered.contains("would have cost"), "no counterfactual where none applies: {filtered}");
+
+        // One packet is not a mean, and the dump suppresses the per-packet figure for the same reason.
+        assert!(!list_cost_note(1, wire, 0, false).contains("ms each"));
     }
 
     // "227 more" answers "is this short?"; naming the groups answers "short of WHAT?", which is the

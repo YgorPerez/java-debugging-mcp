@@ -135,3 +135,68 @@ data that is about the JVM the caller asked about.
 - **The withheld tally is per family, capped at five groups.** "227 more" answers *is this dump short?*;
   naming the groups answers *short of what?*, which is the question that decides between raising `limit`
   and reaching for `name_filter`.
+
+## Amendment (DUMP-5, [#51](https://github.com/YgorPerez/java-debugging-mcp/issues/51)) — the rule covers `debug.list_threads` too
+
+**This decision now describes both thread-selecting tools, not just the dump.** `#43` scoped itself to
+`thread_dump` and left `collect_thread_rows` stopping at `limit` while walking `AllThreads` — the same
+defect, in the neighbouring tool, for the same reason. It is fixed the same way, by the same code:
+`family_round_robin`, `candidates_by_family`, `withheld_by_family` and the header note are one
+implementation shared by both tools, and `DumpSelection` was renamed `FamilySelection` to say so.
+
+Two truncation rules across one tool surface would have been worse than the bug, and not only for tidiness.
+`list_threads` is the **cheap reconnaissance call** — the one you run first, precisely to decide what to
+dump. A caller who lists under one rule and then dumps under another gets two different populations with
+nothing to say the rule changed between them, so being systematically wrong at the reconnaissance step
+aims the expensive call at the wrong threads.
+
+### What it reaches now, measured
+
+`ChurnProbe`, JDK 11, one live probe, the two binaries back to back:
+
+| default `debug.list_threads` | rows | of the 8 workers started last | packets |
+|---|---|---|---|
+| creation order (before) | 40/102 | **0** — `main`, five JVM internals, `collector`, 33 × `io-selector-#` | 41 |
+| name family (after) | 40/102 | **8** | **103** |
+
+The dump of the same JVM, for scale: **206** packets reading no stacks at all, **381** with `suspend:true`.
+So a listing that reads every name in a 102-thread JVM still costs half of the cheapest possible dump of
+it, and a quarter of a real one. JDK 25 reads 104 / 208 / 385 — the same figures, one thread apart.
+
+### The cost, and why it is the right side of the trade
+
+**One packet per thread, not the dump's two.** The dump's triage reads name *and* status because reading
+the name alone put the whole first pass between `AllThreads` and every status read, which cost TEST-10 its
+`[zombie]` observations. A listing has no such exposure: it shows no status it did not already have to
+fetch in order to filter on it, so `only_suspended` pays two packets a thread and everything else pays one.
+
+**It grows with the JVM, not with the limit** — `threads` packets where the old loop read `limit` of them.
+On the 267-thread WildFly this ADR was written against that is 268 against 41, ~6.5×, and still about a
+third of what that instance's *truncated default dump* costs (~790). The multiple is the largest number in
+this decision and the absolute is the one that matters: the tool's whole value is being cheap enough to run
+before you know what you are looking for, and one packet per thread is still that.
+
+**Nothing is paid on the shapes that never truncate.** A listing whose `limit` covers the JVM, or one
+already narrowed by `name_filter` / `only_suspended`, read every name before this change too — the filter
+had to be applied to something. Those replies are byte-for-byte what they were.
+
+**And the reply says the number.** `💸 Cost: 103 JDWP packet(s), 0.15ms each … taking the first 40 in list
+order would have cost 41, and would have been the wrong 40.` Printed only on a truncated listing, because
+that is the only shape that paid anything, and priced on the connection actually attached for the reason
+ADR-0011 gives. The acceptance criterion for this change was never fairness alone — it was *and it is still
+the cheap call* — and a claim about cost that the caller cannot check is the kind this repo keeps having to
+withdraw.
+
+**No budget on the pass.** The dump caps its triage at half of `max_suspend_ms` because it is holding the
+VM frozen while it decides. A listing freezes nothing; the only thing it spends is the caller's own
+latency, linear in a thread count the reply states.
+
+### Rejected here, though the issue allowed it
+
+**Keeping creation order and merely saying the list is not representative.** #51 offered this outcome
+explicitly, on the grounds that being wrong costs a packet a thread to fix and a caller can just raise
+`limit`. Rejected: "raise `limit`" is the alternative this ADR already ruled out for the dump — on the
+measured WildFly you need it in the high 40s to see the *first* request thread, and that number is a
+property of how many selectors the container happens to start. A reconnaissance tool whose honest reply is
+"these 40 are the wrong 40, ask again differently" has moved the work to the caller for a saving of 227
+packets on the tool that costs the least.
