@@ -19,8 +19,10 @@ beyond that baseline is yours.
 **Run the suite on more than one JDK.** `scripts/integration-test.sh` covers the `#[ignore]`d
 JVM tests; plain `cargo test` covers the unit and cassette tests, and you need both to see all of
 `mcp_integration.rs`. CI runs JDK 11/17/21 and has caught version-locked tests that passed on one JDK
-(#36). Note `JAVA_HOME` pointing at a JRE is currently ignored *silently* (#52), so confirm which JDK
-actually ran.
+(#36). Every run now prints one `JDK in use: …` line naming the version, the home the JVM reports, and
+which of `JAVA_HOME` / `PATH` / the snap JBR it came from — read it, and quote it rather than your
+intent when you report a result. Setting `JAVA_HOME` is a *request*: if it is not a usable JDK the run
+now fails instead of quietly testing another one, which it used to do (TEST-18, #52).
 
 ## Agent skills
 

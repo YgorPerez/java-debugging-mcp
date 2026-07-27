@@ -263,6 +263,19 @@ scripts/doctor.sh               # the rust-doctor health gate CI runs
 own probe JVMs from `examples/probes/` — no manual steps. It does need a JDK: without one every test
 prints `SKIP` and passes, so check for `SKIP` lines before reading a green run as coverage.
 
+Which JDK it used is printed once per run and repeated as the last line, because a green run that cannot
+be attributed to a version is worth less than it looks (TEST-18,
+[#52](https://github.com/YgorPerez/java-debugging-mcp/issues/52)):
+
+```
+JDK in use: javac 11.0.30 at /home/you/.jdks/ms-11.0.30 (found via JAVA_HOME)
+```
+
+With `JAVA_HOME` unset the harness searches `PATH` and then a snap-installed IntelliJ's bundled runtime,
+and the banner says which it settled on. Setting `JAVA_HOME` is a **request for that specific JDK**: if it
+is not a usable one — a JRE with no `javac`, most often — the run fails and names what was missing rather
+than quietly testing a different JVM, which is what it used to do.
+
 `mcp-server/tests/stdio_protocol.rs` is one exception: it drives the real binary's JSON-RPC front door
 with malformed input (unparseable lines, non-objects, missing `method`, EOF mid-message) and needs no JDK,
 so it runs in plain `cargo test`. Each case checks that an error came back **and** that the server is

@@ -119,10 +119,22 @@ jobs:
           java-version: ${{ matrix.java }}
 
       # A leg that silently tested the WRONG JDK is the same class of failure as a leg that tested nothing:
-      # green, and evidence-free. The runner image ships several JDKs of its own and `Jdk::find` falls back
-      # to PATH, so if setup-java ever stopped exporting the version it was asked for, the suite would still
-      # find *a* javac, still pass, and this matrix would quietly be three copies of one leg. Assert against
-      # $JAVA_HOME specifically, because that is the first thing `Jdk::find` reads.
+      # green, and evidence-free. The runner image ships several JDKs of its own, so if setup-java ever
+      # stopped exporting the version it was asked for, the suite would still find *a* javac, still pass,
+      # and this matrix would quietly be three copies of one leg.
+      #
+      # KEPT rather than subsumed by TEST-18 (#52), deliberately, because it and the harness check two
+      # different halves and neither implies the other:
+      #
+      #   - this step asserts $JAVA_HOME is the version THIS LEG ASKED FOR. Only the matrix knows that
+      #     number; the harness has never heard of it and #52 put matching a requested version explicitly
+      #     out of scope.
+      #   - `Jdk::find` asserts $JAVA_HOME IS WHAT ACTUALLY RAN — it now fails on an unusable one instead of
+      #     falling through to PATH, and every run prints which JDK it used.
+      #
+      # "this leg tested the version it asked for" is the conjunction, and each guard alone leaves the
+      # other half open: a correct $JAVA_HOME that the harness declined to use, or a happily-used
+      # $JAVA_HOME holding the wrong version. Two guards, on purpose, for one property in two pieces.
       #
       # If a JDK 8 leg is ever added, this comparison needs widening first: 8's javac reports itself as
       # `javac 1.8.0_xxx`, so an `8` entry would fail the assert rather than the tests.
