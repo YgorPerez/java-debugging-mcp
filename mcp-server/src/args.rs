@@ -371,12 +371,22 @@ pub struct ThreadDumpArgs {
     pub only_suspended: bool,
     /// Max threads to include; the rest are reported as a hidden count (default 40).
     ///
-    /// **Known trap, being fixed in DUMP-3 (#43): this is a position, not just a size.** Threads are read
-    /// in JDWP `AllThreads` order, which is *creation* order, and an app server creates its request pool
-    /// last — so on a loaded `WildFly` the default 40 were measured to be entirely JVM internals, the
-    /// service container and Undertow selectors, with **no application threads at all**, while 13 request
-    /// workers sat 328 frames deep (TEST-8, #24). Until that is fixed, reach for `name_filter` (e.g.
-    /// `'default task'`) rather than a bigger `limit`, which mostly buys more selectors.
+    /// **Which 40 you get is a rule, and the reply states it.** They are chosen by **name family** — one
+    /// thread from each distinct thread name with its digits ignored (`default task-7` and
+    /// `default task-91` are one family, `default I/O-3` is another) before a second from any family, so
+    /// no single pool can spend every slot. The rows are then printed in creation order, and the
+    /// truncation footer names the biggest groups it withheld.
+    ///
+    /// It is **not** the first 40 the JVM listed. JDWP `AllThreads` order is *creation* order and an app
+    /// server creates its request pool last, so on a loaded `WildFly` the first 40 were measured to be
+    /// entirely JVM internals, the service container and Undertow selectors, with **no application
+    /// threads at all**, while 13 request workers sat 328 frames deep (TEST-8, #24; fixed in DUMP-3, #43,
+    /// see ADR-0012). Raising `limit` was never the answer to that — it buys more selectors before it
+    /// reaches the pool.
+    ///
+    /// `name_filter` (e.g. `'default task'`) is still the cheapest way to ask about one pool, and it
+    /// composes: with a single family left, the round-robin *is* creation order and the dump says nothing
+    /// about it.
     #[serde(default = "default_limit")]
     pub limit: usize,
     /// Max frames per thread (default 8 — deliberately narrower than `debug.get_stack`, since this
