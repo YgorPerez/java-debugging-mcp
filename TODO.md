@@ -105,6 +105,16 @@ commits (`i64 as usize` casts, redundant clones, missing doc backticks).
 **So: `cargo clippy` is not the gate. `scripts/doctor.sh` is.** Run it before claiming a change is clean,
 and `scripts/doctor.sh --diff main` to see only what you changed.
 
+**And `scripts/doctor.sh --findings` to see *what* it found, not how many** (LINT-3, #42). The summary box
+gives a count and no way to reach the findings behind it — on a run reporting five warnings, grepping the
+output for `⚠`, for `warning`, for the rule name and for `threshold` each returned nothing. That is what
+cost the v0.2.0 release: the tag build failed this gate on five `excessive-clone` findings that were all
+sitting in a local run beforehand, and the count going 1 → 5 was dismissed because there was no cheap way
+to see what the five were. `--findings` prints each warning/error in the same shape CI's step summary uses,
+says whether `--fail-on warning` would pass, exits 3 if it would not, and names what the run did **not**
+look at (passes skipped for a missing tool, and passes that ran only because you have a tool CI does not
+install). **The score is not the gate**: 100/100 "Great" has been observed on a scan carrying 21 warnings.
+
 **The gate fails on warnings, on a pinned toolchain** (LINT-1, #18). It used to gate on errors only, and
 the zero-warning state reached in `7253499` drifted back to seven over twenty-four commits — then got
 described as pre-existing debt rather than as the regression it was. Warnings are back to **0**, and CI

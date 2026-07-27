@@ -332,14 +332,28 @@ a prebuilt binary):
 
 ```bash
 scripts/doctor.sh              # score card for the workspace
+scripts/doctor.sh --findings   # the findings the gate counts, and whether it would pass
 scripts/doctor.sh --verbose    # per-finding file:line detail
 scripts/doctor.sh --diff main  # only files changed vs main
 ```
 
-The same check runs in CI (`.github/workflows/rust-doctor.yml`, pinned to 0.2.0): it gates on errors
-and uploads results to GitHub code scanning (SARIF). Installing the optional external tools
-(`cargo install cargo-audit cargo-deny cargo-machete cargo-geiger`) unlocks the dependency/unsafe
-passes it otherwise skips.
+**The score is not the gate.** CI fails the build on any warning, so a 100/100 "Great" can still be a
+red build — v0.2.0's tag build was, on five `excessive-clone` findings that had been sitting in a local
+run nobody could read out of it. `--findings` prints each warning/error in the same shape the CI step
+summary uses, says whether the gate would pass, and exits 3 if it would not:
+
+```
+- **warning** `excessive-clone` — `src/handlers.rs:3233`
+  `.clone()` inside a loop — may cause repeated heap allocations
+```
+
+It also names what the run did *not* look at — passes skipped for a missing tool, and passes that ran
+only because you have a tool CI does not install — since either one moves the verdict away from CI's.
+
+The same check runs in CI (`.github/workflows/rust-doctor.yml`, pinned to 0.2.0): it gates on warnings
+and errors (`--fail-on warning`) and uploads results to GitHub code scanning (SARIF). Installing the
+optional external tools (`cargo install cargo-audit cargo-deny cargo-machete cargo-geiger`) unlocks the
+dependency/unsafe passes it otherwise skips.
 
 ### Serena (semantic code navigation for agents)
 
