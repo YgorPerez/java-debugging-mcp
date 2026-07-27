@@ -1212,6 +1212,7 @@ impl RequestHandler {
             wire,
             held,
             unread: dump.unread,
+            vanished: dump.vanished,
             selection: &dump.selection,
         };
         Ok(render_thread_dump(&rows, &a, caps.as_ref(), &meta))
@@ -7631,6 +7632,10 @@ struct DumpRow {
     status: &'static str,
     /// Whether the debugger currently holds this thread suspended (`suspendStatus` != 0).
     suspended: bool,
+    /// The JVM reported `ZOMBIE` — this thread has already run to completion. Independent of
+    /// `suspended`, and the reason the header must not count this row among the ones `suspend:true`
+    /// would rescue (DUMP-4, #47).
+    finished: bool,
     /// The frames, why they couldn't be read, or that they were never requested.
     stack: DumpStack,
     /// How many frames were dropped by `max_frames` / `package_filter`.
@@ -7663,6 +7668,10 @@ struct DumpOutcome {
     rows: Vec<DumpRow>,
     /// Matching threads left unread because the budget expired. `0` means the dump is complete.
     unread: usize,
+    /// Threads that stopped existing while the dump was reading the list (DUMP-4, #47). Reported
+    /// apart from `unread` and apart from the `limit`, because it is the one shortfall a caller can do
+    /// nothing about.
+    vanished: usize,
     /// How the `limit` was spent, for the header to state (DUMP-3).
     selection: DumpSelection,
 }
@@ -7753,6 +7762,26 @@ struct DumpCandidate {
     name: String,
     status: &'static str,
     suspended: bool,
+    /// The JVM answered `ZOMBIE`: this thread has run to completion. Carried as a flag rather than
+    /// re-derived from `status` because it changes what the row is allowed to *say* — see
+    /// `unreadable_reason` (DUMP-4, #47).
+    finished: bool,
+}
+
+/// What the triage pass learned about a thread list that is already out of date.
+///
+/// Three outcomes, not two, and the third is the one DUMP-4 (#47) is about. A thread can be a candidate,
+/// it can be one the budget never reached, or it can have **stopped existing** between `AllThreads` and
+/// the question we asked about it. Collapsing the last two loses the only thing a caller can act on: an
+/// unexamined thread is worth another dump, and a vanished one is not.
+struct DumpTriage {
+    candidates: Vec<DumpCandidate>,
+    /// Threads the triage pass ran out of its share of the suspension budget before reaching.
+    untriaged: usize,
+    /// Threads whose id was live when the JVM listed it and invalid by the time we asked — a retiring
+    /// pool worker, collected before the read got to it. A JDWP thread id is a weak reference, so on a
+    /// real request pool this is the normal path rather than the exotic one.
+    vanished: usize,
 }
 
 /// Read every thread's name and status before deciding which ones to read *properly* (DUMP-3, #43).
@@ -7776,38 +7805,46 @@ struct DumpCandidate {
 /// deciding what to read and then read nothing would be a worse answer than the bug it fixes, and on a
 /// slow wire that is exactly what an unbounded first pass would do. Threads it never reached are returned
 /// as a count, never dropped silently.
+///
+/// **So are the threads that stopped existing** (DUMP-4, #47). The status read failing is how a thread
+/// that died under the dump announces itself, and until this counted them the rows they cost were
+/// indistinguishable from rows `limit` withheld — see `render_thread_dump`'s footer for why that
+/// mattered.
 async fn triage_dump_threads(
     conn: &mut jdwp_client::JdwpConnection,
     all: &[u64],
     a: &crate::args::ThreadDumpArgs,
     name_filter: Option<&str>,
     deadline: Option<std::time::Instant>,
-) -> (Vec<DumpCandidate>, usize) {
+) -> DumpTriage {
     let now = std::time::Instant::now();
     let triage_deadline = deadline.map(|d| now + d.saturating_duration_since(now) / 2);
     let mut candidates = Vec::new();
+    let mut vanished = 0usize;
     for (seen, tid) in all.iter().enumerate() {
         if triage_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            return (candidates, all.len() - seen);
+            return DumpTriage { candidates, untriaged: all.len() - seen, vanished };
         }
         let name = conn.get_thread_name(*tid).await.unwrap_or_default();
         if name_filter.is_some_and(|f| !name.to_lowercase().contains(f)) {
             continue;
         }
-        let (status, suspended) = match conn.get_thread_status(*tid).await {
-            Ok((ts, ss)) => (thread_status_name(ts), ss != 0),
-            // A thread that can't report its status has almost certainly died; skip it rather than
-            // showing a row of unknowns.
-            Err(_) => continue,
+        // A thread that can't report its status has almost certainly died; skip it rather than showing a
+        // row of unknowns — but COUNT it, because the reply has to say what became of the difference, and
+        // "the caller's limit" was the wrong answer (DUMP-4, #47).
+        let Ok((ts, ss)) = conn.get_thread_status(*tid).await else {
+            vanished += 1;
+            continue;
         };
+        let (status, suspended, finished) = (thread_status_name(ts), ss != 0, ts == THREAD_STATUS_ZOMBIE);
         // Applied here rather than when the row is built, so the `limit` is spent on threads that are
         // actually readable instead of on slots that turn out empty.
         if a.only_suspended && !suspended {
             continue;
         }
-        candidates.push(DumpCandidate { seen, tid: *tid, name, status, suspended });
+        candidates.push(DumpCandidate { seen, tid: *tid, name, status, suspended, finished });
     }
-    (candidates, 0)
+    DumpTriage { candidates, untriaged: 0, vanished }
 }
 
 /// How many candidates each name family has, before any of them have been printed.
@@ -7864,6 +7901,10 @@ struct DumpMeta<'a> {
     /// one reading a VM someone else already stopped, owns no freeze to report.
     held: Option<std::time::Duration>,
     unread: usize,
+    /// Threads that ceased to exist between the JVM listing them and this dump asking about them
+    /// (DUMP-4, #47). Its own field because it is its own cause: the footer must not fold it into the
+    /// count it blames on `limit`.
+    vanished: usize,
     /// Which threads the `limit` was spent on, and which groups it passed over (DUMP-3).
     selection: &'a DumpSelection,
 }
@@ -7900,7 +7941,7 @@ async fn collect_dump_rows(
     let want_monitors = a.monitors
         && caps.is_some_and(|c| c.can_get_owned_monitor_info || c.can_get_current_contended_monitor);
 
-    let (mut candidates, untriaged) =
+    let DumpTriage { mut candidates, untriaged, vanished } =
         triage_dump_threads(conn, all, a, name_filter.as_deref(), deadline).await;
     let eligible = candidates.len();
     let tally = candidates_by_family(&candidates);
@@ -7941,20 +7982,11 @@ async fn collect_dump_rows(
         // breaks that invariant skips a row instead of taking the whole dump down with it. The name is
         // *moved* out — each candidate is picked at most once, so nothing is left to read it.
         let Some(c) = candidates.get_mut(*pick) else { continue };
-        let (seen, tid, status, suspended) = (c.seen, c.tid, c.status, c.suspended);
+        let (seen, tid, status, suspended, finished) = (c.seen, c.tid, c.status, c.suspended, c.finished);
         let name = std::mem::take(&mut c.name);
 
         let (stack, frames_hidden) = if !suspended {
-            // Not a failure of ours to explain away: JDWP defines both frames and locks as readable
-            // only on a suspended thread. Name whichever the caller actually asked for, so a
-            // monitors-only dump is not told about a stack it never wanted.
-            let what = if a.monitors_only { "locks" } else { "stack" };
-            (
-                DumpStack::Unreadable(format!(
-                    "running — JDWP can only read a suspended thread's {what}; pass suspend:true"
-                )),
-                0,
-            )
+            (DumpStack::Unreadable(unreadable_reason(finished, a.monitors_only)), 0)
         } else if a.monitors_only {
             // The cheap mode (#17): no `Frames` request, and none of the per-frame class/method/line
             // lookups that dominate a dump's packet cost and therefore its suspension window.
@@ -7984,6 +8016,7 @@ async fn collect_dump_rows(
                 name,
                 status,
                 suspended,
+                finished,
                 stack,
                 frames_hidden,
                 holds,
@@ -7995,7 +8028,33 @@ async fn collect_dump_rows(
     rows.sort_by_key(|(seen, _)| *seen);
     let rows: Vec<DumpRow> = rows.into_iter().map(|(_, r)| r).collect();
     let selection = DumpSelection { eligible, families, withheld: withheld_by_family(tally, &rows) };
-    DumpOutcome { rows, unread, selection }
+    DumpOutcome { rows, unread, vanished, selection }
+}
+
+/// Why a thread's frames and locks could not be read, phrased for the state the thread is actually in.
+///
+/// DUMP-4 (#47). This used to be one sentence — `running — … pass suspend:true` — printed for every
+/// unreadable row, and TEST-10's churning pool is where that goes wrong: the JVM has just answered
+/// `ZOMBIE`, so the thread is *finished*, and the row described it as running and then advised a remedy
+/// that can never apply. A finished thread will never be suspendable, so `suspend:true` is not a smaller
+/// help here, it is no help at all.
+///
+/// It is ADR-0009's rule read the other way round. That decision says a running thread must never render
+/// as `(no frames)` "because 'unreadable' and 'idle' are opposite answers on a wedged JVM". Finished and
+/// running are opposite answers too, and this is the dump picking between them rather than guessing.
+///
+/// `monitors_only` decides which noun is named, so a dump that never wanted a stack is not told about one.
+fn unreadable_reason(finished: bool, monitors_only: bool) -> String {
+    let what = if monitors_only { "locks" } else { "stack" };
+    if finished {
+        return format!(
+            "finished — this thread has already terminated (JDWP reports ZOMBIE), so there is no {what} \
+             left to read; suspend:true cannot help, because a finished thread can never be suspended"
+        );
+    }
+    // Not a failure of ours to explain away: JDWP defines both frames and locks as readable only on a
+    // suspended thread.
+    format!("running — JDWP can only read a suspended thread's {what}; pass suspend:true")
 }
 
 /// Read one suspended thread's lock state, as `(monitors held, monitor blocked on, failure note)`.
@@ -8147,7 +8206,11 @@ fn render_dump_header(
         );
     }
     out.push_str(&dump_monitor_caveats(a, caps));
-    let unreadable = rows.iter().filter(|r| matches!(r.stack, DumpStack::Unreadable(_))).count();
+    // Finished threads are excluded on purpose (DUMP-4, #47): they are unreadable too, but `suspend:true`
+    // is not the answer for them, so counting them here would inflate the number of threads the advice
+    // below would actually rescue.
+    let unreadable =
+        rows.iter().filter(|r| matches!(r.stack, DumpStack::Unreadable(_)) && !r.finished).count();
     if unreadable > 0 && !a.suspend {
         let _ = writeln!(
             out,
@@ -8402,14 +8465,33 @@ fn render_thread_dump(
         render_dump_row(&mut out, r, &holder);
     }
 
-    // "Not shown" covers both causes — the thread limit and the suspension budget — but they are
-    // different states, so the budget's own line above says which one applied.
+    // Every thread the JVM listed and this reply did not show, split by WHY (DUMP-4, #47).
+    //
+    // It used to be one sentence, and it named the caller's `limit` whatever the cause was. TEST-10's
+    // churning pool is where that becomes a lie the caller can act on: 41 rows were missing because
+    // those threads had *died* mid-read, and the reply advised raising a `limit` of 500 that had never
+    // bound, or narrowing with a `name_filter` that cannot bring a dead thread back. Two no-ops offered
+    // as remedies. The header already keeps the budget truncation apart from a failed resume (ADR-0009)
+    // for the same reason; this is the third cause finally getting its own voice.
+    //
+    // The two counts still sum to the shortfall, so the arithmetic a caller checks is unchanged.
     let hidden = meta.total.saturating_sub(rows.len());
-    if hidden > 0 {
+    let vanished = meta.vanished.min(hidden);
+    let withheld = hidden - vanished;
+    if withheld > 0 {
         let _ = writeln!(
             out,
-            "\n… +{hidden} more thread(s) (raise limit, or narrow with name_filter){}",
+            "\n… +{withheld} more thread(s) (raise limit, or narrow with name_filter){}",
             withheld_note(&meta.selection.withheld)
+        );
+    }
+    if vanished > 0 {
+        let _ = writeln!(
+            out,
+            "\n… +{vanished} more thread(s) ENDED while this dump was reading — the JVM listed them and \
+             their ids were already invalid by the time it asked, which is what a pool retiring its \
+             workers looks like from here. Nothing to raise or narrow: those threads are gone, and a \
+             later dump will simply not list them."
         );
     }
     let _ = write!(out, "\nCost: {} JDWP packet(s){}.", meta.cost, per_packet_note(meta));
@@ -9244,6 +9326,7 @@ mod tests {
             name: name.to_string(),
             status: "monitor",
             suspended: true,
+            finished: false,
             stack: DumpStack::Frames(vec!["#0 Svc.save:10".to_string()]),
             frames_hidden: 0,
             holds: Vec::new(),
@@ -9273,6 +9356,7 @@ mod tests {
             wire: std::time::Duration::from_millis(u64::from(cost)),
             held: None,
             unread: 0,
+            vanished: 0,
             selection: &WHOLE_POOL,
         }
     }
@@ -9442,6 +9526,96 @@ mod tests {
         assert!(out.contains("waiting to enter: LockB@f"), "the contended lock is still shown:\n{out}");
         assert!(!out.contains("held by"), "no holder may be invented for a thread not dumped:\n{out}");
         assert!(out.contains("+8 more thread(s)"), "the threads left out are counted:\n{out}");
+        assert!(out.contains("raise limit"), "…and a genuine `limit` truncation still says so:\n{out}");
+    }
+
+    // DUMP-4 (#47): "running" and "finished" are opposite answers, and a churning pool is where the dump
+    // was picking the wrong one — the JVM had just said ZOMBIE and the row said `running — … pass
+    // suspend:true`, which is unfollowable because a finished thread can never be suspended. ADR-0009
+    // makes the same point in the other direction: a running thread is never rendered as `(no frames)`.
+    #[test]
+    fn a_finished_thread_says_so_and_is_not_offered_a_suspend_that_cannot_help() {
+        let running = unreadable_reason(false, false);
+        assert!(
+            running.starts_with("running —"),
+            "a live unsuspended thread still reads as running: {running}"
+        );
+        assert!(running.contains("pass suspend:true"), "…with the remedy that does work: {running}");
+
+        let finished = unreadable_reason(true, false);
+        assert!(finished.starts_with("finished —"), "a ZOMBIE thread has finished, not started: {finished}");
+        assert!(finished.contains("ZOMBIE"), "and names the answer the JVM actually gave: {finished}");
+        assert!(
+            !finished.contains("pass suspend:true"),
+            "suspending a finished thread is impossible, so the advice must not be offered: {finished}"
+        );
+
+        // Which noun is named still follows what the caller asked for, in both states.
+        assert!(unreadable_reason(false, true).contains("locks"), "monitors-only names locks, not a stack");
+        assert!(unreadable_reason(true, true).contains("locks"), "…and still does once the thread has ended");
+    }
+
+    // …and the header's offer is counted over the threads it could actually rescue. A finished thread in
+    // that tally would inflate "pass suspend:true and you get N more stacks" with rows that will never
+    // come back.
+    #[test]
+    fn the_suspend_offer_counts_only_the_threads_a_suspend_would_rescue() {
+        let mut zombie = dump_row(0x8, "churn-worker-3");
+        zombie.status = "zombie";
+        zombie.suspended = false;
+        zombie.finished = true;
+        zombie.stack = DumpStack::Unreadable(unreadable_reason(true, false));
+        let mut live = dump_row(0x9, "stable-worker-1");
+        live.status = "running";
+        live.suspended = false;
+        live.stack = DumpStack::Unreadable(unreadable_reason(false, false));
+
+        let out =
+            render_thread_dump(&[zombie, live], &dump_args(json!({})), Some(&ALL_CAPS), &dump_meta(2, 9));
+        assert!(out.contains("1 thread(s) are running"), "only the live thread is offered a freeze:\n{out}");
+        assert!(
+            out.contains("finished — this thread has already terminated"),
+            "and the finished one says what it is on its own row:\n{out}"
+        );
+    }
+
+    // DUMP-4 (#47): with `limit: 500` against 63 threads, 41 rows were missing because those threads had
+    // DIED mid-read — and the only explanation offered was "raise limit, or narrow with name_filter",
+    // two remedies that cannot change the outcome. Counted apart now, and the two counts still sum to
+    // the shortfall the header's arithmetic promises.
+    #[test]
+    fn rows_lost_to_dying_threads_are_reported_apart_from_rows_the_limit_withheld() {
+        let rows: Vec<DumpRow> = (0..22).map(|i| dump_row(i, &format!("stable-worker-{i}"))).collect();
+
+        // The churn case exactly as TEST-10 produced it: 63 listed, 22 read, 41 gone, `limit` untouched.
+        let mut churned = dump_meta(63, 130);
+        churned.vanished = 41;
+        let out = render_thread_dump(&rows, &dump_args(json!({"limit": 500})), Some(&ALL_CAPS), &churned);
+        assert!(
+            out.contains("… +41 more thread(s) ENDED while this dump was reading"),
+            "the 41 that died are counted, and the cause is named:\n{out}"
+        );
+        assert!(
+            !out.contains("raise limit"),
+            "`limit` was 500 against 63 threads and never bound, so advising it is a no-op:\n{out}"
+        );
+        assert!(
+            !out.contains("name_filter"),
+            "narrowing cannot bring back a thread that no longer exists:\n{out}"
+        );
+
+        // Both causes at once. Neither absorbs the other, and 12 + 41 is still the 53 not shown.
+        let mut both = dump_meta(63, 130);
+        both.vanished = 41;
+        let mixed = render_thread_dump(&rows[..10], &dump_args(json!({"limit": 10})), Some(&ALL_CAPS), &both);
+        assert!(
+            mixed.contains("… +12 more thread(s) (raise limit, or narrow with name_filter)"),
+            "the rows the limit really withheld keep their own line and their own advice:\n{mixed}"
+        );
+        assert!(
+            mixed.contains("… +41 more thread(s) ENDED while this dump was reading"),
+            "and the ones that died keep theirs:\n{mixed}"
+        );
     }
 
     // DUMP-1: a JVM that cannot answer the monitor questions must SAY so. A dump with no lock lines

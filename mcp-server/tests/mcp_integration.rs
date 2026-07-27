@@ -4635,9 +4635,13 @@ fn dump_row_count(dump: &str) -> u64 {
 /// the two states to happen in a given dump, so this takes several and requires each shape once; failing
 /// to find either is reported as "the probe is not churning", which is what it would actually mean.
 ///
-/// Both of the pinned messages below are, in the author's reading, WRONG — see the comments. They are
-/// pinned rather than fixed because a test that reaches a line and asserts nothing about it is how this
-/// repo has previously reported coverage it had not looked at. Fixing either should flip this test.
+/// Both of those states were originally pinned as WRONG rather than fixed, because a test that reaches a
+/// line and asserts nothing about it is how this repo has previously reported coverage it had not looked
+/// at. DUMP-4 ([#47](https://github.com/YgorPerez/java-debugging-mcp/issues/47)) fixed them and flipped
+/// the two assertions, which is exactly what the pins were for: (1) a `ZOMBIE` row said `running — … pass
+/// suspend:true`, the opposite answer plus a remedy that can never apply, and now says it finished; (2)
+/// the rows lost to (2) were counted into `… +N more thread(s) (raise limit, or narrow with name_filter)`
+/// against a `limit` of 500 that had not bound, and now have a line of their own that suggests nothing.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 // Both outcomes a vanishing thread can produce — a `[zombie]` row and a dropped row — have to be asserted
@@ -4729,14 +4733,17 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
     let name = row.split('"').nth(1).unwrap_or_default().to_string();
     let section =
         dump_section(&reported, &name).unwrap_or_else(|| panic!("no section for {name} in:\n{reported}"));
-    // FINDING, pinned. The JVM has just answered ZOMBIE — this thread is *finished* — and the same row
-    // explains its unreadable stack as "running", then advises `suspend:true`, which cannot help: a
-    // finished thread will never be suspendable. The `!suspended` branch phrases every unreadable stack
-    // as a running one, and a churning pool is where that reading is wrong.
+    // WAS the finding, now the fix (DUMP-4, #47). The JVM has just answered ZOMBIE — this thread is
+    // *finished* — and the row used to explain its unreadable stack as "running" and advise
+    // `suspend:true`, which can never help because a finished thread is not suspendable. Both halves are
+    // asserted: that it says what the thread actually is, and that it stops offering the impossible.
     assert!(
-        section.contains("running — JDWP can only read a suspended thread's stack; pass suspend:true"),
-        "a finished thread's row is currently explained as a running one — if that has been fixed, this \
-         assertion is what should tell you:\n{section}"
+        section.contains("finished — this thread has already terminated (JDWP reports ZOMBIE)"),
+        "a finished thread's row must say it finished, not that it is running:\n{section}"
+    );
+    assert!(
+        !section.contains("pass suspend:true"),
+        "a finished thread can never be suspended, so its row must not advise it:\n{section}"
     );
 
     // --- (2) finished AND collected: the id is gone, so the row is dropped ---
@@ -4757,14 +4764,18 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
          show — silence here reads as a complete dump:\n{}",
         head_of(&dropped)
     );
-    // FINDING, pinned. The only explanation offered is the caller's own `limit` — which was 500 against
-    // ~63 threads, so raising it changes nothing and narrowing with `name_filter` changes nothing. The
-    // two causes of a short dump (the limit, and threads that stopped existing) are reported with one
-    // sentence that only describes the first.
+    // WAS the finding, now the fix (DUMP-4, #47). The only explanation used to be the caller's own
+    // `limit` — 500 against ~63 threads, so raising it changes nothing, and narrowing with `name_filter`
+    // cannot bring back a thread that no longer exists. Two remedies, neither able to alter the outcome.
+    // The cause has its own sentence now, and `limit` is not blamed for a truncation it did not cause.
     assert!(
-        dropped.contains("(raise limit, or narrow with name_filter)"),
-        "the shortfall is currently attributed to `limit` — pinned so that attributing it to the churn \
-         instead flips this test rather than passing quietly:\n{}",
+        dropped.contains(&format!("… +{missing} more thread(s) ENDED while this dump was reading")),
+        "the shortfall is the churn, and the reply must attribute it to the churn:\n{}",
+        head_of(&dropped)
+    );
+    assert!(
+        !dropped.contains("raise limit"),
+        "`limit` was 500 against ~63 threads and never bound — offering it as the remedy is a no-op:\n{}",
         head_of(&dropped)
     );
 

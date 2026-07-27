@@ -167,6 +167,21 @@ Stopped by the application's own logic — waiting on a monitor, sleeping, parke
 and a thread can be both: a wedged thread is blocked but not suspended, so its stack stays unreadable until
 the debugger suspends it as well.
 
+**Finished**:
+Run to completion. JDWP still answers `ZOMBIE` for it while the debugger holds the `Thread` object, so it
+is a thread the debugger can name and describe but never read — and never suspend. The opposite answer to
+**running**, and DUMP-4 (#47) is what happens when a reply confuses the two.
+_Avoid_: dead, zombie (the first reads as a fault; the second is JDWP's wire word, worth quoting in a
+message but not the concept's name)
+
+**Vanished**:
+Listed by the JVM and already gone by the time the debugger asked about it — the id is invalid, so there
+is nothing to name or describe. A thread id is a weak reference, so on a pool that retires workers this is
+the ordinary case rather than the exotic one, and it is a third reason a dump is short, alongside the
+`limit` and the suspension budget. Distinct from **finished**: a finished thread is still readable as a
+row, a vanished one is only a count.
+_Avoid_: dropped, lost (both suggest the debugger mislaid it)
+
 **Suspend depth**:
 How many outstanding suspends a thread carries. The reason a resume must ask the debuggee whether it is
 actually running rather than assume one resume was enough.
