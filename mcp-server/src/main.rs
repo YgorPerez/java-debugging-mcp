@@ -36,7 +36,15 @@ mod session;
 mod tools;
 
 use handlers::RequestHandler;
-use protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, INVALID_REQUEST, JsonRpcNotification, PARSE_ERROR};
+use protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, INVALID_REQUEST, JsonRpcNotification, Notifier, PARSE_ERROR, NOTIFY_CAPACITY};
+use tokio::sync::mpsc;
+
+/// How long to let the writer task drain after stdin closes, before giving up on it (EVT-2).
+///
+/// Bounded rather than a plain join: the event pump and watchdog tasks hold `Notifier` clones and are
+/// not guaranteed to have stopped, so waiting for the channel to close outright could hang a process
+/// that is already shutting down.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,13 +58,31 @@ async fn main() -> Result<()> {
 
     info!("Starting JDWP MCP Server...");
 
-    let handler = RequestHandler::new();
+    // EVT-2: ONE task owns stdout, and every outbound line goes through this channel to reach it —
+    // responses from the loop below, notifications from the JDWP event pump and the watchdog. That
+    // single writer is the whole interleaving guarantee: a hit landing mid-response cannot split it,
+    // because the pump does not write, it queues.
+    //
+    // The two producers use different disciplines on purpose. A response is sent with `.await`, so a
+    // slow stdout applies backpressure and nothing is ever lost. A notification uses `try_send` and is
+    // dropped (and counted) when the queue is full, because making the debuggee's event pump wait on
+    // how fast an MCP client drains its pipe would be a far worse failure than a missed hint the
+    // caller can still read with `debug.get_last_event`.
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(NOTIFY_CAPACITY);
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(line) = out_rx.recv().await {
+            if let Err(e) = write_message(&mut stdout, &line).await {
+                error!("Write error: {e}");
+                break;
+            }
+        }
+    });
 
-    // Stdio transport - no network, no files
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
-    let mut stdout = stdout;
+    let notifier = Notifier::new(out_tx.clone());
+    let handler = RequestHandler::new(notifier);
+
+    let mut reader = BufReader::new(tokio::io::stdin());
 
     info!("JDWP MCP server ready, waiting for requests...");
 
@@ -76,13 +102,20 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 debug!("Received: {}", line);
-                process_line(&handler, &mut stdout, line).await?;
+                process_line(&handler, &out_tx, line).await?;
             }
             Err(e) => {
                 error!("Read error: {}", e);
                 break;
             }
         }
+    }
+
+    // Drop every sender we hold so the writer sees the channel close and flushes what is queued.
+    drop(out_tx);
+    drop(handler);
+    if tokio::time::timeout(DRAIN_TIMEOUT, writer).await.is_err() {
+        error!("writer task did not finish draining within {DRAIN_TIMEOUT:?}");
     }
 
     info!("JDWP MCP server shutting down");
@@ -124,11 +157,20 @@ async fn write_message<W: AsyncWriteExt + Unpin>(stdout: &mut W, message: &str) 
     Ok(())
 }
 
+/// Queue one outbound line for the writer task.
+///
+/// `.await`s for capacity rather than dropping: this path carries **responses**, and a dropped
+/// response leaves a client waiting on a reply that will never come. Notifications take the
+/// try-send path in [`Notifier`] instead, where dropping is the correct behaviour.
+async fn send_message(out: &mpsc::Sender<String>, message: String) -> Result<()> {
+    out.send(message).await.map_err(|_| anyhow::anyhow!("stdout writer task has gone away"))
+}
+
 /// Parse and dispatch one incoming line: a request gets handled and answered; a notification is
 /// handled without a reply; anything unparseable yields a JSON-RPC error response.
-async fn process_line<W: AsyncWriteExt + Unpin>(
+async fn process_line(
     handler: &RequestHandler,
-    stdout: &mut W,
+    out: &mpsc::Sender<String>,
     line: &str,
 ) -> Result<()> {
     let value: Value = match serde_json::from_str(line) {
@@ -136,7 +178,7 @@ async fn process_line<W: AsyncWriteExt + Unpin>(
         Err(e) => {
             error!("Parse error: {}", e);
             let response = serde_json::to_string(&error_response(PARSE_ERROR, "Parse error"))?;
-            return write_message(stdout, &response).await;
+            return send_message(out, response).await;
         }
     };
 
@@ -154,7 +196,7 @@ async fn process_line<W: AsyncWriteExt + Unpin>(
             INVALID_REQUEST,
             "Invalid request: a JSON-RPC message must be an object",
         ))?;
-        return write_message(stdout, &response).await;
+        return send_message(out, response).await;
     }
 
     // Requests carry an id; notifications don't.
@@ -162,18 +204,17 @@ async fn process_line<W: AsyncWriteExt + Unpin>(
         match serde_json::from_value::<JsonRpcRequest>(value) {
             Ok(request) => {
                 let response = handler.handle_request(request).await;
-                let response_str = serde_json::to_string(&response)?;
-                write_message(stdout, &response_str).await?;
+                send_message(out, serde_json::to_string(&response)?).await?;
             }
             Err(e) => {
                 error!("Invalid request: {}", e);
                 let response = serde_json::to_string(&error_response(INVALID_REQUEST, "Invalid request"))?;
-                write_message(stdout, &response).await?;
+                send_message(out, response).await?;
             }
         }
     } else {
         match serde_json::from_value::<JsonRpcNotification>(value) {
-            Ok(notification) => RequestHandler::handle_notification(&notification),
+            Ok(notification) => handler.handle_notification(&notification),
             Err(e) => error!("Invalid notification: {}", e),
         }
     }

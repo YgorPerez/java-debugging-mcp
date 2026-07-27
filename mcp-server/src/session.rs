@@ -81,6 +81,12 @@ pub struct DebugSession {
     /// silently broke any id the caller had stored — the thing that made `toggle_stop_point` awkward to
     /// script (BP-3). The request id is an internal detail now: still reported, never the identity.
     pub stop_seq: u64,
+    /// Push channel to the MCP client (EVT-2). Lives on the session because the two things that need
+    /// it — the event pump and the watchdog — already hold a session and nothing else.
+    ///
+    /// It never replaces the `events` buffer above. A notification is best-effort and a client may
+    /// never read one, so `debug.get_last_event` has to remain sufficient on its own.
+    pub notifier: crate::protocol::Notifier,
 }
 
 /// Max trace snapshots retained per session; oldest are evicted (documented cap for TRACE-1).
@@ -451,13 +457,17 @@ pub struct BreakpointArm {
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Mutex<DebugSession>>>>>,
     current_session: Arc<Mutex<Option<SessionId>>>,
+    /// Handed to every session it creates (EVT-2), so the event pump and the watchdog can push
+    /// without a path back to the request handler.
+    notifier: crate::protocol::Notifier,
 }
 
 impl SessionManager {
-    pub fn new() -> Self {
+    pub fn new(notifier: crate::protocol::Notifier) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             current_session: Arc::new(Mutex::new(None)),
+            notifier,
         }
     }
 
@@ -487,6 +497,7 @@ impl SessionManager {
             traces: VecDeque::new(),
             trace_seq: 0,
             stop_seq: 0,
+            notifier: self.notifier.clone(),
         };
 
         let mut sessions = self.sessions.lock().await;

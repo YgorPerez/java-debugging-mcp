@@ -22,12 +22,16 @@ fn to_json<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, JsonRpcE
 
 pub struct RequestHandler {
     session_manager: SessionManager,
+    /// Outbound push channel (EVT-2). Held here so the handshake can arm it; sessions get their own
+    /// clone at creation so the event pump and watchdog can reach it without going through here.
+    notifier: crate::protocol::Notifier,
 }
 
 impl RequestHandler {
-    pub fn new() -> Self {
+    pub fn new(notifier: crate::protocol::Notifier) -> Self {
         Self {
-            session_manager: SessionManager::new(),
+            session_manager: SessionManager::new(notifier.clone()),
+            notifier,
         }
     }
 
@@ -71,10 +75,14 @@ impl RequestHandler {
         }
     }
 
-    pub fn handle_notification(notification: &JsonRpcNotification) {
+    pub fn handle_notification(&self, notification: &JsonRpcNotification) {
         match notification.method.as_str() {
             "notifications/initialized" => {
                 info!("Client initialized");
+                // Only now may the server push (EVT-2). A stop point can be armed and hit while the
+                // handshake is still in flight, and a notification sent before this point is a
+                // protocol violation rather than a helpful early warning.
+                self.notifier.arm();
             }
             "notifications/cancelled" => {
                 debug!("Request cancelled");
@@ -97,6 +105,11 @@ impl RequestHandler {
             protocol_version: "2024-11-05".to_string(),
             capabilities: ServerCapabilities {
                 tools: ToolsCapability {},
+                // EVT-2. Declared unconditionally: whether anything is actually pushed depends on
+                // JDWP_NOTIFICATIONS, but the capability describes what this server can do, not how
+                // it happens to be configured — and a client that sees it may still ignore every
+                // notification, which is exactly what best-effort means here.
+                logging: Some(crate::protocol::LoggingCapability {}),
             },
             server_info: ServerInfo {
                 name: "jdwp-mcp".to_string(),
@@ -4372,7 +4385,8 @@ async fn store_reportable_event(
         if let Some(tid) = event_thread(&event_set) {
             session.last_thread = Some(tid);
         }
-        if event_suspends(&event_set) {
+        let suspends = event_suspends(&event_set);
+        if suspends {
             // Record WHICH request suspended us, here and now. The watchdog used to re-derive this from
             // the newest buffered event, which `get_last_event {drain:true}` erases (SAFE-5).
             let cause = event_set.events.first().map_or(
@@ -4381,8 +4395,61 @@ async fn store_reportable_event(
             );
             session.mark_suspended(cause);
         }
-        session.push_event(event_set);
+        let seq = session.push_event(event_set);
+        // Buffer first, then push. The buffer is the authoritative record and must be written whether
+        // or not anyone is listening; the notification is a hint that one exists (EVT-2).
+        if suspends {
+            notify_suspension(session, seq).await;
+        }
     }
+}
+
+/// Push a `notifications/message` for a hit that has just frozen the debuggee (EVT-2).
+///
+/// **Suspending hits only.** A `trace:true` stop point does not stop the VM and is built to fire at
+/// hundreds of hits per second — notifying per hit would flood the transport and defeat the one mode
+/// that is safe on the shared 8180. Snapshots stay where they belong, behind `debug.get_traces`.
+///
+/// The payload is built with the same `describe_event_into` the polled path uses, so a caller acting
+/// on the notification alone sees exactly what `debug.get_last_event` would have told them. That
+/// equivalence is what makes skipping the round trip safe rather than merely quicker.
+///
+/// Cost: the VM is already frozen by the time this runs, and the location lookups hit the type and
+/// line-table caches, so this adds nothing the debuggee was not paying already.
+async fn notify_suspension(session: &mut crate::session::DebugSession, seq: u64) {
+    let notifier = session.notifier.clone();
+    let Some(rec) = session.events.back().cloned() else { return };
+    let Some(ev) = rec.set.events.first() else { return };
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("seq".to_string(), json!(seq));
+    obj.insert("event".to_string(), json!(event_type_name(&ev.details)));
+    describe_event_into(&mut session.connection, &ev.details, &mut obj).await;
+    // The fact that separates this from a trace snapshot, and the reason it is worth interrupting the
+    // caller for at all: the VM is stopped, other people's requests are stalled behind it, and the
+    // watchdog clock is now running.
+    obj.insert("suspended".to_string(), json!(true));
+    if let Some(id) = stop_point_id(session, ev.request_id) {
+        obj.insert("stopPoint".to_string(), json!(id));
+    }
+    // `warning`, not `info`: on a shared instance a freeze is something to act on, and a client
+    // filtering its log level should not have this fall below the line.
+    notifier.notify("warning", &serde_json::Value::Object(obj));
+}
+
+/// The caller-facing stop-point id behind a JDWP request id, across all four kinds (BP-3's ids).
+///
+/// Pure in-memory lookup over the session's own maps — no JDWP traffic — which is what makes it safe
+/// to call on the hit path while the VM is held.
+fn stop_point_id(session: &crate::session::DebugSession, req: i32) -> Option<String> {
+    let hit = Some(req);
+    session.breakpoints.iter().find(|(_, b)| b.request_id == hit).map(|(k, _)| k.clone())
+        .or_else(|| session.exception_requests.iter()
+            .find(|(_, e)| e.request_id == hit).map(|(k, _)| k.clone()))
+        .or_else(|| session.watchpoints.iter()
+            .find(|(_, w)| w.request_id == hit).map(|(k, _)| k.clone()))
+        .or_else(|| session.method_exits.iter()
+            .find(|(_, m)| m.request_id == hit).map(|(k, _)| k.clone()))
 }
 
 /// Upper bound on resume attempts when clearing a suspend depth (SAFE-7). A depth above this means
@@ -4476,31 +4543,44 @@ fn spawn_watchdog(
                     // needs more than one resume, and reporting a rescue that didn't happen — then
                     // clearing `suspended_since` so we never retry — is the worst thing this task can
                     // do (SAFE-7). On failure, leave `suspended_since` set so the next tick tries again.
-                    match resume_and_verify(&mut s).await {
+                    // EVT-2: every arm below sets `last_watchdog_note`, and every one of them is news
+                    // the caller cannot discover by asking — the VM they left suspended is no longer
+                    // suspended, and a stop point they armed is now disabled. Pushed as well as
+                    // recorded, so a caller who walked away is told rather than finding out later.
+                    let pushed = match resume_and_verify(&mut s).await {
                         Ok(None) => {
                             s.mark_resumed();
                             let note = format!("watchdog auto-resumed the VM after {secs}s {disarmed}");
                             info!("{note}");
-                            s.last_watchdog_note = Some(note);
+                            s.last_watchdog_note = Some(note.clone());
+                            Some(("warning", note))
                         }
                         Ok(Some(detail)) if detail.starts_with("cleared") => {
                             s.mark_resumed();
                             let note = format!("watchdog auto-resumed the VM after {secs}s {disarmed} ({detail})");
                             info!("{note}");
-                            s.last_watchdog_note = Some(note);
+                            s.last_watchdog_note = Some(note.clone());
+                            Some(("warning", note))
                         }
                         Ok(Some(problem)) => {
                             // Deliberately NOT calling mark_resumed: the VM is still stopped, so the
                             // watchdog must keep trying rather than going quiet on a false success.
                             let note = format!("⚠️ watchdog tried to resume the VM after {secs}s {disarmed}, but {problem}");
                             warn!("{note}");
-                            s.last_watchdog_note = Some(note);
+                            s.last_watchdog_note = Some(note.clone());
+                            Some(("error", note))
                         }
                         Err(e) => {
                             let note = format!("⚠️ watchdog could not resume the VM after {secs}s: {e}");
                             warn!("{note}");
-                            s.last_watchdog_note = Some(note);
+                            s.last_watchdog_note = Some(note.clone());
+                            Some(("error", note))
                         }
+                    };
+                    // A still-frozen VM is an `error`: nothing the caller does next will work until it
+                    // is running, which is a different thing from "we rescued it for you".
+                    if let Some((level, note)) = pushed {
+                        s.notifier.notify(level, &json!({ "watchdog": note }));
                     }
                     drop(s);
                 }
