@@ -80,6 +80,20 @@ Reading it as-is and leaving it is the only option that neither destroys nor acc
 - **A truncated dump and a failed resume are reported separately.** Both are ways a dump can go wrong, and
   collapsing them would make "I stopped early" indistinguishable from "I could not un-freeze the VM" — the
   second is an emergency and the first is not.
+- **There is a third cause, and it now has its own voice** (DUMP-4,
+  [#47](https://github.com/YgorPerez/java-debugging-mcp/issues/47)). A JDWP thread id is a weak reference,
+  so a pool that retires workers races every dump: threads the JVM listed can be gone by the time they are
+  asked about. Those rows were being counted into `… +N more thread(s) (raise limit, or narrow with
+  name_filter)`, which on TEST-10's churning pool meant 41 missing rows blamed on a `limit` of 500 that
+  never bound, with two remedies offered that are both no-ops — neither raising a limit nor narrowing a
+  filter can bring back a dead thread. Counted apart and stated apart now, and the two counts still sum to
+  the shortfall.
+- **Point 1 reads both ways.** "A running thread is never rendered as `(no frames)`" is one instance of a
+  wider rule: the dump must not answer with the *opposite* state. A `ZOMBIE` thread was rendered as
+  `running — … pass suspend:true`, which is that same mistake inverted — finished and running are opposite
+  answers, and the remedy was unfollowable because a finished thread can never be suspended. A row now says
+  which of the two it is, and the header's "pass suspend:true and these become readable" count excludes the
+  threads a suspension could not rescue.
 - The default budget was **provisional**, chosen from loopback timings where a round trip is
   sub-millisecond, and the assumption was tracked on #13 and then on its successor
   [#24](https://github.com/YgorPerez/java-debugging-mcp/issues/24).

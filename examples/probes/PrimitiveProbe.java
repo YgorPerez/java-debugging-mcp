@@ -25,7 +25,8 @@
 //     string without pinning a formatting library's rounding.
 //   * `chars[2]` is a LONE SURROGATE, `(char) 0xD800`. A Java `char` is a UTF-16 code unit and not a
 //     Unicode scalar value, so half of a surrogate pair is a perfectly ordinary thing to find in a
-//     `char[]` — and it is exactly the input the renderer's `unwrap_or('?')` fallback exists for. Written
+//     `char[]` — and it is exactly the input the renderer's `unwrap_or('?')` fallback used to swallow,
+//     rendering it byte-for-byte as a real question mark until TYPE-1 (#48) made it say what it is. Written
 //     as a numeric cast rather than a `'\uD800'` escape, because Java processes unicode escapes before
 //     lexing and the escape form is a needless way to depend on that.
 //
