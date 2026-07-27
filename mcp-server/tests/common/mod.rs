@@ -797,6 +797,9 @@ pub struct Probe {
     child: Child,
     stdin: Option<ChildStdin>,
     pub port: u16,
+    /// The probe's class name, kept only so a failure can say which probe it is talking about — a
+    /// timeout that names `EvalProbe` is a different bug report from one that names `LateWorker`.
+    name: String,
     lines: Arc<Mutex<Vec<String>>>,
     new_line: Receiver<()>,
     _dir: tempfile::TempDir,
@@ -813,14 +816,53 @@ impl Probe {
     const PROBE_LISTEN_TIMEOUT: Duration = Duration::from_secs(90);
 
     /// Compile and launch `examples/probes/<name>.java`, waiting until it is accepting JDWP.
+    ///
+    /// **Accepting a connection is not the same as running.** The agent binds during JVM startup, before
+    /// the main class is loaded, so a probe returned from here may not have executed a line of Java yet.
+    /// That is the right thing for the tests that want it — arming a *deferred* breakpoint before its class
+    /// exists is what deferred arming is for, and most of the callers here are doing exactly that.
+    ///
+    /// It is the wrong thing if the first question a test asks is about **loaded state**
+    /// (`debug.list_classes`, `debug.list_methods`, `debug.source`): those answer "not loaded" correctly
+    /// when the class genuinely is not loaded yet, so losing the race does not fail loudly, it asserts the
+    /// wrong finding and blames the tool. Use [`launch_running`](Self::launch_running) for those. TEST-17
+    /// (#49) is the incident; `b64d55d` is the two before it.
     pub fn launch(jdk: &Jdk, name: &str) -> Result<Self, String> {
-        Self::launch_built_by(jdk, name, Jdk::compile_probe)
+        Self::launch_built_by(jdk, name, None, Jdk::compile_probe)
+    }
+
+    /// [`launch`](Self::launch), then block until the probe has demonstrably **run**: a stdout line
+    /// matching `ready`.
+    ///
+    /// Naming the readiness line is left to the caller because only the probe's author knows what running
+    /// means for it — most print `tick N`, `EvalProbe` prints `work …` once its static initialiser has
+    /// built the objects it hands out, `LateWorker` prints `ready`. A blanket wait inside `launch` would be
+    /// worse than no wait at all: it would quietly disarm the deferred-breakpoint tests, which need to arm
+    /// *before* the class loads and would then be asserting nothing. So the harness cannot decide readiness,
+    /// but it can make asking for it one named call, and it can make failing to get it say **race** rather
+    /// than reproduce #46's symptom (TEST-17, #49).
+    pub fn launch_running(jdk: &Jdk, name: &str, ready: impl FnMut(&str) -> bool) -> Result<Self, String> {
+        let probe = Self::launch(jdk, name)?;
+        probe.wait_until_running(EVENT_TIMEOUT, ready)?;
+        Ok(probe)
+    }
+
+    /// Like [`launch`](Self::launch), but the probe class is not loaded until `delay` after the agent starts
+    /// listening — the TEST-17 (#49) race on demand, rather than waiting for a loaded CI runner to hand one
+    /// over.
+    ///
+    /// The JVM is up and answering JDWP the entire time; it simply has not reached the probe yet, which is
+    /// precisely what a slow runner looks like from the debugger's side. It is done with a generated wrapper
+    /// main class rather than a sleep inside a probe, so no probe carries test scaffolding for this and any
+    /// probe can be delayed.
+    pub fn launch_delayed(jdk: &Jdk, name: &str, delay: Duration) -> Result<Self, String> {
+        Self::launch_built_by(jdk, name, Some(delay), Jdk::compile_probe)
     }
 
     /// Like [`launch`](Self::launch) but compiled `-g:none` — see [`Jdk::compile_probe_stripped`] for
     /// why exactly one probe wants that, and why it does not weaken the default for the rest.
     pub fn launch_stripped(jdk: &Jdk, name: &str) -> Result<Self, String> {
-        Self::launch_built_by(jdk, name, Jdk::compile_probe_stripped)
+        Self::launch_built_by(jdk, name, None, Jdk::compile_probe_stripped)
     }
 
     /// Like [`launch`](Self::launch), but with the probe's checked-in `<name>.smap` installed into
@@ -830,7 +872,7 @@ impl Probe {
     /// Only the probe's own class is patched. Any other class in the same file is left exactly as
     /// `javac` produced it, which is what gives a test a control compiled in the same breath.
     pub fn launch_with_smap(jdk: &Jdk, name: &str) -> Result<Self, String> {
-        Self::launch_built_by(jdk, name, |jdk, name, dir| {
+        Self::launch_built_by(jdk, name, None, |jdk, name, dir| {
             jdk.compile_probe(name, dir)?;
             let fixture = probe_smap_path(name);
             let smap = std::fs::read_to_string(&fixture)
@@ -849,10 +891,20 @@ impl Probe {
     fn launch_built_by(
         jdk: &Jdk,
         name: &str,
+        start_delay: Option<Duration>,
         build: impl FnOnce(&Jdk, &str, &Path) -> Result<(), String>,
     ) -> Result<Self, String> {
         let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         build(jdk, name, dir.path())?;
+        // Either the probe is the main class, or the wrapper is and the probe is loaded late — see
+        // [`launch_delayed`](Self::launch_delayed).
+        let main_class = match start_delay {
+            None => vec![name.to_string()],
+            Some(delay) => {
+                compile_slow_start(jdk, dir.path())?;
+                vec![SLOW_START.to_string(), delay.as_millis().to_string(), name.to_string()]
+            }
+        };
 
         let port = free_port();
         // suspend=n so the probe runs immediately; the test attaches while it loops.
@@ -860,7 +912,7 @@ impl Probe {
         let mut child = Command::new(&jdk.java)
             .arg(agent)
             .args(["-cp", "."])
-            .arg(name)
+            .args(&main_class)
             .current_dir(dir.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -881,7 +933,7 @@ impl Probe {
         pump(stdout, Arc::clone(&lines), tx.clone());
         pump(stderr, Arc::clone(&lines), tx);
 
-        let probe = Self { child, stdin, port, lines, new_line, _dir: dir };
+        let probe = Self { child, stdin, port, name: name.to_string(), lines, new_line, _dir: dir };
         probe.wait_until_listening()?;
         Ok(probe)
     }
@@ -923,6 +975,35 @@ impl Probe {
         ))
     }
 
+    /// Block until the probe prints a line matching `ready` — until it is *running*, not merely listening.
+    ///
+    /// The other half of [`wait_until_listening`](Self::wait_until_listening), and the reason it is separate
+    /// is that only the caller can say what running means for a given probe. What this adds over a bare
+    /// [`wait_for_line`](Self::wait_for_line) is the failure text: a probe that never runs has to be
+    /// reported as a **race in the test**, because the alternative is what actually happened in TEST-17
+    /// (#49) — the discovery tool answers "not loaded", correctly, the assertion fails, and the message
+    /// reads exactly like the wrong-answer bug #46 was about, in a file the reader has no reason to open.
+    pub fn wait_until_running(
+        &self,
+        timeout: Duration,
+        ready: impl FnMut(&str) -> bool,
+    ) -> Result<String, String> {
+        self.wait_for_line(timeout, ready).ok_or_else(|| {
+            format!(
+                "{name} accepted a JDWP connection but never printed a readiness line within {timeout:?} \
+                 — it is listening, not running.\n\
+                 This is a RACE in the test, not a wrong answer from the debugger: the JDWP agent binds \
+                 before the main class is loaded, so anything asked now about loaded state \
+                 (debug.list_classes, debug.list_methods, debug.source) is correctly answered \"not \
+                 loaded\". See TEST-17 (#49) — and do not go looking for #46's wrong-answer bug, which is \
+                 what this looks like from the assertion's side.\n\
+                 What {name} printed: {output:?}",
+                name = self.name,
+                output = self.output(),
+            )
+        })
+    }
+
     /// Send a line to the probe's stdin (probes that wait for a cue to do something).
     pub fn send_line(&mut self, line: &str) -> Result<(), String> {
         let stdin = self.stdin.as_mut().ok_or("probe stdin already closed")?;
@@ -958,6 +1039,41 @@ impl Drop for Probe {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The generated main class [`Probe::launch_delayed`] runs instead of the probe.
+const SLOW_START: &str = "SlowStart";
+
+/// Write and compile [`SLOW_START`] into `dir`: a main class that sleeps, then loads and runs the probe.
+///
+/// Two properties are the point. It sleeps *before* touching the probe class, so the probe is genuinely not
+/// loaded rather than loaded-and-idle — `debug.list_classes` cannot see it, which is the state TEST-17 (#49)
+/// is about. And it sleeps in Java rather than delaying the launch from Rust, so the JVM is fully up and
+/// answering JDWP throughout: a test can attach, ask, and get the same "not loaded" a slow runner produces.
+fn compile_slow_start(jdk: &Jdk, dir: &Path) -> Result<(), String> {
+    let src = dir.join(format!("{SLOW_START}.java"));
+    std::fs::write(
+        &src,
+        format!(
+            "public class {SLOW_START} {{\n    \
+                 public static void main(String[] args) throws Exception {{\n        \
+                     Thread.sleep(Long.parseLong(args[0]));\n        \
+                     Class.forName(args[1]).getMethod(\"main\", String[].class)\n            \
+                         .invoke(null, (Object) new String[0]);\n    \
+                 }}\n}}\n"
+        ),
+    )
+    .map_err(|e| format!("cannot write {}: {e}", src.display()))?;
+    let out = Command::new(&jdk.javac)
+        .args(["-g", "-encoding", "UTF-8", "-d"])
+        .arg(dir)
+        .arg(&src)
+        .output()
+        .map_err(|e| format!("failed to run javac for {SLOW_START}: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!("javac failed for {SLOW_START}: {}", String::from_utf8_lossy(&out.stderr)))
 }
 
 /// Drain one of the probe's output streams into `sink`, notifying `tx` per line.
