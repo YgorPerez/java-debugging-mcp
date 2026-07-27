@@ -201,6 +201,7 @@ impl RequestHandler {
             "debug.list_threads" => self.handle_list_threads(args).await,
             "debug.list_classes" => self.handle_list_classes(args).await,
             "debug.list_methods" => self.handle_list_methods(args).await,
+            "debug.source" => self.handle_source(args).await,
             "debug.thread_dump" => self.handle_thread_dump(args).await,
             "debug.get_last_event" => self.handle_get_last_event(args).await,
             "debug.set_value" => self.handle_set_value(args).await,
@@ -231,8 +232,16 @@ impl RequestHandler {
         if read_only {
             connection.set_read_only(true);
         }
+        // Roots given here REPLACE the env default rather than adding to it, which is the opposite of
+        // how `read_only` combines above — and deliberately so. `JDWP_READONLY` is a deploy-wide guard
+        // that must not be relaxable per-attach; `JDWP_SOURCE_ROOTS` is only a convenience default, so
+        // a caller who names roots for this JVM means those and not also whatever the environment held.
+        let source_roots = a.source_roots.as_ref().map_or_else(
+            env_source_roots,
+            |v| v.iter().map(std::path::PathBuf::from).collect(),
+        );
         let session_id = self.session_manager
-            .create_session(connection, format!("{host}:{port}"), read_only)
+            .create_session(connection, format!("{host}:{port}"), read_only, source_roots)
             .await;
         // Get the session guard once so the listener/watchdog handles are stored before we return.
         let session_guard = self.resolve_session(&args).await
@@ -973,21 +982,7 @@ impl RequestHandler {
             .map(str::to_lowercase);
         let limit = a.limit.max(1);
 
-        let signature = format!("L{};", class_name.replace('.', "/"));
-        let found = session.connection.classes_by_signature(&signature).await
-            .map_err(|e| format!("Failed to resolve {class_name}: {e}"))?;
-        let Some(class) = found.first() else {
-            // JDWP knows only what is loaded, so it genuinely cannot separate "wrong name" from "not
-            // loaded yet". Saying which one it is would be a guess; saying that both are possible, and
-            // how to tell them apart, is the honest answer — and DISC-1 is the tool that tells them apart.
-            let simple = class_name.rsplit('.').next().unwrap_or(class_name);
-            return Err(format!(
-                "{class_name} is not loaded in the debuggee. Either the name is wrong, or the JVM has \
-                 not loaded it yet — classes load on first use, so an untouched code path has none of \
-                 its classes present. To tell those apart: debug.list_classes with filter \"*.{simple}\"."
-            ));
-        };
-        let target_id = class.type_id;
+        let target_id = resolve_loaded_class(&mut session.connection, class_name).await?;
 
         let mut rows = collect_method_rows(
             &mut session.connection, target_id, a.inherited, name_filter.as_deref(),
@@ -1024,6 +1019,73 @@ impl RequestHandler {
             output.push_str("No method name matched. Drop name_filter to see the whole class.\n");
         }
 
+        Ok(output)
+    }
+
+    /// DISC-3: what file a loaded class was compiled from, and — when source roots are configured —
+    /// the lines around the one a stack frame named.
+    ///
+    /// Two halves, deliberately independent. **The JVM half needs no local files at all**, and it is
+    /// the half that settles whether the checkout in front of you is the code that is running: a class
+    /// reporting `Order.java` when your tree renamed that file months ago is the answer, and no amount
+    /// of reading local source would have shown it. The disk half is a convenience layered on top, so
+    /// every way *it* can fail still reports the JVM half instead of collapsing into one error — the
+    /// four local outcomes (no roots, no match, escaped a root, unreadable) each say something
+    /// different about what to fix, and none of them makes the JVM's answer less true.
+    ///
+    /// The two genuinely empty-handed cases are the errors: the class is not loaded, or it is loaded
+    /// and carries no `SourceFile` attribute at all.
+    async fn handle_source(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.resolve_session(&args).await
+            .ok_or_else(|| "No active debug session".to_string())?;
+
+        let mut session = session_guard.lock().await;
+
+        let a: crate::args::SourceArgs = crate::args::parse(&args)?;
+        let class_name = a.class_name.trim().to_string();
+        if class_name.is_empty() {
+            return Err("class_name is required (e.g. com.example.OrderService)".to_string());
+        }
+
+        let type_id = resolve_loaded_class(&mut session.connection, &class_name).await?;
+        let file_name = match session.connection.get_source_file(type_id).await {
+            Ok(f) => f,
+            Err(jdwp_client::JdwpError::JdwpErrorCode(code, _))
+                if code == jdwp_client::protocol::ERR_ABSENT_INFORMATION =>
+            {
+                return Err(format!(
+                    "{class_name} is loaded, but the JVM reports NO source file for it: the class was \
+                     compiled without the SourceFile attribute (javac -g:none), or it is synthetic — a \
+                     lambda body, a generated proxy, a bytecode-woven class. Nothing local can be \
+                     resolved from a name this build does not carry. Rebuild the deployed artifact with \
+                     debug info, or work from debug.list_methods and bytecode-level stop points."
+                ));
+            }
+            Err(e) => return Err(format!("Failed to read the source file of {class_name}: {e}")),
+        };
+        // One extra packet, asked unconditionally because it is only interesting when it is there and a
+        // caller cannot know in advance that it will be. Absent on nearly every class; when present it
+        // means the `.java` above is a *translation artefact* and the file worth reading is elsewhere.
+        // A hard error is dropped rather than reported: the client already answers `None` for the two
+        // codes that mean "there is no SMAP", so anything left is a garnish failing on a reply the rest
+        // of this tool does not need — losing the whole answer over it would be the wrong trade.
+        let smap = session.connection.get_source_debug_extension(type_id).await.ok().flatten();
+        let roots: Vec<std::path::PathBuf> = a.source_roots.as_ref().map_or_else(
+            || session.source_roots.clone(),
+            |v| v.iter().map(std::path::PathBuf::from).collect(),
+        );
+        drop(session);
+
+        let mut output = format!("{class_name} — compiled from {file_name} (reported by the JVM)\n");
+        if let Some(s) = &smap {
+            let _ = writeln!(
+                output,
+                "Source debug extension (JSR-45 SMAP) present — this class was translated from another \
+                 file, and {file_name} is the intermediate:\n{}",
+                truncate(s.trim_end(), 800)
+            );
+        }
+        output.push_str(&local_source_section(&class_name, &file_name, &roots, &a));
         Ok(output)
     }
 
@@ -3114,6 +3176,31 @@ fn class_matches(fqn: &str, filter: &str) -> bool {
     }
 }
 
+/// The reference type id of a loaded class named the Java way — `com.example.Order`, or an inner
+/// class as `com.example.Order$Line`.
+///
+/// One resolver behind every discovery tool on purpose. "Not loaded" has to mean the same thing in
+/// DISC-1, DISC-2 and DISC-3, and the honest wording is the part that would drift if each tool spelled
+/// it out itself: JDWP knows only what is *loaded*, so it genuinely cannot separate a wrong name from
+/// a class the VM has not touched yet. Picking one would be wrong about half the time, so the reply
+/// says both are possible and names the tool that can actually tell them apart.
+async fn resolve_loaded_class(
+    conn: &mut jdwp_client::JdwpConnection,
+    class_name: &str,
+) -> Result<u64, String> {
+    let signature = format!("L{};", class_name.replace('.', "/"));
+    let found = conn.classes_by_signature(&signature).await
+        .map_err(|e| format!("Failed to resolve {class_name}: {e}"))?;
+    found.first().map(|c| c.type_id).ok_or_else(|| {
+        let simple = class_name.rsplit('.').next().unwrap_or(class_name);
+        format!(
+            "{class_name} is not loaded in the debuggee. Either the name is wrong, or the JVM has \
+             not loaded it yet — classes load on first use, so an untouched code path has none of \
+             its classes present. To tell those apart: debug.list_classes with filter \"*.{simple}\"."
+        )
+    })
+}
+
 /// Collect a class's methods as `(declaring class, rendered signature)` pairs (DISC-2).
 ///
 /// Kept flat rather than grouped by declaring class: an overload set spread across a class and its
@@ -3230,6 +3317,223 @@ fn sig_arg_count(sig: &str) -> usize {
         }
     }
     count
+}
+
+/// A new session's default source roots (DISC-3): `JDWP_SOURCE_ROOTS`, a path list in this platform's
+/// spelling — `:`-separated on Unix, `;` on Windows, which is what `std::env::split_paths` reads and
+/// what the JVM's own `-cp` already uses, so an operator sets it the way they set every other path
+/// list. Unset means no roots, and `debug.source` then reports only what the JVM knows.
+fn env_source_roots() -> Vec<std::path::PathBuf> {
+    std::env::var_os("JDWP_SOURCE_ROOTS").map_or_else(Vec::new, |v| {
+        std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect()
+    })
+}
+
+/// Where a class's source sits *under* a root: the package as directories, then the file name the JVM
+/// reported.
+///
+/// Built from the PACKAGE plus the JVM's file name, never from the class name, and that is the whole
+/// point of asking the debuggee at all. `com.example.Order$Line` has no `Order$Line.java` to find;
+/// neither does a package-private `class OrderRow` that lives inside `Order.java`. The package is the
+/// only part of a class name that maps to a directory, and the JVM is the only source for the rest.
+///
+/// `None` when no path could be trusted: any segment that is empty, `.`, `..`, or carries a path
+/// separator, a Windows drive marker or an NTFS stream marker. The file name arrives from the
+/// DEBUGGEE — a `SourceFile` attribute reading `../../../../etc/passwd` is a perfectly valid class
+/// file, so this is untrusted input, not a formality.
+fn source_relative_path(class_name: &str, source_file: &str) -> Option<std::path::PathBuf> {
+    let package = class_name.rsplit_once('.').map_or("", |(p, _)| p);
+    let mut path = std::path::PathBuf::new();
+    if !package.is_empty() {
+        for segment in package.split('.') {
+            if !is_safe_path_segment(segment) {
+                return None;
+            }
+            path.push(segment);
+        }
+    }
+    if !is_safe_path_segment(source_file) {
+        return None;
+    }
+    path.push(source_file);
+    Some(path)
+}
+
+/// Whether one path component can be joined onto a root without the result being able to leave it.
+fn is_safe_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        // ':' covers both a Windows drive-relative segment (`C:foo`) and an NTFS alternate data
+        // stream (`file.java:hidden`), neither of which joins the way `join` implies it does.
+        && !segment.contains(['/', '\\', ':'])
+}
+
+/// What looking for one relative path under a list of roots found. Three outcomes rather than an
+/// `Option`, because an escape is not a miss: it means a root held something pointing out of the tree,
+/// and reporting that as "not found" would hide it.
+enum SourceLookup {
+    Found(std::path::PathBuf),
+    Missing,
+    Escaped(std::path::PathBuf),
+}
+
+/// Search `roots` in order for `rel`, refusing anything that resolves outside the root it was found
+/// under.
+///
+/// The containment check is NOT redundant with [`source_relative_path`]'s segment rules. Those make
+/// the *joined* path lexically safe; a symlink sitting inside a root can still point anywhere on the
+/// disk, and only resolving the real path catches it. Canonicalising both sides is also what makes the
+/// comparison meaningful on Windows, where one directory has several valid spellings.
+fn find_under_roots(roots: &[std::path::PathBuf], rel: &std::path::Path) -> SourceLookup {
+    for root in roots {
+        let candidate = root.join(rel);
+        if !candidate.is_file() {
+            continue;
+        }
+        // `is_file` just succeeded, so a canonicalize failure here is a race or a permission problem
+        // on the root itself — treat the root as not holding the file rather than trusting a path we
+        // could not resolve.
+        let (Ok(real_root), Ok(resolved)) = (root.canonicalize(), candidate.canonicalize()) else {
+            continue;
+        };
+        if resolved.starts_with(&real_root) {
+            return SourceLookup::Found(resolved);
+        }
+        return SourceLookup::Escaped(candidate);
+    }
+    SourceLookup::Missing
+}
+
+/// The 1-based inclusive line range a reply carries: the window around `line`, or the whole file, and
+/// in both cases clamped to `max_lines`.
+///
+/// Pure, and separate from the reading, because the arithmetic is where this can be wrong in a way no
+/// probe would catch: a `line` within `context` of either end of the file makes the window run off one
+/// side, and a `max_lines` smaller than the window has to keep the requested line in shot rather than
+/// just cutting the tail off.
+fn line_window(total: usize, line: Option<usize>, context: usize, max_lines: usize) -> (usize, usize) {
+    if total == 0 {
+        return (1, 0);
+    }
+    let cap = max_lines.max(1);
+    let Some(line) = line else {
+        return (1, total.min(cap));
+    };
+    // A line past the end still returns the end of the file rather than nothing: the caller is chasing
+    // a frame, and a file shorter than the line it named IS the finding.
+    let centre = line.clamp(1, total);
+    // Shrinking the context (rather than the far edge) keeps the requested line centred when the cap
+    // is the binding constraint — a window cut only at the end would drop the lines *after* the frame,
+    // which are usually the ones being read.
+    let ctx = context.min(cap.saturating_sub(1) / 2);
+    (centre.saturating_sub(ctx).max(1), centre.saturating_add(ctx).min(total))
+}
+
+/// The on-disk half of `debug.source`: resolve the class under `roots` and render the requested lines.
+///
+/// Returns text to append to the JVM-reported header rather than a `Result`, because none of the ways
+/// this can come up empty invalidates that header — see [`RequestHandler::handle_source`].
+fn local_source_section(
+    class_name: &str,
+    file_name: &str,
+    roots: &[std::path::PathBuf],
+    a: &crate::args::SourceArgs,
+) -> String {
+    if roots.is_empty() {
+        return "No source roots are configured, so no file was read. Set them per session with \
+                debug.attach {\"source_roots\":[...]}, or deploy-wide with JDWP_SOURCE_ROOTS (a path \
+                list in this platform's spelling). A root is where the PACKAGE TREE starts — for \
+                com.example.Order that is the directory containing `com`, not the project root.\n"
+            .to_string();
+    }
+    let Some(rel) = source_relative_path(class_name, file_name) else {
+        return format!(
+            "⚠ Refusing to build a path from the file name the JVM reported ({file_name:?}): it \
+             carries a path separator, a drive/stream marker or a `..` segment. That name comes from \
+             the debuggee, so a path built from it could point outside every configured root.\n"
+        );
+    };
+    let path = match find_under_roots(roots, &rel) {
+        SourceLookup::Found(p) => p,
+        SourceLookup::Missing => {
+            let searched: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
+            return format!(
+                "Not found on disk: no configured root holds {}. Searched {} root(s): {}. Either the \
+                 root list is wrong (a root is where the package tree starts) or this class is not in \
+                 this checkout — which is itself worth knowing, since the JVM is running it.\n",
+                rel.display(),
+                roots.len(),
+                searched.join(", "),
+            );
+        }
+        SourceLookup::Escaped(p) => {
+            return format!(
+                "⚠ Refusing to read {}: it is under a configured root but resolves outside it — a \
+                 symlink out of the tree. Nothing was read.\n",
+                p.display(),
+            );
+        }
+    };
+
+    let lines: Vec<String> = match std::fs::read_to_string(&path) {
+        Ok(text) => text.lines().map(str::to_string).collect(),
+        Err(e) => {
+            return format!(
+                "Found {} but could not read it: {e}. The path resolved, so this is a local \
+                 permission or encoding problem, not a wrong root.\n",
+                path.display(),
+            );
+        }
+    };
+    render_source_body(&path, &lines, a)
+}
+
+/// Render the selected lines of a resolved file, with the bound stated in the header.
+///
+/// Split from [`local_source_section`] so the "which lines" decision is not tangled with the four ways
+/// getting to a file can fail.
+fn render_source_body(path: &std::path::Path, lines: &[String], a: &crate::args::SourceArgs) -> String {
+    let total = lines.len();
+    if total == 0 {
+        return format!("{} resolved, but the file is empty (0 lines).\n", path.display());
+    }
+    let wanted = usize::try_from(a.line.unwrap_or(0)).ok().filter(|l| *l > 0);
+    if !a.whole_file && wanted.is_none() {
+        return format!(
+            "Resolved to {} ({total} line(s)). No text returned: pass `line` for a window around it, \
+             or whole_file:true for all of it. A whole file is never the default — a caller chasing \
+             one frame does not want 2000 lines in context.\n",
+            path.display(),
+        );
+    }
+    // `whole_file` wins over `line`, per its documented argument: asking for both is asking for the
+    // file, and a window silently applied on top would be the smaller answer to the larger question.
+    let window = if a.whole_file { None } else { wanted };
+    let (start, end) = line_window(total, window, a.context, a.max_lines);
+
+    let mut out = format!("{} — lines {start}-{end} of {total}\n", path.display());
+    // Only when a window was actually asked for: in `whole_file` mode the whole file IS the answer, and
+    // "showing the end instead" would be a lie about what was returned.
+    if let Some(l) = window.filter(|l| *l > total) {
+        let _ = writeln!(
+            out,
+            "⚠ line {l} is past the end of this {total}-line file — this checkout almost certainly \
+             does not match the running build. Showing the end of the file instead."
+        );
+    }
+    let width = end.to_string().len();
+    for (i, text) in lines.iter().enumerate().skip(start.saturating_sub(1)).take((end + 1).saturating_sub(start)) {
+        let _ = writeln!(out, "{:>width$} | {text}", i + 1);
+    }
+    if start > 1 || end < total {
+        let _ = writeln!(
+            out,
+            "… {} of {total} line(s) shown; raise context/max_lines, or pass whole_file:true",
+            (end + 1).saturating_sub(start),
+        );
+    }
+    out
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -8826,5 +9130,113 @@ mod tests {
         );
         // A constructor keeps its JVM spelling — it is what evaluate and a stop point both name.
         assert_eq!(render_method("<init>", "(I)V", 0), "void <init>(int)");
+    }
+
+    // DISC-3: the directory comes from the PACKAGE and the file name from the JVM, never from the
+    // class name. The inner-class case is the one that proves it: `Order$Line` has no `Order$Line.java`
+    // anywhere, and a resolver built on the class name alone would look for exactly that and miss.
+    #[test]
+    fn source_path_is_built_from_the_package_and_the_jvm_file_name() {
+        let p = |c, f| source_relative_path(c, f).map(|p| p.components().count().to_string() + ":"
+            + &p.iter().map(|s| s.to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"));
+
+        assert_eq!(p("com.example.Order", "Order.java").as_deref(), Some("3:com/example/Order.java"));
+        // Inner, and doubly-nested inner: both live in the enclosing compilation unit.
+        assert_eq!(p("com.example.Order$Line", "Order.java").as_deref(), Some("3:com/example/Order.java"));
+        assert_eq!(p("com.example.Order$Line$Key", "Order.java").as_deref(), Some("3:com/example/Order.java"));
+        // A file whose name differs from the type — a package-private class declared in Order.java.
+        assert_eq!(p("com.example.OrderRow", "Order.java").as_deref(), Some("3:com/example/Order.java"));
+        // Default package: no directories at all, which the package split must not turn into an
+        // empty leading segment.
+        assert_eq!(p("EvalProbe", "EvalProbe.java").as_deref(), Some("1:EvalProbe.java"));
+        assert_eq!(p("EvalProbe$Item", "EvalProbe.java").as_deref(), Some("1:EvalProbe.java"));
+    }
+
+    // DISC-3: the source file name arrives from the DEBUGGEE, so it is untrusted input — a SourceFile
+    // attribute reading `../../../etc/passwd` is a perfectly valid class file. Every shape that could
+    // make the joined path leave the root has to be refused before the join, not after.
+    #[test]
+    fn source_path_refuses_every_segment_that_could_leave_a_root() {
+        for (class, file) in [
+            ("com.example.Order", "../../../../etc/passwd"),
+            ("com.example.Order", "..\\..\\windows\\win.ini"),
+            ("com.example.Order", ".."),
+            ("com.example.Order", "."),
+            ("com.example.Order", ""),
+            ("com.example.Order", "sub/Order.java"),
+            // A Windows drive-relative name and an NTFS alternate data stream: neither joins onto a
+            // root the way `join` makes it look.
+            ("com.example.Order", "C:Order.java"),
+            ("com.example.Order", "Order.java:secret"),
+            // …and the same escapes hidden in the package half.
+            ("com...Order", "Order.java"),
+            ("...Order", "Order.java"),
+        ] {
+            assert!(
+                source_relative_path(class, file).is_none(),
+                "({class}, {file}) must be refused, not turned into a path"
+            );
+        }
+    }
+
+    // DISC-3: the second layer of the traversal defence, which exists because the first is lexical and
+    // a symlink is not. `..` is used here rather than a symlink only because creating one needs
+    // privileges on Windows — the code path exercised (canonicalise, then containment) is the same one
+    // a symlink out of the tree takes.
+    #[test]
+    fn a_path_resolving_outside_its_root_is_refused_rather_than_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("com/example")).expect("mkdir");
+        std::fs::write(root.join("com/example/Order.java"), "class Order {}\n").expect("write");
+        std::fs::write(tmp.path().join("Secret.java"), "class Secret {}\n").expect("write");
+
+        let roots = vec![root];
+        let found = find_under_roots(&roots, std::path::Path::new("com/example/Order.java"));
+        assert!(matches!(found, SourceLookup::Found(_)), "a file genuinely under the root must resolve");
+
+        // The file exists and `root.join(..)` reaches it, so only the containment check stops it.
+        let escaped = find_under_roots(&roots, std::path::Path::new("../Secret.java"));
+        assert!(
+            matches!(escaped, SourceLookup::Escaped(_)),
+            "a path that resolves outside its root must be refused, not read"
+        );
+
+        let missing = find_under_roots(&roots, std::path::Path::new("com/example/Nope.java"));
+        assert!(matches!(missing, SourceLookup::Missing), "an absent file is a miss, not an escape");
+    }
+
+    // DISC-3: the window arithmetic, which is where this can be wrong in a way no probe would catch —
+    // a line within `context` of either end makes the window run off one side.
+    #[test]
+    fn the_line_window_stays_inside_the_file() {
+        // The ordinary case: `context` either side, inclusive.
+        assert_eq!(line_window(100, Some(50), 2, 400), (48, 52));
+        // Against either end, the window is clipped rather than wrapping or underflowing to 0.
+        assert_eq!(line_window(100, Some(1), 20, 400), (1, 21));
+        assert_eq!(line_window(100, Some(100), 20, 400), (80, 100));
+        // A file smaller than the window is returned whole.
+        assert_eq!(line_window(5, Some(3), 20, 400), (1, 5));
+        // A line past the end clamps to the end: the caller is chasing a frame, and a file shorter
+        // than the line it named is itself the finding.
+        assert_eq!(line_window(10, Some(999), 2, 400), (8, 10));
+        // No line means the whole file, capped.
+        assert_eq!(line_window(1000, None, 20, 400), (1, 400));
+        assert_eq!(line_window(30, None, 20, 400), (1, 30));
+        // An empty file has no lines to show, and must not report line 1.
+        assert_eq!(line_window(0, Some(5), 20, 400), (1, 0));
+    }
+
+    // DISC-3: when `max_lines` is the binding constraint the requested line stays CENTRED. Cutting the
+    // tail off instead would drop the lines after the frame, which are usually the ones being read.
+    #[test]
+    fn a_capped_window_keeps_the_requested_line_centred() {
+        assert_eq!(line_window(1000, Some(500), 100, 11), (495, 505));
+        // An odd cap is used whole; an even one loses the spare line rather than overshooting.
+        assert_eq!(line_window(1000, Some(500), 100, 10), (496, 504));
+        // A cap of 1 is the requested line alone, not an empty window.
+        assert_eq!(line_window(1000, Some(500), 100, 1), (500, 500));
+        // The cap never widens a window the caller asked to be narrow.
+        assert_eq!(line_window(1000, Some(500), 2, 400), (498, 502));
     }
 }

@@ -4,7 +4,7 @@
 
 use crate::commands::{command_sets, reference_type_commands};
 use crate::connection::JdwpConnection;
-use crate::protocol::{CommandPacket, JdwpResult};
+use crate::protocol::{CommandPacket, JdwpResult, ERR_ABSENT_INFORMATION, ERR_NOT_IMPLEMENTED};
 use crate::reader::{read_i32, read_string, read_u64};
 use crate::types::{FieldId, MethodId, ReferenceTypeId};
 use bytes::BufMut;
@@ -144,6 +144,70 @@ impl JdwpConnection {
             }
         }
         Ok(false)
+    }
+
+    /// `ReferenceType.SourceFile` — the file this type was compiled from, e.g. `OrderService.java`.
+    ///
+    /// A **bare file name, never a path**: the `SourceFile` class-file attribute records the name of
+    /// the compilation unit and nothing about where it lived, so a caller wanting a path has to get
+    /// the directory part from the type's own package. An inner or local type reports its *enclosing*
+    /// file (`Order.java` for `Order$Line`), because it has no compilation unit of its own — which is
+    /// exactly why resolving source by class name rather than by this cannot work.
+    ///
+    /// Deliberately uncached, unlike [`Self::get_methods`] / `get_signature`: those are read once per
+    /// frame in a loop, this is read once per `debug.source` call.
+    ///
+    /// # Errors
+    /// Returns [`JdwpError::JdwpErrorCode`](crate::JdwpError::JdwpErrorCode) carrying
+    /// [`ERR_ABSENT_INFORMATION`] for a class compiled without the attribute (`javac -g:none`, or a
+    /// synthetic class the JVM generated). That is an answer about the class, not a transport
+    /// failure, and callers are expected to report it as one.
+    pub async fn get_source_file(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<String> {
+        let id = self.next_id();
+        let mut packet =
+            CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::SOURCE_FILE);
+        packet.data.put_u64(ref_type_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        read_string(&mut data)
+    }
+
+    /// `ReferenceType.SourceDebugExtension` — the JSR-45 SMAP that says which *original* file the
+    /// bytecode came from when that is not the `.java` in [`Self::get_source_file`]: a JSP, a Kotlin
+    /// or Groovy unit, anything run through a translating compiler.
+    ///
+    /// `Ok(None)` is the ordinary answer, not a degraded one, so two error codes are absorbed rather
+    /// than propagated: [`ERR_ABSENT_INFORMATION`] for a class with no SMAP — which is nearly every
+    /// class — and [`ERR_NOT_IMPLEMENTED`] for a VM that lacks the optional
+    /// `canGetSourceDebugExtension` capability. Reporting either as an error would make the common
+    /// case look broken.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`](crate::JdwpError) only for a genuine failure — a transport error, some
+    /// other JDWP error code, or a reply that will not parse.
+    pub async fn get_source_debug_extension(
+        &mut self,
+        ref_type_id: ReferenceTypeId,
+    ) -> JdwpResult<Option<String>> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(
+            id,
+            command_sets::REFERENCE_TYPE,
+            reference_type_commands::SOURCE_DEBUG_EXTENSION,
+        );
+        packet.data.put_u64(ref_type_id);
+
+        let reply = self.send_command(packet).await?;
+        if matches!(reply.error_code, ERR_ABSENT_INFORMATION | ERR_NOT_IMPLEMENTED) {
+            return Ok(None);
+        }
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        read_string(&mut data).map(Some)
     }
 
     /// Get fields for a reference type (ReferenceType.Fields command)

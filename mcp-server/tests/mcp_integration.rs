@@ -13,8 +13,8 @@
 mod common;
 
 use common::{
-    assert_contains_all, jdk_or_skip, probe_line, probe_source, Fault, FaultRelay, Jdk, LatencyRelay, Probe,
-    Server, EVENT_TIMEOUT,
+    assert_contains_all, jdk_or_skip, probe_line, probe_source, probe_source_path, Fault, FaultRelay, Jdk,
+    LatencyRelay, Probe, Server, EVENT_TIMEOUT,
 };
 
 /// EVAL-1 / EVAL-2: static-method invocation and object arguments, through the real handlers.
@@ -3937,4 +3937,119 @@ fn list_methods_renders_java_signatures_and_marks_static() {
         serde_json::json!({"class_name": "com.example.NoSuchThing"}),
     );
     assert_contains_all("unloaded class", &missing, &["is not loaded", "debug.list_classes"]);
+}
+
+/// DISC-3 (#31): what a loaded class was compiled from, and the source behind a stack frame's line.
+///
+/// The two halves are asserted separately on purpose. The JVM half is driven with `source_roots: []`
+/// so it is proven to need no local file at all — that is the half that answers "is this checkout the
+/// code that is running?", and a test that always had the file on disk could not tell the two apart.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn source_reports_the_compiled_from_file_and_reads_a_window_from_a_root() {
+    let Some(jdk) = jdk_or_skip("source_reports_the_compiled_from_file_and_reads_a_window_from_a_root")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "EvalProbe").expect("launch EvalProbe");
+    // `examples/probes` is a source root of exactly the shape the tool expects: EvalProbe is in the
+    // default package, so its file sits directly in the root with no package directories between.
+    let root = probe_source_path("EvalProbe").parent().expect("probe source has a parent").to_path_buf();
+    let root_str = root.to_string_lossy().into_owned();
+    let mut server = Server::start_with_env(&[("JDWP_SOURCE_ROOTS", &root_str)]).expect("start server");
+    server.attach(probe.port);
+
+    let source = probe_source("EvalProbe");
+    let total = source.lines().count();
+    let bp1 = probe_line(&source, "// BP1");
+
+    // --- the JVM half, with the disk half switched off for this call ---
+    let jvm_only = server.call(
+        "debug.source",
+        serde_json::json!({"class_name": "EvalProbe", "source_roots": []}),
+    );
+    assert_contains_all("JVM-reported source file", &jvm_only, &[
+        "EvalProbe.java",
+        "reported by the JVM",
+        "No source roots are configured",
+    ]);
+    assert!(!jvm_only.contains("// BP1"), "an empty root list must read no file at all: {jvm_only}");
+    // A JDK class proves the command rather than our probe's build: nothing local could supply this.
+    let jdk_class = server.call(
+        "debug.source",
+        serde_json::json!({"class_name": "java.lang.String", "source_roots": []}),
+    );
+    assert!(jdk_class.contains("String.java"), "SourceFile for a JDK class: {jdk_class}");
+
+    // --- a bounded window around a line, numbered ---
+    let window = server.call(
+        "debug.source",
+        serde_json::json!({"class_name": "EvalProbe", "line": bp1, "context": 2}),
+    );
+    let span = format!("lines {}-{} of {total}", bp1 - 2, bp1 + 2);
+    let numbered = format!("{bp1} | ");
+    assert_contains_all("line window", &window, &["// BP1", &span, &numbered]);
+    // Bounded, and the bound is stated — a page that reads as the whole file is the DUMP-1 failure.
+    assert!(
+        !window.contains("public static void main"),
+        "a window must not carry the rest of the file: {window}"
+    );
+    assert!(window.contains("line(s) shown"), "a partial view must say so: {window}");
+
+    // --- whole_file is possible, and capped loudly rather than silently ---
+    let whole = server.call(
+        "debug.source",
+        serde_json::json!({"class_name": "EvalProbe", "whole_file": true}),
+    );
+    let all = format!("lines 1-{total} of {total}");
+    assert_contains_all("whole file", &whole, &[&all, "public static void main"]);
+    let capped = server.call(
+        "debug.source",
+        serde_json::json!({"class_name": "EvalProbe", "whole_file": true, "max_lines": 5}),
+    );
+    assert_contains_all(
+        "capped whole file",
+        &capped,
+        &[&format!("lines 1-5 of {total}"), "5 of", "line(s) shown"],
+    );
+
+    // --- an inner class resolves to its ENCLOSING file, which is the case a class-name-derived
+    //     resolver gets wrong: there is no EvalProbe$Item.java anywhere on disk ---
+    let item_line = probe_line(&source, "Item(String n, int q)");
+    let inner = server.call(
+        "debug.source",
+        serde_json::json!({"class_name": "EvalProbe$Item", "line": item_line, "context": 1}),
+    );
+    assert_contains_all("inner class", &inner, &["EvalProbe.java", "Item(String n, int q)"]);
+    assert!(
+        !inner.contains("EvalProbe$Item.java"),
+        "the file name must come from the JVM, not the class name: {inner}"
+    );
+
+    // --- the failure modes stay distinguishable ---
+    let unloaded = server.call("debug.source", serde_json::json!({"class_name": "com.example.NoSuchThing"}));
+    assert_contains_all("unloaded class", &unloaded, &["is not loaded", "debug.list_classes"]);
+
+    // A root that exists but does not hold this class: the JVM's answer must survive the local miss.
+    let elsewhere = server.call(
+        "debug.source",
+        serde_json::json!({
+            "class_name": "EvalProbe",
+            "line": bp1,
+            "source_roots": [env!("CARGO_MANIFEST_DIR")],
+        }),
+    );
+    assert_contains_all("no root holds it", &elsewhere, &[
+        "reported by the JVM",
+        "Not found on disk",
+        "Searched 1 root",
+    ]);
+
+    // A line past the end of the file is source DRIFT, not an error — and telling the caller which it
+    // is only works because the JVM's answer and the local file arrive in the same reply.
+    let stale = server.call(
+        "debug.source",
+        serde_json::json!({"class_name": "EvalProbe", "line": total + 500}),
+    );
+    assert_contains_all("stale line number", &stale, &["past the end", "does not match the running build"]);
 }

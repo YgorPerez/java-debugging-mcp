@@ -18,6 +18,13 @@ const fn default_limit() -> usize { 40 }
 // Higher than `default_limit`: a class listing is one short line each, and an app server loads
 // thousands, so the useful default shows enough of a package to recognise it without a second call.
 const fn default_class_limit() -> usize { 100 }
+// A ~41-line window: enough to hold the method a stack frame points into, which is the unit a caller
+// chasing that frame is actually reading, without pulling the file's neighbours in with it.
+const fn default_source_context() -> usize { 20 }
+// The ceiling on source lines in one reply, whichever way they were chosen. Deliberately far above
+// `default_source_context` so it only ever bites on `whole_file`, where the file's own size is the
+// only other bound — and a 2000-line class dumped into context is the cost being capped.
+const fn default_source_max_lines() -> usize { 400 }
 const fn default_trace_limit() -> usize { 50 }
 const fn default_event_limit() -> usize { 1 }
 const fn default_max_depth() -> usize { 2 }
@@ -58,6 +65,13 @@ pub struct AttachArgs {
     /// guard against accident, NOT a security boundary. Also forced on by the `JDWP_READONLY` env var.
     #[serde(default)]
     pub read_only: bool,
+    /// Directories `debug.source` searches for a class's `.java` file, e.g.
+    /// `["/srv/app/src/main/java"]`. A root is where the PACKAGE TREE starts, not the project root:
+    /// the file is looked for at `<root>/<package as directories>/<file the JVM reports>`. Plain
+    /// directories only — sources inside JARs are not read. Given here they replace the
+    /// `JDWP_SOURCE_ROOTS` environment default for this session; omitted, that default applies.
+    #[serde(default)]
+    pub source_roots: Option<Vec<String>>,
 }
 
 /// Arguments for `debug.set_line_stop`.
@@ -308,6 +322,35 @@ pub struct ListMethodsArgs {
     /// Max methods to return; the rest are reported as a hidden count.
     #[serde(default = "default_limit")]
     pub limit: usize,
+}
+
+/// Arguments for `debug.source` (DISC-3).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SourceArgs {
+    /// Fully-qualified class name, e.g. com.example.OrderService, or an inner class
+    /// com.example.Order$Line. Must already be loaded — find it with `debug.list_classes`.
+    pub class_name: String,
+    /// Centre the reply on this 1-based source line — the one a stack frame, a stop point or a trace
+    /// snapshot reported. This is the intended way to use the tool: without it (and without
+    /// `whole_file`) the reply is the JVM's answer only, and no file is read.
+    #[serde(default)]
+    pub line: Option<i32>,
+    /// Lines of context either side of `line`.
+    #[serde(default = "default_source_context")]
+    pub context: usize,
+    /// Return the whole file rather than a window, still capped by `max_lines`. Off by default, and
+    /// it overrides `line` when both are given.
+    #[serde(default)]
+    pub whole_file: bool,
+    /// Hard cap on how many source lines one reply may contain. Hitting it truncates loudly — the
+    /// reply always says which lines of how many it is showing.
+    #[serde(default = "default_source_max_lines")]
+    pub max_lines: usize,
+    /// Directories to search for this call only, replacing the session's roots (set at
+    /// `debug.attach` or by `JDWP_SOURCE_ROOTS`). Pass `[]` to skip reading any file and get only
+    /// what the JVM knows.
+    #[serde(default)]
+    pub source_roots: Option<Vec<String>>,
 }
 
 /// Arguments for `debug.thread_dump` (DUMP-1).

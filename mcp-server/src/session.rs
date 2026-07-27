@@ -62,6 +62,13 @@ pub struct DebugSession {
     /// refused, so pointing the debugger at a production JVM can't accidentally mutate it. A guard
     /// against accident, NOT a security boundary — anyone who can reach the JDWP port can do anything.
     pub read_only: bool,
+    /// Directories `debug.source` searches for a class's `.java` file (DISC-3), resolved once at
+    /// attach from the tool argument or `JDWP_SOURCE_ROOTS`.
+    ///
+    /// Per session rather than per call because a checkout belongs to the JVM you attached to, not to
+    /// the question you are asking: the same list would otherwise be repeated on every call, and two
+    /// sessions against different deployments need different lists.
+    pub source_roots: Vec<std::path::PathBuf>,
     /// Breakpoints requested on classes not yet loaded. Each holds a `CLASS_PREPARE` request that
     /// fires when the class loads; the event pump then arms the real breakpoint. See handlers.rs.
     pub pending_breakpoints: Vec<PendingBreakpoint>,
@@ -471,7 +478,13 @@ impl SessionManager {
         }
     }
 
-    pub async fn create_session(&self, connection: JdwpConnection, endpoint: String, read_only: bool) -> SessionId {
+    pub async fn create_session(
+        &self,
+        connection: JdwpConnection,
+        endpoint: String,
+        read_only: bool,
+        source_roots: Vec<std::path::PathBuf>,
+    ) -> SessionId {
         let session_id = format!("session_{}", uuid::v4());
         let session = DebugSession {
             connection,
@@ -490,6 +503,7 @@ impl SessionManager {
             trace_disarms: std::collections::BTreeMap::new(),
             trace_disarms_dropped: 0,
             read_only,
+            source_roots,
             pending_breakpoints: Vec::new(),
             exception_requests: HashMap::new(),
             watchpoints: HashMap::new(),

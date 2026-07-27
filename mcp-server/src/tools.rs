@@ -4,7 +4,7 @@
 // advertised schema always matches what the handler deserializes. Tools with no arguments use an
 // empty object schema.
 
-use crate::args::{AttachArgs, SetBreakpointArgs, ClearBreakpointArgs, StepArgs, GetStackArgs, EvaluateArgs, GetLastEventArgs, ListThreadsArgs, ListClassesArgs, ListMethodsArgs, SetValueArgs, GetTracesArgs, SetExceptionBreakpointArgs, SetWatchpointArgs, ForceReturnArgs, ToggleBreakpointArgs, ThreadDumpArgs, SetMethodBreakpointArgs};
+use crate::args::{AttachArgs, SetBreakpointArgs, ClearBreakpointArgs, StepArgs, GetStackArgs, EvaluateArgs, GetLastEventArgs, ListThreadsArgs, ListClassesArgs, ListMethodsArgs, SourceArgs, SetValueArgs, GetTracesArgs, SetExceptionBreakpointArgs, SetWatchpointArgs, ForceReturnArgs, ToggleBreakpointArgs, ThreadDumpArgs, SetMethodBreakpointArgs};
 use crate::protocol::Tool;
 use serde_json::json;
 
@@ -173,6 +173,11 @@ fn inspection_tools() -> Vec<Tool> {
             input_schema: to_val(schemars::schema_for!(ListMethodsArgs)),
         },
         Tool {
+            name: "debug.source".to_string(),
+            description: "What file a loaded class was COMPILED FROM, and — when source roots are configured — the source lines around a given line. Two independent halves. The JVM half needs no local files at all and is the one that settles whether your checkout is the code that is actually running: a class reporting Order.java in a tree where that file was renamed months ago is the answer, and reading local source would never have shown it. A JSR-45 source debug extension (JSP, Kotlin, Groovy) is reported when the class carries one, meaning the .java name is only an intermediate. The disk half turns a stack frame's class.method:line into text: pass line to get a bounded window around it with line numbers (context, default 20 either side) — that is the intended use, since a caller chasing one frame should not pull a 2000-line file into context. whole_file:true returns everything, still capped by max_lines (default 400), and the reply always states which lines of how many it is showing. Roots come from debug.attach {source_roots:[...]} or the JDWP_SOURCE_ROOTS environment variable, and source_roots on the call overrides both ([] reads no file). A root is where the PACKAGE TREE starts: the file is looked up at <root>/<package as directories>/<the name the JVM reported>, which is why an inner class (com.example.Order$Line) correctly resolves to its enclosing Order.java. Plain directories only — sources inside JARs are not read. The failure modes stay distinct: class not loaded, loaded but compiled with no SourceFile attribute (javac -g:none, or a synthetic class), no configured root holds the file, and found-but-unreadable each say something different about what to fix.".to_string(),
+            input_schema: to_val(schemars::schema_for!(SourceArgs)),
+        },
+        Tool {
             name: "debug.thread_dump".to_string(),
             description: "Every thread's stack in ONE call, plus which monitors each thread holds and which one it is blocked entering — the \"it's wedged, who is blocked on what?\" question, which list_threads (names only) and get_stack (one thread) can't answer. A thread waiting on a lock someone else holds is annotated `← held by 0x<id> \"<name>\"`, so a deadlock cycle is readable off the output. IMPORTANT: JDWP can only read a SUSPENDED thread's stack and locks, so on a running VM every thread comes back unreadable — pass suspend:true to freeze it briefly (it is resumed and verified before the reply) or only_suspended:true to list just the readable ones. It never suspends on its own. Narrow the cost with name_filter / limit / max_frames / package_filter; for the deadlock question alone, monitors_only:true reads the lock graph without the frames. The reply reports how many JDWP packets it spent, WHAT EACH ONE COST on this connection (round trip plus our processing), and, when it suspended, how many milliseconds it held the VM — bounded by max_suspend_ms (default 2000), which truncates loudly rather than silently and tells you what finishing would have cost at the rate it was running. Those figures are measured against the JVM you are attached to, so you never have to judge whether a number measured elsewhere applies: a dump of a 306-thread pool with 60-frame stacks costs ~258 packets and ~65ms at the defaults, or ~1,625 packets and ~700ms for every thread and every frame. Works in a read-only session (it invokes nothing).".to_string(),
             input_schema: to_val(schemars::schema_for!(ThreadDumpArgs)),
@@ -221,6 +226,7 @@ mod tests {
             "debug.list_threads",
             "debug.list_classes",
             "debug.list_methods",
+            "debug.source",
             "debug.thread_dump",
             "debug.get_traces",
         ] {

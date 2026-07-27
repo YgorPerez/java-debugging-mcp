@@ -103,6 +103,18 @@ impl CommandPacket {
     }
 }
 
+/// `ABSENT_INFORMATION` — the class is there, the debug attribute being asked for is not (`javac
+/// -g:none`, a synthetic class, a JVM without an optional table).
+///
+/// Public because callers *branch* on this one instead of reporting it. It is a fact about how the
+/// class was compiled, and telling it apart from a transport failure is the difference between "this
+/// build has no line numbers" and "the debugger is broken".
+pub const ERR_ABSENT_INFORMATION: u16 = 101;
+
+/// `NOT_IMPLEMENTED` — the VM never had the optional capability behind the command. Public for the
+/// same reason as [`ERR_ABSENT_INFORMATION`]: for an optional command it is an answer, not a fault.
+pub const ERR_NOT_IMPLEMENTED: u16 = 99;
+
 /// JDWP error-code to human-readable name mapping.
 const ERROR_MESSAGES: &[(u16, &str)] = &[
     (0, "NONE"),
