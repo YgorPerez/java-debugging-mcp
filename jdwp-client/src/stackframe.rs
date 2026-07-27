@@ -56,13 +56,9 @@ impl JdwpConnection {
             let tag = read_u8(&mut data)?;
             let value_data = read_value_by_tag(tag, &mut data)?;
 
-            values.push(Value {
-                tag,
-                data: value_data,
-            });
+            values.push(Value { tag, data: value_data });
         }
 
         Ok(values)
     }
 }
-

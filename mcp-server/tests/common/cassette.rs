@@ -101,8 +101,7 @@ impl Cassette {
         if self.served.len() != self.exchanges.len() {
             self.rewind();
         }
-        let matches =
-            |e: &Exchange| e.set == set && e.command == command && e.request.as_slice() == request;
+        let matches = |e: &Exchange| e.set == set && e.command == command && e.request.as_slice() == request;
         if let Some(i) = (0..self.exchanges.len())
             .find(|&i| !self.served.get(i).copied().unwrap_or(true) && matches(&self.exchanges[i]))
         {
@@ -143,8 +142,7 @@ impl Cassette {
     /// Returns the reason as text if the directory cannot be created or the file cannot be written.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
         std::fs::write(path, self.to_json())
             .map_err(|e| format!("cannot write cassette {}: {e}", path.display()))
@@ -188,8 +186,7 @@ impl Cassette {
     /// # Errors
     /// Returns the reason as text, naming the exchange index whenever it can.
     pub fn from_json(text: &str) -> Result<Self, String> {
-        let v: serde_json::Value =
-            serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
+        let v: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
         let raw = v
             .get("exchanges")
             .and_then(serde_json::Value::as_array)
@@ -201,24 +198,22 @@ impl Cassette {
                     .and_then(serde_json::Value::as_u64)
                     .ok_or_else(|| format!("exchange {i} has no numeric `{name}`"))
             };
-            let set = u8::try_from(field("set")?)
-                .map_err(|_| format!("exchange {i}: `set` is not a byte"))?;
-            let command = u8::try_from(field("cmd")?)
-                .map_err(|_| format!("exchange {i}: `cmd` is not a byte"))?;
+            let set =
+                u8::try_from(field("set")?).map_err(|_| format!("exchange {i}: `set` is not a byte"))?;
+            let command =
+                u8::try_from(field("cmd")?).map_err(|_| format!("exchange {i}: `cmd` is not a byte"))?;
             let error = u16::try_from(field("error")?)
                 .map_err(|_| format!("exchange {i}: `error` does not fit a u2"))?;
             exchanges.push(Exchange {
                 set,
                 command,
-                request: hex_value(e.get("request"))
-                    .map_err(|m| format!("exchange {i} `request`: {m}"))?,
+                request: hex_value(e.get("request")).map_err(|m| format!("exchange {i} `request`: {m}"))?,
                 error,
                 reply: hex_value(e.get("reply")).map_err(|m| format!("exchange {i} `reply`: {m}"))?,
             });
         }
-        let text_field = |name: &str| {
-            v.get(name).and_then(serde_json::Value::as_str).unwrap_or_default().to_string()
-        };
+        let text_field =
+            |name: &str| v.get(name).and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
         let served = vec![false; exchanges.len()];
         Ok(Self {
             title: text_field("cassette"),
@@ -258,8 +253,7 @@ impl CassetteRecorder {
     pub fn start(target_port: u16) -> Result<Self, String> {
         let exchanges: Arc<Mutex<Vec<Exchange>>> = Arc::new(Mutex::new(Vec::new()));
         let events = Arc::new(Mutex::new(0usize));
-        let finished: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>> =
-            Arc::new(Mutex::new(None));
+        let finished: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>> = Arc::new(Mutex::new(None));
 
         let (tape, seen, done) = (Arc::clone(&exchanges), Arc::clone(&events), Arc::clone(&finished));
         let relay = Relay::start("cassette recorder", Some(target_port), move |client, server| {
@@ -363,9 +357,7 @@ impl ReplayServer {
             let Ok(mut out) = client.try_clone() else { return };
             std::thread::spawn(move || {
                 read_frames(client, |frame| match frame {
-                    Frame::Handshake(_) => {
-                        std::io::Write::write_all(&mut out, JDWP_HANDSHAKE).is_ok()
-                    }
+                    Frame::Handshake(_) => std::io::Write::write_all(&mut out, JDWP_HANDSHAKE).is_ok(),
                     Frame::Packet(pkt) => serve(pkt, &mut tape, &mut out, &log),
                 });
                 let _ = out.shutdown(std::net::Shutdown::Both);
@@ -407,11 +399,7 @@ impl Drop for ReplayServer {
     /// with a stack trace.
     fn drop(&mut self) {
         let misses = self.misses();
-        assert!(
-            misses.is_empty() || std::thread::panicking(),
-            "{}",
-            miss_report(&misses)
-        );
+        assert!(misses.is_empty() || std::thread::panicking(), "{}", miss_report(&misses));
     }
 }
 
@@ -427,9 +415,7 @@ fn serve(
     if pkt.get(8).copied().is_some_and(|f| f & JDWP_REPLY_FLAG != 0) {
         return true;
     }
-    let (Some(id), Some(set), Some(cmd)) =
-        (packet_id(pkt), pkt.get(9).copied(), pkt.get(10).copied())
-    else {
+    let (Some(id), Some(set), Some(cmd)) = (packet_id(pkt), pkt.get(9).copied(), pkt.get(10).copied()) else {
         return false;
     };
     let request = pkt.get(JDWP_HEADER..).unwrap_or_default();
@@ -468,9 +454,7 @@ fn miss_report(misses: &[String]) -> String {
 
 /// A reply packet's JDWP error code, from bytes 9..11.
 fn reply_error(pkt: &[u8]) -> u16 {
-    pkt.get(9..11)
-        .and_then(|s| <[u8; 2]>::try_from(s).ok())
-        .map_or(0, u16::from_be_bytes)
+    pkt.get(9..11).and_then(|s| <[u8; 2]>::try_from(s).ok()).map_or(0, u16::from_be_bytes)
 }
 
 /// Bytes as lowercase hex — the form a payload takes in a cassette, and what anything synthesising one
@@ -508,8 +492,7 @@ fn hex_field(bytes: &[u8], indent: usize) -> String {
         return format!("\"{}\"", hex(bytes));
     }
     let pad = " ".repeat(indent + 2);
-    let lines: Vec<String> =
-        bytes.chunks(BYTES_PER_LINE).map(|c| format!("{pad}\"{}\"", hex(c))).collect();
+    let lines: Vec<String> = bytes.chunks(BYTES_PER_LINE).map(|c| format!("{pad}\"{}\"", hex(c))).collect();
     format!("[\n{}\n{}]", lines.join(",\n"), " ".repeat(indent))
 }
 
@@ -565,41 +548,110 @@ type NamedCommandSet = (u8, &'static str, &'static [NamedCommand]);
 /// because a cassette stores bytes and decoding them would be a second protocol implementation to keep
 /// honest.
 const COMMAND_SETS: &[NamedCommandSet] = &[
-    (1, "VirtualMachine", &[
-        (1, "Version"), (2, "ClassesBySignature"), (3, "AllClasses"), (4, "AllThreads"),
-        (5, "TopLevelThreadGroups"), (6, "Dispose"), (7, "IDSizes"), (8, "Suspend"), (9, "Resume"),
-        (10, "Exit"), (11, "CreateString"), (12, "Capabilities"), (13, "ClassPaths"),
-        (14, "DisposeObjects"), (15, "HoldEvents"), (16, "ReleaseEvents"), (17, "CapabilitiesNew"),
-        (18, "RedefineClasses"), (19, "SetDefaultStratum"), (20, "AllClassesWithGeneric"),
-        (21, "InstanceCounts"), (22, "AllModules"),
-    ]),
-    (2, "ReferenceType", &[
-        (1, "Signature"), (2, "ClassLoader"), (3, "Modifiers"), (4, "Fields"), (5, "Methods"),
-        (6, "GetValues"), (7, "SourceFile"), (8, "NestedTypes"), (9, "Status"), (10, "Interfaces"),
-        (11, "ClassObject"), (12, "SourceDebugExtension"), (13, "SignatureWithGeneric"),
-        (14, "FieldsWithGeneric"), (15, "MethodsWithGeneric"), (16, "Instances"),
-        (17, "ClassFileVersion"), (18, "ConstantPool"), (19, "Module"),
-    ]),
+    (
+        1,
+        "VirtualMachine",
+        &[
+            (1, "Version"),
+            (2, "ClassesBySignature"),
+            (3, "AllClasses"),
+            (4, "AllThreads"),
+            (5, "TopLevelThreadGroups"),
+            (6, "Dispose"),
+            (7, "IDSizes"),
+            (8, "Suspend"),
+            (9, "Resume"),
+            (10, "Exit"),
+            (11, "CreateString"),
+            (12, "Capabilities"),
+            (13, "ClassPaths"),
+            (14, "DisposeObjects"),
+            (15, "HoldEvents"),
+            (16, "ReleaseEvents"),
+            (17, "CapabilitiesNew"),
+            (18, "RedefineClasses"),
+            (19, "SetDefaultStratum"),
+            (20, "AllClassesWithGeneric"),
+            (21, "InstanceCounts"),
+            (22, "AllModules"),
+        ],
+    ),
+    (
+        2,
+        "ReferenceType",
+        &[
+            (1, "Signature"),
+            (2, "ClassLoader"),
+            (3, "Modifiers"),
+            (4, "Fields"),
+            (5, "Methods"),
+            (6, "GetValues"),
+            (7, "SourceFile"),
+            (8, "NestedTypes"),
+            (9, "Status"),
+            (10, "Interfaces"),
+            (11, "ClassObject"),
+            (12, "SourceDebugExtension"),
+            (13, "SignatureWithGeneric"),
+            (14, "FieldsWithGeneric"),
+            (15, "MethodsWithGeneric"),
+            (16, "Instances"),
+            (17, "ClassFileVersion"),
+            (18, "ConstantPool"),
+            (19, "Module"),
+        ],
+    ),
     (3, "ClassType", &[(1, "Superclass"), (2, "SetValues"), (3, "InvokeMethod"), (4, "NewInstance")]),
     (4, "ArrayType", &[(1, "NewInstance")]),
     (5, "InterfaceType", &[(1, "InvokeMethod")]),
-    (6, "Method", &[
-        (1, "LineTable"), (2, "VariableTable"), (3, "Bytecodes"), (4, "IsObsolete"),
-        (5, "VariableTableWithGeneric"),
-    ]),
+    (
+        6,
+        "Method",
+        &[
+            (1, "LineTable"),
+            (2, "VariableTable"),
+            (3, "Bytecodes"),
+            (4, "IsObsolete"),
+            (5, "VariableTableWithGeneric"),
+        ],
+    ),
     (8, "Field", &[]),
-    (9, "ObjectReference", &[
-        (1, "ReferenceType"), (2, "GetValues"), (3, "SetValues"), (5, "MonitorInfo"),
-        (6, "InvokeMethod"), (7, "DisableCollection"), (8, "EnableCollection"), (9, "IsCollected"),
-        (10, "ReferringObjects"),
-    ]),
+    (
+        9,
+        "ObjectReference",
+        &[
+            (1, "ReferenceType"),
+            (2, "GetValues"),
+            (3, "SetValues"),
+            (5, "MonitorInfo"),
+            (6, "InvokeMethod"),
+            (7, "DisableCollection"),
+            (8, "EnableCollection"),
+            (9, "IsCollected"),
+            (10, "ReferringObjects"),
+        ],
+    ),
     (10, "StringReference", &[(1, "Value")]),
-    (11, "ThreadReference", &[
-        (1, "Name"), (2, "Suspend"), (3, "Resume"), (4, "Status"), (5, "ThreadGroup"), (6, "Frames"),
-        (7, "FrameCount"), (8, "OwnedMonitors"), (9, "CurrentContendedMonitor"), (10, "Stop"),
-        (11, "Interrupt"), (12, "SuspendCount"), (13, "OwnedMonitorsStackDepthInfo"),
-        (14, "ForceEarlyReturn"),
-    ]),
+    (
+        11,
+        "ThreadReference",
+        &[
+            (1, "Name"),
+            (2, "Suspend"),
+            (3, "Resume"),
+            (4, "Status"),
+            (5, "ThreadGroup"),
+            (6, "Frames"),
+            (7, "FrameCount"),
+            (8, "OwnedMonitors"),
+            (9, "CurrentContendedMonitor"),
+            (10, "Stop"),
+            (11, "Interrupt"),
+            (12, "SuspendCount"),
+            (13, "OwnedMonitorsStackDepthInfo"),
+            (14, "ForceEarlyReturn"),
+        ],
+    ),
     (12, "ThreadGroupReference", &[(1, "Name"), (2, "Parent"), (3, "Children")]),
     (13, "ArrayReference", &[(1, "Length"), (2, "GetValues"), (3, "SetValues")]),
     (14, "ClassLoaderReference", &[(1, "VisibleClasses")]),

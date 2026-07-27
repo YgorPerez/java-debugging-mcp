@@ -9,29 +9,61 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-fn default_host() -> String { "localhost".to_string() }
-const fn default_port() -> u16 { 5005 }
-const fn default_max_frames() -> usize { 20 }
-const fn default_true() -> bool { true }
-const fn default_max_result_length() -> usize { 2000 }
-const fn default_limit() -> usize { 40 }
+fn default_host() -> String {
+    "localhost".to_string()
+}
+const fn default_port() -> u16 {
+    5005
+}
+const fn default_max_frames() -> usize {
+    20
+}
+const fn default_true() -> bool {
+    true
+}
+const fn default_max_result_length() -> usize {
+    2000
+}
+const fn default_limit() -> usize {
+    40
+}
 // Higher than `default_limit`: a class listing is one short line each, and an app server loads
 // thousands, so the useful default shows enough of a package to recognise it without a second call.
-const fn default_class_limit() -> usize { 100 }
+const fn default_class_limit() -> usize {
+    100
+}
 // A ~41-line window: enough to hold the method a stack frame points into, which is the unit a caller
 // chasing that frame is actually reading, without pulling the file's neighbours in with it.
-const fn default_source_context() -> usize { 20 }
+const fn default_source_context() -> usize {
+    20
+}
 // The ceiling on source lines in one reply, whichever way they were chosen. Deliberately far above
 // `default_source_context` so it only ever bites on `whole_file`, where the file's own size is the
 // only other bound — and a 2000-line class dumped into context is the cost being capped.
-const fn default_source_max_lines() -> usize { 400 }
-const fn default_trace_limit() -> usize { 50 }
-const fn default_event_limit() -> usize { 1 }
-const fn default_max_depth() -> usize { 2 }
-const fn default_max_children() -> usize { 16 }
-const fn default_trace_frames() -> usize { crate::handlers::DEFAULT_TRACE_FRAMES }
-const fn default_dump_frames() -> usize { 8 }
-const fn default_max_suspend_ms() -> u64 { crate::handlers::DEFAULT_MAX_SUSPEND_MS }
+const fn default_source_max_lines() -> usize {
+    400
+}
+const fn default_trace_limit() -> usize {
+    50
+}
+const fn default_event_limit() -> usize {
+    1
+}
+const fn default_max_depth() -> usize {
+    2
+}
+const fn default_max_children() -> usize {
+    16
+}
+const fn default_trace_frames() -> usize {
+    crate::handlers::DEFAULT_TRACE_FRAMES
+}
+const fn default_dump_frames() -> usize {
+    8
+}
+const fn default_max_suspend_ms() -> u64 {
+    crate::handlers::DEFAULT_MAX_SUSPEND_MS
+}
 
 /// Parse an optional hex thread id like "0x2" (or "2") into a raw id.
 pub fn parse_thread_id(s: Option<&str>) -> Option<u64> {
@@ -41,11 +73,7 @@ pub fn parse_thread_id(s: Option<&str>) -> Option<u64> {
 /// Deserialize tool arguments into a typed struct, tolerating a missing/`null` arguments value
 /// (treated as an empty object so all-optional structs still get their defaults).
 pub fn parse<T: serde::de::DeserializeOwned>(args: &serde_json::Value) -> Result<T, String> {
-    let v = if args.is_null() {
-        serde_json::Value::Object(serde_json::Map::new())
-    } else {
-        args.clone()
-    };
+    let v = if args.is_null() { serde_json::Value::Object(serde_json::Map::new()) } else { args.clone() };
     serde_json::from_value(v).map_err(|e| format!("Invalid arguments: {e}"))
 }
 
@@ -750,8 +778,10 @@ mod tests {
     // callers keep working after the locals→fields generalization.
     #[test]
     fn set_value_accepts_target_and_legacy_name() {
-        let by_target: SetValueArgs =
-            serde_json::from_value(serde_json::json!({"target": "ConfigDefaultUtils.dsInfra", "value": "DEV"})).unwrap();
+        let by_target: SetValueArgs = serde_json::from_value(
+            serde_json::json!({"target": "ConfigDefaultUtils.dsInfra", "value": "DEV"}),
+        )
+        .unwrap();
         assert_eq!(by_target.target, "ConfigDefaultUtils.dsInfra");
 
         let by_name: SetValueArgs =

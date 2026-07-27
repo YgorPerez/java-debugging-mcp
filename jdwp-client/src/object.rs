@@ -29,16 +29,10 @@ impl JdwpConnection {
     ///
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
-    pub async fn get_object_reference_type(
-        &mut self,
-        object_id: ObjectId,
-    ) -> JdwpResult<ReferenceTypeId> {
+    pub async fn get_object_reference_type(&mut self, object_id: ObjectId) -> JdwpResult<ReferenceTypeId> {
         let id = self.next_id();
-        let mut packet = CommandPacket::new(
-            id,
-            command_sets::OBJECT_REFERENCE,
-            object_reference_commands::REFERENCE_TYPE,
-        );
+        let mut packet =
+            CommandPacket::new(id, command_sets::OBJECT_REFERENCE, object_reference_commands::REFERENCE_TYPE);
 
         packet.data.put_u64(object_id);
 
@@ -83,11 +77,8 @@ impl JdwpConnection {
         field_ids: Vec<FieldId>,
     ) -> JdwpResult<Vec<Value>> {
         let id = self.next_id();
-        let mut packet = CommandPacket::new(
-            id,
-            command_sets::OBJECT_REFERENCE,
-            object_reference_commands::GET_VALUES,
-        );
+        let mut packet =
+            CommandPacket::new(id, command_sets::OBJECT_REFERENCE, object_reference_commands::GET_VALUES);
 
         // Write object ID
         packet.data.put_u64(object_id);
@@ -113,10 +104,7 @@ impl JdwpConnection {
             let tag = read_u8(&mut data)?;
             let value_data = read_value_by_tag(tag, &mut data)?;
 
-            values.push(Value {
-                tag,
-                data: value_data,
-            });
+            values.push(Value { tag, data: value_data });
         }
 
         Ok(values)
@@ -144,11 +132,8 @@ impl JdwpConnection {
     ) -> JdwpResult<Vec<Value>> {
         use crate::commands::reference_type_commands;
         let id = self.next_id();
-        let mut packet = CommandPacket::new(
-            id,
-            command_sets::REFERENCE_TYPE,
-            reference_type_commands::GET_VALUES,
-        );
+        let mut packet =
+            CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::GET_VALUES);
 
         // Write reference type ID
         packet.data.put_u64(ref_type_id);
@@ -174,10 +159,7 @@ impl JdwpConnection {
             let tag = read_u8(&mut data)?;
             let value_data = read_value_by_tag(tag, &mut data)?;
 
-            values.push(Value {
-                tag,
-                data: value_data,
-            });
+            values.push(Value { tag, data: value_data });
         }
 
         Ok(values)
@@ -226,11 +208,8 @@ impl JdwpConnection {
     ) -> JdwpResult<()> {
         self.guard_invocation("an instance field write")?;
         let id = self.next_id();
-        let mut packet = CommandPacket::new(
-            id,
-            command_sets::OBJECT_REFERENCE,
-            object_reference_commands::SET_VALUES,
-        );
+        let mut packet =
+            CommandPacket::new(id, command_sets::OBJECT_REFERENCE, object_reference_commands::SET_VALUES);
         packet.data.put_u64(object_id);
         packet.data.put_i32(i32::try_from(updates.len()).unwrap_or(i32::MAX));
         for (field_id, value) in &updates {
@@ -245,7 +224,6 @@ impl JdwpConnection {
 
 #[cfg(test)]
 mod tests {
-    
 
     #[test]
     fn test_object_values_packet() {

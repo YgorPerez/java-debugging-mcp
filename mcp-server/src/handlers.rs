@@ -2,7 +2,11 @@
 //
 // Handles initialize, list tools, and debug tool execution
 
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, METHOD_NOT_FOUND, JsonRpcNotification, InitializeParams, INVALID_PARAMS, INTERNAL_ERROR, InitializeResult, ServerCapabilities, ToolsCapability, ServerInfo, ListToolsResult, CallToolParams, CallToolResult, ContentBlock};
+use crate::protocol::{
+    CallToolParams, CallToolResult, ContentBlock, InitializeParams, InitializeResult, JsonRpcError,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ListToolsResult, ServerCapabilities, ServerInfo,
+    ToolsCapability, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND,
+};
 use crate::session::SessionManager;
 use crate::tools;
 use serde_json::json;
@@ -29,10 +33,7 @@ pub struct RequestHandler {
 
 impl RequestHandler {
     pub fn new(alerter: crate::protocol::Alerter) -> Self {
-        Self {
-            session_manager: SessionManager::new(alerter.clone()),
-            alerter,
-        }
+        Self { session_manager: SessionManager::new(alerter.clone()), alerter }
     }
 
     /// Resolve the target session: an explicit `session_id` argument, else the current session.
@@ -94,8 +95,8 @@ impl RequestHandler {
     }
 
     fn handle_initialize(params: Option<serde_json::Value>) -> Result<serde_json::Value, JsonRpcError> {
-        let _params: InitializeParams = serde_json::from_value(params.unwrap_or_else(|| json!({})))
-            .map_err(|e| JsonRpcError {
+        let _params: InitializeParams =
+            serde_json::from_value(params.unwrap_or_else(|| json!({}))).map_err(|e| JsonRpcError {
                 code: INVALID_PARAMS,
                 message: format!("Invalid initialize params: {e}"),
                 data: None,
@@ -127,14 +128,15 @@ impl RequestHandler {
     }
 
     fn handle_list_tools() -> Result<serde_json::Value, JsonRpcError> {
-        let result = ListToolsResult {
-            tools: tools::get_tools(),
-        };
+        let result = ListToolsResult { tools: tools::get_tools() };
 
         to_json(&result)
     }
 
-    async fn handle_call_tool(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value, JsonRpcError> {
+    async fn handle_call_tool(
+        &self,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, JsonRpcError> {
         let call_params: CallToolParams = serde_json::from_value(params.unwrap_or_else(|| json!({})))
             .map_err(|e| JsonRpcError {
                 code: INVALID_PARAMS,
@@ -155,10 +157,8 @@ impl RequestHandler {
 
         match result {
             Ok(content) => {
-                let call_result = CallToolResult {
-                    content: vec![ContentBlock::Text { text: content }],
-                    is_error: None,
-                };
+                let call_result =
+                    CallToolResult { content: vec![ContentBlock::Text { text: content }], is_error: None };
                 to_json(&call_result)
             }
             Err(error) => {
@@ -219,7 +219,8 @@ impl RequestHandler {
         let host = a.host.as_str();
         let port = a.port;
 
-        let connection = jdwp_client::JdwpConnection::connect(host, port).await
+        let connection = jdwp_client::JdwpConnection::connect(host, port)
+            .await
             .map_err(|e| format!("Failed to connect: {e}"))?;
 
         // Read-only when the caller asks for it OR the env forces it (a deploy-wide guard for a
@@ -236,15 +237,18 @@ impl RequestHandler {
         // how `read_only` combines above — and deliberately so. `JDWP_READONLY` is a deploy-wide guard
         // that must not be relaxable per-attach; `JDWP_SOURCE_ROOTS` is only a convenience default, so
         // a caller who names roots for this JVM means those and not also whatever the environment held.
-        let source_roots = a.source_roots.as_ref().map_or_else(
-            env_source_roots,
-            |v| v.iter().map(std::path::PathBuf::from).collect(),
-        );
-        let session_id = self.session_manager
+        let source_roots = a
+            .source_roots
+            .as_ref()
+            .map_or_else(env_source_roots, |v| v.iter().map(std::path::PathBuf::from).collect());
+        let session_id = self
+            .session_manager
             .create_session(connection, format!("{host}:{port}"), read_only, source_roots)
             .await;
         // Get the session guard once so the listener/watchdog handles are stored before we return.
-        let session_guard = self.resolve_session(&args).await
+        let session_guard = self
+            .resolve_session(&args)
+            .await
             .ok_or_else(|| "Failed to get session after creation".to_string())?;
 
         {
@@ -258,10 +262,7 @@ impl RequestHandler {
             ));
             // Watchdog: auto-resume if a breakpoint leaves the VM suspended too long, so a
             // forgotten breakpoint can't freeze a request thread on a shared instance.
-            session.watchdog_task = Some(spawn_watchdog(
-                self.session_manager.clone(),
-                session_id.clone(),
-            ));
+            session.watchdog_task = Some(spawn_watchdog(self.session_manager.clone(), session_id.clone()));
         }
 
         let ro = if read_only {
@@ -326,7 +327,9 @@ impl RequestHandler {
             suspend_policy,
         };
 
-        let session_guard = self.resolve_session(&args).await
+        let session_guard = self
+            .resolve_session(&args)
+            .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
         check_readonly_exprs(session.read_only, spec.condition.as_deref(), spec.trace_expr.as_deref())?;
@@ -336,7 +339,10 @@ impl RequestHandler {
         // deferred — and kept across any later disable/re-arm (BP-3).
         let bp_id = session.next_stop_id("bp_");
 
-        let classes = session.connection.classes_by_signature(&spec.signature).await
+        let classes = session
+            .connection
+            .classes_by_signature(&spec.signature)
+            .await
             .map_err(|e| format!("Failed to find class: {e}"))?;
         let Some(first_class) = classes.first() else {
             return register_deferred_breakpoint(&mut session, &spec, bp_id).await;
@@ -360,18 +366,25 @@ impl RequestHandler {
         Ok(format!(
             "✅ {} set at {}:{}\n   Method: {}\n   Stop-point ID: {}\n   JDWP Request ID: {}{}",
             if spec.trace { "Trace breakpoint" } else { "Breakpoint" },
-            spec.class_pattern, line, method_name, bp_id, request_id, extra
+            spec.class_pattern,
+            line,
+            method_name,
+            bp_id,
+            request_id,
+            extra
         ))
     }
 
     async fn handle_list_stop_points(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
 
-        if session.breakpoints.is_empty() && session.pending_breakpoints.is_empty()
-            && session.exception_requests.is_empty() && session.watchpoints.is_empty()
+        if session.breakpoints.is_empty()
+            && session.pending_breakpoints.is_empty()
+            && session.exception_requests.is_empty()
+            && session.watchpoints.is_empty()
             && session.method_exits.is_empty()
         {
             return Ok(session.last_watchdog_note.as_ref().map_or_else(
@@ -390,10 +403,14 @@ impl RequestHandler {
         if let Some(n) = &session.last_watchdog_note {
             let _ = writeln!(output, "⏰ {n}\n");
         }
-        let _ = write!(output,
+        let _ = write!(
+            output,
             "📍 {} breakpoint(s), {} deferred, {} exception, {} watchpoint(s), {} method-exit:\n\n",
-            session.breakpoints.len(), session.pending_breakpoints.len(),
-            session.exception_requests.len(), session.watchpoints.len(), session.method_exits.len()
+            session.breakpoints.len(),
+            session.pending_breakpoints.len(),
+            session.exception_requests.len(),
+            session.watchpoints.len(),
+            session.method_exits.len()
         );
 
         for (bp_id, bp) in &session.breakpoints {
@@ -434,8 +451,8 @@ impl RequestHandler {
         let a: crate::args::ClearBreakpointArgs = crate::args::parse(&args)?;
         let bp_id = a.breakpoint_id.as_str();
 
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
 
@@ -456,7 +473,10 @@ impl RequestHandler {
             }
             return Ok(format!(
                 "✅ Watchpoint cleared: {} ({}.{} {})",
-                bp_id, wp.class_name, wp.field_name, wp.kind.label()
+                bp_id,
+                wp.class_name,
+                wp.field_name,
+                wp.kind.label()
             ));
         }
 
@@ -484,14 +504,16 @@ impl RequestHandler {
         }
 
         // Find the breakpoint
-        let bp_info = session.breakpoints.get(bp_id)
-            .ok_or_else(|| format!("Breakpoint not found: {bp_id}"))?
-            .clone();
+        let bp_info =
+            session.breakpoints.get(bp_id).ok_or_else(|| format!("Breakpoint not found: {bp_id}"))?.clone();
 
         // Clear the breakpoint in the JVM — a disabled breakpoint has no live request, so there is
         // nothing to clear there, only the stored definition to drop (BP-1).
         if let Some(req) = bp_info.request_id {
-            session.connection.clear_breakpoint(req).await
+            session
+                .connection
+                .clear_breakpoint(req)
+                .await
                 .map_err(|e| format!("Failed to clear breakpoint: {e}"))?;
         }
 
@@ -501,7 +523,9 @@ impl RequestHandler {
 
         Ok(format!(
             "✅ Breakpoint cleared: {} at {}:{}\n   JDWP Request ID: {}",
-            bp_id, bp_info.class_pattern, bp_info.line,
+            bp_id,
+            bp_info.class_pattern,
+            bp_info.line,
             bp_info.request_id.map_or_else(|| "(disabled)".to_string(), |r| r.to_string())
         ))
     }
@@ -515,8 +539,8 @@ impl RequestHandler {
         let a: crate::args::ToggleBreakpointArgs = crate::args::parse(&args)?;
         let id = a.breakpoint_id.trim().to_string();
 
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
         // Current state, whichever map owns this id.
@@ -545,10 +569,7 @@ impl RequestHandler {
         // Omitted `enabled` flips the current state.
         let want = a.enabled.unwrap_or(!current);
         if want == current {
-            return Ok(format!(
-                "No change: {id} is already {}.",
-                if current { "armed" } else { "disabled" }
-            ));
+            return Ok(format!("No change: {id} is already {}.", if current { "armed" } else { "disabled" }));
         }
 
         let what = if want {
@@ -566,8 +587,8 @@ impl RequestHandler {
     }
 
     async fn handle_continue(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
 
@@ -581,10 +602,7 @@ impl RequestHandler {
         session.mark_resumed();
         drop(session);
 
-        Ok(note.map_or_else(
-            || "▶️  Execution resumed".to_string(),
-            |n| format!("▶️  {n}"),
-        ))
+        Ok(note.map_or_else(|| "▶️  Execution resumed".to_string(), |n| format!("▶️  {n}")))
     }
 
     async fn handle_step_over(&self, args: serde_json::Value) -> Result<String, String> {
@@ -605,8 +623,8 @@ impl RequestHandler {
         depth: jdwp_client::extra::StepDepth,
         label: &str,
     ) -> Result<String, String> {
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
         let a: crate::args::StepArgs = crate::args::parse(&args)?;
@@ -618,12 +636,14 @@ impl RequestHandler {
         if let Some(req) = session.pending_step.take() {
             let _ = session.connection.clear_step(req).await;
         }
-        let req = session.connection.set_step(thread_id, depth).await
+        let req = session
+            .connection
+            .set_step(thread_id, depth)
+            .await
             .map_err(|e| format!("Failed to set step: {e}"))?;
         session.pending_step = Some(req);
         session.mark_resumed();
-        session.connection.resume_all().await
-            .map_err(|e| format!("Failed to resume for step: {e}"))?;
+        session.connection.resume_all().await.map_err(|e| format!("Failed to resume for step: {e}"))?;
         drop(session);
 
         Ok(format!(
@@ -632,8 +652,8 @@ impl RequestHandler {
     }
 
     async fn handle_panic(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
         if let Some(req) = session.pending_step.take() {
@@ -647,7 +667,8 @@ impl RequestHandler {
         let _ = session.connection.clear_all_breakpoints().await;
         session.breakpoints.clear();
         // Also drop deferred breakpoints' CLASS_PREPARE watches.
-        let pend: Vec<i32> = session.pending_breakpoints.drain(..).map(|p| p.class_prepare_request_id).collect();
+        let pend: Vec<i32> =
+            session.pending_breakpoints.drain(..).map(|p| p.class_prepare_request_id).collect();
         for req in pend {
             let _ = session.connection.clear_class_prepare(req).await;
         }
@@ -667,7 +688,9 @@ impl RequestHandler {
         // Method-exit requests are the most important thing for panic to drop: a suspending one on a hot
         // method re-freezes the VM on the very next return, so resuming without clearing them would be
         // no rescue at all. `ClearAllBreakpoints` does not touch them either.
-        let mexits: Vec<(i32, bool)> = session.method_exits.drain()
+        let mexits: Vec<(i32, bool)> = session
+            .method_exits
+            .drain()
             .filter_map(|(_, m)| m.request_id.map(|r| (r, m.with_return_value)))
             .collect();
         for (req, with_value) in mexits {
@@ -679,17 +702,20 @@ impl RequestHandler {
         session.mark_resumed();
         drop(session);
 
-        Ok(format!("🧯 Panic: cleared {} breakpoint(s){}{}{}{} and resumed all threads.{}", n,
+        Ok(format!(
+            "🧯 Panic: cleared {} breakpoint(s){}{}{}{} and resumed all threads.{}",
+            n,
             if np > 0 { format!(" + {np} deferred") } else { String::new() },
             if ne > 0 { format!(" + {ne} exception") } else { String::new() },
             if nw > 0 { format!(" + {nw} watchpoint") } else { String::new() },
             if nm > 0 { format!(" + {nm} method-exit") } else { String::new() },
-            note.map_or_else(String::new, |t| format!("\n   ⚠️  {t}"))))
+            note.map_or_else(String::new, |t| format!("\n   ⚠️  {t}"))
+        ))
     }
 
     async fn handle_get_stack(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
 
@@ -703,11 +729,13 @@ impl RequestHandler {
         let expand_objects = a.expand_objects && !read_only;
 
         let last_thread = session.last_thread;
-        let target_thread =
-            resolve_target_thread(&mut session.connection, thread_id, last_thread).await?;
+        let target_thread = resolve_target_thread(&mut session.connection, thread_id, last_thread).await?;
 
         // Get frames (-1 means all frames to avoid INVALID_LENGTH errors)
-        let mut frames = session.connection.get_frames(target_thread, 0, -1).await
+        let mut frames = session
+            .connection
+            .get_frames(target_thread, 0, -1)
+            .await
             .map_err(|e| format!("Failed to get frames: {e}"))?;
 
         // Truncate to max_frames
@@ -722,9 +750,7 @@ impl RequestHandler {
         // `package_filter` collapses frames whose class doesn't match (a JVM like WildFly buries a
         // few app frames under dozens of framework ones) into `… N frame(s) hidden` markers, and
         // skips the expensive method/variable round-trips for those hidden frames.
-        let package_filter = a.package_filter.as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_lowercase);
+        let package_filter = a.package_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
 
         let mut output = package_filter.as_ref().map_or_else(
             || format!("Stack (thread 0x{:x}, {} frames):\n", target_thread, frames.len()),
@@ -740,11 +766,7 @@ impl RequestHandler {
             hidden: 0,
             deep: expand_objects.then(|| {
                 (
-                    DeepOpts {
-                        depth_limit: a.max_depth,
-                        child_limit: a.max_children.max(1),
-                        text_len: 200,
-                    },
+                    DeepOpts { depth_limit: a.max_depth, child_limit: a.max_children.max(1), text_len: 200 },
                     DeepState::new(STACK_NODE_BUDGET),
                 )
             }),
@@ -753,15 +775,10 @@ impl RequestHandler {
             let _ = writeln!(output, "🔒 read-only: showing shallow values — expand_objects invokes methods in the debuggee, which is refused here.");
         }
 
-        let walk = StackWalk {
-            target_thread,
-            package_filter: package_filter.as_deref(),
-            include_variables,
-        };
+        let walk = StackWalk { target_thread, package_filter: package_filter.as_deref(), include_variables };
         for (idx, frame) in frames.iter().enumerate() {
             let more =
-                render_stack_frame(&mut session.connection, &mut output, idx, frame, &walk, &mut state)
-                    .await;
+                render_stack_frame(&mut session.connection, &mut output, idx, frame, &walk, &mut state).await;
             if !more {
                 break;
             }
@@ -778,8 +795,8 @@ impl RequestHandler {
         let frame_index = a.frame_index;
         let max_len = a.max_result_length;
 
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
         // Read-only: invocation is refused by the connection itself (SAFE-6), so nothing here needs to
         // guess from the expression text — which used to miss `List.get` subscripts and `toString()`
@@ -846,34 +863,35 @@ impl RequestHandler {
     }
 
     async fn handle_list_threads(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
 
         let a: crate::args::ListThreadsArgs = crate::args::parse(&args)?;
-        let name_filter = a.name_filter.as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_lowercase);
+        let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
         let only_suspended = a.only_suspended;
         let limit = a.limit.max(1);
         let filtering = name_filter.is_some() || only_suspended;
 
-        let all = session.connection.get_all_threads().await
-            .map_err(|e| format!("Failed to get threads: {e}"))?;
+        let all =
+            session.connection.get_all_threads().await.map_err(|e| format!("Failed to get threads: {e}"))?;
         let total = all.len();
 
         let rows = collect_thread_rows(
-            &mut session.connection, &all, filtering, limit, name_filter.as_deref(), only_suspended,
-        ).await;
+            &mut session.connection,
+            &all,
+            filtering,
+            limit,
+            name_filter.as_deref(),
+            only_suspended,
+        )
+        .await;
         drop(session);
 
         let shown = rows.len().min(limit);
-        let hidden = if filtering {
-            rows.len().saturating_sub(shown)
-        } else {
-            total.saturating_sub(rows.len())
-        };
+        let hidden =
+            if filtering { rows.len().saturating_sub(shown) } else { total.saturating_sub(rows.len()) };
 
         let mut note = String::new();
         if let Some(f) = &name_filter {
@@ -908,8 +926,8 @@ impl RequestHandler {
     /// matched-against-loaded and shows a page — truncating loudly, per DUMP-1, so a page is never
     /// mistaken for the whole answer.
     async fn handle_list_classes(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
 
@@ -917,14 +935,15 @@ impl RequestHandler {
         let filter = a.filter.as_deref().map(str::trim).filter(|s| !s.is_empty());
         let limit = a.limit.max(1);
 
-        let all = session.connection.all_classes().await
-            .map_err(|e| format!("Failed to list classes: {e}"))?;
+        let all =
+            session.connection.all_classes().await.map_err(|e| format!("Failed to list classes: {e}"))?;
         drop(session);
         let loaded = all.len();
 
         // Arrays outnumber the interesting entries on a real heap and are never the answer to "what do
         // I arm a stop point on", so they are excluded unless asked for.
-        let names: Vec<(String, bool)> = all.into_iter()
+        let names: Vec<(String, bool)> = all
+            .into_iter()
             .filter(|c| a.include_arrays || c.ref_type_tag != REF_TAG_ARRAY)
             .map(|c| (decode_signature(&c.signature), c.ref_type_tag == REF_TAG_INTERFACE))
             .collect();
@@ -941,16 +960,11 @@ impl RequestHandler {
         let note = filter.map_or_else(String::new, |f| format!(" matching \"{f}\""));
         let mut output = format!("{shown}/{matched} class(es){note} — {loaded} loaded in the VM:\n");
         for (fqn, is_interface) in rows.iter().take(limit) {
-            let _ = if *is_interface {
-                writeln!(output, "{fqn} (interface)")
-            } else {
-                writeln!(output, "{fqn}")
-            };
+            let _ =
+                if *is_interface { writeln!(output, "{fqn} (interface)") } else { writeln!(output, "{fqn}") };
         }
         if matched > shown {
-            let _ = writeln!(
-                output, "… +{} more (raise limit, or narrow with filter)", matched - shown,
-            );
+            let _ = writeln!(output, "… +{} more (raise limit, or narrow with filter)", matched - shown,);
         }
         if matched == 0 {
             output.push_str(&explain_no_match(&names, filter));
@@ -966,8 +980,8 @@ impl RequestHandler {
     /// type is the most intricate machinery in this server, and composing arguments for it blind means
     /// a refused argument sends you back to guessing.
     async fn handle_list_methods(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
 
@@ -976,16 +990,14 @@ impl RequestHandler {
         if class_name.is_empty() {
             return Err("class_name is required (e.g. com.example.OrderService)".to_string());
         }
-        let name_filter = a.name_filter.as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_lowercase);
+        let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
         let limit = a.limit.max(1);
 
         let target_id = resolve_loaded_class(&mut session.connection, class_name).await?;
 
-        let mut rows = collect_method_rows(
-            &mut session.connection, target_id, a.inherited, name_filter.as_deref(),
-        ).await?;
+        let mut rows =
+            collect_method_rows(&mut session.connection, target_id, a.inherited, name_filter.as_deref())
+                .await?;
         drop(session);
 
         // Sorted by rendered form so overloads land together, which is the comparison being made.
@@ -1010,9 +1022,7 @@ impl RequestHandler {
             };
         }
         if matched > shown {
-            let _ = writeln!(
-                output, "… +{} more (raise limit or use name_filter)", matched - shown,
-            );
+            let _ = writeln!(output, "… +{} more (raise limit or use name_filter)", matched - shown,);
         }
         if matched == 0 && name_filter.is_some() {
             output.push_str("No method name matched. Drop name_filter to see the whole class.\n");
@@ -1035,8 +1045,8 @@ impl RequestHandler {
     /// The two genuinely empty-handed cases are the errors: the class is not loaded, or it is loaded
     /// and carries no `SourceFile` attribute at all.
     async fn handle_source(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
 
@@ -1111,16 +1121,16 @@ impl RequestHandler {
                         Drop one of the two."
                 .to_string());
         }
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
         let before = session.connection.packets_sent();
         // Same start as the packet counter, so `wire / cost` is a per-packet figure over exactly the
         // packets it counts — including the suspend and resume, which are round trips like any other.
         let wire_from = std::time::Instant::now();
-        let all = session.connection.get_all_threads().await
-            .map_err(|e| format!("Failed to get threads: {e}"))?;
+        let all =
+            session.connection.get_all_threads().await.map_err(|e| format!("Failed to get threads: {e}"))?;
         let total = all.len();
         if all.is_empty() {
             return Ok("No threads — the JVM reported none.".to_string());
@@ -1128,11 +1138,7 @@ impl RequestHandler {
 
         // Only ask about the monitor capabilities when monitors were actually requested, so a dump that
         // doesn't want them doesn't pay for the round trip.
-        let caps = if a.monitors {
-            session.connection.capabilities().await.ok()
-        } else {
-            None
-        };
+        let caps = if a.monitors { session.connection.capabilities().await.ok() } else { None };
 
         // Suspension policy, decided ONCE up front so the resume half can't disagree with it.
         //
@@ -1142,7 +1148,10 @@ impl RequestHandler {
         let already = session.suspended_cause.is_some();
         let suspend_now = a.suspend && !already;
         if suspend_now {
-            session.connection.suspend_all().await
+            session
+                .connection
+                .suspend_all()
+                .await
                 .map_err(|e| format!("Failed to suspend for the dump: {e}"))?;
             // Arm the watchdog for the window we hold it: if this call dies before the resume below,
             // something still un-freezes the VM (SAFE-4).
@@ -1209,8 +1218,8 @@ impl RequestHandler {
     }
 
     async fn handle_pause(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
 
@@ -1232,8 +1241,7 @@ impl RequestHandler {
             ));
         }
 
-        session.connection.suspend_all().await
-            .map_err(|e| format!("Failed to suspend: {e}"))?;
+        session.connection.suspend_all().await.map_err(|e| format!("Failed to suspend: {e}"))?;
         // Arm the watchdog for a MANUAL pause too. This used to suspend every thread and record
         // nothing, so `suspended_since` stayed None and the watchdog — the one thing that makes
         // attaching to a shared JVM defensible — never fired. A forgotten `debug.pause` froze the VM
@@ -1270,8 +1278,10 @@ impl RequestHandler {
         let safety = if let Some(guard) = self.session_manager.get_session_by_id(&session_id).await {
             let mut session = guard.lock().await;
             let was_suspended = session.suspended_since.is_some();
-            let stops = session.breakpoints.len() + session.pending_breakpoints.len()
-                + session.exception_requests.len() + session.watchpoints.len();
+            let stops = session.breakpoints.len()
+                + session.pending_breakpoints.len()
+                + session.exception_requests.len()
+                + session.watchpoints.len();
             if let Some(req) = session.pending_step.take() {
                 let _ = session.connection.clear_step(req).await;
             }
@@ -1283,7 +1293,9 @@ impl RequestHandler {
                 // the VM as unfrozen as we can manage.
                 let _ = session.connection.clear_all_breakpoints().await;
                 let _ = session.connection.resume_all().await;
-                format!("Dispose failed — best-effort cleared breakpoints and resumed ({stops} stop point(s))")
+                format!(
+                    "Dispose failed — best-effort cleared breakpoints and resumed ({stops} stop point(s))"
+                )
             };
             session.mark_resumed();
             drop(session);
@@ -1297,7 +1309,11 @@ impl RequestHandler {
         Ok(match safety {
             Some((note, was_suspended)) => format!(
                 "✅ Disconnected from debug session: {session_id}\n   {note}{}",
-                if was_suspended { "\n   The VM was suspended at a stop point — it is now running." } else { "" }
+                if was_suspended {
+                    "\n   The VM was suspended at a stop point — it is now running."
+                } else {
+                    ""
+                }
             ),
             None => format!("✅ Disconnected from debug session: {session_id}"),
         })
@@ -1305,8 +1321,8 @@ impl RequestHandler {
 
     async fn handle_get_last_event(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::GetLastEventArgs = crate::args::parse(&args)?;
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
 
@@ -1370,8 +1386,8 @@ impl RequestHandler {
         let value_str = a.value.as_str();
         let frame_index = a.frame_index;
 
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
         if session.read_only {
             return Err(readonly_refusal("set_value writes to the JVM"));
@@ -1384,9 +1400,7 @@ impl RequestHandler {
         // A slice or filter names several elements, so there is no single place to write. Refused
         // explicitly: this used to parse the subscript and then silently drop it, writing the whole
         // field instead of the elements the caller named.
-        if let Some(seg) = segs.iter().find(|s| {
-            s.subs.iter().any(|x| !matches!(x, Subscript::Index(_)))
-        }) {
+        if let Some(seg) = segs.iter().find(|s| s.subs.iter().any(|x| !matches!(x, Subscript::Index(_)))) {
             return Err(format!(
                 "'{}[…]' selects several elements with a slice or filter, so there is nothing single \
                  to write. Use one index (e.g. [0]) to write one element.",
@@ -1418,26 +1432,33 @@ impl RequestHandler {
     async fn handle_force_return(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::ForceReturnArgs = crate::args::parse(&args)?;
 
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
         if session.read_only {
             return Err(readonly_refusal("force_return changes what the JVM does"));
         }
-        let thread_id = crate::args::parse_thread_id(a.thread_id.as_deref()).or(session.last_thread)
+        let thread_id = crate::args::parse_thread_id(a.thread_id.as_deref())
+            .or(session.last_thread)
             .ok_or_else(|| "No thread. Pass thread_id, or hit a breakpoint first.".to_string())?;
         let conn = &mut session.connection;
 
-        let frames = conn.get_frames(thread_id, 0, -1).await
+        let frames = conn
+            .get_frames(thread_id, 0, -1)
+            .await
             .map_err(|e| format!("Failed to get frames (is the thread suspended?): {e}"))?;
-        let frame = frames.first().cloned()
-            .ok_or_else(|| "Thread has no frames (not suspended?)".to_string())?;
+        let frame =
+            frames.first().cloned().ok_or_else(|| "Thread has no frames (not suspended?)".to_string())?;
 
         // The forced value must match the top method's declared return type. Pull the return
         // descriptor (the part after ')') so we coerce the literal correctly and handle void.
-        let methods = conn.get_methods(frame.location.class_id).await
+        let methods = conn
+            .get_methods(frame.location.class_id)
+            .await
             .map_err(|e| format!("Failed to get methods: {e}"))?;
-        let method = methods.iter().find(|m| m.method_id == frame.location.method_id)
+        let method = methods
+            .iter()
+            .find(|m| m.method_id == frame.location.method_id)
             .ok_or_else(|| "Could not resolve the current method".to_string())?;
         let ret_sig = method.signature.rsplit(')').next().unwrap_or("V");
         let ret_byte = *ret_sig.as_bytes().first().unwrap_or(&b'V');
@@ -1448,14 +1469,18 @@ impl RequestHandler {
         } else if raw.is_empty() {
             return Err(format!(
                 "{}() returns {} — a 'value' is required (int, 123L, true/false, null, or \"string\")",
-                method.name, decode_signature(ret_sig)
+                method.name,
+                decode_signature(ret_sig)
             ));
         } else {
             literal_to_value(conn, raw, ret_byte).await?
         };
 
-        conn.force_early_return(thread_id, &value).await
-            .map_err(|e| format!("ForceEarlyReturn failed (JVM may lack canForceEarlyReturn, or the value type is wrong): {e}"))?;
+        conn.force_early_return(thread_id, &value).await.map_err(|e| {
+            format!(
+                "ForceEarlyReturn failed (JVM may lack canForceEarlyReturn, or the value type is wrong): {e}"
+            )
+        })?;
         drop(session);
 
         let shown = if ret_byte == b'V' { "void".to_string() } else { raw.to_string() };
@@ -1468,10 +1493,14 @@ impl RequestHandler {
     async fn handle_set_exception_stop(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::SetExceptionBreakpointArgs = crate::args::parse(&args)?;
         if !a.caught && !a.uncaught {
-            return Err("Set at least one of caught/uncaught to true — otherwise nothing is reported.".to_string());
+            return Err(
+                "Set at least one of caught/uncaught to true — otherwise nothing is reported.".to_string()
+            );
         }
 
-        let session_guard = self.resolve_session(&args).await
+        let session_guard = self
+            .resolve_session(&args)
+            .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
         check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
@@ -1499,28 +1528,39 @@ impl RequestHandler {
         // so a shared JVM keeps serving while you collect throws. An optional ThreadOnly restricts it
         // to one thread (FILT-1); the trace budget lives on our side (see try_record_trace) rather
         // than as a JDWP Count, because Count reports only the *Nth* throw, not the first N.
-        let request_id = session.connection
-            .set_exception_request_ex(ref_type, a.caught, a.uncaught, suspend_policy_for(a.trace), None, thread_filter)
+        let request_id = session
+            .connection
+            .set_exception_request_ex(
+                ref_type,
+                a.caught,
+                a.uncaught,
+                suspend_policy_for(a.trace),
+                None,
+                thread_filter,
+            )
             .await
             .map_err(|e| format!("Failed to set exception breakpoint: {e}"))?;
 
         let class_pattern = pattern.unwrap_or("*").to_string();
         let exc_id = session.next_stop_id("exc_");
-        session.exception_requests.insert(exc_id.clone(), crate::session::ExceptionRequestInfo {
-            id: exc_id.clone(),
-            request_id: Some(request_id),
-            enabled: true,
-            ref_type,
-            class_pattern: class_pattern.clone(),
-            caught: a.caught,
-            uncaught: a.uncaught,
-            trace: a.trace,
-            trace_expr: a.trace_expr.clone(),
-            trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
-            trace_frames,
-            trace_cost: crate::session::TraceCost::default(),
-            thread_filter,
-        });
+        session.exception_requests.insert(
+            exc_id.clone(),
+            crate::session::ExceptionRequestInfo {
+                id: exc_id.clone(),
+                request_id: Some(request_id),
+                enabled: true,
+                ref_type,
+                class_pattern: class_pattern.clone(),
+                caught: a.caught,
+                uncaught: a.uncaught,
+                trace: a.trace,
+                trace_expr: a.trace_expr.clone(),
+                trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
+                trace_frames,
+                trace_cost: crate::session::TraceCost::default(),
+                thread_filter,
+            },
+        );
         drop(session);
 
         Ok(render_exception_stop_reply(
@@ -1542,7 +1582,9 @@ impl RequestHandler {
         let class_name = a.class_name.trim();
         let field_name = a.field_name.trim();
 
-        let session_guard = self.resolve_session(&args).await
+        let session_guard = self
+            .resolve_session(&args)
+            .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
         check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
@@ -1554,8 +1596,9 @@ impl RequestHandler {
                 "Class '{class_name}' is not loaded yet — exercise it once so the JVM loads it, then retry (watchpoints can't be deferred)."
             ))?;
         let (declaring_type, field) =
-            find_field_info(&mut session.connection, type_id, field_name, None).await?
-                .ok_or_else(|| format!("Class '{class_name}' has no field '{field_name}' (nor does any superclass)"))?;
+            find_field_info(&mut session.connection, type_id, field_name, None).await?.ok_or_else(|| {
+                format!("Class '{class_name}' has no field '{field_name}' (nor does any superclass)")
+            })?;
         let is_static = (field.mod_bits & ACC_STATIC) != 0;
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
@@ -1603,43 +1646,52 @@ impl RequestHandler {
         // The refusal, before anything is armed.
         refuse_broad_suspending_method_exit(a.trace, class_pattern, method.as_deref())?;
 
-        let session_guard = self.resolve_session(&args).await
+        let session_guard = self
+            .resolve_session(&args)
+            .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
         check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
 
         // Kind 42 (with the return value) when the JVM speaks JDWP >= 1.6, else plain kind 41. This is a
         // version check, not a capability bit — there is no `canGetMethodReturnValues` flag to read.
-        let with_return_value =
-            session.connection.can_get_method_return_values().await.unwrap_or(false);
+        let with_return_value = session.connection.can_get_method_return_values().await.unwrap_or(false);
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
         check_thread_filter(&mut session.connection, thread_filter).await?;
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
         let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
 
-        let request_id = session.connection
+        let request_id = session
+            .connection
             .set_method_exit_request(
-                class_pattern, with_return_value, suspend_policy_for(a.trace), None, thread_filter,
+                class_pattern,
+                with_return_value,
+                suspend_policy_for(a.trace),
+                None,
+                thread_filter,
             )
             .await
             .map_err(|e| format!("Failed to set method-exit request on '{class_pattern}': {e}"))?;
 
         let mexit_id = session.next_stop_id("mexit_");
-        session.method_exits.insert(mexit_id.clone(), crate::session::MethodExitRequestInfo {
-            id: mexit_id.clone(),
-            request_id: Some(request_id),
-            enabled: true,
-            class_pattern: class_pattern.to_string(),
-            method: method.clone(),
-            with_return_value,
-            trace: a.trace,
-            trace_expr: a.trace_expr.clone(),
-            trace_budget,
-            trace_frames,
-            trace_cost: crate::session::TraceCost::default(),
-            thread_filter,
-        });
+        session.method_exits.insert(
+            mexit_id.clone(),
+            crate::session::MethodExitRequestInfo {
+                id: mexit_id.clone(),
+                request_id: Some(request_id),
+                enabled: true,
+                class_pattern: class_pattern.to_string(),
+                method: method.clone(),
+                with_return_value,
+                trace: a.trace,
+                trace_expr: a.trace_expr.clone(),
+                trace_budget,
+                trace_frames,
+                trace_cost: crate::session::TraceCost::default(),
+                thread_filter,
+            },
+        );
         drop(session);
 
         let mut extra = String::new();
@@ -1686,8 +1738,8 @@ impl RequestHandler {
 
     async fn handle_get_traces(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::GetTracesArgs = crate::args::parse(&args)?;
-        let session_guard = self.resolve_session(&args).await
-            .ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
         // FILT-2: the reader of an empty (or quiet) trace buffer is exactly who needs telling that a
@@ -1715,7 +1767,9 @@ impl RequestHandler {
         // the caller asked for rather than the whole buffer.
         let total = session.traces.len();
         let class_filter = a.class_filter.as_deref().map(str::to_lowercase);
-        let matched: Vec<&crate::session::TraceRecord> = session.traces.iter()
+        let matched: Vec<&crate::session::TraceRecord> = session
+            .traces
+            .iter()
             .filter(|r| a.bp_id.as_ref().is_none_or(|id| &r.bp_id == id))
             .filter(|r| a.since.is_none_or(|s| r.seq > s))
             .filter(|r| class_filter.as_ref().is_none_or(|c| r.class.to_lowercase().contains(c.as_str())))
@@ -1725,11 +1779,7 @@ impl RequestHandler {
         let start = n_matched - take;
 
         let filtered = a.bp_id.is_some() || a.class_filter.is_some() || a.since.is_some();
-        let scope = if filtered {
-            format!("{n_matched} matching of {total}")
-        } else {
-            format!("{total}")
-        };
+        let scope = if filtered { format!("{n_matched} matching of {total}") } else { format!("{total}") };
         let mut lines = Vec::with_capacity(take + 3);
         lines.push(format!(
             "📢 {scope} trace snapshot(s) (showing {take}, buffer cap {}):",
@@ -1742,8 +1792,16 @@ impl RequestHandler {
             let expr_s = format_trace_expr(rec);
             lines.push(format!(
                 "#{} [{}] {}.{}:{}{} thread=0x{:x}{}{}{}",
-                rec.seq, rec.bp_id, rec.class, rec.method, rec.line.unwrap_or(-1), callers_s,
-                rec.thread, detail_s, args_s, expr_s
+                rec.seq,
+                rec.bp_id,
+                rec.class,
+                rec.method,
+                rec.line.unwrap_or(-1),
+                callers_s,
+                rec.thread,
+                detail_s,
+                args_s,
+                expr_s
             ));
         }
         // A stop point that hit its budget disarmed itself (TRACE-3) — say so, so a caller doesn't
@@ -1758,7 +1816,8 @@ impl RequestHandler {
         if session.trace_disarms_dropped > 0 {
             lines.push(format!(
                 "[dropped] {} further disarm notice(s) (cap {}) — read and clear them sooner",
-                session.trace_disarms_dropped, crate::session::MAX_TRACE_DISARMS
+                session.trace_disarms_dropped,
+                crate::session::MAX_TRACE_DISARMS
             ));
         }
         if a.clear {
@@ -1797,12 +1856,13 @@ async fn set_field_by_path(
     let container_expr = raws.split_last().map_or_else(String::new, |(_, prefix)| prefix.join("."));
 
     // Instance-field attempt: resolve the container to an object using a suspended frame.
-    let instance_err = match set_instance_field(
-        conn, thread_opt, frame_index, &container_expr, &field_name, value_str,
-    ).await? {
-        FieldWrite::Done(msg) => return Ok(msg),
-        FieldWrite::Fallthrough(e) => e,
-    };
+    let instance_err =
+        match set_instance_field(conn, thread_opt, frame_index, &container_expr, &field_name, value_str)
+            .await?
+        {
+            FieldWrite::Done(msg) => return Ok(msg),
+            FieldWrite::Fallthrough(e) => e,
+        };
 
     // Static-field attempt: treat the container as a dotted class name.
     if let Some(msg) =
@@ -2105,21 +2165,24 @@ async fn arm_one_field_watch(
         })?;
     let watch_id = session.next_stop_id(&format!("watch_{}_", kind.label()));
     let label = format!("{watch_id} ({})", kind.label());
-    session.watchpoints.insert(watch_id, crate::session::WatchpointInfo {
-        request_id: Some(request_id),
-        enabled: true,
-        arm: spec.arm,
-        kind,
-        class_name: spec.class_name.clone(),
-        field_name: spec.field_name.clone(),
-        is_static: spec.is_static,
-        trace: spec.trace,
-        trace_expr: spec.trace_expr.map(str::to_string),
-        trace_budget: spec.trace_budget,
-        trace_frames: spec.trace_frames,
-        trace_cost: crate::session::TraceCost::default(),
-        thread_filter: spec.thread_filter,
-    });
+    session.watchpoints.insert(
+        watch_id,
+        crate::session::WatchpointInfo {
+            request_id: Some(request_id),
+            enabled: true,
+            arm: spec.arm,
+            kind,
+            class_name: spec.class_name.clone(),
+            field_name: spec.field_name.clone(),
+            is_static: spec.is_static,
+            trace: spec.trace,
+            trace_expr: spec.trace_expr.map(str::to_string),
+            trace_budget: spec.trace_budget,
+            trace_frames: spec.trace_frames,
+            trace_cost: crate::session::TraceCost::default(),
+            thread_filter: spec.thread_filter,
+        },
+    );
     Ok(label)
 }
 
@@ -2272,10 +2335,8 @@ fn render_session_line(
     } else {
         "running"
     };
-    let stops = s.breakpoints.len()
-        + s.pending_breakpoints.len()
-        + s.exception_requests.len()
-        + s.watchpoints.len();
+    let stops =
+        s.breakpoints.len() + s.pending_breakpoints.len() + s.exception_requests.len() + s.watchpoints.len();
     let mut line = format!(
         "  {} [{}] {} — {}{}, {} stop point(s), {} JDWP packet(s)",
         if is_current { "▶" } else { " " },
@@ -2355,7 +2416,10 @@ fn render_pending_line(
     let _ = writeln!(
         output,
         "  ⏳ [{}] {} ({}) — waiting for class load{}",
-        pb.bp_id, pb.class_pattern, where_, dead_filter_tag(pb.thread_filter, dead)
+        pb.bp_id,
+        pb.class_pattern,
+        where_,
+        dead_filter_tag(pb.thread_filter, dead)
     );
 }
 
@@ -2436,8 +2500,12 @@ fn render_trace_cost(output: &mut String, trace: bool, cost: &crate::session::Tr
     );
     match (cost.observed_rate(), cost.capture_share()) {
         (Some(rate), Some(share)) => {
-            let _ =
-                write!(line, ", arriving at {:.1}/s ({:.1}% of the window spent capturing)", rate, share * 100.0);
+            let _ = write!(
+                line,
+                ", arriving at {:.1}/s ({:.1}% of the window spent capturing)",
+                rate,
+                share * 100.0
+            );
         }
         // One capture establishes a cost but no interval, so there is no arrival rate to report yet.
         _ => line.push_str(", one capture so far, so no arrival rate yet"),
@@ -2540,10 +2608,7 @@ async fn describe_method_exit_event(
             obj.insert("returned".to_string(), json!(render_value(conn, v, None, 200).await));
         }
         None => {
-            obj.insert(
-                "returned".to_string(),
-                json!("<not reported — this JVM speaks JDWP < 1.6>"),
-            );
+            obj.insert("returned".to_string(), json!("<not reported — this JVM speaks JDWP < 1.6>"));
         }
     }
 }
@@ -2573,8 +2638,8 @@ async fn describe_field_event(
     let (ref_type, field_id, instance) = (f.ref_type, f.field_id, f.object);
 
     let declaring = decode_signature(&conn.get_signature(ref_type).await.unwrap_or_default());
-    let info = conn.get_fields(ref_type).await.ok()
-        .and_then(|fs| fs.into_iter().find(|f| f.field_id == field_id));
+    let info =
+        conn.get_fields(ref_type).await.ok().and_then(|fs| fs.into_iter().find(|f| f.field_id == field_id));
     let (name, is_static) = info.map_or_else(
         // No field info means the type's field list didn't include the id the event named; fall back
         // to the raw id and infer staticness from whether an instance was reported.
@@ -2689,7 +2754,9 @@ async fn resolve_class_name(
     if let Some(n) = cache.get(&class_id) {
         return n.clone();
     }
-    let n = conn.get_signature(class_id).await
+    let n = conn
+        .get_signature(class_id)
+        .await
         .ok()
         .map(|s| decode_signature(&s))
         .filter(|s| !s.is_empty())
@@ -2715,7 +2782,8 @@ async fn frame_method_info(
             if include_variables {
                 if let Ok(var_table) = conn.get_variable_table(location.class_id, location.method_id).await {
                     let ci = location.index;
-                    for v in var_table.into_iter()
+                    for v in var_table
+                        .into_iter()
                         .filter(|v| ci >= v.code_index && ci < v.code_index + u64::from(v.length))
                     {
                         let slot = i32::try_from(v.slot).unwrap_or(0);
@@ -2743,8 +2811,7 @@ async fn resolve_target_thread(
     if let Some(tid) = explicit.or(last_hit) {
         return Ok(tid);
     }
-    let threads = conn.get_all_threads().await
-        .map_err(|e| format!("Failed to get threads: {e}"))?;
+    let threads = conn.get_all_threads().await.map_err(|e| format!("Failed to get threads: {e}"))?;
     threads.first().copied().ok_or_else(|| "No threads found".to_string())
 }
 
@@ -2780,8 +2847,7 @@ async fn render_frame_variables(
             frame_id = f.frame_id;
         }
     }
-    let slots: Vec<jdwp_client::stackframe::VariableSlot> =
-        active.iter().map(|(_, s)| *s).collect();
+    let slots: Vec<jdwp_client::stackframe::VariableSlot> = active.iter().map(|(_, s)| *s).collect();
     let Ok(values) = conn.get_frame_values(target_thread, frame_id, slots).await else {
         return None;
     };
@@ -2790,9 +2856,7 @@ async fn render_frame_variables(
     let mut exhausted_at = None;
     for ((name, _), value) in active.iter().zip(values.iter()) {
         let formatted_value = match &mut deep {
-            Some((opts, state)) => {
-                render_node(conn, value, Some(target_thread), *opts, state, 0).await
-            }
+            Some((opts, state)) => render_node(conn, value, Some(target_thread), *opts, state, 0).await,
             None => render_value(conn, value, None, 200).await,
         };
         let _ = writeln!(output, "     {name} = {formatted_value}");
@@ -2845,8 +2909,7 @@ async fn render_stack_frame(
     flush_hidden(output, &mut state.hidden);
 
     // Method name + source line, and the variable slots live at this bytecode index.
-    let (method_name, line, active) =
-        frame_method_info(conn, &frame.location, walk.include_variables).await;
+    let (method_name, line, active) = frame_method_info(conn, &frame.location, walk.include_variables).await;
 
     let _ = match line {
         Some(l) => writeln!(output, "#{idx} {class_name}.{method_name}:{l}"),
@@ -3195,7 +3258,8 @@ fn explain_no_match(names: &[(String, bool)], filter: Option<&str>) -> String {
     // a loop. Both sides are normalised, so it does not matter which spelling the caller arrived with.
     let under_another_spelling: Vec<&str> = filter.map_or_else(Vec::new, |f| {
         let loose = f.replace('/', ".");
-        names.iter()
+        names
+            .iter()
             .filter(|(fqn, _)| !class_matches(fqn, f) && class_matches(&fqn.replace('/', "."), &loose))
             .map(|(fqn, _)| fqn.as_str())
             .take(10)
@@ -3238,7 +3302,9 @@ async fn resolve_loaded_class(
     class_name: &str,
 ) -> Result<u64, String> {
     let signature = format!("L{};", class_name.replace('.', "/"));
-    let found = conn.classes_by_signature(&signature).await
+    let found = conn
+        .classes_by_signature(&signature)
+        .await
         .map_err(|e| format!("Failed to resolve {class_name}: {e}"))?;
     found.first().map(|c| c.type_id).ok_or_else(|| {
         let simple = class_name.rsplit('.').next().unwrap_or(class_name);
@@ -3269,9 +3335,12 @@ async fn collect_method_rows(
     while let Some(type_id) = current {
         // `Arc<str>`, not `String`: every method of a class repeats its declaring class, so a plain
         // clone per row re-heap-allocates the same name once for each method — a refcount bump instead.
-        let owner: std::sync::Arc<str> =
-            std::sync::Arc::from(decode_signature(&conn.get_signature(type_id).await.unwrap_or_default()).as_str());
-        let methods = conn.get_methods(type_id).await
+        let owner: std::sync::Arc<str> = std::sync::Arc::from(
+            decode_signature(&conn.get_signature(type_id).await.unwrap_or_default()).as_str(),
+        );
+        let methods = conn
+            .get_methods(type_id)
+            .await
             .map_err(|e| format!("Failed to read the methods of {owner}: {e}"))?;
         for m in &methods {
             // `<clinit>` is the static initialiser: nothing can call it and nothing can usefully break
@@ -3287,7 +3356,9 @@ async fn collect_method_rows(
         if !inherited {
             break;
         }
-        current = conn.get_superclass(type_id).await
+        current = conn
+            .get_superclass(type_id)
+            .await
             .map_err(|e| format!("Failed to walk the superclass chain: {e}"))?;
     }
     Ok(rows)
@@ -3422,9 +3493,8 @@ fn sig_arg_count(sig: &str) -> usize {
 /// what the JVM's own `-cp` already uses, so an operator sets it the way they set every other path
 /// list. Unset means no roots, and `debug.source` then reports only what the JVM knows.
 fn env_source_roots() -> Vec<std::path::PathBuf> {
-    std::env::var_os("JDWP_SOURCE_ROOTS").map_or_else(Vec::new, |v| {
-        std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect()
-    })
+    std::env::var_os("JDWP_SOURCE_ROOTS")
+        .map_or_else(Vec::new, |v| std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect())
 }
 
 /// Where a class's source sits *under* a root: the package as directories, then the file name the JVM
@@ -3621,7 +3691,9 @@ fn render_source_body(path: &std::path::Path, lines: &[String], a: &crate::args:
         );
     }
     let width = end.to_string().len();
-    for (i, text) in lines.iter().enumerate().skip(start.saturating_sub(1)).take((end + 1).saturating_sub(start)) {
+    for (i, text) in
+        lines.iter().enumerate().skip(start.saturating_sub(1)).take((end + 1).saturating_sub(start))
+    {
         let _ = writeln!(out, "{:>width$} | {text}", i + 1);
     }
     if start > 1 || end < total {
@@ -3832,18 +3904,12 @@ fn score_param(param: &str, arg: &ArgType) -> Option<u32> {
 /// `InvokeMethod` accepted an object that does not implement the parameter's interface. Nothing failed
 /// because that method body never used the argument; one that called `r.run()` would have been acting on
 /// a value of the wrong type. So being wrong here is silent, not loud, which is why the check is strict.
-async fn assignable(
-    conn: &mut jdwp_client::JdwpConnection,
-    param: &str,
-    arg: &ArgType,
-) -> Option<u32> {
+async fn assignable(conn: &mut jdwp_client::JdwpConnection, param: &str, arg: &ArgType) -> Option<u32> {
     match arg {
         // Handled entirely by `score_param`: null fits any reference, and a primitive either widens
         // into a primitive parameter or boxes into its own wrapper.
         ArgType::Null => None,
-        ArgType::Primitive(tag) => {
-            boxed_wrapper_of(*tag).filter(|w| w == &param).map(|_| 1)
-        }
+        ArgType::Primitive(tag) => boxed_wrapper_of(*tag).filter(|w| w == &param).map(|_| 1),
         ArgType::Object { type_id, chain } => {
             if param.starts_with('[') {
                 // Array parameter: accept only an array argument.
@@ -3956,10 +4022,8 @@ async fn find_method_for_args(
                 continue;
             }
             // `None` anywhere means at least one argument isn't plainly assignable to its parameter.
-            let scored = params
-                .iter()
-                .zip(&argtypes)
-                .try_fold(0u32, |acc, (p, a)| score_param(p, a).map(|s| acc + s));
+            let scored =
+                params.iter().zip(&argtypes).try_fold(0u32, |acc, (p, a)| score_param(p, a).map(|s| acc + s));
             match scored {
                 // Strictly-greater keeps the first (most derived) winner on a tie, so an override
                 // in a subclass shadows the inherited method as Java would.
@@ -4055,54 +4119,73 @@ async fn try_arm_deferred_breakpoints(
     event_set: &jdwp_client::EventSet,
 ) -> bool {
     let Some((cp_thread, cp_ref, cp_sig)) = event_set.events.iter().find_map(|e| match &e.details {
-        jdwp_client::events::EventKind::ClassPrepare { thread, ref_type, signature, .. } =>
-            Some((*thread, *ref_type, signature.clone())),
+        jdwp_client::events::EventKind::ClassPrepare { thread, ref_type, signature, .. } => {
+            Some((*thread, *ref_type, signature.clone()))
+        }
         _ => None,
     }) else {
         return false;
     };
-    let pending: Vec<crate::session::PendingBreakpoint> = session
-        .pending_breakpoints.iter().filter(|p| p.signature == cp_sig).cloned().collect();
+    let pending: Vec<crate::session::PendingBreakpoint> =
+        session.pending_breakpoints.iter().filter(|p| p.signature == cp_sig).cloned().collect();
     for pend in pending {
         match resolve_bp_location(&mut session.connection, cp_ref, pend.line, pend.method.as_deref()).await {
             Ok((method, index, line)) => {
                 let sp = suspend_policy_for(pend.trace);
-                match session.connection.set_breakpoint_ex(
-                    cp_ref, method.method_id, index, sp, pend.hit_count, pend.thread_filter,
-                ).await {
+                match session
+                    .connection
+                    .set_breakpoint_ex(
+                        cp_ref,
+                        method.method_id,
+                        index,
+                        sp,
+                        pend.hit_count,
+                        pend.thread_filter,
+                    )
+                    .await
+                {
                     Ok(req_id) => {
                         // Do the bookkeeping that only borrows `pend` first, so its owned fields can
                         // be moved (not cloned) into the stored BreakpointInfo below.
                         let _ = session.connection.clear_class_prepare(pend.class_prepare_request_id).await;
                         session.pending_breakpoints.retain(|p| p.bp_id != pend.bp_id);
-                        info!("Armed deferred breakpoint {} on {} (line {})", pend.bp_id, pend.class_pattern, line);
-                        session.breakpoints.insert(pend.bp_id, crate::session::BreakpointInfo {
-                            request_id: Some(req_id),
-                            class_pattern: pend.class_pattern,
-                            line: u32::try_from(line).unwrap_or(0),
-                            method: Some(method.name),
-                            enabled: true,
-                            hit_count: 0,
-                            condition: pend.condition,
-                            trace: pend.trace,
-                            trace_expr: pend.trace_expr,
-                            trace_budget: pend.trace_budget,
-                            trace_frames: pend.trace_frames,
-                            trace_cost: crate::session::TraceCost::default(),
-                            arm: crate::session::BreakpointArm {
-                                class_id: cp_ref,
-                                method_id: method.method_id,
-                                bytecode_index: index,
-                                suspend_policy: sp,
-                                hit_count: pend.hit_count,
-                                thread_filter: pend.thread_filter,
+                        info!(
+                            "Armed deferred breakpoint {} on {} (line {})",
+                            pend.bp_id, pend.class_pattern, line
+                        );
+                        session.breakpoints.insert(
+                            pend.bp_id,
+                            crate::session::BreakpointInfo {
+                                request_id: Some(req_id),
+                                class_pattern: pend.class_pattern,
+                                line: u32::try_from(line).unwrap_or(0),
+                                method: Some(method.name),
+                                enabled: true,
+                                hit_count: 0,
+                                condition: pend.condition,
+                                trace: pend.trace,
+                                trace_expr: pend.trace_expr,
+                                trace_budget: pend.trace_budget,
+                                trace_frames: pend.trace_frames,
+                                trace_cost: crate::session::TraceCost::default(),
+                                arm: crate::session::BreakpointArm {
+                                    class_id: cp_ref,
+                                    method_id: method.method_id,
+                                    bytecode_index: index,
+                                    suspend_policy: sp,
+                                    hit_count: pend.hit_count,
+                                    thread_filter: pend.thread_filter,
+                                },
                             },
-                        });
+                        );
                     }
                     Err(e) => warn!("Failed to arm deferred breakpoint {}: {}", pend.bp_id, e),
                 }
             }
-            Err(e) => warn!("Deferred breakpoint {}: class {} loaded but location unresolved: {}", pend.bp_id, pend.class_pattern, e),
+            Err(e) => warn!(
+                "Deferred breakpoint {}: class {} loaded but location unresolved: {}",
+                pend.bp_id, pend.class_pattern, e
+            ),
         }
     }
     let _ = session.connection.resume_thread(cp_thread).await;
@@ -4129,10 +4212,7 @@ struct TracedRequest {
 /// One lookup, three maps — deliberately not a fourth map keyed by request id. Each kind already owns
 /// its bookkeeping (and its `clear`/`panic` handling), so a parallel index would be a second source of
 /// truth that could outlive an entry it points at. The maps are small enough that scanning is free.
-fn find_traced_request(
-    session: &crate::session::DebugSession,
-    req_id: i32,
-) -> Option<TracedRequest> {
+fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> Option<TracedRequest> {
     if let Some((id, b)) = session.breakpoints.iter().find(|(_, b)| b.request_id == Some(req_id) && b.trace) {
         return Some(TracedRequest {
             id: id.clone(),
@@ -4162,7 +4242,8 @@ fn find_traced_request(
             method_filter: None,
         });
     }
-    if let Some((id, m)) = session.method_exits.iter().find(|(_, m)| m.request_id == Some(req_id) && m.trace) {
+    if let Some((id, m)) = session.method_exits.iter().find(|(_, m)| m.request_id == Some(req_id) && m.trace)
+    {
         return Some(TracedRequest {
             id: id.clone(),
             condition: None,
@@ -4227,9 +4308,7 @@ async fn thread_is_alive(conn: &mut jdwp_client::JdwpConnection, tid: u64) -> bo
 /// This exists because a filter pinned to a dead thread can never match again: the stop point reports
 /// nothing and, before this, still listed itself as armed. On a pool that reaps idle workers — which is
 /// exactly where FILT-1 recommends the filter — that silence read as "the bug didn't reproduce".
-async fn dead_filter_threads(
-    session: &mut crate::session::DebugSession,
-) -> std::collections::BTreeSet<u64> {
+async fn dead_filter_threads(session: &mut crate::session::DebugSession) -> std::collections::BTreeSet<u64> {
     let mut filters: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     filters.extend(session.breakpoints.values().filter_map(|b| b.arm.thread_filter));
     filters.extend(session.exception_requests.values().filter_map(|e| e.thread_filter));
@@ -4287,7 +4366,9 @@ async fn method_name_matches(
 /// silently destroy a condition or `trace_expr` the user typed by hand — the very setup SAFE-2's design
 /// note said not to throw away. Disabling keeps it recoverable in one call (BP-2).
 async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32) -> Option<String> {
-    if let Some((id, bp)) = session.breakpoints.iter()
+    if let Some((id, bp)) = session
+        .breakpoints
+        .iter()
         .find(|(_, b)| b.request_id == Some(req_id))
         .map(|(k, v)| (k.clone(), v.clone()))
     {
@@ -4298,7 +4379,9 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
         }
         return Some(format!("breakpoint {id} at {}:{}", bp.class_pattern, bp.line));
     }
-    if let Some((id, er)) = session.exception_requests.iter()
+    if let Some((id, er)) = session
+        .exception_requests
+        .iter()
         .find(|(_, e)| e.request_id == Some(req_id))
         .map(|(k, v)| (k.clone(), v.clone()))
     {
@@ -4309,7 +4392,9 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
         }
         return Some(format!("exception breakpoint {id} ({})", er.class_pattern));
     }
-    if let Some((id, wp)) = session.watchpoints.iter()
+    if let Some((id, wp)) = session
+        .watchpoints
+        .iter()
         .find(|(_, w)| w.request_id == Some(req_id))
         .map(|(k, v)| (k.clone(), v.clone()))
     {
@@ -4320,7 +4405,9 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
         }
         return Some(format!("watchpoint {id} ({}.{})", wp.class_name, wp.field_name));
     }
-    if let Some((id, me)) = session.method_exits.iter()
+    if let Some((id, me)) = session
+        .method_exits
+        .iter()
         .find(|(_, m)| m.request_id == Some(req_id))
         .map(|(k, v)| (k.clone(), v.clone()))
     {
@@ -4345,10 +4432,7 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
 /// (watchdog / trace budget); this is the explicit one, via `debug.toggle_stop_point`.
 /// One disable per kind, mirroring how [`rearm_stop_point`] is split: each clears a different JDWP
 /// request type, and inlining all four made this branchy enough to trip the complexity gate.
-async fn disable_stop_point(
-    session: &mut crate::session::DebugSession,
-    id: &str,
-) -> Result<String, String> {
+async fn disable_stop_point(session: &mut crate::session::DebugSession, id: &str) -> Result<String, String> {
     if let Some(bp) = session.breakpoints.get(id).cloned() {
         return disable_line_breakpoint(session, id, &bp).await;
     }
@@ -4370,7 +4454,10 @@ async fn disable_line_breakpoint(
     bp: &crate::session::BreakpointInfo,
 ) -> Result<String, String> {
     if let Some(req) = bp.request_id {
-        session.connection.clear_breakpoint(req).await
+        session
+            .connection
+            .clear_breakpoint(req)
+            .await
             .map_err(|e| format!("Failed to clear breakpoint request: {e}"))?;
     }
     if let Some(b) = session.breakpoints.get_mut(id) {
@@ -4386,7 +4473,10 @@ async fn disable_exception_request(
     er: &crate::session::ExceptionRequestInfo,
 ) -> Result<String, String> {
     if let Some(req) = er.request_id {
-        session.connection.clear_exception_request(req).await
+        session
+            .connection
+            .clear_exception_request(req)
+            .await
             .map_err(|e| format!("Failed to clear exception request: {e}"))?;
     }
     if let Some(e) = session.exception_requests.get_mut(id) {
@@ -4402,7 +4492,10 @@ async fn disable_watchpoint(
     wp: &crate::session::WatchpointInfo,
 ) -> Result<String, String> {
     if let Some(req) = wp.request_id {
-        session.connection.clear_field_watch(req, wp.kind).await
+        session
+            .connection
+            .clear_field_watch(req, wp.kind)
+            .await
             .map_err(|e| format!("Failed to clear field watch: {e}"))?;
     }
     if let Some(w) = session.watchpoints.get_mut(id) {
@@ -4420,7 +4513,10 @@ async fn disable_method_exit(
     me: &crate::session::MethodExitRequestInfo,
 ) -> Result<String, String> {
     if let Some(req) = me.request_id {
-        session.connection.clear_method_exit_request(req, me.with_return_value).await
+        session
+            .connection
+            .clear_method_exit_request(req, me.with_return_value)
+            .await
             .map_err(|e| format!("Failed to clear method-exit request: {e}"))?;
     }
     if let Some(m) = session.method_exits.get_mut(id) {
@@ -4441,10 +4537,7 @@ async fn disable_method_exit(
 ///
 /// A re-armed stop point gets a fresh trace budget: it was disarmed *because* the old one ran out, so
 /// re-arming with zero left would fire once and immediately disable itself again.
-async fn rearm_stop_point(
-    session: &mut crate::session::DebugSession,
-    id: &str,
-) -> Result<String, String> {
+async fn rearm_stop_point(session: &mut crate::session::DebugSession, id: &str) -> Result<String, String> {
     // One arm per kind, each in its own function: the resolution steps differ (a location, a class, a
     // field) and inlining all three made this branchy enough to trip the complexity gate.
     if let Some(bp) = session.breakpoints.get(id).cloned() {
@@ -4473,9 +4566,14 @@ async fn rearm_method_exit(
     id: &str,
     me: &crate::session::MethodExitRequestInfo,
 ) -> Result<String, String> {
-    let req = session.connection
+    let req = session
+        .connection
         .set_method_exit_request(
-            &me.class_pattern, me.with_return_value, suspend_policy_for(me.trace), None, me.thread_filter,
+            &me.class_pattern,
+            me.with_return_value,
+            suspend_policy_for(me.trace),
+            None,
+            me.thread_filter,
         )
         .await
         .map_err(|e| format!("Failed to re-arm method-exit request: {e}"))?;
@@ -4514,10 +4612,18 @@ async fn rearm_line_breakpoint(
     bp: &crate::session::BreakpointInfo,
 ) -> Result<String, String> {
     let arm = rearm_breakpoint_location(session, bp).await?;
-    let req = session.connection.set_breakpoint_ex(
-        arm.class_id, arm.method_id, arm.bytecode_index, arm.suspend_policy,
-        arm.hit_count, arm.thread_filter,
-    ).await.map_err(|e| format!("Failed to re-arm breakpoint: {e}"))?;
+    let req = session
+        .connection
+        .set_breakpoint_ex(
+            arm.class_id,
+            arm.method_id,
+            arm.bytecode_index,
+            arm.suspend_policy,
+            arm.hit_count,
+            arm.thread_filter,
+        )
+        .await
+        .map_err(|e| format!("Failed to re-arm breakpoint: {e}"))?;
     if let Some(b) = session.breakpoints.get_mut(id) {
         b.request_id = Some(req);
         b.enabled = true;
@@ -4538,15 +4644,26 @@ async fn rearm_exception_request(
     let ref_type = if er.class_pattern == "*" {
         None
     } else {
-        Some(resolve_class_by_dotted(&mut session.connection, &er.class_pattern).await?
-            .ok_or_else(|| format!(
+        Some(resolve_class_by_dotted(&mut session.connection, &er.class_pattern).await?.ok_or_else(|| {
+            format!(
                 "Cannot re-arm {id}: exception class '{}' is not loaded any more (was it redeployed? \
-                 trigger it once so the JVM loads it, then retry)", er.class_pattern
-            ))?)
+                 trigger it once so the JVM loads it, then retry)",
+                er.class_pattern
+            )
+        })?)
     };
-    let req = session.connection.set_exception_request_ex(
-        ref_type, er.caught, er.uncaught, suspend_policy_for(er.trace), None, er.thread_filter,
-    ).await.map_err(|e| format!("Failed to re-arm exception breakpoint: {e}"))?;
+    let req = session
+        .connection
+        .set_exception_request_ex(
+            ref_type,
+            er.caught,
+            er.uncaught,
+            suspend_policy_for(er.trace),
+            None,
+            er.thread_filter,
+        )
+        .await
+        .map_err(|e| format!("Failed to re-arm exception breakpoint: {e}"))?;
     if let Some(e) = session.exception_requests.get_mut(id) {
         e.request_id = Some(req);
         e.enabled = true;
@@ -4563,20 +4680,30 @@ async fn rearm_watchpoint(
     id: &str,
     wp: &crate::session::WatchpointInfo,
 ) -> Result<String, String> {
-    let type_id = resolve_class_by_dotted(&mut session.connection, &wp.class_name).await?
-        .ok_or_else(|| format!(
-            "Cannot re-arm {id}: class '{}' is not loaded any more (was it redeployed? exercise it \
-             once so the JVM loads it, then retry)", wp.class_name
-        ))?;
+    let type_id =
+        resolve_class_by_dotted(&mut session.connection, &wp.class_name).await?.ok_or_else(|| {
+            format!(
+                "Cannot re-arm {id}: class '{}' is not loaded any more (was it redeployed? exercise it \
+             once so the JVM loads it, then retry)",
+                wp.class_name
+            )
+        })?;
     let (declaring, field) =
-        find_field_info(&mut session.connection, type_id, &wp.field_name, None).await?
-            .ok_or_else(|| format!(
-                "Cannot re-arm {id}: class '{}' no longer has a field '{}'",
-                wp.class_name, wp.field_name
-            ))?;
-    let req = session.connection.set_field_watch_ex(
-        declaring, field.field_id, wp.kind, suspend_policy_for(wp.trace), None, wp.thread_filter,
-    ).await.map_err(|e| format!("Failed to re-arm watchpoint: {e}"))?;
+        find_field_info(&mut session.connection, type_id, &wp.field_name, None).await?.ok_or_else(|| {
+            format!("Cannot re-arm {id}: class '{}' no longer has a field '{}'", wp.class_name, wp.field_name)
+        })?;
+    let req = session
+        .connection
+        .set_field_watch_ex(
+            declaring,
+            field.field_id,
+            wp.kind,
+            suspend_policy_for(wp.trace),
+            None,
+            wp.thread_filter,
+        )
+        .await
+        .map_err(|e| format!("Failed to re-arm watchpoint: {e}"))?;
     if let Some(w) = session.watchpoints.get_mut(id) {
         w.request_id = Some(req);
         w.enabled = true;
@@ -4595,7 +4722,10 @@ async fn rearm_breakpoint_location(
     bp: &crate::session::BreakpointInfo,
 ) -> Result<crate::session::BreakpointArm, String> {
     let signature = format!("L{};", bp.class_pattern.replace('.', "/"));
-    let classes = session.connection.classes_by_signature(&signature).await
+    let classes = session
+        .connection
+        .classes_by_signature(&signature)
+        .await
         .map_err(|e| format!("Failed to look up '{}': {e}", bp.class_pattern))?;
     let Some(class) = classes.first() else {
         return Err(format!(
@@ -4655,10 +4785,18 @@ async fn try_record_trace(
     let record = if skip {
         None
     } else {
-        Some(capture_trace(
-            &mut session.connection, &req.id, req.trace_expr.as_deref(), req.trace_frames,
-            thread, &loc, &details,
-        ).await)
+        Some(
+            capture_trace(
+                &mut session.connection,
+                &req.id,
+                req.trace_expr.as_deref(),
+                req.trace_frames,
+                thread,
+                &loc,
+                &details,
+            )
+            .await,
+        )
     };
     let took = started.elapsed();
     let recorded = record.is_some();
@@ -4762,7 +4900,9 @@ async fn store_reportable_event(
         // A suspending method-exit request narrowed to one method (METH-1) still receives every method of
         // the class, so an exit from a different one must resume and be dropped — otherwise a request for
         // `save` freezes the VM on the first unrelated getter that returns.
-        let method_filter = session.method_exits.values()
+        let method_filter = session
+            .method_exits
+            .values()
             .find(|m| m.request_id == Some(req_id))
             .and_then(|m| m.method.clone());
         if method_filter.is_some()
@@ -4771,7 +4911,9 @@ async fn store_reportable_event(
             let _ = session.connection.resume_all().await;
             skip = true;
         }
-        let cond = session.breakpoints.values()
+        let cond = session
+            .breakpoints
+            .values()
             .find(|b| b.request_id == Some(req_id))
             .and_then(|b| b.condition.clone());
         if !skip {
@@ -4791,10 +4933,9 @@ async fn store_reportable_event(
         if suspends {
             // Record WHICH request suspended us, here and now. The watchdog used to re-derive this from
             // the newest buffered event, which `get_last_event {drain:true}` erases (SAFE-5).
-            let cause = event_set.events.first().map_or(
-                crate::session::SuspendCause::ManualPause,
-                |e| crate::session::SuspendCause::StopPoint(e.request_id),
-            );
+            let cause = event_set.events.first().map_or(crate::session::SuspendCause::ManualPause, |e| {
+                crate::session::SuspendCause::StopPoint(e.request_id)
+            });
             session.mark_suspended(cause);
         }
         let seq = session.push_event(event_set);
@@ -4845,13 +4986,16 @@ async fn notify_suspension(session: &mut crate::session::DebugSession, seq: u64)
 /// to call on the hit path while the VM is held.
 fn stop_point_id(session: &crate::session::DebugSession, req: i32) -> Option<String> {
     let hit = Some(req);
-    session.breakpoints.iter().find(|(_, b)| b.request_id == hit).map(|(k, _)| k.clone())
-        .or_else(|| session.exception_requests.iter()
-            .find(|(_, e)| e.request_id == hit).map(|(k, _)| k.clone()))
-        .or_else(|| session.watchpoints.iter()
-            .find(|(_, w)| w.request_id == hit).map(|(k, _)| k.clone()))
-        .or_else(|| session.method_exits.iter()
-            .find(|(_, m)| m.request_id == hit).map(|(k, _)| k.clone()))
+    session
+        .breakpoints
+        .iter()
+        .find(|(_, b)| b.request_id == hit)
+        .map(|(k, _)| k.clone())
+        .or_else(|| {
+            session.exception_requests.iter().find(|(_, e)| e.request_id == hit).map(|(k, _)| k.clone())
+        })
+        .or_else(|| session.watchpoints.iter().find(|(_, w)| w.request_id == hit).map(|(k, _)| k.clone()))
+        .or_else(|| session.method_exits.iter().find(|(_, m)| m.request_id == hit).map(|(k, _)| k.clone()))
 }
 
 /// Upper bound on resume attempts when clearing a suspend depth (SAFE-7). A depth above this means
@@ -4874,8 +5018,10 @@ async fn resume_and_verify(session: &mut crate::session::DebugSession) -> Result
         session.connection.resume_all().await.map_err(|e| format!("Failed to resume: {e}"))?;
         return Ok(None);
     };
-    let (issued, left) = session.connection
-        .resume_all_fully(probe, MAX_RESUME_ATTEMPTS).await
+    let (issued, left) = session
+        .connection
+        .resume_all_fully(probe, MAX_RESUME_ATTEMPTS)
+        .await
         .map_err(|e| format!("Failed to resume: {e}"))?;
     if left > 0 {
         return Ok(Some(format!(
@@ -4891,10 +5037,7 @@ async fn resume_and_verify(session: &mut crate::session::DebugSession) -> Result
 /// How long the VM may sit suspended before the watchdog resumes it: `JDWP_WATCHDOG_SECS`, default 120,
 /// `0` to disable. Read in one place so the tools can *report* the value they're promising.
 fn watchdog_secs() -> u64 {
-    std::env::var("JDWP_WATCHDOG_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(120)
+    std::env::var("JDWP_WATCHDOG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(120)
 }
 
 /// Spawn the watchdog: auto-resume the VM if anything leaves it suspended past `JDWP_WATCHDOG_SECS`
@@ -4962,7 +5105,8 @@ fn spawn_watchdog(
                         }
                         Ok(Some(detail)) if detail.starts_with("cleared") => {
                             s.mark_resumed();
-                            let note = format!("watchdog auto-resumed the VM after {secs}s {disarmed} ({detail})");
+                            let note =
+                                format!("watchdog auto-resumed the VM after {secs}s {disarmed} ({detail})");
                             info!("{note}");
                             s.last_watchdog_note = Some(note);
                             "warning"
@@ -4970,7 +5114,9 @@ fn spawn_watchdog(
                         Ok(Some(problem)) => {
                             // Deliberately NOT calling mark_resumed: the VM is still stopped, so the
                             // watchdog must keep trying rather than going quiet on a false success.
-                            let note = format!("⚠️ watchdog tried to resume the VM after {secs}s {disarmed}, but {problem}");
+                            let note = format!(
+                                "⚠️ watchdog tried to resume the VM after {secs}s {disarmed}, but {problem}"
+                            );
                             warn!("{note}");
                             s.last_watchdog_note = Some(note);
                             // A still-frozen VM is an `error`: nothing the caller does next will work
@@ -5021,33 +5167,50 @@ async fn arm_and_insert(
     bp_id: String,
 ) -> Result<(String, i32, String, i32), String> {
     let (method, index, line) = resolve_bp_location(
-        &mut session.connection, class_type_id, spec.line_opt, spec.method_hint.as_deref(),
-    ).await.map_err(|e| format!("{e} in {}", spec.class_pattern))?;
-    let request_id = session.connection.set_breakpoint_ex(
-        class_type_id, method.method_id, index, spec.suspend_policy, spec.hit_count, spec.thread_filter,
-    ).await.map_err(|e| format!("Failed to set breakpoint: {e}"))?;
-    session.breakpoints.insert(bp_id.clone(), crate::session::BreakpointInfo {
-        request_id: Some(request_id),
-        class_pattern: spec.class_pattern.clone(),
-        line: u32::try_from(line).unwrap_or(0),
-        method: Some(method.name.clone()),
-        enabled: true,
-        hit_count: 0,
-        condition: spec.condition.clone(),
-        trace: spec.trace,
-        trace_expr: spec.trace_expr.clone(),
-        trace_budget: spec.trace_budget,
-        trace_frames: spec.trace_frames,
-        trace_cost: crate::session::TraceCost::default(),
-        arm: crate::session::BreakpointArm {
-            class_id: class_type_id,
-            method_id: method.method_id,
-            bytecode_index: index,
-            suspend_policy: spec.suspend_policy,
-            hit_count: spec.hit_count,
-            thread_filter: spec.thread_filter,
+        &mut session.connection,
+        class_type_id,
+        spec.line_opt,
+        spec.method_hint.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("{e} in {}", spec.class_pattern))?;
+    let request_id = session
+        .connection
+        .set_breakpoint_ex(
+            class_type_id,
+            method.method_id,
+            index,
+            spec.suspend_policy,
+            spec.hit_count,
+            spec.thread_filter,
+        )
+        .await
+        .map_err(|e| format!("Failed to set breakpoint: {e}"))?;
+    session.breakpoints.insert(
+        bp_id.clone(),
+        crate::session::BreakpointInfo {
+            request_id: Some(request_id),
+            class_pattern: spec.class_pattern.clone(),
+            line: u32::try_from(line).unwrap_or(0),
+            method: Some(method.name.clone()),
+            enabled: true,
+            hit_count: 0,
+            condition: spec.condition.clone(),
+            trace: spec.trace,
+            trace_expr: spec.trace_expr.clone(),
+            trace_budget: spec.trace_budget,
+            trace_frames: spec.trace_frames,
+            trace_cost: crate::session::TraceCost::default(),
+            arm: crate::session::BreakpointArm {
+                class_id: class_type_id,
+                method_id: method.method_id,
+                bytecode_index: index,
+                suspend_policy: spec.suspend_policy,
+                hit_count: spec.hit_count,
+                thread_filter: spec.thread_filter,
+            },
         },
-    });
+    );
     Ok((bp_id, line, method.name, request_id))
 }
 
@@ -5060,8 +5223,10 @@ async fn register_deferred_breakpoint(
     spec: &BreakpointSpec,
     bp_id: String,
 ) -> Result<String, String> {
-    let cp_req = session.connection
-        .set_class_prepare(&spec.class_pattern, jdwp_client::SuspendPolicy::EventThread).await
+    let cp_req = session
+        .connection
+        .set_class_prepare(&spec.class_pattern, jdwp_client::SuspendPolicy::EventThread)
+        .await
         .map_err(|e| format!("Failed to register class-prepare watch: {e}"))?;
 
     let recheck = session.connection.classes_by_signature(&spec.signature).await.unwrap_or_default();
@@ -5072,7 +5237,10 @@ async fn register_deferred_breakpoint(
         return Ok(format!(
             "✅ {} set at {}:{} (class had just loaded)\n   Method: {}\n   Stop-point ID: {}",
             if spec.trace { "Trace breakpoint" } else { "Breakpoint" },
-            spec.class_pattern, line, method_name, bp_id
+            spec.class_pattern,
+            line,
+            method_name,
+            bp_id
         ));
     }
 
@@ -5111,8 +5279,7 @@ async fn resolve_bp_location(
     line_opt: Option<i32>,
     method_hint: Option<&str>,
 ) -> Result<(jdwp_client::reftype::MethodInfo, u64, i32), String> {
-    let methods = conn.get_methods(class_type_id).await
-        .map_err(|e| format!("Failed to get methods: {e}"))?;
+    let methods = conn.get_methods(class_type_id).await.map_err(|e| format!("Failed to get methods: {e}"))?;
     // Hold a reference to the winning method and clone it once after the loop, rather than cloning
     // on every candidate.
     let mut chosen: Option<(&jdwp_client::reftype::MethodInfo, u64, i32)> = None;
@@ -5189,7 +5356,9 @@ async fn find_field_info(
 fn type_mismatch_err(name: &str, field_sig: &str, value: &jdwp_client::types::Value) -> String {
     format!(
         "Type mismatch: '{}' is declared {}, but the value {} is not assignable — pass a compatible literal.",
-        name, decode_signature(field_sig), value.format()
+        name,
+        decode_signature(field_sig),
+        value.format()
     )
 }
 
@@ -5212,25 +5381,32 @@ async fn set_local_variable(
         return Err("Cannot assign to a method call".to_string());
     }
     let name = &seg.name;
-    let thread_id = thread_opt
-        .ok_or_else(|| "No thread. Pass thread_id, or hit a breakpoint first.".to_string())?;
-    let frames = conn.get_frames(thread_id, 0, -1).await
-        .map_err(|e| format!("Failed to get frames: {e}"))?;
-    let frame = frames.get(frame_index).cloned()
-        .ok_or_else(|| format!("frame_index {frame_index} out of range"))?;
-    let vars = conn.get_variable_table(frame.location.class_id, frame.location.method_id).await
+    let thread_id =
+        thread_opt.ok_or_else(|| "No thread. Pass thread_id, or hit a breakpoint first.".to_string())?;
+    let frames = conn.get_frames(thread_id, 0, -1).await.map_err(|e| format!("Failed to get frames: {e}"))?;
+    let frame =
+        frames.get(frame_index).cloned().ok_or_else(|| format!("frame_index {frame_index} out of range"))?;
+    let vars = conn
+        .get_variable_table(frame.location.class_id, frame.location.method_id)
+        .await
         .map_err(|e| format!("Failed to read variable table: {e}"))?;
     let idx = frame.location.index;
-    let var = vars.iter()
+    let var = vars
+        .iter()
         .find(|v| &v.name == name && idx >= v.code_index && idx < v.code_index + u64::from(v.length))
         .or_else(|| vars.iter().find(|v| &v.name == name))
-        .ok_or_else(|| format!("Unknown local variable '{name}' (for a static/instance field use Class.field or obj.field)"))?;
+        .ok_or_else(|| {
+            format!(
+                "Unknown local variable '{name}' (for a static/instance field use Class.field or obj.field)"
+            )
+        })?;
     let sig_byte = *var.signature.as_bytes().first().ok_or_else(|| "Bad signature".to_string())?;
     let value = value_to_write(conn, Some(thread_id), frame_index, value_str, &var.signature).await?;
     if !tag_compatible(sig_byte, value.tag) {
         return Err(type_mismatch_err(name, &var.signature, &value));
     }
-    conn.set_frame_value(thread_id, frame.frame_id, i32::try_from(var.slot).unwrap_or(0), &value).await
+    conn.set_frame_value(thread_id, frame.frame_id, i32::try_from(var.slot).unwrap_or(0), &value)
+        .await
         .map_err(|e| format!("Failed to set value: {e}"))?;
     Ok(format!("✅ Set local {name} = {value_str}"))
 }
@@ -5287,9 +5463,13 @@ async fn set_element(
     raw_value: &str,
 ) -> Result<String, String> {
     let tid = thread_opt.ok_or_else(|| {
-        format!("Writing '{container_expr}[…]' needs a suspended thread — pause one or hit a breakpoint first")
+        format!(
+            "Writing '{container_expr}[…]' needs a suspended thread — pause one or hit a breakpoint first"
+        )
     })?;
-    let frames = conn.get_frames(tid, 0, -1).await
+    let frames = conn
+        .get_frames(tid, 0, -1)
+        .await
         .map_err(|e| format!("Failed to get frames (is the thread suspended?): {e}"))?;
     let frame = frames.get(frame_index).or_else(|| frames.first()).cloned();
     let container = resolve_expression(conn, Some(tid), frame.as_ref(), container_expr).await?;
@@ -5318,7 +5498,9 @@ async fn set_collection_element(
     key: &ArgLit,
     raw_value: &str,
 ) -> Result<String, String> {
-    let type_id = conn.get_object_reference_type(id).await
+    let type_id = conn
+        .get_object_reference_type(id)
+        .await
         .map_err(|e| format!("Failed to resolve type of '{container_expr}': {e}"))?;
     let writer = match find_method_arity(conn, type_id, "set", 2).await? {
         Some((d, m)) => Some((d, m, false)),
@@ -5348,15 +5530,13 @@ async fn set_collection_element(
     let new_value = value_to_write(conn, Some(tid), frame_index, raw_value, &value_sig).await?;
     let args = coerce_args(conn, tid, &m.signature, vec![key_value, new_value]).await?;
 
-    let (ret, exc) = conn.invoke_method(id, tid, decl, m.method_id, args).await
+    let (ret, exc) = conn
+        .invoke_method(id, tid, decl, m.method_id, args)
+        .await
         .map_err(|e| format!("{}() on '{container_expr}' failed: {e}", m.name))?;
     let displaced = invoke_result(conn, &m.name, ret, exc).await?;
     let old = render_value(conn, &displaced, Some(tid), 200).await;
-    Ok(format!(
-        "✅ Set {container_expr}[{}] = {raw_value} (was {old}) via {}()",
-        render_arglit(key),
-        m.name,
-    ))
+    Ok(format!("✅ Set {container_expr}[{}] = {raw_value} (was {old}) via {}()", render_arglit(key), m.name,))
 }
 
 /// Write one array element via `ArrayReference.SetValues`, coercing the literal to the array's
@@ -5373,14 +5553,18 @@ async fn set_array_element(
     let ArgLit::Int(i) = key else {
         return Err(format!("An array index must be an int, got {key:?} on '{container_expr}'"));
     };
-    let len = conn.get_array_length(id).await
+    let len = conn
+        .get_array_length(id)
+        .await
         .map_err(|e| format!("Failed to read length of '{container_expr}': {e}"))?;
     if *i < 0 || *i >= len {
         return Err(format!("Index {i} is out of bounds for '{container_expr}' (length {len})"));
     }
     // "[I" -> 'I', "[Ljava/lang/String;" -> 'L'. The component type is what the value must match:
     // ArrayReference.SetValues writes untagged, so a wrong width would corrupt the element silently.
-    let type_id = conn.get_object_reference_type(id).await
+    let type_id = conn
+        .get_object_reference_type(id)
+        .await
         .map_err(|e| format!("Failed to resolve type of '{container_expr}': {e}"))?;
     let sig = conn.get_signature(type_id).await.unwrap_or_default();
     let component = sig.strip_prefix('[').unwrap_or(&sig).to_string();
@@ -5395,7 +5579,8 @@ async fn set_array_element(
             decode_signature(&String::from_utf8_lossy(&[value.tag])),
         ));
     }
-    conn.set_array_values(id, *i, std::slice::from_ref(&value)).await
+    conn.set_array_values(id, *i, std::slice::from_ref(&value))
+        .await
         .map_err(|e| format!("Failed to write '{container_expr}[{i}]': {e}"))?;
 
     let was = match old {
@@ -5429,18 +5614,26 @@ async fn set_instance_field(
             return Err(format!("Cannot set '.{field_name}' — '{container_expr}' is null"))
         }
         jdwp_client::types::ValueData::Object(obj_id) => obj_id,
-        _ => return Ok(FieldWrite::Fallthrough(Some(format!("'{container_expr}' is a primitive, not an object")))),
+        _ => {
+            return Ok(FieldWrite::Fallthrough(Some(format!(
+                "'{container_expr}' is a primitive, not an object"
+            ))))
+        }
     };
-    let type_id = conn.get_object_reference_type(obj_id).await
+    let type_id = conn
+        .get_object_reference_type(obj_id)
+        .await
         .map_err(|e| format!("Failed to resolve object type: {e}"))?;
-    let (_, f) = find_field_info(conn, type_id, field_name, Some(false)).await?
+    let (_, f) = find_field_info(conn, type_id, field_name, Some(false))
+        .await?
         .ok_or_else(|| format!("No instance field '{field_name}' on the resolved object"))?;
     let sig_byte = *f.signature.as_bytes().first().ok_or_else(|| "Bad field signature".to_string())?;
     let value = value_to_write(conn, Some(thread_id), frame_index, value_str, &f.signature).await?;
     if !tag_compatible(sig_byte, value.tag) {
         return Err(type_mismatch_err(field_name, &f.signature, &value));
     }
-    conn.set_object_values(obj_id, vec![(f.field_id, value)]).await
+    conn.set_object_values(obj_id, vec![(f.field_id, value)])
+        .await
         .map_err(|e| format!("Failed to set instance field: {e}"))?;
     Ok(FieldWrite::Done(format!("✅ Set instance field {container_expr}.{field_name} = {value_str}")))
 }
@@ -5458,14 +5651,16 @@ async fn set_static_field(
     let Some(class_id) = resolve_class_by_dotted(conn, container_expr).await? else {
         return Ok(None);
     };
-    let (_, f) = find_field_info(conn, class_id, field_name, Some(true)).await?
+    let (_, f) = find_field_info(conn, class_id, field_name, Some(true))
+        .await?
         .ok_or_else(|| format!("class '{container_expr}' has no static field '{field_name}'"))?;
     let sig_byte = *f.signature.as_bytes().first().ok_or_else(|| "Bad field signature".to_string())?;
     let value = value_to_write(conn, thread_opt, frame_index, value_str, &f.signature).await?;
     if !tag_compatible(sig_byte, value.tag) {
         return Err(type_mismatch_err(field_name, &f.signature, &value));
     }
-    conn.set_reference_values(class_id, vec![(f.field_id, value)]).await
+    conn.set_reference_values(class_id, vec![(f.field_id, value)])
+        .await
         .map_err(|e| format!("Failed to set static field: {e}"))?;
     Ok(Some(format!("✅ Set static field {container_expr}.{field_name} = {value_str}")))
 }
@@ -5526,23 +5721,30 @@ async fn resolve_head(
         return Err("Expression must start with a local variable or 'this'".to_string());
     }
     if seg.name == "this" {
-        let obj = conn.get_this_object(thread_id, frame.frame_id).await
+        let obj = conn
+            .get_this_object(thread_id, frame.frame_id)
+            .await
             .map_err(|e| format!("Failed to get 'this': {e}"))?;
         if obj == 0 {
             return Err("No 'this' in this frame (static method)".to_string());
         }
         return Ok(Value { tag: 76, data: ValueData::Object(obj) });
     }
-    let vars = conn.get_variable_table(frame.location.class_id, frame.location.method_id).await
+    let vars = conn
+        .get_variable_table(frame.location.class_id, frame.location.method_id)
+        .await
         .map_err(|e| format!("Failed to read local variable table (compiled without -g?): {e}"))?;
     let idx = frame.location.index;
-    let var = vars.iter()
+    let var = vars
+        .iter()
         .find(|v| v.name == seg.name && idx >= v.code_index && idx < v.code_index + u64::from(v.length))
         .or_else(|| vars.iter().find(|v| v.name == seg.name))
         .ok_or_else(|| format!("Unknown local variable '{}' in this frame", seg.name))?;
     let sig_byte = *var.signature.as_bytes().first().ok_or_else(|| "Bad variable signature".to_string())?;
     let slot = jdwp_client::stackframe::VariableSlot { slot: i32::try_from(var.slot).unwrap_or(0), sig_byte };
-    let frame_values = conn.get_frame_values(thread_id, frame.frame_id, vec![slot]).await
+    let frame_values = conn
+        .get_frame_values(thread_id, frame.frame_id, vec![slot])
+        .await
         .map_err(|e| format!("Failed to read variable value: {e}"))?;
     frame_values.into_iter().next().ok_or_else(|| "No value returned for variable".to_string())
 }
@@ -5606,8 +5808,8 @@ async fn apply_index(
     key: &ArgLit,
     label: &str,
 ) -> Result<jdwp_client::types::Value, String> {
-    let id = as_object_id(base)
-        .ok_or_else(|| format!("Cannot index '{label}' — it is null or a primitive"))?;
+    let id =
+        as_object_id(base).ok_or_else(|| format!("Cannot index '{label}' — it is null or a primitive"))?;
 
     // Arrays are indexable without invoking anything, so handle them before touching the debuggee.
     if base.tag == 91 {
@@ -5655,9 +5857,9 @@ async fn apply_index(
         // an object pointer and dies.
         let key_value = arglit_to_value(conn, thread_id, frame, key).await?;
         if render_primitive(&key_value.data).is_some() {
-            box_primitive(conn, tid, &key_value).await.ok_or_else(|| {
-                format!("Could not box the key for '{label}[…]' — try a String key")
-            })?
+            box_primitive(conn, tid, &key_value)
+                .await
+                .ok_or_else(|| format!("Could not box the key for '{label}[…]' — try a String key"))?
         } else {
             key_value
         }
@@ -5698,9 +5900,8 @@ async fn box_primitive(
         ValueData::Object(_) | ValueData::Void => return None,
     };
     let type_id = resolve_class_by_dotted(conn, class).await.ok()??;
-    let (decl, m) = find_method_for_args(conn, type_id, "valueOf", std::slice::from_ref(v), Some(true))
-        .await
-        .ok()??;
+    let (decl, m) =
+        find_method_for_args(conn, type_id, "valueOf", std::slice::from_ref(v), Some(true)).await.ok()??;
     let (ret, exc) = conn.invoke_static_method(decl, tid, m.method_id, vec![v.clone()]).await.ok()?;
     (exc == 0).then_some(ret)
 }
@@ -5777,10 +5978,8 @@ async fn scan_elements(
         }
     };
 
-    let len = conn
-        .get_array_length(arr)
-        .await
-        .map_err(|e| format!("Failed to read length of '{label}': {e}"))?;
+    let len =
+        conn.get_array_length(arr).await.map_err(|e| format!("Failed to read length of '{label}': {e}"))?;
     let take = len.min(SUBSCRIPT_SCAN_CAP);
     let values = if take == 0 {
         Vec::new()
@@ -5857,8 +6056,7 @@ async fn apply_range(
     to: i64,
     label: &str,
 ) -> Result<Resolved, String> {
-    let Scan { values, len, name, .. } =
-        scan_elements(conn, thread_id, base, label, MapScan::Refuse).await?;
+    let Scan { values, len, name, .. } = scan_elements(conn, thread_id, base, label, MapScan::Refuse).await?;
     if from < 0 {
         return Err(format!("Range start must not be negative in '{label}[{from}..{to}]'"));
     }
@@ -5970,7 +6168,11 @@ enum Predicate {
     Or(Vec<Self>),
     And(Vec<Self>),
     /// `lhs OP rhs`: `lhs` is re-resolved against each element, `rhs` was resolved once.
-    Compare { lhs: String, op: String, rhs: PredRhs },
+    Compare {
+        lhs: String,
+        op: String,
+        rhs: PredRhs,
+    },
     /// A boolean chain evaluated against each element.
     Bool(String),
 }
@@ -6108,13 +6310,13 @@ async fn resolve_member(
 ) -> Result<jdwp_client::types::Value, String> {
     use jdwp_client::types::ValueData;
     let obj_id = match &current.data {
-        ValueData::Object(0) => {
-            return Err(format!("Cannot access '.{}' on null", seg.name))
-        }
+        ValueData::Object(0) => return Err(format!("Cannot access '.{}' on null", seg.name)),
         ValueData::Object(id) => *id,
         _ => return Err(format!("Cannot access '.{}' on a primitive value", seg.name)),
     };
-    let type_id = conn.get_object_reference_type(obj_id).await
+    let type_id = conn
+        .get_object_reference_type(obj_id)
+        .await
         .map_err(|e| format!("Failed to resolve object type: {e}"))?;
 
     if let Some(arglits) = &seg.args {
@@ -6138,8 +6340,8 @@ async fn invoke_segment_method(
         format!("Calling '.{}()' needs a suspended thread — pause one or hit a breakpoint first", seg.name)
     })?;
     let argvals = eval_args(conn, thread_id, frame, arglits).await?;
-    let (decl, m) = find_method_for_args(conn, type_id, &seg.name, &argvals, None).await?
-        .ok_or_else(|| {
+    let (decl, m) =
+        find_method_for_args(conn, type_id, &seg.name, &argvals, None).await?.ok_or_else(|| {
             format!(
                 "No method '{}' on the object accepts {} argument(s) of these types",
                 seg.name,
@@ -6148,7 +6350,9 @@ async fn invoke_segment_method(
         })?;
     // Box any primitive the chosen overload declares as a reference (`f(Integer)` given `5`).
     let argvals = coerce_args(conn, tid, &m.signature, argvals).await?;
-    let (ret, exc) = conn.invoke_method(obj_id, tid, decl, m.method_id, argvals).await
+    let (ret, exc) = conn
+        .invoke_method(obj_id, tid, decl, m.method_id, argvals)
+        .await
         .map_err(|e| format!("invoke {}() failed: {}", seg.name, e))?;
     invoke_result(conn, &seg.name, ret, exc).await
 }
@@ -6192,9 +6396,12 @@ async fn read_segment_field(
     type_id: u64,
     seg: &Seg,
 ) -> Result<jdwp_client::types::Value, String> {
-    let fid = find_field(conn, type_id, &seg.name).await?
+    let fid = find_field(conn, type_id, &seg.name)
+        .await?
         .ok_or_else(|| format!("No field '{}' found on the object", seg.name))?;
-    let vals = conn.get_object_values(obj_id, vec![fid]).await
+    let vals = conn
+        .get_object_values(obj_id, vec![fid])
+        .await
         .map_err(|e| format!("Failed to read field '{}': {}", seg.name, e))?;
     vals.into_iter().next().ok_or_else(|| "No value returned for field".to_string())
 }
@@ -6207,7 +6414,8 @@ fn resolve_expression_boxed<'a>(
     thread_id: Option<u64>,
     frame: Option<&'a jdwp_client::thread::Frame>,
     expr: &'a str,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<jdwp_client::types::Value, String>> + Send + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<jdwp_client::types::Value, String>> + Send + 'a>>
+{
     Box::pin(resolve_expression(conn, thread_id, frame, expr))
 }
 
@@ -6253,9 +6461,7 @@ async fn resolve_expression(
     frame: Option<&jdwp_client::thread::Frame>,
     expr: &str,
 ) -> Result<jdwp_client::types::Value, String> {
-    resolve_expression_multi(conn, thread_id, frame, expr)
-        .await?
-        .single("This")
+    resolve_expression_multi(conn, thread_id, frame, expr).await?.single("This")
 }
 
 async fn resolve_expression_multi(
@@ -6279,17 +6485,19 @@ async fn resolve_expression_multi(
         _ => None,
     };
 
-    let (mut current, start) = if let Some(Ok(v)) = head_result { (v, 1usize) } else {
-        let (v, consumed) = resolve_static_head(conn, thread_id, frame, &segs).await.map_err(|static_err| {
-            match &head_result {
+    let (mut current, start) = if let Some(Ok(v)) = head_result {
+        (v, 1usize)
+    } else {
+        let (v, consumed) = resolve_static_head(conn, thread_id, frame, &segs).await.map_err(
+            |static_err| match &head_result {
                 Some(Err(head_err)) => {
                     format!("{head_err} (also not a resolvable static member: {static_err})")
                 }
                 _ => format!(
                     "No suspended frame to read locals from, and not a resolvable static member: {static_err}"
                 ),
-            }
-        })?;
+            },
+        )?;
         (v, consumed)
     };
 
@@ -6302,11 +6510,7 @@ async fn resolve_expression_multi(
         Resolved::One(v) => current = v,
         // A multi-value subscript must be the last thing in the expression.
         many @ Resolved::Many { .. } => {
-            return if start < segs.len() {
-                Err(multi_then_chain_error(&head_owner.name))
-            } else {
-                Ok(many)
-            }
+            return if start < segs.len() { Err(multi_then_chain_error(&head_owner.name)) } else { Ok(many) }
         }
     }
 
@@ -6412,9 +6616,8 @@ async fn invoke_static_member(
         )
     })?;
     let argvals = eval_args(conn, thread_id, frame, arglits).await?;
-    let (decl, m) = find_method_for_args(conn, type_id, &member.name, &argvals, Some(true))
-        .await?
-        .ok_or_else(|| {
+    let (decl, m) =
+        find_method_for_args(conn, type_id, &member.name, &argvals, Some(true)).await?.ok_or_else(|| {
             format!(
                 "class '{}' has no static method '{}' accepting {} argument(s) of these types",
                 dotted,
@@ -6442,10 +6645,8 @@ async fn resolve_class_by_dotted(
     dotted: &str,
 ) -> Result<Option<u64>, String> {
     let sig = format!("L{};", dotted.replace('.', "/"));
-    let classes = conn
-        .classes_by_signature(&sig)
-        .await
-        .map_err(|e| format!("classes_by_signature failed: {e}"))?;
+    let classes =
+        conn.classes_by_signature(&sig).await.map_err(|e| format!("classes_by_signature failed: {e}"))?;
     if let Some(c) = classes.iter().find(|c| c.ref_type_tag == 1).or_else(|| classes.first()) {
         return Ok(Some(c.type_id));
     }
@@ -6501,7 +6702,11 @@ async fn render_element(conn: &mut jdwp_client::JdwpConnection, value: &jdwp_cli
                 }
             }
             match conn.get_object_reference_type(*id).await {
-                Ok(t) => format!("{} (id=0x{:x})", decode_signature(&conn.get_signature(t).await.unwrap_or_default()), id),
+                Ok(t) => format!(
+                    "{} (id=0x{:x})",
+                    decode_signature(&conn.get_signature(t).await.unwrap_or_default()),
+                    id
+                ),
                 Err(_) => format!("(object) @{id:x}"),
             }
         }
@@ -6725,8 +6930,7 @@ async fn expand_object(
     }
     // Collections need method invocation, so only attempt them with a suspended thread.
     if let Some(tid) = thread_id {
-        if let Some(rendered) =
-            render_collection_deep(conn, id, type_id, name, tid, opts, state, depth).await
+        if let Some(rendered) = render_collection_deep(conn, id, type_id, name, tid, opts, state, depth).await
         {
             return rendered;
         }
@@ -7216,19 +7420,24 @@ async fn literal_to_value(
         // Assigning an integer literal to a narrower Java primitive performs Java's own
         // narrowing conversion (`(byte)`, `(short)`, `(char)`, `(float)`) — a deliberate,
         // possibly-lossy reinterpretation, exactly as `javac` would compile it.
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
         ArgLit::Int(n) => match sig_byte {
             b'J' => value_long(i64::from(n)),
             b'Z' => value_bool(n != 0),
             b'B' => jdwp_client::types::Value { tag: 66, data: jdwp_client::types::ValueData::Byte(n as i8) },
-            b'S' => jdwp_client::types::Value { tag: 83, data: jdwp_client::types::ValueData::Short(n as i16) },
-            b'C' => jdwp_client::types::Value { tag: 67, data: jdwp_client::types::ValueData::Char(n as u16) },
-            b'F' => jdwp_client::types::Value { tag: 70, data: jdwp_client::types::ValueData::Float(n as f32) },
-            b'D' => jdwp_client::types::Value { tag: 68, data: jdwp_client::types::ValueData::Double(f64::from(n)) },
+            b'S' => {
+                jdwp_client::types::Value { tag: 83, data: jdwp_client::types::ValueData::Short(n as i16) }
+            }
+            b'C' => {
+                jdwp_client::types::Value { tag: 67, data: jdwp_client::types::ValueData::Char(n as u16) }
+            }
+            b'F' => {
+                jdwp_client::types::Value { tag: 70, data: jdwp_client::types::ValueData::Float(n as f32) }
+            }
+            b'D' => jdwp_client::types::Value {
+                tag: 68,
+                data: jdwp_client::types::ValueData::Double(f64::from(n)),
+            },
             _ => value_int(n),
         },
     })
@@ -7252,10 +7461,15 @@ async fn value_to_write(
     let sig_byte = declared_sig.as_bytes().first().copied().unwrap_or(b'L');
     match parse_lit(value_str.trim())? {
         ArgLit::Expr(e) => {
-            let tid = thread_opt.ok_or_else(|| format!(
+            let tid = thread_opt.ok_or_else(|| {
+                format!(
                 "Copying the live value '{e}' needs a suspended thread — pause one or hit a breakpoint first"
-            ))?;
-            let frame = conn.get_frames(tid, 0, -1).await.ok()
+            )
+            })?;
+            let frame = conn
+                .get_frames(tid, 0, -1)
+                .await
+                .ok()
                 .and_then(|f| f.get(frame_index).cloned().or_else(|| f.first().cloned()));
             let v = resolve_expression(conn, Some(tid), frame.as_ref(), &e).await?;
             validate_ref_assignable(conn, declared_sig, &v).await?;
@@ -7280,7 +7494,9 @@ async fn validate_ref_assignable(
     match v.data {
         jdwp_client::types::ValueData::Object(0) => Ok(()), // null fits any reference
         jdwp_client::types::ValueData::Object(id) => {
-            let rt = conn.get_object_reference_type(id).await
+            let rt = conn
+                .get_object_reference_type(id)
+                .await
                 .map_err(|e| format!("Failed to resolve the source value's type: {e}"))?;
             let ok = if declared_sig.starts_with('[') {
                 conn.get_signature(rt).await.is_ok_and(|s| s.starts_with('['))
@@ -7745,7 +7961,12 @@ async fn collect_dump_rows(
             (DumpStack::Omitted, 0)
         } else {
             let (frames, hidden) = read_dump_stack(
-                conn, tid, a.max_frames, package_filter.as_deref(), &mut class_names, &mut line_tables,
+                conn,
+                tid,
+                a.max_frames,
+                package_filter.as_deref(),
+                &mut class_names,
+                &mut line_tables,
             )
             .await;
             (frames.map_or_else(DumpStack::Unreadable, DumpStack::Frames), hidden)
@@ -7756,22 +7977,24 @@ async fn collect_dump_rows(
         let (holds, waiting_on, monitor_note) =
             read_thread_monitors(conn, tid, want_monitors && suspended, &mut monitor_names).await;
 
-        rows.push((seen, DumpRow {
-            id: tid,
-            name,
-            status,
-            suspended,
-            stack,
-            frames_hidden,
-            holds,
-            waiting_on,
-            monitor_note,
-        }));
+        rows.push((
+            seen,
+            DumpRow {
+                id: tid,
+                name,
+                status,
+                suspended,
+                stack,
+                frames_hidden,
+                holds,
+                waiting_on,
+                monitor_note,
+            },
+        ));
     }
     rows.sort_by_key(|(seen, _)| *seen);
     let rows: Vec<DumpRow> = rows.into_iter().map(|(_, r)| r).collect();
-    let selection =
-        DumpSelection { eligible, families, withheld: withheld_by_family(tally, &rows) };
+    let selection = DumpSelection { eligible, families, withheld: withheld_by_family(tally, &rows) };
     DumpOutcome { rows, unread, selection }
 }
 
@@ -7846,10 +8069,12 @@ async fn read_dump_stack(
             continue;
         }
         let (method, line) = dump_frame_method(conn, &f.location, line_tables).await;
-        out.push(line.map_or_else(
-            || format!("#{idx} {class}.{method}"),
-            |l| format!("#{idx} {class}.{method}:{l}"),
-        ));
+        out.push(
+            line.map_or_else(
+                || format!("#{idx} {class}.{method}"),
+                |l| format!("#{idx} {class}.{method}:{l}"),
+            ),
+        );
     }
     (Ok(out), hidden)
 }
@@ -7894,7 +8119,8 @@ fn render_dump_header(
     caps: Option<&jdwp_client::vm::VmCapabilities>,
     meta: &DumpMeta<'_>,
 ) -> String {
-    let mut out = format!("🧵 Thread dump — {}/{} thread(s){}\n", rows.len(), meta.total, dump_filter_note(a));
+    let mut out =
+        format!("🧵 Thread dump — {}/{} thread(s){}\n", rows.len(), meta.total, dump_filter_note(a));
     out.push_str(&dump_order_note(rows.len(), meta.selection));
     if meta.already_suspended {
         out.push_str("   VM was already suspended — read as it is, and left suspended.\n");
@@ -7915,7 +8141,9 @@ fn render_dump_header(
             "   ✂️  Stopped early — the {}ms suspension budget ran out with {} thread(s) still \
              unexamined, so this dump is INCOMPLETE. Raise max_suspend_ms for a deeper dump, or narrow \
              with name_filter / limit / max_frames / package_filter, which costs nothing.{}",
-            a.max_suspend_ms, meta.unread, truncation_estimate(rows.len(), meta)
+            a.max_suspend_ms,
+            meta.unread,
+            truncation_estimate(rows.len(), meta)
         );
     }
     out.push_str(&dump_monitor_caveats(a, caps));
@@ -7966,8 +8194,7 @@ fn withheld_note(withheld: &[(String, usize)]) -> String {
     if withheld.is_empty() {
         return String::new();
     }
-    let named: Vec<String> =
-        withheld.iter().take(LISTED).map(|(f, n)| format!("{n} × \"{f}\"")).collect();
+    let named: Vec<String> = withheld.iter().take(LISTED).map(|(f, n)| format!("{n} × \"{f}\"")).collect();
     let rest = withheld.len().saturating_sub(LISTED);
     format!(
         " — biggest groups not shown: {}{}",
@@ -8106,11 +8333,7 @@ fn dump_monitor_caveats(
 /// blocked on a lock — while `debugger-suspended` means we are holding it, which is the only reason its
 /// stack is readable at all. `[monitor, suspended]` invited the reading "suspended at a monitor", which
 /// attributes the freeze to the application instead of to us.
-fn render_dump_row(
-    out: &mut String,
-    r: &DumpRow,
-    holder: &std::collections::HashMap<u64, (u64, &str)>,
-) {
+fn render_dump_row(out: &mut String, r: &DumpRow, holder: &std::collections::HashMap<u64, (u64, &str)>) {
     let _ = write!(
         out,
         "\n0x{:x} \"{}\" [{}]{}\n",
@@ -8279,7 +8502,10 @@ async fn dump_frame_method(
 }
 
 /// Resolve (class name, method name, source line) for a location.
-async fn describe_location(conn: &mut jdwp_client::JdwpConnection, loc: &Location) -> (String, String, Option<i32>) {
+async fn describe_location(
+    conn: &mut jdwp_client::JdwpConnection,
+    loc: &Location,
+) -> (String, String, Option<i32>) {
     let class = conn.get_signature(loc.class_id).await.ok().map(|s| decode_signature(&s)).unwrap_or_default();
     let method = conn
         .get_methods(loc.class_id)
@@ -8347,7 +8573,8 @@ async fn capture_trace(
                 let ci = loc.index;
                 // Own each in-scope variable's (name, slot) so the names can be moved into `args`
                 // below without cloning.
-                let in_scope: Vec<(String, jdwp_client::stackframe::VariableSlot)> = var_table.into_iter()
+                let in_scope: Vec<(String, jdwp_client::stackframe::VariableSlot)> = var_table
+                    .into_iter()
                     .filter(|v| ci >= v.code_index && ci < v.code_index + u64::from(v.length))
                     .map(|v| {
                         let slot = i32::try_from(v.slot).unwrap_or(0);
@@ -8385,7 +8612,16 @@ async fn capture_trace(
     let detail = obj.into_iter().map(|(k, v)| (k, json_scalar_to_string(&v))).collect();
 
     crate::session::TraceRecord {
-        seq: 0, bp_id: bp_id.to_string(), thread, class, method, line, args, callers, expr, detail,
+        seq: 0,
+        bp_id: bp_id.to_string(),
+        thread,
+        class,
+        method,
+        line,
+        args,
+        callers,
+        expr,
+        detail,
     }
 }
 
@@ -8409,10 +8645,7 @@ async fn describe_caller_chain(
     for f in frames {
         let class = resolve_class_name(conn, f.location.class_id, &mut class_names).await;
         let (method, line, _) = frame_method_info(conn, &f.location, false).await;
-        out.push(line.map_or_else(
-            || format!("{class}.{method}"),
-            |l| format!("{class}.{method}:{l}"),
-        ));
+        out.push(line.map_or_else(|| format!("{class}.{method}"), |l| format!("{class}.{method}:{l}")));
     }
     out
 }
@@ -8749,7 +8982,7 @@ async fn string_value_of(conn: &mut jdwp_client::JdwpConnection, id: u64) -> Opt
 /// i64 may lose precision above 2^53, acceptable for this best-effort comparison of debugger literals.
 #[allow(clippy::cast_precision_loss)]
 fn value_as_f64(data: &jdwp_client::types::ValueData) -> Option<f64> {
-    use jdwp_client::types::ValueData::{Int, Long, Short, Byte, Char, Float, Double};
+    use jdwp_client::types::ValueData::{Byte, Char, Double, Float, Int, Long, Short};
     Some(match data {
         Int(v) => f64::from(*v),
         Long(v) => *v as f64,
@@ -8804,11 +9037,13 @@ async fn compare_object(
             if id == 0 {
                 return Ok(op == "!=");
             }
-            let t = conn.get_object_reference_type(id).await
+            let t = conn
+                .get_object_reference_type(id)
+                .await
                 .map_err(|e| format!("Failed to resolve type: {e}"))?;
             if conn.get_signature(t).await.unwrap_or_default() == "Ljava/lang/String;" {
-                let sv = conn.get_string_value(id).await
-                    .map_err(|e| format!("Failed to read string: {e}"))?;
+                let sv =
+                    conn.get_string_value(id).await.map_err(|e| format!("Failed to read string: {e}"))?;
                 match op {
                     "==" => Ok(&sv == s),
                     "!=" => Ok(&sv != s),
@@ -8818,7 +9053,9 @@ async fn compare_object(
                 Err("Left side is not a String".to_string())
             }
         }
-        _ => Err("Unsupported comparison (numbers, booleans, null, or String value compares only)".to_string()),
+        _ => {
+            Err("Unsupported comparison (numbers, booleans, null, or String value compares only)".to_string())
+        }
     }
 }
 
@@ -8840,10 +9077,7 @@ mod tests {
     fn boolean_precedence_puts_and_below_or() {
         assert_eq!(shape(&parse_bool_tree("a == 1 && b == 2")), "AND(a == 1, b == 2)");
         assert_eq!(shape(&parse_bool_tree("a == 1 || b == 2")), "OR(a == 1, b == 2)");
-        assert_eq!(
-            shape(&parse_bool_tree("a == 1 || b == 2 && c == 3")),
-            "OR(a == 1, AND(b == 2, c == 3))"
-        );
+        assert_eq!(shape(&parse_bool_tree("a == 1 || b == 2 && c == 3")), "OR(a == 1, AND(b == 2, c == 3))");
     }
 
     // Parentheses regroup, overriding the default precedence.
@@ -8968,9 +9202,7 @@ mod tests {
         }
         let mut out = String::new();
         render_trace_cost(&mut out, true, &cost);
-        for want in
-            ["10 capture(s)", "1.00ms mean", "arriving at 10.0/s", "(1.0% of the window"]
-        {
+        for want in ["10 capture(s)", "1.00ms mean", "arriving at 10.0/s", "(1.0% of the window"] {
             assert!(out.contains(want), "missing {want:?} in: {out}");
         }
 
@@ -9055,7 +9287,7 @@ mod tests {
         can_get_monitor_info: true,
     };
 
-// DUMP-3: a pool's threads differ only in the number on the end, and that is the one naming
+    // DUMP-3: a pool's threads differ only in the number on the end, and that is the one naming
     // convention every framework shares. Nothing here knows what WildFly or Tomcat call anything.
     #[test]
     fn a_thread_name_family_is_the_name_with_its_numbering_removed() {
@@ -9076,10 +9308,11 @@ mod tests {
     /// The `WildFly` roster from TEST-8 (#24), in `AllThreads` order: the JVM's own threads, then the
     /// service container, then the selectors, and the request pool last.
     fn wildfly_shaped_threads() -> Vec<String> {
-        let mut names: Vec<String> = ["Reference Handler", "Finalizer", "Signal Dispatcher", "Common-Cleaner"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
+        let mut names: Vec<String> =
+            ["Reference Handler", "Finalizer", "Signal Dispatcher", "Common-Cleaner"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
         names.extend((1..=8).map(|i| format!("MSC service thread 1-{i}")));
         names.extend((1..=2).map(|i| format!("DeploymentScanner-threads - {i}")));
         names.extend((1..=38).map(|i| format!("ServerService Thread Pool -- {i}")));
@@ -9186,9 +9419,7 @@ mod tests {
         two.holds = vec![("LockB@f".to_string(), 0xf)];
         two.waiting_on = Some(("LockA@d".to_string(), 0xd));
 
-        let out = render_thread_dump(
-            &[one, two], &dump_args(json!({})), Some(&ALL_CAPS), &dump_meta(2, 44),
-        );
+        let out = render_thread_dump(&[one, two], &dump_args(json!({})), Some(&ALL_CAPS), &dump_meta(2, 44));
         assert!(
             out.contains("waiting to enter: LockB@f ← held by 0x9 \"deadlock-two\""),
             "the cycle's first half must name its holder:\n{out}"
@@ -9206,9 +9437,8 @@ mod tests {
     fn thread_dump_omits_the_holder_when_it_is_not_in_the_dump() {
         let mut one = dump_row(0x8, "deadlock-one");
         one.waiting_on = Some(("LockB@f".to_string(), 0xf));
-        let out = render_thread_dump(
-            &[one], &dump_args(json!({"limit": 1})), Some(&ALL_CAPS), &dump_meta(9, 10),
-        );
+        let out =
+            render_thread_dump(&[one], &dump_args(json!({"limit": 1})), Some(&ALL_CAPS), &dump_meta(9, 10));
         assert!(out.contains("waiting to enter: LockB@f"), "the contended lock is still shown:\n{out}");
         assert!(!out.contains("held by"), "no holder may be invented for a thread not dumped:\n{out}");
         assert!(out.contains("+8 more thread(s)"), "the threads left out are counted:\n{out}");
@@ -9224,7 +9454,10 @@ mod tests {
             ..ALL_CAPS
         };
         let out = render_thread_dump(
-            &[dump_row(0x8, "worker")], &dump_args(json!({})), Some(&caps), &dump_meta(1, 5),
+            &[dump_row(0x8, "worker")],
+            &dump_args(json!({})),
+            Some(&caps),
+            &dump_meta(1, 5),
         );
         assert!(out.contains("cannot report all monitor info"), "the gap must be stated:\n{out}");
         assert!(out.contains("canGetOwnedMonitorInfo=false"), "and named precisely:\n{out}");
@@ -9236,7 +9469,10 @@ mod tests {
 
         // ...but a dump that never asked for monitors says nothing about them at all.
         let off = render_thread_dump(
-            &[dump_row(0x8, "worker")], &dump_args(json!({"monitors": false})), None, &dump_meta(1, 5),
+            &[dump_row(0x8, "worker")],
+            &dump_args(json!({"monitors": false})),
+            None,
+            &dump_meta(1, 5),
         );
         assert!(!off.contains("monitor info"), "monitors:false should not editorialise:\n{off}");
     }
@@ -9299,7 +9535,10 @@ mod tests {
         let mut row = dump_row(0x8, "worker");
         row.stack = DumpStack::Omitted;
         let unknown = render_thread_dump(&[row], &args, None, &dump_meta(1, 2));
-        assert!(unknown.contains("NO lock payload"), "an unknown capability set is no payload too:\n{unknown}");
+        assert!(
+            unknown.contains("NO lock payload"),
+            "an unknown capability set is no payload too:\n{unknown}"
+        );
 
         // A capable JVM says none of this.
         let mut row = dump_row(0x8, "worker");
@@ -9321,7 +9560,10 @@ mod tests {
         let out = render_thread_dump(&[row], &args, Some(&ALL_CAPS), &dump_meta(60, 2));
 
         assert!(out.contains("name~\"default task\""), "a thread filter still applies:\n{out}");
-        assert!(!out.contains("frames~\"com.acme\""), "an inert frame filter must not read as applied:\n{out}");
+        assert!(
+            !out.contains("frames~\"com.acme\""),
+            "an inert frame filter must not read as applied:\n{out}"
+        );
         assert!(out.contains("had no effect"), "it is reported as ignored instead:\n{out}");
 
         // Without monitors_only the same filter is real, and is echoed.
@@ -9363,7 +9605,10 @@ mod tests {
         meta.wire = std::time::Duration::from_secs(1);
         let out = render_thread_dump(&[dump_row(0x8, "worker")], &dump_args(json!({})), None, &meta);
         assert!(out.contains("Cost: 500 JDWP packet(s), 2.00ms each"), "per-packet price missing:\n{out}");
-        assert!(out.contains("round trip + our own processing"), "it must say what the figure covers:\n{out}");
+        assert!(
+            out.contains("round trip + our own processing"),
+            "it must say what the figure covers:\n{out}"
+        );
 
         // One packet is not a sample: a "mean" over it would be a number pretending to be a measurement.
         let mut single = dump_meta(1, 1);
@@ -9412,7 +9657,10 @@ mod tests {
         meta.held = Some(std::time::Duration::from_millis(2001));
         meta.unread = 47;
         let out = render_thread_dump(
-            &[dump_row(0x8, "worker-0")], &dump_args(json!({"suspend": true})), None, &meta,
+            &[dump_row(0x8, "worker-0")],
+            &dump_args(json!({"suspend": true})),
+            None,
+            &meta,
         );
         assert!(out.contains("Stopped early"), "the truncation must be stated:\n{out}");
         assert!(out.contains("47 thread(s) still"), "and name how many it skipped:\n{out}");
@@ -9432,7 +9680,10 @@ mod tests {
     #[test]
     fn a_dump_row_keeps_blocked_and_debugger_suspended_apart() {
         let out = render_thread_dump(
-            &[dump_row(0x8, "deadlock-one")], &dump_args(json!({})), None, &dump_meta(1, 5),
+            &[dump_row(0x8, "deadlock-one")],
+            &dump_args(json!({})),
+            None,
+            &dump_meta(1, 5),
         );
         assert!(out.contains("[monitor] debugger-suspended"), "the axes must read separately:\n{out}");
         assert!(!out.contains("[monitor, suspended]"), "the old ambiguous form must be gone:\n{out}");
@@ -9490,7 +9741,10 @@ mod tests {
         let unbounded = describe_trace_budget(true, None);
         assert!(unbounded.contains("UNBOUNDED"), "the state is named:\n{unbounded}");
         assert!(unbounded.contains("trace_max_hits: 0"), "and attributed to the argument:\n{unbounded}");
-        assert!(unbounded.contains("720 hits/s"), "with the ceiling as a number, not an adjective:\n{unbounded}");
+        assert!(
+            unbounded.contains("720 hits/s"),
+            "with the ceiling as a number, not an adjective:\n{unbounded}"
+        );
 
         // A bounded budget is reported plainly — the warning must not fire on the safe default.
         let bounded = describe_trace_budget(true, Some(DEFAULT_TRACE_BUDGET));
@@ -9698,13 +9952,21 @@ mod tests {
     // anywhere, and a resolver built on the class name alone would look for exactly that and miss.
     #[test]
     fn source_path_is_built_from_the_package_and_the_jvm_file_name() {
-        let p = |c, f| source_relative_path(c, f).map(|p| p.components().count().to_string() + ":"
-            + &p.iter().map(|s| s.to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"));
+        let p = |c, f| {
+            source_relative_path(c, f).map(|p| {
+                p.components().count().to_string()
+                    + ":"
+                    + &p.iter().map(|s| s.to_string_lossy().into_owned()).collect::<Vec<_>>().join("/")
+            })
+        };
 
         assert_eq!(p("com.example.Order", "Order.java").as_deref(), Some("3:com/example/Order.java"));
         // Inner, and doubly-nested inner: both live in the enclosing compilation unit.
         assert_eq!(p("com.example.Order$Line", "Order.java").as_deref(), Some("3:com/example/Order.java"));
-        assert_eq!(p("com.example.Order$Line$Key", "Order.java").as_deref(), Some("3:com/example/Order.java"));
+        assert_eq!(
+            p("com.example.Order$Line$Key", "Order.java").as_deref(),
+            Some("3:com/example/Order.java")
+        );
         // A file whose name differs from the type — a package-private class declared in Order.java.
         assert_eq!(p("com.example.OrderRow", "Order.java").as_deref(), Some("3:com/example/Order.java"));
         // Default package: no directories at all, which the package split must not turn into an

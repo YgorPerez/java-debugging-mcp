@@ -32,11 +32,8 @@ impl JdwpConnection {
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_string_value(&mut self, string_id: ObjectId) -> JdwpResult<String> {
         let id = self.next_id();
-        let mut packet = CommandPacket::new(
-            id,
-            command_sets::STRING_REFERENCE,
-            string_reference_commands::VALUE,
-        );
+        let mut packet =
+            CommandPacket::new(id, command_sets::STRING_REFERENCE, string_reference_commands::VALUE);
 
         // Write the string object ID
         packet.data.put_u64(string_id);
@@ -55,7 +52,6 @@ impl JdwpConnection {
 
 #[cfg(test)]
 mod tests {
-    
 
     #[test]
     fn test_string_value_packet() {

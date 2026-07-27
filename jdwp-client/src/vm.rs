@@ -50,7 +50,7 @@ pub struct VmCapabilities {
 /// Class information from `ClassesBySignature`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassInfo {
-    pub ref_type_tag: u8,  // 1=class, 2=interface, 3=array
+    pub ref_type_tag: u8, // 1=class, 2=interface, 3=array
     pub type_id: ReferenceTypeId,
     pub signature: String,
     pub status: i32,
@@ -76,13 +76,7 @@ impl JdwpConnection {
         let vm_version = read_string(&mut data)?;
         let vm_name = read_string(&mut data)?;
 
-        Ok(VmVersion {
-            description,
-            jdwp_major,
-            jdwp_minor,
-            vm_version,
-            vm_name,
-        })
+        Ok(VmVersion { description, jdwp_major, jdwp_minor, vm_version, vm_name })
     }
 
     // `VirtualMachine.IDSizes` (command 7) used to be wrapped here and was deleted by CLEAN-1 (#27):
@@ -148,7 +142,8 @@ impl JdwpConnection {
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn classes_by_signature(&mut self, signature: &str) -> JdwpResult<Vec<ClassInfo>> {
         let id = self.next_id();
-        let mut packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::CLASSES_BY_SIGNATURE);
+        let mut packet =
+            CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::CLASSES_BY_SIGNATURE);
 
         // Write signature as JDWP string (4-byte length + UTF-8 bytes)
         let sig_bytes = signature.as_bytes();
@@ -169,12 +164,7 @@ impl JdwpConnection {
             let type_id = crate::reader::read_u64(&mut data)?;
             let status = read_i32(&mut data)?;
 
-            classes.push(ClassInfo {
-                ref_type_tag,
-                type_id,
-                signature: signature.to_string(),
-                status,
-            });
+            classes.push(ClassInfo { ref_type_tag, type_id, signature: signature.to_string(), status });
         }
 
         Ok(classes)
@@ -206,12 +196,7 @@ impl JdwpConnection {
             let signature = read_string(&mut data)?;
             let status = read_i32(&mut data)?;
 
-            classes.push(ClassInfo {
-                ref_type_tag,
-                type_id,
-                signature,
-                status,
-            });
+            classes.push(ClassInfo { ref_type_tag, type_id, signature, status });
         }
 
         Ok(classes)

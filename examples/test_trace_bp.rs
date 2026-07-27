@@ -45,21 +45,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = JdwpConnection::connect("localhost", port).await?;
     println!("✓ Connected");
 
-    let cid = conn.classes_by_signature(&format!("L{class};")).await?
-        .first().map(|c| c.type_id).ok_or_else(|| format!("{class} not loaded"))?;
+    let cid = conn
+        .classes_by_signature(&format!("L{class};"))
+        .await?
+        .first()
+        .map(|c| c.type_id)
+        .ok_or_else(|| format!("{class} not loaded"))?;
     let methods = conn.get_methods(cid).await?;
     let m = methods.iter().find(|m| m.name == method).ok_or("method not found")?;
-    let entry = conn.get_line_table(cid, m.method_id).await?
-        .lines.into_iter().min_by_key(|e| e.line_code_index).ok_or("no line table")?;
+    let entry = conn
+        .get_line_table(cid, m.method_id)
+        .await?
+        .lines
+        .into_iter()
+        .min_by_key(|e| e.line_code_index)
+        .ok_or("no line table")?;
 
     // The crux of a logpoint: EventThread suspend policy — only the hit thread pauses, briefly.
-    let req = conn.set_breakpoint_ex(cid, m.method_id, entry.line_code_index, SuspendPolicy::EventThread, None, None).await?;
+    let req = conn
+        .set_breakpoint_ex(cid, m.method_id, entry.line_code_index, SuspendPolicy::EventThread, None, None)
+        .await?;
     println!("✓ Trace breakpoint set on {class}.{method} (EventThread policy, request id {req})");
 
     let mut seen_i: Vec<i32> = Vec::new();
     let mut labels: Vec<String> = Vec::new();
     for _ in 0..(TARGET * 4) {
-        let Some(ev) = next_event(&conn, 15).await else { break; };
+        let Some(ev) = next_event(&conn, 15).await else {
+            break;
+        };
         let Some((thread, loc)) = ev.events.iter().find_map(|e| match &e.details {
             EventKind::Breakpoint { thread, location } => Some((*thread, location.clone())),
             _ => None,
@@ -73,11 +86,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let frame = frames.first().ok_or("no frame at breakpoint")?;
         let vars = conn.get_variable_table(loc.class_id, loc.method_id).await?;
         let ci = loc.index;
-        let in_scope: Vec<_> = vars.iter()
-            .filter(|v| ci >= v.code_index && ci < v.code_index + v.length as u64)
-            .collect();
+        let in_scope: Vec<_> =
+            vars.iter().filter(|v| ci >= v.code_index && ci < v.code_index + v.length as u64).collect();
         assert!(!in_scope.is_empty(), "no locals in scope — was the probe compiled with -g?");
-        let slots: Vec<VariableSlot> = in_scope.iter()
+        let slots: Vec<VariableSlot> = in_scope
+            .iter()
             .map(|v| VariableSlot { slot: v.slot as i32, sig_byte: v.signature.as_bytes()[0] })
             .collect();
         let vals = conn.get_frame_values(thread, frame.frame_id, slots).await?;
@@ -87,17 +100,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (v, val) in in_scope.iter().zip(vals.iter()) {
             match (v.name.as_str(), &val.data) {
                 ("i", ValueData::Int(n)) => i_val = Some(*n),
-                ("label", ValueData::Object(id)) if *id != 0 => label_val = conn.get_string_value(*id).await.ok(),
+                ("label", ValueData::Object(id)) if *id != 0 => {
+                    label_val = conn.get_string_value(*id).await.ok()
+                }
                 _ => {}
             }
         }
         println!("📢 trace hit: i={i_val:?} label={label_val:?} thread=0x{thread:x}");
-        if let Some(i) = i_val { seen_i.push(i); }
-        if let Some(l) = label_val { labels.push(l); }
+        if let Some(i) = i_val {
+            seen_i.push(i);
+        }
+        if let Some(l) = label_val {
+            labels.push(l);
+        }
 
         // Resume ONLY the hit thread — the loop keeps running; nothing left frozen.
         conn.resume_thread(thread).await?;
-        if seen_i.len() >= TARGET { break; }
+        if seen_i.len() >= TARGET {
+            break;
+        }
     }
 
     conn.clear_breakpoint(req).await?;
@@ -108,6 +129,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(seen_i.windows(2).all(|w| w[1] > w[0]), "loop did not advance (frozen?): {seen_i:?}");
     assert!(labels.iter().all(|l| l.starts_with("iter-")), "unexpected label capture: {labels:?}");
 
-    println!("\n🎉 TRACE/LOGPOINT WORKS: {} snapshots, i={seen_i:?} (increasing → never frozen)", seen_i.len());
+    println!(
+        "\n🎉 TRACE/LOGPOINT WORKS: {} snapshots, i={seen_i:?} (increasing → never frozen)",
+        seen_i.len()
+    );
     Ok(())
 }

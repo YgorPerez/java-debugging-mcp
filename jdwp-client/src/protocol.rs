@@ -79,12 +79,7 @@ pub struct ReplyPacket {
 impl CommandPacket {
     #[must_use]
     pub const fn new(id: u32, command_set: u8, command: u8) -> Self {
-        Self {
-            id,
-            command_set,
-            command,
-            data: Vec::new(),
-        }
+        Self { id, command_set, command, data: Vec::new() }
     }
 
     #[must_use]
@@ -196,11 +191,7 @@ impl ReplyPacket {
         let error_code = buf.get_u16();
         let data = buf.to_vec();
 
-        Ok(Self {
-            id,
-            error_code,
-            data,
-        })
+        Ok(Self { id, error_code, data })
     }
 
     #[must_use]
@@ -214,10 +205,7 @@ impl ReplyPacket {
     /// Returns a [`JdwpError::JdwpErrorCode`] when the reply's error code is non-zero.
     pub fn check_error(&self) -> JdwpResult<()> {
         if self.is_error() {
-            Err(JdwpError::JdwpErrorCode(
-                self.error_code,
-                self.error_message().to_string(),
-            ))
+            Err(JdwpError::JdwpErrorCode(self.error_code, self.error_message().to_string()))
         } else {
             Ok(())
         }
@@ -272,10 +260,10 @@ mod tests {
     fn test_reply_packet_decode() {
         // Construct a reply packet manually with big-endian values
         let reply_data = vec![
-            0, 0, 0, 11,  // length = 11 (big-endian)
-            0, 0, 0, 1,   // id = 1 (big-endian)
-            0x80,         // reply flag
-            0, 0,         // error code = 0 (big-endian)
+            0, 0, 0, 11, // length = 11 (big-endian)
+            0, 0, 0, 1,    // id = 1 (big-endian)
+            0x80, // reply flag
+            0, 0, // error code = 0 (big-endian)
         ];
 
         let packet = ReplyPacket::decode(&reply_data).unwrap();

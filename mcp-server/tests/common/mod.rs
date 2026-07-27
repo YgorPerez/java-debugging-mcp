@@ -150,11 +150,7 @@ fn glob_snap_jbr() -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir("/snap/intellij-idea-ultimate") else {
         return Vec::new();
     };
-    entries
-        .flatten()
-        .map(|e| e.path().join("jbr/bin"))
-        .filter(|p| p.is_dir())
-        .collect()
+    entries.flatten().map(|e| e.path().join("jbr/bin")).filter(|p| p.is_dir()).collect()
 }
 
 /// Absolute path to a checked-in probe's source.
@@ -202,7 +198,8 @@ pub fn install_source_debug_extension(class_file: &Path, smap: &str) -> Result<(
         ));
     }
 
-    let bytes = std::fs::read(class_file).map_err(|e| format!("cannot read {}: {e}", class_file.display()))?;
+    let bytes =
+        std::fs::read(class_file).map_err(|e| format!("cannot read {}: {e}", class_file.display()))?;
     if be_u32(&bytes, 0)? != 0xCAFE_BABE {
         return Err(format!("{} does not begin with 0xCAFEBABE", class_file.display()));
     }
@@ -231,7 +228,8 @@ pub fn install_source_debug_extension(class_file: &Path, smap: &str) -> Result<(
     let name_index = new_pool_count - 1;
     let new_attribute_count = u16::try_from(be_u16(&bytes, attributes_at)? + 1)
         .map_err(|_| "class attribute table is full".to_string())?;
-    let name_length = u16::try_from(ATTRIBUTE_NAME.len()).map_err(|_| "attribute name too long".to_string())?;
+    let name_length =
+        u16::try_from(ATTRIBUTE_NAME.len()).map_err(|_| "attribute name too long".to_string())?;
     let smap_length = u32::try_from(smap.len()).map_err(|_| "SMAP too long for a u4 length".to_string())?;
 
     let mut out = Vec::with_capacity(bytes.len() + smap.len() + ATTRIBUTE_NAME.len() + 16);
@@ -272,11 +270,11 @@ fn constant_pool_end(bytes: &[u8]) -> Result<usize, String> {
         let tag = *bytes.get(at).ok_or_else(|| format!("class file ends at pool slot {slot}"))?;
         at += 1;
         at += match tag {
-            CONSTANT_UTF8 => 2 + be_u16(bytes, at)?,  // a u2 length, then that many bytes
-            7 | 8 | 16 | 19 | 20 => 2,                // Class, String, MethodType, Module, Package
-            15 => 3,                                  // MethodHandle
-            3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => 4,  // Integer, Float, the refs, NameAndType, Dynamic
-            5 | 6 => 8,                               // Long, Double
+            CONSTANT_UTF8 => 2 + be_u16(bytes, at)?, // a u2 length, then that many bytes
+            7 | 8 | 16 | 19 | 20 => 2,               // Class, String, MethodType, Module, Package
+            15 => 3,                                 // MethodHandle
+            3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => 4, // Integer, Float, the refs, NameAndType, Dynamic
+            5 | 6 => 8,                              // Long, Double
             other => return Err(format!("constant pool tag {other} at offset {at} is not one this knows")),
         };
         // Long and Double eat TWO slots each — a wart the JVMS itself calls "a poor choice" in a
@@ -338,10 +336,7 @@ pub fn probe_line(source: &str, marker: &str) -> i32 {
     source
         .lines()
         .position(|l| l.contains(marker))
-        .map_or_else(
-            || panic!("no `{marker}` marker in probe source"),
-            |i| i32::try_from(i).unwrap_or(0) + 1,
-        )
+        .map_or_else(|| panic!("no `{marker}` marker in probe source"), |i| i32::try_from(i).unwrap_or(0) + 1)
 }
 
 /// Ask the OS for a free TCP port by binding to port 0 and immediately releasing it.
@@ -350,10 +345,7 @@ pub fn probe_line(source: &str, marker: &str) -> i32 {
 /// does better, since the JVM must open the port itself, and each test picking a fresh port keeps
 /// concurrent tests from colliding, which is the failure that actually happened in practice.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map_or(0, |a| a.port())
+    std::net::TcpListener::bind("127.0.0.1:0").ok().and_then(|l| l.local_addr().ok()).map_or(0, |a| a.port())
 }
 
 /// The half of a JDWP proxy that is the same whatever the proxy is *for*.
@@ -918,15 +910,16 @@ impl Probe {
         let said = if tail.is_empty() {
             "it printed nothing at all".to_string()
         } else {
-            format!("it printed:\n  {}", tail.iter()
-                .map(|l| l.as_str()).collect::<Vec<_>>().join("\n  "))
+            format!("it printed:\n  {}", tail.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n  "))
         };
         Err(format!(
             "probe never listened on port {} within {:?} (waited {:?}) — {said}\n\
              If it printed nothing, the JVM is probably just slow to start rather than broken: on \
              Windows a first run after a JDK is installed or updated can spend longer than this being \
              scanned by Defender, and the same probe then launches in ~1s once warm.",
-            self.port, Self::PROBE_LISTEN_TIMEOUT, started.elapsed(),
+            self.port,
+            Self::PROBE_LISTEN_TIMEOUT,
+            started.elapsed(),
         ))
     }
 

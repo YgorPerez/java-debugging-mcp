@@ -29,7 +29,9 @@ async fn read_string_field_static(conn: &mut JdwpConnection, class_id: u64, fiel
     match conn.get_reference_values(class_id, vec![field_id]).await.ok().and_then(|v| v.into_iter().next()) {
         Some(v) => match v.data {
             ValueData::Object(0) => "null".to_string(),
-            ValueData::Object(id) => conn.get_string_value(id).await.unwrap_or_else(|_| format!("<obj 0x{id:x}>")),
+            ValueData::Object(id) => {
+                conn.get_string_value(id).await.unwrap_or_else(|_| format!("<obj 0x{id:x}>"))
+            }
             other => format!("{other:?}"),
         },
         None => "<none>".to_string(),
@@ -45,11 +47,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = JdwpConnection::connect("localhost", port).await?;
     println!("✓ Connected");
 
-    let class = conn.classes_by_signature("LSetProbe;").await?
-        .first().map(|c| c.type_id).ok_or("SetProbe not loaded")?;
+    let class = conn
+        .classes_by_signature("LSetProbe;")
+        .await?
+        .first()
+        .map(|c| c.type_id)
+        .ok_or("SetProbe not loaded")?;
     let fields = conn.get_fields(class).await?;
     let fid = |name: &str, want_static: bool| {
-        fields.iter()
+        fields
+            .iter()
             .find(|f| f.name == name && ((f.mod_bits & ACC_STATIC) != 0) == want_static)
             .map(|f| f.field_id)
             .ok_or_else(|| format!("field {name} not found"))
@@ -68,20 +75,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Static int: counter = 0 -> 42 ---
     let counter_id = fid("counter", true)?;
     conn.set_reference_values(class, vec![(counter_id, value_int(42))]).await?;
-    let counter_val = conn.get_reference_values(class, vec![counter_id]).await?.into_iter().next().map(|v| v.data);
+    let counter_val =
+        conn.get_reference_values(class, vec![counter_id]).await?.into_iter().next().map(|v| v.data);
     println!("static int counter -> {counter_val:?}");
     assert!(matches!(counter_val, Some(ValueData::Int(42))));
 
     // --- Instance fields on the static `holder` object ---
     let holder_id = fid("holder", true)?;
-    let holder_obj = match conn.get_reference_values(class, vec![holder_id]).await?.into_iter().next().map(|v| v.data) {
-        Some(ValueData::Object(id)) if id != 0 => id,
-        other => return Err(format!("holder is not an object: {other:?}").into()),
-    };
+    let holder_obj =
+        match conn.get_reference_values(class, vec![holder_id]).await?.into_iter().next().map(|v| v.data) {
+            Some(ValueData::Object(id)) if id != 0 => id,
+            other => return Err(format!("holder is not an object: {other:?}").into()),
+        };
     let holder_type = conn.get_object_reference_type(holder_obj).await?;
     let hfields = conn.get_fields(holder_type).await?;
-    let hfid = |name: &str| hfields.iter().find(|f| f.name == name).map(|f| f.field_id)
-        .ok_or_else(|| format!("holder field {name} not found"));
+    let hfid = |name: &str| {
+        hfields
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.field_id)
+            .ok_or_else(|| format!("holder field {name} not found"))
+    };
 
     // int num = 10 -> 99
     let num_id = hfid("num")?;

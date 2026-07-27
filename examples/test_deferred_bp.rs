@@ -55,11 +55,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("timed out waiting for ClassPrepare (did the probe load the class?)".into());
         };
         if let Some(hit) = ev.events.iter().find_map(|e| match &e.details {
-            EventKind::ClassPrepare { thread, ref_type, signature, status } if signature.contains(&class) =>
-                Some((*thread, *ref_type, signature.clone(), *status)),
+            EventKind::ClassPrepare { thread, ref_type, signature, status } if signature.contains(&class) => {
+                Some((*thread, *ref_type, signature.clone(), *status))
+            }
             _ => None,
         }) {
-            println!("✓ ClassPrepare parsed: thread=0x{:x} ref_type=0x{:x} sig={} status={}", hit.0, hit.1, hit.2, hit.3);
+            println!(
+                "✓ ClassPrepare parsed: thread=0x{:x} ref_type=0x{:x} sig={} status={}",
+                hit.0, hit.1, hit.2, hit.3
+            );
             break (hit.0, hit.1, hit.2);
         }
     };
@@ -70,7 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let m = methods.iter().find(|m| m.name == method).ok_or("method not found on loaded class")?;
     let lt = conn.get_line_table(cp_ref, m.method_id).await?;
     let entry = lt.lines.iter().min_by_key(|e| e.line_code_index).ok_or("no line table")?;
-    let bp_req = conn.set_breakpoint_ex(cp_ref, m.method_id, entry.line_code_index, SuspendPolicy::All, None, None).await?;
+    let bp_req = conn
+        .set_breakpoint_ex(cp_ref, m.method_id, entry.line_code_index, SuspendPolicy::All, None, None)
+        .await?;
     println!("✓ Armed breakpoint at {class}.{method}:{} (request id {bp_req})", entry.line_number);
 
     // 4) Release the class-prepare-suspended thread so class init + the loop proceed.
@@ -90,7 +96,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break loc;
         }
     };
-    println!("✓ Breakpoint FIRED: thread=0x{:x} method_id=0x{:x} index={}", fired.0, fired.1.method_id, fired.1.index);
+    println!(
+        "✓ Breakpoint FIRED: thread=0x{:x} method_id=0x{:x} index={}",
+        fired.0, fired.1.method_id, fired.1.index
+    );
     assert_eq!(fired.1.method_id, m.method_id, "fired in the wrong method");
 
     println!("\n🎉 DEFERRED BREAKPOINT WORKS END TO END");

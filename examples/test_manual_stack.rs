@@ -13,14 +13,12 @@
 )]
 // Simpler stack inspection: manually suspend and inspect
 
-use jdwp_client::JdwpConnection;
 use jdwp_client::stackframe::VariableSlot;
+use jdwp_client::JdwpConnection;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter("jdwp_client=info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("jdwp_client=info").init();
 
     println!("🔍 Manual Stack Inspection Test\n");
     println!("📌 This test will:");
@@ -56,8 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match conn.get_frames(*thread_id, 0, 3).await {
             Ok(frames) if !frames.is_empty() => {
                 for (fidx, frame) in frames.iter().enumerate() {
-                    println!("  Frame {}: class_id={:x}, method_id={:x}, index={}",
-                        fidx, frame.location.class_id, frame.location.method_id, frame.location.index);
+                    println!(
+                        "  Frame {}: class_id={:x}, method_id={:x}, index={}",
+                        fidx, frame.location.class_id, frame.location.method_id, frame.location.index
+                    );
 
                     // If this is HelloController, inspect variables
                     if Some(frame.location.class_id) == hello_class_id {
@@ -65,11 +65,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Get methods to find method name
                         let methods = conn.get_methods(frame.location.class_id).await?;
-                        if let Some(method) = methods.iter().find(|m| m.method_id == frame.location.method_id) {
+                        if let Some(method) = methods.iter().find(|m| m.method_id == frame.location.method_id)
+                        {
                             println!("       Method: {}", method.name);
 
                             // Try to get variable table
-                            match conn.get_variable_table(frame.location.class_id, frame.location.method_id).await {
+                            match conn
+                                .get_variable_table(frame.location.class_id, frame.location.method_id)
+                                .await
+                            {
                                 Ok(var_table) => {
                                     let current_index = frame.location.index;
                                     let active_vars: Vec<_> = var_table

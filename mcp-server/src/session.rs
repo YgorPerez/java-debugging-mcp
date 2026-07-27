@@ -2,7 +2,7 @@
 //
 // Manages JDWP connection state, breakpoints, and thread tracking
 
-use jdwp_client::{JdwpConnection, EventSet};
+use jdwp_client::{EventSet, JdwpConnection};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -687,7 +687,10 @@ mod tests {
         let mut cost = TraceCost::default();
         let t0 = std::time::Instant::now();
         for i in 0..10u32 {
-            cost.record(t0 + std::time::Duration::from_millis(u64::from(i) * 100), std::time::Duration::from_millis(1));
+            cost.record(
+                t0 + std::time::Duration::from_millis(u64::from(i) * 100),
+                std::time::Duration::from_millis(1),
+            );
         }
         assert_eq!(cost.captures, 10);
         assert_eq!(cost.mean_capture(), Some(std::time::Duration::from_millis(1)));

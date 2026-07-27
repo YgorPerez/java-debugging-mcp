@@ -4,7 +4,7 @@
 
 use crate::eventloop::{spawn_event_loop, EventLoopHandle};
 use crate::events::EventSet;
-use crate::protocol::{JdwpResult, JDWP_HANDSHAKE, JdwpError, CommandPacket, ReplyPacket};
+use crate::protocol::{CommandPacket, JdwpError, JdwpResult, ReplyPacket, JDWP_HANDSHAKE};
 use crate::reftype::{FieldInfo, MethodInfo};
 use crate::types::{ClassId, ReferenceTypeId};
 use std::collections::HashMap;
@@ -337,12 +337,10 @@ mod tests {
         assert_eq!(c.fields(7).map(|f| f.len()), Some(2));
 
         assert!(c.methods(7).is_none());
-        c.put_methods(7, &[MethodInfo {
-            method_id: 2,
-            name: "m".to_string(),
-            signature: "()V".to_string(),
-            mod_bits: 0,
-        }]);
+        c.put_methods(
+            7,
+            &[MethodInfo { method_id: 2, name: "m".to_string(), signature: "()V".to_string(), mod_bits: 0 }],
+        );
         assert_eq!(c.methods(7).map(|m| m.len()), Some(1));
 
         // A different type id must not see the first one's entries.

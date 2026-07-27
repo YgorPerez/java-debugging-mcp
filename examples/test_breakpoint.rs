@@ -17,9 +17,7 @@ use jdwp_client::{JdwpConnection, SuspendPolicy};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter("jdwp_client=debug")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("jdwp_client=debug").init();
 
     println!("🔧 Setting up breakpoint test...\n");
 
@@ -46,12 +44,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set breakpoint!
     println!("\n🎯 Setting breakpoint at HelloController.java:64...");
-    let request_id = conn.set_breakpoint(
-        class.type_id,
-        hello_method.method_id,
-        line_64.line_code_index,
-        SuspendPolicy::All,  // Suspend all threads when hit
-    ).await?;
+    let request_id = conn
+        .set_breakpoint(
+            class.type_id,
+            hello_method.method_id,
+            line_64.line_code_index,
+            SuspendPolicy::All, // Suspend all threads when hit
+        )
+        .await?;
 
     println!("✅ Breakpoint set! Request ID: {}", request_id);
     println!("\n📍 Breakpoint is active at:");

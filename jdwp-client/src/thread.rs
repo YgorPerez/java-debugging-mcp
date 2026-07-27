@@ -68,15 +68,7 @@ impl JdwpConnection {
             let method_id = read_u64(&mut data)?;
             let index = read_u64(&mut data)?;
 
-            frames.push(Frame {
-                frame_id,
-                location: Location {
-                    type_tag,
-                    class_id,
-                    method_id,
-                    index,
-                },
-            });
+            frames.push(Frame { frame_id, location: Location { type_tag, class_id, method_id, index } });
         }
 
         Ok(frames)
@@ -153,7 +145,8 @@ impl JdwpConnection {
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_all_threads(&mut self) -> JdwpResult<Vec<ThreadId>> {
         let id = self.next_id();
-        let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, crate::commands::vm_commands::ALL_THREADS);
+        let packet =
+            CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, crate::commands::vm_commands::ALL_THREADS);
 
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
@@ -240,7 +233,8 @@ impl JdwpConnection {
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn suspend_all(&mut self) -> JdwpResult<()> {
         let id = self.next_id();
-        let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, crate::commands::vm_commands::SUSPEND);
+        let packet =
+            CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, crate::commands::vm_commands::SUSPEND);
 
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
@@ -258,7 +252,8 @@ impl JdwpConnection {
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn resume_all(&mut self) -> JdwpResult<()> {
         let id = self.next_id();
-        let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, crate::commands::vm_commands::RESUME);
+        let packet =
+            CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, crate::commands::vm_commands::RESUME);
 
         let reply = self.send_command(packet).await?;
         reply.check_error()?;

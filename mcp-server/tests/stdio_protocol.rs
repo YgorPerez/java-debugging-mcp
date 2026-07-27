@@ -152,9 +152,8 @@ fn eof_on_stdin_exits_cleanly() {
     let mut server = Server::start().expect("start server");
     assert_still_serving(&mut server, "startup");
 
-    let status = server
-        .close_stdin_and_wait(Duration::from_secs(10))
-        .expect("server did not exit after EOF on stdin");
+    let status =
+        server.close_stdin_and_wait(Duration::from_secs(10)).expect("server did not exit after EOF on stdin");
     assert!(status.success(), "EOF should be a clean exit, got {status:?}");
 }
 

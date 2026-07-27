@@ -44,7 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The target exception class must be loaded so we can pin the request to its ref type.
     let cls = conn.classes_by_signature(&target_sig).await?;
-    let target_id = cls.first().map(|c| c.type_id)
+    let target_id = cls
+        .first()
+        .map(|c| c.type_id)
         .ok_or_else(|| format!("{target} not loaded — the probe should pre-touch it"))?;
     println!("✓ {target} loaded (type_id 0x{target_id:x})");
 
@@ -60,8 +62,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break; // no more events in the window
         };
         let Some((thread, exc, catch)) = ev.events.iter().find_map(|e| match &e.details {
-            EventKind::Exception { thread, exception, catch_location, .. } =>
-                Some((*thread, *exception, catch_location.clone())),
+            EventKind::Exception { thread, exception, catch_location, .. } => {
+                Some((*thread, *exception, catch_location.clone()))
+            }
             _ => None,
         }) else {
             // Some unrelated event kind — resume and keep waiting.

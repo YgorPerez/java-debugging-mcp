@@ -76,9 +76,7 @@ impl EventLoopHandle {
             .await
             .map_err(|_| JdwpError::Protocol("Event loop shut down".to_string()))?;
 
-        reply_rx
-            .await
-            .map_err(|_| JdwpError::Protocol("Reply channel closed".to_string()))?
+        reply_rx.await.map_err(|_| JdwpError::Protocol("Reply channel closed".to_string()))?
     }
 
     /// Try to receive an event (non-blocking)
@@ -104,10 +102,7 @@ pub fn spawn_event_loop(reader: OwnedReadHalf, writer: OwnedWriteHalf) -> EventL
 
     tokio::spawn(event_loop_task(reader, writer, command_rx, event_tx));
 
-    EventLoopHandle {
-        command_tx,
-        event_rx: Arc::new(tokio::sync::Mutex::new(event_rx)),
-    }
+    EventLoopHandle { command_tx, event_rx: Arc::new(tokio::sync::Mutex::new(event_rx)) }
 }
 
 /// Pending reply with timestamp for timeout tracking
@@ -177,10 +172,8 @@ async fn handle_outgoing_command(
         return;
     }
 
-    pending_replies.insert(packet_id, PendingReply {
-        sender: cmd.reply_tx,
-        sent_at: tokio::time::Instant::now(),
-    });
+    pending_replies
+        .insert(packet_id, PendingReply { sender: cmd.reply_tx, sent_at: tokio::time::Instant::now() });
 }
 
 /// Drop any pending replies that have exceeded [`REPLY_TIMEOUT`].
@@ -266,8 +259,11 @@ fn handle_event_packet(event_tx: &mpsc::Sender<EventSet>, data: &[u8]) -> bool {
 
     match parse_event_packet(event_data) {
         Ok(event_set) => {
-            info!("Parsed event set: {} events, suspend_policy={}",
-                  event_set.events.len(), event_set.suspend_policy);
+            info!(
+                "Parsed event set: {} events, suspend_policy={}",
+                event_set.events.len(),
+                event_set.suspend_policy
+            );
 
             // Send event without blocking to avoid deadlock
             // If consumer is sending commands while we're reading, blocking here would deadlock
@@ -298,10 +294,7 @@ async fn read_packet(reader: &mut OwnedReadHalf) -> JdwpResult<(bool, u32, Vec<u
     // Read header into a fixed-size buffer (constant-index access, no bounds risk).
     let mut header = [0u8; HEADER_SIZE];
 
-    reader
-        .read_exact(&mut header)
-        .await
-        .map_err(JdwpError::Io)?;
+    reader.read_exact(&mut header).await.map_err(JdwpError::Io)?;
 
     // Parse header
     let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
@@ -309,9 +302,7 @@ async fn read_packet(reader: &mut OwnedReadHalf) -> JdwpResult<(bool, u32, Vec<u
     let flags = header[8];
 
     if length < HEADER_SIZE {
-        return Err(JdwpError::Protocol(format!(
-            "Invalid packet length: {length}"
-        )));
+        return Err(JdwpError::Protocol(format!("Invalid packet length: {length}")));
     }
 
     if length > MAX_PACKET_SIZE {

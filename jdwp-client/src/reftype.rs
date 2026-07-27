@@ -40,7 +40,8 @@ impl JdwpConnection {
             return Ok(hit);
         }
         let id = self.next_id();
-        let mut packet = CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::METHODS);
+        let mut packet =
+            CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::METHODS);
 
         // Write reference type ID (8 bytes)
         packet.data.put_u64(ref_type_id);
@@ -60,12 +61,7 @@ impl JdwpConnection {
             let signature = read_string(&mut data)?;
             let mod_bits = read_i32(&mut data)?;
 
-            methods.push(MethodInfo {
-                method_id,
-                name,
-                signature,
-                mod_bits,
-            });
+            methods.push(MethodInfo { method_id, name, signature, mod_bits });
         }
 
         self.types().put_methods(ref_type_id, &methods);
@@ -80,10 +76,7 @@ impl JdwpConnection {
     ///
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
-    pub async fn get_interfaces(
-        &mut self,
-        ref_type_id: ReferenceTypeId,
-    ) -> JdwpResult<Vec<ReferenceTypeId>> {
+    pub async fn get_interfaces(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<Vec<ReferenceTypeId>> {
         if let Some(hit) = self.types().interfaces(ref_type_id) {
             return Ok(hit);
         }
@@ -115,11 +108,7 @@ impl JdwpConnection {
     ///
     /// # Errors
     /// Returns a [`JdwpError`] if a JDWP request fails or a reply cannot be parsed.
-    pub async fn implements_interface(
-        &mut self,
-        type_id: ReferenceTypeId,
-        wanted: &str,
-    ) -> JdwpResult<bool> {
+    pub async fn implements_interface(&mut self, type_id: ReferenceTypeId, wanted: &str) -> JdwpResult<bool> {
         // Breadth-first over (superclasses × interfaces), with `seen` guarding the diamonds that make
         // interface graphs a lattice rather than a tree — without it, `Collection` is visited once per
         // path that reaches it.
@@ -239,7 +228,8 @@ impl JdwpConnection {
             return Ok(hit);
         }
         let id = self.next_id();
-        let mut packet = CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::FIELDS);
+        let mut packet =
+            CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::FIELDS);
 
         // Write reference type ID (8 bytes)
         packet.data.put_u64(ref_type_id);
@@ -259,16 +249,10 @@ impl JdwpConnection {
             let signature = read_string(&mut data)?;
             let mod_bits = read_i32(&mut data)?;
 
-            fields.push(FieldInfo {
-                field_id,
-                name,
-                signature,
-                mod_bits,
-            });
+            fields.push(FieldInfo { field_id, name, signature, mod_bits });
         }
 
         self.types().put_fields(ref_type_id, &fields);
         Ok(fields)
     }
 }
-

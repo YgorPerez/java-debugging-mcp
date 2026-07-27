@@ -35,10 +35,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2) Simple-name lookup via all_classes (the new primitive backing bare-name resolution).
     let all = conn.all_classes().await?;
     println!("all_classes() -> {} loaded types", all.len());
-    let simple = all
-        .iter()
-        .find(|c| c.ref_type_tag == 1 && c.signature.ends_with("/ConfigDefaultUtils;"))
-        .cloned();
+    let simple =
+        all.iter().find(|c| c.ref_type_tag == 1 && c.signature.ends_with("/ConfigDefaultUtils;")).cloned();
     let type_id = match (by_sig.first(), &simple) {
         (Some(c), _) => c.type_id,
         (None, Some(c)) => {
@@ -73,9 +71,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let vals = conn.get_reference_values(type_id, vec![f.field_id]).await?;
         let rendered = match vals.into_iter().next().map(|v| v.data) {
             Some(ValueData::Object(0)) => "null".to_string(),
-            Some(ValueData::Object(id)) => {
-                conn.get_string_value(id).await.map(|s| format!("\"{s}\"")).unwrap_or_else(|_| format!("<obj 0x{id:x}>"))
-            }
+            Some(ValueData::Object(id)) => conn
+                .get_string_value(id)
+                .await
+                .map(|s| format!("\"{s}\""))
+                .unwrap_or_else(|_| format!("<obj 0x{id:x}>")),
             Some(other) => format!("{other:?}"),
             None => "<no value>".to_string(),
         };

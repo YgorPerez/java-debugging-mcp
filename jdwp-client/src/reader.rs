@@ -19,9 +19,9 @@
 // that ever needs guarding, the fix is a real check at attach time that refuses the session — not a
 // function nobody calls.
 
-use bytes::Buf;
 use crate::protocol::{JdwpError, JdwpResult};
 use crate::types::ValueData;
+use bytes::Buf;
 
 /// JDWP value tags (JDWP spec, `Value` / `TaggedObjectID`). Each is the ASCII code of the JNI type
 /// signature character, which is why they look arbitrary as numbers.
@@ -68,8 +68,15 @@ fn value_width(tag: u8) -> JdwpResult<usize> {
         t::CHAR | t::SHORT => 2,
         t::FLOAT | t::INT => 4,
         // 8 covers both the 64-bit primitives and every reference kind, which is an objectID.
-        t::DOUBLE | t::LONG | t::OBJECT | t::STRING | t::THREAD | t::THREAD_GROUP
-        | t::CLASS_LOADER | t::CLASS_OBJECT | t::ARRAY => 8,
+        t::DOUBLE
+        | t::LONG
+        | t::OBJECT
+        | t::STRING
+        | t::THREAD
+        | t::THREAD_GROUP
+        | t::CLASS_LOADER
+        | t::CLASS_OBJECT
+        | t::ARRAY => 8,
         _ => return Err(JdwpError::Protocol(format!("Unknown value tag: {tag}"))),
     })
 }
@@ -117,8 +124,7 @@ pub fn read_string(buf: &mut &[u8]) -> JdwpResult<String> {
         .to_vec();
     buf.advance(len);
 
-    String::from_utf8(bytes)
-        .map_err(|e| JdwpError::Protocol(format!("Invalid UTF-8 in string: {e}")))
+    String::from_utf8(bytes).map_err(|e| JdwpError::Protocol(format!("Invalid UTF-8 in string: {e}")))
 }
 
 /// Read a u32

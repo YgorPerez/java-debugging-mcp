@@ -14,12 +14,10 @@
 )]
 // Restriction lints above target production code; unit tests may panic on failure, so `unwrap`,
 // `expect`, indexing, and assertions are idiomatic there.
-#![cfg_attr(test, allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic_in_result_fn
-))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic_in_result_fn)
+)]
 // JDWP MCP Server - Java debugging via Model Context Protocol
 //
 // Provides LLM-friendly debugging tools for JVM applications via JDWP
@@ -36,7 +34,10 @@ mod session;
 mod tools;
 
 use handlers::RequestHandler;
-use protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, INVALID_REQUEST, JsonRpcNotification, Alerter, PARSE_ERROR, ALERT_CAPACITY};
+use protocol::{
+    Alerter, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ALERT_CAPACITY,
+    INVALID_REQUEST, PARSE_ERROR,
+};
 use tokio::sync::mpsc;
 
 /// How long to let the writer task drain after stdin closes, before giving up on it (EVT-2).
@@ -51,10 +52,7 @@ async fn main() -> Result<()> {
     // Tracing to stderr only - stdout is reserved for JSON-RPC protocol
     let env_filter =
         tracing_subscriber::EnvFilter::from_default_env().add_directive("jdwp_mcp=info".parse()?);
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_writer(std::io::stderr)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(env_filter).with_writer(std::io::stderr).init();
 
     info!("Starting JDWP MCP Server...");
 
@@ -128,11 +126,7 @@ fn error_response(code: i32, message: &str) -> JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id: serde_json::Value::Null,
         result: None,
-        error: Some(JsonRpcError {
-            code,
-            message: message.to_string(),
-            data: None,
-        }),
+        error: Some(JsonRpcError { code, message: message.to_string(), data: None }),
     }
 }
 
@@ -168,11 +162,7 @@ async fn send_message(out: &mpsc::Sender<String>, message: String) -> Result<()>
 
 /// Parse and dispatch one incoming line: a request gets handled and answered; a notification is
 /// handled without a reply; anything unparseable yields a JSON-RPC error response.
-async fn process_line(
-    handler: &RequestHandler,
-    out: &mpsc::Sender<String>,
-    line: &str,
-) -> Result<()> {
+async fn process_line(handler: &RequestHandler, out: &mpsc::Sender<String>, line: &str) -> Result<()> {
     let value: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {

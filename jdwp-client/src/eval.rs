@@ -1,7 +1,9 @@
 // Primitives for expression evaluation: type signatures, superclass walking,
 // `this` object, and method invocation (instance and static).
 
-use crate::commands::{command_sets, object_reference_commands, reference_type_commands, stack_frame_commands};
+use crate::commands::{
+    command_sets, object_reference_commands, reference_type_commands, stack_frame_commands,
+};
 use crate::connection::JdwpConnection;
 use crate::protocol::{CommandPacket, JdwpResult};
 use crate::reader::{read_string, read_u64, read_u8, read_value_by_tag};
@@ -27,7 +29,8 @@ impl JdwpConnection {
             return Ok(hit);
         }
         let id = self.next_id();
-        let mut packet = CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::SIGNATURE);
+        let mut packet =
+            CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::SIGNATURE);
         packet.data.put_u64(ref_type_id);
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
@@ -153,10 +156,7 @@ impl JdwpConnection {
 /// invoke commands, whose replies are identical.
 fn read_invoke_reply(mut data: &[u8]) -> JdwpResult<(Value, ObjectId)> {
     let ret_tag = read_u8(&mut data)?;
-    let ret = Value {
-        tag: ret_tag,
-        data: read_value_by_tag(ret_tag, &mut data)?,
-    };
+    let ret = Value { tag: ret_tag, data: read_value_by_tag(ret_tag, &mut data)? };
     let _exc_tag = read_u8(&mut data)?;
     let exc_id = read_u64(&mut data)?;
     Ok((ret, exc_id))
@@ -185,4 +185,3 @@ pub(crate) fn write_untagged_value<B: BufMut>(buf: &mut B, v: &Value) {
         ValueData::Void => {}
     }
 }
-

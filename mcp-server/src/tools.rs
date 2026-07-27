@@ -4,7 +4,12 @@
 // advertised schema always matches what the handler deserializes. Tools with no arguments use an
 // empty object schema.
 
-use crate::args::{AttachArgs, SetBreakpointArgs, ClearBreakpointArgs, StepArgs, GetStackArgs, EvaluateArgs, GetLastEventArgs, ListThreadsArgs, ListClassesArgs, ListMethodsArgs, SourceArgs, SetValueArgs, GetTracesArgs, SetExceptionBreakpointArgs, SetWatchpointArgs, ForceReturnArgs, ToggleBreakpointArgs, ThreadDumpArgs, SetMethodBreakpointArgs};
+use crate::args::{
+    AttachArgs, ClearBreakpointArgs, EvaluateArgs, ForceReturnArgs, GetLastEventArgs, GetStackArgs,
+    GetTracesArgs, ListClassesArgs, ListMethodsArgs, ListThreadsArgs, SetBreakpointArgs,
+    SetExceptionBreakpointArgs, SetMethodBreakpointArgs, SetValueArgs, SetWatchpointArgs, SourceArgs,
+    StepArgs, ThreadDumpArgs, ToggleBreakpointArgs,
+};
 use crate::protocol::Tool;
 use serde_json::json;
 

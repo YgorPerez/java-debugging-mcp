@@ -12,12 +12,10 @@
 )]
 // Restriction lints above target production code; unit tests may panic on failure, so `unwrap`,
 // `expect`, indexing, and assertions are idiomatic there.
-#![cfg_attr(test, allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic_in_result_fn
-))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic_in_result_fn)
+)]
 // JDWP client library for Java debugging
 //
 // Implements a subset of the JDWP protocol focused on practical debugging scenarios:
@@ -27,29 +25,29 @@
 // - Variable evaluation
 // - Execution control
 
-pub mod connection;
-pub mod protocol;
 pub mod commands;
-pub mod events;
+pub mod connection;
+pub mod eval;
 pub mod eventloop;
-pub mod types;
-pub mod reader;
-pub mod vm;
-pub mod reftype;
-pub mod method;
 pub mod eventrequest;
-pub mod thread;
+pub mod events;
+pub mod extra;
+pub mod method;
+pub mod object;
+pub mod protocol;
+pub mod reader;
+pub mod reftype;
 pub mod stackframe;
 pub mod string;
-pub mod object;
-pub mod eval;
-pub mod extra;
+pub mod thread;
+pub mod types;
+pub mod vm;
 
 pub use connection::JdwpConnection;
-pub use eventloop::{EventLoopHandle, spawn_event_loop};
+pub use eventloop::{spawn_event_loop, EventLoopHandle};
+pub use eventrequest::{SuspendPolicy, WatchKind};
 pub use events::EventSet;
 pub use protocol::{JdwpError, JdwpResult};
-pub use eventrequest::{SuspendPolicy, WatchKind};
 
 #[cfg(test)]
 mod tests {

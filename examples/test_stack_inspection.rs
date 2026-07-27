@@ -13,14 +13,12 @@
 )]
 // Test complete stack inspection flow
 
-use jdwp_client::{JdwpConnection, SuspendPolicy};
 use jdwp_client::stackframe::VariableSlot;
+use jdwp_client::{JdwpConnection, SuspendPolicy};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter("jdwp_client=info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("jdwp_client=info").init();
 
     println!("🔍 Stack Inspection Test\n");
 
@@ -38,12 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let line_64 = line_table.lines.iter().find(|e| e.line_number == 64).unwrap();
 
     println!("🎯 Setting breakpoint at HelloController.java:64...");
-    let request_id = conn.set_breakpoint(
-        class.type_id,
-        hello_method.method_id,
-        line_64.line_code_index,
-        SuspendPolicy::All,
-    ).await?;
+    let request_id = conn
+        .set_breakpoint(class.type_id, hello_method.method_id, line_64.line_code_index, SuspendPolicy::All)
+        .await?;
     println!("✓ Breakpoint set (request_id: {})\n", request_id);
 
     println!("💡 Now trigger the endpoint:");
@@ -79,7 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Get variable table to know what variables exist
                         println!("🔬 Inspecting variables...");
-                        let var_table = conn.get_variable_table(class.type_id, hello_method.method_id).await?;
+                        let var_table =
+                            conn.get_variable_table(class.type_id, hello_method.method_id).await?;
 
                         // Find variables that are valid at this bytecode location
                         let current_index = frame.location.index;

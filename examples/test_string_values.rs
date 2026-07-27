@@ -47,9 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🔍 Finding debugTest method...");
     let methods = connection.get_methods(class_id).await?;
 
-    let debug_test_method = methods.iter()
-        .find(|m| m.name == "debugTest")
-        .expect("debugTest method not found");
+    let debug_test_method =
+        methods.iter().find(|m| m.name == "debugTest").expect("debugTest method not found");
 
     println!("✅ Found debugTest method ID: {:x}", debug_test_method.method_id);
 
@@ -57,15 +56,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let line_table = connection.get_line_table(class_id, debug_test_method.method_id).await?;
 
     // Find the line entry for line 148 (where we return the concatenated string)
-    let line_entry = line_table.lines.iter()
-        .find(|l| l.line_number == 148)
-        .expect("Line 148 not found in line table");
+    let line_entry =
+        line_table.lines.iter().find(|l| l.line_number == 148).expect("Line 148 not found in line table");
 
     println!("✅ Line 148 is at code index: {}", line_entry.line_code_index);
 
     // Set breakpoint at line 148
     println!("\n⏸️  Setting breakpoint at line 148...");
-    let _bp_id = connection.set_breakpoint(class_id, debug_test_method.method_id, line_entry.line_code_index, SuspendPolicy::All).await?;
+    let _bp_id = connection
+        .set_breakpoint(class_id, debug_test_method.method_id, line_entry.line_code_index, SuspendPolicy::All)
+        .await?;
     println!("✅ Breakpoint set!");
 
     println!("\n📞 Trigger the breakpoint by running:");
@@ -73,8 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nWaiting for breakpoint to hit...");
 
     // Wait for breakpoint event
-    let event_set = connection.recv_event().await
-        .expect("No event received");
+    let event_set = connection.recv_event().await.expect("No event received");
 
     println!("\n🎯 Breakpoint hit! Event: {:?}", event_set.suspend_policy);
 
@@ -93,7 +92,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let frame = &frames[0];
             println!("✅ Got {} frame(s)", frames.len());
-            println!("   Frame 0: class={:x}, method={:x}", frame.location.class_id, frame.location.method_id);
+            println!(
+                "   Frame 0: class={:x}, method={:x}",
+                frame.location.class_id, frame.location.method_id
+            );
 
             // Get variable table for debugTest method
             println!("\n🔍 Getting variable table...");
@@ -106,14 +108,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Get variables that are active at current code index
             let current_index = frame.location.index;
-            let active_vars: Vec<_> = var_table.iter()
+            let active_vars: Vec<_> = var_table
+                .iter()
                 .filter(|v| current_index >= v.code_index && current_index < v.code_index + v.length as u64)
                 .collect();
 
             println!("\n📊 Active variables at index {}:", current_index);
 
             // Prepare slots for getting values
-            let slots: Vec<jdwp_client::stackframe::VariableSlot> = active_vars.iter()
+            let slots: Vec<jdwp_client::stackframe::VariableSlot> = active_vars
+                .iter()
                 .map(|v| jdwp_client::stackframe::VariableSlot {
                     slot: v.slot as i32,
                     sig_byte: v.signature.as_bytes()[0],

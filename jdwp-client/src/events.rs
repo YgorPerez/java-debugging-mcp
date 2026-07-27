@@ -5,7 +5,7 @@
 use crate::commands::event_kinds;
 use crate::protocol::JdwpResult;
 use crate::reader::{read_i32, read_string, read_u64, read_u8};
-use crate::types::{ThreadId, ReferenceTypeId, Location, ObjectId, FieldId, Value};
+use crate::types::{FieldId, Location, ObjectId, ReferenceTypeId, ThreadId, Value};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -112,20 +112,9 @@ pub enum EventModifier {
     ClassMatch(String),
     ClassExclude(String),
     LocationOnly(Location),
-    ExceptionOnly {
-        ref_type: ReferenceTypeId,
-        caught: bool,
-        uncaught: bool,
-    },
-    FieldOnly {
-        ref_type: ReferenceTypeId,
-        field_id: FieldId,
-    },
-    Step {
-        thread: ThreadId,
-        size: i32,
-        depth: i32,
-    },
+    ExceptionOnly { ref_type: ReferenceTypeId, caught: bool, uncaught: bool },
+    FieldOnly { ref_type: ReferenceTypeId, field_id: FieldId },
+    Step { thread: ThreadId, size: i32, depth: i32 },
     InstanceOnly(ObjectId),
 }
 
@@ -150,17 +139,10 @@ pub fn parse_event_packet(data: &[u8]) -> JdwpResult<EventSet> {
 
         let details = parse_event_details(kind, &mut buf)?;
 
-        events.push(Event {
-            kind,
-            request_id,
-            details,
-        });
+        events.push(Event { kind, request_id, details });
     }
 
-    Ok(EventSet {
-        suspend_policy,
-        events,
-    })
+    Ok(EventSet { suspend_policy, events })
 }
 
 /// Dispatch a single event's kind-specific payload to the matching parser.
@@ -230,11 +212,8 @@ fn parse_exception_event(buf: &mut &[u8]) -> JdwpResult<EventKind> {
     let _exc_tag = read_u8(buf)?;
     let exception = read_u64(buf)?;
     let catch = read_location(buf)?;
-    let catch_location = if catch.class_id == 0 && catch.method_id == 0 && catch.index == 0 {
-        None
-    } else {
-        Some(catch)
-    };
+    let catch_location =
+        if catch.class_id == 0 && catch.method_id == 0 && catch.index == 0 { None } else { Some(catch) };
     Ok(EventKind::Exception { thread, location, exception, catch_location })
 }
 
@@ -286,12 +265,7 @@ fn read_location(buf: &mut &[u8]) -> JdwpResult<Location> {
     let method_id = read_u64(buf)?;
     let index = read_u64(buf)?;
 
-    Ok(Location {
-        type_tag,
-        class_id,
-        method_id,
-        index,
-    })
+    Ok(Location { type_tag, class_id, method_id, index })
 }
 
 #[cfg(test)]
@@ -387,11 +361,8 @@ mod tests {
 
         // Two kind-42 events back to back: the second only parses if the first consumed its value and
         // nothing more. This is the assertion that catches a length mistake in the tagged-value read.
-        let pair = parse_event_packet(&packet(
-            1,
-            &[method_exit_event(true, 7), method_exit_event(true, 8)],
-        ))
-        .expect("well-formed");
+        let pair = parse_event_packet(&packet(1, &[method_exit_event(true, 7), method_exit_event(true, 8)]))
+            .expect("well-formed");
         assert_eq!(pair.events.len(), 2, "the first event must consume exactly its own bytes");
     }
 
@@ -446,11 +417,7 @@ mod tests {
     /// killing the whole debug session instead of reporting a malformed reply.
     #[test]
     fn every_truncation_of_a_packet_errors_instead_of_panicking() {
-        for event in [
-            breakpoint_event(5, 0xabc),
-            field_modification_event(42),
-            method_exit_event(true, 42),
-        ] {
+        for event in [breakpoint_event(5, 0xabc), field_modification_event(42), method_exit_event(true, 42)] {
             let wire = packet(1, &[event]);
             for keep in 0..wire.len() {
                 let short = &wire[..keep];

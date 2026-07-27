@@ -13,15 +13,15 @@ use serde::{Deserialize, Serialize};
 /// Line table entry - maps source line to bytecode index
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineTableEntry {
-    pub line_code_index: u64,  // bytecode index
-    pub line_number: i32,       // source line number
+    pub line_code_index: u64, // bytecode index
+    pub line_number: i32,     // source line number
 }
 
 /// Complete line table for a method
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineTable {
-    pub start: u64,   // starting bytecode index
-    pub end: u64,     // ending bytecode index
+    pub start: u64, // starting bytecode index
+    pub end: u64,   // ending bytecode index
     pub lines: Vec<LineTableEntry>,
 }
 
@@ -60,10 +60,7 @@ impl JdwpConnection {
             let line_code_index = read_u64(&mut data)?;
             let line_number = read_i32(&mut data)?;
 
-            lines.push(LineTableEntry {
-                line_code_index,
-                line_number,
-            });
+            lines.push(LineTableEntry { line_code_index, line_number });
         }
 
         Ok(LineTable { start, end, lines })
@@ -105,13 +102,7 @@ impl JdwpConnection {
             let length = crate::reader::read_u32(&mut data)?;
             let slot = crate::reader::read_u32(&mut data)?;
 
-            variables.push(Variable {
-                code_index,
-                name,
-                signature,
-                length,
-                slot,
-            });
+            variables.push(Variable { code_index, name, signature, length, slot });
         }
 
         Ok(variables)

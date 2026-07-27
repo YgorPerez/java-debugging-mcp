@@ -19,9 +19,7 @@
 
 mod common;
 
-use common::cassette::{
-    cassette_path, rerecording, Cassette, CassetteRecorder, ReplayServer, RERECORD_ENV,
-};
+use common::cassette::{cassette_path, rerecording, Cassette, CassetteRecorder, ReplayServer, RERECORD_ENV};
 use common::{
     assert_contains_all, jdk_or_skip, probe_line, probe_source, probe_source_path, Fault, FaultRelay, Jdk,
     LatencyRelay, Probe, Server, EVENT_TIMEOUT,
@@ -38,10 +36,7 @@ fn evaluate_static_methods_and_object_arguments() {
 
     let source = probe_source("EvalProbe");
     let line = probe_line(&source, "// BP1");
-    server.call(
-        "debug.set_line_stop",
-        serde_json::json!({"class_pattern": "EvalProbe", "line": line}),
-    );
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "EvalProbe", "line": line}));
     let hit = server
         .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
         .expect("breakpoint in EvalProbe.work never fired");
@@ -54,8 +49,16 @@ fn evaluate_static_methods_and_object_arguments() {
     // A static field read must keep working alongside the call path.
     assert_contains_all("static field", &server.evaluate("EvalProbe.infra"), &["PROD"]);
     // A static call result is an ordinary head, so it keeps chaining.
-    assert_contains_all("chained off a static call", &server.evaluate("EvalProbe.infraName().length()"), &["(int) 4"]);
-    assert_contains_all("field then instance call", &server.evaluate("EvalProbe.holder.label()"), &["holder#3"]);
+    assert_contains_all(
+        "chained off a static call",
+        &server.evaluate("EvalProbe.infraName().length()"),
+        &["(int) 4"],
+    );
+    assert_contains_all(
+        "field then instance call",
+        &server.evaluate("EvalProbe.holder.label()"),
+        &["holder#3"],
+    );
     assert_contains_all(
         "unknown static method",
         &server.evaluate("EvalProbe.noSuchMethod(1)"),
@@ -63,8 +66,16 @@ fn evaluate_static_methods_and_object_arguments() {
     );
 
     // --- EVAL-2: expressions as arguments, passed by reference ---
-    assert_contains_all("local as arg to instance method", &server.evaluate("a.matches(b)"), &["(boolean) true"]);
-    assert_contains_all("local as arg to static method", &server.evaluate("EvalProbe.describe(a)"), &["item:alpha/1"]);
+    assert_contains_all(
+        "local as arg to instance method",
+        &server.evaluate("a.matches(b)"),
+        &["(boolean) true"],
+    );
+    assert_contains_all(
+        "local as arg to static method",
+        &server.evaluate("EvalProbe.describe(a)"),
+        &["item:alpha/1"],
+    );
     assert_contains_all("two object args", &server.evaluate("EvalProbe.sameName(a, b)"), &["(boolean) true"]);
     assert_contains_all("static field as arg", &server.evaluate("a.plus(EvalProbe.base)"), &["(int) 8"]);
     assert_contains_all("nested call as arg", &server.evaluate("EvalProbe.twice(a.plus(1))"), &["(int) 4"]);
@@ -123,7 +134,11 @@ fn evaluate_static_methods_and_object_arguments() {
         &["has no static method"],
     );
     // Autoboxing: an int argument selects f(Integer), and a real Integer reaches the method.
-    assert_contains_all("int boxes into Integer", &server.evaluate("EvalProbe.takesInteger(5)"), &["Integer:5"]);
+    assert_contains_all(
+        "int boxes into Integer",
+        &server.evaluate("EvalProbe.takesInteger(5)"),
+        &["Integer:5"],
+    );
     // Array covariance — a String[] is an Object[], which no signature comparison can tell you.
     assert_contains_all(
         "array covariance",
@@ -131,12 +146,17 @@ fn evaluate_static_methods_and_object_arguments() {
         &["Object[]:2"],
     );
     // The cheap path must be unchanged: an exact match still wins without asking the JVM anything.
-    assert_contains_all("exact overload still preferred", &server.evaluate("EvalProbe.pick(a)"), &["Item:alpha"]);
+    assert_contains_all(
+        "exact overload still preferred",
+        &server.evaluate("EvalProbe.pick(a)"),
+        &["Item:alpha"],
+    );
 
     // --- Conditions whose right-hand side is an expression, not a literal ---
     // Each gets its own line so its hit is distinguishable from every earlier one by line number.
     // Both hold on every iteration, so a miss means the condition failed to evaluate.
-    for (marker, condition) in [("// BP2", "a.name == b.name"), ("// BP3", "check == EvalProbe.twice(local)")] {
+    for (marker, condition) in [("// BP2", "a.name == b.name"), ("// BP3", "check == EvalProbe.twice(local)")]
+    {
         let cond_line = probe_line(&source, marker);
         server.panic_reset();
         server.call(
@@ -169,7 +189,8 @@ fn watchpoints_report_field_writes_and_reads() {
         serde_json::json!({"class_name": "WatchProbe", "field_name": "counter"}),
     );
     assert_contains_all("static watch set", &set, &["watch_modify_", "static int"]);
-    let hit = server.wait_for_event("field_modification", EVENT_TIMEOUT).expect("counter write never reported");
+    let hit =
+        server.wait_for_event("field_modification", EVENT_TIMEOUT).expect("counter write never reported");
     assert_contains_all(
         "static write hit",
         &hit,
@@ -189,7 +210,12 @@ fn watchpoints_report_field_writes_and_reads() {
     assert_contains_all(
         "instance write hit",
         &hit,
-        &["\"method\":\"relabel\"", "\"field\":\"WatchProbe$Holder.label\"", "\"static\":false", "\"instance\":\"0x"],
+        &[
+            "\"method\":\"relabel\"",
+            "\"field\":\"WatchProbe$Holder.label\"",
+            "\"static\":false",
+            "\"instance\":\"0x",
+        ],
     );
     let distinct = ["even", "odd", "start"].iter().filter(|w| hit.contains(*w)).count();
     assert!(distinct >= 2, "expected two distinct label strings in: {hit}");
@@ -242,12 +268,18 @@ fn watchpoints_report_field_writes_and_reads() {
     // --- Argument validation.
     assert_contains_all(
         "unknown field",
-        &server.call("debug.set_field_stop", serde_json::json!({"class_name": "WatchProbe", "field_name": "nope"})),
+        &server.call(
+            "debug.set_field_stop",
+            serde_json::json!({"class_name": "WatchProbe", "field_name": "nope"}),
+        ),
         &["has no field 'nope'"],
     );
     assert_contains_all(
         "unloaded class",
-        &server.call("debug.set_field_stop", serde_json::json!({"class_name": "NoSuchClass", "field_name": "x"})),
+        &server.call(
+            "debug.set_field_stop",
+            serde_json::json!({"class_name": "NoSuchClass", "field_name": "x"}),
+        ),
         &["not loaded yet"],
     );
     assert_contains_all(
@@ -277,10 +309,8 @@ fn deferred_breakpoint_arms_when_its_class_loads() {
     probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("ready")).expect("probe never printed ready");
 
     let line = probe_line(&probe_source("DeferredProbe"), "// BP1");
-    let set = server.call(
-        "debug.set_line_stop",
-        serde_json::json!({"class_pattern": "LateWorker", "line": line}),
-    );
+    let set =
+        server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "LateWorker", "line": line}));
     assert_contains_all(
         "deferred breakpoint is accepted and says it is deferred",
         &set.to_lowercase(),
@@ -318,7 +348,11 @@ fn deferred_breakpoint_arms_when_its_class_loads() {
     // The frame must be real and inspectable, not just a location — this is what proves the
     // breakpoint was armed properly rather than the event being an artefact of class loading.
     assert_contains_all("locals are readable at the deferred hit", &server.evaluate("n"), &["(int)"]);
-    assert_contains_all("static field on the late class", &server.evaluate("LateWorker.label"), &["late-worker"]);
+    assert_contains_all(
+        "static field on the late class",
+        &server.evaluate("LateWorker.label"),
+        &["late-worker"],
+    );
 
     // Once armed it is a normal breakpoint, so it must now appear as armed rather than deferred.
     assert_contains_all(
@@ -389,7 +423,9 @@ fn force_return_changes_what_the_caller_receives() {
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn deep_expansion_walks_objects_collections_and_survives_cycles() {
-    let Some(jdk) = jdk_or_skip("deep_expansion_walks_objects_collections_and_survives_cycles") else { return };
+    let Some(jdk) = jdk_or_skip("deep_expansion_walks_objects_collections_and_survives_cycles") else {
+        return;
+    };
     let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
@@ -436,14 +472,14 @@ fn deep_expansion_walks_objects_collections_and_survives_cycles() {
     assert!(d3.contains("cycle"), "expected a cycle marker for customer.self / lastOrder in:\n{d3}");
 
     // --- Collections, element-level ---
-    assert_contains_all(
-        "List elements",
-        &d3,
-        &["tags = ", "[0] = \"urgent\"", "[1] = \"fragile\""],
-    );
+    assert_contains_all("List elements", &d3, &["tags = ", "[0] = \"urgent\"", "[1] = \"fragile\""]);
     assert_contains_all("Map entries render as key → value", &d3, &["counts = ", "\"a\" → (int) 1"]);
     assert_contains_all("Set elements", &d3, &["labels = ", "\"x\""]);
-    assert_contains_all("Optional present and empty", &d3, &["note = Optional[\"gift\"]", "missing = Optional.empty"]);
+    assert_contains_all(
+        "Optional present and empty",
+        &d3,
+        &["note = Optional[\"gift\"]", "missing = Optional.empty"],
+    );
     assert_contains_all("empty List", &d3, &["empty = "]);
 
     // --- Arrays take a different path from collections ---
@@ -472,10 +508,7 @@ fn deep_expansion_walks_objects_collections_and_survives_cycles() {
     // --- Depth bound: depth 1 expands `order`'s own fields but must not expand `customer`'s ---
     let d1 = deep(&mut server, "order", 1);
     assert_contains_all("depth 1 still shows own fields", &d1, &["id = (int) 42", "customer = "]);
-    assert!(
-        !d1.contains("city = "),
-        "max_depth=1 must not reach order.customer.address.city:\n{d1}"
-    );
+    assert!(!d1.contains("city = "), "max_depth=1 must not reach order.customer.address.city:\n{d1}");
 
     // --- get_stack expansion is the same machinery on a frame's locals ---
     let stack = server.call(
@@ -515,7 +548,11 @@ fn collection_subscripts_index_slice_and_filter() {
     assert_contains_all("String array index", &server.evaluate("order.words[0]"), &["\"alpha\""]);
     // A Map subscript is a key lookup, not a position — and an int key must be boxed for get(Object).
     assert_contains_all("Map string key", &server.evaluate("order.counts[\"b\"]"), &["(int) 2"]);
-    assert_contains_all("Optional via index is refused clearly", &server.evaluate("order.note[0]"), &["not indexable"]);
+    assert_contains_all(
+        "Optional via index is refused clearly",
+        &server.evaluate("order.note[0]"),
+        &["not indexable"],
+    );
 
     // Bounds and type errors say which is which.
     assert_contains_all("array out of bounds", &server.evaluate("order.numbers[9]"), &["out of bounds"]);
@@ -527,18 +564,30 @@ fn collection_subscripts_index_slice_and_filter() {
 
     // --- [a..b]: half-open slice ---
     let sliced = server.evaluate("order.lines[1..3]");
-    assert_contains_all("slice reports selection and count", &sliced, &["2 of 5", "[0] = ", "Line(bb,5,false)", "Line(cc,2,true)"]);
+    assert_contains_all(
+        "slice reports selection and count",
+        &sliced,
+        &["2 of 5", "[0] = ", "Line(bb,5,false)", "Line(cc,2,true)"],
+    );
     assert!(!sliced.contains("Line(aa"), "slice [1..3] must exclude element 0:\n{sliced}");
     assert!(!sliced.contains("Line(dd"), "slice [1..3] must be half-open:\n{sliced}");
     // An over-long range clamps rather than erroring — asking for "up to 100" is normal.
     assert_contains_all("over-long range clamps", &server.evaluate("order.lines[0..100]"), &["5 of 5"]);
     assert_contains_all("empty range", &server.evaluate("order.lines[2..2]"), &["0 of 5"]);
     assert_contains_all("array slice", &server.evaluate("order.numbers[0..2]"), &["2 of 3", "(int) 1"]);
-    assert_contains_all("reversed range is rejected", &server.evaluate("order.lines[3..1]"), &["ends before it starts"]);
+    assert_contains_all(
+        "reversed range is rejected",
+        &server.evaluate("order.lines[3..1]"),
+        &["ends before it starts"],
+    );
 
     // --- [?predicate]: left side resolves against each element ---
     let paid = server.evaluate("order.lines[?paid == true]");
-    assert_contains_all("boolean field predicate", &paid, &["2 of 5 matched", "Line(aa,1,true)", "Line(cc,2,true)"]);
+    assert_contains_all(
+        "boolean field predicate",
+        &paid,
+        &["2 of 5 matched", "Line(aa,1,true)", "Line(cc,2,true)"],
+    );
     assert!(!paid.contains("Line(bb"), "unpaid lines must not match:\n{paid}");
 
     // qty > 3 matches bb(5), dd(9) AND ee(4) — three, not two.
@@ -565,14 +614,22 @@ fn collection_subscripts_index_slice_and_filter() {
         &["3 of 5 matched"],
     );
     // A match-nothing predicate is a real answer, and must not look like a broken one.
-    assert_contains_all("no matches still reports the scan", &server.evaluate("order.lines[?qty > 999]"), &["0 of 5 matched"]);
+    assert_contains_all(
+        "no matches still reports the scan",
+        &server.evaluate("order.lines[?qty > 999]"),
+        &["0 of 5 matched"],
+    );
     // A predicate that can't resolve on any element is an error, not "0 matched".
     assert_contains_all(
         "broken predicate is an error, not an empty result",
         &server.evaluate("order.lines[?nosuchfield == 1]"),
         &["failed on every element"],
     );
-    assert_contains_all("string filter on a String list", &server.evaluate("order.tags[?length() == 7]"), &["1 of 2 matched"]);
+    assert_contains_all(
+        "string filter on a String list",
+        &server.evaluate("order.tags[?length() == 7]"),
+        &["1 of 2 matched"],
+    );
 
     // --- Multi-value results end the expression, explicitly ---
     assert_contains_all(
@@ -641,7 +698,11 @@ fn roadmap_metrics_inspection_criteria() {
 
     // "Set a breakpoint in HelloController" + the Week-1 BLOCKER: know WHICH thread hit it, rather
     // than guessing among dozens.
-    assert_contains_all("the hit names its thread and location", &hit, &["\"method\":\"hello\"", "\"thread\":\"0x"]);
+    assert_contains_all(
+        "the hit names its thread and location",
+        &hit,
+        &["\"method\":\"hello\"", "\"thread\":\"0x"],
+    );
 
     // "See that meterRegistry is a SimpleMeterRegistry"
     assert_contains_all(
@@ -662,7 +723,11 @@ fn roadmap_metrics_inspection_criteria() {
     );
 
     // "See that helloCounter exists with count=42.0"
-    assert_contains_all("helloCounter's count", &server.evaluate("this.helloCounter.count"), &["(double) 42"]);
+    assert_contains_all(
+        "helloCounter's count",
+        &server.evaluate("this.helloCounter.count"),
+        &["(double) 42"],
+    );
 
     // "See string values directly (not object IDs)" — and the Week-4 headline, field-path navigation.
     assert_contains_all(
@@ -688,7 +753,8 @@ fn roadmap_metrics_inspection_criteria() {
     );
 
     // Stretch goal: "find metrics with name containing 'hello'" — the filter, keyed on the element.
-    let hello_only = server.evaluate("this.meterRegistry.meters.values()[?id.name != \"http.server.requests\"]");
+    let hello_only =
+        server.evaluate("this.meterRegistry.meters.values()[?id.name != \"http.server.requests\"]");
     assert_contains_all(
         "filter the registry down to the hello meters",
         &hello_only,
@@ -715,7 +781,9 @@ fn roadmap_metrics_inspection_criteria() {
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn traced_exception_breakpoints_record_throws_without_suspending() {
-    let Some(jdk) = jdk_or_skip("traced_exception_breakpoints_record_throws_without_suspending") else { return };
+    let Some(jdk) = jdk_or_skip("traced_exception_breakpoints_record_throws_without_suspending") else {
+        return;
+    };
     let probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
@@ -798,9 +866,7 @@ fn traced_watchpoints_record_writes_without_suspending() {
     // WatchProbe's tick number IS `counter`, so a rising tick proves both that the probe is running
     // and that the writes the watchpoint is reporting are really committing.
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
         "probe stopped ticking after a traced watchpoint — a write left it suspended\n  output: {:?}",
         probe.output(),
     );
@@ -901,11 +967,7 @@ fn traced_hits_record_which_caller_reached_them() {
             assert!(hit.contains(want), "record({v}) should report `{want}` in its chain: {hit}");
         }
         // Exactly the callers that exist — not the requested 3 padded out, and not a truncation.
-        assert_eq!(
-            hit.matches(" ← ").count(),
-            depth,
-            "record({v}) has {depth} caller(s) above it: {hit}"
-        );
+        assert_eq!(hit.matches(" ← ").count(), depth, "record({v}) has {depth} caller(s) above it: {hit}");
         // The locals must survive alongside the chain. Losing them was the real cost of the
         // over-long `Frames` request, and it was silent: the line still looked like a valid hit.
         assert!(
@@ -958,10 +1020,7 @@ fn trace_frames_zero_keeps_the_one_frame_snapshot_and_the_cap_is_reported() {
 
     let traces = server.wait_for_traces("CallerProbe.record", EVENT_TIMEOUT).unwrap_or_default();
     assert!(traces.contains("CallerProbe.record"), "the logpoint never fired: {traces}");
-    assert!(
-        !traces.contains(" ← "),
-        "trace_frames:0 must record no callers at all: {traces}"
-    );
+    assert!(!traces.contains(" ← "), "trace_frames:0 must record no callers at all: {traces}");
     // ...and with no callers there is nothing extra on the listing either.
     assert!(
         !server.call("debug.list_stop_points", serde_json::json!({})).contains("caller frame(s)"),
@@ -1134,10 +1193,7 @@ fn trace_cost_line(listing: &str, id: &str) -> Option<String> {
     let header = format!("[{id}]");
     let mut lines = listing.lines().skip_while(|l| !l.contains(&header));
     lines.next()?; // the row itself
-    lines
-        .take_while(|l| l.starts_with("   "))
-        .find(|l| l.contains("Trace cost:"))
-        .map(str::to_string)
+    lines.take_while(|l| l.starts_with("   ")).find(|l| l.contains("Trace cost:")).map(str::to_string)
 }
 
 /// The number immediately before `suffix`, e.g. `number_before("1.23ms mean", "ms mean") == Some(1.23)`.
@@ -1170,10 +1226,8 @@ fn thread_dump_shows_stacks_and_the_deadlock_cycle() {
 
     // Without suspend:true the running threads are unreadable — and the reply must SAY that rather than
     // return an empty-looking dump that reads as "nothing is contended".
-    let running = server.call(
-        "debug.thread_dump",
-        serde_json::json!({"name_filter": "deadlock", "monitors": true}),
-    );
+    let running =
+        server.call("debug.thread_dump", serde_json::json!({"name_filter": "deadlock", "monitors": true}));
     assert_contains_all(
         "a running VM explains why it can't be read",
         &running,
@@ -1198,10 +1252,10 @@ fn thread_dump_shows_stacks_and_the_deadlock_cycle() {
     // Each thread's own section, holding one lock and blocked on the other — with the holder named.
     // Split on "\n0x" (a thread header, always at the start of a line): a bare "0x" also appears
     // mid-line in the `← held by 0x…` annotation and inside JVM lambda class names.
-    let one = dump_section(&dump, "deadlock-one")
-        .unwrap_or_else(|| panic!("no deadlock-one section in:\n{dump}"));
-    let two = dump_section(&dump, "deadlock-two")
-        .unwrap_or_else(|| panic!("no deadlock-two section in:\n{dump}"));
+    let one =
+        dump_section(&dump, "deadlock-one").unwrap_or_else(|| panic!("no deadlock-one section in:\n{dump}"));
+    let two =
+        dump_section(&dump, "deadlock-two").unwrap_or_else(|| panic!("no deadlock-two section in:\n{dump}"));
     let (one, two) = (one.as_str(), two.as_str());
 
     assert!(one.contains("holds: DeadlockProbe$LockA@"), "deadlock-one must hold LockA:\n{one}");
@@ -1225,9 +1279,7 @@ fn thread_dump_shows_stacks_and_the_deadlock_cycle() {
     // The load-bearing check, as everywhere else in this suite: the debuggee is still running. Only
     // main can report that — the deadlocked pair never will.
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
         "the probe stopped ticking after a suspending thread dump — it was not resumed\n  output: {:?}",
         probe.output(),
     );
@@ -1245,8 +1297,7 @@ fn thread_dump_shows_stacks_and_the_deadlock_cycle() {
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_monitors_only_dump_finds_the_cycle_for_a_fraction_of_the_packets() {
-    let Some(jdk) = jdk_or_skip("a_monitors_only_dump_finds_the_cycle_for_a_fraction_of_the_packets")
-    else {
+    let Some(jdk) = jdk_or_skip("a_monitors_only_dump_finds_the_cycle_for_a_fraction_of_the_packets") else {
         return;
     };
     let probe = Probe::launch(&jdk, "DeadlockProbe").expect("launch DeadlockProbe");
@@ -1259,10 +1310,8 @@ fn a_monitors_only_dump_finds_the_cycle_for_a_fraction_of_the_packets() {
     let base = highest_tick(&probe).expect("no tick to count from");
 
     // Neither locks nor stacks is not a cheaper dump, it is an empty one — refused rather than answered.
-    let refused = server.call(
-        "debug.thread_dump",
-        serde_json::json!({"monitors_only": true, "monitors": false}),
-    );
+    let refused =
+        server.call("debug.thread_dump", serde_json::json!({"monitors_only": true, "monitors": false}));
     assert_contains_all(
         "asking for nothing at all is refused, with the reason",
         &refused,
@@ -1349,10 +1398,8 @@ fn a_tostring_that_never_returns_is_bounded_and_reported() {
     server.attach(probe.port);
 
     let line = probe_line(&probe_source("SlowToStringProbe"), "// BP1");
-    server.call(
-        "debug.set_line_stop",
-        serde_json::json!({"class_pattern": "SlowToStringProbe", "line": line}),
-    );
+    server
+        .call("debug.set_line_stop", serde_json::json!({"class_pattern": "SlowToStringProbe", "line": line}));
     server
         .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
         .expect("breakpoint in SlowToStringProbe.inspect never fired");
@@ -1423,10 +1470,8 @@ fn a_filter_pinned_to_a_retired_thread_reports_itself_as_dead() {
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
-    let threads = server.call(
-        "debug.list_threads",
-        serde_json::json!({"name_filter": "pool-worker", "limit": 400}),
-    );
+    let threads =
+        server.call("debug.list_threads", serde_json::json!({"name_filter": "pool-worker", "limit": 400}));
     let target = threads
         .lines()
         .find(|l| l.trim_start().starts_with("0x") && l.contains("pool-worker"))
@@ -1453,9 +1498,7 @@ fn a_filter_pinned_to_a_retired_thread_reports_itself_as_dead() {
         .wait_for_line(EVENT_TIMEOUT, |l| l.contains("quiesced"))
         .unwrap_or_else(|| panic!("the pool never quiesced\n  output: {:?}", probe.output()));
     probe.send_line("resume").expect("send resume");
-    probe
-        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("resumed"))
-        .expect("the pool never resumed");
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("resumed")).expect("the pool never resumed");
 
     // The pool is serving again on brand-new threads, so the filter can never match.
     let listed = server.call("debug.list_stop_points", serde_json::json!({}));
@@ -1514,10 +1557,8 @@ fn a_thread_filter_holds_against_a_real_pool_of_reused_threads() {
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let base = highest_tick(&probe).expect("no tick to count from");
 
-    let threads = server.call(
-        "debug.list_threads",
-        serde_json::json!({"name_filter": "pool-worker", "limit": 400}),
-    );
+    let threads =
+        server.call("debug.list_threads", serde_json::json!({"name_filter": "pool-worker", "limit": 400}));
     // The premise of the test: if the pool were not saturated this would be a handful of threads, and
     // "the filter excluded the others" would prove almost nothing.
     let pool_size = threads.lines().filter(|l| l.contains("pool-worker")).count();
@@ -1563,9 +1604,7 @@ fn a_thread_filter_holds_against_a_real_pool_of_reused_threads() {
 
     // And the other 199 kept working — the filter must not have suspended anything.
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
         "the pool stopped making progress under a filtered trace\n  output: {:?}",
         probe.output().len(),
     );
@@ -1593,10 +1632,8 @@ fn a_dump_reports_how_long_it_held_the_vm_and_a_budget_bounds_it() {
     let base = highest_tick(&probe).expect("no tick to count from");
 
     // A budget that cannot be met: 60 workers, three frames each, in 1ms.
-    let truncated = server.call(
-        "debug.thread_dump",
-        serde_json::json!({"suspend": true, "max_suspend_ms": 1, "limit": 60}),
-    );
+    let truncated = server
+        .call("debug.thread_dump", serde_json::json!({"suspend": true, "max_suspend_ms": 1, "limit": 60}));
     assert_contains_all(
         "an exhausted budget says so, and says the dump is incomplete",
         &truncated,
@@ -1611,9 +1648,7 @@ fn a_dump_reports_how_long_it_held_the_vm_and_a_budget_bounds_it() {
 
     // The VM really was released, which only the probe's own output can show.
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
         "the probe stopped ticking after a budget-truncated dump — it was not resumed\n  output: {:?}",
         probe.output(),
     );
@@ -1710,9 +1745,7 @@ fn a_production_shaped_dump_costs_a_bounded_number_of_packets_per_thread() {
     // ADR-0003 failure.
     let base = highest_tick(&probe).unwrap_or(0);
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base)).is_some(),
         "probe stopped ticking after the dumps — it was left suspended\n  output: {:?}",
         probe.output()
     );
@@ -1979,19 +2012,22 @@ fn thread_dump_works_read_only_and_never_suspends_on_its_own() {
 
     // Reading frames and monitors invokes nothing, so read-only must not refuse it — the guard is about
     // executing code in the debuggee, and a wedged production JVM is exactly where a dump is needed.
-    let dump = server.call(
-        "debug.thread_dump",
-        serde_json::json!({"name_filter": "deadlock", "suspend": true}),
+    let dump =
+        server.call("debug.thread_dump", serde_json::json!({"name_filter": "deadlock", "suspend": true}));
+    assert!(
+        !dump.contains("Read-only session"),
+        "a dump invokes nothing, so read-only must allow it: {dump}"
     );
-    assert!(!dump.contains("Read-only session"), "a dump invokes nothing, so read-only must allow it: {dump}");
-    assert_contains_all("the read-only dump still correlates the locks", &dump, &["holds: DeadlockProbe$Lock", "held by"]);
+    assert_contains_all(
+        "the read-only dump still correlates the locks",
+        &dump,
+        &["holds: DeadlockProbe$Lock", "held by"],
+    );
 
     // A dump WITHOUT suspend:true must leave the VM running: no pause, so the ticks never stop.
     server.call("debug.thread_dump", serde_json::json!({"limit": 5}));
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
         "a default thread dump must not suspend the VM\n  output: {:?}",
         probe.output(),
     );
@@ -2109,8 +2145,7 @@ fn method_exit_reports_the_value_each_return_produced() {
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_broad_suspending_method_exit_is_refused_and_panic_clears_the_rest() {
-    let Some(jdk) = jdk_or_skip("a_broad_suspending_method_exit_is_refused_and_panic_clears_the_rest")
-    else {
+    let Some(jdk) = jdk_or_skip("a_broad_suspending_method_exit_is_refused_and_panic_clears_the_rest") else {
         return;
     };
     let probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
@@ -2143,9 +2178,7 @@ fn a_broad_suspending_method_exit_is_refused_and_panic_clears_the_rest() {
         "a refused request must not be armed"
     );
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 1))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 1)).is_some(),
         "the probe must still be running after two refusals\n  output: {:?}",
         probe.output(),
     );
@@ -2166,7 +2199,10 @@ fn a_broad_suspending_method_exit_is_refused_and_panic_clears_the_rest() {
     // panic must drop it: resuming without clearing would re-freeze on the very next return, which for
     // this kind is immediate.
     let panicked = server.panic_reset();
-    assert!(panicked.contains("method-exit"), "panic must say it cleared the method-exit request: {panicked}");
+    assert!(
+        panicked.contains("method-exit"),
+        "panic must say it cleared the method-exit request: {panicked}"
+    );
     assert!(
         probe
             .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 3))
@@ -2189,24 +2225,20 @@ fn events_are_buffered_so_a_second_hit_doesnt_erase_the_first() {
     // A breakpoint then a step: two suspending events in a row, the second arriving before anything
     // has read the first. Single-threaded and deterministic, unlike racing two threads at one line.
     let line = probe_line(&probe_source("ExcProbe"), "// BP2");
-    server.call(
-        "debug.set_line_stop",
-        serde_json::json!({"class_pattern": "ExcProbe", "line": line}),
-    );
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "ExcProbe", "line": line}));
     server
         .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
         .expect("breakpoint in ExcProbe.main never fired");
     server.call("debug.step_over", serde_json::json!({}));
-    server
-        .wait_for_event("\"event\":\"step\"", EVENT_TIMEOUT)
-        .expect("step never reported");
+    server.wait_for_event("\"event\":\"step\"", EVENT_TIMEOUT).expect("step never reported");
 
     // A bare call still means "the newest event", as it always did — plus a note that there is more.
     let latest = server.last_event();
-    assert_contains_all("newest event, and the backlog is announced", &latest, &[
-        "\"event\":\"step\"",
-        "[pending] 1 older event",
-    ]);
+    assert_contains_all(
+        "newest event, and the backlog is announced",
+        &latest,
+        &["\"event\":\"step\"", "[pending] 1 older event"],
+    );
     assert!(
         !latest.contains("\"event\":\"breakpoint\""),
         "the default limit must return only the newest event: {latest}"
@@ -2214,10 +2246,11 @@ fn events_are_buffered_so_a_second_hit_doesnt_erase_the_first() {
 
     // Both are still there. This is the assertion that fails against a single-slot `last_event`.
     let both = server.call("debug.get_last_event", serde_json::json!({"limit": 5}));
-    assert_contains_all("both hits are retrievable", &both, &[
-        "\"event\":\"breakpoint\"",
-        "\"event\":\"step\"",
-    ]);
+    assert_contains_all(
+        "both hits are retrievable",
+        &both,
+        &["\"event\":\"breakpoint\"", "\"event\":\"step\""],
+    );
     assert!(
         both.find("\"event\":\"breakpoint\"") < both.find("\"event\":\"step\""),
         "buffered events read oldest-first, so the breakpoint must precede the step:\n{both}"
@@ -2246,10 +2279,7 @@ fn get_stack_node_budget_bounds_the_whole_call() {
     server.attach(probe.port);
 
     let line = probe_line(&probe_source("DeepProbe"), "// BP1");
-    server.call(
-        "debug.set_line_stop",
-        serde_json::json!({"class_pattern": "DeepProbe", "line": line}),
-    );
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
     server
         .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
         .expect("breakpoint in DeepProbe.inspect never fired");
@@ -2261,10 +2291,11 @@ fn get_stack_node_budget_bounds_the_whole_call() {
         "debug.get_stack",
         serde_json::json!({"expand_objects": true, "max_depth": 5, "max_children": 30}),
     );
-    assert_contains_all("the cap is reported once, naming where it stopped", &stack, &[
-        "node budget (1000) exhausted at #",
-        "remaining frames not expanded",
-    ]);
+    assert_contains_all(
+        "the cap is reported once, naming where it stopped",
+        &stack,
+        &["node budget (1000) exhausted at #", "remaining frames not expanded"],
+    );
     assert!(
         stack.matches("node budget").count() == 1,
         "the exhaustion notice belongs once per call, not per local:\n{stack}"
@@ -2281,9 +2312,11 @@ fn get_stack_node_budget_bounds_the_whole_call() {
         "debug.evaluate",
         serde_json::json!({"expression": "batch", "expand_objects": true, "max_depth": 5, "max_children": 30}),
     );
-    assert_contains_all("evaluate keeps its documented per-expression budget", &one, &[
-        "node budget (400) exhausted",
-    ]);
+    assert_contains_all(
+        "evaluate keeps its documented per-expression budget",
+        &one,
+        &["node budget (400) exhausted"],
+    );
 
     // Every frame keeps its locals under expansion. Expanding frame #0 invokes toArray/toString in the
     // debuggee, which invalidates the thread's frame ids — so frame #1's id, read before that, is
@@ -2295,10 +2328,11 @@ fn get_stack_node_budget_bounds_the_whole_call() {
     let main_frame = both_frames
         .split_once("DeepProbe.main")
         .map_or_else(|| panic!("no main frame in:\n{both_frames}"), |(_, rest)| rest.to_string());
-    assert_contains_all("a frame below an expanded one still shows its locals", &main_frame, &[
-        "i = (int)",
-        "order = DeepProbe$Order",
-    ]);
+    assert_contains_all(
+        "a frame below an expanded one still shows its locals",
+        &main_frame,
+        &["i = (int)", "order = DeepProbe$Order"],
+    );
 
     server.panic_reset();
 }
@@ -2314,10 +2348,7 @@ fn subscript_writes_and_map_entry_filters() {
     server.attach(probe.port);
 
     let line = probe_line(&probe_source("DeepProbe"), "// BP1");
-    server.call(
-        "debug.set_line_stop",
-        serde_json::json!({"class_pattern": "DeepProbe", "line": line}),
-    );
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
     server
         .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
         .expect("breakpoint in DeepProbe.inspect never fired");
@@ -2328,7 +2359,11 @@ fn subscript_writes_and_map_entry_filters() {
 
     // --- Array element: ArrayReference.SetValues, no invocation in the debuggee ---
     let set = write(&mut server, "order.numbers[1]", "42");
-    assert_contains_all("array element written, old value reported", &set, &["numbers[1] = 42", "was (int) 2"]);
+    assert_contains_all(
+        "array element written, old value reported",
+        &set,
+        &["numbers[1] = 42", "was (int) 2"],
+    );
     assert_contains_all("and it stuck", &server.evaluate("order.numbers[1]"), &["(int) 42"]);
     // The neighbours must be untouched — an untagged write of the wrong width would corrupt them.
     assert_contains_all("neighbours intact", &server.evaluate("order.numbers[0]"), &["(int) 1"]);
@@ -2371,14 +2406,11 @@ fn subscript_writes_and_map_entry_filters() {
     // --- Map entry filtering: predicate against each VALUE, keys preserved in the output ---
     // qty > 3 keeps bb(5), dd(9) and ee(4) — three of five.
     let matched = server.evaluate("order.byId[?qty > 3]");
-    assert_contains_all("filtered entries render as key → value", &matched, &[
-        "3 of 5 entr(ies)",
-        "\"bb\" → ",
-        "Line(bb,5,false)",
-        "\"dd\" → ",
-        "Line(dd,9,false)",
-        "\"ee\" → ",
-    ]);
+    assert_contains_all(
+        "filtered entries render as key → value",
+        &matched,
+        &["3 of 5 entr(ies)", "\"bb\" → ", "Line(bb,5,false)", "\"dd\" → ", "Line(dd,9,false)", "\"ee\" → "],
+    );
     assert!(!matched.contains("Line(aa"), "qty 1 must not match qty > 3:\n{matched}");
     assert!(!matched.contains("Line(cc"), "qty 2 must not match qty > 3:\n{matched}");
     assert!(!matched.contains("[0] = "), "map results are keyed, not positional:\n{matched}");
@@ -2434,7 +2466,6 @@ fn parse_old_new(ev: &str) -> Option<(i64, i64)> {
     Some((grab("old")?, grab("new")?))
 }
 
-
 /// SESS-1: `debug.list_sessions` — concurrent sessions are addressable, and one whose JVM has gone is
 /// reported dead rather than listed as healthy.
 #[test]
@@ -2467,23 +2498,15 @@ fn list_sessions_names_every_attachment_and_flags_a_dead_one() {
     );
 
     let listed = server.call("debug.list_sessions", serde_json::json!({}));
-    assert_contains_all("both sessions, by endpoint", &listed, &[
-        "2 session(s)",
-        &first.port.to_string(),
-        &second.port.to_string(),
-        &first_id,
-        &second_id,
-    ]);
+    assert_contains_all(
+        "both sessions, by endpoint",
+        &listed,
+        &["2 session(s)", &first.port.to_string(), &second.port.to_string(), &first_id, &second_id],
+    );
     assert_contains_all("the newest attach is current", &listed, &["← current"]);
     assert_eq!(listed.matches("← current").count(), 1, "exactly one session is current:\n{listed}");
-    let current_line = listed
-        .lines()
-        .find(|l| l.contains("← current"))
-        .expect("a current line");
-    assert!(
-        current_line.contains(&second_id),
-        "the last attach should be current, got: {current_line}"
-    );
+    let current_line = listed.lines().find(|l| l.contains("← current")).expect("a current line");
+    assert!(current_line.contains(&second_id), "the last attach should be current, got: {current_line}");
     let first_line = listed.lines().find(|l| l.contains(&first_id)).expect("a line for the first session");
     assert_contains_all("per-session stop-point count", first_line, &["1 stop point(s)"]);
 
@@ -2539,10 +2562,7 @@ fn deep_expansion_stays_within_its_packet_budget() {
     server.attach(probe.port);
 
     let line = probe_line(&probe_source("DeepProbe"), "// BP1");
-    server.call(
-        "debug.set_line_stop",
-        serde_json::json!({"class_pattern": "DeepProbe", "line": line}),
-    );
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
     server
         .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
         .expect("breakpoint in DeepProbe.inspect never fired");
@@ -2585,9 +2605,8 @@ fn packets_sent(server: &mut Server) -> u32 {
         .lines()
         .find(|l| l.contains("← current"))
         .unwrap_or_else(|| panic!("no current session in:\n{listed}"));
-    let (head, _) = line
-        .split_once(" JDWP packet(s)")
-        .unwrap_or_else(|| panic!("no packet count in: {line}"));
+    let (head, _) =
+        line.split_once(" JDWP packet(s)").unwrap_or_else(|| panic!("no packet count in: {line}"));
     head.rsplit(' ')
         .next()
         .and_then(|n| n.parse().ok())
@@ -2674,9 +2693,7 @@ fn watchdog_auto_resumes_and_disarms_the_offending_breakpoint() {
     // only thing that proves it really resumed (the debugger would report success either way), and a
     // tick well past the freeze point proves it didn't just re-freeze on the next bump.
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 3))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 3)).is_some(),
         "probe never resumed ticking after the watchdog window — it was left frozen\n  output: {:?}",
         probe.output(),
     );
@@ -2740,11 +2757,10 @@ fn watchdog_clears_a_pending_single_step() {
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
-    let set = server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
+    let set =
+        server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
     let bp_id = grab_token(&set, "bp_").expect("no bp id in set reply");
-    server
-        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
-        .expect("breakpoint never fired");
+    server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).expect("breakpoint never fired");
 
     // Arm a step (sets pending_step), then clear the breakpoint so ONLY the step remains as the reason
     // the VM is suspended. Now the watchdog's step-clearing is the only thing that can free the probe.
@@ -2753,9 +2769,7 @@ fn watchdog_clears_a_pending_single_step() {
     let frozen_at = highest_tick(&probe).unwrap_or(0);
 
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 2))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 2)).is_some(),
         "probe never resumed — the watchdog did not clear the pending step\n  output: {:?}",
         probe.output(),
     );
@@ -2780,9 +2794,7 @@ fn disconnect_resumes_and_clears_instead_of_freezing() {
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
     server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
-    server
-        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
-        .expect("breakpoint never fired");
+    server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).expect("breakpoint never fired");
     let frozen_at = highest_tick(&probe).expect("no tick before suspension");
 
     let bye = server.call("debug.disconnect", serde_json::json!({"session_id": sid}));
@@ -2794,9 +2806,7 @@ fn disconnect_resumes_and_clears_instead_of_freezing() {
 
     // The debuggee's own ticks resuming is the only proof the VM was actually left running.
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 3))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 3)).is_some(),
         "probe never resumed after disconnect — the VM was left frozen\n  output: {:?}",
         probe.output(),
     );
@@ -2841,7 +2851,8 @@ fn trace_budget_disarms_and_get_traces_filters() {
     // Exactly the budget was recorded — not more (it kept flooding), not fewer (it stopped early).
     let by_id = server.call("debug.get_traces", serde_json::json!({"bp_id": watch_id}));
     assert_eq!(
-        count_trace_records(&by_id), 3,
+        count_trace_records(&by_id),
+        3,
         "a budget of 3 must record exactly 3, filtered to this stop point:\n{by_id}"
     );
 
@@ -2857,11 +2868,7 @@ fn trace_budget_disarms_and_get_traces_filters() {
     // The watch disarmed itself but is still LISTED as disabled (BP-2) — an automatic disarm must not
     // destroy a definition the user typed, so it stays recoverable in one call.
     let listed = server.call("debug.list_stop_points", serde_json::json!({}));
-    assert_contains_all(
-        "a self-disarmed watch stays listed as disabled",
-        &listed,
-        &[&watch_id, "DISABLED"],
-    );
+    assert_contains_all("a self-disarmed watch stays listed as disabled", &listed, &[&watch_id, "DISABLED"]);
     // …and the probe keeps running (it never suspended, and now records nothing either).
     assert!(
         probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 4)).is_some(),
@@ -2870,13 +2877,16 @@ fn trace_budget_disarms_and_get_traces_filters() {
 
     // BP-2: re-arming the self-disarmed watch works, keeps the same id, and records again — which is
     // only possible because the definition survived the auto-disarm.
-    let on = server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": watch_id, "enabled": true}));
+    let on = server
+        .call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": watch_id, "enabled": true}));
     assert_contains_all("a self-disarmed watch can be re-armed", &on, &["Re-armed", &watch_id]);
     server.call("debug.get_traces", serde_json::json!({"clear": true}));
     assert!(
         (0..40).any(|_| {
             let got = count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))) > 0;
-            if !got { std::thread::sleep(std::time::Duration::from_millis(100)); }
+            if !got {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             got
         }),
         "the re-armed watch never recorded again — its budget was not restored"
@@ -2937,7 +2947,8 @@ fn thread_filter_reports_only_the_chosen_thread() {
         probe
             .wait_for_line(EVENT_TIMEOUT, |l| {
                 l.starts_with("beta throw")
-                    && l.rsplit(' ').next()
+                    && l.rsplit(' ')
+                        .next()
                         .and_then(|n| n.parse::<usize>().ok())
                         .is_some_and(|n| n > beta_before)
             })
@@ -2972,7 +2983,11 @@ fn boolean_operators_in_predicates_and_conditions() {
     );
     // `||`: paid OR qty>8 -> aa, cc (paid) + dd (qty 9).
     let or = server.evaluate("order.lines[?paid == true || qty > 8]");
-    assert_contains_all("OR predicate", &or, &["3 of 5 matched", "Line(aa,1,true)", "Line(cc,2,true)", "Line(dd,9,false)"]);
+    assert_contains_all(
+        "OR predicate",
+        &or,
+        &["3 of 5 matched", "Line(aa,1,true)", "Line(cc,2,true)", "Line(dd,9,false)"],
+    );
     assert!(!or.contains("Line(bb"), "bb is unpaid and qty 5 (<=8), so must not match:\n{or}");
 
     // Precedence: `a || b && c` is `a || (b && c)`, NOT `(a || b) && c`.
@@ -3027,7 +3042,9 @@ fn boolean_operators_in_predicates_and_conditions() {
         .expect("compound condition never fired");
     assert!(hit.contains("[suspended] true"), "the compound condition should have suspended: {hit}");
     assert_contains_all(
-        &format!("condition held at the first qualifying iteration (n == {expect_n}, resumed from {first_n})"),
+        &format!(
+            "condition held at the first qualifying iteration (n == {expect_n}, resumed from {first_n})"
+        ),
         &server.evaluate("n"),
         &[&format!("(int) {expect_n}")],
     );
@@ -3058,14 +3075,17 @@ fn toggle_stop_point_disables_and_rearms() {
     assert!(
         (0..40).any(|_| {
             let got = count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))) > 0;
-            if !got { std::thread::sleep(std::time::Duration::from_millis(100)); }
+            if !got {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             got
         }),
         "the trace breakpoint never recorded while enabled"
     );
 
     // Disable: the JDWP request is cleared but the definition kept.
-    let off = server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": bp_id, "enabled": false}));
+    let off =
+        server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": bp_id, "enabled": false}));
     assert_contains_all("disable keeps the definition", &off, &["Disabled", "re-arm"]);
     assert_contains_all(
         "a disabled breakpoint stays listed",
@@ -3077,17 +3097,21 @@ fn toggle_stop_point_disables_and_rearms() {
     server.call("debug.get_traces", serde_json::json!({"clear": true}));
     std::thread::sleep(std::time::Duration::from_millis(800));
     assert_eq!(
-        count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))), 0,
+        count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))),
+        0,
         "a disabled breakpoint must not fire"
     );
 
     // Re-enable: re-armed at the same location (with a fresh id), and snapshots resume.
-    let on = server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": bp_id, "enabled": true}));
+    let on =
+        server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": bp_id, "enabled": true}));
     assert_contains_all("enable re-arms", &on, &["Re-armed"]);
     assert!(
         (0..40).any(|_| {
             let got = count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))) > 0;
-            if !got { std::thread::sleep(std::time::Duration::from_millis(100)); }
+            if !got {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             got
         }),
         "re-enabling did not re-arm the breakpoint"
@@ -3100,7 +3124,8 @@ fn toggle_stop_point_disables_and_rearms() {
         &server.call("debug.list_stop_points", serde_json::json!({})),
         &[&bp_id],
     );
-    let again = server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": bp_id, "enabled": false}));
+    let again =
+        server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": bp_id, "enabled": false}));
     assert_contains_all("the original id still resolves after a re-arm", &again, &["Disabled", &bp_id]);
 
     server.panic_reset();
@@ -3136,7 +3161,11 @@ fn watchdog_rescues_a_manual_pause() {
     // And it is reported honestly: a manual pause has no stop point, so the note must say that rather
     // than claim it failed to identify one.
     let note = server.call("debug.list_stop_points", serde_json::json!({}));
-    assert_contains_all("the pause resume is reported as a pause", &note, &["watchdog auto-resumed", "debug.pause"]);
+    assert_contains_all(
+        "the pause resume is reported as a pause",
+        &note,
+        &["watchdog auto-resumed", "debug.pause"],
+    );
     assert!(
         !note.contains("could not identify"),
         "a manual pause must not be reported as an unidentifiable stop point: {note}"
@@ -3159,11 +3188,10 @@ fn watchdog_disarms_even_after_the_events_were_drained() {
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
-    let set = server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
+    let set =
+        server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
     let bp_id = grab_token(&set, "bp_").expect("no bp id");
-    server
-        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
-        .expect("breakpoint never fired");
+    server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).expect("breakpoint never fired");
     let frozen_at = highest_tick(&probe).expect("no tick before suspension");
 
     // Read AND DRAIN the events — the normal polling pattern EVT-1 added `drain` for. This is what used
@@ -3173,9 +3201,7 @@ fn watchdog_disarms_even_after_the_events_were_drained() {
 
     // The VM must be resumed…
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at)).is_some(),
         "probe never resumed after the watchdog window\n  output: {:?}",
         probe.output(),
     );
@@ -3235,13 +3261,25 @@ fn read_only_blocks_every_invocation_path() {
     assert_contains_all("a List subscript is refused", &sub, &["Read-only"]);
 
     // 3. An explicit call is still refused (it always was).
-    assert_contains_all("an explicit call is refused", &server.evaluate("order.lines[0].getQty()"), &["Read-only"]);
+    assert_contains_all(
+        "an explicit call is refused",
+        &server.evaluate("order.lines[0].getQty()"),
+        &["Read-only"],
+    );
 
     // 4. Reads needing no invocation keep working — the honest cost is shallower output, not no output.
     assert_contains_all("a field read still works", &server.evaluate("order.status"), &["\"OPEN\""]);
     assert_contains_all("an array index still works", &server.evaluate("order.numbers[2]"), &["(int) 3"]);
-    assert_contains_all("a nested field read still works", &server.evaluate("order.customer.name"), &["\"Ana\""]);
-    assert_contains_all("get_stack still works", &server.call("debug.get_stack", serde_json::json!({})), &["inspect"]);
+    assert_contains_all(
+        "a nested field read still works",
+        &server.evaluate("order.customer.name"),
+        &["\"Ana\""],
+    );
+    assert_contains_all(
+        "get_stack still works",
+        &server.call("debug.get_stack", serde_json::json!({})),
+        &["inspect"],
+    );
 
     // 5. An invoking condition / trace_expr is refused at ARM time, so it fails once where the caller is
     //    looking instead of silently on every hit inside the event pump.
@@ -3254,7 +3292,11 @@ fn read_only_blocks_every_invocation_path() {
         "debug.set_field_stop",
         serde_json::json!({"class_name": "DeepProbe", "field_name": "threshold", "trace": true, "trace_expr": "order.toString()"}),
     );
-    assert_contains_all("an invoking trace_expr is refused at arm time", &texpr, &["Read-only", "trace_expr"]);
+    assert_contains_all(
+        "an invoking trace_expr is refused at arm time",
+        &texpr,
+        &["Read-only", "trace_expr"],
+    );
 
     // 6. Writes are refused at the wire too, not just by the handler.
     assert_contains_all(
@@ -3292,7 +3334,8 @@ fn toggling_a_deferred_breakpoint_explains_itself() {
         &[&bp_id],
     );
 
-    let toggled = server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": bp_id, "enabled": false}));
+    let toggled =
+        server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": bp_id, "enabled": false}));
     assert_contains_all(
         "toggling a deferred breakpoint names its deferred state",
         &toggled,
@@ -3331,15 +3374,9 @@ fn set_value_copies_a_live_reference_and_refuses_a_mismatch() {
     assert_contains_all("the live value was copied", &server.evaluate("order.status"), &["\"Ana\""]);
 
     // A type-incompatible source is refused, naming both types (Customer field <- String value).
-    let refused = server.call(
-        "debug.set_value",
-        serde_json::json!({"target": "order.customer", "value": "order.status"}),
-    );
-    assert_contains_all(
-        "a mismatched reference is refused",
-        &refused,
-        &["mismatch", "java.lang.String"],
-    );
+    let refused = server
+        .call("debug.set_value", serde_json::json!({"target": "order.customer", "value": "order.status"}));
+    assert_contains_all("a mismatched reference is refused", &refused, &["mismatch", "java.lang.String"]);
 
     // Literals still work unchanged.
     server.call("debug.set_value", serde_json::json!({"target": "order.status", "value": "\"DONE\""}));
@@ -3374,7 +3411,11 @@ fn read_only_refuses_mutation_but_allows_reads() {
     // Reads that need no invocation still work.
     assert_contains_all("a field read still works", &server.evaluate("order.status"), &["\"OPEN\""]);
     assert_contains_all("an array index still works", &server.evaluate("order.numbers[2]"), &["(int) 3"]);
-    assert_contains_all("get_stack still works", &server.call("debug.get_stack", serde_json::json!({})), &["inspect"]);
+    assert_contains_all(
+        "get_stack still works",
+        &server.call("debug.get_stack", serde_json::json!({})),
+        &["inspect"],
+    );
 
     // Mutations and invocation are refused.
     assert_contains_all(
@@ -3397,10 +3438,6 @@ fn read_only_refuses_mutation_but_allows_reads() {
 
     server.panic_reset();
 }
-
-
-
-
 
 /// SAFE-7: JDWP counts suspends, so a second suspend needs a second resume. `debug.pause` is therefore
 /// idempotent, and `debug.continue` clears whatever depth exists — otherwise "pause twice" needed two
@@ -3427,9 +3464,7 @@ fn pause_is_idempotent_and_continue_clears_any_suspend_depth() {
 
     // ONE continue must be enough. Before the fix the probe sat at 0 ticks here.
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 3))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 3)).is_some(),
         "one debug.continue did not resume the VM after two pauses — suspends stacked up\n  output: {:?}",
         probe.output(),
     );
@@ -3448,11 +3483,10 @@ fn pausing_at_a_breakpoint_keeps_the_disarm_target() {
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
     let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
-    let set = server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
+    let set =
+        server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
     let bp_id = grab_token(&set, "bp_").expect("no bp id");
-    server
-        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
-        .expect("breakpoint never fired");
+    server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).expect("breakpoint never fired");
 
     // Pause while already suspended at the breakpoint. This is the call that used to clobber the cause.
     server.call("debug.pause", serde_json::json!({}));
@@ -3461,9 +3495,7 @@ fn pausing_at_a_breakpoint_keeps_the_disarm_target() {
     // The watchdog must still disarm the breakpoint (not just resume), and the VM must STAY running —
     // a lost disarm shows up as the probe re-freezing within ~150ms of the resume.
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at))
-            .is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at)).is_some(),
         "the VM was never resumed\n  output: {:?}",
         probe.output(),
     );
@@ -3506,12 +3538,15 @@ fn rearming_reresolves_by_name_and_reports_a_missing_class() {
     // Disable then re-arm: the re-arm must re-resolve WatchProbe.counter by name and fire again.
     server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": watch_id, "enabled": false}));
     server.call("debug.get_traces", serde_json::json!({"clear": true}));
-    let on = server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": watch_id, "enabled": true}));
+    let on = server
+        .call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": watch_id, "enabled": true}));
     assert_contains_all("re-armed by name", &on, &["Re-armed", "WatchProbe.counter"]);
     assert!(
         (0..40).any(|_| {
             let got = count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))) > 0;
-            if !got { std::thread::sleep(std::time::Duration::from_millis(100)); }
+            if !got {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             got
         }),
         "the re-armed watchpoint never fired — re-resolution by name failed"
@@ -3519,10 +3554,8 @@ fn rearming_reresolves_by_name_and_reports_a_missing_class() {
 
     // A deferred breakpoint's class never loads; arming it is fine, but its class genuinely isn't there,
     // which is the state BP-4 says must be reported rather than guessed at.
-    let deferred = server.call(
-        "debug.set_line_stop",
-        serde_json::json!({"class_pattern": "com.example.GoneAway", "line": 3}),
-    );
+    let deferred = server
+        .call("debug.set_line_stop", serde_json::json!({"class_pattern": "com.example.GoneAway", "line": 3}));
     assert_contains_all("still deferred", &deferred, &["Deferred"]);
 
     server.panic_reset();
@@ -3584,13 +3617,8 @@ enum Resume {
 }
 
 impl Freeze {
-    const ALL: [Self; 5] = [
-        Self::Breakpoint,
-        Self::Pause,
-        Self::BreakpointThenPause,
-        Self::BreakpointDrained,
-        Self::Step,
-    ];
+    const ALL: [Self; 5] =
+        [Self::Breakpoint, Self::Pause, Self::BreakpointThenPause, Self::BreakpointDrained, Self::Step];
 }
 
 /// Drive one (freeze, resume) pair and assert the invariant. Panics with the offending combination
@@ -3600,8 +3628,7 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
     // broken `continue`/`panic` and the test would pass on someone else's work.
     let watchdog = if matches!(resume, Resume::Watchdog) { "1" } else { "0" };
     let probe = Probe::launch(jdk, "WatchProbe").expect("launch WatchProbe");
-    let mut server =
-        Server::start_with_env(&[("JDWP_WATCHDOG_SECS", watchdog)]).expect("start server");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", watchdog)]).expect("start server");
     server.attach(probe.port);
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
@@ -3654,9 +3681,8 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
     };
 
     // --- the invariant ---
-    let advanced = probe
-        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 2))
-        .is_some();
+    let advanced =
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 2)).is_some();
 
     // Whatever the path says about itself, gathered after the fact: `continue`/`panic` answer inline,
     // the watchdog leaves its note on `list_stop_points` / `get_last_event`. After a disconnect there is
@@ -3664,7 +3690,8 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
     let said = if matches!(resume, Resume::Disconnect) {
         reply
     } else {
-        format!("{reply}\n{}\n{}",
+        format!(
+            "{reply}\n{}\n{}",
             server.call("debug.list_stop_points", serde_json::json!({})),
             server.last_event(),
         )
@@ -3848,7 +3875,9 @@ fn rearming_survives_a_classloader_reload() {
     assert!(
         (0..40).any(|_| {
             let got = count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))) > 0;
-            if !got { std::thread::sleep(std::time::Duration::from_millis(100)); }
+            if !got {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             got
         }),
         "the watchpoint never fired before the reload"
@@ -3864,7 +3893,8 @@ fn rearming_survives_a_classloader_reload() {
     // Re-arm. The stored (declaringType, fieldId) pair now refers to a discarded type; only a by-name
     // re-resolve can find the live one.
     server.call("debug.get_traces", serde_json::json!({"clear": true}));
-    let on = server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": watch_id, "enabled": true}));
+    let on = server
+        .call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": watch_id, "enabled": true}));
     assert!(
         on.contains("Re-armed") || on.contains("not loaded any more"),
         "a re-arm after a reload must either succeed or say the class is gone — got: {on}"
@@ -3877,7 +3907,9 @@ fn rearming_survives_a_classloader_reload() {
         assert!(
             (0..60).any(|_| {
                 let got = count_trace_records(&server.call("debug.get_traces", serde_json::json!({}))) > 0;
-                if !got { std::thread::sleep(std::time::Duration::from_millis(100)); }
+                if !got {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
                 got
             }),
             "the re-armed watchpoint reported success but never fired against the reloaded class — \
@@ -3888,9 +3920,7 @@ fn rearming_survives_a_classloader_reload() {
     // Whatever happened to the watchpoint, the debuggee must still be running.
     let now = probe.output().iter().filter(|l| l.starts_with("tick ")).count();
     assert!(
-        probe
-            .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick "))
-            .is_some() && now > 0,
+        probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick ")).is_some() && now > 0,
         "the probe stopped running during the reload test"
     );
 
@@ -3915,7 +3945,8 @@ fn list_classes_finds_loaded_types_and_bounds_the_answer() {
     assert!(!mine.contains("LEvalProbe"), "signatures must be decoded, not raw JNI: {mine}");
 
     // A prefix anchors at the start, so it must not behave as a substring.
-    let prefixed = server.call("debug.list_classes", serde_json::json!({"filter": "java.util.*", "limit": 200}));
+    let prefixed =
+        server.call("debug.list_classes", serde_json::json!({"filter": "java.util.*", "limit": 200}));
     assert!(prefixed.contains("java.util."), "prefix filter found nothing: {prefixed}");
     for line in prefixed.lines().skip(1).filter(|l| !l.starts_with('…')) {
         assert!(
@@ -3931,10 +3962,8 @@ fn list_classes_finds_loaded_types_and_bounds_the_answer() {
     // Arrays are excluded by default and available on request.
     let no_arrays = server.call("debug.list_classes", serde_json::json!({"filter": "*[]"}));
     assert!(no_arrays.starts_with("0/0 "), "arrays must be excluded by default: {no_arrays}");
-    let arrays = server.call(
-        "debug.list_classes",
-        serde_json::json!({"filter": "*[]", "include_arrays": true, "limit": 5}),
-    );
+    let arrays = server
+        .call("debug.list_classes", serde_json::json!({"filter": "*[]", "include_arrays": true, "limit": 5}));
     assert!(arrays.contains("[]"), "include_arrays must surface array types: {arrays}");
 
     // Nothing matched must not read as "no such class" — the JVM only knows what it has loaded. Three
@@ -3993,11 +4022,15 @@ fn eval_probe_running(jdk: &Jdk) -> Probe {
 fn disc2_method_listing(server: &mut Server) -> Vec<String> {
     let m = server.call("debug.list_methods", serde_json::json!({"class_name": "EvalProbe", "limit": 100}));
     // Primitives, arrays and void all render as Java source types.
-    assert_contains_all("rendered signatures", &m, &[
-        "static int twice(int)",
-        "static java.lang.String greet(java.lang.String)",
-        "static void main(java.lang.String[])",
-    ]);
+    assert_contains_all(
+        "rendered signatures",
+        &m,
+        &[
+            "static int twice(int)",
+            "static java.lang.String greet(java.lang.String)",
+            "static void main(java.lang.String[])",
+        ],
+    );
     assert!(!m.contains("(I)"), "raw JVM descriptors must not leak into the listing: {m}");
 
     // Every overload appears — comparing their parameter lists side by side is the point.
@@ -4007,10 +4040,8 @@ fn disc2_method_listing(server: &mut Server) -> Vec<String> {
     // The static initialiser is not callable and not breakable, so it is not listed.
     assert!(!m.contains("<clinit>"), "<clinit> is noise and should be omitted: {m}");
 
-    let twice = server.call(
-        "debug.list_methods",
-        serde_json::json!({"class_name": "EvalProbe", "name_filter": "twice"}),
-    );
+    let twice = server
+        .call("debug.list_methods", serde_json::json!({"class_name": "EvalProbe", "name_filter": "twice"}));
     assert_contains_all("name_filter", &twice, &["twice(int)", "name~\"twice\""]);
     assert!(!twice.contains("greet"), "name_filter must exclude non-matches: {twice}");
 
@@ -4025,10 +4056,8 @@ fn disc2_method_listing(server: &mut Server) -> Vec<String> {
 
     // "Not loaded" and "no such class" are indistinguishable over JDWP, so the reply must say that
     // rather than pick one — and point at the tool that can tell them apart.
-    let missing = server.call(
-        "debug.list_methods",
-        serde_json::json!({"class_name": "com.example.NoSuchThing"}),
-    );
+    let missing =
+        server.call("debug.list_methods", serde_json::json!({"class_name": "com.example.NoSuchThing"}));
     assert_contains_all("unloaded class", &missing, &["is not loaded", "debug.list_classes"]);
 
     vec![m, twice, own, chain, missing]
@@ -4077,8 +4106,7 @@ fn a_recorded_session_replays_with_the_probe_stopped_and_says_the_same_thing() {
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_method_exit_arming_is_recorded_for_the_cassette_that_gets_edited() {
-    let Some(jdk) = jdk_or_skip("a_method_exit_arming_is_recorded_for_the_cassette_that_gets_edited")
-    else {
+    let Some(jdk) = jdk_or_skip("a_method_exit_arming_is_recorded_for_the_cassette_that_gets_edited") else {
         return;
     };
     let tape = record_replay_and_compare(&jdk, MEXIT_CASSETTE, arm_a_traced_method_exit);
@@ -4102,10 +4130,7 @@ fn arm_a_traced_method_exit(server: &mut Server) -> Vec<String> {
     // The control for the hand-edited cassette below. Every JVM this suite can reach speaks JDWP 1.11 or
     // later, so the degraded arming must NOT appear here — otherwise the edited cassette would be proving
     // nothing about the edit.
-    assert!(
-        !armed.contains("JDWP < 1.6"),
-        "a modern JVM must arm METHOD_EXIT_WITH_RETURN_VALUE: {armed}"
-    );
+    assert!(!armed.contains("JDWP < 1.6"), "a modern JVM must arm METHOD_EXIT_WITH_RETURN_VALUE: {armed}");
     vec![armed]
 }
 
@@ -4136,12 +4161,11 @@ fn a_method_exit_armed_against_a_jdwp_1_5_vm_degrades_to_the_return_site_and_say
         server.attach(replay.port);
         arm_a_traced_method_exit_on_an_old_vm(&mut server)
     };
-    assert_contains_all("degraded arming", &armed, &[
-        "mexit_",
-        "JDWP < 1.6",
-        "Degraded to a plain MethodExit",
-        "return site",
-    ]);
+    assert_contains_all(
+        "degraded arming",
+        &armed,
+        &["mexit_", "JDWP < 1.6", "Degraded to a plain MethodExit", "return site"],
+    );
     replay.assert_no_misses();
 }
 
@@ -4166,8 +4190,8 @@ fn arm_a_traced_method_exit_on_an_old_vm(server: &mut Server) -> String {
 fn every_checked_in_cassette_round_trips_through_the_writer() {
     for name in [DISC2_CASSETTE, MEXIT_CASSETTE, JDWP15_CASSETTE] {
         let path = cassette_path(name);
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let tape = Cassette::load(&path).unwrap_or_else(|e| panic!("{e}"));
         assert!(!tape.is_empty(), "{name} has no exchanges on it");
         assert_eq!(
@@ -4183,11 +4207,7 @@ fn every_checked_in_cassette_round_trips_through_the_writer() {
 /// **killed**, and insist the two agree reply for reply.
 ///
 /// Returns the cassette, and writes it over the checked-in fixture when `JDWP_RERECORD_CASSETTES` is set.
-fn record_replay_and_compare(
-    jdk: &Jdk,
-    name: &str,
-    body: fn(&mut Server) -> Vec<String>,
-) -> Cassette {
+fn record_replay_and_compare(jdk: &Jdk, name: &str, body: fn(&mut Server) -> Vec<String>) -> Cassette {
     let probe = eval_probe_running(jdk);
     let recorder = CassetteRecorder::start(probe.port).expect("start cassette recorder");
 
@@ -4351,28 +4371,22 @@ fn source_reports_the_compiled_from_file_and_reads_a_window_from_a_root() {
     let bp1 = probe_line(&source, "// BP1");
 
     // --- the JVM half, with the disk half switched off for this call ---
-    let jvm_only = server.call(
-        "debug.source",
-        serde_json::json!({"class_name": "EvalProbe", "source_roots": []}),
+    let jvm_only =
+        server.call("debug.source", serde_json::json!({"class_name": "EvalProbe", "source_roots": []}));
+    assert_contains_all(
+        "JVM-reported source file",
+        &jvm_only,
+        &["EvalProbe.java", "reported by the JVM", "No source roots are configured"],
     );
-    assert_contains_all("JVM-reported source file", &jvm_only, &[
-        "EvalProbe.java",
-        "reported by the JVM",
-        "No source roots are configured",
-    ]);
     assert!(!jvm_only.contains("// BP1"), "an empty root list must read no file at all: {jvm_only}");
     // A JDK class proves the command rather than our probe's build: nothing local could supply this.
-    let jdk_class = server.call(
-        "debug.source",
-        serde_json::json!({"class_name": "java.lang.String", "source_roots": []}),
-    );
+    let jdk_class = server
+        .call("debug.source", serde_json::json!({"class_name": "java.lang.String", "source_roots": []}));
     assert!(jdk_class.contains("String.java"), "SourceFile for a JDK class: {jdk_class}");
 
     // --- a bounded window around a line, numbered ---
-    let window = server.call(
-        "debug.source",
-        serde_json::json!({"class_name": "EvalProbe", "line": bp1, "context": 2}),
-    );
+    let window = server
+        .call("debug.source", serde_json::json!({"class_name": "EvalProbe", "line": bp1, "context": 2}));
     let span = format!("lines {}-{} of {total}", bp1 - 2, bp1 + 2);
     let numbered = format!("{bp1} | ");
     assert_contains_all("line window", &window, &["// BP1", &span, &numbered]);
@@ -4384,10 +4398,8 @@ fn source_reports_the_compiled_from_file_and_reads_a_window_from_a_root() {
     assert!(window.contains("line(s) shown"), "a partial view must say so: {window}");
 
     // --- whole_file is possible, and capped loudly rather than silently ---
-    let whole = server.call(
-        "debug.source",
-        serde_json::json!({"class_name": "EvalProbe", "whole_file": true}),
-    );
+    let whole =
+        server.call("debug.source", serde_json::json!({"class_name": "EvalProbe", "whole_file": true}));
     let all = format!("lines 1-{total} of {total}");
     assert_contains_all("whole file", &whole, &[&all, "public static void main"]);
     let capped = server.call(
@@ -4426,18 +4438,16 @@ fn source_reports_the_compiled_from_file_and_reads_a_window_from_a_root() {
             "source_roots": [env!("CARGO_MANIFEST_DIR")],
         }),
     );
-    assert_contains_all("no root holds it", &elsewhere, &[
-        "reported by the JVM",
-        "Not found on disk",
-        "Searched 1 root",
-    ]);
+    assert_contains_all(
+        "no root holds it",
+        &elsewhere,
+        &["reported by the JVM", "Not found on disk", "Searched 1 root"],
+    );
 
     // A line past the end of the file is source DRIFT, not an error — and telling the caller which it
     // is only works because the JVM's answer and the local file arrive in the same reply.
-    let stale = server.call(
-        "debug.source",
-        serde_json::json!({"class_name": "EvalProbe", "line": total + 500}),
-    );
+    let stale =
+        server.call("debug.source", serde_json::json!({"class_name": "EvalProbe", "line": total + 500}));
     assert_contains_all("stale line number", &stale, &["past the end", "does not match the running build"]);
 }
 
@@ -4456,8 +4466,7 @@ fn source_reports_the_compiled_from_file_and_reads_a_window_from_a_root() {
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn source_says_when_a_loaded_class_carries_no_source_file_attribute() {
-    let Some(jdk) = jdk_or_skip("source_says_when_a_loaded_class_carries_no_source_file_attribute")
-    else {
+    let Some(jdk) = jdk_or_skip("source_says_when_a_loaded_class_carries_no_source_file_attribute") else {
         return;
     };
     let probe = Probe::launch_stripped(&jdk, "StrippedProbe").expect("launch StrippedProbe");
@@ -4469,15 +4478,13 @@ fn source_says_when_a_loaded_class_carries_no_source_file_attribute() {
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
 
-    let stripped = server.call(
-        "debug.source",
-        serde_json::json!({"class_name": "StrippedProbe", "source_roots": []}),
+    let stripped =
+        server.call("debug.source", serde_json::json!({"class_name": "StrippedProbe", "source_roots": []}));
+    assert_contains_all(
+        "no SourceFile attribute",
+        &stripped,
+        &["NO source file", "-g:none", "debug.list_methods"],
     );
-    assert_contains_all("no SourceFile attribute", &stripped, &[
-        "NO source file",
-        "-g:none",
-        "debug.list_methods",
-    ]);
     // Not the unloaded answer. The class is right there and the attribute is what is missing, so a reply
     // saying "not loaded" would send someone hunting a classpath problem that does not exist.
     assert!(!stripped.contains("is not loaded"), "ABSENT_INFORMATION is not 'not loaded': {stripped}");
@@ -4487,11 +4494,13 @@ fn source_says_when_a_loaded_class_carries_no_source_file_attribute() {
     // Control, same session and same connection: a class that DID keep the attribute still answers.
     // Without it this test would also pass with `SourceFile` broken outright, or with every reply an
     // error the assertions happened to match — the green-run-of-nothing shape this repo keeps finding.
-    let jdk_class = server.call(
-        "debug.source",
-        serde_json::json!({"class_name": "java.lang.String", "source_roots": []}),
+    let jdk_class = server
+        .call("debug.source", serde_json::json!({"class_name": "java.lang.String", "source_roots": []}));
+    assert_contains_all(
+        "a class that kept its attribute",
+        &jdk_class,
+        &["String.java", "reported by the JVM"],
     );
-    assert_contains_all("a class that kept its attribute", &jdk_class, &["String.java", "reported by the JVM"]);
 
     // The one that would be easy to get wrong, and quietly: `StrippedProbe.java` is sitting in
     // `examples/probes`, so a resolver that derived a file name from the CLASS name would find it and
@@ -4526,8 +4535,7 @@ fn source_says_when_a_loaded_class_carries_no_source_file_attribute() {
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn source_reports_the_smap_when_the_class_was_translated_from_another_file() {
-    let Some(jdk) =
-        jdk_or_skip("source_reports_the_smap_when_the_class_was_translated_from_another_file")
+    let Some(jdk) = jdk_or_skip("source_reports_the_smap_when_the_class_was_translated_from_another_file")
     else {
         return;
     };
@@ -4541,17 +4549,13 @@ fn source_reports_the_smap_when_the_class_was_translated_from_another_file() {
 
     // Needs no local file: the SMAP travels in the class, so this half answers on a box holding no
     // source at all — which is the half that matters when the question is what the deployed thing is.
-    let translated = server.call(
-        "debug.source",
-        serde_json::json!({"class_name": "SmapProbe", "source_roots": []}),
+    let translated =
+        server.call("debug.source", serde_json::json!({"class_name": "SmapProbe", "source_roots": []}));
+    assert_contains_all(
+        "SMAP present",
+        &translated,
+        &["SmapProbe.java", "JSR-45 SMAP) present", "is the intermediate", "hello.jsp", "*S JSP"],
     );
-    assert_contains_all("SMAP present", &translated, &[
-        "SmapProbe.java",
-        "JSR-45 SMAP) present",
-        "is the intermediate",
-        "hello.jsp",
-        "*S JSP",
-    ]);
     // The whole attribute came back, not just a header that happened to match: `*L` and a line-section
     // entry are the last bytes of the fixture, so their arrival proves the length field was right too.
     assert_contains_all("the whole SMAP round-tripped", &translated, &["*L", "1#1,3:24", "*E"]);
@@ -4559,10 +4563,8 @@ fn source_reports_the_smap_when_the_class_was_translated_from_another_file() {
     // The control: same file, same compile, no attribute. `debug.source` must say nothing about an SMAP
     // for it — an unconditional banner would be worse than none, since it would teach the reader to
     // ignore the one case where the `.java` really is not what anyone wrote.
-    let plain = server.call(
-        "debug.source",
-        serde_json::json!({"class_name": "Neighbour", "source_roots": []}),
-    );
+    let plain =
+        server.call("debug.source", serde_json::json!({"class_name": "Neighbour", "source_roots": []}));
     assert_contains_all("the unpatched neighbour", &plain, &["SmapProbe.java", "reported by the JVM"]);
     assert!(
         !plain.contains("SMAP") && !plain.contains("hello.jsp"),
@@ -4583,11 +4585,11 @@ fn source_reports_the_smap_when_the_class_was_translated_from_another_file() {
             "source_roots": [root.to_string_lossy()],
         }),
     );
-    assert_contains_all("labelled intermediate, still read", &both, &[
-        "is the intermediate",
-        "hello.jsp",
-        "public class SmapProbe",
-    ]);
+    assert_contains_all(
+        "labelled intermediate, still read",
+        &both,
+        &["is the intermediate", "hello.jsp", "public class SmapProbe"],
+    );
 }
 
 /// `retired=<n>` from a `ChurnProbe` heartbeat — how many workers have finished so far.
@@ -4643,17 +4645,16 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
     // which is what it costs against an instance one hop away: the debuggee is unchanged and only the
     // wire is slower, exactly as in ADR-0011's measurements. Declared before the server so it outlives
     // it.
-    let relay =
-        LatencyRelay::start(probe.port, std::time::Duration::from_millis(2)).expect("start relay");
+    let relay = LatencyRelay::start(probe.port, std::time::Duration::from_millis(2)).expect("start relay");
     let mut server = Server::start().expect("start server");
     server.attach(relay.port);
 
     // A whole generation of workers must have turned over before anything is asserted: at
     // `SLOTS / LIFE_MS` a first tick can arrive before any churn worker has retired at all, and a dump
     // taken then would be a dump of a perfectly stable JVM.
-    probe
-        .wait_for_line(EVENT_TIMEOUT, |l| churn_retired(l).is_some_and(|n| n >= 48))
-        .unwrap_or_else(|| panic!("the pool never retired a full generation\n  output: {:?}", probe.output()));
+    probe.wait_for_line(EVENT_TIMEOUT, |l| churn_retired(l).is_some_and(|n| n >= 48)).unwrap_or_else(|| {
+        panic!("the pool never retired a full generation\n  output: {:?}", probe.output())
+    });
 
     // `limit` is deliberately an order of magnitude above the thread count. It matters later: whatever
     // the dump ends up withholding, the caller's limit is provably not the reason.
@@ -4678,7 +4679,8 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
         assert!(read <= total, "a dump cannot read more threads than the JVM listed:\n{}", head_of(&dump));
         let stable = dump.lines().filter(|l| l.contains("\"stable-worker-")).count();
         assert_eq!(
-            stable, 8,
+            stable,
+            8,
             "the eight non-churning workers must be in every dump — they are the fixed point that makes \
              the rest of this test about churn rather than about noise:\n{}",
             head_of(&dump)
@@ -4712,8 +4714,8 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
         "the thread that vanished is still named, not reduced to a bare id: {row}"
     );
     let name = row.split('"').nth(1).unwrap_or_default().to_string();
-    let section = dump_section(&reported, &name)
-        .unwrap_or_else(|| panic!("no section for {name} in:\n{reported}"));
+    let section =
+        dump_section(&reported, &name).unwrap_or_else(|| panic!("no section for {name} in:\n{reported}"));
     // FINDING, pinned. The JVM has just answered ZOMBIE — this thread is *finished* — and the same row
     // explains its unreadable stack as "running", then advises `suspend:true`, which cannot help: a
     // finished thread will never be suspendable. The `!suspended` branch phrases every unreadable stack
@@ -4759,10 +4761,8 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
     // dump. What is asserted here is coherence — every row it printed that is still a thread is one it
     // was actually holding — plus a real stack off the stable half and a VM that is running afterwards.
     let base = highest_tick(&probe).expect("no tick to count from");
-    let frozen = server.call(
-        "debug.thread_dump",
-        serde_json::json!({"limit": 500, "suspend": true, "max_frames": 4}),
-    );
+    let frozen =
+        server.call("debug.thread_dump", serde_json::json!({"limit": 500, "suspend": true, "max_frames": 4}));
     assert_contains_all(
         "a suspending dump of a churning pool completes and resumes it",
         &frozen,
@@ -4832,9 +4832,9 @@ fn a_default_dump_reaches_a_pool_the_debuggee_started_last() {
 
     // A full generation must have turned over first — the stable eight are started only after all 48
     // churn slots have been staggered, so a dump taken before that would be a dump of half a probe.
-    probe
-        .wait_for_line(EVENT_TIMEOUT, |l| churn_retired(l).is_some_and(|n| n >= 48))
-        .unwrap_or_else(|| panic!("the pool never retired a full generation\n  output: {:?}", probe.output()));
+    probe.wait_for_line(EVENT_TIMEOUT, |l| churn_retired(l).is_some_and(|n| n >= 48)).unwrap_or_else(|| {
+        panic!("the pool never retired a full generation\n  output: {:?}", probe.output())
+    });
 
     // --- the reading itself: DEFAULT arguments, which is the whole point ---
     let dump = server.call("debug.thread_dump", serde_json::json!({}));
@@ -4848,7 +4848,8 @@ fn a_default_dump_reaches_a_pool_the_debuggee_started_last() {
     );
     let stable = dump.lines().filter(|l| l.contains("\"stable-worker-")).count();
     assert_eq!(
-        stable, 8,
+        stable,
+        8,
         "a default dump reached {stable} of the 8 threads this debuggee started LAST. That is the WildFly \
          reading (#43): 40 slots spent on the least interesting end of the list because `AllThreads` is \
          creation order.\n{}",
@@ -4910,10 +4911,7 @@ fn a_default_dump_reaches_a_pool_the_debuggee_started_last() {
     // regardless of the deadline, this dump would hold the VM for as long as it took to name 60 threads
     // while claiming a 1ms budget — the widened read paying for itself out of somebody else's instance.
     let base = highest_tick(&probe).expect("no tick to count from");
-    let starved = server.call(
-        "debug.thread_dump",
-        serde_json::json!({"suspend": true, "max_suspend_ms": 1}),
-    );
+    let starved = server.call("debug.thread_dump", serde_json::json!({"suspend": true, "max_suspend_ms": 1}));
     assert_contains_all(
         "the selection pass is inside the budget, not before it",
         &starved,
@@ -4988,10 +4986,8 @@ fn a_contended_lock_names_its_real_holder_out_of_four() {
 
     // monitors_only: the lock graph is the entire question here, and 52 stacks would be another test's
     // worth of suspension for nothing this one reads.
-    let dump = server.call(
-        "debug.thread_dump",
-        serde_json::json!({"limit": 200, "suspend": true, "monitors_only": true}),
-    );
+    let dump = server
+        .call("debug.thread_dump", serde_json::json!({"limit": 200, "suspend": true, "monitors_only": true}));
     assert_contains_all("the dump completed and resumed the VM", &dump, &["verified running", "Cost:"]);
 
     // The premise, checked before anything is concluded from it. If the contention had not formed, every
@@ -5003,9 +4999,11 @@ fn a_contended_lock_names_its_real_holder_out_of_four() {
     // `System.out`'s monitor to print its heartbeat is enough. Scoping to `ContendedProbe$Lock` keeps the
     // count exact where exactness means something (all 48 waiters really are queued on the four locks
     // under test) without asserting anything about monitors that are not this test's business.
-    let waiting = dump.lines().filter(|l| l.contains("waiting to enter:")).filter(|l| l.contains(PROBE_LOCK)).count();
+    let waiting =
+        dump.lines().filter(|l| l.contains("waiting to enter:")).filter(|l| l.contains(PROBE_LOCK)).count();
     assert_eq!(
-        waiting, 48,
+        waiting,
+        48,
         "this test is about contention at scale, so all 48 waiters must be queued on the probe's own \
          four locks in the dump it reads:\n{}",
         head_of(&dump)
@@ -5206,10 +5204,12 @@ fn synthetic_frames_render_with_names_a_reader_can_act_on() {
     // than package structure. That is the invariant, and it is what is asserted.
     let mut rendered: Vec<&str> = Vec::new();
     for line in &hidden {
-        let named = line.split_once(".run")
-            .unwrap_or_else(|| panic!("a hidden-class frame is a call to its generated `run`: {line}")).0;
-        let class = named.split_once(' ')
-            .unwrap_or_else(|| panic!("a frame line starts with `#N `: {line}")).1;
+        let named = line
+            .split_once(".run")
+            .unwrap_or_else(|| panic!("a hidden-class frame is a call to its generated `run`: {line}"))
+            .0;
+        let class =
+            named.split_once(' ').unwrap_or_else(|| panic!("a frame line starts with `#N `: {line}")).1;
         let (owner, assigned) = class.rsplit_once('/').unwrap_or_else(|| {
             panic!(
                 "a hidden class is named `<class>/<suffix the JVM assigned>` and the `/` must survive \
@@ -5284,10 +5284,8 @@ fn synthetic_frames_render_with_names_a_reader_can_act_on() {
 
     // The dump renders frames through the same decoder, so the two views must not disagree — a caller who
     // reads one and pastes into the other has to get the same class.
-    let dump = server.call(
-        "debug.thread_dump",
-        serde_json::json!({"name_filter": "synthetic-worker", "max_frames": 20}),
-    );
+    let dump = server
+        .call("debug.thread_dump", serde_json::json!({"name_filter": "synthetic-worker", "max_frames": 20}));
     // Compared against the exact name `get_stack` printed, rather than a spelling written in here — same
     // reason as the round trip above, and it asserts more: not "both look mangled" but "both produced the
     // identical string", which is what a caller moving between the two views actually depends on.
@@ -5345,18 +5343,13 @@ fn every_primitive_and_its_array_renders_the_same_as_local_field_and_element() {
 
     let source = probe_source("PrimitiveProbe");
     let line = probe_line(&source, "// BP1");
-    server.call(
-        "debug.set_line_stop",
-        serde_json::json!({"class_pattern": "PrimitiveProbe", "line": line}),
-    );
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "PrimitiveProbe", "line": line}));
     server
         .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
         .unwrap_or_else(|| panic!("the breakpoint in PrimitiveProbe.work never fired"));
 
-    let stack = server.call(
-        "debug.get_stack",
-        serde_json::json!({"max_frames": 1, "include_variables": true}),
-    );
+    let stack =
+        server.call("debug.get_stack", serde_json::json!({"max_frames": 1, "include_variables": true}));
 
     // `(local name, static field, instance field, rendered value)` — the same eight values reached three
     // ways. Reading all three and comparing them is the point: they are three different resolution paths
@@ -5424,19 +5417,15 @@ fn every_primitive_and_its_array_renders_the_same_as_local_field_and_element() {
 
     // The other route into `Value::format`: the type-mismatch message renders the value that was refused.
     // Both object shapes go through it, and neither is reachable from an array of primitives.
-    let null_into_int = server.call(
-        "debug.set_value",
-        serde_json::json!({"target": "PrimitiveProbe.sInt", "value": "null"}),
-    );
+    let null_into_int =
+        server.call("debug.set_value", serde_json::json!({"target": "PrimitiveProbe.sInt", "value": "null"}));
     assert_contains_all(
         "null refused for an int, showing what was refused",
         &null_into_int,
         &["is declared int", "(object) null", "not assignable"],
     );
-    let string_into_int = server.call(
-        "debug.set_value",
-        serde_json::json!({"target": "PrimitiveProbe.sInt", "value": "\"nope\""}),
-    );
+    let string_into_int = server
+        .call("debug.set_value", serde_json::json!({"target": "PrimitiveProbe.sInt", "value": "\"nope\""}));
     assert_contains_all(
         "a reference refused for an int, showing its id",
         &string_into_int,

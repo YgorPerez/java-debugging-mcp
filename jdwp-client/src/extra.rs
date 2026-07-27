@@ -1,9 +1,7 @@
 // Additional JDWP commands: single-stepping, clear-all-breakpoints, breakpoint
 // modifiers (count/thread), array access, string creation, and setting frame values.
 
-use crate::commands::{
-    command_sets, event_commands, event_kinds, step_depths, step_sizes, vm_commands,
-};
+use crate::commands::{command_sets, event_commands, event_kinds, step_depths, step_sizes, vm_commands};
 use crate::connection::JdwpConnection;
 use crate::eval::{write_tagged_value, write_untagged_value};
 use crate::eventrequest::SuspendPolicy;
@@ -119,11 +117,8 @@ impl JdwpConnection {
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn clear_all_breakpoints(&mut self) -> JdwpResult<()> {
         let id = self.next_id();
-        let packet = CommandPacket::new(
-            id,
-            command_sets::EVENT_REQUEST,
-            event_commands::CLEAR_ALL_BREAKPOINTS,
-        );
+        let packet =
+            CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR_ALL_BREAKPOINTS);
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
         Ok(())
