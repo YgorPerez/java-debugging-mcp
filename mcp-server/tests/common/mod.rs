@@ -260,6 +260,259 @@ fn pump_delayed(mut from: std::net::TcpStream, mut to: std::net::TcpStream, dela
     });
 }
 
+/// What a [`FaultRelay`] does to a JDWP reply on its way back to the debugger.
+#[derive(Clone, Debug)]
+pub enum Fault {
+    /// Replace the reply with a JDWP error reply carrying this code and no payload — what a JVM sends
+    /// when it cannot answer (`NOT_IMPLEMENTED` 99, `ABSENT_INFORMATION` 101, `INVALID_OBJECT` 20 …).
+    Error(u16),
+    /// Replace the reply's payload with these bytes, recomputing the length header. Used to make the JVM
+    /// *lie* rather than fail: a `SuspendCount` that never reaches zero, a `Version` that claims JDWP 1.5,
+    /// or a payload too short for what the reader expects.
+    Payload(Vec<u8>),
+}
+
+/// A JDWP proxy that rewrites chosen replies, so the debugger can be driven through failures a healthy
+/// `HotSpot` will not produce on demand.
+///
+/// Some of this codebase's most important branches are the ones that report bad news, and several were
+/// unreachable from outside. TODO.md's coverage review names the worst case: `resume_all_fully`'s
+/// "the VM is STILL suspended" tail, which needs a suspend depth above `MAX_RESUME_ATTEMPTS`, and
+/// **cannot be built by any sequence of this tool's own calls** because `debug.pause` is idempotent
+/// (ADR-0003). That branch is the entire point of ADR-0003 — a resume that verifies instead of assuming —
+/// and it had never once executed. Rewriting `ThreadReference.SuspendCount` to a count that never falls
+/// reaches it in one test.
+///
+/// Same seam as [`LatencyRelay`], used differently: sit in the middle of the JDWP stream and change what
+/// arrives. Unlike that one this must **frame** the protocol, because a reply carries only the request id —
+/// which command it answers is known only from the request that went the other way.
+///
+/// Deliberately a second proxy rather than a flag on the first: `LatencyRelay` is a *measuring instrument*
+/// whose numbers are already recorded in ADR-0011, and its chunk-level delay is documented as a lower
+/// bound. Framing it would change what it measures. They converge when cassette recording needs framing
+/// too — a third user is the point to unify, not the second.
+pub struct FaultRelay {
+    /// The port a test attaches to instead of the probe's own.
+    pub port: u16,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    open: Arc<Mutex<Vec<std::net::TcpStream>>>,
+}
+
+/// The JDWP handshake both ends send before any packet framing begins.
+const JDWP_HANDSHAKE: &[u8] = b"JDWP-Handshake";
+
+/// Every JDWP packet starts with length(4) + id(4) + flags(1), then either error(2) or set+cmd(2).
+const JDWP_HEADER: usize = 11;
+
+/// Set in a packet's flags byte when it is a reply rather than a command.
+const JDWP_REPLY_FLAG: u8 = 0x80;
+
+impl FaultRelay {
+    /// Listen on a fresh port, forwarding to `target_port` and applying `faults` — keyed by
+    /// `(command set, command)` — to every reply answering a matching command.
+    pub fn start(target_port: u16, faults: Vec<(u8, u8, Fault)>) -> Result<Self, String> {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("fault relay bind: {e}"))?;
+        let port = listener.local_addr().map_err(|e| format!("fault relay addr: {e}"))?.port();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let open: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let (acc_stop, acc_open) = (Arc::clone(&stop), Arc::clone(&open));
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                if acc_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let Ok(client) = incoming else { return };
+                let Ok(server) = std::net::TcpStream::connect(("127.0.0.1", target_port)) else { return };
+                let _ = client.set_nodelay(true);
+                let _ = server.set_nodelay(true);
+                if let (Ok(c2), Ok(s2)) = (client.try_clone(), server.try_clone()) {
+                    if let Ok(mut v) = acc_open.lock() {
+                        v.push(c2);
+                        v.push(s2);
+                    }
+                }
+                // Which command each id belongs to, learned from the request direction and read by the
+                // reply direction. A reply names no command, so this map is the only way to key a fault.
+                let pending: Arc<Mutex<std::collections::HashMap<u32, (u8, u8)>>> =
+                    Arc::new(Mutex::new(std::collections::HashMap::new()));
+                match (client.try_clone(), server.try_clone()) {
+                    (Ok(c_read), Ok(s_read)) => {
+                        pump_requests(c_read, server, Arc::clone(&pending));
+                        pump_replies(s_read, client, pending, faults.clone());
+                    }
+                    _ => return,
+                }
+            }
+        });
+        Ok(Self { port, stop, open })
+    }
+}
+
+impl Drop for FaultRelay {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(v) = self.open.lock() {
+            for s in v.iter() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+    }
+}
+
+/// Read whole JDWP packets out of `buf`, returning them and leaving any partial tail behind.
+///
+/// Framing is length-prefixed, so a chunk boundary can fall anywhere; a proxy that assumed one read is
+/// one packet would corrupt the stream under load rather than fail visibly.
+fn take_packets(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    // The length is copied out rather than borrowed, so the drain below is free to take the buffer.
+    while let Some(head) = buf.get(..4).and_then(|h| <[u8; 4]>::try_from(h).ok()) {
+        let len = u32::from_be_bytes(head) as usize;
+        // A length below the header size would be a protocol violation; stop rather than loop forever.
+        if len < JDWP_HEADER || buf.len() < len {
+            break;
+        }
+        out.push(buf.drain(..len).collect());
+    }
+    out
+}
+
+/// Forward the handshake, then every request — recording each id's `(set, command)` so replies can be
+/// matched. Requests are never modified: the debugger's own traffic is not what is under test.
+fn pump_requests(
+    mut from: std::net::TcpStream,
+    mut to: std::net::TcpStream,
+    pending: Arc<Mutex<std::collections::HashMap<u32, (u8, u8)>>>,
+) {
+    std::thread::spawn(move || {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; 1 << 16];
+        let mut shaken = false;
+        loop {
+            let n = match std::io::Read::read(&mut from, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+            if !shaken {
+                if buf.len() < JDWP_HANDSHAKE.len() {
+                    continue;
+                }
+                let shake: Vec<u8> = buf.drain(..JDWP_HANDSHAKE.len()).collect();
+                if std::io::Write::write_all(&mut to, &shake).is_err() {
+                    break;
+                }
+                shaken = true;
+            }
+            for pkt in take_packets(&mut buf) {
+                if let (Some(id), Some(flags), Some(set), Some(cmd)) =
+                    (packet_id(&pkt), pkt.get(8).copied(), pkt.get(9).copied(), pkt.get(10).copied())
+                {
+                    if flags & JDWP_REPLY_FLAG == 0 {
+                        if let Ok(mut m) = pending.lock() {
+                            m.insert(id, (set, cmd));
+                        }
+                    }
+                }
+                if std::io::Write::write_all(&mut to, &pkt).is_err() {
+                    return;
+                }
+            }
+        }
+        let _ = to.shutdown(std::net::Shutdown::Both);
+    });
+}
+
+/// Forward the handshake, then every reply — rewriting the ones whose command matches a fault.
+///
+/// Composite events arrive on this side too and are *command* packets (set 64), not replies; they carry no
+/// id we issued, so they fall through untouched. Faulting them would break the event pump rather than test
+/// it.
+fn pump_replies(
+    mut from: std::net::TcpStream,
+    mut to: std::net::TcpStream,
+    pending: Arc<Mutex<std::collections::HashMap<u32, (u8, u8)>>>,
+    faults: Vec<(u8, u8, Fault)>,
+) {
+    std::thread::spawn(move || {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; 1 << 16];
+        let mut shaken = false;
+        loop {
+            let n = match std::io::Read::read(&mut from, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+            if !shaken {
+                if buf.len() < JDWP_HANDSHAKE.len() {
+                    continue;
+                }
+                let shake: Vec<u8> = buf.drain(..JDWP_HANDSHAKE.len()).collect();
+                if std::io::Write::write_all(&mut to, &shake).is_err() {
+                    break;
+                }
+                shaken = true;
+            }
+            for pkt in take_packets(&mut buf) {
+                let out = faulted(&pkt, &pending, &faults).unwrap_or(pkt);
+                if std::io::Write::write_all(&mut to, &out).is_err() {
+                    return;
+                }
+            }
+        }
+        let _ = to.shutdown(std::net::Shutdown::Both);
+    });
+}
+
+/// The rewritten packet, or `None` to forward the original untouched.
+fn faulted(
+    pkt: &[u8],
+    pending: &Arc<Mutex<std::collections::HashMap<u32, (u8, u8)>>>,
+    faults: &[(u8, u8, Fault)],
+) -> Option<Vec<u8>> {
+    if pkt.get(8).copied()? & JDWP_REPLY_FLAG == 0 {
+        return None; // an event, not a reply to us
+    }
+    let id = packet_id(pkt)?;
+    // Taken, not read: an id is answered once, so leaving it would grow the map for the whole session.
+    let (set, cmd) = pending.lock().ok()?.remove(&id)?;
+    let fault = faults.iter().find(|(s, c, _)| *s == set && *c == cmd).map(|(_, _, f)| f)?;
+    Some(match fault {
+        Fault::Error(code) => reply_packet(id, *code, &[]),
+        Fault::Payload(p) => reply_packet(id, 0, p),
+    })
+}
+
+/// A JDWP reply packet: length, id, the reply flag, an error code, and a payload.
+fn reply_packet(id: u32, error: u16, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(JDWP_HEADER + payload.len()).unwrap_or(u32::MAX);
+    let mut out = Vec::with_capacity(JDWP_HEADER + payload.len());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&id.to_be_bytes());
+    out.push(JDWP_REPLY_FLAG);
+    out.extend_from_slice(&error.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// A packet's request id, from bytes 4..8.
+fn packet_id(pkt: &[u8]) -> Option<u32> {
+    let b = pkt.get(4..8)?;
+    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// A JDWP string as it appears in a reply payload: a 4-byte length then UTF-8 bytes. For hand-building
+/// the payloads a [`Fault::Payload`] substitutes.
+pub fn jdwp_string(s: &str) -> Vec<u8> {
+    let mut out = u32::try_from(s.len()).unwrap_or(0).to_be_bytes().to_vec();
+    out.extend_from_slice(s.as_bytes());
+    out
+}
+
 /// A probe JVM running under JDWP, with its stdout captured.
 ///
 /// Capturing stdout is what lets a test observe the *debuggee's own* behaviour — e.g. that the

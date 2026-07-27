@@ -12,7 +12,10 @@
 
 mod common;
 
-use common::{assert_contains_all, jdk_or_skip, probe_line, probe_source, Jdk, LatencyRelay, Probe, Server, EVENT_TIMEOUT};
+use common::{
+    assert_contains_all, jdk_or_skip, probe_line, probe_source, Fault, FaultRelay, Jdk, LatencyRelay, Probe,
+    Server, EVENT_TIMEOUT,
+};
 
 /// EVAL-1 / EVAL-2: static-method invocation and object arguments, through the real handlers.
 #[test]
@@ -3634,6 +3637,88 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
         // Legitimate but worth seeing in the log: it failed honestly.
         println!("note: {resume:?} from {freeze:?} did not resume, and said so (acceptable)");
     }
+}
+
+/// ADR-0003's honest-failure path, reached at last: a resume that cannot free the VM must SAY so.
+///
+/// This branch is why `resume_all_fully` exists — "resume" and "is it running" are different questions in
+/// JDWP, and a watchdog that reported success on the strength of a command returning OK was the SAFE-7 bug.
+/// It was also the one path TODO.md's coverage review called **unreachable through the tool's own API**:
+/// getting there needs a suspend count that outlives `MAX_RESUME_ATTEMPTS` resumes, and since ADR-0003 made
+/// `debug.pause` idempotent, no sequence of this tool's own calls can build one. So the most important
+/// failure branch in the codebase had never executed, and the tests around it only ever proved the *success*
+/// side.
+///
+/// `FaultRelay` reaches it by making the JVM lie: every `ThreadReference.SuspendCount` reply comes back as 9,
+/// so however many resumes are issued the count never falls. That is exactly the observable shape of the
+/// real hazard — something outside this session holding the VM down — without needing a second debugger.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_resume_that_cannot_free_the_vm_reports_it_instead_of_claiming_success() {
+    let Some(jdk) = jdk_or_skip("a_resume_that_cannot_free_the_vm_reports_it_instead_of_claiming_success")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
+
+    // A count that never reaches zero, whatever we resume. 9 is above MAX_RESUME_ATTEMPTS (8), so the loop
+    // exhausts rather than happening to succeed on its last try.
+    let relay = FaultRelay::start(
+        probe.port,
+        vec![(
+            11, // ThreadReference
+            12, // SuspendCount
+            Fault::Payload(9i32.to_be_bytes().to_vec()),
+        )],
+    )
+    .expect("start fault relay");
+
+    let mut server = Server::start().expect("start server");
+    server.attach(relay.port);
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).is_some(),
+        "probe never ticked, so the relay may not be passing traffic at all\n  output: {:?}",
+        probe.output()
+    );
+
+    // Freeze it on a real breakpoint rather than with `debug.pause`. That is not incidental: the verifying
+    // resume needs a thread to probe the count of, and it only has one after an event has named one — a
+    // bare pause takes the plain `resume_all` path and never asks the question this test is about.
+    let src = probe_source("ExcProbe");
+    let line = probe_line(&src, "// BP2");
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "ExcProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("the breakpoint never fired, so no thread was ever recorded to probe");
+
+    // Every resume path must reach the same verdict: it could not confirm the VM is running, and says so.
+    // `debug.panic` also clears the breakpoint, which is what lets the probe run freely afterwards.
+    for tool in ["debug.continue", "debug.panic"] {
+        let said = server.call(tool, serde_json::json!({}));
+        assert!(
+            said.contains("STILL suspended"),
+            "{tool} must report that the VM is still suspended rather than claiming success — this is the \
+             ADR-0003 invariant, and the reply was:\n{said}"
+        );
+        assert!(
+            said.contains("resume(s)"),
+            "{tool} should say how many resumes it issued, so the caller knows it tried: {said}"
+        );
+        // And it must name the next move rather than leaving the caller with a dead end.
+        assert!(
+            said.contains("debug.continue") || said.contains("debug.panic"),
+            "{tool} should point at what to try next: {said}"
+        );
+    }
+
+    // The lie is confined to the count, so the VM really was resumed underneath — the probe keeps ticking.
+    // Worth asserting: it separates "reported honestly" from "actually broke the debuggee".
+    let base = highest_tick(&probe).unwrap_or(0);
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base)).is_some(),
+        "the probe stopped ticking — the faulted count should not have left the VM frozen\n  output: {:?}",
+        probe.output()
+    );
 }
 
 /// Invariant: `debug.continue` either resumes the VM or says it didn't — from every suspended state.
