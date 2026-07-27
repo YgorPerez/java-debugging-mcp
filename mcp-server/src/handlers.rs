@@ -1204,6 +1204,7 @@ impl RequestHandler {
             wire,
             held,
             unread: dump.unread,
+            selection: &dump.selection,
         };
         Ok(render_thread_dump(&rows, &a, caps.as_ref(), &meta))
     }
@@ -7352,6 +7353,182 @@ struct DumpOutcome {
     rows: Vec<DumpRow>,
     /// Matching threads left unread because the budget expired. `0` means the dump is complete.
     unread: usize,
+    /// How the `limit` was spent, for the header to state (DUMP-3).
+    selection: DumpSelection,
+}
+
+/// How a dump chose which threads to spend its `limit` on, so the reply can say (DUMP-3, #43).
+///
+/// Carried out of the collection rather than recomputed at render time: the rows that survived are not
+/// enough to reconstruct what was passed over, and "what am I NOT seeing" is the question a truncated
+/// dump has to answer. A header that says `40/267 thread(s)` and nothing else reads as a sample.
+struct DumpSelection {
+    /// Threads that passed `name_filter` and were therefore in the running for a slot.
+    eligible: usize,
+    /// Distinct name families among them — the number of independent things the pool is made of.
+    families: usize,
+    /// Per family, how many eligible threads never made it into the dump. Biggest first.
+    withheld: Vec<(String, usize)>,
+}
+
+/// A thread name with every run of digits collapsed to `#` — the shape a pool's threads share.
+///
+/// `default task-17` and `default task-91` become one family; `default I/O-3` stays another. Crude on
+/// purpose: the alternative is a vocabulary of framework thread names, which is guessing at somebody
+/// else's naming convention and goes stale the first time they change it. Numbering the workers is the
+/// one thing every pool in every framework actually does.
+fn thread_name_family(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut in_digits = false;
+    for c in name.chars() {
+        if c.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+            }
+            in_digits = true;
+        } else {
+            in_digits = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The order a dump reads its candidates in: one thread from each name family before a second from any.
+///
+/// Returns indices into `names`, plus how many families there were. Round-robin over the families in
+/// first-appearance order, each family internally still in creation order — so the result is a
+/// deterministic function of the thread list, and a dump taken twice against a still debuggee reads the
+/// same threads.
+///
+/// This is the DUMP-3 fix in one function. Creation order is not an arbitrary slice of a pool, it is a
+/// *biased* one: the JVM's own threads exist first, the container's next, and the request workers a
+/// caller came to look at exist last. Round-robin refuses to let any one family spend the whole `limit`,
+/// which is the only property needed — 40 slots across ~25 families reaches every family, including the
+/// 13-thread one that mattered, instead of being eaten by 16 Undertow selectors and 8 MSC service threads.
+fn family_round_robin(names: &[&str]) -> (Vec<usize>, usize) {
+    let mut families: Vec<Vec<usize>> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, n) in names.iter().enumerate() {
+        let key = thread_name_family(n);
+        if let Some(members) = index.get(&key).and_then(|f| families.get_mut(*f)) {
+            members.push(i);
+        } else {
+            index.insert(key, families.len());
+            families.push(vec![i]);
+        }
+    }
+    let deepest = families.iter().map(Vec::len).max().unwrap_or(0);
+    let mut order = Vec::with_capacity(names.len());
+    for round in 0..deepest {
+        for f in &families {
+            if let Some(i) = f.get(round) {
+                order.push(*i);
+            }
+        }
+    }
+    (order, families.len())
+}
+
+/// A thread that survived the triage pass: where `AllThreads` listed it, its id, and everything the two
+/// cheap per-thread reads already answered.
+///
+/// The creation position is kept because the rows are *rendered* in it. Selection is by family and
+/// presentation is by creation order deliberately — the caller asked "what is this JVM doing", not "what
+/// order did the debugger decide to ask in", and a stable presentation means the only thing DUMP-3
+/// changed about an untruncated dump is nothing at all.
+struct DumpCandidate {
+    seen: usize,
+    tid: u64,
+    name: String,
+    status: &'static str,
+    suspended: bool,
+}
+
+/// Read every thread's name and status before deciding which ones to read *properly* (DUMP-3, #43).
+///
+/// ADR-0008's shape — fetch wide, then truncate deliberately — applied to threads instead of frames. Both
+/// reads are flat single round trips with no per-frame lookups behind them, ~2 packets against the ~8 a
+/// full row costs, and they are the only per-thread data a ranking is allowed to use: #43 rules out
+/// anything needing an *extra* round trip per thread to decide, because that would cost the very thing
+/// the ordering is trying to save.
+///
+/// **Both reads happen here, together, rather than the name here and the status when the row is built.**
+/// Name-only triage is the cheaper shape and it was the first one written — but it puts the whole first
+/// pass between `AllThreads` and every status read, and on a pool that turns over several times a second
+/// that is the difference between a thread that has *died* and one that has died **and been collected**.
+/// TEST-10's churning-pool test caught it immediately: across three runs of twelve dumps it could no
+/// longer observe a single `[zombie]` row, because every thread in the snapshot was already gone by the
+/// time the second pass reached it. Two packets per thread buys data that is about the JVM the caller
+/// asked about. See ADR-0012.
+///
+/// **The pass gets at most half the remaining budget.** A dump that spent its entire suspension window
+/// deciding what to read and then read nothing would be a worse answer than the bug it fixes, and on a
+/// slow wire that is exactly what an unbounded first pass would do. Threads it never reached are returned
+/// as a count, never dropped silently.
+async fn triage_dump_threads(
+    conn: &mut jdwp_client::JdwpConnection,
+    all: &[u64],
+    a: &crate::args::ThreadDumpArgs,
+    name_filter: Option<&str>,
+    deadline: Option<std::time::Instant>,
+) -> (Vec<DumpCandidate>, usize) {
+    let now = std::time::Instant::now();
+    let triage_deadline = deadline.map(|d| now + d.saturating_duration_since(now) / 2);
+    let mut candidates = Vec::new();
+    for (seen, tid) in all.iter().enumerate() {
+        if triage_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return (candidates, all.len() - seen);
+        }
+        let name = conn.get_thread_name(*tid).await.unwrap_or_default();
+        if name_filter.is_some_and(|f| !name.to_lowercase().contains(f)) {
+            continue;
+        }
+        let (status, suspended) = match conn.get_thread_status(*tid).await {
+            Ok((ts, ss)) => (thread_status_name(ts), ss != 0),
+            // A thread that can't report its status has almost certainly died; skip it rather than
+            // showing a row of unknowns.
+            Err(_) => continue,
+        };
+        // Applied here rather than when the row is built, so the `limit` is spent on threads that are
+        // actually readable instead of on slots that turn out empty.
+        if a.only_suspended && !suspended {
+            continue;
+        }
+        candidates.push(DumpCandidate { seen, tid: *tid, name, status, suspended });
+    }
+    (candidates, 0)
+}
+
+/// How many candidates each name family has, before any of them have been printed.
+///
+/// Taken before the read loop rather than after, because that loop *moves* each name into the row it
+/// builds — a thread name is used exactly once, so handing it over beats cloning it per row.
+fn candidates_by_family(candidates: &[DumpCandidate]) -> std::collections::HashMap<String, usize> {
+    let mut tally = std::collections::HashMap::new();
+    for c in candidates {
+        *tally.entry(thread_name_family(&c.name)).or_default() += 1;
+    }
+    tally
+}
+
+/// The tally above minus what actually reached the reply — the "what am I not seeing" answer.
+///
+/// Counted against the candidates rather than against `limit`, so it covers every reason a row is
+/// missing: the limit, and the suspension budget stopping the read pass part way.
+fn withheld_by_family(
+    mut tally: std::collections::HashMap<String, usize>,
+    shown: &[DumpRow],
+) -> Vec<(String, usize)> {
+    for r in shown {
+        if let Some(n) = tally.get_mut(&thread_name_family(&r.name)) {
+            *n = n.saturating_sub(1);
+        }
+    }
+    let mut out: Vec<(String, usize)> = tally.into_iter().filter(|(_, n)| *n > 0).collect();
+    // Biggest group first, ties broken by name so the line is reproducible rather than hash-ordered.
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 /// The reporting context a dump reply needs beyond the rows themselves.
@@ -7377,6 +7554,8 @@ struct DumpMeta<'a> {
     /// one reading a VM someone else already stopped, owns no freeze to report.
     held: Option<std::time::Duration>,
     unread: usize,
+    /// Which threads the `limit` was spent on, and which groups it passed over (DUMP-3).
+    selection: &'a DumpSelection,
 }
 
 /// Read one `DumpRow` per thread, honouring the name/suspended filters and the thread limit.
@@ -7388,6 +7567,14 @@ struct DumpMeta<'a> {
 /// `deadline` bounds the **suspension**, not the call (#17): it is checked between threads, so the loop
 /// stops at a thread boundary rather than leaving a half-read row, and the caller resumes immediately
 /// after. Threads not reached are counted, never silently dropped.
+///
+/// **Two passes, since DUMP-3 (#43).** The first reads the cheap half of every thread's row — its name
+/// and status; the second spends the `limit` on them in `family_round_robin` order and pays for frames
+/// and locks only there. This used to be one pass that stopped at the first `limit` ids `AllThreads`
+/// handed over, and `AllThreads` is creation order — see `family_round_robin` for the `WildFly` reading
+/// that made the difference visible. The extra cost is two packets per thread the dump does not go on to
+/// show, and it is paid **only when the dump is truncated**: when `limit` covers the whole JVM the first
+/// pass reads exactly what the single loop used to read, thread for thread.
 async fn collect_dump_rows(
     conn: &mut jdwp_client::JdwpConnection,
     all: &[u64],
@@ -7403,7 +7590,18 @@ async fn collect_dump_rows(
     let want_monitors = a.monitors
         && caps.is_some_and(|c| c.can_get_owned_monitor_info || c.can_get_current_contended_monitor);
 
-    let mut rows = Vec::new();
+    let (mut candidates, untriaged) =
+        triage_dump_threads(conn, all, a, name_filter.as_deref(), deadline).await;
+    let eligible = candidates.len();
+    let tally = candidates_by_family(&candidates);
+    let (order, families) = {
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        family_round_robin(&names)
+    };
+
+    // Paired with each row's position in `AllThreads`, so the reply can be put back into creation order
+    // once the selection has done its job. Choosing fairly and presenting stably are separate jobs.
+    let mut rows: Vec<(usize, DumpRow)> = Vec::new();
     // Class names are shared across every thread in the dump — a request pool's stacks are largely the
     // same frames, so this is where most of the lookup cost disappears.
     let mut class_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
@@ -7415,8 +7613,10 @@ async fn collect_dump_rows(
     // entire safety argument.
     let mut line_tables: LineTableCache = std::collections::HashMap::new();
 
-    let mut unread = 0usize;
-    for (seen, tid) in all.iter().enumerate() {
+    // `untriaged` is already unread: the triage pass ran out of its share of the budget before it got to
+    // those threads, so they were never even candidates.
+    let mut unread = untriaged;
+    for (taken, pick) in order.iter().enumerate() {
         if rows.len() >= limit {
             break;
         }
@@ -7424,22 +7624,15 @@ async fn collect_dump_rows(
         // long the VM is frozen, so stopping mid-thread would hold it longer to produce a partial row.
         // Everything still unexamined is counted so the reply can say what it skipped.
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            unread = all.len().saturating_sub(seen);
+            unread += order.len().saturating_sub(taken);
             break;
         }
-        let name = conn.get_thread_name(*tid).await.unwrap_or_default();
-        if name_filter.as_ref().is_some_and(|f| !name.to_lowercase().contains(f.as_str())) {
-            continue;
-        }
-        let (status, suspended) = match conn.get_thread_status(*tid).await {
-            Ok((ts, ss)) => (thread_status_name(ts), ss != 0),
-            // A thread that can't report its status has almost certainly died; skip it rather than
-            // showing a row of unknowns.
-            Err(_) => continue,
-        };
-        if a.only_suspended && !suspended {
-            continue;
-        }
+        // `order` indexes `candidates` by construction; `get_mut` rather than `[]` so a future edit that
+        // breaks that invariant skips a row instead of taking the whole dump down with it. The name is
+        // *moved* out — each candidate is picked at most once, so nothing is left to read it.
+        let Some(c) = candidates.get_mut(*pick) else { continue };
+        let (seen, tid, status, suspended) = (c.seen, c.tid, c.status, c.suspended);
+        let name = std::mem::take(&mut c.name);
 
         let (stack, frames_hidden) = if !suspended {
             // Not a failure of ours to explain away: JDWP defines both frames and locks as readable
@@ -7458,7 +7651,7 @@ async fn collect_dump_rows(
             (DumpStack::Omitted, 0)
         } else {
             let (frames, hidden) = read_dump_stack(
-                conn, *tid, a.max_frames, package_filter.as_deref(), &mut class_names, &mut line_tables,
+                conn, tid, a.max_frames, package_filter.as_deref(), &mut class_names, &mut line_tables,
             )
             .await;
             (frames.map_or_else(DumpStack::Unreadable, DumpStack::Frames), hidden)
@@ -7467,10 +7660,10 @@ async fn collect_dump_rows(
         // The "should we even ask?" guard lives inside the helper, so the loop body holds no
         // per-iteration collection of its own.
         let (holds, waiting_on, monitor_note) =
-            read_thread_monitors(conn, *tid, want_monitors && suspended, &mut monitor_names).await;
+            read_thread_monitors(conn, tid, want_monitors && suspended, &mut monitor_names).await;
 
-        rows.push(DumpRow {
-            id: *tid,
+        rows.push((seen, DumpRow {
+            id: tid,
             name,
             status,
             suspended,
@@ -7479,9 +7672,13 @@ async fn collect_dump_rows(
             holds,
             waiting_on,
             monitor_note,
-        });
+        }));
     }
-    DumpOutcome { rows, unread }
+    rows.sort_by_key(|(seen, _)| *seen);
+    let rows: Vec<DumpRow> = rows.into_iter().map(|(_, r)| r).collect();
+    let selection =
+        DumpSelection { eligible, families, withheld: withheld_by_family(tally, &rows) };
+    DumpOutcome { rows, unread, selection }
 }
 
 /// Read one suspended thread's lock state, as `(monitors held, monitor blocked on, failure note)`.
@@ -7604,6 +7801,7 @@ fn render_dump_header(
     meta: &DumpMeta<'_>,
 ) -> String {
     let mut out = format!("🧵 Thread dump — {}/{} thread(s){}\n", rows.len(), meta.total, dump_filter_note(a));
+    out.push_str(&dump_order_note(rows.len(), meta.selection));
     if meta.already_suspended {
         out.push_str("   VM was already suspended — read as it is, and left suspended.\n");
     }
@@ -7637,6 +7835,51 @@ fn render_dump_header(
         );
     }
     out
+}
+
+/// The line that says WHICH threads a shortened dump chose, and on what rule (DUMP-3, #43).
+///
+/// Printed only when something was left out, because that is the only time the rule changes what you see.
+/// It exists because the alternative is a header that reads as a representative sample: a default dump of
+/// a real `WildFly` said `40/267 thread(s)` while every one of those 40 was a JVM internal, an MSC service
+/// thread or an Undertow selector, and the 13 request workers a caller came for sat 328 frames deep and
+/// unread. Nothing in that reply said so, which is this repo's recurring failure — a check that reports
+/// success without having looked.
+///
+/// Silent on a single-family dump: `name_filter: "default task"` narrows to one pool, round-robin over one
+/// family IS creation order, and announcing a rule that did nothing is noise.
+fn dump_order_note(shown: usize, sel: &DumpSelection) -> String {
+    if shown >= sel.eligible || sel.families < 2 {
+        return String::new();
+    }
+    format!(
+        "   🔀 Chose {shown} of {} by NAME FAMILY, not by the order the JVM listed them in: one thread \
+         from each of the {} distinct names (digits ignored, so \"task-3\" and \"task-91\" are one \
+         family) before a second from any, so no single pool can spend every slot. JDWP `AllThreads` \
+         order is *creation* order, and an app server creates its request pool last (DUMP-3). Rows below \
+         are printed in creation order.\n",
+        sel.eligible, sel.families
+    )
+}
+
+/// The `— biggest groups not shown: 227 × "churn-worker-#"` tail on the truncation footer (DUMP-3).
+///
+/// A count of what is missing answers "is this dump short?"; naming the groups answers "short of what?",
+/// which is the question that decides whether to raise `limit` or reach for `name_filter`. Capped at five
+/// groups, because a 267-thread JVM has more families than anyone reads in a footer.
+fn withheld_note(withheld: &[(String, usize)]) -> String {
+    const LISTED: usize = 5;
+    if withheld.is_empty() {
+        return String::new();
+    }
+    let named: Vec<String> =
+        withheld.iter().take(LISTED).map(|(f, n)| format!("{n} × \"{f}\"")).collect();
+    let rest = withheld.len().saturating_sub(LISTED);
+    format!(
+        " — biggest groups not shown: {}{}",
+        named.join(", "),
+        if rest > 0 { format!(", and {rest} other group(s)") } else { String::new() }
+    )
 }
 
 /// The `, 0.42ms each` suffix on the cost line — this connection's observed per-packet price (TEST-8).
@@ -7846,7 +8089,11 @@ fn render_thread_dump(
     // different states, so the budget's own line above says which one applied.
     let hidden = meta.total.saturating_sub(rows.len());
     if hidden > 0 {
-        let _ = writeln!(out, "\n… +{hidden} more thread(s) (raise limit, or narrow with name_filter)");
+        let _ = writeln!(
+            out,
+            "\n… +{hidden} more thread(s) (raise limit, or narrow with name_filter){}",
+            withheld_note(&meta.selection.withheld)
+        );
     }
     let _ = write!(out, "\nCost: {} JDWP packet(s){}.", meta.cost, per_packet_note(meta));
     out
@@ -8683,6 +8930,10 @@ mod tests {
         serde_json::from_value(json).expect("valid ThreadDumpArgs")
     }
 
+    /// A selection that left nothing out, so `dump_order_note` stays silent — the render tests that are
+    /// not about DUMP-3 keep the output they were written against.
+    static WHOLE_POOL: DumpSelection = DumpSelection { eligible: 0, families: 0, withheld: Vec::new() };
+
     /// A `DumpMeta` for a dump that suspended nothing and completed — the fields each test varies are
     /// overridden at the call site, so a test only states what it is actually about.
     fn dump_meta(total: usize, cost: u32) -> DumpMeta<'static> {
@@ -8696,6 +8947,7 @@ mod tests {
             wire: std::time::Duration::from_millis(u64::from(cost)),
             held: None,
             unread: 0,
+            selection: &WHOLE_POOL,
         }
     }
 
@@ -8708,6 +8960,126 @@ mod tests {
         can_get_current_contended_monitor: true,
         can_get_monitor_info: true,
     };
+
+// DUMP-3: a pool's threads differ only in the number on the end, and that is the one naming
+    // convention every framework shares. Nothing here knows what WildFly or Tomcat call anything.
+    #[test]
+    fn a_thread_name_family_is_the_name_with_its_numbering_removed() {
+        assert_eq!(thread_name_family("default task-17"), "default task-#");
+        assert_eq!(thread_name_family("default task-17"), thread_name_family("default task-914"));
+        // Different pools stay different, which is the half that makes the grouping useful rather than
+        // merely small: collapsing selectors and request workers together would re-create the bug.
+        assert_ne!(thread_name_family("default I/O-3"), thread_name_family("default task-3"));
+        // Numbers in the middle count too — `MSC service thread 1-4`, `http-nio-8080-exec-3`.
+        assert_eq!(thread_name_family("http-nio-8080-exec-3"), "http-nio-#-exec-#");
+        assert_eq!(thread_name_family("MSC service thread 1-4"), "MSC service thread #-#");
+        // A name with no digits is its own family, and an unnamed thread (a dead one reads as "") must
+        // not panic its way out of a dump.
+        assert_eq!(thread_name_family("Reference Handler"), "Reference Handler");
+        assert_eq!(thread_name_family(""), "");
+    }
+
+    /// The `WildFly` roster from TEST-8 (#24), in `AllThreads` order: the JVM's own threads, then the
+    /// service container, then the selectors, and the request pool last.
+    fn wildfly_shaped_threads() -> Vec<String> {
+        let mut names: Vec<String> = ["Reference Handler", "Finalizer", "Signal Dispatcher", "Common-Cleaner"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        names.extend((1..=8).map(|i| format!("MSC service thread 1-{i}")));
+        names.extend((1..=2).map(|i| format!("DeploymentScanner-threads - {i}")));
+        names.extend((1..=38).map(|i| format!("ServerService Thread Pool -- {i}")));
+        names.extend((1..=16).map(|i| format!("default I/O-{i}")));
+        names.extend((1..=13).map(|i| format!("default task-{i}")));
+        names
+    }
+
+    // DUMP-3 (#43), and the whole issue in one assertion. Against this roster the old rule — take the
+    // first `limit` in `AllThreads` order — returned 40 threads containing ZERO `default task-*`, because
+    // creation order puts an app server's request pool last. The measurement was taken on a real WildFly
+    // and the arithmetic is reproduced here so a regression fails without a JVM.
+    #[test]
+    fn the_default_limit_reaches_a_request_pool_that_was_created_last() {
+        let names = wildfly_shaped_threads();
+        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        // What it used to do. Pinned as the thing being fixed, not as a helper: if this ever stops being
+        // zero the roster has drifted and the test below has stopped proving anything.
+        let creation_order = borrowed.iter().take(40).filter(|n| n.starts_with("default task")).count();
+        assert_eq!(creation_order, 0, "the roster must reproduce the finding, or the fix is untested");
+
+        let (order, families) = family_round_robin(&borrowed);
+        assert_eq!(families, 9, "four singletons plus MSC, DeploymentScanner, ServerService, I/O and task");
+        let chosen: Vec<&str> = order.iter().take(40).map(|i| borrowed[*i]).collect();
+        let pool = chosen.iter().filter(|n| n.starts_with("default task")).count();
+        assert!(pool >= 5, "a default dump must reach the request pool, got {pool} of 13:\n{chosen:?}");
+        // …and not by starving everything else: the point is a fair sample, not a different bias.
+        assert!(chosen.iter().any(|n| n.starts_with("default I/O")), "selectors are still represented");
+        assert!(chosen.contains(&"Finalizer"), "so are the JVM's own threads");
+
+        // Every thread is still offered, exactly once — a selection rule that quietly dropped candidates
+        // would make `limit: 500` unable to reach what `limit: 40` skipped.
+        assert_eq!(order.len(), borrowed.len());
+        let mut seen = order.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), borrowed.len(), "each thread appears in the order exactly once");
+    }
+
+    // A rule that only holds on a tidy list is not a rule. One family, an empty list, and a list of
+    // singletons are all shapes a real JVM produces, and none of them may reorder into nonsense.
+    #[test]
+    fn family_round_robin_degenerates_to_creation_order_when_there_is_nothing_to_interleave() {
+        let (order, families) = family_round_robin(&[]);
+        assert!(order.is_empty());
+        assert_eq!(families, 0);
+
+        // `name_filter: "default task"` narrows to one pool; interleaving one family IS creation order,
+        // which is what lets the header stay silent about a rule that did nothing.
+        let one_pool = ["task-1", "task-2", "task-3"];
+        assert_eq!(family_round_robin(&one_pool), (vec![0, 1, 2], 1));
+
+        let all_distinct = ["main", "Finalizer", "collector"];
+        assert_eq!(family_round_robin(&all_distinct), (vec![0, 1, 2], 3));
+    }
+
+    // DUMP-3: the caller must be able to know what the forty they got are without reading this file —
+    // and must not be told about a rule that changed nothing.
+    #[test]
+    fn a_dump_states_its_selection_rule_only_when_the_rule_mattered() {
+        let truncated = DumpSelection { eligible: 267, families: 25, withheld: Vec::new() };
+        let note = dump_order_note(40, &truncated);
+        assert!(note.contains("Chose 40 of 267"), "the note states the arithmetic: {note}");
+        assert!(note.contains("NAME FAMILY"), "and the rule: {note}");
+        assert!(note.contains("printed in creation order"), "and how to read the rows: {note}");
+
+        // Nothing was left out, so there is no "which forty" to answer.
+        let whole = DumpSelection { eligible: 12, families: 5, withheld: Vec::new() };
+        assert_eq!(dump_order_note(12, &whole), "");
+        // One family: round-robin over it is creation order, so announcing it would be noise.
+        let narrowed = DumpSelection { eligible: 300, families: 1, withheld: Vec::new() };
+        assert_eq!(dump_order_note(40, &narrowed), "");
+    }
+
+    // "227 more" answers "is this short?"; naming the groups answers "short of WHAT?", which is the
+    // question that decides between raising `limit` and reaching for `name_filter`.
+    #[test]
+    fn the_truncation_footer_names_the_groups_it_withheld_and_stops_at_five() {
+        let nothing: Vec<(String, usize)> = Vec::new();
+        assert_eq!(withheld_note(&nothing), "");
+
+        let pair = [("default task-#".to_string(), 11), ("default I/O-#".to_string(), 14)];
+        let listed = withheld_note(&pair);
+        assert!(listed.contains("11 × \"default task-#\""), "{listed}");
+        assert!(listed.contains("14 × \"default I/O-#\""), "{listed}");
+        assert!(!listed.contains("other group(s)"), "two groups is not a truncated list: {listed}");
+
+        // A 267-thread JVM has more families than anyone reads in a footer, so the tail is counted.
+        let many: Vec<(String, usize)> = (0..9).map(|i| (format!("pool-{i}-#"), 9 - i)).collect();
+        let long = withheld_note(&many);
+        assert!(long.contains("and 4 other group(s)"), "the rest are counted, not dropped: {long}");
+        assert!(!long.contains("pool-6-#"), "the sixth group is past the cap: {long}");
+    }
 
     // DUMP-1: the whole point of collecting monitors is the correlation — "A waits for L" plus "B holds
     // L" has to render as one readable fact, or a deadlock stays invisible in a correct-looking dump.

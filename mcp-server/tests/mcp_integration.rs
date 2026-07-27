@@ -4440,6 +4440,149 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
     server.panic_reset();
 }
 
+/// The `⏱  Held the VM suspended for Nms.` figure a dump reports, in milliseconds.
+fn dump_held_ms(dump: &str) -> Option<u64> {
+    let at = dump.find("Held the VM suspended for ")? + "Held the VM suspended for ".len();
+    dump.get(at..)?.split_once("ms").and_then(|(n, _)| n.trim().parse().ok())
+}
+
+/// DUMP-3 (#43): the threads a caller came to look at are the ones a server starts LAST, so the default
+/// dump has to reach them.
+///
+/// Measured against a real `WildFly` 21 (TEST-8, #24), a default `debug.thread_dump` of a 267-thread loaded
+/// instance returned **zero application threads**. All 40 slots went to JVM internals, MSC service
+/// threads, the deployment scanner and Undertow selectors, while 13 `default task-*` workers sat a median
+/// 328 frames deep in application code and were never read. The cause was ordering, not size:
+/// `collect_dump_rows` walked JDWP `AllThreads` — creation order — and stopped at `limit`, and an app
+/// server creates its request pool last. The header said `40/267 thread(s)`, which reads as a sample.
+///
+/// `ChurnProbe` was built for exactly this shape (#35): its eight `stable-worker-*` threads start **after**
+/// all 48 churn slots, so they sit behind ~55 earlier ids and the churn keeps minting more after them.
+/// Before this fix the default dump reached **0 of 8**; only `limit: 500` reached all eight — which is the
+/// finding, restated as a test.
+///
+/// **Reversing the walk is not the fix, and this probe is why.** Newest-first would return churn workers,
+/// which are created continuously and forever. The rule has to be about *what* the threads are, from data
+/// the dump already reads (the name), not about where they sit in the list.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+// One probe, one attach, three readings that only mean something together: the default dump reaches the
+// pool, it says how it chose, and the wider selection is still bounded by the suspension budget. Split up,
+// each half would be asserting against a debuggee the others never proved was in the state that matters.
+#[allow(clippy::too_many_lines)]
+fn a_default_dump_reaches_a_pool_the_debuggee_started_last() {
+    let Some(jdk) = jdk_or_skip("a_default_dump_reaches_a_pool_the_debuggee_started_last") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "ChurnProbe").expect("launch ChurnProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // A full generation must have turned over first — the stable eight are started only after all 48
+    // churn slots have been staggered, so a dump taken before that would be a dump of half a probe.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| churn_retired(l).is_some_and(|n| n >= 48))
+        .unwrap_or_else(|| panic!("the pool never retired a full generation\n  output: {:?}", probe.output()));
+
+    // --- the reading itself: DEFAULT arguments, which is the whole point ---
+    let dump = server.call("debug.thread_dump", serde_json::json!({}));
+    let (read, total) = dump_thread_counts(&dump)
+        .unwrap_or_else(|| panic!("no `N/M thread(s)` header in:\n{}", head_of(&dump)));
+    // Without this the test could pass on a debuggee small enough that `limit` never bit, which is the
+    // one shape that cannot reproduce the bug.
+    assert!(
+        total > 40,
+        "ChurnProbe must have more threads than the default limit, or truncation never happens: {read}/{total}"
+    );
+    let stable = dump.lines().filter(|l| l.contains("\"stable-worker-")).count();
+    assert_eq!(
+        stable, 8,
+        "a default dump reached {stable} of the 8 threads this debuggee started LAST. That is the WildFly \
+         reading (#43): 40 slots spent on the least interesting end of the list because `AllThreads` is \
+         creation order.\n{}",
+        head_of(&dump)
+    );
+    // …and it did not get there by reading everything: the churn population is still mostly withheld, so
+    // the pool was reached by CHOOSING, not by the limit quietly growing.
+    let churn = dump.lines().filter(|l| l.contains("\"churn-worker-")).count();
+    assert!(
+        churn < 40,
+        "the whole churn population was read, so `limit` is no longer bounding anything: {churn} rows\n{}",
+        head_of(&dump)
+    );
+
+    // --- and it SAYS what the forty are, which is the other half of the finding ---
+    assert_contains_all(
+        "a truncated dump states the rule it selected by, so a caller need not read the source",
+        &dump,
+        &["by NAME FAMILY", "printed in creation order"],
+    );
+    assert!(
+        dump.contains("… +") && dump.contains("more thread(s)"),
+        "the withheld remainder is still counted:\n{}",
+        head_of(&dump)
+    );
+    assert!(
+        dump.contains("churn-worker-#"),
+        "the footer must name the groups it withheld — the caller's next question is 'what am I not \
+         seeing', and 227 of them being one pool is the answer:\n{dump}"
+    );
+
+    // --- the cost of choosing stays inside the budget, and is still reported ---
+    let frozen = server.call(
+        "debug.thread_dump",
+        // Six frames, because a parked worker's own code is four down: `Object.wait0` / `wait` / `wait`
+        // sit above `ChurnProbe.park`. Reading a stack that stops inside `java.lang.Object` would prove
+        // the row exists, not that the thread this dump went looking for was actually read.
+        serde_json::json!({"suspend": true, "max_frames": 6}),
+    );
+    assert_contains_all(
+        "a suspending default dump completes, resumes and reports both costs",
+        &frozen,
+        &["verified running", "Held the VM suspended for", "Cost:"],
+    );
+    let held = dump_held_ms(&frozen).unwrap_or_else(|| panic!("no held figure in:\n{}", head_of(&frozen)));
+    assert!(
+        held <= 2000,
+        "the default 2000ms budget must still bound a dump that reads every thread's NAME before \
+         choosing: held {held}ms\n{}",
+        head_of(&frozen)
+    );
+    assert!(
+        frozen.contains("ChurnProbe.park:"),
+        "the frozen default dump must have read a stable worker's real stack, not merely listed it:\n{}",
+        head_of(&frozen)
+    );
+
+    // A budget that cannot be met has to bind on the *choosing* too. If the name pass ran to completion
+    // regardless of the deadline, this dump would hold the VM for as long as it took to name 60 threads
+    // while claiming a 1ms budget — the widened read paying for itself out of somebody else's instance.
+    let base = highest_tick(&probe).expect("no tick to count from");
+    let starved = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"suspend": true, "max_suspend_ms": 1}),
+    );
+    assert_contains_all(
+        "the selection pass is inside the budget, not before it",
+        &starved,
+        &["Stopped early", "suspension budget ran out", "INCOMPLETE", "verified running"],
+    );
+    let starved_held =
+        dump_held_ms(&starved).unwrap_or_else(|| panic!("no held figure in:\n{}", head_of(&starved)));
+    assert!(
+        starved_held < 500,
+        "a 1ms budget held the VM for {starved_held}ms — the name pass is not checking the deadline\n{}",
+        head_of(&starved)
+    );
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
+        "the probe stopped ticking after a starved dump\n  output: {:?}",
+        probe.output().len(),
+    );
+
+    server.panic_reset();
+}
+
 /// A dump section's own thread id — the `0x…` that opens its header line.
 fn section_thread_id(section: &str) -> Option<&str> {
     section.lines().next()?.split_whitespace().next()
