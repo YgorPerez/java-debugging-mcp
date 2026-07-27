@@ -4468,6 +4468,10 @@ fn sole_held_lock(section: &str) -> Option<&str> {
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_contended_lock_names_its_real_holder_out_of_four() {
+    /// The probe's own monitors. Every assertion here is scoped to these, so a thread blocked on some
+    /// other lock — the debuggee's, or the JVM's — is not mistaken for one of this test's waiters.
+    const PROBE_LOCK: &str = "ContendedProbe$Lock";
+
     let Some(jdk) = jdk_or_skip("a_contended_lock_names_its_real_holder_out_of_four") else { return };
     let probe = Probe::launch(&jdk, "ContendedProbe").expect("launch ContendedProbe");
     let mut server = Server::start().expect("start server");
@@ -4497,11 +4501,18 @@ fn a_contended_lock_names_its_real_holder_out_of_four() {
 
     // The premise, checked before anything is concluded from it. If the contention had not formed, every
     // assertion below would pass vacuously on a dump with no `waiting to enter` lines in it at all.
-    let waiting = dump.lines().filter(|l| l.contains("waiting to enter:")).count();
+    //
+    // Counted over THIS probe's locks rather than over every `waiting to enter:` line in the dump. The
+    // first version counted all of them and demanded exactly 48; CI failed it on all three JDK legs with
+    // 50, because a debuggee contains blocked threads this test did not create — a holder pausing on
+    // `System.out`'s monitor to print its heartbeat is enough. Scoping to `ContendedProbe$Lock` keeps the
+    // count exact where exactness means something (all 48 waiters really are queued on the four locks
+    // under test) without asserting anything about monitors that are not this test's business.
+    let waiting = dump.lines().filter(|l| l.contains("waiting to enter:")).filter(|l| l.contains(PROBE_LOCK)).count();
     assert_eq!(
         waiting, 48,
-        "this test is about contention at scale, so all 48 waiters must be queued in the dump it \
-         reads:\n{}",
+        "this test is about contention at scale, so all 48 waiters must be queued on the probe's own \
+         four locks in the dump it reads:\n{}",
         head_of(&dump)
     );
 
@@ -4547,9 +4558,14 @@ fn a_contended_lock_names_its_real_holder_out_of_four() {
     // And nobody was handed a holder that holds a different lock. The loop above proves each waiter got
     // the right annotation; this proves the dump contains no other kind, including on rows the loop never
     // named.
+    //
+    // Scoped to the probe's own locks for the same reason as the count above: a thread blocked on a
+    // monitor this test did not create has no `$Lock<k>` in its name and no `holder-<k>` holding it, so it
+    // read as a mispairing and would have failed here the moment it failed the count.
     let wrong: Vec<&str> = dump
         .lines()
         .filter(|l| l.contains("waiting to enter:"))
+        .filter(|l| l.contains(PROBE_LOCK))
         .filter(|l| {
             let (before, after) = l.split_once(" ← held by ").unwrap_or((l, ""));
             // `…$Lock2@3f ← … "holder-2"` — the digit in the lock's class name must be the digit in the
@@ -4665,16 +4681,30 @@ fn synthetic_frames_render_with_names_a_reader_can_act_on() {
     // THE FINDING. `/` is not a package separator here, and every one of these is rendered as though it
     // were. Both halves are asserted: what the caller IS shown, and that the JVM's own spelling never
     // appears — so a fix that stops mangling the name flips this test rather than passing quietly.
+    //
+    // Pinned on the SUBSTITUTION, not on either JDK's spelling of the suffix, because the suffix is not
+    // stable across versions and the first draft of this test pinned JDK 21's. CI caught it on the JDK 11
+    // leg the day the matrix landed (#36's first real find):
+    //
+    //   JDK 21:  SyntheticProbe$$Lambda/0x0000000087040970
+    //   JDK 11:  SyntheticProbe$$Lambda$3/397187020        <- ordinal, and decimal rather than hex
+    //
+    // What both have in common is the `/`, and that is the whole bug: everything after it is a
+    // JVM-assigned suffix rather than package structure. So the assertion is "the `/` is gone" — true on
+    // every version, and it still flips the moment SIG-1 (#46) stops rewriting it.
     for line in &hidden {
         assert!(
-            line.contains("$$Lambda.0x"),
+            !line.contains('/'),
             "pinned: a hidden class currently renders with the JVM's `/` rewritten to `.`, which is not \
              its name — if that has been fixed, this is the assertion that should tell you: {line}"
         );
     }
+    let jvm_spelled: Vec<&str> =
+        stack.lines().map(str::trim).filter(|l| l.contains("$$Lambda") && l.contains('/')).collect();
     assert!(
-        !stack.contains("$$Lambda/0x"),
-        "pinned: the JVM's own spelling of a hidden class does not survive decode_signature:\n{stack}"
+        jvm_spelled.is_empty(),
+        "pinned: the JVM's own spelling of a hidden class does not survive decode_signature — these kept \
+         their `/`, which would mean the mangling is gone: {jvm_spelled:?}"
     );
     // And it has no line number, because a hidden class has no line table — so the one frame a reader
     // cannot act on is also the one with nothing to look up.
@@ -4688,14 +4718,22 @@ fn synthetic_frames_render_with_names_a_reader_can_act_on() {
     // The mangled name is at least CONSISTENT — `debug.list_classes` spells it the same way, so a name
     // copied out of a stack finds the class again here. What it cannot do is leave this tool: the JVM's
     // `Class.getName()`, a `-verbose:class` line, a jstack dump and a JDWP class pattern all use the `/`.
-    let by_mangled =
-        server.call("debug.list_classes", serde_json::json!({"filter": "SyntheticProbe$$Lambda"}));
+    // Searched by the name THIS STACK PRINTED, lifted straight out of the frame, rather than by a spelling
+    // written into the test. That is what makes it a round trip: whatever the tool showed the caller is
+    // exactly what the caller pastes back. It is also the only version-independent way to ask — JDK 11
+    // renders `$$Lambda$3.574182878` where 21 renders `$$Lambda.0x...`, and an earlier draft of this
+    // assertion hardcoded the latter and failed the JDK 11 leg.
+    let shown = mangled.split(".run").next().unwrap_or_default().rsplit(' ').next().unwrap_or_default();
+    assert!(shown.contains("$$Lambda"), "expected a hidden-class frame to lift a name from: {mangled}");
+    let by_mangled = server.call("debug.list_classes", serde_json::json!({"filter": shown}));
     assert!(
-        by_mangled.contains("SyntheticProbe$$Lambda."),
-        "the name a stack shows must at least find the class again in this tool:\n{by_mangled}"
+        by_mangled.contains(shown),
+        "the name a stack shows must at least find the class again in this tool — searched `{shown}`:\n\
+         {by_mangled}"
     );
-    let by_jvm_name =
-        server.call("debug.list_classes", serde_json::json!({"filter": "SyntheticProbe$$Lambda/0x"}));
+    // The JVM's own spelling keeps the `/`, and no decoded listing can contain one, so this finds nothing
+    // on every JDK without naming either one's suffix format.
+    let by_jvm_name = server.call("debug.list_classes", serde_json::json!({"filter": "$$Lambda/"}));
     assert!(
         by_jvm_name.starts_with("0/0 class(es)"),
         "pinned: searching for a hidden class by the name the JVM itself uses finds nothing, because the \
@@ -4718,9 +4756,12 @@ fn synthetic_frames_render_with_names_a_reader_can_act_on() {
         "debug.thread_dump",
         serde_json::json!({"name_filter": "synthetic-worker", "max_frames": 20}),
     );
+    // Compared against the exact name `get_stack` printed, rather than a spelling written in here — same
+    // reason as the round trip above, and it asserts more: not "both look mangled" but "both produced the
+    // identical string", which is what a caller moving between the two views actually depends on.
     assert!(
-        dump.contains("$$Lambda.0x") && !dump.contains("$$Lambda/0x"),
-        "the dump and get_stack must spell a hidden class the same way:\n{dump}"
+        dump.contains(shown),
+        "the dump and get_stack must spell a hidden class the same way — get_stack said `{shown}`:\n{dump}"
     );
 
     server.panic_reset();
