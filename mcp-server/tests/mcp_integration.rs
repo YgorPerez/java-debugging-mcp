@@ -4375,3 +4375,156 @@ fn a_contended_lock_names_its_real_holder_out_of_four() {
 
     server.panic_reset();
 }
+
+/// The one frame line in a stack that mentions `needle`, or `None`.
+fn frame_line<'a>(stack: &'a str, needle: &str) -> Option<&'a str> {
+    stack.lines().map(str::trim).find(|l| l.starts_with('#') && l.contains(needle))
+}
+
+/// TEST-10 (#35): a lambda, a method reference and an anonymous inner class in one stack, and what
+/// `decode_signature` makes of the names the JVM invents for them.
+///
+/// Seventeen probes and not one of them put a synthetic frame in a stack a test read, so the signature
+/// decoder had only ever been handed names a human wrote. A dump of any real application server is full
+/// of the other kind, and the failure mode is not a crash — it is a class name that comes back subtly
+/// wrong and reads as plausible.
+///
+/// Two of the three are fine and this says so specifically, because "it did not crash" is not a finding
+/// either way:
+///
+/// * `SyntheticProbe$1.run:<line>` — the anonymous class's name says nothing about what it does, but the
+///   frame carries a source line, and the line is what makes it actionable.
+/// * `SyntheticProbe.lambda$lambdaStep$0:<line>` — the lambda's BODY is an ordinary method on the
+///   enclosing class, named after the method it was written in, with a line of its own.
+///
+/// The third is not fine, and it is pinned rather than fixed. The JVM names a lambda's hidden class
+/// `SyntheticProbe$$Lambda/0x00007f…`, where the `/` separates the class from a JVM-assigned address and
+/// is **not** a package separator. `decode_signature` replaces every `/` in a `L…;` signature with a
+/// `.`, because in a JNI signature that is what a `/` is — so what a caller is shown is
+/// `SyntheticProbe$$Lambda.0x00007f…`, a name the JVM does not use and will not answer to. It reads
+/// exactly like a class `0x00007f…` in a package `SyntheticProbe$$Lambda`, which is the kind of wrongness
+/// that gets acted on.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn synthetic_frames_render_with_names_a_reader_can_act_on() {
+    let Some(jdk) = jdk_or_skip("synthetic_frames_render_with_names_a_reader_can_act_on") else { return };
+    let probe = Probe::launch(&jdk, "SyntheticProbe").expect("launch SyntheticProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // `parked` means the whole chain is on the worker's stack — main polls the worker's own `getState()`
+    // for it, so this is not a sleep dressed up as a barrier.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("parked"))
+        .unwrap_or_else(|| panic!("the worker never parked\n  output: {:?}", probe.output()));
+
+    let tid = thread_hex_for(&mut server, "synthetic-worker")
+        .unwrap_or_else(|| panic!("no synthetic-worker thread"));
+    // JDWP will not read a running thread's frames, and the worker is parked rather than at a stop point,
+    // so nothing else has suspended it.
+    server.call("debug.pause", serde_json::json!({}));
+    let stack = server.call(
+        "debug.get_stack",
+        serde_json::json!({"thread_id": tid, "max_frames": 20, "include_variables": false}),
+    );
+
+    let source = probe_source("SyntheticProbe");
+
+    // --- the two that are readable, each pinned to the line it was written on ---
+    let anon_line = probe_line(&source, "call(lambdaStep());");
+    assert!(
+        stack.contains(&format!("SyntheticProbe$1.run:{anon_line}")),
+        "the anonymous inner class must appear with its real name AND the line it runs — `$1` alone names \
+         nothing a reader could go and look at:\n{stack}"
+    );
+    let lambda_line = probe_line(&source, "return () -> call(SyntheticProbe::viaMethodReference);");
+    assert!(
+        stack.contains(&format!("SyntheticProbe.lambda$lambdaStep$0:{lambda_line}")),
+        "the lambda's body must be attributed to the method it was written in, with its own line:\n{stack}"
+    );
+    // The method reference resolves to the ordinary method it names, which is the whole point of one.
+    let ref_line = probe_line(&source, "        park();");
+    assert!(
+        stack.contains(&format!("SyntheticProbe.viaMethodReference:{ref_line}")),
+        "a method reference must reach the method it refers to, by name:\n{stack}"
+    );
+
+    // --- the hidden classes, pinned exactly as they render ---
+    // Three of them: the lambda, the method reference, and the one `new Thread(SyntheticProbe::worker)`
+    // created. Each is a frame in its own right, between the ordinary frames on either side.
+    let hidden: Vec<&str> = stack.lines().map(str::trim).filter(|l| l.contains("$$Lambda")).collect();
+    assert_eq!(
+        hidden.len(),
+        3,
+        "a lambda and a method reference each add a hidden-class frame of their own, and the thread's own \
+         method reference adds a third:\n{stack}"
+    );
+    // THE FINDING. `/` is not a package separator here, and every one of these is rendered as though it
+    // were. Both halves are asserted: what the caller IS shown, and that the JVM's own spelling never
+    // appears — so a fix that stops mangling the name flips this test rather than passing quietly.
+    for line in &hidden {
+        assert!(
+            line.contains("$$Lambda.0x"),
+            "pinned: a hidden class currently renders with the JVM's `/` rewritten to `.`, which is not \
+             its name — if that has been fixed, this is the assertion that should tell you: {line}"
+        );
+    }
+    assert!(
+        !stack.contains("$$Lambda/0x"),
+        "pinned: the JVM's own spelling of a hidden class does not survive decode_signature:\n{stack}"
+    );
+    // And it has no line number, because a hidden class has no line table — so the one frame a reader
+    // cannot act on is also the one with nothing to look up.
+    let mangled = frame_line(&stack, "$$Lambda").expect("a hidden-class frame was found a moment ago");
+    let after_run = mangled.split(".run").nth(1).unwrap_or("!");
+    assert!(
+        after_run.trim().is_empty(),
+        "a hidden class has no line table, so its frame must carry no line: {mangled}"
+    );
+
+    // The mangled name is at least CONSISTENT — `debug.list_classes` spells it the same way, so a name
+    // copied out of a stack finds the class again here. What it cannot do is leave this tool: the JVM's
+    // `Class.getName()`, a `-verbose:class` line, a jstack dump and a JDWP class pattern all use the `/`.
+    let by_mangled =
+        server.call("debug.list_classes", serde_json::json!({"filter": "SyntheticProbe$$Lambda"}));
+    assert!(
+        by_mangled.contains("SyntheticProbe$$Lambda."),
+        "the name a stack shows must at least find the class again in this tool:\n{by_mangled}"
+    );
+    let by_jvm_name =
+        server.call("debug.list_classes", serde_json::json!({"filter": "SyntheticProbe$$Lambda/0x"}));
+    assert!(
+        by_jvm_name.starts_with("0/0 class(es)"),
+        "pinned: searching for a hidden class by the name the JVM itself uses finds nothing, because the \
+         listing is decoded exactly the way the stack is:\n{by_jvm_name}"
+    );
+    // …and the miss is then explained with the one reading that is definitely wrong. All three classes are
+    // loaded — the listing above found them a moment ago under the other spelling — so "a class the JVM has
+    // not loaded yet does not appear here" sends a caller looking for a code path that was never the
+    // problem. CONTEXT.md's whole point about **loaded** is that "not loaded" and "no such class" are
+    // indistinguishable from outside; this is a third case, and the tool cannot see it because it is the
+    // one doing the renaming.
+    assert!(
+        by_jvm_name.contains("has not loaded yet"),
+        "pinned: a name this tool mangled is reported as a class that may not be loaded:\n{by_jvm_name}"
+    );
+
+    // The dump renders frames through the same decoder, so the two views must not disagree — a caller who
+    // reads one and pastes into the other has to get the same class.
+    let dump = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"name_filter": "synthetic-worker", "max_frames": 20}),
+    );
+    assert!(
+        dump.contains("$$Lambda.0x") && !dump.contains("$$Lambda/0x"),
+        "the dump and get_stack must spell a hidden class the same way:\n{dump}"
+    );
+
+    let base = highest_tick(&probe).expect("no tick to count from");
+    server.panic_reset();
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 1)).is_some(),
+        "the probe stopped ticking after the pause was released\n  output: {:?}",
+        probe.output(),
+    );
+}
