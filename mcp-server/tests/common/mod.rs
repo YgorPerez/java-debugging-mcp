@@ -148,6 +148,118 @@ fn free_port() -> u16 {
         .map_or(0, |a| a.port())
 }
 
+/// A TCP relay in front of a probe's JDWP port that adds a round-trip delay to every forwarded chunk,
+/// so a test can drive the debugger against a JVM that behaves like one **across a network hop**.
+///
+/// This exists because of what TEST-8 (#24) needed and could not get: every shared-instance default was
+/// calibrated on loopback, and the reason given for not being able to re-calibrate was the real instance.
+/// Two of the three variables that make the real thing different — thread count and stack depth — are
+/// properties of the debuggee, so a probe can reproduce them exactly (see `PoolShapeProbe`). The third is
+/// latency, and *that* is what this supplies. Kernel-level shaping (`tc qdisc … netem delay`) would be the
+/// obvious tool and is unavailable in a container without `NET_ADMIN`; doing it in userspace also makes it
+/// deterministic and portable, which a real network never is.
+///
+/// With it, "how does this behave on an instance 1ms away" stops being a question that needs the instance.
+///
+/// **What it models, and what it does not.** The delay is charged per forwarded *chunk*, not per JDWP
+/// packet. Command/reply traffic is one packet per chunk — the client awaits each reply before sending the
+/// next command — so for measuring a dump the two coincide. Traffic that arrives coalesced in one `read`
+/// (a burst of events, or pipelined commands) shares a single delay and is therefore charged *less* than a
+/// real network would charge it, so a measurement through this relay is a **lower bound** on the real
+/// cost. It also models latency only: no jitter, no loss, no bandwidth limit.
+pub struct LatencyRelay {
+    /// The port a test should attach to instead of the probe's own.
+    pub port: u16,
+    /// Set on drop so the acceptor loop stops; the copy threads end on EOF.
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Live sockets, shut down on drop so a blocked `read` returns instead of leaking its thread.
+    open: Arc<Mutex<Vec<std::net::TcpStream>>>,
+}
+
+impl LatencyRelay {
+    /// Listen on a fresh port, forwarding to `target_port` with `rtt` added per round trip.
+    ///
+    /// `rtt` is the round trip, so each direction sleeps half of it — a caller thinking in terms of
+    /// "an instance 2ms away" passes `Duration::from_millis(2)` and gets what they expect.
+    pub fn start(target_port: u16, rtt: Duration) -> Result<Self, String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| format!("relay bind: {e}"))?;
+        let port = listener.local_addr().map_err(|e| format!("relay addr: {e}"))?.port();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let open: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let one_way = rtt / 2;
+
+        let (acc_stop, acc_open) = (Arc::clone(&stop), Arc::clone(&open));
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                if acc_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let Ok(client) = incoming else { return };
+                // dt_socket with server=y accepts one connection, so there is exactly one of these per
+                // probe; connecting lazily (here, not at start) keeps the probe's single slot free until
+                // the debugger actually attaches.
+                let Ok(server) = std::net::TcpStream::connect(("127.0.0.1", target_port)) else { return };
+                // Nagle would add its own delay on top of the one being measured, which is the one thing
+                // this must not do.
+                let _ = client.set_nodelay(true);
+                let _ = server.set_nodelay(true);
+                if let (Ok(c2), Ok(s2)) = (client.try_clone(), server.try_clone()) {
+                    if let Ok(mut v) = acc_open.lock() {
+                        v.push(c2);
+                        v.push(s2);
+                    }
+                }
+                match (client.try_clone(), server.try_clone()) {
+                    (Ok(c_read), Ok(s_read)) => {
+                        pump_delayed(c_read, server, one_way);
+                        pump_delayed(s_read, client, one_way);
+                    }
+                    _ => return,
+                }
+            }
+        });
+        Ok(Self { port, stop, open })
+    }
+}
+
+impl Drop for LatencyRelay {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Shutting the sockets down is what actually ends the copy threads: they are parked in a blocking
+        // `read`, which a flag alone can never interrupt.
+        if let Ok(v) = self.open.lock() {
+            for s in v.iter() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        // Unblock the acceptor's own `accept` by connecting to it once.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+    }
+}
+
+/// Copy `from` → `to`, sleeping `delay` before each write. One thread per direction.
+fn pump_delayed(mut from: std::net::TcpStream, mut to: std::net::TcpStream, delay: Duration) {
+    std::thread::spawn(move || {
+        // Big enough for a `Frames` or `Methods` reply on a deep stack, so a single logical reply is not
+        // split into several chunks and charged the delay more than once.
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            let n = match std::io::Read::read(&mut from, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            if std::io::Write::write_all(&mut to, buf.get(..n).unwrap_or_default()).is_err() {
+                break;
+            }
+        }
+        let _ = to.shutdown(std::net::Shutdown::Both);
+    });
+}
+
 /// A probe JVM running under JDWP, with its stdout captured.
 ///
 /// Capturing stdout is what lets a test observe the *debuggee's own* behaviour — e.g. that the
