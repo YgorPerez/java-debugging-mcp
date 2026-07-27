@@ -4810,6 +4810,19 @@ fn churn_retired(line: &str) -> Option<u64> {
     line.split("retired=").nth(1)?.split_whitespace().next()?.parse().ok()
 }
 
+/// `held=<n>` from a `ChurnProbe` heartbeat — retired workers whose `Thread` object the probe is still
+/// holding, and which the debugger can therefore still resolve *after* they have finished.
+///
+/// The probe's side of TEST-19 (#54). See `ChurnProbe.HELD`.
+fn churn_held(line: &str) -> Option<u64> {
+    line.split("held=").nth(1)?.split_whitespace().next()?.parse().ok()
+}
+
+/// The latest value of one of `ChurnProbe`'s heartbeat counters, or 0 before the first tick.
+fn churn_counter(probe: &Probe, read: fn(&str) -> Option<u64>) -> u64 {
+    probe.output().iter().rev().find_map(|l| read(l)).unwrap_or(0)
+}
+
 /// How many rows a dump actually printed — one header line per thread, at the start of a line.
 fn dump_row_count(dump: &str) -> u64 {
     dump.lines().filter(|l| l.starts_with("0x")).count() as u64
@@ -4830,10 +4843,19 @@ fn dump_row_count(dump: &str) -> u64 {
 /// 2. The object has since been collected as well, so the id is not valid any more and the status read
 ///    *fails*. That is the `continue` arm the coverage review named — the row is dropped.
 ///
-/// The probe reaches (2) on purpose: `ChurnProbe` runs an explicit collector, because a JDWP object id is
-/// a weak reference and a retired worker's `Thread` is unreachable the moment it exits. Nothing forces
-/// the two states to happen in a given dump, so this takes several and requires each shape once; failing
-/// to find either is reported as "the probe is not churning", which is what it would actually mean.
+/// **Which of the two a given worker leaves behind is the probe's decision, not the collector's**
+/// (TEST-19, [#54](https://github.com/YgorPerez/java-debugging-mcp/issues/54)). A JDWP object id is a weak
+/// reference, so a retired worker's `Thread` is unreachable the moment it exits and the probe's explicit
+/// collector then invalidates the id — state (2). `ChurnProbe` *holds* every second retirement's `Thread`
+/// so that it cannot go that way, which is state (1). Both populations therefore exist by construction,
+/// alternating in creation order, and the only thing a dump still has to do is overlap some deaths.
+///
+/// It used to be the collector's decision, and that was the flake. Which state a dump found depended on
+/// where each death fell between `AllThreads` and the next `System.gc()`, i.e. on **how long the dump
+/// took** — so a loaded JDK 11 run, where the same dump costs ~950ms instead of ~500ms, found every
+/// listed worker already collected and no `[zombie]` at all, roughly three runs in five. Twelve attempts
+/// did not help, because a slower dump made every attempt worse in the same direction. Now a slower dump
+/// overlaps *more* deaths and finds more of both, which is the failure mode the right way round.
 ///
 /// Both of those states were originally pinned as WRONG rather than fixed, because a test that reaches a
 /// line and asserts nothing about it is how this repo has previously reported coverage it had not looked
@@ -4866,20 +4888,44 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
     let mut server = Server::start().expect("start server");
     server.attach(relay.port);
 
-    // A whole generation of workers must have turned over before anything is asserted: at
-    // `SLOTS / LIFE_MS` a first tick can arrive before any churn worker has retired at all, and a dump
+    // Both preconditions, read off the debuggee's own heartbeat rather than inferred from how long
+    // anything took (TEST-19, #54).
+    //
+    // `retired >= 48`: a whole generation of workers must have turned over before anything is asserted —
+    // at `SLOTS / LIFE_MS` a first tick can arrive before any churn worker has retired at all, and a dump
     // taken then would be a dump of a perfectly stable JVM.
-    probe.wait_for_line(EVENT_TIMEOUT, |l| churn_retired(l).is_some_and(|n| n >= 48)).unwrap_or_else(|| {
-        panic!("the pool never retired a full generation\n  output: {:?}", probe.output())
-    });
+    //
+    // `held > 0`: the probe is holding at least one *finished* worker's `Thread`, so at least one thread
+    // exists that the debugger can list, watch end, and still resolve. That is exactly the state the
+    // `[zombie]` half below asserts against, and it is not a state a debugger can ask about — it is a
+    // property of the debuggee's reference graph, so racing for it is the only alternative to being told.
+    // The probe tells. Which is why a failure below is now a statement about `collect_dump_rows` and not
+    // about the host's timing.
+    let heartbeat = probe
+        .wait_for_line(EVENT_TIMEOUT, |l| {
+            churn_retired(l).is_some_and(|n| n >= 48) && churn_held(l).is_some_and(|n| n > 0)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the pool never reached a full retired generation with a held worker in it\n  output: {:?}",
+                probe.output()
+            )
+        });
+    let held = churn_held(&heartbeat).unwrap_or_default();
 
     // `limit` is deliberately an order of magnitude above the thread count. It matters later: whatever
     // the dump ends up withholding, the caller's limit is provably not the reason.
     let ask = serde_json::json!({"limit": 500, "monitors": false, "max_frames": 3});
     let mut vanished_but_reported: Option<String> = None;
     let mut vanished_and_dropped: Option<String> = None;
+    // How many workers finished *while a dump was in flight*, summed over the attempts. The number that
+    // separates "the probe stopped churning" from "the probe churned and the dump did not notice" — two
+    // failures that used to be reported as the first one whichever had happened.
+    let mut retired_during_a_dump = 0_u64;
     for _ in 0..12 {
+        let before = churn_counter(&probe, churn_retired);
         let dump = server.call("debug.thread_dump", ask.clone());
+        retired_during_a_dump += churn_counter(&probe, churn_retired).saturating_sub(before);
 
         // Whatever the churn did, the reply is a whole reply about a JVM that still has its stable half.
         // This runs on every attempt, so a dump that fell apart under churn cannot hide behind one that
@@ -4916,9 +4962,22 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
 
     // --- (1) finished, still readable: reported as a row, with a status that says so ---
     let reported = vanished_but_reported.unwrap_or_else(|| {
+        assert!(
+            retired_during_a_dump > 0,
+            "twelve dumps and not one worker finished while any of them was running — ChurnProbe is not \
+             churning, so there was never a thread to catch vanishing\n  output: {:?}",
+            probe.output()
+        );
+        // Which leaves the interesting failure, and it is now unambiguous. Workers DID finish under these
+        // dumps, and the probe holds every second one's `Thread` so that finishing does not make it
+        // unreadable — for ~6s, against dumps that take a fraction of that. Whether the row appears is
+        // therefore no longer a question about GC timing or host load (TEST-19, #54): the JVM listed a
+        // thread, the thread ended, the id still resolves, and the dump did not say so.
         panic!(
-            "twelve dumps and no thread ever finished during one — ChurnProbe is not churning\n  \
-             output: {:?}",
+            "{retired_during_a_dump} worker(s) finished while these twelve dumps were reading, and the \
+             probe was holding {held} finished workers' Thread objects so their ids stay resolvable — yet \
+             no dump reported a [zombie] row. `collect_dump_rows` listed threads that then ended and did \
+             not report them as finished\n  output: {:?}",
             probe.output()
         )
     });
@@ -4949,8 +5008,10 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
     // --- (2) finished AND collected: the id is gone, so the row is dropped ---
     let dropped = vanished_and_dropped.unwrap_or_else(|| {
         panic!(
-            "twelve dumps and no thread id ever went stale mid-dump, so `collect_dump_rows`' dead-thread \
-             arm still has not executed — the probe's collector is not reclaiming retired workers\n  \
+            "twelve dumps, {retired_during_a_dump} worker(s) finished under them, and no thread id ever \
+             went stale mid-dump — so `collect_dump_rows`' dead-thread arm still has not executed. The \
+             odd-numbered half of the churn population is deliberately left unheld for this, so either \
+             the probe's collector is not reclaiming them or every one of them outlived its own read\n  \
              output: {:?}",
             probe.output()
         )
