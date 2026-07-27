@@ -908,7 +908,7 @@ above.
 | [#28](https://github.com/YgorPerez/java-debugging-mcp/issues/28) LINT-2 · P2 | The #18 gate's maintenance debt: a pinned toolchain with no bump trigger, and per-crate `clippy.toml` that a third crate would not have. | Item 1 is a policy call about cadence and noise tolerance; item 2's best fix depends on the answer. |
 
 **From a tool-surface comparison against [`d4n-sec/jdb-mcp`](https://github.com/d4n-sec/jdb-mcp)
-(2026-07-26) — six open.** A JDI-based Java debugger MCP server; the first batch here not produced by
+(2026-07-26) — five filed, one rejected.** A JDI-based Java debugger MCP server; the first batch not produced by
 reviewing this codebase. Eleven candidate features, six real gaps, and they share a theme worth stating
 plainly: **every stop point in this server is addressed by a name the caller has no way to look up.**
 Two of the six are the same shape METH-1/#16 found — implemented in `jdwp-client` and unreachable from
@@ -920,7 +920,7 @@ MCP. Each carries an agent brief.
 | [#30](https://github.com/YgorPerez/java-debugging-mcp/issues/30) DISC-2 · P2 · S | No method listing, so a caller composing `debug.evaluate` cannot see the parameter lists they are trying to satisfy — the most intricate part of this server, driven blind. | `ReferenceType.Methods` is implemented and already consumed internally by overload resolution. Left: the tool, and rendering JVM signatures as Java source types. |
 | [#31](https://github.com/YgorPerez/java-debugging-mcp/issues/31) DISC-3 · P2 · M | A stop point reports `class.method:412` and nothing can read line 412 — or confirm the local checkout is the deployed build, which is the assumption that wastes an hour mid-investigation. | All of it. No `ReferenceType.SourceFile` command exists; `Method.LineTable` gives numbers only. Two halves — ask the debuggee what it compiled from, then read it from source roots. |
 | [#32](https://github.com/YgorPerez/java-debugging-mcp/issues/32) EVT-2 · P2 · M | Hits are discoverable only by polling, so the watchdog's 120s budget burns while nobody is looking. MCP already has the mechanism. | The buffer stays regardless — notifications are best-effort. Constraints in the brief: suspension only (a traced hit at ~720/s would flood the transport), bounded repeats per SAFE-8/#8, and the watchdog's auto-disarm is worth pushing too. |
-| [#33](https://github.com/YgorPerez/java-debugging-mcp/issues/33) TRANS-1 · P3 · M | stdio-only. | **`needs-triage`, not agent-ready.** An HTTP listener has no trust boundary and this server executes code in the debuggee. Prior question is what it is *for* — `kubectl port-forward` already covers the remote case on the JDWP port, and a negative answer closes it. |
+| ❌ [#33](https://github.com/YgorPerez/java-debugging-mcp/issues/33) TRANS-1 · P3 · M | stdio-only. | **Closed `wontfix`** — see `.out-of-scope/http-transport.md`. The "what is it *for*" question did have an answer, and it was not HTTP: co-locating the debugger with the debuggee, because TRACE-6's ~720 hits/s is a round-trip limit. Running the stdio binary near the JVM buys that for nothing. What killed it is that client lifetime **is** session lifetime here — SAFE-1's disconnect and EVT-2's single writer both assume it — so an HTTP client closing its laptop mid-suspension makes the watchdog load-bearing for routine disconnects. |
 | [#34](https://github.com/YgorPerez/java-debugging-mcp/issues/34) REL-1 · P3 · S | Installing needs a Rust toolchain, which hands back most of the no-JVM argument for writing JDWP natively — a Java developer is the person least likely to have `cargo`. | All of it. No release workflow exists; `Cargo.toml` already carries the metadata. Should reuse the existing toolchain pinning rather than adding a second, per LINT-2/#28. |
 
 **From TEST-8's method — three open.** #24 was labelled `ready-for-human` because it needed the shared
@@ -935,10 +935,13 @@ coverage review had called unreachable through this tool's own API. These are th
 | [#36](https://github.com/YgorPerez/java-debugging-mcp/issues/36) TEST-11 · P2 · S | The suite runs on JDK 21; **the 8180 runs JDK 11**, and nothing had ever run against it. | **Answered, and it found something on the first run.** 50 of 53 tests failed on 11 — not a JDWP difference but `javac` reading source in the platform charset before JEP 400, so every probe comment with an em dash failed to compile. One `-encoding UTF-8` later: **53/53 green on 11 and on 21**, so there is no incompatibility to fix. Left: the CI matrix that keeps it that way. A matrix still can**not** reach the `JDWP < 1.6` path — JDWP tracks the JDK, so 11 speaks 1.11; that needs `FaultRelay` or #37. |
 | [#37](https://github.com/YgorPerez/java-debugging-mcp/issues/37) TEST-12 · P2 · M | #24's residue is one human dump against the real instance, after which the evidence evaporates. Recording the JDWP stream once turns that visit into a permanent CI fixture — replayable with no JVM and no access, and hand-editable into shapes nothing can produce. | The machinery, tested against probe recordings first. `FaultRelay` already frames JDWP; this is the third user of that framing and the point to unify the two proxies rather than add a third. |
 
-The comparison also produced one **rejection**, recorded in `.out-of-scope/method-entry-events.md`
-rather than filed: `METHOD_ENTRY` stays unarmed for the reasons METH-1/#16 settled — it fires on every
-method of every matching class, and the caller chain from TRACE-5/#14 answers the same question at one
-site without suspending. Four other candidates were checked against the code and not filed at all:
+The comparison also produced two **rejections**, both recorded in `.out-of-scope/` so the reasoning
+outlives the issues. `method-entry-events.md`: `METHOD_ENTRY` stays unarmed for the reasons METH-1/#16
+settled — it fires on every method of every matching class, and the caller chain from TRACE-5/#14
+answers the same question at one site without suspending. `http-transport.md`: TRANS-1/#33 above, where
+the recorded part worth keeping is the *motivation* — latency to the debuggee — since that is what
+would legitimately reopen it, and it has a cheaper answer than a second transport.
+Four other candidates were checked against the code and not filed at all:
 `smartStep` (already the last-hit-thread default), JDK 7 support (n/a on the wire protocol),
 `get_output`/`send_input` (no process handle on an attach-only connection — dead code upstream too),
 and bilingual docs.
