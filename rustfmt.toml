@@ -1,0 +1,20 @@
+# Formatting is rustfmt's job as of LINT-4 (#44). Before this file, running the single most reflexive
+# pre-commit command in Rust rewrote 37 files and 5,000-odd lines, because the tree was hand-formatted and
+# nothing said so. That is a trap rather than a preference: `cargo fmt` still compiles, still passes, and
+# buries whatever change you actually made. It was hit during the #24 work — a two-file documentation edit
+# came back as a whole-repo diff.
+#
+# Both numbers below were measured against the tree as it stood, not chosen from taste:
+#
+#   max_width = 110          the code's own p99 line length is 110. Only 108 code lines in the workspace
+#                            exceeded it and only 3 comment lines did, so this is the width the codebase
+#                            was already being written to by hand.
+#   use_small_heuristics      "Max" reproduces the existing dense style; the default exploded it.
+#                            Measured: 1,737 insertions against 4,949 for the default at the same width.
+#
+# What this deliberately does NOT do: reflow comments. `wrap_comments` is nightly-only and stays off, so
+# the narrative doc comments that carry most of this repo's reasoning are untouched — the longest line in
+# the workspace is a 391-character comment and it survives `cargo fmt` unchanged. That was the one real
+# cost of adopting a formatter here, and it turned out not to be a cost at all.
+max_width = 110
+use_small_heuristics = "Max"
