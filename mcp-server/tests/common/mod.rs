@@ -683,7 +683,8 @@ fn read_frames(mut from: std::net::TcpStream, mut on_frame: impl FnMut(Frame<'_>
 }
 
 /// Copy one framed direction, giving `transform` the chance to substitute each packet. `None` forwards the
-/// original untouched, which is what every packet nobody is interested in gets.
+/// original untouched, which is what every packet nobody is interested in gets. The handshake is always
+/// forwarded as it arrived — it is fourteen fixed bytes and there is nothing in it to change.
 ///
 /// The returned flag goes `true` when this direction has ended — the recorder needs to know the debugger
 /// has hung up before it writes a cassette, and the alternative (guessing with a sleep) is how a recording
@@ -697,7 +698,6 @@ fn pump_framed(
     let flag = Arc::clone(&finished);
     std::thread::spawn(move || {
         read_frames(from, |frame| match frame {
-            // Requests are never modified: the debugger's own traffic is not what is under test.
             Frame::Handshake(b) => std::io::Write::write_all(&mut to, b).is_ok(),
             Frame::Packet(p) => {
                 let out = transform(p);
@@ -710,17 +710,17 @@ fn pump_framed(
     finished
 }
 
-/// What a framing proxy sees coming back from the debuggee.
-///
-/// The distinction is the whole reason framing is needed. A reply names no command — only the id it
-/// answers — so pairing it with the request that went the other way is the only way to know what it is a
-/// reply *to*. An event names no id of ours at all, because nobody asked for it.
 /// Requests still waiting for their reply: id → the command it was, and the payload it carried.
 ///
 /// Shared by both directions of a framing proxy — written by the request pump, taken by the reply pump —
 /// which is why it is behind an `Arc<Mutex<…>>` rather than owned by either.
 type Pending = Arc<Mutex<std::collections::HashMap<u32, (u8, u8, Vec<u8>)>>>;
 
+/// What a framing proxy sees coming back from the debuggee.
+///
+/// The distinction is the whole reason framing is needed. A reply names no command — only the id it
+/// answers — so pairing it with the request that went the other way is the only way to know what it is a
+/// reply *to*. An event names no id of ours at all, because nobody asked for it.
 enum FromDebuggee<'a> {
     /// A reply, with the `(command set, command)` and request payload it answers.
     Reply { command: (u8, u8), request: &'a [u8], reply: &'a [u8] },
