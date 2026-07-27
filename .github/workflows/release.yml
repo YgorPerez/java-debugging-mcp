@@ -1,0 +1,205 @@
+name: release
+
+# Builds `jdwp-mcp` for the platforms this project is actually used from and attaches the binaries to a
+# GitHub release, so installing needs no Rust toolchain (REL-1, #34).
+#
+# The job order is the safety property, not a preference:
+#   version -> {gate-tests, gate-lint, build} -> release
+# `version` is toolchain-free and finishes in seconds, so a tag that disagrees with the manifest costs
+# nothing and, more importantly, cannot reach a job that publishes. `release` is the only job able to
+# write to the repository and it waits on both gates.
+#
+# The gates are CALLED here rather than assumed to have run: tests.yml and rust-doctor.yml trigger on
+# push-to-main and pull_request, so a tag ref fires neither. Without this a tag placed on a commit that
+# never faced them — or on a branch that never merged — would publish in silence.
+
+on:
+  push:
+    # Deliberately loose: the `version` job below is the real check, and a tag that gets this far only to
+    # be rejected there produces a visible failure, whereas a tag that misses a strict filter produces
+    # nothing at all and looks like the workflow is broken.
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # NOT cancel-in-progress, unlike every other workflow here. Cancelling mid-upload leaves a published
+  # release carrying a subset of its assets and a SHA256SUMS that lists files nobody can download; a
+  # duplicate run is the cheaper failure.
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Tag agrees with the manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # [workspace.package].version is the single source of truth and the tag is a claim about it. Read
+      # the TOML directly rather than asking cargo: it keeps the first job free of a toolchain install,
+      # which is what makes it cheap enough to run before everything else. tomllib is stdlib as of
+      # Python 3.11 and the ubuntu runner image ships 3.12.
+      - name: Compare the tag against [workspace.package].version
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, sys, tomllib
+          tag = os.environ["GITHUB_REF_NAME"]
+          with open("Cargo.toml", "rb") as f:
+              manifest = tomllib.load(f)["workspace"]["package"]["version"]
+          if tag != f"v{manifest}":
+              print(f"::error::Tag {tag} does not match [workspace.package].version {manifest}. "
+                    f"Either the tag should be v{manifest}, or Cargo.toml was never bumped. "
+                    f"Nothing has been built or published.")
+              sys.exit(1)
+          print(f"{tag} matches [workspace.package].version = {manifest}")
+          PY
+
+  # Re-running the gates costs a few minutes and buys the guarantee the acceptance criteria ask for: the
+  # release is bound to the gate's verdict for THIS commit, not to whatever happened to be green on main
+  # when the tag was cut.
+  gate-tests:
+    name: Gate (tests)
+    needs: version
+    uses: ./.github/workflows/tests.yml
+
+  gate-lint:
+    name: Gate (lint)
+    needs: version
+    uses: ./.github/workflows/rust-doctor.yml
+    # security-events: write is rust-doctor.yml's own requirement — it publishes its SARIF to code
+    # scanning — and is granted to this job alone. The job that can write to the repository is `release`,
+    # and it carries contents: write and nothing else.
+    permissions:
+      contents: read
+      security-events: write
+
+  build:
+    name: ${{ matrix.name }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One platform failing should not hide whether the others would have built; with `needs` on the
+      # release job a partial matrix still cannot publish.
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          # Both macOS slices are cross-compiled from the arm64 runner. macos-13 is the only Intel image
+          # left and it is on a retirement clock; the Apple SDK on the arm64 image targets both
+          # architectures, and nothing here is tested at release time anyway — the gates above already
+          # ran the suite.
+          - name: macos-aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+    steps:
+      - uses: actions/checkout@v4
+
+      # `@stable`, matching tests.yml and coverage.yml — NOT rust-doctor.yml's "1.97.1". That pin exists
+      # for exactly one reason (#18): rust-doctor fails the build on clippy warnings, so a new lint in a
+      # newer toolchain would break code nobody touched. This job compiles and gates on nothing, so a
+      # second pinned version number here would buy no safety and add a second thing to remember to bump
+      # — the maintenance hazard LINT-2 (#28) is about.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # rust-cache keys on job and host, not on --target, so without this the two macOS slices share
+          # the arm64 runner's cache entry and fight over it.
+          key: ${{ matrix.target }}
+
+      # GLIBC: the Linux slice is static musl, not glibc, and that is a deliberate answer to where these
+      # binaries run. This debugger attaches to Java app servers, which are routinely older than a GitHub
+      # runner image; a glibc build carries a hard floor and dies on anything older with
+      # `version 'GLIBC_2.xx' not found`. Choosing an older runner image only lowers that floor, and puts
+      # the choice on a deprecation clock. musl removes the floor: crt-static is the default for this
+      # target, so the result depends on the kernel and nothing else. The workspace is pure Rust down to
+      # libc (serde/serde_json/tokio/tracing/bytes/schemars — no -sys crate in Cargo.lock), so there is
+      # no C dependency to fight, and musl's slower allocator does not matter to a process that spends
+      # its life blocked on a socket.
+      #
+      # rustc drives this target's link through the runner's `cc` using its own bundled crt objects, so a
+      # pure-Rust build most likely needs nothing extra; musl-gcc is installed regardless because one apt
+      # line is cheaper than finding out otherwise during a release.
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # --locked: Cargo.lock is committed, and a release is the one build where resolving something newer
+      # than what the gates just tested is unacceptable. -p jdwp-mcp keeps the examples and the client's
+      # dev-dependencies out of a build whose only output is one binary.
+      - name: Build jdwp-mcp
+        run: cargo build --release --locked --target ${{ matrix.target }} -p jdwp-mcp
+
+      # Named for the person downloading it. Every platform's binary is `jdwp-mcp` inside target/, which
+      # collides the moment they land in one directory, and a target triple answers the question only if
+      # you already know how to read one.
+      - name: Name the artifact for a human
+        shell: bash
+        run: |
+          asset="jdwp-mcp-${GITHUB_REF_NAME}-${{ matrix.name }}${{ matrix.ext }}"
+          mv "target/${{ matrix.target }}/release/jdwp-mcp${{ matrix.ext }}" "$asset"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: [version, gate-tests, gate-lint, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload its assets; nothing else is needed
+    steps:
+      - name: Collect every platform's binary
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true # flatten the per-matrix directories into one upload set
+
+      # One SHA256SUMS over all of them rather than a .sha256 beside each: that is the form
+      # `sha256sum -c SHA256SUMS` consumes directly. The glob is explicit so the file cannot list itself.
+      - name: Checksum the assets
+        shell: bash
+        working-directory: dist
+        run: |
+          sha256sum jdwp-mcp-* > SHA256SUMS
+          cat SHA256SUMS
+
+      # --verify-tag matters more than it looks: without it `gh release create` happily CREATES a tag
+      # that does not exist, so a typo would publish a release pointing at the default branch instead of
+      # failing. --prerelease for anything with a hyphen in the version keeps an rc out of
+      # /releases/latest, which is what unattended installers follow.
+      - name: Create the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job deliberately does not check out the repo — it only needs the built artifacts. That
+          # leaves `gh` with no git remote to infer the target from, so name it explicitly; without this
+          # the publish step fails at the very end of an otherwise successful release.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          flags=(--verify-tag --generate-notes --title "$GITHUB_REF_NAME")
+          case "$GITHUB_REF_NAME" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}" dist/*
