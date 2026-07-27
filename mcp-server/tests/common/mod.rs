@@ -528,9 +528,12 @@ impl Relay {
                     return;
                 }
                 let Ok(client) = incoming else { return };
-                // dt_socket with server=y accepts one connection, so there is exactly one of these per
-                // probe; connecting lazily (here, not at start) keeps the probe's single slot free until
-                // the debugger actually attaches.
+                // dt_socket with server=y serves one HANDSHAKED session at a time — it closes its
+                // listener for the life of that session and re-opens it when the session ends (measured
+                // on JDK 11/21/25 in TEST-20, #55; it is not the "one connection, ever" the comment here
+                // used to claim). So connecting lazily — here, not at start — keeps the probe's single
+                // slot free until the debugger actually attaches, and keeps the relay from being the
+                // thing that shuts the listener.
                 let server = match target_port {
                     Some(p) => match std::net::TcpStream::connect(("127.0.0.1", p)) {
                         Ok(s) => Some(s),
@@ -1066,18 +1069,49 @@ impl Probe {
         Ok(probe)
     }
 
-    /// Block until the JDWP port accepts a connection, so `debug.attach` can't lose the race with a
+    /// Block until the JDWP agent says it is listening, so `debug.attach` can't lose the race with a
     /// still-starting JVM.
+    ///
+    /// **Readiness is read from the agent's own banner rather than by dialling the port**, and the
+    /// difference is not stylistic. This used to prove the port was up with a `TcpStream::connect` whose
+    /// result was dropped on the spot, under a comment claiming that `dt_socket` with `server=y` "accepts
+    /// ONE connection then stops listening, so that probe connection is the one the server will use". Both
+    /// halves were wrong, and TEST-20 (#55) measured it: connect, close, connect again and complete a
+    /// handshake works on JDK 11, 21 and 25 alike, because the agent only stops listening once a debugger
+    /// has finished a **handshake**, and starts again when that session ends. A connection that never
+    /// speaks JDWP costs it nothing.
+    ///
+    /// What it did cost was the truth of every probe's captured output. A connect that closes without
+    /// handshaking makes the agent print
+    ///
+    /// ```text
+    /// Debugger failed to attach: handshake failed - connection prematurally closed
+    /// ```
+    ///
+    /// to the JVM's stderr — the JDK's own typo — and `pump` folds stderr into the same buffer the tests
+    /// assert over and print on failure. So every probe in the suite carried a line saying the debugger
+    /// had failed to attach, moments before it attached perfectly well. #55 was filed on that line, read
+    /// from `ChurnProbe`'s log as evidence of a real attach failure. Readiness that says nothing to the
+    /// agent leaves the log honest.
+    ///
+    /// The banner is printed by the agent immediately after `listen()` returns and before any client can
+    /// be accepted, so it is if anything *earlier* than the old 100ms connect poll could notice. It is
+    /// suppressed by the agent's `quiet=y` option, which is exactly why [`launch_built_by`] owns the agent
+    /// argument and does not pass it.
+    ///
+    /// One thing it can do that a connect cannot: a connect proves only that **something** answers on that
+    /// port, and [`free_port`] documents that something else may have taken it before the JVM got there.
+    /// This reads the port out of *this* JVM's own banner, so a probe whose agent lost that race now waits
+    /// out the timeout and reports what the JVM said — including a bind failure — instead of pronouncing a
+    /// stranger's listener ready and handing `debug.attach` the wrong JVM.
     fn wait_until_listening(&self) -> Result<(), String> {
         let started = Instant::now();
-        let deadline = started + Self::PROBE_LISTEN_TIMEOUT;
-        while Instant::now() < deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
-                // dt_socket with server=y accepts ONE connection then stops listening, so that probe
-                // connection is the one the server will use — hand the port over immediately.
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(100));
+        // Deliberately not matched against the whole line: JDK 11 prints the bare port where later ones
+        // may print `host:port`, and the transport name is the agent's to spell.
+        let port = self.port.to_string();
+        let banner = |l: &str| l.starts_with("Listening for transport ") && l.trim_end().ends_with(&port);
+        if self.wait_for_line(Self::PROBE_LISTEN_TIMEOUT, banner).is_some() {
+            return Ok(());
         }
 
         // Say what the probe said. The reader threads have been capturing stdout AND stderr this whole
@@ -1093,13 +1127,16 @@ impl Probe {
             format!("it printed:\n  {}", tail.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n  "))
         };
         Err(format!(
-            "probe never listened on port {} within {:?} (waited {:?}) — {said}\n\
+            "probe never announced a JDWP listener on port {} within {:?} (waited {:?}) — {said}\n\
+             Expected a line like `Listening for transport dt_socket at address: {}` from the agent \
+             itself.\n\
              If it printed nothing, the JVM is probably just slow to start rather than broken: on \
              Windows a first run after a JDK is installed or updated can spend longer than this being \
              scanned by Defender, and the same probe then launches in ~1s once warm.",
             self.port,
             Self::PROBE_LISTEN_TIMEOUT,
             started.elapsed(),
+            self.port,
         ))
     }
 
