@@ -4289,7 +4289,14 @@ fn a_contended_lock_names_its_real_holder_out_of_four() {
     probe
         .wait_for_line(EVENT_TIMEOUT, |l| l.contains("armed"))
         .unwrap_or_else(|| panic!("the probe never got all waiters blocked\n  output: {:?}", probe.output()));
-    let base = highest_tick(&probe).expect("no tick to count from");
+    // `armed` is printed BEFORE the first tick, so the heartbeat has to be waited for separately rather
+    // than assumed to exist by now. Taking the baseline straight off `armed` passed every time this test
+    // was run on its own and failed the first time it ran alongside 59 others, which is the whole reason
+    // the tick baseline is read from a line that has actually arrived.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some())
+        .unwrap_or_else(|| panic!("the probe never ticked after arming\n  output: {:?}", probe.output()));
+    let base = highest_tick(&probe).expect("a tick line just arrived");
 
     // monitors_only: the lock graph is the entire question here, and 52 stacks would be another test's
     // worth of suspension for nothing this one reads.
@@ -4417,6 +4424,13 @@ fn synthetic_frames_render_with_names_a_reader_can_act_on() {
     probe
         .wait_for_line(EVENT_TIMEOUT, |l| l.contains("parked"))
         .unwrap_or_else(|| panic!("the worker never parked\n  output: {:?}", probe.output()));
+    // Both of these must happen BEFORE the pause below. `parked` is printed before the first tick, and
+    // the pause freezes the thread that prints them — so a baseline taken after it would be read from a
+    // probe that can no longer produce the line it is waiting for.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some())
+        .unwrap_or_else(|| panic!("the probe never ticked\n  output: {:?}", probe.output()));
+    let base = highest_tick(&probe).expect("a tick line just arrived");
 
     let tid = thread_hex_for(&mut server, "synthetic-worker")
         .unwrap_or_else(|| panic!("no synthetic-worker thread"));
@@ -4520,11 +4534,161 @@ fn synthetic_frames_render_with_names_a_reader_can_act_on() {
         "the dump and get_stack must spell a hidden class the same way:\n{dump}"
     );
 
-    let base = highest_tick(&probe).expect("no tick to count from");
     server.panic_reset();
     assert!(
         probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 1)).is_some(),
         "the probe stopped ticking after the pause was released\n  output: {:?}",
+        probe.output(),
+    );
+}
+
+/// The right-hand side of a `debug.evaluate` reply — `PrimitiveProbe.sByte = (byte) -7` → `(byte) -7`.
+fn evaluated(reply: &str) -> &str {
+    reply.split_once(" = ").map_or(reply, |(_, v)| v).trim()
+}
+
+/// TEST-10 (#35): every Java primitive, and an array of every Java primitive, read as a local, as a
+/// static field and as an instance field — and rendered identically by all three.
+///
+/// `jdwp-client/src/types.rs` measured 16.67% region coverage, and the coverage review's verdict was "one
+/// big match over value kinds and most arms are for types the probes never produce — low percentage, not
+/// a finding". That was true *because of the probes*: the suite deals in `int`, `String` and objects, so
+/// `byte`, `short`, `char`, `float` and `boolean` had never once come back over the wire in a test. A
+/// renderer nobody has run is not a renderer whose output anyone knows.
+///
+/// **The arrays are the half that matters, and not for symmetry.** `handlers.rs` renders a bare primitive
+/// with its own private copy of the match (`render_primitive`); the copy in `types.rs` — `Value::format`,
+/// the one that measured 16.67% — is reached only for ARRAY ELEMENTS and for the type-mismatch message.
+/// A probe with eight primitive locals and no arrays would exercise the duplicate and leave the original
+/// exactly as unmeasured as before, which is the kind of coverage that reports a number without having
+/// looked.
+///
+/// The values are picked so the rendering can be pinned rather than merely observed: signed extremes,
+/// which catch a width or signedness mistake that `3` never could, and floats that are exact binary
+/// fractions, so the expected string does not depend on anyone's rounding.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn every_primitive_and_its_array_renders_the_same_as_local_field_and_element() {
+    let Some(jdk) = jdk_or_skip("every_primitive_and_its_array_renders_the_same_as_local_field_and_element")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "PrimitiveProbe").expect("launch PrimitiveProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let source = probe_source("PrimitiveProbe");
+    let line = probe_line(&source, "// BP1");
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "PrimitiveProbe", "line": line}),
+    );
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("the breakpoint in PrimitiveProbe.work never fired"));
+
+    let stack = server.call(
+        "debug.get_stack",
+        serde_json::json!({"max_frames": 1, "include_variables": true}),
+    );
+
+    // `(local name, static field, instance field, rendered value)` — the same eight values reached three
+    // ways. Reading all three and comparing them is the point: they are three different resolution paths
+    // in the handlers, and a difference between them is a bug that no single-path test can see.
+    let scalars = [
+        ("b", "sByte", "b", "(byte) -7"),
+        ("s", "sShort", "s", "(short) -300"),
+        ("c", "sChar", "c", "(char) 'Q'"),
+        ("i", "sInt", "i", "(int) -2147483648"),
+        ("j", "sLong", "j", "(long) 9000000000"),
+        ("f", "sFloat", "f", "(float) 1.5"),
+        ("d", "sDouble", "d", "(double) -2.25"),
+        ("z", "sBoolean", "z", "(boolean) true"),
+    ];
+    // And the arrays, which are the only route to `Value::format`. Every element carries its own type
+    // prefix, so a `short[]` read as an `int[]` would be visible here rather than plausible.
+    let arrays = [
+        ("bs", "sBytes", "bs", "byte[3]{(byte) 1, (byte) -2, (byte) 127}"),
+        ("ss", "sShorts", "ss", "short[3]{(short) -300, (short) 0, (short) 300}"),
+        ("cs", "sChars", "cs", "char[3]{(char) 'a', (char) 'Z', (char) '?'}"),
+        ("is", "sInts", "is", "int[3]{(int) 0, (int) -1, (int) 2147483647}"),
+        ("js", "sLongs", "js", "long[2]{(long) -9000000000, (long) 9000000000}"),
+        ("fs", "sFloats", "fs", "float[2]{(float) 0.5, (float) -1.25}"),
+        ("ds", "sDoubles", "ds", "double[2]{(double) 2.5, (double) -0.125}"),
+        ("zs", "sBooleans", "zs", "boolean[2]{(boolean) true, (boolean) false}"),
+    ];
+
+    for (local, static_field, instance_field, want) in scalars.iter().chain(arrays.iter()) {
+        assert!(
+            stack.contains(&format!("{local} = {want}")),
+            "the local `{local}` must render as `{want}`:\n{stack}"
+        );
+        let by_static = server.evaluate(&format!("PrimitiveProbe.{static_field}"));
+        assert_eq!(
+            evaluated(&by_static),
+            *want,
+            "the static field `{static_field}` holds the same value as the local `{local}` and must \
+             render the same way; got {by_static}"
+        );
+        let by_instance = server.evaluate(&format!("PrimitiveProbe.holder.{instance_field}"));
+        assert_eq!(
+            evaluated(&by_instance),
+            *want,
+            "the instance field `holder.{instance_field}` holds the same value and must render the same \
+             way; got {by_instance}"
+        );
+    }
+
+    // FINDING, pinned. `chars[2]` is `(char) 0xD800`, a lone surrogate — an ordinary thing to find in a
+    // Java `char[]`, since a `char` is a UTF-16 code unit and not a Unicode scalar value. It is not
+    // representable as a Rust `char`, so the renderer's `unwrap_or('?')` fires and it comes back as
+    // `(char) '?'` — byte-identical to a real question mark, and there is nothing in the reply to tell
+    // the two apart. The array above pins it; this says what it means.
+    assert!(
+        stack.contains("(char) 'Z', (char) '?'"),
+        "a lone surrogate must be rendered somehow, and the current somehow is indistinguishable from a \
+         literal '?':\n{stack}"
+    );
+    let real_question_mark = server.evaluate("PrimitiveProbe.sChars[1]");
+    assert_eq!(
+        evaluated(&real_question_mark),
+        "(char) 'Z'",
+        "sanity: element 1 is a Z, so the '?' above came from element 2 and not from a failed read"
+    );
+
+    // The other route into `Value::format`: the type-mismatch message renders the value that was refused.
+    // Both object shapes go through it, and neither is reachable from an array of primitives.
+    let null_into_int = server.call(
+        "debug.set_value",
+        serde_json::json!({"target": "PrimitiveProbe.sInt", "value": "null"}),
+    );
+    assert_contains_all(
+        "null refused for an int, showing what was refused",
+        &null_into_int,
+        &["is declared int", "(object) null", "not assignable"],
+    );
+    let string_into_int = server.call(
+        "debug.set_value",
+        serde_json::json!({"target": "PrimitiveProbe.sInt", "value": "\"nope\""}),
+    );
+    assert_contains_all(
+        "a reference refused for an int, showing its id",
+        &string_into_int,
+        &["is declared int", "(object) @", "not assignable"],
+    );
+    // Refused means refused: the field still holds what it did, so the loop above is describing the same
+    // JVM the assertions below would see.
+    assert_eq!(
+        evaluated(&server.evaluate("PrimitiveProbe.sInt")),
+        "(int) -2147483648",
+        "a refused set_value must not have written anything"
+    );
+
+    let base = highest_tick(&probe).unwrap_or(0);
+    server.panic_reset();
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 1)).is_some(),
+        "the probe stopped ticking after the breakpoint was cleared\n  output: {:?}",
         probe.output(),
     );
 }
