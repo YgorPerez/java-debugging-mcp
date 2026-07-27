@@ -988,6 +988,20 @@ Four other candidates were checked against the code and not filed at all:
 `get_output`/`send_input` (no process handle on an attach-only connection — dead code upstream too),
 and bilingual docs.
 
+### The flake family (TEST-16/19/20/21) — one open
+
+Four intermittent failures accumulated in this suite, and #38's lesson is why they were worth chasing as a
+group rather than tuning one at a time: *a suite with known-flaky members trains everyone to re-run on
+red, which is how a real regression gets waved through.* Three are closed and the fourth is the only one
+whose cause has never been captured.
+
+| issue | why it exists | what is actually left |
+| --- | --- | --- |
+| [#54](https://github.com/YgorPerez/java-debugging-mcp/issues/54) TEST-19 · P2 · S | `a_dump_of_a_churning_pool_…` failed ~3 runs in 5 on JDK 11 under load: the `[zombie]` state it asserts existed only between a worker's death and the next `System.gc()`, so **which of two states a dump saw was a function of how long the dump took** — #43's recorded "worker lifetime tracks dump length" coupling, one turn on. Instrumented: ~500ms/5-6 zombies idle, ~950ms/**zero** under 32 CPU hogs. | **Fixed** (2026-07-27). `ChurnProbe` now holds every second retirement's `Thread` in a bounded 512-slot ring, so a held worker answers `ZOMBIE` and an unheld one is collected and drops its row — **both states exist by construction**, alternating in creation order. No bound widened, no retry added: `LIFE_MS`, `SLOTS` and the twelve attempts are unchanged, and the failure mode is inverted (a slower dump now finds more of *both*). Paired A/B under 32 hogs: before 4 pass/8 fail, after 12/0. Left: nothing. |
+| [#55](https://github.com/YgorPerez/java-debugging-mcp/issues/55) TEST-20 · P2 · S | Filed as a hypothesis: the readiness probe looked like it was spending `dt_socket`'s single accept, and might be behind three flakes. | **Rejected, and fixed anyway** (2026-07-27). Measured on JDK 11/21/25: the agent serves one *handshaked session* at a time and re-listens after it ends, so a connection that never speaks JDWP costs it nothing. But the connect-and-drop made every probe print `Debugger failed to attach: handshake failed…` into the buffer tests dump on failure — **the harness was forging the evidence this issue was filed on**. Readiness now reads the agent's own banner. It explained none of #45/#54, and its earliness exposed two tests living on ~50ms of accidental slack (fixed in `ed87a29`). Left: nothing. |
+| [#56](https://github.com/YgorPerez/java-debugging-mcp/issues/56) TEST-21 · P3 · S | Split out of #55, which cleared its own suspect and left this one standing: attach intermittently fails `Connection refused`, reproduced on the *unmodified* harness. | **Open.** #55 narrowed it to two mechanisms — a live handshaked session provably refuses a second connection, and `free_port`'s documented TOCTOU — and left a diagnostic: since readiness now reads *this* JVM's banner naming *this* port, a lost `free_port` race should now present as a readiness timeout quoting the JVM rather than a refusal at attach. **The next sighting distinguishes them for free**, which is why this is filed rather than patched. |
+| [#45](https://github.com/YgorPerez/java-debugging-mcp/issues/45) TEST-16 · P2 · S | `force_return` fails ~1 run in 24 and **its cause was never captured** — the reason it sat unassigned while the others were worked. | **In progress** (2026-07-27). #55 ran it 60/60 without a failure, so repetition alone is not enough; what changed is that #54 proved synthetic CPU load reproduces this suite's timing flakes on demand (0-in-8 → 8-in-12 at 32 hogs), and that post-`4034628` logs no longer carry #55's forged attach-failure line. Capture first, diagnose second — "could not reproduce, here is the instrumentation that would catch it next time" is an acceptable outcome. |
+
 A **fifth** review found three more, shipped as issues
 [#7–#9](https://github.com/YgorPerez/java-debugging-mcp/issues?q=is%3Aissue). The headline one was
 verified against a real JVM before being filed, not reasoned about:
