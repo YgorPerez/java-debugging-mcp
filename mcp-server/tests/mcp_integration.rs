@@ -3927,9 +3927,15 @@ fn list_classes_finds_loaded_types_and_bounds_the_answer() {
     );
     assert!(arrays.contains("[]"), "include_arrays must surface array types: {arrays}");
 
-    // Nothing matched must not read as "no such class" — the JVM only knows what it has loaded.
+    // Nothing matched must not read as "no such class" — the JVM only knows what it has loaded. Three
+    // readings rather than two since SIG-1 (#46): the tool's own spelling of a name is the third thing
+    // that can be wrong, and a miss it cannot resolve has to say so instead of picking one.
     let absent = server.call("debug.list_classes", serde_json::json!({"filter": "com.nosuch.*"}));
-    assert_contains_all("absent class", &absent, &["Nothing matched", "not loaded yet"]);
+    assert_contains_all(
+        "absent class",
+        &absent,
+        &["Nothing matched", "not be loaded yet", "no such class", "spelled differently"],
+    );
 }
 
 /// DISC-2 (#30): a method listing the caller can compose a `debug.evaluate` call from, rather than
@@ -4618,15 +4624,28 @@ fn frame_line<'a>(stack: &'a str, needle: &str) -> Option<&'a str> {
 /// * `SyntheticProbe.lambda$lambdaStep$0:<line>` — the lambda's BODY is an ordinary method on the
 ///   enclosing class, named after the method it was written in, with a line of its own.
 ///
-/// The third is not fine, and it is pinned rather than fixed. The JVM names a lambda's hidden class
-/// `SyntheticProbe$$Lambda/0x00007f…`, where the `/` separates the class from a JVM-assigned address and
-/// is **not** a package separator. `decode_signature` replaces every `/` in a `L…;` signature with a
-/// `.`, because in a JNI signature that is what a `/` is — so what a caller is shown is
-/// `SyntheticProbe$$Lambda.0x00007f…`, a name the JVM does not use and will not answer to. It reads
-/// exactly like a class `0x00007f…` in a package `SyntheticProbe$$Lambda`, which is the kind of wrongness
-/// that gets acted on.
+/// The third was not fine, and SIG-1 (#46) fixed it. The JVM names a lambda's hidden class
+/// `SyntheticProbe$$Lambda/0x00007f…`, where the `/` separates the class from a JVM-assigned suffix and
+/// is **not** a package separator. `decode_signature` used to replace every `/` in a `L…;` signature with
+/// a `.`, because in a JNI signature that is what a `/` is — so a caller was shown
+/// `SyntheticProbe$$Lambda.0x00007f…`, which reads exactly like a class `0x00007f…` in a package
+/// `SyntheticProbe$$Lambda` and is a name the JVM will not answer to. Worse one step out:
+/// `debug.list_classes` decoded identically, so searching for the JVM's own spelling returned `0/0` and
+/// the miss was explained with *"a class the JVM has not loaded yet does not appear here at all"* — about
+/// three classes that were loaded and in the very list being searched.
+///
+/// **The suffix's shape is JDK-dependent and is deliberately not asserted here.** #36's matrix caught the
+/// original pinned assertion passing on JDK 21 and failing on JDK 11: 15+ produces a real hidden class
+/// with a hex address (`$$Lambda/0x0000000087040970`), 11 a VM-anonymous class with an ordinal and a
+/// plain decimal (`$$Lambda$3/397187020`). Pinning either spelling reproduces that failure the other way
+/// round. What holds on every JDK is the boundary — a `/`, followed by a suffix beginning with a digit,
+/// which no Java name may — and the round trip, which is the criterion that actually matters: the exact
+/// string a caller reads out of a stack, pasted back into `list_classes`, finds the class.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
+// The three constructs are one stack and one JVM, and the point of the test is what they look like side
+// by side — split across functions each half would relaunch the probe and could no longer compare.
+#[allow(clippy::too_many_lines)]
 fn synthetic_frames_render_with_names_a_reader_can_act_on() {
     let Some(jdk) = jdk_or_skip("synthetic_frames_render_with_names_a_reader_can_act_on") else { return };
     let probe = Probe::launch(&jdk, "SyntheticProbe").expect("launch SyntheticProbe");
@@ -4677,7 +4696,16 @@ fn synthetic_frames_render_with_names_a_reader_can_act_on() {
         "a method reference must reach the method it refers to, by name:\n{stack}"
     );
 
-    // --- the hidden classes, pinned exactly as they render ---
+    // The anonymous inner class again, from the other side: `SyntheticProbe$1` is separated by a `$`,
+    // never by a `/`, so `decode_signature` had nothing to get wrong about it and #46 changed nothing
+    // here. Confirmed rather than assumed, because "the other two were fine" is a claim.
+    let anon = server.call("debug.list_classes", serde_json::json!({"filter": "SyntheticProbe$1"}));
+    assert!(
+        anon.starts_with("1/1 class(es)") && anon.contains("SyntheticProbe$1"),
+        "an anonymous inner class is named with a `$` and must round-trip unchanged:\n{anon}"
+    );
+
+    // --- the hidden classes ---
     // Three of them: the lambda, the method reference, and the one `new Thread(SyntheticProbe::worker)`
     // created. Each is a frame in its own right, between the ordinary frames on either side.
     let hidden: Vec<&str> = stack.lines().map(str::trim).filter(|l| l.contains("$$Lambda")).collect();
@@ -4687,76 +4715,91 @@ fn synthetic_frames_render_with_names_a_reader_can_act_on() {
         "a lambda and a method reference each add a hidden-class frame of their own, and the thread's own \
          method reference adds a third:\n{stack}"
     );
-    // THE FINDING. `/` is not a package separator here, and every one of these is rendered as though it
-    // were. Both halves are asserted: what the caller IS shown, and that the JVM's own spelling never
-    // appears — so a fix that stops mangling the name flips this test rather than passing quietly.
+    // SIG-1 (#46). Asserted by SHAPE rather than by spelling, because the suffix is not stable across
+    // versions and the first draft of this test pinned JDK 21's — #36's matrix caught it on the 11 leg
+    // the day it landed, which is the whole reason the matrix exists:
     //
-    // Pinned on the SUBSTITUTION, not on either JDK's spelling of the suffix, because the suffix is not
-    // stable across versions and the first draft of this test pinned JDK 21's. CI caught it on the JDK 11
-    // leg the day the matrix landed (#36's first real find):
+    //   JDK 21:  SyntheticProbe$$Lambda/0x0000000092040970
+    //   JDK 11:  SyntheticProbe$$Lambda$3/574182878        <- ordinal, and decimal rather than hex
     //
-    //   JDK 21:  SyntheticProbe$$Lambda/0x0000000087040970
-    //   JDK 11:  SyntheticProbe$$Lambda$3/397187020        <- ordinal, and decimal rather than hex
-    //
-    // What both have in common is the `/`, and that is the whole bug: everything after it is a
-    // JVM-assigned suffix rather than package structure. So the assertion is "the `/` is gone" — true on
-    // every version, and it still flips the moment SIG-1 (#46) stops rewriting it.
+    // What both have in common is the boundary: a `/`, and after it a suffix the JVM assigned rather
+    // than package structure. That is the invariant, and it is what is asserted.
+    let mut rendered: Vec<&str> = Vec::new();
     for line in &hidden {
+        let named = line.split_once(".run")
+            .unwrap_or_else(|| panic!("a hidden-class frame is a call to its generated `run`: {line}")).0;
+        let class = named.split_once(' ')
+            .unwrap_or_else(|| panic!("a frame line starts with `#N `: {line}")).1;
+        let (owner, assigned) = class.rsplit_once('/').unwrap_or_else(|| {
+            panic!(
+                "a hidden class is named `<class>/<suffix the JVM assigned>` and the `/` must survive \
+                 into what a caller is shown — this is the SIG-1 (#46) regression: {line}"
+            )
+        });
         assert!(
-            !line.contains('/'),
-            "pinned: a hidden class currently renders with the JVM's `/` rewritten to `.`, which is not \
-             its name — if that has been fixed, this is the assertion that should tell you: {line}"
+            owner.contains("$$Lambda"),
+            "the part before the `/` is the class the JVM generated the lambda for: {line}"
         );
+        assert!(
+            assigned.as_bytes().first().is_some_and(u8::is_ascii_digit),
+            "the part after the `/` is a JVM-assigned suffix — hex on 15+, decimal on 11, a digit on \
+             both, which is exactly why no Java name can be mistaken for one: {line}"
+        );
+        // SyntheticProbe is in the default package, so its hidden classes have no package structure at
+        // all: any `.` left in the name is the old rewrite, whatever the JDK spelled the suffix as.
+        assert!(
+            !class.contains('.'),
+            "pinned the other way now: the JVM's `/` must NOT come back as a `.` — that name reads as a \
+             class in a package `SyntheticProbe$$Lambda` and the JVM will not answer to it: {line}"
+        );
+        rendered.push(class);
     }
-    let jvm_spelled: Vec<&str> =
-        stack.lines().map(str::trim).filter(|l| l.contains("$$Lambda") && l.contains('/')).collect();
-    assert!(
-        jvm_spelled.is_empty(),
-        "pinned: the JVM's own spelling of a hidden class does not survive decode_signature — these kept \
-         their `/`, which would mean the mangling is gone: {jvm_spelled:?}"
-    );
     // And it has no line number, because a hidden class has no line table — so the one frame a reader
     // cannot act on is also the one with nothing to look up.
-    let mangled = frame_line(&stack, "$$Lambda").expect("a hidden-class frame was found a moment ago");
-    let after_run = mangled.split(".run").nth(1).unwrap_or("!");
+    let generated = frame_line(&stack, "$$Lambda").expect("a hidden-class frame was found a moment ago");
+    let after_run = generated.split(".run").nth(1).unwrap_or("!");
     assert!(
         after_run.trim().is_empty(),
-        "a hidden class has no line table, so its frame must carry no line: {mangled}"
+        "a hidden class has no line table, so its frame must carry no line: {generated}"
     );
 
-    // The mangled name is at least CONSISTENT — `debug.list_classes` spells it the same way, so a name
-    // copied out of a stack finds the class again here. What it cannot do is leave this tool: the JVM's
-    // `Class.getName()`, a `-verbose:class` line, a jstack dump and a JDWP class pattern all use the `/`.
-    // Searched by the name THIS STACK PRINTED, lifted straight out of the frame, rather than by a spelling
-    // written into the test. That is what makes it a round trip: whatever the tool showed the caller is
-    // exactly what the caller pastes back. It is also the only version-independent way to ask — JDK 11
-    // renders `$$Lambda$3.574182878` where 21 renders `$$Lambda.0x...`, and an earlier draft of this
-    // assertion hardcoded the latter and failed the JDK 11 leg.
-    let shown = mangled.split(".run").next().unwrap_or_default().rsplit(' ').next().unwrap_or_default();
-    assert!(shown.contains("$$Lambda"), "expected a hidden-class frame to lift a name from: {mangled}");
-    let by_mangled = server.call("debug.list_classes", serde_json::json!({"filter": shown}));
+    // THE ROUND TRIP, which is the whole acceptance criterion: the exact string a caller reads out of the
+    // stack, pasted straight back in, finds the one class it names. Each hidden class's suffix is unique
+    // to it, so `1/1` is the honest expectation and not a lucky substring.
+    for class in &rendered {
+        let found = server.call("debug.list_classes", serde_json::json!({"filter": class}));
+        assert!(
+            found.starts_with("1/1 class(es)") && found.contains(class),
+            "a name this tool printed must find its class again when pasted back: {class}\n{found}"
+        );
+    }
+    // The prefix a human would type finds all three, and none of them is spelled the old way.
+    let by_prefix =
+        server.call("debug.list_classes", serde_json::json!({"filter": "SyntheticProbe$$Lambda"}));
     assert!(
-        by_mangled.contains(shown),
-        "the name a stack shows must at least find the class again in this tool — searched `{shown}`:\n\
-         {by_mangled}"
+        !by_prefix.starts_with("0/0 class(es)") && !by_prefix.contains("$$Lambda."),
+        "the listing must spell a hidden class the way the JVM does:\n{by_prefix}"
     );
-    // The JVM's own spelling keeps the `/`, and no decoded listing can contain one, so this finds nothing
-    // on every JDK without naming either one's suffix format.
-    let by_jvm_name = server.call("debug.list_classes", serde_json::json!({"filter": "$$Lambda/"}));
+
+    // THE SECOND HALF OF #46, and the more dangerous one. The mangled spelling is now a genuine miss —
+    // but the classes are loaded, this tool is looking straight at them, and the reply has to say so.
+    // "A class the JVM has not loaded yet does not appear here at all" sent a caller hunting a code path
+    // that had never been the problem. CONTEXT.md's rule under **Loaded** is that where the tool cannot
+    // tell it offers both readings; here it *can* tell, so it names the actual cause.
+    let legacy = rendered[0].replace('/', ".");
+    let by_legacy = server.call("debug.list_classes", serde_json::json!({"filter": legacy}));
     assert!(
-        by_jvm_name.starts_with("0/0 class(es)"),
-        "pinned: searching for a hidden class by the name the JVM itself uses finds nothing, because the \
-         listing is decoded exactly the way the stack is:\n{by_jvm_name}"
+        by_legacy.starts_with("0/0 class(es)"),
+        "the mangled spelling is not a name the debuggee uses, so it must not match:\n{by_legacy}"
     );
-    // …and the miss is then explained with the one reading that is definitely wrong. All three classes are
-    // loaded — the listing above found them a moment ago under the other spelling — so "a class the JVM has
-    // not loaded yet does not appear here" sends a caller looking for a code path that was never the
-    // problem. CONTEXT.md's whole point about **loaded** is that "not loaded" and "no such class" are
-    // indistinguishable from outside; this is a third case, and the tool cannot see it because it is the
-    // one doing the renaming.
     assert!(
-        by_jvm_name.contains("has not loaded yet"),
-        "pinned: a name this tool mangled is reported as a class that may not be loaded:\n{by_jvm_name}"
+        by_legacy.contains(rendered[0]) && by_legacy.contains("spelling difference"),
+        "a miss on a loaded class must hand back the spelling that does work:\n{by_legacy}"
+    );
+    assert!(
+        !by_legacy.contains("has not loaded yet") && !by_legacy.contains("may not be loaded"),
+        "a class the tool is looking at must never be explained away as one the JVM has not \
+         loaded:\n{by_legacy}"
     );
 
     // The dump renders frames through the same decoder, so the two views must not disagree — a caller who
@@ -4769,8 +4812,8 @@ fn synthetic_frames_render_with_names_a_reader_can_act_on() {
     // reason as the round trip above, and it asserts more: not "both look mangled" but "both produced the
     // identical string", which is what a caller moving between the two views actually depends on.
     assert!(
-        dump.contains(shown),
-        "the dump and get_stack must spell a hidden class the same way — get_stack said `{shown}`:\n{dump}"
+        dump.contains(rendered[0]) && !dump.contains("$$Lambda."),
+        "the dump and get_stack must spell a hidden class the same way:\n{dump}"
     );
 
     server.panic_reset();

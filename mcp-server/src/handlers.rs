@@ -924,13 +924,16 @@ impl RequestHandler {
 
         // Arrays outnumber the interesting entries on a real heap and are never the answer to "what do
         // I arm a stop point on", so they are excluded unless asked for.
-        let mut rows: Vec<(String, bool)> = all.into_iter()
+        let names: Vec<(String, bool)> = all.into_iter()
             .filter(|c| a.include_arrays || c.ref_type_tag != REF_TAG_ARRAY)
             .map(|c| (decode_signature(&c.signature), c.ref_type_tag == REF_TAG_INTERFACE))
             .collect();
-        if let Some(f) = filter {
-            rows.retain(|(fqn, _)| class_matches(fqn, f));
-        }
+        // Borrowed rather than retained in place, because a miss is explained by re-reading the same
+        // list under a looser spelling (SIG-1) and the rejected rows are exactly what that needs.
+        let mut rows: Vec<&(String, bool)> = filter.map_or_else(
+            || names.iter().collect(),
+            |f| names.iter().filter(|(fqn, _)| class_matches(fqn, f)).collect(),
+        );
         rows.sort_by(|x, y| x.0.cmp(&y.0));
         let matched = rows.len();
         let shown = matched.min(limit);
@@ -950,11 +953,7 @@ impl RequestHandler {
             );
         }
         if matched == 0 {
-            output.push_str(
-                "Nothing matched. Note that a class the JVM has not loaded yet does not appear here \
-                 at all — classes load on first use, so an untouched code path contributes none of \
-                 its classes. That is different from the class not existing.\n",
-            );
+            output.push_str(&explain_no_match(&names, filter));
         }
 
         Ok(output)
@@ -3176,6 +3175,55 @@ fn class_matches(fqn: &str, filter: &str) -> bool {
     }
 }
 
+/// What `debug.list_classes` says when its filter matched nothing (DISC-1).
+///
+/// SIG-1 (#46) is why this is a function rather than a string literal. The old note explained every miss
+/// with class loading — *"a class the JVM has not loaded yet does not appear here at all"* — and that
+/// was flatly wrong for the miss it was most likely to be printing. A caller who copied a lambda's real
+/// name out of a stack trace got `0/0` and was sent to look for a code path that had never run, while
+/// the class sat in the very list the tool had just searched, spelled differently by the tool itself.
+///
+/// So the first thing this does is *check*. Rejected rows are re-read with `/` and `.` treated as the
+/// same separator, which catches a name in the JVM's internal form (`com/example/Order`), a hidden class
+/// under either spelling, and the mangled names this tool handed out before #46. If any of them come
+/// back, the answer is a spelling, and saying "not loaded" would be a lie the tool had the evidence to
+/// avoid. Only when nothing comes back is the reading genuinely open — and then all three readings are
+/// offered rather than one picked, which is `CONTEXT.md`'s standing rule under **Loaded**.
+fn explain_no_match(names: &[(String, bool)], filter: Option<&str>) -> String {
+    // Only in the miss path, so the per-name allocation buys honesty on a reply nobody is waiting on in
+    // a loop. Both sides are normalised, so it does not matter which spelling the caller arrived with.
+    let under_another_spelling: Vec<&str> = filter.map_or_else(Vec::new, |f| {
+        let loose = f.replace('/', ".");
+        names.iter()
+            .filter(|(fqn, _)| !class_matches(fqn, f) && class_matches(&fqn.replace('/', "."), &loose))
+            .map(|(fqn, _)| fqn.as_str())
+            .take(10)
+            .collect()
+    });
+
+    if under_another_spelling.is_empty() {
+        return "Nothing matched — and this tool cannot tell you which of three things that means. The \
+                class may not be loaded yet: classes load on first use, so an untouched code path \
+                contributes none of its classes. There may be no such class. Or the name may simply be \
+                spelled differently here — a hidden class (a lambda, a method reference, a generated \
+                proxy) is named `Outer$$Lambda/<a suffix the JVM assigned>`, with the `/` part of the \
+                name, and a nested class is `Outer$Inner`. Filters are substrings, so a fragment of the \
+                name matches where the whole of it may not.\n"
+            .to_string();
+    }
+
+    let mut note = format!(
+        "Nothing matched that spelling — but {} loaded class(es) match it once `/` and `.` are read as \
+         the same separator, so this is a spelling difference and NOT a class that is missing or \
+         unloaded. The debuggee has them. Search for one of these instead:\n",
+        under_another_spelling.len(),
+    );
+    for fqn in &under_another_spelling {
+        let _ = writeln!(note, "{fqn}");
+    }
+    note
+}
+
 /// The reference type id of a loaded class named the Java way — `com.example.Order`, or an inner
 /// class as `com.example.Order$Line`.
 ///
@@ -3268,6 +3316,8 @@ fn render_method(name: &str, signature: &str, mod_bits: i32) -> String {
 }
 
 /// JNI signature -> readable type name. "Lpkg/Cls;" -> "pkg.Cls"; "[I" -> "int[]".
+///
+/// The `/` -> `.` rewrite is deliberately not unconditional; see `decode_internal_name`.
 fn decode_signature(sig: &str) -> String {
     let bytes = sig.as_bytes();
     let mut i = 0;
@@ -3279,7 +3329,7 @@ fn decode_signature(sig: &str) -> String {
     let base = match bytes.get(i) {
         Some(b'L') => {
             let end = if sig.ends_with(';') { sig.len() - 1 } else { sig.len() };
-            sig.get(i + 1..end).unwrap_or_default().replace('/', ".")
+            decode_internal_name(sig.get(i + 1..end).unwrap_or_default())
         }
         Some(b'Z') => "boolean".to_string(),
         Some(b'B') => "byte".to_string(),
@@ -3295,6 +3345,50 @@ fn decode_signature(sig: &str) -> String {
         _ => sig.to_string(),
     };
     format!("{}{}", base, "[]".repeat(dims))
+}
+
+/// A JVM internal class name (`java/lang/String`) as Java spells it — including the `/` that a lambda's
+/// generated class carries, which is not a package separator.
+///
+/// SIG-1 (#46). Every `/` used to become a `.`, which is right for package structure and wrong for the
+/// name the JVM invents for a lambda. `Class.getName()`, a `jstack` dump, a `-verbose:class` line and a
+/// stack trace all spell that name `<binary name>/<a suffix the JVM assigned>`, so
+/// `SyntheticProbe$$Lambda/0x0000000092040970` came back as `SyntheticProbe$$Lambda.0x0000000092040970`
+/// — which reads as a class `0x…` in a package `SyntheticProbe$$Lambda`, and is a name nothing outside
+/// this tool will answer to. Worse one step out: `debug.list_classes` decoded the same way, so a caller
+/// who pasted the JVM's own spelling got `0/0 class(es)` and was then told the class might not be
+/// loaded, while the tool was looking straight at it.
+///
+/// **Two different wire spellings arrive here, and the issue only knew about one.** Measured against
+/// live JVMs rather than assumed, because #36's matrix had already caught this shape changing between
+/// legs:
+///
+/// * **JDK 15+** (hidden classes): `LSyntheticProbe$$Lambda.0x0000000092040970;` — the JDK writes a
+///   **dot**, because a `/` there would not be a legal descriptor. So the separator is not being mangled
+///   by us at all on a modern JVM; it arrives already replaced, and has to be put back.
+/// * **JDK 11** (VM-anonymous classes, which predate hidden classes):
+///   `LSyntheticProbe$$Lambda$3/574182878;` — an ordinal before a **slash**, a plain decimal after it.
+///   This one is the rewrite's fault, and is what the issue describes.
+///
+/// The dot case is exact rather than a guess: JVMS §4.2.2 forbids `.` in an unqualified name, so a `.`
+/// inside a descriptor's class name cannot be package structure and can only be this boundary. The slash
+/// case cannot be exact — both separators are `/` on the wire — so it leans on the one thing Java
+/// guarantees about the other side: **a simple name cannot begin with a digit**. Keying on `0x` instead
+/// would have been written against 21 and broken on 11, which is the mistake the matrix already caught
+/// once.
+fn decode_internal_name(internal: &str) -> String {
+    if let Some((binary_name, assigned_by_the_vm)) = internal.split_once('.') {
+        return format!("{}/{}", binary_name.replace('/', "."), assigned_by_the_vm);
+    }
+    let mut out = String::with_capacity(internal.len());
+    for (nth, segment) in internal.split('/').enumerate() {
+        if nth > 0 {
+            let assigned_by_the_vm = segment.as_bytes().first().is_some_and(u8::is_ascii_digit);
+            out.push(if assigned_by_the_vm { '/' } else { '.' });
+        }
+        out.push_str(segment);
+    }
+    out
 }
 
 /// Count the top-level argument types in a method descriptor like "(ILjava/lang/String;)V".
@@ -9103,6 +9197,95 @@ mod tests {
     fn class_filter_suffix_finds_a_default_package_class() {
         assert!(class_matches("Order", "*.Order"));
         assert!(!class_matches("Reorder", "*.Order"));
+    }
+
+    // SIG-1 (#46): the second half, and the dangerous one. `debug.list_classes` used to explain every
+    // miss with class loading, including the misses it had caused itself by renaming the class. It now
+    // checks before it blames, and only offers the open readings when the reading is genuinely open.
+    #[test]
+    fn a_miss_is_never_blamed_on_class_loading_when_the_class_is_loaded() {
+        let loaded = [
+            ("SyntheticProbe$$Lambda/0x0000000087040970".to_string(), false),
+            ("SyntheticProbe$$Lambda$3/397187020".to_string(), false),
+            ("com.example.Order".to_string(), false),
+        ];
+
+        // The spelling this tool handed out before the fix, and the JVM's internal form. Both are misses
+        // and both are about spelling, so neither may mention loading.
+        for filter in ["SyntheticProbe$$Lambda.0x0000000087040970", "com/example/Order"] {
+            let miss = explain_no_match(&loaded, Some(filter));
+            assert!(
+                miss.contains("spelling difference"),
+                "`{filter}` names a class that is loaded, so the reply must say so: {miss}"
+            );
+            assert!(
+                !miss.contains("not be loaded") && !miss.contains("not loaded"),
+                "`{filter}` must not be explained away as a class the JVM has not loaded: {miss}"
+            );
+        }
+        // …and the class it does name comes back, so the caller has somewhere to go.
+        assert!(
+            explain_no_match(&loaded, Some("SyntheticProbe$$Lambda$3.397187020"))
+                .contains("SyntheticProbe$$Lambda$3/397187020"),
+            "the reply has to hand back the spelling that works"
+        );
+
+        // A name nothing matches under any spelling is the case JDWP genuinely cannot resolve, and there
+        // all three readings are offered rather than one picked — CONTEXT.md's rule under **Loaded**.
+        let open = explain_no_match(&loaded, Some("com.example.Invoice"));
+        assert!(open.contains("may not be loaded"), "the loading reading must still be offered: {open}");
+        assert!(open.contains("no such class"), "so must the no-such-class reading: {open}");
+        assert!(open.contains("spelled differently"), "and so must the spelling one: {open}");
+    }
+
+    // SIG-1 (#46): a lambda's generated class is named `<class>/<suffix>` everywhere outside this tool —
+    // `Class.getName()`, a stack trace, a jstack dump — and it used to be rendered `<class>.<suffix>`,
+    // which is not a name the JVM will answer to.
+    //
+    // Every descriptor below was **read off a live JVM**, not invented: the two shapes differ between
+    // JDK versions and the second one is not the shape the issue describes. Guessing here is exactly how
+    // #36's matrix caught the previous assertion passing on 21 and failing on 11.
+    #[test]
+    fn a_hidden_class_is_named_the_way_the_jvm_names_it() {
+        // JDK 15+ (measured on 21): a real hidden class. The JDK writes a DOT on the wire, because a `/`
+        // would not be a legal descriptor — so the separator arrives already replaced and is put back.
+        assert_eq!(
+            decode_signature("LSyntheticProbe$$Lambda.0x0000000092040970;"),
+            "SyntheticProbe$$Lambda/0x0000000092040970"
+        );
+        // JDK 11 (measured): a VM-anonymous class, which predates hidden classes — an ordinal before a
+        // SLASH and a plain decimal after it. This is the one the unconditional rewrite corrupted.
+        assert_eq!(
+            decode_signature("LSyntheticProbe$$Lambda$3/574182878;"),
+            "SyntheticProbe$$Lambda$3/574182878"
+        );
+        // In a package both separators appear in one name, and each has to be read for what it is.
+        assert_eq!(
+            decode_signature("Ljava/lang/invoke/LambdaForm$MH.0x00007f2c4c0a1800;"),
+            "java.lang.invoke.LambdaForm$MH/0x00007f2c4c0a1800"
+        );
+        assert_eq!(
+            decode_signature("Lcom/example/Handler$$Lambda$7/1234567;"),
+            "com.example.Handler$$Lambda$7/1234567"
+        );
+        // An array of one still gets its `[]`, because the suffix is part of the element's name.
+        assert_eq!(
+            decode_signature("[Lcom/example/Handler$$Lambda.0x00007f2c;"),
+            "com.example.Handler$$Lambda/0x00007f2c[]"
+        );
+    }
+
+    // SIG-1 (#46): the other half of the same rule. An ordinary `/` is still a package separator, and an
+    // anonymous inner class was never affected — it is `Outer$1`, a `$` the rewrite never touched — so
+    // this pins that the fix did not go looking for work it did not have.
+    #[test]
+    fn ordinary_and_anonymous_class_names_are_untouched() {
+        assert_eq!(decode_signature("Lcom/example/Order;"), "com.example.Order");
+        assert_eq!(decode_signature("Lcom/example/Order$Line;"), "com.example.Order$Line");
+        assert_eq!(decode_signature("LSyntheticProbe$1;"), "SyntheticProbe$1");
+        assert_eq!(decode_signature("Lcom/example/Outer$1;"), "com.example.Outer$1");
+        assert_eq!(decode_signature("[[Ljava/lang/String;"), "java.lang.String[][]");
+        assert_eq!(decode_signature("[I"), "int[]");
     }
 
     // DISC-2: a signature the caller can paste into debug.evaluate — dotted FQNs, arrays as `T[]`,

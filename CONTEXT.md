@@ -22,7 +22,27 @@ Present in the debuggee, as opposed to present in a source tree. A class loads o
 untouched code path contributes none of its classes, and the debuggee is the only authority on the
 question. Load-bearing because JDWP can only report what is loaded: "not loaded" and "no such class" are
 indistinguishable from outside, so a tool must offer both readings rather than pick one.
+
+There is a **third** case, and unlike the other two it is not a limit of JDWP — it is ours. SIG-1
+([#46](https://github.com/YgorPerez/java-debugging-mcp/issues/46)): a class can be loaded, sitting in the
+very list the tool just searched, and still be missed because the tool spelled its name differently from
+the JVM. Every lambda was rendered `Outer$$Lambda.0x…` where the JVM, a stack trace and `jstack` all say
+`Outer$$Lambda/0x…`, so a caller who pasted the real name got `0/0` and was told the class might not have
+loaded yet. The two-reading rule above quietly assumes the tool's own spelling is not the variable. Where
+it might be, the tool must **check before it blames** — `debug.list_classes` re-reads the loaded names
+with `/` and `.` treated alike and, when the class is there, names the spelling instead. "Not loaded"
+about a class the debugger is looking at is not one of two honest readings; it is a wrong answer.
 _Avoid_: exists, defined (both invite the source tree as the authority)
+
+**Hidden class**:
+A class the JVM made rather than a compiler — what is actually behind a lambda, a method reference or a
+generated proxy. Named `<class>/<a suffix the JVM assigned>`, where the `/` is part of the name rather
+than a package separator, and carrying no line table, so its frame is real but has nothing to look up.
+The name a caller is shown is always the one `Class.getName()` and a `jstack` dump use, even though the
+debuggee spells the boundary differently on the wire depending on its version.
+_Avoid_: synthetic class (the compiler's own inventions — a `lambda$…` body, an `Outer$1` — are ordinary
+classes and methods with real names and real source lines; one is actionable and the other is not, and
+a word covering both loses exactly that)
 
 **Source drift**:
 The checkout in front of you not being the build that is running. A finding, not an error — the debuggee
