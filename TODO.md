@@ -7,7 +7,7 @@ item and finish it.
 
 ## Coverage: `scripts/coverage.sh`, and the gaps reviewed once
 
-**86.30% region / 87.78% line / 80.59% functions**, unit + integration together — 58 unit + 6 doc + 7 stdio
+**86.29% region / 87.77% line / 80.52% functions**, unit + integration together — 58 unit + 6 doc + 7 stdio
 + 51 integration tests, zero skips (TRACE-7/TEST-9/CLEAN-1/TEST-8). Up from **85.28% / 86.64% / 79.62%** at
 TEST-7 (#19), and from 83%/78% at TEST-5.
 
@@ -31,7 +31,7 @@ broken instrument produced a plausible-looking low number, not an error.
 
 ### Read the function column with care — async breaks it
 
-`handlers.rs` reports **186 of 754 functions "missed"**, which reads as a great deal of dead code and is
+`handlers.rs` reports **187 of 764 functions "missed"**, which reads as a great deal of dead code and is
 mostly an artifact. For an `async fn`, llvm-cov attributes hits to the *generator* the compiler produces,
 while the elided outer shell that merely builds the future records **zero**. So `handle_thread_dump` and
 `handle_attach` appear as never-executed while 48 tests drive them. Judge a function by the max hit count
