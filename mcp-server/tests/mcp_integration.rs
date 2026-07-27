@@ -4237,3 +4237,642 @@ fn source_reports_the_smap_when_the_class_was_translated_from_another_file() {
         "public class SmapProbe",
     ]);
 }
+
+/// `retired=<n>` from a `ChurnProbe` heartbeat — how many workers have finished so far.
+fn churn_retired(line: &str) -> Option<u64> {
+    line.split("retired=").nth(1)?.split_whitespace().next()?.parse().ok()
+}
+
+/// How many rows a dump actually printed — one header line per thread, at the start of a line.
+fn dump_row_count(dump: &str) -> u64 {
+    dump.lines().filter(|l| l.starts_with("0x")).count() as u64
+}
+
+/// TEST-10 (#35): a dump taken while a pool retires and replaces its workers must account for the
+/// threads that went away underneath it.
+///
+/// `collect_dump_rows` asks the JVM about each thread separately from the `AllThreads` that named it, so
+/// every dump is answering questions about a list that is already out of date. On a real request pool
+/// that is not the exotic case, it is the *only* case — and until this probe existed the suite had never
+/// produced one, because every other probe's threads outlive the test. Two different things can happen
+/// to a thread that vanishes between the list and the read, and this asserts what the reply says about
+/// **both**:
+///
+/// 1. The thread has finished but the debugger still holds its `Thread` object, so `Status` answers
+///    `ZOMBIE` quite happily (the same JDWP behaviour FILT-2 turned on). The row is printed.
+/// 2. The object has since been collected as well, so the id is not valid any more and the status read
+///    *fails*. That is the `continue` arm the coverage review named — the row is dropped.
+///
+/// The probe reaches (2) on purpose: `ChurnProbe` runs an explicit collector, because a JDWP object id is
+/// a weak reference and a retired worker's `Thread` is unreachable the moment it exits. Nothing forces
+/// the two states to happen in a given dump, so this takes several and requires each shape once; failing
+/// to find either is reported as "the probe is not churning", which is what it would actually mean.
+///
+/// Both of the pinned messages below are, in the author's reading, WRONG — see the comments. They are
+/// pinned rather than fixed because a test that reaches a line and asserts nothing about it is how this
+/// repo has previously reported coverage it had not looked at. Fixing either should flip this test.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
+    let Some(jdk) = jdk_or_skip("a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "ChurnProbe").expect("launch ChurnProbe");
+    // Through the relay, deliberately. A dump that finishes in ten milliseconds barely overlaps
+    // anything, and the state this test is about — the thread list going stale while it is being read —
+    // is a function of how LONG the read takes. On loopback that is nearly nothing, which is why the arm
+    // has never executed. At a 2ms round trip the same ~130-packet dump takes a quarter of a second,
+    // which is what it costs against an instance one hop away: the debuggee is unchanged and only the
+    // wire is slower, exactly as in ADR-0011's measurements. Declared before the server so it outlives
+    // it.
+    let relay =
+        LatencyRelay::start(probe.port, std::time::Duration::from_millis(2)).expect("start relay");
+    let mut server = Server::start().expect("start server");
+    server.attach(relay.port);
+
+    // A whole generation of workers must have turned over before anything is asserted: at
+    // `SLOTS / LIFE_MS` a first tick can arrive before any churn worker has retired at all, and a dump
+    // taken then would be a dump of a perfectly stable JVM.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| churn_retired(l).is_some_and(|n| n >= 48))
+        .unwrap_or_else(|| panic!("the pool never retired a full generation\n  output: {:?}", probe.output()));
+
+    // `limit` is deliberately an order of magnitude above the thread count. It matters later: whatever
+    // the dump ends up withholding, the caller's limit is provably not the reason.
+    let ask = serde_json::json!({"limit": 500, "monitors": false, "max_frames": 3});
+    let mut vanished_but_reported: Option<String> = None;
+    let mut vanished_and_dropped: Option<String> = None;
+    for _ in 0..12 {
+        let dump = server.call("debug.thread_dump", ask.clone());
+
+        // Whatever the churn did, the reply is a whole reply about a JVM that still has its stable half.
+        // This runs on every attempt, so a dump that fell apart under churn cannot hide behind one that
+        // did not.
+        assert!(dump.contains("Cost:"), "a dump under churn must still complete:\n{dump}");
+        let (read, total) = dump_thread_counts(&dump)
+            .unwrap_or_else(|| panic!("no `N/M thread(s)` header in:\n{}", head_of(&dump)));
+        assert_eq!(
+            read,
+            dump_row_count(&dump),
+            "the header's count must be the rows it really printed:\n{}",
+            head_of(&dump)
+        );
+        assert!(read <= total, "a dump cannot read more threads than the JVM listed:\n{}", head_of(&dump));
+        let stable = dump.lines().filter(|l| l.contains("\"stable-worker-")).count();
+        assert_eq!(
+            stable, 8,
+            "the eight non-churning workers must be in every dump — they are the fixed point that makes \
+             the rest of this test about churn rather than about noise:\n{}",
+            head_of(&dump)
+        );
+
+        if vanished_but_reported.is_none() && dump.contains("[zombie]") {
+            vanished_but_reported = Some(dump.clone());
+        }
+        if vanished_and_dropped.is_none() && read < total {
+            vanished_and_dropped = Some(dump);
+        }
+        if vanished_but_reported.is_some() && vanished_and_dropped.is_some() {
+            break;
+        }
+    }
+
+    // --- (1) finished, still readable: reported as a row, with a status that says so ---
+    let reported = vanished_but_reported.unwrap_or_else(|| {
+        panic!(
+            "twelve dumps and no thread ever finished during one — ChurnProbe is not churning\n  \
+             output: {:?}",
+            probe.output()
+        )
+    });
+    let row = reported
+        .lines()
+        .find(|l| l.starts_with("0x") && l.contains("[zombie]"))
+        .expect("a zombie row was found a moment ago");
+    assert!(
+        row.contains("\"churn-worker-"),
+        "the thread that vanished is still named, not reduced to a bare id: {row}"
+    );
+    let name = row.split('"').nth(1).unwrap_or_default().to_string();
+    let section = dump_section(&reported, &name)
+        .unwrap_or_else(|| panic!("no section for {name} in:\n{reported}"));
+    // FINDING, pinned. The JVM has just answered ZOMBIE — this thread is *finished* — and the same row
+    // explains its unreadable stack as "running", then advises `suspend:true`, which cannot help: a
+    // finished thread will never be suspendable. The `!suspended` branch phrases every unreadable stack
+    // as a running one, and a churning pool is where that reading is wrong.
+    assert!(
+        section.contains("running — JDWP can only read a suspended thread's stack; pass suspend:true"),
+        "a finished thread's row is currently explained as a running one — if that has been fixed, this \
+         assertion is what should tell you:\n{section}"
+    );
+
+    // --- (2) finished AND collected: the id is gone, so the row is dropped ---
+    let dropped = vanished_and_dropped.unwrap_or_else(|| {
+        panic!(
+            "twelve dumps and no thread id ever went stale mid-dump, so `collect_dump_rows`' dead-thread \
+             arm still has not executed — the probe's collector is not reclaiming retired workers\n  \
+             output: {:?}",
+            probe.output()
+        )
+    });
+    let (read, total) = dump_thread_counts(&dropped).expect("counts");
+    let missing = total - read;
+    // Not silently dropped: the difference is stated, and it is the arithmetic the header promised.
+    assert!(
+        dropped.contains(&format!("… +{missing} more thread(s)")),
+        "{missing} thread(s) went away mid-dump and the reply must SAY there are that many it did not \
+         show — silence here reads as a complete dump:\n{}",
+        head_of(&dropped)
+    );
+    // FINDING, pinned. The only explanation offered is the caller's own `limit` — which was 500 against
+    // ~63 threads, so raising it changes nothing and narrowing with `name_filter` changes nothing. The
+    // two causes of a short dump (the limit, and threads that stopped existing) are reported with one
+    // sentence that only describes the first.
+    assert!(
+        dropped.contains("(raise limit, or narrow with name_filter)"),
+        "the shortfall is currently attributed to `limit` — pinned so that attributing it to the churn \
+         instead flips this test rather than passing quietly:\n{}",
+        head_of(&dropped)
+    );
+
+    // --- and the same pool, dumped with the VM frozen ---
+    // Freezing right after `AllThreads` closes almost the whole window, which is why this half exists:
+    // the states above are a property of reading a *live* list, not a fault the churn induces in the
+    // dump. What is asserted here is coherence — every row it printed that is still a thread is one it
+    // was actually holding — plus a real stack off the stable half and a VM that is running afterwards.
+    let base = highest_tick(&probe).expect("no tick to count from");
+    let frozen = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"limit": 500, "suspend": true, "max_frames": 4}),
+    );
+    assert_contains_all(
+        "a suspending dump of a churning pool completes and resumes it",
+        &frozen,
+        &["verified running", "Cost:"],
+    );
+    assert!(
+        frozen.contains("ChurnProbe.park:"),
+        "the frozen dump must have read a real stable worker's stack, not only counted threads:\n{}",
+        head_of(&frozen)
+    );
+    let incoherent: Vec<&str> = frozen
+        .lines()
+        .filter(|l| l.starts_with("0x") && !l.contains("debugger-suspended") && !l.contains("[zombie]"))
+        .collect();
+    assert!(
+        incoherent.is_empty(),
+        "a dump that froze the VM must be holding every live thread it reports; these rows are neither \
+         held nor finished: {incoherent:?}"
+    );
+
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
+        "the probe stopped ticking after a suspending dump of a churning pool\n  output: {:?}",
+        probe.output().len(),
+    );
+
+    server.panic_reset();
+}
+
+/// A dump section's own thread id — the `0x…` that opens its header line.
+fn section_thread_id(section: &str) -> Option<&str> {
+    section.lines().next()?.split_whitespace().next()
+}
+
+/// The single monitor a `holds:` line names, e.g. `ContendedProbe$Lock2@3f`.
+fn sole_held_lock(section: &str) -> Option<&str> {
+    let held = section.lines().find_map(|l| l.trim().strip_prefix("holds: "))?;
+    (!held.contains(", ")).then_some(held)
+}
+
+/// TEST-10 (#35): with four locks and forty-eight waiters in one dump, the holder each waiter is told
+/// about has to be the RIGHT one.
+///
+/// `thread_dump_shows_stacks_and_the_deadlock_cycle` already proves the correlation exists, and
+/// `DeadlockProbe` is the right shape for that: a cross-pairing that a report merely listing monitors per
+/// thread would get backwards. What two threads and two locks cannot show is whether the correlation
+/// still picks the right holder when there is a choice — with one other thread in the dump, `← held by
+/// 0x…` is right by construction, and every wrong answer is also the right one.
+///
+/// Here every waiter is on a lock that three other threads in the same dump are each holding one of, so
+/// naming the holder means finding the one row out of four whose `holds` list contains this waiter's
+/// contended monitor. The expected string is built from the dump's OWN answers — the label off the
+/// holder's `holds:` line and the id off its header — rather than from anything this test assumes, so
+/// what is checked is that the two halves agree, not that both match a guess.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_contended_lock_names_its_real_holder_out_of_four() {
+    let Some(jdk) = jdk_or_skip("a_contended_lock_names_its_real_holder_out_of_four") else { return };
+    let probe = Probe::launch(&jdk, "ContendedProbe").expect("launch ContendedProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // The probe polls every waiter's own `getState()` and only says `armed` once all 48 report BLOCKED,
+    // so this is the JVM's answer rather than a sleep long enough to look like one.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("armed"))
+        .unwrap_or_else(|| panic!("the probe never got all waiters blocked\n  output: {:?}", probe.output()));
+    // `armed` is printed BEFORE the first tick, so the heartbeat has to be waited for separately rather
+    // than assumed to exist by now. Taking the baseline straight off `armed` passed every time this test
+    // was run on its own and failed the first time it ran alongside 59 others, which is the whole reason
+    // the tick baseline is read from a line that has actually arrived.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some())
+        .unwrap_or_else(|| panic!("the probe never ticked after arming\n  output: {:?}", probe.output()));
+    let base = highest_tick(&probe).expect("a tick line just arrived");
+
+    // monitors_only: the lock graph is the entire question here, and 52 stacks would be another test's
+    // worth of suspension for nothing this one reads.
+    let dump = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"limit": 200, "suspend": true, "monitors_only": true}),
+    );
+    assert_contains_all("the dump completed and resumed the VM", &dump, &["verified running", "Cost:"]);
+
+    // The premise, checked before anything is concluded from it. If the contention had not formed, every
+    // assertion below would pass vacuously on a dump with no `waiting to enter` lines in it at all.
+    let waiting = dump.lines().filter(|l| l.contains("waiting to enter:")).count();
+    assert_eq!(
+        waiting, 48,
+        "this test is about contention at scale, so all 48 waiters must be queued in the dump it \
+         reads:\n{}",
+        head_of(&dump)
+    );
+
+    let mut locks_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for k in 0..4 {
+        let holder_name = format!("holder-{k}");
+        let holder = dump_section(&dump, &format!("\"{holder_name}\""))
+            .unwrap_or_else(|| panic!("no {holder_name} section in:\n{dump}"));
+        // One lock, and the right one. A holder that had released it — `Object.wait()` does, which is how
+        // every other parking probe here waits — would show no `holds:` line, and the test would be
+        // measuring nothing.
+        let lock = sole_held_lock(&holder).unwrap_or_else(|| {
+            panic!("{holder_name} must hold exactly one lock and nothing else:\n{holder}")
+        });
+        assert!(
+            lock.starts_with(&format!("ContendedProbe$Lock{k}@")),
+            "{holder_name} must hold Lock{k} — a bare java.lang.Object here could be paired any way at \
+             all and still look right: {lock}"
+        );
+        let holder_id = section_thread_id(&holder)
+            .unwrap_or_else(|| panic!("no thread id on {holder_name}'s header:\n{holder}"));
+        locks_seen.insert(lock.to_string());
+
+        // Every one of this lock's twelve waiters, not just the first: a correlation that resolved the
+        // holder once and reused it would pass a spot check on waiter 0 and be wrong for the other 47.
+        let expected = format!("waiting to enter: {lock} ← held by {holder_id} \"{holder_name}\"");
+        for i in 0..12 {
+            let waiter_name = format!("waiter-{k}-{i}");
+            let waiter = dump_section(&dump, &format!("\"{waiter_name}\""))
+                .unwrap_or_else(|| panic!("no {waiter_name} section in:\n{dump}"));
+            assert!(
+                waiter.contains(&expected),
+                "{waiter_name} must be shown blocked on the lock {holder_name} is actually holding, named \
+                 by that thread's own id — expected `{expected}`:\n{waiter}"
+            );
+        }
+    }
+
+    // Four distinct monitor objects, or "the right one out of four" was never a choice: if two locks
+    // shared an object id, naming either holder would satisfy every assertion above.
+    assert_eq!(locks_seen.len(), 4, "the four locks must be four distinct objects, saw {locks_seen:?}");
+
+    // And nobody was handed a holder that holds a different lock. The loop above proves each waiter got
+    // the right annotation; this proves the dump contains no other kind, including on rows the loop never
+    // named.
+    let wrong: Vec<&str> = dump
+        .lines()
+        .filter(|l| l.contains("waiting to enter:"))
+        .filter(|l| {
+            let (before, after) = l.split_once(" ← held by ").unwrap_or((l, ""));
+            // `…$Lock2@3f ← … "holder-2"` — the digit in the lock's class name must be the digit in the
+            // holder's name, so a swapped pair is visible without trusting the loop above.
+            let lock_k = before.split("$Lock").nth(1).and_then(|s| s.chars().next());
+            let holder_k = after.split("\"holder-").nth(1).and_then(|s| s.chars().next());
+            lock_k.is_none() || holder_k.is_none() || lock_k != holder_k
+        })
+        .collect();
+    assert!(wrong.is_empty(), "every contended lock must name its own holder; these do not: {wrong:?}");
+
+    // TRACE-2 discipline: only the debuggee can report that the suspension ended, and the 52 wedged
+    // threads never will.
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
+        "the probe stopped ticking after a dump of 52 contended threads\n  output: {:?}",
+        probe.output(),
+    );
+
+    server.panic_reset();
+}
+
+/// The one frame line in a stack that mentions `needle`, or `None`.
+fn frame_line<'a>(stack: &'a str, needle: &str) -> Option<&'a str> {
+    stack.lines().map(str::trim).find(|l| l.starts_with('#') && l.contains(needle))
+}
+
+/// TEST-10 (#35): a lambda, a method reference and an anonymous inner class in one stack, and what
+/// `decode_signature` makes of the names the JVM invents for them.
+///
+/// Seventeen probes and not one of them put a synthetic frame in a stack a test read, so the signature
+/// decoder had only ever been handed names a human wrote. A dump of any real application server is full
+/// of the other kind, and the failure mode is not a crash — it is a class name that comes back subtly
+/// wrong and reads as plausible.
+///
+/// Two of the three are fine and this says so specifically, because "it did not crash" is not a finding
+/// either way:
+///
+/// * `SyntheticProbe$1.run:<line>` — the anonymous class's name says nothing about what it does, but the
+///   frame carries a source line, and the line is what makes it actionable.
+/// * `SyntheticProbe.lambda$lambdaStep$0:<line>` — the lambda's BODY is an ordinary method on the
+///   enclosing class, named after the method it was written in, with a line of its own.
+///
+/// The third is not fine, and it is pinned rather than fixed. The JVM names a lambda's hidden class
+/// `SyntheticProbe$$Lambda/0x00007f…`, where the `/` separates the class from a JVM-assigned address and
+/// is **not** a package separator. `decode_signature` replaces every `/` in a `L…;` signature with a
+/// `.`, because in a JNI signature that is what a `/` is — so what a caller is shown is
+/// `SyntheticProbe$$Lambda.0x00007f…`, a name the JVM does not use and will not answer to. It reads
+/// exactly like a class `0x00007f…` in a package `SyntheticProbe$$Lambda`, which is the kind of wrongness
+/// that gets acted on.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn synthetic_frames_render_with_names_a_reader_can_act_on() {
+    let Some(jdk) = jdk_or_skip("synthetic_frames_render_with_names_a_reader_can_act_on") else { return };
+    let probe = Probe::launch(&jdk, "SyntheticProbe").expect("launch SyntheticProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // `parked` means the whole chain is on the worker's stack — main polls the worker's own `getState()`
+    // for it, so this is not a sleep dressed up as a barrier.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("parked"))
+        .unwrap_or_else(|| panic!("the worker never parked\n  output: {:?}", probe.output()));
+    // Both of these must happen BEFORE the pause below. `parked` is printed before the first tick, and
+    // the pause freezes the thread that prints them — so a baseline taken after it would be read from a
+    // probe that can no longer produce the line it is waiting for.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some())
+        .unwrap_or_else(|| panic!("the probe never ticked\n  output: {:?}", probe.output()));
+    let base = highest_tick(&probe).expect("a tick line just arrived");
+
+    let tid = thread_hex_for(&mut server, "synthetic-worker")
+        .unwrap_or_else(|| panic!("no synthetic-worker thread"));
+    // JDWP will not read a running thread's frames, and the worker is parked rather than at a stop point,
+    // so nothing else has suspended it.
+    server.call("debug.pause", serde_json::json!({}));
+    let stack = server.call(
+        "debug.get_stack",
+        serde_json::json!({"thread_id": tid, "max_frames": 20, "include_variables": false}),
+    );
+
+    let source = probe_source("SyntheticProbe");
+
+    // --- the two that are readable, each pinned to the line it was written on ---
+    let anon_line = probe_line(&source, "call(lambdaStep());");
+    assert!(
+        stack.contains(&format!("SyntheticProbe$1.run:{anon_line}")),
+        "the anonymous inner class must appear with its real name AND the line it runs — `$1` alone names \
+         nothing a reader could go and look at:\n{stack}"
+    );
+    let lambda_line = probe_line(&source, "return () -> call(SyntheticProbe::viaMethodReference);");
+    assert!(
+        stack.contains(&format!("SyntheticProbe.lambda$lambdaStep$0:{lambda_line}")),
+        "the lambda's body must be attributed to the method it was written in, with its own line:\n{stack}"
+    );
+    // The method reference resolves to the ordinary method it names, which is the whole point of one.
+    let ref_line = probe_line(&source, "        park();");
+    assert!(
+        stack.contains(&format!("SyntheticProbe.viaMethodReference:{ref_line}")),
+        "a method reference must reach the method it refers to, by name:\n{stack}"
+    );
+
+    // --- the hidden classes, pinned exactly as they render ---
+    // Three of them: the lambda, the method reference, and the one `new Thread(SyntheticProbe::worker)`
+    // created. Each is a frame in its own right, between the ordinary frames on either side.
+    let hidden: Vec<&str> = stack.lines().map(str::trim).filter(|l| l.contains("$$Lambda")).collect();
+    assert_eq!(
+        hidden.len(),
+        3,
+        "a lambda and a method reference each add a hidden-class frame of their own, and the thread's own \
+         method reference adds a third:\n{stack}"
+    );
+    // THE FINDING. `/` is not a package separator here, and every one of these is rendered as though it
+    // were. Both halves are asserted: what the caller IS shown, and that the JVM's own spelling never
+    // appears — so a fix that stops mangling the name flips this test rather than passing quietly.
+    for line in &hidden {
+        assert!(
+            line.contains("$$Lambda.0x"),
+            "pinned: a hidden class currently renders with the JVM's `/` rewritten to `.`, which is not \
+             its name — if that has been fixed, this is the assertion that should tell you: {line}"
+        );
+    }
+    assert!(
+        !stack.contains("$$Lambda/0x"),
+        "pinned: the JVM's own spelling of a hidden class does not survive decode_signature:\n{stack}"
+    );
+    // And it has no line number, because a hidden class has no line table — so the one frame a reader
+    // cannot act on is also the one with nothing to look up.
+    let mangled = frame_line(&stack, "$$Lambda").expect("a hidden-class frame was found a moment ago");
+    let after_run = mangled.split(".run").nth(1).unwrap_or("!");
+    assert!(
+        after_run.trim().is_empty(),
+        "a hidden class has no line table, so its frame must carry no line: {mangled}"
+    );
+
+    // The mangled name is at least CONSISTENT — `debug.list_classes` spells it the same way, so a name
+    // copied out of a stack finds the class again here. What it cannot do is leave this tool: the JVM's
+    // `Class.getName()`, a `-verbose:class` line, a jstack dump and a JDWP class pattern all use the `/`.
+    let by_mangled =
+        server.call("debug.list_classes", serde_json::json!({"filter": "SyntheticProbe$$Lambda"}));
+    assert!(
+        by_mangled.contains("SyntheticProbe$$Lambda."),
+        "the name a stack shows must at least find the class again in this tool:\n{by_mangled}"
+    );
+    let by_jvm_name =
+        server.call("debug.list_classes", serde_json::json!({"filter": "SyntheticProbe$$Lambda/0x"}));
+    assert!(
+        by_jvm_name.starts_with("0/0 class(es)"),
+        "pinned: searching for a hidden class by the name the JVM itself uses finds nothing, because the \
+         listing is decoded exactly the way the stack is:\n{by_jvm_name}"
+    );
+    // …and the miss is then explained with the one reading that is definitely wrong. All three classes are
+    // loaded — the listing above found them a moment ago under the other spelling — so "a class the JVM has
+    // not loaded yet does not appear here" sends a caller looking for a code path that was never the
+    // problem. CONTEXT.md's whole point about **loaded** is that "not loaded" and "no such class" are
+    // indistinguishable from outside; this is a third case, and the tool cannot see it because it is the
+    // one doing the renaming.
+    assert!(
+        by_jvm_name.contains("has not loaded yet"),
+        "pinned: a name this tool mangled is reported as a class that may not be loaded:\n{by_jvm_name}"
+    );
+
+    // The dump renders frames through the same decoder, so the two views must not disagree — a caller who
+    // reads one and pastes into the other has to get the same class.
+    let dump = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"name_filter": "synthetic-worker", "max_frames": 20}),
+    );
+    assert!(
+        dump.contains("$$Lambda.0x") && !dump.contains("$$Lambda/0x"),
+        "the dump and get_stack must spell a hidden class the same way:\n{dump}"
+    );
+
+    server.panic_reset();
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 1)).is_some(),
+        "the probe stopped ticking after the pause was released\n  output: {:?}",
+        probe.output(),
+    );
+}
+
+/// The right-hand side of a `debug.evaluate` reply — `PrimitiveProbe.sByte = (byte) -7` → `(byte) -7`.
+fn evaluated(reply: &str) -> &str {
+    reply.split_once(" = ").map_or(reply, |(_, v)| v).trim()
+}
+
+/// TEST-10 (#35): every Java primitive, and an array of every Java primitive, read as a local, as a
+/// static field and as an instance field — and rendered identically by all three.
+///
+/// `jdwp-client/src/types.rs` measured 16.67% region coverage, and the coverage review's verdict was "one
+/// big match over value kinds and most arms are for types the probes never produce — low percentage, not
+/// a finding". That was true *because of the probes*: the suite deals in `int`, `String` and objects, so
+/// `byte`, `short`, `char`, `float` and `boolean` had never once come back over the wire in a test. A
+/// renderer nobody has run is not a renderer whose output anyone knows.
+///
+/// **The arrays are the half that matters, and not for symmetry.** `handlers.rs` renders a bare primitive
+/// with its own private copy of the match (`render_primitive`); the copy in `types.rs` — `Value::format`,
+/// the one that measured 16.67% — is reached only for ARRAY ELEMENTS and for the type-mismatch message.
+/// A probe with eight primitive locals and no arrays would exercise the duplicate and leave the original
+/// exactly as unmeasured as before, which is the kind of coverage that reports a number without having
+/// looked.
+///
+/// The values are picked so the rendering can be pinned rather than merely observed: signed extremes,
+/// which catch a width or signedness mistake that `3` never could, and floats that are exact binary
+/// fractions, so the expected string does not depend on anyone's rounding.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn every_primitive_and_its_array_renders_the_same_as_local_field_and_element() {
+    let Some(jdk) = jdk_or_skip("every_primitive_and_its_array_renders_the_same_as_local_field_and_element")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "PrimitiveProbe").expect("launch PrimitiveProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let source = probe_source("PrimitiveProbe");
+    let line = probe_line(&source, "// BP1");
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "PrimitiveProbe", "line": line}),
+    );
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("the breakpoint in PrimitiveProbe.work never fired"));
+
+    let stack = server.call(
+        "debug.get_stack",
+        serde_json::json!({"max_frames": 1, "include_variables": true}),
+    );
+
+    // `(local name, static field, instance field, rendered value)` — the same eight values reached three
+    // ways. Reading all three and comparing them is the point: they are three different resolution paths
+    // in the handlers, and a difference between them is a bug that no single-path test can see.
+    let scalars = [
+        ("b", "sByte", "b", "(byte) -7"),
+        ("s", "sShort", "s", "(short) -300"),
+        ("c", "sChar", "c", "(char) 'Q'"),
+        ("i", "sInt", "i", "(int) -2147483648"),
+        ("j", "sLong", "j", "(long) 9000000000"),
+        ("f", "sFloat", "f", "(float) 1.5"),
+        ("d", "sDouble", "d", "(double) -2.25"),
+        ("z", "sBoolean", "z", "(boolean) true"),
+    ];
+    // And the arrays, which are the only route to `Value::format`. Every element carries its own type
+    // prefix, so a `short[]` read as an `int[]` would be visible here rather than plausible.
+    let arrays = [
+        ("bs", "sBytes", "bs", "byte[3]{(byte) 1, (byte) -2, (byte) 127}"),
+        ("ss", "sShorts", "ss", "short[3]{(short) -300, (short) 0, (short) 300}"),
+        ("cs", "sChars", "cs", "char[3]{(char) 'a', (char) 'Z', (char) '?'}"),
+        ("is", "sInts", "is", "int[3]{(int) 0, (int) -1, (int) 2147483647}"),
+        ("js", "sLongs", "js", "long[2]{(long) -9000000000, (long) 9000000000}"),
+        ("fs", "sFloats", "fs", "float[2]{(float) 0.5, (float) -1.25}"),
+        ("ds", "sDoubles", "ds", "double[2]{(double) 2.5, (double) -0.125}"),
+        ("zs", "sBooleans", "zs", "boolean[2]{(boolean) true, (boolean) false}"),
+    ];
+
+    for (local, static_field, instance_field, want) in scalars.iter().chain(arrays.iter()) {
+        assert!(
+            stack.contains(&format!("{local} = {want}")),
+            "the local `{local}` must render as `{want}`:\n{stack}"
+        );
+        let by_static = server.evaluate(&format!("PrimitiveProbe.{static_field}"));
+        assert_eq!(
+            evaluated(&by_static),
+            *want,
+            "the static field `{static_field}` holds the same value as the local `{local}` and must \
+             render the same way; got {by_static}"
+        );
+        let by_instance = server.evaluate(&format!("PrimitiveProbe.holder.{instance_field}"));
+        assert_eq!(
+            evaluated(&by_instance),
+            *want,
+            "the instance field `holder.{instance_field}` holds the same value and must render the same \
+             way; got {by_instance}"
+        );
+    }
+
+    // FINDING, pinned. `chars[2]` is `(char) 0xD800`, a lone surrogate — an ordinary thing to find in a
+    // Java `char[]`, since a `char` is a UTF-16 code unit and not a Unicode scalar value. It is not
+    // representable as a Rust `char`, so the renderer's `unwrap_or('?')` fires and it comes back as
+    // `(char) '?'` — byte-identical to a real question mark, and there is nothing in the reply to tell
+    // the two apart. The array above pins it; this says what it means.
+    assert!(
+        stack.contains("(char) 'Z', (char) '?'"),
+        "a lone surrogate must be rendered somehow, and the current somehow is indistinguishable from a \
+         literal '?':\n{stack}"
+    );
+    let real_question_mark = server.evaluate("PrimitiveProbe.sChars[1]");
+    assert_eq!(
+        evaluated(&real_question_mark),
+        "(char) 'Z'",
+        "sanity: element 1 is a Z, so the '?' above came from element 2 and not from a failed read"
+    );
+
+    // The other route into `Value::format`: the type-mismatch message renders the value that was refused.
+    // Both object shapes go through it, and neither is reachable from an array of primitives.
+    let null_into_int = server.call(
+        "debug.set_value",
+        serde_json::json!({"target": "PrimitiveProbe.sInt", "value": "null"}),
+    );
+    assert_contains_all(
+        "null refused for an int, showing what was refused",
+        &null_into_int,
+        &["is declared int", "(object) null", "not assignable"],
+    );
+    let string_into_int = server.call(
+        "debug.set_value",
+        serde_json::json!({"target": "PrimitiveProbe.sInt", "value": "\"nope\""}),
+    );
+    assert_contains_all(
+        "a reference refused for an int, showing its id",
+        &string_into_int,
+        &["is declared int", "(object) @", "not assignable"],
+    );
+    // Refused means refused: the field still holds what it did, so the loop above is describing the same
+    // JVM the assertions below would see.
+    assert_eq!(
+        evaluated(&server.evaluate("PrimitiveProbe.sInt")),
+        "(int) -2147483648",
+        "a refused set_value must not have written anything"
+    );
+
+    let base = highest_tick(&probe).unwrap_or(0);
+    server.panic_reset();
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 1)).is_some(),
+        "the probe stopped ticking after the breakpoint was cleared\n  output: {:?}",
+        probe.output(),
+    );
+}
