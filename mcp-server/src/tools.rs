@@ -6,7 +6,7 @@
 
 use crate::args::{
     AttachArgs, ClearBreakpointArgs, EvaluateArgs, ForceReturnArgs, GetLastEventArgs, GetStackArgs,
-    GetTracesArgs, ListClassesArgs, ListMethodsArgs, ListThreadsArgs, SetBreakpointArgs,
+    GetTracesArgs, ListClassesArgs, ListFieldsArgs, ListMethodsArgs, ListThreadsArgs, SetBreakpointArgs,
     SetExceptionBreakpointArgs, SetMethodBreakpointArgs, SetValueArgs, SetWatchpointArgs, SourceArgs,
     StepArgs, ThreadDumpArgs, ToggleBreakpointArgs,
 };
@@ -178,6 +178,11 @@ fn inspection_tools() -> Vec<Tool> {
             input_schema: to_val(schemars::schema_for!(ListMethodsArgs)),
         },
         Tool {
+            name: "debug.list_fields".to_string(),
+            description: "List what state a loaded class HOLDS — the other half of debug.list_methods, for when you have a type but no instance: a static holder, a class you are about to breakpoint into, a vendored or shaded class your checkout cannot show you. Each field is rendered the way Java source spells it (static final java.lang.String INFRA, int qty), so static and instance fields are told apart at a glance and the declared type is a name you can use. Statics are listed FIRST, because those are the ones debug.evaluate can read with no instance and no suspended thread. final and volatile are marked too: a final may refuse a debug.set_value and will never fire a debug.set_field_stop, and a volatile is being written by something else. Declared fields only unless inherited:true walks the superclass chain (each inherited row says which class it came from) — note that expanding an actual object shows inherited state either way, so the default here is deliberately the narrower question. Bounded like the other discovery tools: raise limit or narrow with name_filter. It reads NO values — debug.evaluate reads a named static, and expand_objects renders an instance. A class that declares nothing says so as an answer rather than looking like a failed lookup; a class that is not loaded gets the same reply debug.list_methods gives, pointing at debug.list_classes, because JDWP cannot tell a wrong name from a not-yet-loaded one.".to_string(),
+            input_schema: to_val(schemars::schema_for!(ListFieldsArgs)),
+        },
+        Tool {
             name: "debug.source".to_string(),
             description: "What file a loaded class was COMPILED FROM, and — when source roots are configured — the source lines around a given line. Two independent halves. The JVM half needs no local files at all and is the one that settles whether your checkout is the code that is actually running: a class reporting Order.java in a tree where that file was renamed months ago is the answer, and reading local source would never have shown it. A JSR-45 source debug extension (JSP, Kotlin, Groovy) is reported when the class carries one, meaning the .java name is only an intermediate. The disk half turns a stack frame's class.method:line into text: pass line to get a bounded window around it with line numbers (context, default 20 either side) — that is the intended use, since a caller chasing one frame should not pull a 2000-line file into context. whole_file:true returns everything, still capped by max_lines (default 400), and the reply always states which lines of how many it is showing. Roots come from debug.attach {source_roots:[...]} or the JDWP_SOURCE_ROOTS environment variable, and source_roots on the call overrides both ([] reads no file). A root is where the PACKAGE TREE starts: the file is looked up at <root>/<package as directories>/<the name the JVM reported>, which is why an inner class (com.example.Order$Line) correctly resolves to its enclosing Order.java. Plain directories only — sources inside JARs are not read. The failure modes stay distinct: class not loaded, loaded but compiled with no SourceFile attribute (javac -g:none, or a synthetic class), no configured root holds the file, and found-but-unreadable each say something different about what to fix.".to_string(),
             input_schema: to_val(schemars::schema_for!(SourceArgs)),
@@ -231,6 +236,7 @@ mod tests {
             "debug.list_threads",
             "debug.list_classes",
             "debug.list_methods",
+            "debug.list_fields",
             "debug.source",
             "debug.thread_dump",
             "debug.get_traces",

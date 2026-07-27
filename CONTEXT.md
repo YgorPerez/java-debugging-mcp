@@ -228,9 +228,10 @@ the debugger reports success either way.
 Having executed code — as opposed to **listening**, which is all a successful attach proves. The JDWP agent
 binds during JVM startup, before the main class is loaded, so the two are minutes apart on a slow enough
 runner and indistinguishable from the debugger's side. A test whose first question is about loaded state
-(`debug.list_classes`, `debug.list_methods`, `debug.source`) has to wait for the probe's readiness line
-first: those tools answer "not loaded" *correctly*, so losing the race does not fail loudly, it asserts a
-wrong finding and blames the tool (TEST-17, #49). `Probe::launch_running` is that wait.
+(`debug.list_classes`, `debug.list_methods`, `debug.list_fields`, `debug.source`) has to wait for the
+probe's readiness line first: those tools answer "not loaded" *correctly*, so losing the race does not
+fail loudly, it asserts a wrong finding and blames the tool (TEST-17, #49). `Probe::launch_running` is
+that wait.
 _Avoid_: "started", "up", "attached" — every one of them reads as either state.
 
 **Cassette**:

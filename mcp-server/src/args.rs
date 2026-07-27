@@ -352,6 +352,29 @@ pub struct ListMethodsArgs {
     pub limit: usize,
 }
 
+/// Arguments for `debug.list_fields` (DISC-5).
+///
+/// Deliberately the same shape as [`ListMethodsArgs`], down to the argument names and the default
+/// limit: the two answer the two halves of one question ("what can I call on this type", "what state
+/// does it hold"), and a caller who has learnt one should not have to learn the other. See ADR-0015 for
+/// why this is a second tool rather than a `fields:true` flag on the first.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListFieldsArgs {
+    /// Fully-qualified class name, e.g. com.example.OrderService. Must already be loaded — find it
+    /// with `debug.list_classes` if unsure.
+    pub class_name: String,
+    /// Only fields whose name contains this substring (case-insensitive).
+    #[serde(default)]
+    pub name_filter: Option<String>,
+    /// Also walk the superclass chain. Off by default: what this type itself declares is the smaller,
+    /// clearer answer, and Object's contribute noise to every listing.
+    #[serde(default)]
+    pub inherited: bool,
+    /// Max fields to return; the rest are reported as a hidden count.
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
 /// Arguments for `debug.source` (DISC-3).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SourceArgs {

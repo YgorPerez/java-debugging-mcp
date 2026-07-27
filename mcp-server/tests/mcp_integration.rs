@@ -4127,8 +4127,105 @@ fn disc2_method_listing(server: &mut Server) -> Vec<String> {
     vec![m, twice, own, chain, missing]
 }
 
+/// DISC-5 (#53): the other half of the same question — what state a type HOLDS, for a caller who has the
+/// type and no instance to expand.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn list_fields_renders_java_declarations_and_marks_static() {
+    let Some(jdk) = jdk_or_skip("list_fields_renders_java_declarations_and_marks_static") else { return };
+    let probe = eval_probe_running(&jdk);
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    disc5_field_listing(&mut server);
+}
+
+/// DISC-5's assertions, against whatever is on the other end of `server` — a JVM or a cassette.
+///
+/// Split out for the same reason as [`disc2_method_listing`], and asking the same *kind* of question: it
+/// is all loaded state, so there are no events on the tape and both halves of the pair can run it.
+///
+/// `EvalProbe` was given three fields for this (a `static final`, an instance `int`, and a `volatile` on
+/// `Task`), because a probe made entirely of statics cannot show that statics are listed first, and one
+/// with no inherited field cannot show the superclass walk attributing a row.
+fn disc5_field_listing(server: &mut Server) -> Vec<String> {
+    let f = server.call("debug.list_fields", serde_json::json!({"class_name": "EvalProbe", "limit": 100}));
+    assert_contains_all(
+        "rendered declarations",
+        &f,
+        &[
+            "static java.lang.String infra",
+            "static int base",
+            "static java.lang.String[] words",
+            "static final int LIMIT",
+            "int seq",
+        ],
+    );
+    assert!(!f.contains("Ljava/lang/String;"), "raw JVM descriptors must not leak into a listing: {f}");
+    // Statics lead, because those are the ones readable with no instance — the case the tool is for. The
+    // probe's single instance field is therefore last, whatever order the class file listed them in.
+    let seq_at = f.find("\nint seq").expect("the instance field is listed");
+    assert!(
+        f.find("static java.lang.String infra").is_some_and(|s| s < seq_at)
+            && f.find("static final int LIMIT").is_some_and(|s| s < seq_at),
+        "every static must precede the instance field:\n{f}"
+    );
+
+    // Instance fields of a type that has only those — and no `static` marker anywhere, which is the
+    // distinction the criterion asks for read from the other side.
+    let item = server.call("debug.list_fields", serde_json::json!({"class_name": "EvalProbe$Item"}));
+    assert_contains_all("instance fields", &item, &["java.lang.String name", "int qty"]);
+    assert!(!item.contains("static"), "Item declares no statics, so nothing may be marked one: {item}");
+
+    // Bounded like every other discovery tool: the header counts what matched, and the truncation is
+    // loud rather than a short page that reads like the whole answer.
+    // The total is read off the unbounded reply rather than written down, so adding a field to the probe
+    // does not silently make this test assert the wrong arithmetic.
+    let declared: usize = f
+        .split_once('/')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("the header counts shown/matched: {f}"));
+    let capped = server.call("debug.list_fields", serde_json::json!({"class_name": "EvalProbe", "limit": 2}));
+    assert!(
+        capped.starts_with(&format!("2/{declared} field(s) on EvalProbe")),
+        "a capped listing states both numbers: {capped}"
+    );
+    let hidden = format!("… +{} more", declared - 2);
+    assert_contains_all("loud truncation", &capped, &[hidden.as_str(), "raise limit"]);
+
+    let filtered =
+        server.call("debug.list_fields", serde_json::json!({"class_name": "EvalProbe", "name_filter": "in"}));
+    assert_contains_all("name_filter", &filtered, &["infra", "name~\"in\""]);
+    assert!(!filtered.contains("words"), "name_filter must exclude non-matches: {filtered}");
+
+    // Declared-only by default. `Subtask` declares nothing at all, which is a CORRECT answer that reads
+    // exactly like a failed lookup — so it has to say the class resolved and name the next move.
+    let own = server.call("debug.list_fields", serde_json::json!({"class_name": "EvalProbe$Subtask"}));
+    assert!(own.starts_with("0/0 field(s) on EvalProbe$Subtask"), "{own}");
+    assert_contains_all("resolved but empty", &own, &["RESOLVED", "inherited:true"]);
+    assert!(!own.contains("not loaded"), "a class that resolved must never be called unloaded: {own}");
+
+    // And the walk, attributing the row to the class that declares it.
+    let chain = server.call(
+        "debug.list_fields",
+        serde_json::json!({"class_name": "EvalProbe$Subtask", "inherited": true, "limit": 100}),
+    );
+    assert_contains_all("inherited walk", &chain, &["volatile int runs", "[from EvalProbe$Task]"]);
+
+    // "Not loaded" and "no such class" are indistinguishable over JDWP, so this must say so rather than
+    // pick one — the same resolver, and therefore the same answer, as `list_methods` gives.
+    let missing =
+        server.call("debug.list_fields", serde_json::json!({"class_name": "com.example.NoSuchThing"}));
+    assert_contains_all("unloaded class", &missing, &["is not loaded", "debug.list_classes"]);
+
+    vec![f, item, capped, filtered, own, chain, missing]
+}
+
 /// The checked-in cassette of the session above, named for what it plays rather than for how it was made.
 const DISC2_CASSETTE: &str = "list_methods_disc2";
+
+/// The checked-in cassette of DISC-5's field listing — the JDK-free half of its pair.
+const DISC5_CASSETTE: &str = "list_fields_disc5";
 
 /// The checked-in cassette of one method-exit arming, kept for the sake of being edited.
 const MEXIT_CASSETTE: &str = "method_exit_arming";
@@ -4155,6 +4252,21 @@ fn a_recorded_session_replays_with_the_probe_stopped_and_says_the_same_thing() {
         return;
     };
     record_replay_and_compare(&jdk, DISC2_CASSETTE, disc2_method_listing);
+}
+
+/// DISC-5 (#53): the field listing's own recording, made the same way and for the same pair.
+///
+/// A new tool arriving with only a JVM-dependent test would have re-created the gap TEST-12 (#37) closed:
+/// the fast half is the one that runs in CI's default `cargo test` and on a machine with no Java on it.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_recorded_field_listing_replays_with_the_probe_stopped_and_says_the_same_thing() {
+    let Some(jdk) =
+        jdk_or_skip("a_recorded_field_listing_replays_with_the_probe_stopped_and_says_the_same_thing")
+    else {
+        return;
+    };
+    record_replay_and_compare(&jdk, DISC5_CASSETTE, disc5_field_listing);
 }
 
 /// TEST-12 (#37): the second cassette, recorded for the sake of being **edited**.
@@ -4252,7 +4364,7 @@ fn arm_a_traced_method_exit_on_an_old_vm(server: &mut Server) -> String {
 /// No JDK: it reads files.
 #[test]
 fn every_checked_in_cassette_round_trips_through_the_writer() {
-    for name in [DISC2_CASSETTE, MEXIT_CASSETTE, JDWP15_CASSETTE] {
+    for name in [DISC2_CASSETTE, DISC5_CASSETTE, MEXIT_CASSETTE, JDWP15_CASSETTE] {
         let path = cassette_path(name);
         let text =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
@@ -4354,6 +4466,29 @@ fn list_methods_renders_java_signatures_from_a_cassette() {
         disc2_method_listing(&mut server);
     }
     // Explicit as well as in `Drop`, so the failure names this test rather than arriving during unwinding.
+    replay.assert_no_misses();
+}
+
+/// DISC-5 (#53): the field listing out of a checked-in file — **no JDK, no JVM, no `#[ignore]`**.
+///
+/// Same shape and same argument as the test above. The bounding, the statics-first order, the empty
+/// answer that must not read as a failure and the not-loaded reply are all regressions a file read can
+/// catch, and only the questions about a *live* debuggee need the probe.
+#[test]
+fn list_fields_renders_java_declarations_from_a_cassette() {
+    let path = cassette_path(DISC5_CASSETTE);
+    let tape = Cassette::load(&path).unwrap_or_else(|e| {
+        panic!(
+            "{e}\nRe-record it with a JDK:\n  {RERECORD_ENV}=1 scripts/integration-test.sh \
+             a_recorded_field_listing"
+        )
+    });
+    let replay = ReplayServer::start(&tape).expect("start replay server");
+    {
+        let mut server = Server::start().expect("start server");
+        server.attach(replay.port);
+        disc5_field_listing(&mut server);
+    }
     replay.assert_no_misses();
 }
 
@@ -5395,11 +5530,13 @@ fn synthetic_frames_render_with_names_a_reader_can_act_on() {
 /// here is spelled out for that reason: the class name comes off the live stack and goes straight back in,
 /// which is the criterion in the caller's terms and is JDK-agnostic by construction.
 ///
-/// `debug.list_fields` is named in the issue and does not exist in this server — there is no field-listing
-/// MCP tool to fix. What both criteria are really about is the one resolver behind every tool that takes a
-/// class name, so the two that exist stand in for it: `list_methods`, and `debug.source` for the "answers
-/// plainly" criterion — a hidden class has no `SourceFile` attribute, and saying so is a real answer,
-/// where "not loaded" was not.
+/// `debug.list_fields` was named in #50's criteria and **did not exist** when this test was written, which
+/// is how DISC-5 ([#53](https://github.com/YgorPerez/java-debugging-mcp/issues/53)) came to be filed. What
+/// both criteria were really about is the one resolver behind every tool that takes a class name, so the
+/// tools that did exist stood in for it: `list_methods`, and `debug.source` for the "answers plainly"
+/// criterion — a hidden class has no `SourceFile` attribute, and saying so is a real answer where "not
+/// loaded" was not. `list_fields` now exists and is asked the same round trip below, so the criterion is
+/// met by the tool it named rather than by a stand-in.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_hidden_class_answers_questions_asked_under_the_name_the_stack_printed() {
@@ -5457,6 +5594,42 @@ fn a_hidden_class_answers_questions_asked_under_the_name_the_stack_printed() {
         methods.contains("void run()"),
         "a lambda's hidden class implements Runnable, so its generated `run` is the method a caller came \
          for — an empty listing would resolve and still answer nothing:\n{methods}"
+    );
+
+    // DISC-5 (#53): the tool the issue behind #50 went looking for and did not find now exists, so the
+    // stand-in above is joined by the real thing. Nothing is spelled out about WHAT a hidden class holds,
+    // and that is deliberate rather than lazy: whether the JVM gives a non-capturing lambda's class a
+    // `LAMBDA_INSTANCE$` static, a captured `arg$1`, or no field at all is a detail of the metafactory
+    // that has changed between JDK generations, and pinning it is the JDK-locked assertion #36's matrix
+    // exists to catch. What must hold on every JDK is that the class RESOLVES under the name the stack
+    // printed and gets a real answer — a listing, or the explicit "it declares none", never "not loaded".
+    //
+    // Measured rather than guessed, and the same on both legs: `SyntheticProbe`'s lambdas capture nothing,
+    // so the reply is `0/0` on JDK 11 (`SyntheticProbe$$Lambda$3/891297757`) and on JDK 25
+    // (`SyntheticProbe$$Lambda/0x…`) alike. That makes the hidden class the tool's *typical* empty answer
+    // rather than an exotic one — which is exactly why an empty listing has to say the class resolved.
+    let fields = server.call("debug.list_fields", serde_json::json!({"class_name": printed}));
+    assert!(
+        !fields.contains("is not loaded"),
+        "DISC-5 (#53): {printed} came off the stack this server just printed — a field listing may not \
+         call it unloaded:\n{fields}"
+    );
+    assert!(
+        fields.contains(&format!("field(s) on {printed}")),
+        "list_fields must answer under the name it was asked about:\n{fields}"
+    );
+    assert!(
+        !fields.starts_with("0/0") || fields.contains("RESOLVED"),
+        "a hidden class that declares nothing is the likeliest answer here, and an empty listing that does \
+         not say the class resolved is indistinguishable from a miss:\n{fields}"
+    );
+    // The ordinary control for the same tool: `SyntheticProbe.GATE` is a plain `static final Object`, and
+    // all three of those words are the listing's own work rather than the JVM's.
+    let ordinary_fields =
+        server.call("debug.list_fields", serde_json::json!({"class_name": "SyntheticProbe"}));
+    assert!(
+        ordinary_fields.contains("static final java.lang.Object GATE"),
+        "an ordinary class must be unaffected by the hidden-class spelling:\n{ordinary_fields}"
     );
 
     // The other tool that resolves a class name this way, and the "says so plainly" criterion. A hidden
