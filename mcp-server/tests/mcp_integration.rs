@@ -4097,3 +4097,143 @@ fn source_reports_the_compiled_from_file_and_reads_a_window_from_a_root() {
     );
     assert_contains_all("stale line number", &stale, &["past the end", "does not match the running build"]);
 }
+
+/// TEST-14 (#39): the fourth `debug.source` answer — loaded, and compiled with no `SourceFile` at all.
+///
+/// The realistic shape of this is a vendored jar, a shaded dependency, or an app server's own internals,
+/// all of which routinely ship without `-g`; `StrippedProbe` is the stand-in, and the only probe the
+/// harness compiles `-g:none`. Until it existed the branch was unreachable *by construction* — `-g` is
+/// right for every other probe, and no amount of different Java produces a class file missing the
+/// attribute this branch is about the absence of.
+///
+/// What makes it worth a test rather than a shrug is that all four of `debug.source`'s empty-handed
+/// answers have to stay **distinguishable**. "Not loaded", "no root holds it", and this one send the
+/// reader somewhere completely different, and it is the moment someone is already asking why they cannot
+/// see their code — the worst possible moment to hand them the wrong one.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn source_says_when_a_loaded_class_carries_no_source_file_attribute() {
+    let Some(jdk) = jdk_or_skip("source_says_when_a_loaded_class_carries_no_source_file_attribute")
+    else {
+        return;
+    };
+    let probe = Probe::launch_stripped(&jdk, "StrippedProbe").expect("launch StrippedProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let stripped = server.call(
+        "debug.source",
+        serde_json::json!({"class_name": "StrippedProbe", "source_roots": []}),
+    );
+    assert_contains_all("no SourceFile attribute", &stripped, &[
+        "NO source file",
+        "-g:none",
+        "debug.list_methods",
+    ]);
+    // Not the unloaded answer. The class is right there and the attribute is what is missing, so a reply
+    // saying "not loaded" would send someone hunting a classpath problem that does not exist.
+    assert!(!stripped.contains("is not loaded"), "ABSENT_INFORMATION is not 'not loaded': {stripped}");
+    let methods = server.call("debug.list_methods", serde_json::json!({"class_name": "StrippedProbe"}));
+    assert_contains_all("the stripped class really is loaded", &methods, &["main"]);
+
+    // Control, same session and same connection: a class that DID keep the attribute still answers.
+    // Without it this test would also pass with `SourceFile` broken outright, or with every reply an
+    // error the assertions happened to match — the green-run-of-nothing shape this repo keeps finding.
+    let jdk_class = server.call(
+        "debug.source",
+        serde_json::json!({"class_name": "java.lang.String", "source_roots": []}),
+    );
+    assert_contains_all("a class that kept its attribute", &jdk_class, &["String.java", "reported by the JVM"]);
+
+    // The one that would be easy to get wrong, and quietly: `StrippedProbe.java` is sitting in
+    // `examples/probes`, so a resolver that derived a file name from the CLASS name would find it and
+    // print source for a build carrying no record of having come from that file. Right lines, wrong
+    // reason — worse than the error, because nothing about the output looks wrong.
+    let on_disk = probe_source_path("StrippedProbe");
+    let root = on_disk.parent().expect("probe source has a parent");
+    let with_root = server.call(
+        "debug.source",
+        serde_json::json!({"class_name": "StrippedProbe", "source_roots": [root.to_string_lossy()]}),
+    );
+    assert_contains_all("a root holding the file changes nothing", &with_root, &["NO source file"]);
+    assert!(
+        !with_root.contains("public class StrippedProbe"),
+        "the file on disk must not be guessed from the class name: {with_root}"
+    );
+}
+
+/// TEST-15 (#40): a class whose `.java` is an intermediate, and the SMAP that says what it came from.
+///
+/// This is the JSP case, which is why the SMAP path exists: Jasper compiles `hello.jsp` into a servlet
+/// and records a JSR-45 SMAP mapping the generated lines back. Ask such a class what it was compiled
+/// from and the honest answer — the generated `.java` — is a **confidently wrong** one, because the file
+/// someone actually wrote is named nowhere else. `debug.source` reporting the intermediate as though it
+/// were source is the failure this branch exists to prevent, and until now the branch had never run:
+/// `javac` cannot emit the attribute, so no probe carried one (see `install_source_debug_extension` for
+/// how one does now, and what was rejected on the way).
+///
+/// `Neighbour` is the control, and the reason the probe has two classes. It comes out of the same `javac`
+/// invocation, from the same file, and is deliberately NOT patched — so a `debug.source` that announced
+/// an SMAP unconditionally, or a splice that quietly did nothing, both fail here rather than passing.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn source_reports_the_smap_when_the_class_was_translated_from_another_file() {
+    let Some(jdk) =
+        jdk_or_skip("source_reports_the_smap_when_the_class_was_translated_from_another_file")
+    else {
+        return;
+    };
+    let probe = Probe::launch_with_smap(&jdk, "SmapProbe").expect("launch SmapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // Needs no local file: the SMAP travels in the class, so this half answers on a box holding no
+    // source at all — which is the half that matters when the question is what the deployed thing is.
+    let translated = server.call(
+        "debug.source",
+        serde_json::json!({"class_name": "SmapProbe", "source_roots": []}),
+    );
+    assert_contains_all("SMAP present", &translated, &[
+        "SmapProbe.java",
+        "JSR-45 SMAP) present",
+        "is the intermediate",
+        "hello.jsp",
+        "*S JSP",
+    ]);
+    // The whole attribute came back, not just a header that happened to match: `*L` and a line-section
+    // entry are the last bytes of the fixture, so their arrival proves the length field was right too.
+    assert_contains_all("the whole SMAP round-tripped", &translated, &["*L", "1#1,3:24", "*E"]);
+
+    // The control: same file, same compile, no attribute. `debug.source` must say nothing about an SMAP
+    // for it — an unconditional banner would be worse than none, since it would teach the reader to
+    // ignore the one case where the `.java` really is not what anyone wrote.
+    let plain = server.call(
+        "debug.source",
+        serde_json::json!({"class_name": "Neighbour", "source_roots": []}),
+    );
+    assert_contains_all("the unpatched neighbour", &plain, &["SmapProbe.java", "reported by the JVM"]);
+    assert!(
+        !plain.contains("SMAP") && !plain.contains("hello.jsp"),
+        "a class with no source debug extension must not be announced as translated: {plain}"
+    );
+
+    // And with roots configured, both halves arrive: the intermediate IS readable and worth reading —
+    // it is what the stack line numbers refer to — but it arrives labelled as an intermediate rather
+    // than handed over as the source. Reading the window without the label is the confidently wrong
+    // answer this whole branch is here to avoid.
+    let on_disk = probe_source_path("SmapProbe");
+    let root = on_disk.parent().expect("probe source has a parent");
+    let both = server.call(
+        "debug.source",
+        serde_json::json!({
+            "class_name": "SmapProbe",
+            "whole_file": true,
+            "source_roots": [root.to_string_lossy()],
+        }),
+    );
+    assert_contains_all("labelled intermediate, still read", &both, &[
+        "is the intermediate",
+        "hello.jsp",
+        "public class SmapProbe",
+    ]);
+}
