@@ -5857,7 +5857,7 @@ async fn apply_index(
         // Map.get(Object) cannot take a raw primitive: hand it a wrapper, or the JVM reads the int as
         // an object pointer and dies.
         let key_value = arglit_to_value(conn, thread_id, frame, key).await?;
-        if render_primitive(&key_value.data).is_some() {
+        if key_value.data.format_primitive().is_some() {
             box_primitive(conn, tid, &key_value)
                 .await
                 .ok_or_else(|| format!("Could not box the key for '{label}[…]' — try a String key"))?
@@ -6741,25 +6741,10 @@ async fn render_value(
     match &value.data {
         ValueData::Object(0) => "null".to_string(),
         ValueData::Object(id) => render_object(conn, *id, value.tag, thread_id, max_len).await,
-        other => render_primitive(other).unwrap_or_else(|| "(?)".to_string()),
+        // `ValueData::format_primitive` declines only a reference, and both reference shapes are matched
+        // above — so the fallback is unreachable rather than a rendering anyone should see.
+        other => other.format_primitive().unwrap_or_else(|| "(?)".to_string()),
     }
-}
-
-/// Render a primitive value; `None` for a reference (which needs a JVM round trip to describe).
-fn render_primitive(data: &jdwp_client::types::ValueData) -> Option<String> {
-    use jdwp_client::types::ValueData;
-    Some(match data {
-        ValueData::Byte(v) => format!("(byte) {v}"),
-        ValueData::Char(v) => format!("(char) '{}'", char::from_u32(u32::from(*v)).unwrap_or('?')),
-        ValueData::Float(v) => format!("(float) {v}"),
-        ValueData::Double(v) => format!("(double) {v}"),
-        ValueData::Int(v) => format!("(int) {v}"),
-        ValueData::Long(v) => format!("(long) {v}"),
-        ValueData::Short(v) => format!("(short) {v}"),
-        ValueData::Boolean(v) => format!("(boolean) {v}"),
-        ValueData::Void => "(void)".to_string(),
-        ValueData::Object(_) => return None,
-    })
 }
 
 // ----- deep (recursive) object rendering: OBJ-1 -----
@@ -6859,7 +6844,7 @@ async fn render_node(
     state: &mut DeepState,
     depth: usize,
 ) -> String {
-    if let Some(p) = render_primitive(&value.data) {
+    if let Some(p) = value.data.format_primitive() {
         return p;
     }
     let jdwp_client::types::ValueData::Object(id) = value.data else {
@@ -7271,7 +7256,7 @@ async fn render_boxed_primitive(conn: &mut jdwp_client::JdwpConnection, id: u64)
     }
     let (_, f) = find_field_info(conn, type_id, "value", Some(false)).await.ok()??;
     let v = conn.get_object_values(id, vec![f.field_id]).await.ok()?.into_iter().next()?;
-    render_primitive(&v.data)
+    v.data.format_primitive()
 }
 
 /// The type name of a live object, or a placeholder if it can't be read.

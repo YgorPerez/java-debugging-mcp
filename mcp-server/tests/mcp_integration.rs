@@ -5340,12 +5340,16 @@ fn evaluated(reply: &str) -> &str {
 /// `byte`, `short`, `char`, `float` and `boolean` had never once come back over the wire in a test. A
 /// renderer nobody has run is not a renderer whose output anyone knows.
 ///
-/// **The arrays are the half that matters, and not for symmetry.** `handlers.rs` renders a bare primitive
-/// with its own private copy of the match (`render_primitive`); the copy in `types.rs` — `Value::format`,
-/// the one that measured 16.67% — is reached only for ARRAY ELEMENTS and for the type-mismatch message.
-/// A probe with eight primitive locals and no arrays would exercise the duplicate and leave the original
-/// exactly as unmeasured as before, which is the kind of coverage that reports a number without having
-/// looked.
+/// **The arrays are the half that matters, and not for symmetry.** `handlers.rs` used to render a bare
+/// primitive with its own private copy of the match (`render_primitive`), so the copy in `types.rs` —
+/// `Value::format`, the one that measured 16.67% — was reached only through ARRAY ELEMENTS and the
+/// type-mismatch message. A probe with eight primitive locals and no arrays would have exercised the
+/// duplicate and left the original exactly as unmeasured as before, which is the kind of coverage that
+/// reports a number without having looked. Reading through both paths is what caught it; TYPE-1
+/// ([#48](https://github.com/YgorPerez/java-debugging-mcp/issues/48)) then deleted the duplicate, so
+/// there is now one renderer in `jdwp-client` and every route below reaches it. The arrays stay: they are
+/// still the only way to see an element rendered on its own, and a `short[]` read as an `int[]` would be
+/// visible here rather than plausible.
 ///
 /// The values are picked so the rendering can be pinned rather than merely observed: signed extremes,
 /// which catch a width or signedness mistake that `3` never could, and floats that are exact binary
@@ -5393,7 +5397,12 @@ fn every_primitive_and_its_array_renders_the_same_as_local_field_and_element() {
     let arrays = [
         ("bs", "sBytes", "bs", "byte[3]{(byte) 1, (byte) -2, (byte) 127}"),
         ("ss", "sShorts", "ss", "short[3]{(short) -300, (short) 0, (short) 300}"),
-        ("cs", "sChars", "cs", "char[3]{(char) 'a', (char) 'Z', (char) '?'}"),
+        (
+            "cs",
+            "sChars",
+            "cs",
+            "char[3]{(char) 'a', (char) 'Z', (char) '\\uD800' (unpaired surrogate, not a character)}",
+        ),
         ("is", "sInts", "is", "int[3]{(int) 0, (int) -1, (int) 2147483647}"),
         ("js", "sLongs", "js", "long[2]{(long) -9000000000, (long) 9000000000}"),
         ("fs", "sFloats", "fs", "float[2]{(float) 0.5, (float) -1.25}"),
@@ -5422,21 +5431,27 @@ fn every_primitive_and_its_array_renders_the_same_as_local_field_and_element() {
         );
     }
 
-    // FINDING, pinned. `chars[2]` is `(char) 0xD800`, a lone surrogate — an ordinary thing to find in a
-    // Java `char[]`, since a `char` is a UTF-16 code unit and not a Unicode scalar value. It is not
-    // representable as a Rust `char`, so the renderer's `unwrap_or('?')` fires and it comes back as
-    // `(char) '?'` — byte-identical to a real question mark, and there is nothing in the reply to tell
-    // the two apart. The array above pins it; this says what it means.
+    // WAS the finding, now the fix (TYPE-1, #48). `chars[2]` is `(char) 0xD800`, a lone surrogate — an
+    // ordinary thing to find in a Java `char[]`, since a `char` is a UTF-16 code unit and not a Unicode
+    // scalar value. It is not representable as a Rust `char`, and the renderer's `unwrap_or('?')` used to
+    // fire and hand back `(char) '?'`, byte-identical to a real question mark with nothing in the reply
+    // to tell the two apart. The array above pins the new rendering; this pins the property that made it
+    // a finding — that it can be told apart from a genuine `'?'` rather than merely rendered as
+    // *something*.
     assert!(
-        stack.contains("(char) 'Z', (char) '?'"),
-        "a lone surrogate must be rendered somehow, and the current somehow is indistinguishable from a \
-         literal '?':\n{stack}"
+        !stack.contains("(char) 'Z', (char) '?'"),
+        "a lone surrogate must not render as a literal '?', which is a value the debuggee could really \
+         hold:\n{stack}"
+    );
+    assert!(
+        stack.contains("(char) '\\uD800' (unpaired surrogate"),
+        "it renders as the code unit it is, and says what that is:\n{stack}"
     );
     let real_question_mark = server.evaluate("PrimitiveProbe.sChars[1]");
     assert_eq!(
         evaluated(&real_question_mark),
         "(char) 'Z'",
-        "sanity: element 1 is a Z, so the '?' above came from element 2 and not from a failed read"
+        "sanity: element 1 is a Z, so the surrogate above came from element 2 and not from a failed read"
     );
 
     // The other route into `Value::format`: the type-mismatch message renders the value that was refused.
