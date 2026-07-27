@@ -77,6 +77,14 @@ Reading it as-is and leaving it is the only option that neither destroys nor acc
 - **A truncated dump and a failed resume are reported separately.** Both are ways a dump can go wrong, and
   collapsing them would make "I stopped early" indistinguishable from "I could not un-freeze the VM" — the
   second is an emergency and the first is not.
-- The default budget is **provisional**, chosen from loopback timings where a round trip is sub-millisecond.
-  Calibrating it against a real thread pool is tracked as an assumption on
-  [#13](https://github.com/YgorPerez/java-debugging-mcp/issues/13).
+- The default budget was **provisional**, chosen from loopback timings where a round trip is
+  sub-millisecond, and the assumption was tracked on #13 and then on its successor
+  [#24](https://github.com/YgorPerez/java-debugging-mcp/issues/24).
+  **It is no longer provisional, and it did not change.** It has since been tested against a
+  production-shaped pool — `PoolShapeProbe`: 300 threads, 60 frames deep — and against added network
+  latency via `LatencyRelay`, neither of which needs the shared instance. The budget *did* bind under that
+  shape (a whole-pool deep dump truncated at 40%), and the answer was to make the dump cheaper rather than
+  the freeze longer: line tables are now cached per dump, the same dump costs 1,625 packets instead of
+  21,364, and it completes within the existing 2000 ms. See
+  [ADR-0011](0011-line-tables-are-cached-per-dump-not-per-connection.md), which also records why the
+  rejection below now applies only to caching *across* dumps.

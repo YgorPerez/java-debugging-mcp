@@ -237,6 +237,30 @@ with malformed input (unparseable lines, non-objects, missing `method`, EOF mid-
 so it runs in plain `cargo test`. Each case checks that an error came back **and** that the server is
 still serving afterwards, since one bad line from a client must not end the session.
 
+#### Testing shared-instance behaviour without a shared instance
+
+The costs that matter on a busy remote JVM — how long a dump freezes it, how much a trace slows it — used
+to be answerable only against the real thing. They aren't. Three variables separate a real app server from
+a loopback probe, and two of them belong to the debuggee:
+
+| variable | how a test presents it |
+| --- | --- |
+| hundreds of threads, not tens | `PoolShapeProbe` — 300 workers, named like a real pool |
+| stacks far deeper than `max_frames` | `PoolShapeProbe` — 60 **distinct** frames per worker |
+| a network hop instead of loopback | `LatencyRelay::start(probe.port, rtt)`, then attach to `relay.port` |
+
+`LatencyRelay` forwards the JDWP stream adding a measured round trip, in userspace — `tc … netem` needs
+`NET_ADMIN`, and deterministic latency beats a real network's jitter for a test. It charges coalesced
+traffic once, so measurements through it are a lower bound, and it models latency only.
+
+The cost model these established is `held ≈ packets × (our per-packet cost + RTT)`, measured linear in RTT
+with a slope of 1 packet per round trip. So **packet count is the lever**, which is why a dump caches line
+tables per call (ADR-0011) rather than being given a longer suspension budget. Assert packet counts, not
+durations: a packet count is deterministic and load-independent.
+
+What still needs the real instance is only its own parameters — thread count, stack depth, and RTT — which
+one dump at defaults and one `ping` supply.
+
 For poking at the tools by hand against a realistic app, use the companion
 [java-example-for-k8s](../java-example-for-k8s) as a target:
 

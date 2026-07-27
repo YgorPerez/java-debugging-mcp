@@ -7,9 +7,9 @@ item and finish it.
 
 ## Coverage: `scripts/coverage.sh`, and the gaps reviewed once
 
-**86.19% region / 87.70% line / 80.43% functions**, unit + integration together — 55 unit + 6 doc + 7 stdio
-+ 48 integration tests, zero skips (TRACE-7/TEST-9/CLEAN-1). Up from **85.28% / 86.64% / 79.62%** at TEST-7
-(#19), and from 83%/78% at TEST-5.
+**86.30% region / 87.78% line / 80.59% functions**, unit + integration together — 58 unit + 6 doc + 7 stdio
++ 51 integration tests, zero skips (TRACE-7/TEST-9/CLEAN-1/TEST-8). Up from **85.28% / 86.64% / 79.62%** at
+TEST-7 (#19), and from 83%/78% at TEST-5.
 
 The move worth naming is not the total: **`main.rs` went from 65.38% region / 66.25% line to 90.07% /
 95.88%**, which was TEST-9's whole point — it was the one uncovered path #19 judged a real gap. The new
@@ -212,6 +212,35 @@ Register an `examples/test_*.rs` in `jdwp-client/Cargo.toml` and run it against 
 3. `cargo run --release --example …`
 
 Worked patterns: `examples/test_static_field.rs`, `examples/test_deferred_bp.rs`.
+
+**Shared-instance behaviour — a shaped probe plus the latency relay. You do not need the 8180.**
+This was the standing excuse for leaving the shared-instance defaults uncalibrated, and it does not hold.
+What makes a real app server different from a loopback probe is three variables, and two of them belong to
+the *debuggee*:
+
+| variable | how to present it here |
+| --- | --- |
+| hundreds of threads, not 60 | `PoolShapeProbe` — `WORKERS = 300`, named like a real pool's |
+| stacks far deeper than 8 frames | `PoolShapeProbe` — `DEPTH = 60`, **distinct** methods, not recursion |
+| a network hop instead of loopback | `LatencyRelay::start(probe.port, Duration::from_millis(4))`, then attach to `relay.port` |
+
+`LatencyRelay` (in `tests/common/mod.rs`) forwards the JDWP stream with a delay per chunk. Userspace
+because `tc qdisc … netem delay` needs `NET_ADMIN`, which a container lacks — and because deterministic
+latency is better for a test than a real network's jitter. It charges coalesced traffic once, so a
+measurement through it is a **lower bound**; it models latency only, not loss or bandwidth.
+
+Depth must be **distinct methods**. Line tables are cached per dump by `(class, method)`, so a recursive
+chain collapses to one lookup and flatters the cache; a real request stack has about as many methods as
+frames (ADR-0011).
+
+Prefer asserting **packet counts** over durations for anything cost-related: a packet count is
+deterministic and independent of machine load, a duration is neither. See
+`a_production_shaped_dump_costs_a_bounded_number_of_packets_per_thread`, whose ≤20-per-thread bound fails
+at ~70 if the cache is removed — verified by defeating it, not assumed.
+
+What still needs the real instance is only its **own parameters**: how many threads, how deep, and the RTT
+to it. One `debug.thread_dump` at defaults (~65 ms held, 258 packets) and one `ping` answer that, and
+`held ≈ packets × (our per-packet cost + RTT)` does the rest.
 
 Note: the `mcp__jdwp__` tools in a running Claude Code session hold the OLD binary — a rebuild is only
 picked up after a Claude Code restart. That's why validation goes through tests/examples, not the live
@@ -779,6 +808,36 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   and a final request with no trailing newline — which is answered *at* EOF, since `read_line` holds a
   partial line until the newline or the close. **No JDK needed**, so they are not `#[ignore]`d: hiding them
   behind the flag that exists for JVM tests would put them behind a gate they don't need.
+- **A production-shaped dump cost 13× more packets than it needed to (TEST-8, #24, partial)** — and the
+  reason nobody knew is that "we need the real 8180" had been accepted as the answer. It is not. Of the
+  three things that make the real instance different, **two are properties of the debuggee**: thread count
+  is a loop bound and stack depth is a call chain. `PoolShapeProbe` presents them (300 workers, 60 distinct
+  frames, parked, named like a real pool); `LatencyRelay` supplies the third in userspace, since
+  `tc … netem` needs `NET_ADMIN` a container lacks.
+  Measured against that shape on loopback, a whole-pool 60-frame dump cost **21,364 packets / 4,686 ms**,
+  and **at the default 2000 ms budget it truncated at 40% of the pool**. ~19,000 of those packets were
+  `Method.LineTable` — asked once per frame per thread while covering ~60 distinct methods, because the
+  threads of a request pool are all standing in the same code. Method *lists* were already cached on the
+  connection; line tables were not. Cached per dump: **1,625 packets / ~700 ms**, and the same dump now
+  completes *inside* the existing budget.
+  The relay then settled what the wire contributes: 0/1/2/4 ms round trip over one workload gave **~1.0 ms
+  of held time per ms of RTT per packet** (slope 0.997), against a raw loopback TCP round trip of 0.048 ms
+  and ~0.22 ms of our own per-packet cost. So `held ≈ packets × (ours + RTT)`, which is why the fix was
+  fewer packets rather than a longer freeze — on an instance 1 ms away that dump would have frozen the VM
+  for ~26 s. **`max_suspend_ms` stays 2000**, deliberately: it is a safety net, and its truncation was the
+  net working. `limit` 40 / `max_frames` 8 stay too — reviewed against a 306-thread, 60-frame pool where
+  they cost 258 packets and ~65 ms, and their binding constraint was never round trips but how much stack a
+  reader can use. Recorded as **ADR-0011**, which also explains why a *connection*-level cache is still the
+  rejected option (a redefined class keeps its type id, so a stale line is worse than a round trip) and why
+  `monitors_only` was not the answer — it is ~1.3× cheaper now rather than ~18×, which is the honest
+  position for a mode that answers a different question.
+  Three tests, and the cost one asserts **packets per thread (≤20), not a duration**: a packet count is
+  deterministic and load-independent, and it fails at ~70 with the cache defeated — verified by defeating
+  it. `a_deep_dump_resolves_each_frames_own_source_line` checks all 59 chain frames against the probe's own
+  source, because a cache keyed too coarsely still produces a plausible dump;
+  `one_cached_line_table_resolves_each_bytecode_index_to_its_own_line` covers the case no probe can
+  construct on demand; `latency_added_to_the_wire_shows_up_as_held_time_per_packet` keeps the relay honest,
+  since a relay that silently stopped delaying would make every measurement through it worthless.
 - **`get_id_sizes` deleted (CLEAN-1, #27)** — the only function in the #19 coverage review with **zero hits
   anywhere**. Its one caller was `examples/test_vm_commands.rs`, a manual harness nothing runs, which is
   why it measured zero. Deleting it was the point: the reader assumes 8-byte ids outright, and an uncalled
@@ -792,13 +851,13 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## Backlog
 
-**Two open.** Three of the five filed from #17–#22's evidence have shipped (#25, #26, #27 — see above);
-what is left is what an agent cannot do, and for the stated reason in each case. Tracked as GitHub issues,
-not here:
+**Two open, one of them nearly closed.** Three of the five filed from #17–#22's evidence have shipped
+(#25, #26, #27), and most of #24 turned out not to need what it said it needed — see the shipped entries
+above. Tracked as GitHub issues, not here:
 
-| issue | why it exists | why it is still open |
+| issue | why it exists | what is actually left |
 | --- | --- | --- |
-| [#24](https://github.com/YgorPerez/java-debugging-mcp/issues/24) TEST-8 · P1 | Successor to the closed TEST-6/#13. Every shared-instance default (`max_suspend_ms` 2000, `limit` 40, `max_frames` 8) was calibrated on loopback against probes, and the monitors-only saving was measured at 3 frames deep. | Needs the real 8180 — an instance other people are using — and a judgment call about how long it is acceptable to freeze it. |
+| [#24](https://github.com/YgorPerez/java-debugging-mcp/issues/24) TEST-8 · P1 | Successor to the closed TEST-6/#13. Every shared-instance default (`max_suspend_ms` 2000, `limit` 40, `max_frames` 8) was calibrated on loopback against probes, and the monitors-only saving was measured at 3 frames deep. | **Mostly done without the 8180.** Thread count and stack depth are debuggee properties (`PoolShapeProbe`) and latency is now injectable (`LatencyRelay`); the defaults were tested against a production shape, the 13× packet waste that made them look wrong was fixed, and all three were reviewed and deliberately kept (ADR-0011). Left: read the real instance's own parameters — thread count, depth, RTT — from one defaults dump plus one ping, and confirm the freeze policy against them. |
 | [#28](https://github.com/YgorPerez/java-debugging-mcp/issues/28) LINT-2 · P2 | The #18 gate's maintenance debt: a pinned toolchain with no bump trigger, and per-crate `clippy.toml` that a third crate would not have. | Item 1 is a policy call about cadence and noise tolerance; item 2's best fix depends on the answer. |
 
 A **fifth** review found three more, shipped as issues
