@@ -1827,9 +1827,21 @@ fn a_deep_dump_resolves_each_frames_own_source_line() {
 /// test's assertion is drawn from: 0/1/2/4ms nominal RTT over the same workload gave ~1.0ms of extra held
 /// time per ms of RTT per packet. That linearity is why **packet count is the lever** and why the fix for a
 /// slow remote dump was caching, not a bigger budget.
+///
+/// **How the two readings are taken is part of the test** (TEST-13,
+/// [#38](https://github.com/YgorPerez/java-debugging-mcp/issues/38)). This is a wall-clock comparison on a
+/// box running 55 other tests, each with its own JVM, and it used to take its two readings from two
+/// separate attaches — so a scheduler hiccup landing on one and not the other was indistinguishable from
+/// the wire, and the test failed about one full run in three. Both readings now come off **one**
+/// connection whose round trip is turned up and down between dumps, taken alternately, each arm scored on
+/// its fastest sample. See the loop.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
+    /// Samples per arm. Three is enough for one spike to be outvoted and cheap enough that the whole
+    /// test still runs in seconds; the reasoning for taking the fastest of them is at the loop.
+    const ROUNDS: usize = 3;
+
     let Some(jdk) = jdk_or_skip("latency_added_to_the_wire_shows_up_as_held_time_per_packet") else {
         return;
     };
@@ -1845,28 +1857,56 @@ fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
     });
     let rtt = std::time::Duration::from_millis(4);
 
-    let measure = |delay: std::time::Duration| -> (u64, f64) {
-        let relay = LatencyRelay::start(probe.port, delay).expect("start relay");
-        let mut server = Server::start().expect("start server");
-        // Attaching THROUGH the relay is the whole point: the debugger is told nothing about it.
-        server.attach(relay.port);
+    // One relay and one attach for both arms, with the round trip dialled between dumps. Two relays
+    // behind two attaches put a JVM handshake and several seconds between the readings, which is long
+    // enough for the machine to be doing something else by the second one (TEST-13).
+    let relay = LatencyRelay::start(probe.port, std::time::Duration::ZERO).expect("start relay");
+    let mut server = Server::start().expect("start server");
+    // Attaching THROUGH the relay is the whole point: the debugger is told nothing about it.
+    server.attach(relay.port);
+
+    let mut sample = |delay: std::time::Duration| -> (u64, f64) {
+        relay.set_rtt(delay);
         let dump = server.call("debug.thread_dump", workload.clone());
         let packets = dump_packet_cost(&dump).expect("no packet cost");
         // The figure the dump reports about ITSELF, which is what a caller on a real instance reads
         // instead of doing this arithmetic (TEST-8). Asserting on the reported number rather than a
         // recomputed one is the point: it is the reading #24 wanted from the 8180.
         let reported = dump_per_packet_ms(&dump).expect("the dump must report its own per-packet cost");
-        server.panic_reset();
         (packets, reported)
     };
 
-    let (near_packets, near_per_packet) = measure(std::time::Duration::ZERO);
-    let (far_packets, far_per_packet) = measure(rtt);
+    // The first dump on a fresh connection also fills the connection-lifetime method-list cache every
+    // dump after it reuses (ADR-0011 caches line tables per call, `TypeCache` caches method lists per
+    // connection), so it does strictly more work than the ones being compared. Thrown away rather than
+    // averaged in.
+    sample(std::time::Duration::ZERO);
 
-    // Same work either way — if the relay changed what was read, the comparison would be meaningless.
+    // Alternate the two arms instead of running one and then the other, and score each on its *lowest*
+    // reading. Both halves of that are about the same hazard, which is that this is a clock.
+    //
+    // A busy machine can only ever make a dump slower — never faster — so the floor of a handful of
+    // samples is the closest thing to the cost with the noise taken out, and it is a floor for both arms
+    // alike, so it cannot invent a difference the wire did not put there. Alternating is what makes the
+    // two floors comparable: a slow stretch outlasting one dump lands on both arms rather than on
+    // whichever one happened to be running.
+    let mut near = Vec::with_capacity(ROUNDS);
+    let mut far = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        near.push(sample(std::time::Duration::ZERO));
+        far.push(sample(rtt));
+    }
+    let fastest = |arm: &[(u64, f64)]| -> (u64, f64) {
+        arm.iter().copied().min_by(|a, b| a.1.total_cmp(&b.1)).expect("an arm with no samples")
+    };
+    let (near_packets, near_per_packet) = fastest(&near);
+    let (far_packets, far_per_packet) = fastest(&far);
+
+    // Same work either way — if the delay changed what was read, the comparison would be meaningless.
     assert!(
         near_packets > 100 && far_packets.abs_diff(near_packets) * 10 < near_packets,
-        "the relay must not change the work done: {near_packets} packets direct vs {far_packets} through it"
+        "the wire must not change the work done: {near_packets} packets with the relay passing traffic \
+         straight through vs {far_packets} with it holding each chunk"
     );
 
     // Each packet crosses the wire once, so the round trip shows up in the per-packet figure the dump
@@ -1876,11 +1916,15 @@ fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
     let added = far_per_packet - near_per_packet;
     assert!(
         (rtt_ms * 0.4..rtt_ms * 3.0).contains(&added),
-        "a {rtt_ms}ms round trip should show up as roughly that much per packet: the dump reported \
-         {near_per_packet:.2}ms/packet direct and {far_per_packet:.2}ms/packet through the relay, a \
-         difference of {added:.2}ms. If this is ~0, either the relay is not delaying anything or the dump \
-         is not measuring itself — and every measurement taken through it is worthless."
+        "a {rtt_ms}ms round trip should show up as roughly that much per packet: the fastest of {ROUNDS} \
+         dumps reported {near_per_packet:.2}ms/packet with the relay passing traffic straight through and \
+         {far_per_packet:.2}ms/packet with it holding each chunk, a difference of {added:.2}ms. If this \
+         is ~0, either the relay is not delaying anything or the dump is not measuring itself — and every \
+         measurement taken through it is worthless.\n  straight through: {near:?}\n  {rtt_ms}ms away: \
+         {far:?}"
     );
+
+    server.panic_reset();
 }
 
 /// `(threads read, threads total)` from a dump's `🧵 Thread dump — 40/306 thread(s)` header.

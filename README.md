@@ -282,6 +282,14 @@ a loopback probe, and two of them belong to the debuggee:
 `NET_ADMIN`, and deterministic latency beats a real network's jitter for a test. It charges coalesced
 traffic once, so measurements through it are a lower bound, and it models latency only.
 
+The round trip is a **dial** (`relay.set_rtt(rtt)`), not just a constructor argument, and a test that
+*compares* two latencies should use it rather than standing up a second relay. Two relays mean two
+attaches, which puts a JVM handshake and several seconds between the readings — long enough on a box
+running the rest of this suite for a load spike to land on one of them and not the other, which is
+indistinguishable from the wire. Turning the dial under one live connection, alternating the arms and
+scoring each on its *fastest* sample, puts both readings in the same few seconds of the same machine
+(TEST-13, [#38](https://github.com/YgorPerez/java-debugging-mcp/issues/38)).
+
 The cost model these established is `held ≈ packets × (our per-packet cost + RTT)`, measured linear in RTT
 with a slope of 1 packet per round trip. So **packet count is the lever**, which is why a dump caches line
 tables per call (ADR-0011) rather than being given a longer suspension budget. Assert packet counts, not
