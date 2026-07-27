@@ -1,0 +1,51 @@
+{
+  "cassette": "method_exit_on_a_jdwp_1_5_vm",
+  "recorded_from": "NOTHING — hand-edited from method_exit_arming.json, which was recorded from EvalProbe. No JVM ever said any of this.",
+  "note": "TEST-12 (#37): the hand-edit case, and the reason cassettes are readable. TODO.md's TEST-11 row says a JDK matrix CANNOT reach the JDWP < 1.6 branch, because JDWP tracks the JDK and the oldest JVM in the estate speaks 1.11 — so debug.set_method_exit_stop's degraded arming had never once executed. Three edits to a five-exchange recording reach it. (1) VirtualMachine.Version answers major 1, minor 5 with a matching 1.5-era banner. (2) EventRequest.Set's request key changes from 2a... to 29..., because the debugger now arms plain METHOD_EXIT (kind 41 = 0x29) instead of METHOD_EXIT_WITH_RETURN_VALUE (kind 42 = 0x2a) — the request payload is the key, so an edit that changed the version and not the key would be answered by nothing and fail loudly, which is how it was caught the first time. (3) EventRequest.Clear's key changes for the same reason. Nothing else is touched. Re-derive it by re-recording method_exit_arming.json and redoing these three; it has no re-record path of its own on purpose, because it is not a recording of anything.",
+  "events_seen": 0,
+  "exchanges": [
+    {
+      "command": "VirtualMachine.Version",
+      "set": 1, "cmd": 1,
+      "request": "",
+      "error": 0,
+      "reply": [
+        "0000009d4a61766120446562756720576972652050726f746f636f6c20285265",
+        "666572656e636520496d706c656d656e746174696f6e292076657273696f6e20",
+        "312e350a4a564d20446562756720496e746572666163652076657273696f6e20",
+        "312e350a4a564d2076657273696f6e20312e352e305f323220284a6176612048",
+        "6f7453706f7428544d2920436c69656e7420564d2c206d69786564206d6f6465",
+        "29000000010000000500000008312e352e305f32320000001a4a61766120486f",
+        "7453706f7428544d2920436c69656e7420564d"
+      ]
+    },
+    {
+      "command": "EventRequest.Set",
+      "set": 15, "cmd": 1,
+      "request": "29010000000105000000114576616c50726f6265245375627461736b",
+      "error": 0,
+      "reply": "00000002"
+    },
+    {
+      "command": "EventRequest.ClearAllBreakpoints",
+      "set": 15, "cmd": 3,
+      "request": "",
+      "error": 0,
+      "reply": ""
+    },
+    {
+      "command": "EventRequest.Clear",
+      "set": 15, "cmd": 2,
+      "request": "2900000002",
+      "error": 0,
+      "reply": ""
+    },
+    {
+      "command": "VirtualMachine.Resume",
+      "set": 1, "cmd": 9,
+      "request": "",
+      "error": 0,
+      "reply": ""
+    }
+  ]
+}

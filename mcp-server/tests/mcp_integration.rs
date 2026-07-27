@@ -4030,6 +4030,9 @@ fn disc2_method_listing(server: &mut Server) -> Vec<String> {
 /// The checked-in cassette of the session above, named for what it plays rather than for how it was made.
 const DISC2_CASSETTE: &str = "list_methods_disc2";
 
+/// The checked-in cassette of one method-exit arming, kept for the sake of being edited.
+const MEXIT_CASSETTE: &str = "method_exit_arming";
+
 /// TEST-12 (#37): a session recorded through the proxy, then replayed **with the probe stopped**.
 ///
 /// This is the acceptance criterion the whole issue turns on, and the order of the lines below is the
@@ -4051,30 +4054,130 @@ fn a_recorded_session_replays_with_the_probe_stopped_and_says_the_same_thing() {
     else {
         return;
     };
-    let probe = eval_probe_running(&jdk);
+    record_replay_and_compare(&jdk, DISC2_CASSETTE, disc2_method_listing);
+}
+
+/// TEST-12 (#37): the second cassette, recorded for the sake of being **edited**.
+///
+/// Nothing here asserts anything DISC-2's does not; the value of this recording is what
+/// `a_method_exit_armed_against_a_jdwp_1_5_vm_degrades_and_says_so` does to it afterwards. It is recorded
+/// and verified by the same helper as the other one so that the raw material is known-good before anyone
+/// starts editing it — a hand edit on top of a cassette that was already wrong is very hard to read.
+///
+/// `EvalProbe$Subtask.run` is the target on purpose: the class is loaded (its static initialiser made one)
+/// and nothing ever calls it, so the request arms and never fires. A method-exit request on a class the
+/// probe is actually running would fill the recording with events, which are not replayed.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_method_exit_arming_is_recorded_for_the_cassette_that_gets_edited() {
+    let Some(jdk) = jdk_or_skip("a_method_exit_arming_is_recorded_for_the_cassette_that_gets_edited")
+    else {
+        return;
+    };
+    let tape = record_replay_and_compare(&jdk, MEXIT_CASSETTE, arm_a_traced_method_exit);
+    assert!(
+        tape.exchanges().iter().any(|e| (e.set, e.command) == (1, 1)),
+        "the edit this cassette exists for rewrites the VirtualMachine.Version reply, and there isn't one \
+         on the tape — the debugger stopped asking, so the JDWP < 1.6 branch is no longer reachable this way"
+    );
+}
+
+/// The hand-edited descendant of [`MEXIT_CASSETTE`]: the same session against a JVM that says `JDWP 1.5`.
+const JDWP15_CASSETTE: &str = "method_exit_on_a_jdwp_1_5_vm";
+
+/// Arming one traced method-exit request, as a body a cassette can be recorded from.
+fn arm_a_traced_method_exit(server: &mut Server) -> Vec<String> {
+    let armed = server.call(
+        "debug.set_method_exit_stop",
+        serde_json::json!({"class_pattern": "EvalProbe$Subtask", "method": "run", "trace": true}),
+    );
+    assert_contains_all("armed method exit", &armed, &["mexit_", "EvalProbe$Subtask"]);
+    // The control for the hand-edited cassette below. Every JVM this suite can reach speaks JDWP 1.11 or
+    // later, so the degraded arming must NOT appear here — otherwise the edited cassette would be proving
+    // nothing about the edit.
+    assert!(
+        !armed.contains("JDWP < 1.6"),
+        "a modern JVM must arm METHOD_EXIT_WITH_RETURN_VALUE: {armed}"
+    );
+    vec![armed]
+}
+
+/// TEST-12 (#37): a JVM answering **`JDWP 1.5`** — the shape the issue names, and one nothing here can be.
+///
+/// TODO.md's TEST-11 row states the problem and hands it to this issue: a JDK matrix cannot reach the
+/// `JDWP < 1.6` branch, because JDWP's version tracks the JDK's and the oldest JVM in the estate speaks
+/// 1.11. So `debug.set_method_exit_stop`'s degraded arming — the one that tells a caller they will get the
+/// return *site* and not the return *value* — had never executed, and the warning it prints had never been
+/// read by anything but a human.
+///
+/// Three edits to a five-exchange recording reach it, and the cassette says which three. That is the
+/// acceptance criterion about hand-editing, spent on the branch that most needed it rather than
+/// demonstrated on a toy: the fixture is not a recording of anything, it is a world that was written down.
+///
+/// The second and third edits are the interesting ones. Because a cassette is keyed by request payload, the
+/// `EventRequest.Set` key had to change too — the debugger arms kind 41 rather than 42 once it believes the
+/// version — and an edit that changed the version alone produced a loud miss naming `EventRequest.Set`
+/// instead of a quietly wrong pass. The keying and the loudness carried the edit; that is what they are for.
+///
+/// No JDK: there is no JVM in this test, and there could not be one.
+#[test]
+fn a_method_exit_armed_against_a_jdwp_1_5_vm_degrades_to_the_return_site_and_says_so() {
+    let tape = Cassette::load(&cassette_path(JDWP15_CASSETTE)).expect("load the hand-edited cassette");
+    let replay = ReplayServer::start(&tape).expect("start replay server");
+    let armed = {
+        let mut server = Server::start().expect("start server");
+        server.attach(replay.port);
+        arm_a_traced_method_exit_on_an_old_vm(&mut server)
+    };
+    assert_contains_all("degraded arming", &armed, &[
+        "mexit_",
+        "JDWP < 1.6",
+        "Degraded to a plain MethodExit",
+        "return site",
+    ]);
+    replay.assert_no_misses();
+}
+
+/// The same call as [`arm_a_traced_method_exit`] without its modern-JVM control, since this one is aimed at
+/// a JVM that is deliberately ancient.
+fn arm_a_traced_method_exit_on_an_old_vm(server: &mut Server) -> String {
+    server.call(
+        "debug.set_method_exit_stop",
+        serde_json::json!({"class_pattern": "EvalProbe$Subtask", "method": "run", "trace": true}),
+    )
+}
+
+/// Record `body` against a freshly started `EvalProbe`, then run it again from the recording with the probe
+/// **killed**, and insist the two agree reply for reply.
+///
+/// Returns the cassette, and writes it over the checked-in fixture when `JDWP_RERECORD_CASSETTES` is set.
+fn record_replay_and_compare(
+    jdk: &Jdk,
+    name: &str,
+    body: fn(&mut Server) -> Vec<String>,
+) -> Cassette {
+    let probe = eval_probe_running(jdk);
     let recorder = CassetteRecorder::start(probe.port).expect("start cassette recorder");
 
     let live = {
         let mut server = Server::start().expect("start server");
         server.attach(recorder.port);
-        disc2_method_listing(&mut server)
+        body(&mut server)
         // `server` drops HERE, inside the recording. Its `Drop` sends `debug.panic` down the wire, so the
         // cassette carries the shutdown as well as the questions — without it the replayed server's own
         // exit would ask something the tape had never heard, which is a miss in a test that had already
         // finished asserting.
     };
 
-    let mut cassette = recorder.finish(DISC2_CASSETTE);
-    cassette.recorded_from = format!("EvalProbe on {}", java_version(&jdk));
-    cassette.note = "Recorded by a_recorded_session_replays_with_the_probe_stopped_and_says_the_same_thing. \
-                     Re-record with JDWP_RERECORD_CASSETTES=1; edit by hand to synthesise a shape no JVM \
-                     here can produce."
+    let mut cassette = recorder.finish(name);
+    cassette.recorded_from = format!("EvalProbe on {}", java_version(jdk));
+    cassette.note = "Recorded by mcp_integration.rs; re-record with JDWP_RERECORD_CASSETTES=1. Editing it \
+                     by hand is a supported way to synthesise a shape no JVM here can produce."
         .to_string();
     assert!(
-        cassette.len() > 5,
-        "a session that asked five tools' worth of questions recorded {} exchange(s) — the recorder is \
-         not seeing the traffic",
-        cassette.len()
+        !cassette.is_empty(),
+        "a session that asked the debuggee questions recorded no exchanges at all — the recorder is not \
+         seeing the traffic"
     );
     assert_eq!(
         cassette.events_seen, 0,
@@ -4096,16 +4199,17 @@ fn a_recorded_session_replays_with_the_probe_stopped_and_says_the_same_thing() {
     let from_tape = {
         let mut server = Server::start().expect("start server");
         server.attach(replay.port);
-        disc2_method_listing(&mut server)
+        body(&mut server)
     };
     replay.assert_no_misses();
     assert_eq!(live, from_tape, "the replay answered differently from the JVM it was recorded from");
 
     if rerecording() {
-        let fixture = cassette_path(DISC2_CASSETTE);
+        let fixture = cassette_path(name);
         cassette.save(&fixture).expect("save the checked-in fixture");
         println!("re-recorded {}", fixture.display());
     }
+    cassette
 }
 
 /// TEST-12 (#37): DISC-2's whole test again, out of a checked-in file — **no JDK, no JVM, no `#[ignore]`**.

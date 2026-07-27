@@ -475,8 +475,9 @@ fn reply_error(pkt: &[u8]) -> u16 {
         .map_or(0, u16::from_be_bytes)
 }
 
-/// Bytes as lowercase hex.
-fn hex(bytes: &[u8]) -> String {
+/// Bytes as lowercase hex — the form a payload takes in a cassette, and what anything synthesising one
+/// by hand has to produce.
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
         s.push_str(&format!("{b:02x}"));
         s
