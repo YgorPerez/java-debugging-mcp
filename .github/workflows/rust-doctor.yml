@@ -51,7 +51,18 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97.1"
-          components: clippy
+          components: clippy, rustfmt
+
+      # Formatting, on the SAME pinned toolchain as the lint below and for the same reason: rustfmt's
+      # output moves between releases, so an unpinned formatter would reformat code nobody touched and
+      # fail the build on it — the drift LINT-1 (#18) pinned clippy to avoid, reintroduced by the other
+      # half of the toolchain.
+      #
+      # Runs before the scan because it is seconds against minutes, and because a misformatted diff is a
+      # one-command fix (`cargo fmt`) that nobody should wait for a health scan to be told about. See
+      # rustfmt.toml for where the two settings came from — both measured off this tree, not chosen.
+      - name: Check formatting
+        run: cargo fmt --all --check
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2

@@ -28,6 +28,11 @@ use common::{
 /// EVAL-1 / EVAL-2: static-method invocation and object arguments, through the real handlers.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
+// A linear script against one probe: arrange, then a dozen evaluations that only mean something
+// against the state the ones before them established. Split, each half would need its own probe and
+// neither could claim the other's setup. Over 100 lines only since the rustfmt adoption (#44) split
+// the lines that ran past 110.
+#[allow(clippy::too_many_lines)]
 fn evaluate_static_methods_and_object_arguments() {
     let Some(jdk) = jdk_or_skip("evaluate_static_methods_and_object_arguments") else { return };
     let probe = Probe::launch(&jdk, "EvalProbe").expect("launch EvalProbe");
@@ -175,6 +180,10 @@ fn evaluate_static_methods_and_object_arguments() {
 /// WATCH-1: field watchpoints, including the old → new pair on a write.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
+// Writes and reads are asserted against the SAME armed watchpoint and the same probe run — the point
+// is that one stop point reports both, which two tests could not show. Crossed 100 lines when the
+// rustfmt adoption (#44) split its over-110 lines.
+#[allow(clippy::too_many_lines)]
 fn watchpoints_report_field_writes_and_reads() {
     let Some(jdk) = jdk_or_skip("watchpoints_report_field_writes_and_reads") else { return };
     let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
@@ -528,6 +537,10 @@ fn deep_expansion_walks_objects_collections_and_survives_cycles() {
 /// OBJ-2: collection subscripts — indexing, slicing, and predicate filters.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
+// Index, slice and filter over the same live collections: the assertions are a comparison, and a
+// comparison cannot be split across test functions. Crossed 100 lines when the rustfmt adoption
+// (#44) split its over-110 lines.
+#[allow(clippy::too_many_lines)]
 fn collection_subscripts_index_slice_and_filter() {
     let Some(jdk) = jdk_or_skip("collection_subscripts_index_slice_and_filter") else { return };
     let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");

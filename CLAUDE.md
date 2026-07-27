@@ -4,6 +4,24 @@ A native JDWP debugger exposed as an MCP server (Rust). `jdwp-client` speaks the
 `mcp-server` wraps it as `debug.*` MCP tools (attach, breakpoints, stack/variable inspection,
 expression evaluation, stepping). See `README.md` for the full tool list and setup.
 
+## Before you commit
+
+**Run `cargo fmt`.** The workspace is rustfmt-formatted as of LINT-4 (#44) and CI fails on a
+misformatted diff. Settings live in `rustfmt.toml` and were measured off this tree rather than
+chosen — comments are *not* reflowed, so the narrative doc comments are safe to write long.
+
+**Run `scripts/doctor.sh --findings`**, not just `cargo clippy`. Doctor is the gate (ADR-0007), it
+fails on *warnings*, and the score is not the verdict — 100/100 "Great" has sat on top of 21 warnings.
+`--findings` prints what the gate will fail on and says whether it would pass. The baseline is 21
+`unsafe-dependency` findings from a locally-installed `cargo-geiger` that CI does not install; anything
+beyond that baseline is yours.
+
+**Run the suite on more than one JDK.** `scripts/integration-test.sh` covers the `#[ignore]`d
+JVM tests; plain `cargo test` covers the unit and cassette tests, and you need both to see all of
+`mcp_integration.rs`. CI runs JDK 11/17/21 and has caught version-locked tests that passed on one JDK
+(#36). Note `JAVA_HOME` pointing at a JRE is currently ignored *silently* (#52), so confirm which JDK
+actually ran.
+
 ## Agent skills
 
 ### Issue tracker

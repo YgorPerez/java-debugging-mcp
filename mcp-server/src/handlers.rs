@@ -964,7 +964,7 @@ impl RequestHandler {
                 if *is_interface { writeln!(output, "{fqn} (interface)") } else { writeln!(output, "{fqn}") };
         }
         if matched > shown {
-            let _ = writeln!(output, "… +{} more (raise limit, or narrow with filter)", matched - shown,);
+            let _ = writeln!(output, "… +{} more (raise limit, or narrow with filter)", matched - shown);
         }
         if matched == 0 {
             output.push_str(&explain_no_match(&names, filter));
@@ -1022,7 +1022,7 @@ impl RequestHandler {
             };
         }
         if matched > shown {
-            let _ = writeln!(output, "… +{} more (raise limit or use name_filter)", matched - shown,);
+            let _ = writeln!(output, "… +{} more (raise limit or use name_filter)", matched - shown);
         }
         if matched == 0 && name_filter.is_some() {
             output.push_str("No method name matched. Drop name_filter to see the whole class.\n");
@@ -5536,7 +5536,7 @@ async fn set_collection_element(
         .map_err(|e| format!("{}() on '{container_expr}' failed: {e}", m.name))?;
     let displaced = invoke_result(conn, &m.name, ret, exc).await?;
     let old = render_value(conn, &displaced, Some(tid), 200).await;
-    Ok(format!("✅ Set {container_expr}[{}] = {raw_value} (was {old}) via {}()", render_arglit(key), m.name,))
+    Ok(format!("✅ Set {container_expr}[{}] = {raw_value} (was {old}) via {}()", render_arglit(key), m.name))
 }
 
 /// Write one array element via `ArrayReference.SetValues`, coercing the literal to the array's

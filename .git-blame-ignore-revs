@@ -1,0 +1,9 @@
+# Commits that changed layout and nothing else. `git blame` should look straight through them.
+#
+# Enable it once per clone (it is not automatic):
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honours this file without any configuration.
+
+# style: reformat the workspace with rustfmt, and nothing else (#44)
+443b4cb041548c42bdd1e259944807e26c242b85
