@@ -4053,3 +4053,200 @@ fn source_reports_the_compiled_from_file_and_reads_a_window_from_a_root() {
     );
     assert_contains_all("stale line number", &stale, &["past the end", "does not match the running build"]);
 }
+
+/// `retired=<n>` from a `ChurnProbe` heartbeat — how many workers have finished so far.
+fn churn_retired(line: &str) -> Option<u64> {
+    line.split("retired=").nth(1)?.split_whitespace().next()?.parse().ok()
+}
+
+/// How many rows a dump actually printed — one header line per thread, at the start of a line.
+fn dump_row_count(dump: &str) -> u64 {
+    dump.lines().filter(|l| l.starts_with("0x")).count() as u64
+}
+
+/// TEST-10 (#35): a dump taken while a pool retires and replaces its workers must account for the
+/// threads that went away underneath it.
+///
+/// `collect_dump_rows` asks the JVM about each thread separately from the `AllThreads` that named it, so
+/// every dump is answering questions about a list that is already out of date. On a real request pool
+/// that is not the exotic case, it is the *only* case — and until this probe existed the suite had never
+/// produced one, because every other probe's threads outlive the test. Two different things can happen
+/// to a thread that vanishes between the list and the read, and this asserts what the reply says about
+/// **both**:
+///
+/// 1. The thread has finished but the debugger still holds its `Thread` object, so `Status` answers
+///    `ZOMBIE` quite happily (the same JDWP behaviour FILT-2 turned on). The row is printed.
+/// 2. The object has since been collected as well, so the id is not valid any more and the status read
+///    *fails*. That is the `continue` arm the coverage review named — the row is dropped.
+///
+/// The probe reaches (2) on purpose: `ChurnProbe` runs an explicit collector, because a JDWP object id is
+/// a weak reference and a retired worker's `Thread` is unreachable the moment it exits. Nothing forces
+/// the two states to happen in a given dump, so this takes several and requires each shape once; failing
+/// to find either is reported as "the probe is not churning", which is what it would actually mean.
+///
+/// Both of the pinned messages below are, in the author's reading, WRONG — see the comments. They are
+/// pinned rather than fixed because a test that reaches a line and asserts nothing about it is how this
+/// repo has previously reported coverage it had not looked at. Fixing either should flip this test.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
+    let Some(jdk) = jdk_or_skip("a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "ChurnProbe").expect("launch ChurnProbe");
+    // Through the relay, deliberately. A dump that finishes in ten milliseconds barely overlaps
+    // anything, and the state this test is about — the thread list going stale while it is being read —
+    // is a function of how LONG the read takes. On loopback that is nearly nothing, which is why the arm
+    // has never executed. At a 2ms round trip the same ~130-packet dump takes a quarter of a second,
+    // which is what it costs against an instance one hop away: the debuggee is unchanged and only the
+    // wire is slower, exactly as in ADR-0011's measurements. Declared before the server so it outlives
+    // it.
+    let relay =
+        LatencyRelay::start(probe.port, std::time::Duration::from_millis(2)).expect("start relay");
+    let mut server = Server::start().expect("start server");
+    server.attach(relay.port);
+
+    // A whole generation of workers must have turned over before anything is asserted: at
+    // `SLOTS / LIFE_MS` a first tick can arrive before any churn worker has retired at all, and a dump
+    // taken then would be a dump of a perfectly stable JVM.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| churn_retired(l).is_some_and(|n| n >= 48))
+        .unwrap_or_else(|| panic!("the pool never retired a full generation\n  output: {:?}", probe.output()));
+
+    // `limit` is deliberately an order of magnitude above the thread count. It matters later: whatever
+    // the dump ends up withholding, the caller's limit is provably not the reason.
+    let ask = serde_json::json!({"limit": 500, "monitors": false, "max_frames": 3});
+    let mut vanished_but_reported: Option<String> = None;
+    let mut vanished_and_dropped: Option<String> = None;
+    for _ in 0..12 {
+        let dump = server.call("debug.thread_dump", ask.clone());
+
+        // Whatever the churn did, the reply is a whole reply about a JVM that still has its stable half.
+        // This runs on every attempt, so a dump that fell apart under churn cannot hide behind one that
+        // did not.
+        assert!(dump.contains("Cost:"), "a dump under churn must still complete:\n{dump}");
+        let (read, total) = dump_thread_counts(&dump)
+            .unwrap_or_else(|| panic!("no `N/M thread(s)` header in:\n{}", head_of(&dump)));
+        assert_eq!(
+            read,
+            dump_row_count(&dump),
+            "the header's count must be the rows it really printed:\n{}",
+            head_of(&dump)
+        );
+        assert!(read <= total, "a dump cannot read more threads than the JVM listed:\n{}", head_of(&dump));
+        let stable = dump.lines().filter(|l| l.contains("\"stable-worker-")).count();
+        assert_eq!(
+            stable, 8,
+            "the eight non-churning workers must be in every dump — they are the fixed point that makes \
+             the rest of this test about churn rather than about noise:\n{}",
+            head_of(&dump)
+        );
+
+        if vanished_but_reported.is_none() && dump.contains("[zombie]") {
+            vanished_but_reported = Some(dump.clone());
+        }
+        if vanished_and_dropped.is_none() && read < total {
+            vanished_and_dropped = Some(dump);
+        }
+        if vanished_but_reported.is_some() && vanished_and_dropped.is_some() {
+            break;
+        }
+    }
+
+    // --- (1) finished, still readable: reported as a row, with a status that says so ---
+    let reported = vanished_but_reported.unwrap_or_else(|| {
+        panic!(
+            "twelve dumps and no thread ever finished during one — ChurnProbe is not churning\n  \
+             output: {:?}",
+            probe.output()
+        )
+    });
+    let row = reported
+        .lines()
+        .find(|l| l.starts_with("0x") && l.contains("[zombie]"))
+        .expect("a zombie row was found a moment ago");
+    assert!(
+        row.contains("\"churn-worker-"),
+        "the thread that vanished is still named, not reduced to a bare id: {row}"
+    );
+    let name = row.split('"').nth(1).unwrap_or_default().to_string();
+    let section = dump_section(&reported, &name)
+        .unwrap_or_else(|| panic!("no section for {name} in:\n{reported}"));
+    // FINDING, pinned. The JVM has just answered ZOMBIE — this thread is *finished* — and the same row
+    // explains its unreadable stack as "running", then advises `suspend:true`, which cannot help: a
+    // finished thread will never be suspendable. The `!suspended` branch phrases every unreadable stack
+    // as a running one, and a churning pool is where that reading is wrong.
+    assert!(
+        section.contains("running — JDWP can only read a suspended thread's stack; pass suspend:true"),
+        "a finished thread's row is currently explained as a running one — if that has been fixed, this \
+         assertion is what should tell you:\n{section}"
+    );
+
+    // --- (2) finished AND collected: the id is gone, so the row is dropped ---
+    let dropped = vanished_and_dropped.unwrap_or_else(|| {
+        panic!(
+            "twelve dumps and no thread id ever went stale mid-dump, so `collect_dump_rows`' dead-thread \
+             arm still has not executed — the probe's collector is not reclaiming retired workers\n  \
+             output: {:?}",
+            probe.output()
+        )
+    });
+    let (read, total) = dump_thread_counts(&dropped).expect("counts");
+    let missing = total - read;
+    // Not silently dropped: the difference is stated, and it is the arithmetic the header promised.
+    assert!(
+        dropped.contains(&format!("… +{missing} more thread(s)")),
+        "{missing} thread(s) went away mid-dump and the reply must SAY there are that many it did not \
+         show — silence here reads as a complete dump:\n{}",
+        head_of(&dropped)
+    );
+    // FINDING, pinned. The only explanation offered is the caller's own `limit` — which was 500 against
+    // ~63 threads, so raising it changes nothing and narrowing with `name_filter` changes nothing. The
+    // two causes of a short dump (the limit, and threads that stopped existing) are reported with one
+    // sentence that only describes the first.
+    assert!(
+        dropped.contains("(raise limit, or narrow with name_filter)"),
+        "the shortfall is currently attributed to `limit` — pinned so that attributing it to the churn \
+         instead flips this test rather than passing quietly:\n{}",
+        head_of(&dropped)
+    );
+
+    // --- and the same pool, dumped with the VM frozen ---
+    // Freezing right after `AllThreads` closes almost the whole window, which is why this half exists:
+    // the states above are a property of reading a *live* list, not a fault the churn induces in the
+    // dump. What is asserted here is coherence — every row it printed that is still a thread is one it
+    // was actually holding — plus a real stack off the stable half and a VM that is running afterwards.
+    let base = highest_tick(&probe).expect("no tick to count from");
+    let frozen = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"limit": 500, "suspend": true, "max_frames": 4}),
+    );
+    assert_contains_all(
+        "a suspending dump of a churning pool completes and resumes it",
+        &frozen,
+        &["verified running", "Cost:"],
+    );
+    assert!(
+        frozen.contains("ChurnProbe.park:"),
+        "the frozen dump must have read a real stable worker's stack, not only counted threads:\n{}",
+        head_of(&frozen)
+    );
+    let incoherent: Vec<&str> = frozen
+        .lines()
+        .filter(|l| l.starts_with("0x") && !l.contains("debugger-suspended") && !l.contains("[zombie]"))
+        .collect();
+    assert!(
+        incoherent.is_empty(),
+        "a dump that froze the VM must be holding every live thread it reports; these rows are neither \
+         held nor finished: {incoherent:?}"
+    );
+
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
+        "the probe stopped ticking after a suspending dump of a churning pool\n  output: {:?}",
+        probe.output().len(),
+    );
+
+    server.panic_reset();
+}
