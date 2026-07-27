@@ -180,6 +180,9 @@ fn free_port() -> u16 {
 pub struct LatencyRelay {
     /// The port a test should attach to instead of the probe's own.
     pub port: u16,
+    /// The one-way delay in nanoseconds, read fresh by both copy threads before every write so
+    /// [`set_rtt`](Self::set_rtt) can move the far end of the wire under a live connection.
+    one_way_nanos: Arc<std::sync::atomic::AtomicU64>,
     /// Set on drop so the acceptor loop stops; the copy threads end on EOF.
     stop: Arc<std::sync::atomic::AtomicBool>,
     /// Live sockets, shut down on drop so a blocked `read` returns instead of leaking its thread.
@@ -197,9 +200,10 @@ impl LatencyRelay {
         let port = listener.local_addr().map_err(|e| format!("relay addr: {e}"))?.port();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let open: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
-        let one_way = rtt / 2;
+        let one_way = Arc::new(std::sync::atomic::AtomicU64::new(one_way_nanos(rtt)));
 
-        let (acc_stop, acc_open) = (Arc::clone(&stop), Arc::clone(&open));
+        let (acc_stop, acc_open, acc_delay) =
+            (Arc::clone(&stop), Arc::clone(&open), Arc::clone(&one_way));
         std::thread::spawn(move || {
             for incoming in listener.incoming() {
                 if acc_stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -222,14 +226,27 @@ impl LatencyRelay {
                 }
                 match (client.try_clone(), server.try_clone()) {
                     (Ok(c_read), Ok(s_read)) => {
-                        pump_delayed(c_read, server, one_way);
-                        pump_delayed(s_read, client, one_way);
+                        pump_delayed(c_read, server, Arc::clone(&acc_delay));
+                        pump_delayed(s_read, client, Arc::clone(&acc_delay));
                     }
                     _ => return,
                 }
             }
         });
-        Ok(Self { port, stop, open })
+        Ok(Self { port, one_way_nanos: one_way, stop, open })
+    }
+
+    /// Move the round trip on a **live** relay: the next chunk in either direction pays the new one.
+    ///
+    /// A dial rather than a constructor argument because of TEST-13 ([#38](
+    /// https://github.com/YgorPerez/java-debugging-mcp/issues/38)). Measuring "0ms away" and "4ms away"
+    /// used to mean two relays behind two attaches, so the two readings were separated by a JVM
+    /// handshake and several seconds in which whatever else the box was doing could change its mind —
+    /// and on a machine running the rest of this suite, it did. Turning the wire up and down under one
+    /// connection puts both readings in the same few seconds of the same machine, which is the only
+    /// thing that makes a difference between two wall clocks mean the wire.
+    pub fn set_rtt(&self, rtt: Duration) {
+        self.one_way_nanos.store(one_way_nanos(rtt), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -248,8 +265,21 @@ impl Drop for LatencyRelay {
     }
 }
 
-/// Copy `from` → `to`, sleeping `delay` before each write. One thread per direction.
-fn pump_delayed(mut from: std::net::TcpStream, mut to: std::net::TcpStream, delay: Duration) {
+/// Half a round trip, in nanoseconds — what one direction of the relay sleeps.
+fn one_way_nanos(rtt: Duration) -> u64 {
+    u64::try_from((rtt / 2).as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Copy `from` → `to`, sleeping the relay's current one-way delay before each write. One thread per
+/// direction.
+///
+/// The delay is loaded per chunk rather than captured once, because it is a dial the test can turn while
+/// this thread is running — see [`LatencyRelay::set_rtt`].
+fn pump_delayed(
+    mut from: std::net::TcpStream,
+    mut to: std::net::TcpStream,
+    delay: Arc<std::sync::atomic::AtomicU64>,
+) {
     std::thread::spawn(move || {
         // Big enough for a `Frames` or `Methods` reply on a deep stack, so a single logical reply is not
         // split into several chunks and charged the delay more than once.
@@ -259,8 +289,9 @@ fn pump_delayed(mut from: std::net::TcpStream, mut to: std::net::TcpStream, dela
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            if !delay.is_zero() {
-                std::thread::sleep(delay);
+            let one_way = Duration::from_nanos(delay.load(std::sync::atomic::Ordering::Relaxed));
+            if !one_way.is_zero() {
+                std::thread::sleep(one_way);
             }
             if std::io::Write::write_all(&mut to, buf.get(..n).unwrap_or_default()).is_err() {
                 break;
