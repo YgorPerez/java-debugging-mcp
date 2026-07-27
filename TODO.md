@@ -790,6 +790,27 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   fixed, and "0 tests ran" is now a hard failure too — an empty selection is a failed request, not a
   pass. Three ways to get a green run that executed nothing, all found in one sitting: SIGKILL'd counters
   (TEST-5), an undetectable JDK, and a filter that matches no tests.
+- **A run pinned to one JDK tested another and said nothing (TEST-18, #52)** — the fourth of that family,
+  and the worst-shaped: not a run that executed nothing, but a run that executed *something else* and
+  reported the name of the thing it did not execute. `Jdk::find` tried `JAVA_HOME`, then `PATH`, then the
+  snap JBR, and returned the first **usable** one — so an unusable `JAVA_HOME` was discarded in silence.
+  On the box where it was found, `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64` is a JRE with no `javac`;
+  several hours of `JAVA_HOME=… scripts/integration-test.sh` runs were reported as "green on JDK 21", in
+  issue comments and to the maintainer, and every one of them was green on the snap IntelliJ runtime —
+  **JDK 25.0.3**. Nothing in the output distinguished that from an unpinned run, because nothing in the
+  output mentioned a JDK at all. Not caught by a failing test; caught by an unrelated agent noticing the
+  JRE had no `javac` while looking at something else. **Two halves, and the second is the one that would
+  have caught it.** An unusable `JAVA_HOME` is now a hard failure naming the path and what was missing —
+  exporting it is a request for a *specific* JDK, and the fallback chain answers a different question
+  ("find me any JDK"), correctly, for the unset case, which still searches exactly as it did. And every
+  run now prints one `JDK in use: javac <version> at <java.home> (found via …)` line, asked of the JVM
+  rather than inferred: `javac -version` for the version a JRE would not have, and
+  `-XshowSettings:properties` for the home, which is what resolves the snap's `current` symlink to a
+  revision and gives a `PATH` hit a directory at all. `scripts/integration-test.sh` greps for that line
+  as a third guard beside no-SKIP and 0-tests, and reprints it last so it does not scroll away.
+  CI's per-leg `$JAVA_HOME` assert (#36) **stays, deliberately**: it checks the version the leg *asked
+  for*, which only the matrix knows, while the harness checks that `$JAVA_HOME` is what actually *ran*.
+  Two guards, two halves of one property, neither implying the other.
 - **Zero doctor warnings, and a gate that keeps them there (LINT-1, #18)** — `7253499` reached 0 warnings
   deliberately; twenty-four commits later `main` reported 7, and the four over-threshold handlers were
   described as pre-existing debt the new work merely "matched" rather than as the regression they were.

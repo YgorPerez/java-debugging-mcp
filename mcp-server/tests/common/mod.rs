@@ -6,10 +6,14 @@
 // its own server process, so they can run concurrently.
 //
 // A JDK is required to compile and run the probes. There is no system JDK on every box (and CI may
-// have none at all), so `Jdk::find` returns `None` and each test SKIPS rather than fails. Run them
+// have none at all), so `Jdk::find` returns `Ok(None)` and each test SKIPS rather than fails. Run them
 // with:
 //
 //     scripts/integration-test.sh          # or: cargo test --test mcp_integration -- --ignored
+//
+// Setting `JAVA_HOME` is a different request, and since TEST-18 (#52) it gets a different answer: it
+// names the JDK to test, so if it cannot be honoured the run FAILS instead of quietly testing another
+// one. Every run also prints one line saying which JDK it used — see [`JDK_BANNER`].
 //
 // They are `#[ignore]`d because they spawn JVMs and take seconds, not milliseconds.
 //
@@ -34,60 +38,184 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// How long to wait for a JVM event to show up before calling it a failure. Generous: the probes
 /// loop on a ~150ms sleep, but a cold JVM plus class loading can take a second or two.
 pub const EVENT_TIMEOUT: Duration = Duration::from_secs(25);
 
-/// Locations of the `java` / `javac` a test should use.
+/// The prefix of the one line every run prints to say which JDK it used.
+///
+/// A constant because it is a contract with `scripts/integration-test.sh`, which greps for it as the
+/// third of its green-run-of-nothing guards (TEST-18, #52): a run that never said which JDK it used is a
+/// run whose result cannot be attributed to a version, and that is a distinct failure from running
+/// nothing at all.
+pub const JDK_BANNER: &str = "JDK in use:";
+
+/// Locations of the `java` / `javac` a test should use, and a note of where they were found.
+#[derive(Clone)]
 pub struct Jdk {
     pub java: PathBuf,
     pub javac: PathBuf,
+    /// Which of the three places [`Jdk::find`] looks turned this one up, in words. It is printed and
+    /// nothing else reads it — but "`JAVA_HOME`" versus "the snap `JetBrains` runtime" is exactly the
+    /// distinction TEST-18 (#52) turned on, so a banner that omitted it would leave the interesting half
+    /// unsaid.
+    origin: &'static str,
 }
 
 impl Jdk {
-    /// Find a JDK, or `None` if this machine has none (a JRE alone is not enough — the probes must
-    /// be compiled). Checks `JAVA_HOME`, then `PATH`, then the `JetBrains` runtime that ships with a
-    /// snap-installed `IntelliJ`, which is the only JDK on some dev boxes here.
-    pub fn find() -> Option<Self> {
-        if let Some(home) = std::env::var_os("JAVA_HOME") {
-            let jdk = Self::in_bin(&PathBuf::from(home).join("bin"));
-            if jdk.is_usable() {
-                return Some(jdk);
+    /// Find the JDK this run should use. Three outcomes, and the middle one is what TEST-18
+    /// ([#52](https://github.com/YgorPerez/java-debugging-mcp/issues/52)) added:
+    ///
+    ///  * `Ok(Some(jdk))` — use it.
+    ///  * `Err(why)` — `JAVA_HOME` is set and does not hold a usable JDK. The caller must **fail**, not
+    ///    skip and not search on.
+    ///  * `Ok(None)` — `JAVA_HOME` is unset and this machine has no JDK anywhere the search looks. The
+    ///    caller SKIPs, which has always been allowed because CI may have no JDK at all.
+    ///
+    /// **Why the refusal.** `JAVA_HOME` → `PATH` → snap JBR is the right chain for "find me *any* JDK".
+    /// It is the wrong chain for the only reason anybody exports `JAVA_HOME` before this suite, which is
+    /// to say *which* JDK to test — and those are different questions. On the box where this was found
+    /// `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64` is a JRE with no `javac`, so the old search
+    /// discarded it without comment, found no `javac` on `PATH`, and ran the snap `IntelliJ` runtime —
+    /// **JDK 25**. Several hours of results were reported as "green on JDK 21" and every one of them was
+    /// green on 25. Nothing in the output distinguished that from an unpinned run, because nothing in the
+    /// output mentioned a JDK at all; see [`Jdk::banner`] for the other half of the fix.
+    ///
+    /// Note what deliberately did **not** change: the unset case still searches, in the same order. The
+    /// fallback is correct for "any JDK", and requiring every developer to export `JAVA_HOME` would be a
+    /// bigger imposition than the bug.
+    pub fn find() -> Result<Option<Self>, String> {
+        // An EMPTY `JAVA_HOME` counts as unset rather than as a refusal: `JAVA_HOME= cmd` is how a shell
+        // spells "no value", and joining `bin` onto "" yields a RELATIVE `bin/javac` resolved against
+        // whatever directory cargo happened to run the test in — which is nobody's JDK.
+        if let Some(home) = std::env::var_os("JAVA_HOME").filter(|h| !h.is_empty()) {
+            let home = PathBuf::from(home);
+            let jdk = Self::in_bin(&home.join("bin"), "JAVA_HOME");
+            if let Some(shortfall) = jdk.shortfall() {
+                return Err(format!(
+                    "JAVA_HOME={} is not a usable JDK: {shortfall}.\n\
+                     Refusing to fall back to PATH or the snap JetBrains runtime. Exporting JAVA_HOME is \
+                     a request for a SPECIFIC JDK, and searching on used to answer it with a different \
+                     one in silence — on this very path, a run pinned to JDK 21 ran JDK 25 and said so \
+                     nowhere (TEST-18, #52).\n\
+                     Point JAVA_HOME at a JDK, or unset it entirely to search for any.",
+                    home.display(),
+                ));
             }
+            return Ok(Some(jdk));
         }
         // No suffix here on purpose: this goes through `CreateProcessW`/`execvp` rather than an
         // existence check, and both resolve the platform's executable extension themselves.
-        let on_path = Self { java: PathBuf::from("java"), javac: PathBuf::from("javac") };
+        let on_path = Self { java: PathBuf::from("java"), javac: PathBuf::from("javac"), origin: "PATH" };
         if Command::new(&on_path.javac).arg("-version").output().is_ok_and(|o| o.status.success()) {
-            return Some(on_path);
+            return Ok(Some(on_path));
         }
         // Newest snap revision first, so a stale one doesn't win.
         let mut candidates: Vec<PathBuf> = glob_snap_jbr();
         candidates.sort();
         candidates.reverse();
-        candidates.into_iter().find_map(|bin| {
-            let jdk = Self::in_bin(&bin);
+        Ok(candidates.into_iter().find_map(|bin| {
+            let jdk = Self::in_bin(&bin, "the snap JetBrains runtime");
             jdk.is_usable().then_some(jdk)
-        })
+        }))
     }
 
     /// The `java`/`javac` pair inside a JDK's `bin`, with the platform's executable suffix.
     ///
-    /// The suffix is load-bearing rather than cosmetic: `is_usable` asks the filesystem, and on Windows
+    /// The suffix is load-bearing rather than cosmetic: `shortfall` asks the filesystem, and on Windows
     /// the files are `java.exe` and `javac.exe`, so an unsuffixed path never exists. That made
     /// `Jdk::find` return `None` on a machine with a perfectly good JDK at `JAVA_HOME`, and because a
     /// missing JDK skips rather than fails, the entire `--ignored` suite reported `ok` in 0.00s while
     /// running nothing — the same shape as the SIGKILL coverage bug TEST-5 found.
-    fn in_bin(bin: &std::path::Path) -> Self {
+    fn in_bin(bin: &std::path::Path, origin: &'static str) -> Self {
         const EXE: &str = if cfg!(windows) { ".exe" } else { "" };
-        Self { java: bin.join(format!("java{EXE}")), javac: bin.join(format!("javac{EXE}")) }
+        Self { java: bin.join(format!("java{EXE}")), javac: bin.join(format!("javac{EXE}")), origin }
+    }
+
+    /// What this candidate is missing, in words, or `None` when both tools are there.
+    ///
+    /// The `java`-but-no-`javac` case gets its own sentence because that difference *is* the incident: a
+    /// JRE reads as "Java is installed" to anyone who checks by running `java -version`, and is useless
+    /// here, since the probes in `examples/probes` are compiled at test time rather than merely run.
+    fn shortfall(&self) -> Option<String> {
+        match (self.java.exists(), self.javac.exists()) {
+            (true, true) => None,
+            (true, false) => Some(format!(
+                "there is no javac at {} — only java, so this is a JRE, and the probes in \
+                 examples/probes are COMPILED at test time rather than merely run",
+                self.javac.display()
+            )),
+            (false, true) => Some(format!("there is no java at {}", self.java.display())),
+            (false, false) => Some(format!(
+                "neither java nor javac is in {}",
+                self.java.parent().unwrap_or(&self.java).display()
+            )),
+        }
     }
 
     fn is_usable(&self) -> bool {
-        self.java.exists() && self.javac.exists()
+        self.shortfall().is_none()
+    }
+
+    /// The one line a run prints to say which JDK it used: version, where the JVM says it lives, and
+    /// which of the three places the search found it.
+    ///
+    /// **This is the half of TEST-18 (#52) that would actually have caught the bug.** The fallthrough was
+    /// not invisible because it was subtle; it was invisible because nothing ever said, so a run on the
+    /// pinned JDK and a run on some other one produced byte-identical output. A refusal only helps the
+    /// person who mis-set `JAVA_HOME`; saying which JDK ran helps every run, including the ones where
+    /// `JAVA_HOME` is unset on purpose and the answer is still worth knowing.
+    fn banner(&self) -> String {
+        format!("{JDK_BANNER} {} at {} (found via {})", self.version(), self.home().display(), self.origin)
+    }
+
+    /// `javac -version`'s first line.
+    ///
+    /// `javac` rather than `java` on two counts: it is the half a JRE lacks, and it is the half that broke
+    /// on JDK 11 (TEST-11, #36 — pre-JEP-400 platform-charset source reading). It goes to stdout on JDK 9
+    /// and later and to stderr on 8, so both are read rather than guessed at.
+    fn version(&self) -> String {
+        Command::new(&self.javac)
+            .arg("-version")
+            .output()
+            .ok()
+            .and_then(|out| {
+                let said = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                said.lines().map(str::trim).find(|l| !l.is_empty()).map(ToString::to_string)
+            })
+            .unwrap_or_else(|| format!("an unidentified javac ({})", self.javac.display()))
+    }
+
+    /// Where the JVM says it lives — asked of the JVM rather than inferred from the path it was invoked
+    /// through.
+    ///
+    /// Worth the second process launch because the two cases where inference is worst are the two this
+    /// incident ran through. A `PATH` hit is the bare word `javac` and names no directory at all. The snap
+    /// runtime is reached through a `current` symlink, so only `java.home` pins the answer to a revision
+    /// (`/snap/intellij-idea-ultimate/800/jbr`) rather than to whatever `current` meant that afternoon.
+    fn home(&self) -> PathBuf {
+        Command::new(&self.java)
+            .args(["-XshowSettings:properties", "-version"])
+            .output()
+            .ok()
+            .and_then(|out| {
+                let said = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                said.lines()
+                    .find_map(|l| l.split_once("java.home = "))
+                    .map(|(_, home)| PathBuf::from(home.trim()))
+            })
+            .unwrap_or_else(|| self.javac.clone())
     }
 
     /// Compile `<repo>/examples/probes/<name>.java` into a fresh directory with `-g`.
@@ -1213,16 +1341,47 @@ impl Drop for Server {
     }
 }
 
+/// The JDK for the whole run, resolved once and announced once.
+///
+/// A `OnceLock` rather than a search per test, for two reasons that pull the same way. Which JDK ran is a
+/// property of the *run*, so printing it once per test would turn the one line that matters into
+/// wallpaper. And resolving now costs two extra process launches — a version and a home — which is
+/// nothing once and silly sixty-five times.
+fn resolved_jdk() -> &'static Result<Option<Jdk>, String> {
+    static RESOLVED: OnceLock<Result<Option<Jdk>, String>> = OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        let found = Jdk::find();
+        // stdout rather than stderr, in both arms: `scripts/integration-test.sh` tees stdout and greps
+        // the log for its guards, and the banner is now one of the things it looks for.
+        match &found {
+            Ok(Some(jdk)) => println!("{}", jdk.banner()),
+            // Nothing to announce; the per-test SKIP line below is the report, and the script fails on it.
+            Ok(None) => {}
+            Err(why) => println!("error: {why}"),
+        }
+        found
+    })
+}
+
 /// Skip-with-a-reason guard. Returns the JDK, or `None` after printing why the test is skipped.
 ///
 /// A missing JDK must not fail the suite — CI may have none — but a silent pass would hide that
 /// nothing ran, so it says so on stdout (visible with `cargo test -- --nocapture`).
+///
+/// An **unusable `JAVA_HOME`** is the one case that panics instead. A skip there would be the original
+/// bug wearing a different hat: the run asked for a specific JDK, the request cannot be honoured, and any
+/// outcome other than failing lets the suite report a version it never tested (TEST-18, #52). The full
+/// explanation was printed once by [`resolved_jdk`]; the line here is what shows up against each failing
+/// test, so it names the path and the shortfall on its own rather than pointing at something above.
 pub fn jdk_or_skip(test: &str) -> Option<Jdk> {
-    let found = Jdk::find();
-    if found.is_none() {
-        println!("SKIP {test}: no JDK found (set JAVA_HOME or put javac on PATH)");
+    match resolved_jdk() {
+        Ok(Some(jdk)) => Some(jdk.clone()),
+        Ok(None) => {
+            println!("SKIP {test}: no JDK found (set JAVA_HOME or put javac on PATH)");
+            None
+        }
+        Err(why) => panic!("{}", why.lines().next().unwrap_or(why)),
     }
-    found
 }
 
 /// Assert `got` contains every string in `wants`, with a message naming the ones it doesn't.
