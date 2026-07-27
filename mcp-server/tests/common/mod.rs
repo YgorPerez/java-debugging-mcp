@@ -84,10 +84,20 @@ impl Jdk {
     ///
     /// `-g` is not optional: without the local-variable table the JVM reports no locals, and every
     /// expression test that reads one silently has nothing to read.
+    ///
+    /// `-encoding UTF-8` is not optional either, and the reason it looks optional is that JDK 18 hid it.
+    /// Before JEP 400, `javac` reads source in the **platform** charset, which in a container with no
+    /// locale set is US-ASCII — so every probe comment containing an em dash fails to compile with
+    /// `unmappable character (0xE2)`. On JDK 21 the default is UTF-8 and the whole suite is green; on
+    /// JDK 11 — which is what the shared 8180 runs — **50 of 53 tests failed to launch a probe** (TEST-11,
+    /// #36). The sources are UTF-8, so saying so is correct on every JDK rather than a workaround for old
+    /// ones.
     pub fn compile_probe(&self, name: &str, out_dir: &Path) -> Result<(), String> {
         let src = probe_source_path(name);
         let out = Command::new(&self.javac)
             .arg("-g")
+            .arg("-encoding")
+            .arg("UTF-8")
             .arg("-d")
             .arg(out_dir)
             .arg(&src)
