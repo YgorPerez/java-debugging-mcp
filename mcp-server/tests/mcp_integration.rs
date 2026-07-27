@@ -3946,7 +3946,7 @@ fn rearming_survives_a_classloader_reload() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn list_classes_finds_loaded_types_and_bounds_the_answer() {
     let Some(jdk) = jdk_or_skip("list_classes_finds_loaded_types_and_bounds_the_answer") else { return };
-    let probe = Probe::launch(&jdk, "EvalProbe").expect("launch EvalProbe");
+    let probe = eval_probe_running(&jdk);
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
 
@@ -4010,12 +4010,63 @@ fn list_methods_renders_java_signatures_and_marks_static() {
 /// the evidence that `Item`, `Task` and `Subtask` are all in the VM. It matters more here than anywhere
 /// else in this file, because a recording taken too early does not fail — it bakes "not loaded" into a
 /// cassette and every replay of it is confidently wrong.
+///
+/// Every `EvalProbe` test whose first call asks about loaded state now comes through here rather than
+/// remembering the wait itself: TEST-17 (#49) found `list_classes` and `source` still racing after the same
+/// failure had been seen on `list_methods`, so the one-line wait was clearly not something to keep
+/// re-deciding per test. The wait lives in [`Probe::launch_running`], which is where the failure text that
+/// names the race lives too.
 fn eval_probe_running(jdk: &Jdk) -> Probe {
-    let probe = Probe::launch(jdk, "EvalProbe").expect("launch EvalProbe");
-    probe
-        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("work "))
-        .unwrap_or_else(|| panic!("EvalProbe never reached work()\n  output: {:?}", probe.output()));
-    probe
+    // `work …` rather than a tick: EvalProbe has no heartbeat, and its first `work` line is printed from
+    // inside the loop, after the static initialiser has built `holder`, `task`, `subtask` and `words`.
+    Probe::launch_running(jdk, "EvalProbe", |l| l.starts_with("work ")).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// TEST-17 (#49): the readiness wait is all that keeps three discovery tests honest, so prove it works
+/// rather than trusting that it does — and prove that losing the race is reported *as* a race.
+///
+/// The race is normally unreproducible on demand: it needs a runner slow enough that a JVM which is already
+/// answering JDWP has still not loaded its main class, which is why this shape gets found in CI and not
+/// here. [`Probe::launch_delayed`] manufactures exactly that state, so the two halves below are the real
+/// failure and the real fix rather than a simulation of them.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_probe_that_has_not_run_yet_reads_as_a_race_rather_than_an_unloaded_class() {
+    let Some(jdk) = jdk_or_skip("a_probe_that_has_not_run_yet_reads_as_a_race_rather_than_an_unloaded_class")
+    else {
+        return;
+    };
+    // Long enough to attach and ask a question inside the window, short enough not to pad the suite.
+    let probe = Probe::launch_delayed(&jdk, "EvalProbe", std::time::Duration::from_secs(8))
+        .expect("launch EvalProbe");
+
+    // The trap in three lines: attaching succeeds against a debuggee that has run no code at all, and the
+    // discovery tool then answers correctly and uselessly. This is what the three tests were asserting on.
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    let too_early = server.call("debug.list_classes", serde_json::json!({"filter": "EvalProbe"}));
+    assert!(too_early.starts_with("0/0 "), "EvalProbe cannot be loaded this early: {too_early}");
+    assert!(
+        too_early.contains("not be loaded yet"),
+        "the tool's answer is correct here, which is the whole problem: {too_early}"
+    );
+
+    // So a test that asks for readiness and does not get it has to be told it raced, in those words —
+    // otherwise the reader starts in the handler, hunting #46's wrong-answer bug, which is not there.
+    let raced = probe
+        .wait_until_running(std::time::Duration::from_millis(500), |l| l.starts_with("work "))
+        .expect_err("EvalProbe cannot be running yet");
+    assert_contains_all(
+        "a lost race says so",
+        &raced,
+        &["EvalProbe", "RACE", "listening, not running", "#49"],
+    );
+
+    // And the wait is not just a sleep: it ends when the probe really is running, and the same question
+    // asked then gives the three discovery tests the answer they were always meant to assert on.
+    probe.wait_until_running(EVENT_TIMEOUT, |l| l.starts_with("work ")).unwrap_or_else(|e| panic!("{e}"));
+    let now_loaded = server.call("debug.list_classes", serde_json::json!({"filter": "EvalProbe"}));
+    assert_contains_all("loaded once running", &now_loaded, &["EvalProbe", "EvalProbe$Item"]);
 }
 
 /// DISC-2's assertions, against whatever is on the other end of `server` — a JVM or a cassette.
@@ -4371,7 +4422,7 @@ fn source_reports_the_compiled_from_file_and_reads_a_window_from_a_root() {
     else {
         return;
     };
-    let probe = Probe::launch(&jdk, "EvalProbe").expect("launch EvalProbe");
+    let probe = eval_probe_running(&jdk);
     // `examples/probes` is a source root of exactly the shape the tool expects: EvalProbe is in the
     // default package, so its file sits directly in the root with no package directories between.
     let root = probe_source_path("EvalProbe").parent().expect("probe source has a parent").to_path_buf();
@@ -4487,7 +4538,9 @@ fn source_says_when_a_loaded_class_carries_no_source_file_attribute() {
     // before the main class is loaded, and this test's entire premise is the difference between "loaded
     // but stripped" and "not loaded" — so racing the class load turns the assertion into a coin flip that
     // reports the wrong finding when it loses. It lost on CI's JDK 11 leg while passing everywhere else.
-    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("StrippedProbe never ticked");
+    // The launch is not `launch_running` only because the class files are built differently here; the wait
+    // is the same one, and so is the failure text (TEST-17, #49).
+    probe.wait_until_running(EVENT_TIMEOUT, |l| tick_index(l).is_some()).unwrap_or_else(|e| panic!("{e}"));
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
 
@@ -4556,7 +4609,7 @@ fn source_reports_the_smap_when_the_class_was_translated_from_another_file() {
     // Same race as the stripped probe above: the agent listens before the classes are loaded. Waiting for
     // a tick settles both at once — the heartbeat prints `Neighbour.touched`, so a tick proves the control
     // class is loaded too, and the control is the whole reason a passing SMAP assertion means anything.
-    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("SmapProbe never ticked");
+    probe.wait_until_running(EVENT_TIMEOUT, |l| tick_index(l).is_some()).unwrap_or_else(|e| panic!("{e}"));
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
 
