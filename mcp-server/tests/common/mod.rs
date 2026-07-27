@@ -539,6 +539,15 @@ pub struct Probe {
 
 impl Probe {
     /// Compile and launch `examples/probes/<name>.java`, waiting until it is accepting JDWP.
+    /// How long to wait for a freshly launched probe to accept a JDWP connection.
+    ///
+    /// 30s was enough for every warm run measured (a probe binds in about a second) but not for a
+    /// cold one: the first launch after a JDK install spent over 80s being virus-scanned on Windows
+    /// and timed out here, which read as a broken probe rather than a slow disk. 90s costs nothing
+    /// when things are working — the wait ends as soon as the port answers — and only lengthens the
+    /// genuinely-broken case, which now at least explains itself.
+    const PROBE_LISTEN_TIMEOUT: Duration = Duration::from_secs(90);
+
     pub fn launch(jdk: &Jdk, name: &str) -> Result<Self, String> {
         let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         jdk.compile_probe(name, dir.path())?;
@@ -578,7 +587,8 @@ impl Probe {
     /// Block until the JDWP port accepts a connection, so `debug.attach` can't lose the race with a
     /// still-starting JVM.
     fn wait_until_listening(&self) -> Result<(), String> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let started = Instant::now();
+        let deadline = started + Self::PROBE_LISTEN_TIMEOUT;
         while Instant::now() < deadline {
             if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
                 // dt_socket with server=y accepts ONE connection then stops listening, so that probe
@@ -587,7 +597,27 @@ impl Probe {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        Err(format!("probe never listened on port {}", self.port))
+
+        // Say what the probe said. The reader threads have been capturing stdout AND stderr this whole
+        // time, and on the two failures that actually happen — the JVM refusing the agent argument, and
+        // a Java exception before main gets going — the reason is sitting right there. Reporting only
+        // "never listened" throws it away and leaves a timeout with nothing to go on, which is the same
+        // mistake `pump` already documents for the stderr case.
+        let captured = self.output();
+        let tail: Vec<&String> = captured.iter().rev().take(10).rev().collect();
+        let said = if tail.is_empty() {
+            "it printed nothing at all".to_string()
+        } else {
+            format!("it printed:\n  {}", tail.iter()
+                .map(|l| l.as_str()).collect::<Vec<_>>().join("\n  "))
+        };
+        Err(format!(
+            "probe never listened on port {} within {:?} (waited {:?}) — {said}\n\
+             If it printed nothing, the JVM is probably just slow to start rather than broken: on \
+             Windows a first run after a JDK is installed or updated can spend longer than this being \
+             scanned by Defender, and the same probe then launches in ~1s once warm.",
+            self.port, Self::PROBE_LISTEN_TIMEOUT, started.elapsed(),
+        ))
     }
 
     /// Send a line to the probe's stdin (probes that wait for a cue to do something).
