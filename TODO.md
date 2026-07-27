@@ -896,7 +896,7 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## Backlog
 
-**Eight open, from two sources.** Tracked as GitHub issues, not here.
+**Eleven open, from three sources.** Tracked as GitHub issues, not here.
 
 **From #17–#22's evidence — two open, one of them nearly closed.** Three of the five have shipped
 (#25, #26, #27), and most of #24 turned out not to need what it said it needed — see the shipped entries
@@ -922,6 +922,18 @@ MCP. Each carries an agent brief.
 | [#32](https://github.com/YgorPerez/java-debugging-mcp/issues/32) EVT-2 · P2 · M | Hits are discoverable only by polling, so the watchdog's 120s budget burns while nobody is looking. MCP already has the mechanism. | The buffer stays regardless — notifications are best-effort. Constraints in the brief: suspension only (a traced hit at ~720/s would flood the transport), bounded repeats per SAFE-8/#8, and the watchdog's auto-disarm is worth pushing too. |
 | [#33](https://github.com/YgorPerez/java-debugging-mcp/issues/33) TRANS-1 · P3 · M | stdio-only. | **`needs-triage`, not agent-ready.** An HTTP listener has no trust boundary and this server executes code in the debuggee. Prior question is what it is *for* — `kubectl port-forward` already covers the remote case on the JDWP port, and a negative answer closes it. |
 | [#34](https://github.com/YgorPerez/java-debugging-mcp/issues/34) REL-1 · P3 · S | Installing needs a Rust toolchain, which hands back most of the no-JVM argument for writing JDWP natively — a Java developer is the person least likely to have `cargo`. | All of it. No release workflow exists; `Cargo.toml` already carries the metadata. Should reuse the existing toolchain pinning rather than adding a second, per LINT-2/#28. |
+
+**From TEST-8's method — three open.** #24 was labelled `ready-for-human` because it needed the shared
+8180, and most of it turned out not to. The generalisation is worth keeping: *"we cannot test that" is
+usually "we have not built the instrument"*. Four were proposed; the first shipped — `FaultRelay`, a
+fault-injecting JDWP proxy, which immediately reached `resume_all_fully`'s honest-failure tail that the
+coverage review had called unreachable through this tool's own API. These are the other three.
+
+| issue | why it exists | what is actually left |
+| --- | --- | --- |
+| [#35](https://github.com/YgorPerez/java-debugging-mcp/issues/35) TEST-10 · P2 · S | Every probe is well-behaved, so four real debuggee states are never presented: threads dying mid-dump (the `collect_dump_rows` arm for it is unexercised), contention beyond `DeadlockProbe`'s two threads, synthetic/lambda class names, and most `ValueData` variants — which is *why* `types.rs` sits at 16.67%. | All of it, but cheap: probes only, no new infrastructure. |
+| [#36](https://github.com/YgorPerez/java-debugging-mcp/issues/36) TEST-11 · P2 · S | The suite runs on JDK 21; the 8180 is a WildFly 21, far more likely on 8 or 11. Capabilities, synthetic names, line tables and `Frames` behaviour all move between generations. | A matrix in `tests.yml`; the harness already honours `JAVA_HOME`. Note a matrix can**not** reach the `JDWP < 1.6` path — JDWP tracks the JDK, so even 8 speaks 1.8. That needs `FaultRelay` or #37. |
+| [#37](https://github.com/YgorPerez/java-debugging-mcp/issues/37) TEST-12 · P2 · M | #24's residue is one human dump against the real instance, after which the evidence evaporates. Recording the JDWP stream once turns that visit into a permanent CI fixture — replayable with no JVM and no access, and hand-editable into shapes nothing can produce. | The machinery, tested against probe recordings first. `FaultRelay` already frames JDWP; this is the third user of that framing and the point to unify the two proxies rather than add a third. |
 
 The comparison also produced one **rejection**, recorded in `.out-of-scope/method-entry-events.md`
 rather than filed: `METHOD_ENTRY` stays unarmed for the reasons METH-1/#16 settled — it fires on every
