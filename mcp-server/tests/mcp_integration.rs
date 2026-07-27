@@ -1707,6 +1707,61 @@ fn a_production_shaped_dump_costs_a_bounded_number_of_packets_per_thread() {
     server.panic_reset();
 }
 
+/// TEST-8 (#24): the cache's win survives a pool whose threads are in DIFFERENT code.
+///
+/// The headline measurement uses `PoolShapeProbe`, where all 300 workers sit in the same 60 frames — the
+/// cache's best case, and the obvious objection: if the win depended on that uniformity it would not
+/// survive contact with a real app server, whose workers are spread across handlers.
+///
+/// Both ends of the bracket are already known. Uniform costs **1,625 packets**; a pool sharing *no* frames
+/// costs **21,364**, because that is the pre-cache measurement — with nothing shared the cache never hits.
+/// `MixedPoolProbe` measures the realistic middle: 300 workers across 10 handlers over a shared 40-frame
+/// framework prefix, so 240 distinct `(class, method)` pairs rather than 60.
+///
+/// Measured at **1,812** — +187 over uniform for +180 distinct pairs, one packet each, which is the cost
+/// model stated exactly: `threads × fixed + distinct pairs`. Diversity is paid for per distinct frame, not
+/// per thread, and the shared prefix is what carries the cache. That is why this holds on a real server.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_heterogeneous_pool_pays_only_for_its_distinct_frames() {
+    let Some(jdk) = jdk_or_skip("a_heterogeneous_pool_pays_only_for_its_distinct_frames") else { return };
+    let probe = Probe::launch(&jdk, "MixedPoolProbe").expect("launch MixedPoolProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe
+        .wait_for_line(std::time::Duration::from_secs(60), |l| l.starts_with("tick "))
+        .expect("MixedPoolProbe never finished starting its pool");
+
+    let deep = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"suspend": true, "limit": 400, "max_frames": 200, "max_suspend_ms": 120_000}),
+    );
+    let (read, total) = dump_thread_counts(&deep).expect("no thread count in the dump header");
+    assert!(read >= 300, "expected the whole pool, got {read}/{total}:\n{}", head_of(&deep));
+    let packets = dump_packet_cost(&deep).expect("no packet cost in the dump");
+
+    // The same per-thread bound the uniform pool has to meet. Heterogeneity must not quietly restore the
+    // per-frame-per-thread cost the cache exists to remove.
+    let per_thread = packets / read;
+    assert!(
+        per_thread <= 20,
+        "a heterogeneous dump cost {per_thread} packets per thread ({packets} for {read}). Uniform stacks \
+         cost ~5; no sharing at all costs ~70, which is the pre-cache number. This landing near 70 would \
+         mean the cache only ever worked because every thread was in identical code.\n{}",
+        head_of(&deep)
+    );
+
+    // And the frames must actually be diverse, or the test is measuring the uniform case by accident: the
+    // dump should show workers in several different handler classes.
+    let handlers = (0..10).filter(|k| deep.contains(&format!("Handler{k}."))).count();
+    assert!(
+        handlers >= 5,
+        "expected workers spread across handlers, found {handlers} of 10 in the dump — is the probe routing?"
+    );
+
+    server.panic_reset();
+}
+
 /// TEST-8 (#24): the line numbers in a deep dump are the RIGHT ones, per frame.
 ///
 /// The per-dump line-table cache is keyed by (class, method) and the line is resolved per frame from the

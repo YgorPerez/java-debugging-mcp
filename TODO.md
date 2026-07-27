@@ -240,6 +240,7 @@ the *debuggee*:
 | --- | --- |
 | hundreds of threads, not 60 | `PoolShapeProbe` — `WORKERS = 300`, named like a real pool's |
 | stacks far deeper than 8 frames | `PoolShapeProbe` — `DEPTH = 60`, **distinct** methods, not recursion |
+| threads in DIFFERENT code, not one shape | `MixedPoolProbe` — 300 workers across 10 handlers over a shared 40-frame framework prefix |
 | a network hop instead of loopback | `LatencyRelay::start(probe.port, Duration::from_millis(4))`, then attach to `relay.port` |
 
 `LatencyRelay` (in `tests/common/mod.rs`) forwards the JDWP stream with a delay per chunk. Userspace
@@ -856,7 +857,14 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   rejected option (a redefined class keeps its type id, so a stale line is worse than a round trip) and why
   `monitors_only` was not the answer — it is ~1.3× cheaper now rather than ~18×, which is the honest
   position for a mode that answers a different question.
-  Three tests, and the cost one asserts **packets per thread (≤20), not a duration**: a packet count is
+  **And the win does not depend on the pool being uniform**, which is the obvious objection to measuring it
+  against 300 threads in identical code. Cost is `threads × fixed + distinct (class, method) pairs`, so
+  diversity is paid for per distinct frame rather than per thread: `MixedPoolProbe` (300 workers, 10
+  handlers, a shared 40-frame framework prefix — 240 distinct pairs instead of 60) costs **1,812 packets**
+  against 1,625 uniform and 21,364 with nothing shared. +187 for +180 extra pairs, one packet each, which is
+  the model exactly. A real request stack is mostly shared framework with a handler at the bottom, so it
+  sits in that middle row.
+  Four tests, and the cost one asserts **packets per thread (≤20), not a duration**: a packet count is
   deterministic and load-independent, and it fails at ~70 with the cache defeated — verified by defeating
   it. `a_deep_dump_resolves_each_frames_own_source_line` checks all 59 chain frames against the probe's own
   source, because a cache keyed too coarsely still produces a plausible dump;

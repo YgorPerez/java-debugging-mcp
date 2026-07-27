@@ -80,6 +80,20 @@ past ~7 ms:
 So 2000 ms is right for a LAN-local instance, and on a slower link even a defaults dump truncates — which
 is the safety net behaving correctly, and now says what it would have taken to finish.
 
+**The win does not depend on the pool being uniform**, which is the obvious objection to measuring it
+against 300 threads in identical code. Cost is `threads × fixed + distinct (class, method) pairs`, so
+diversity is paid for **per distinct frame, not per thread**. Measured across the whole bracket:
+
+| pool | distinct pairs | packets |
+| --- | --- | --- |
+| `PoolShapeProbe` — 300 threads, identical 60 frames | 60 | 1,625 |
+| `MixedPoolProbe` — 300 threads, 10 handlers over a shared 40-frame prefix | 240 | **1,812** |
+| no frame shared by any two threads (= the pre-cache measurement) | ~18,000 | 21,364 |
+
++187 packets for +180 distinct pairs — one each, the model exactly. A real request stack is mostly shared
+framework (filter chain, security, dispatch, connection pool) with a handler at the bottom, which is the
+middle row, so this holds on an app server for the same reason it holds here.
+
 ## Rejected alternatives
 
 **Caching line tables on the connection**, which is where the reuse would be largest — a hot traced stop
