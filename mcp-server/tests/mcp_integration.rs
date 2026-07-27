@@ -9,9 +9,19 @@
 //     cargo test --test mcp_integration -- --ignored --nocapture   # also shows SKIP reasons
 //
 // Without a JDK each test prints SKIP and passes, so a JDK-less CI stays green rather than red.
+//
+// **Four tests here are NOT `#[ignore]`d**, and they are the point of TEST-12 (#37): they drive the same
+// server against a recorded JDWP session instead of a JVM (`common/cassette.rs`, ADR-0014). They need no
+// JDK and no Java, so they run in the default `cargo test` — a test that needs no JDK must not hide behind
+// the flag that exists for tests that do (TEST-9, #25). Note the corollary:
+// `scripts/integration-test.sh` passes `--ignored`, which runs ONLY ignored tests, so it does not run
+// them. Both commands are needed to see everything in this file.
 
 mod common;
 
+use common::cassette::{
+    cassette_path, rerecording, Cassette, CassetteRecorder, ReplayServer, RERECORD_ENV,
+};
 use common::{
     assert_contains_all, jdk_or_skip, probe_line, probe_source, probe_source_path, Fault, FaultRelay, Jdk,
     LatencyRelay, Probe, Server, EVENT_TIMEOUT,
@@ -3944,10 +3954,43 @@ fn list_classes_finds_loaded_types_and_bounds_the_answer() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn list_methods_renders_java_signatures_and_marks_static() {
     let Some(jdk) = jdk_or_skip("list_methods_renders_java_signatures_and_marks_static") else { return };
-    let probe = Probe::launch(&jdk, "EvalProbe").expect("launch EvalProbe");
+    let probe = eval_probe_running(&jdk);
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
+    disc2_method_listing(&mut server);
+}
 
+/// `EvalProbe`, launched and **actually running** — not merely accepting a JDWP connection.
+///
+/// The distinction cost three tests one afternoon (`b64d55d`): attaching proves the agent is listening,
+/// which happens before `main` does anything, and every question below is about what the debuggee has
+/// *loaded*. `EvalProbe`'s nested types are created by its static initialiser, so the first `work` line is
+/// the evidence that `Item`, `Task` and `Subtask` are all in the VM. It matters more here than anywhere
+/// else in this file, because a recording taken too early does not fail — it bakes "not loaded" into a
+/// cassette and every replay of it is confidently wrong.
+fn eval_probe_running(jdk: &Jdk) -> Probe {
+    let probe = Probe::launch(jdk, "EvalProbe").expect("launch EvalProbe");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("work "))
+        .unwrap_or_else(|| panic!("EvalProbe never reached work()\n  output: {:?}", probe.output()));
+    probe
+}
+
+/// DISC-2's assertions, against whatever is on the other end of `server` — a JVM or a cassette.
+///
+/// Lifted out of the test above for TEST-12 (#37). The acceptance criterion was that an existing
+/// JVM-dependent test be runnable from a cassette *as well*, "proving equivalence rather than asserting
+/// it", and the only way to prove it is for both to be literally the same assertions rather than two
+/// hand-copied sets that agree today. Three callers now: the probe test above, the record-and-replay test,
+/// and the JDK-free replay of the checked-in cassette.
+///
+/// This one was chosen because everything it asks is a *question about loaded state* — no breakpoints, no
+/// suspension, no probe stdout, and therefore no events, which the first cut of cassettes does not replay.
+/// It is also the same on JDK 11, 17 and 21: every name it asserts on belongs to `EvalProbe` itself.
+///
+/// Returns every reply verbatim, so a caller can compare two runs byte for byte instead of trusting that
+/// two passes of the same assertions mean the same output.
+fn disc2_method_listing(server: &mut Server) -> Vec<String> {
     let m = server.call("debug.list_methods", serde_json::json!({"class_name": "EvalProbe", "limit": 100}));
     // Primitives, arrays and void all render as Java source types.
     assert_contains_all("rendered signatures", &m, &[
@@ -3987,6 +4030,300 @@ fn list_methods_renders_java_signatures_and_marks_static() {
         serde_json::json!({"class_name": "com.example.NoSuchThing"}),
     );
     assert_contains_all("unloaded class", &missing, &["is not loaded", "debug.list_classes"]);
+
+    vec![m, twice, own, chain, missing]
+}
+
+/// The checked-in cassette of the session above, named for what it plays rather than for how it was made.
+const DISC2_CASSETTE: &str = "list_methods_disc2";
+
+/// The checked-in cassette of one method-exit arming, kept for the sake of being edited.
+const MEXIT_CASSETTE: &str = "method_exit_arming";
+
+/// TEST-12 (#37): a session recorded through the proxy, then replayed **with the probe stopped**.
+///
+/// This is the acceptance criterion the whole issue turns on, and the order of the lines below is the
+/// argument. The same assertions run twice: once against a JVM with a recorder in the middle, and once
+/// against a file, after the JVM has been killed. Their *outputs* are then compared verbatim rather than
+/// both merely passing — two passes of the same assertions can hide two different answers, and "the same
+/// tool output" is what the issue asked to be shown.
+///
+/// It also round-trips through a real file on the way, because the format is half of what #37 delivers: a
+/// cassette held in memory would prove the recorder works and nothing about whether anyone could read,
+/// edit or check in what it produces.
+///
+/// Run it with `JDWP_RERECORD_CASSETTES=1` to also overwrite the checked-in fixture — deliberately opt-in,
+/// since it needs a JDK and rewrites a reviewed artefact.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_recorded_session_replays_with_the_probe_stopped_and_says_the_same_thing() {
+    let Some(jdk) = jdk_or_skip("a_recorded_session_replays_with_the_probe_stopped_and_says_the_same_thing")
+    else {
+        return;
+    };
+    record_replay_and_compare(&jdk, DISC2_CASSETTE, disc2_method_listing);
+}
+
+/// TEST-12 (#37): the second cassette, recorded for the sake of being **edited**.
+///
+/// Nothing here asserts anything DISC-2's does not; the value of this recording is what
+/// `a_method_exit_armed_against_a_jdwp_1_5_vm_degrades_and_says_so` does to it afterwards. It is recorded
+/// and verified by the same helper as the other one so that the raw material is known-good before anyone
+/// starts editing it — a hand edit on top of a cassette that was already wrong is very hard to read.
+///
+/// `EvalProbe$Subtask.run` is the target on purpose: the class is loaded (its static initialiser made one)
+/// and nothing ever calls it, so the request arms and never fires. A method-exit request on a class the
+/// probe is actually running would fill the recording with events, which are not replayed.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_method_exit_arming_is_recorded_for_the_cassette_that_gets_edited() {
+    let Some(jdk) = jdk_or_skip("a_method_exit_arming_is_recorded_for_the_cassette_that_gets_edited")
+    else {
+        return;
+    };
+    let tape = record_replay_and_compare(&jdk, MEXIT_CASSETTE, arm_a_traced_method_exit);
+    assert!(
+        tape.exchanges().iter().any(|e| (e.set, e.command) == (1, 1)),
+        "the edit this cassette exists for rewrites the VirtualMachine.Version reply, and there isn't one \
+         on the tape — the debugger stopped asking, so the JDWP < 1.6 branch is no longer reachable this way"
+    );
+}
+
+/// The hand-edited descendant of [`MEXIT_CASSETTE`]: the same session against a JVM that says `JDWP 1.5`.
+const JDWP15_CASSETTE: &str = "method_exit_on_a_jdwp_1_5_vm";
+
+/// Arming one traced method-exit request, as a body a cassette can be recorded from.
+fn arm_a_traced_method_exit(server: &mut Server) -> Vec<String> {
+    let armed = server.call(
+        "debug.set_method_exit_stop",
+        serde_json::json!({"class_pattern": "EvalProbe$Subtask", "method": "run", "trace": true}),
+    );
+    assert_contains_all("armed method exit", &armed, &["mexit_", "EvalProbe$Subtask"]);
+    // The control for the hand-edited cassette below. Every JVM this suite can reach speaks JDWP 1.11 or
+    // later, so the degraded arming must NOT appear here — otherwise the edited cassette would be proving
+    // nothing about the edit.
+    assert!(
+        !armed.contains("JDWP < 1.6"),
+        "a modern JVM must arm METHOD_EXIT_WITH_RETURN_VALUE: {armed}"
+    );
+    vec![armed]
+}
+
+/// TEST-12 (#37): a JVM answering **`JDWP 1.5`** — the shape the issue names, and one nothing here can be.
+///
+/// TODO.md's TEST-11 row states the problem and hands it to this issue: a JDK matrix cannot reach the
+/// `JDWP < 1.6` branch, because JDWP's version tracks the JDK's and the oldest JVM in the estate speaks
+/// 1.11. So `debug.set_method_exit_stop`'s degraded arming — the one that tells a caller they will get the
+/// return *site* and not the return *value* — had never executed, and the warning it prints had never been
+/// read by anything but a human.
+///
+/// Three edits to a five-exchange recording reach it, and the cassette says which three. That is the
+/// acceptance criterion about hand-editing, spent on the branch that most needed it rather than
+/// demonstrated on a toy: the fixture is not a recording of anything, it is a world that was written down.
+///
+/// The second and third edits are the interesting ones. Because a cassette is keyed by request payload, the
+/// `EventRequest.Set` key had to change too — the debugger arms kind 41 rather than 42 once it believes the
+/// version — and an edit that changed the version alone produced a loud miss naming `EventRequest.Set`
+/// instead of a quietly wrong pass. The keying and the loudness carried the edit; that is what they are for.
+///
+/// No JDK: there is no JVM in this test, and there could not be one.
+#[test]
+fn a_method_exit_armed_against_a_jdwp_1_5_vm_degrades_to_the_return_site_and_says_so() {
+    let tape = Cassette::load(&cassette_path(JDWP15_CASSETTE)).expect("load the hand-edited cassette");
+    let replay = ReplayServer::start(&tape).expect("start replay server");
+    let armed = {
+        let mut server = Server::start().expect("start server");
+        server.attach(replay.port);
+        arm_a_traced_method_exit_on_an_old_vm(&mut server)
+    };
+    assert_contains_all("degraded arming", &armed, &[
+        "mexit_",
+        "JDWP < 1.6",
+        "Degraded to a plain MethodExit",
+        "return site",
+    ]);
+    replay.assert_no_misses();
+}
+
+/// The same call as [`arm_a_traced_method_exit`] without its modern-JVM control, since this one is aimed at
+/// a JVM that is deliberately ancient.
+fn arm_a_traced_method_exit_on_an_old_vm(server: &mut Server) -> String {
+    server.call(
+        "debug.set_method_exit_stop",
+        serde_json::json!({"class_pattern": "EvalProbe$Subtask", "method": "run", "trace": true}),
+    )
+}
+
+/// TEST-12 (#37): every checked-in cassette is exactly what the writer emits, hand edits included.
+///
+/// Two things at once, both cheap. It parses each fixture, which is the only guard a hand edit gets against
+/// a stray comma or an odd number of hex digits; and it re-serialises and compares, which says the edit
+/// stayed inside the format rather than drifting into something only this parser happens to accept. A
+/// format nobody can round-trip is not hand-editable, it is hand-breakable.
+///
+/// No JDK: it reads files.
+#[test]
+fn every_checked_in_cassette_round_trips_through_the_writer() {
+    for name in [DISC2_CASSETTE, MEXIT_CASSETTE, JDWP15_CASSETTE] {
+        let path = cassette_path(name);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let tape = Cassette::load(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!tape.is_empty(), "{name} has no exchanges on it");
+        assert_eq!(
+            tape.to_json(),
+            text,
+            "{name} is not in the shape the writer emits — re-record it, or match the layout by hand so \
+             the next reader can trust that what they see is what gets served"
+        );
+    }
+}
+
+/// Record `body` against a freshly started `EvalProbe`, then run it again from the recording with the probe
+/// **killed**, and insist the two agree reply for reply.
+///
+/// Returns the cassette, and writes it over the checked-in fixture when `JDWP_RERECORD_CASSETTES` is set.
+fn record_replay_and_compare(
+    jdk: &Jdk,
+    name: &str,
+    body: fn(&mut Server) -> Vec<String>,
+) -> Cassette {
+    let probe = eval_probe_running(jdk);
+    let recorder = CassetteRecorder::start(probe.port).expect("start cassette recorder");
+
+    let live = {
+        let mut server = Server::start().expect("start server");
+        server.attach(recorder.port);
+        body(&mut server)
+        // `server` drops HERE, inside the recording. Its `Drop` sends `debug.panic` down the wire, so the
+        // cassette carries the shutdown as well as the questions — without it the replayed server's own
+        // exit would ask something the tape had never heard, which is a miss in a test that had already
+        // finished asserting.
+    };
+
+    let mut cassette = recorder.finish(name);
+    cassette.recorded_from = format!("EvalProbe on {}", java_version(jdk));
+    cassette.note = "Recorded by mcp_integration.rs; re-record with JDWP_RERECORD_CASSETTES=1. Editing it \
+                     by hand is a supported way to synthesise a shape no JVM here can produce."
+        .to_string();
+    assert!(
+        !cassette.is_empty(),
+        "a session that asked the debuggee questions recorded no exchanges at all — the recorder is not \
+         seeing the traffic"
+    );
+    assert_eq!(
+        cassette.events_seen, 0,
+        "this session was chosen because it has no events; {} showed up, so either the probe changed or \
+         the cassette is now a partial record",
+        cassette.events_seen
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("session.json");
+    cassette.save(&path).expect("save cassette");
+    let tape = Cassette::load(&path).expect("load the cassette back");
+    assert_eq!(tape.len(), cassette.len(), "the file lost exchanges between save and load");
+
+    // The probe dies here. Everything below this line runs against a JSON file.
+    drop(probe);
+
+    let replay = ReplayServer::start(&tape).expect("start replay server");
+    let from_tape = {
+        let mut server = Server::start().expect("start server");
+        server.attach(replay.port);
+        body(&mut server)
+    };
+    replay.assert_no_misses();
+    assert_eq!(live, from_tape, "the replay answered differently from the JVM it was recorded from");
+
+    if rerecording() {
+        let fixture = cassette_path(name);
+        cassette.save(&fixture).expect("save the checked-in fixture");
+        println!("re-recorded {}", fixture.display());
+    }
+    cassette
+}
+
+/// TEST-12 (#37): DISC-2's whole test again, out of a checked-in file — **no JDK, no JVM, no `#[ignore]`**.
+///
+/// The point of the issue in one test. Everything `list_methods_renders_java_signatures_and_marks_static`
+/// asserts is asserted here too, by the same function, and this one runs in the default `cargo test` on a
+/// machine with no Java on it at all. Where the probe test proves the debugger works against a JVM, this
+/// proves it still works against the *recorded shape* of one — so a regression in signature rendering,
+/// overload listing or the not-loaded message fails a test that costs a file read instead of a JVM launch.
+///
+/// It does not replace the probe test and must not (the issue is explicit): a cassette is a snapshot and
+/// cannot notice the debuggee changing. It is the fast half of a pair.
+#[test]
+fn list_methods_renders_java_signatures_from_a_cassette() {
+    let path = cassette_path(DISC2_CASSETTE);
+    let tape = Cassette::load(&path).unwrap_or_else(|e| {
+        panic!(
+            "{e}\nRe-record it with a JDK:\n  {RERECORD_ENV}=1 scripts/integration-test.sh \
+             a_recorded_session_replays"
+        )
+    });
+    let replay = ReplayServer::start(&tape).expect("start replay server");
+    {
+        let mut server = Server::start().expect("start server");
+        server.attach(replay.port);
+        disc2_method_listing(&mut server);
+    }
+    // Explicit as well as in `Drop`, so the failure names this test rather than arriving during unwinding.
+    replay.assert_no_misses();
+}
+
+/// TEST-12 (#37): an unmatched request must fail **loudly**, and this is what proves it does.
+///
+/// The acceptance criterion is stated as a hazard rather than a feature: "a replay that quietly returns an
+/// error reply would make every test using it meaningless". That is not a hypothetical failure mode in this
+/// repo, it is the recurring one — a SIGKILL'd coverage counter, an undetectable JDK, a filter matching no
+/// tests, all of them green. So the empty cassette below is the worst case on purpose: it can answer
+/// *nothing*.
+///
+/// Two things are asserted, and the second is the one that matters. The tool call must fail — not come back
+/// with a plausible-looking empty listing — and the miss must **name the command**, because the reader's
+/// next move is either to re-record or to add that exchange by hand, and neither is possible from "it
+/// didn't work".
+///
+/// Note what the attach itself proves: nothing. A JDWP attach is a handshake and no commands at all, so it
+/// succeeds against a cassette with no exchanges in it — which is exactly why the loudness has to live at
+/// the first real question rather than at connect time.
+///
+/// No JDK, for the same reason as the test above: there is no JVM in it.
+#[test]
+fn a_cassette_that_cannot_answer_says_which_command_it_could_not_answer() {
+    let replay = ReplayServer::start(&Cassette::default()).expect("start replay server");
+    let asked = {
+        let mut server = Server::start().expect("start server");
+        server.call("debug.attach", serde_json::json!({"host": "127.0.0.1", "port": replay.port}));
+        server.call("debug.list_methods", serde_json::json!({"class_name": "EvalProbe"}))
+        // Dropped inside the scope so its own shutdown traffic lands before the misses are read.
+    };
+    assert!(
+        !asked.contains("method(s) on"),
+        "a cassette with nothing on it must not produce a method listing: {asked}"
+    );
+
+    // Drained rather than read, so the `Drop` backstop does not fire on the miss this test went looking for.
+    let misses = replay.take_misses();
+    assert!(!misses.is_empty(), "an empty cassette answered a question without recording a miss: {asked}");
+    assert!(
+        misses.iter().any(|m| m.starts_with("VirtualMachine.") || m.starts_with("ReferenceType.")),
+        "a miss must NAME the command, so the reader knows what to add to the cassette: {misses:?}"
+    );
+}
+
+/// The `java -version` banner's first line, for the record kept inside a cassette. A cassette is a snapshot
+/// of one debuggee on one JVM, and which JVM is the first thing a reader of it will want to know.
+fn java_version(jdk: &Jdk) -> String {
+    std::process::Command::new(&jdk.java)
+        .arg("-version")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or_default().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "an unidentified JVM".to_string())
 }
 
 /// DISC-3 (#31): what a loaded class was compiled from, and the source behind a stack frame's line.

@@ -13,12 +13,22 @@
 //
 // They are `#[ignore]`d because they spawn JVMs and take seconds, not milliseconds.
 //
-// One exception, and it is deliberate: `stdio_protocol.rs` uses the [`Server`] half alone to drive the
-// process's JSON-RPC front door with malformed input. No `Probe`, no JVM, no `#[ignore]` — those tests
-// run in the default suite, because a test that needs no JDK must not be hidden behind the flag that
-// exists for tests that do (TEST-9, #25).
+// Two exceptions, both deliberate, both following the same rule: a test that needs no JDK must not be
+// hidden behind the flag that exists for tests that do (TEST-9, #25).
+//
+//  * `stdio_protocol.rs` uses the [`Server`] half alone to drive the process's JSON-RPC front door with
+//    malformed input. No `Probe`, no JVM, no `#[ignore]`.
+//  * The cassette tests in `mcp_integration.rs` drive the whole server against a **recorded** JDWP session
+//    served out of a file — see [`cassette`] and ADR-0014. Same server, same handlers, same assertions as
+//    the probe tests they were recorded from; no JVM anywhere.
 
 #![allow(dead_code)] // each test file uses a subset of this harness
+
+/// Recording a JDWP session to a file and serving it back with no JVM (TEST-12, #37). A child module rather
+/// than more of this one: it is the only part of the harness a *reader* has to understand a file format for,
+/// and it reaches into the proxy seam here (`Relay`, `wire_framed`, `read_frames`) rather than reimplementing
+/// any of it — which was the whole condition #37 attached to building it.
+pub mod cassette;
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -346,6 +356,104 @@ fn free_port() -> u16 {
         .map_or(0, |a| a.port())
 }
 
+/// The half of a JDWP proxy that is the same whatever the proxy is *for*.
+///
+/// Bind a port the debugger attaches to instead of the debuggee's, accept its one connection, dial the
+/// debuggee behind it, keep the live sockets so a blocked `read` can be woken, and take the whole thing
+/// down on drop. Four modes now sit on this — a latency dial, a fault injector, a cassette recorder and a
+/// cassette player — and until TEST-12 ([#37](https://github.com/YgorPerez/java-debugging-mcp/issues/37))
+/// each new one arrived carrying its own copy of that paragraph. `7db6318` said so at the time and
+/// deferred it on purpose: *a third user is the point to unify, not the second*. The recorder is the third.
+///
+/// **What the unification is careful NOT to swallow.** Only the socket lifecycle is shared. What each mode
+/// does with the bytes is a closure, because the modes disagree about the one thing that matters:
+/// [`LatencyRelay`] copies raw chunks and charges its delay per chunk, which is what ADR-0011's numbers were
+/// measured through and what makes them a documented lower bound. Framing it — splitting a coalesced read
+/// into packets and charging each one — would change the instrument, not just its implementation. So it
+/// keeps [`pump_delayed`], and the three modes that must understand JDWP packets share [`wire_framed`]
+/// instead. One seam, two pumps, and the reason for the second is written down rather than inherited.
+///
+/// `target_port` is `None` for a proxy with **nothing behind it** — the cassette player is a JDWP endpoint
+/// rather than a middleman, and needs every line of this except the upstream connect.
+struct Relay {
+    /// The port a test attaches to instead of the probe's own.
+    port: u16,
+    /// Set on drop so the acceptor loop stops; the copy threads end on EOF.
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Live sockets, shut down on drop so a blocked `read` returns instead of leaking its thread.
+    open: Arc<Mutex<Vec<std::net::TcpStream>>>,
+}
+
+impl Relay {
+    /// Listen on a fresh port and hand each accepted connection — and the upstream one behind it, if
+    /// there is an upstream — to `wire`, which is responsible for pumping the bytes.
+    ///
+    /// `label` only ever shows up in the two bind errors, and exists so a failure names the mode that
+    /// failed rather than "relay" for all four.
+    fn start(
+        label: &'static str,
+        target_port: Option<u16>,
+        mut wire: impl FnMut(std::net::TcpStream, Option<std::net::TcpStream>) + Send + 'static,
+    ) -> Result<Self, String> {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("{label} bind: {e}"))?;
+        let port = listener.local_addr().map_err(|e| format!("{label} addr: {e}"))?.port();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let open: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let (acc_stop, acc_open) = (Arc::clone(&stop), Arc::clone(&open));
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                if acc_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let Ok(client) = incoming else { return };
+                // dt_socket with server=y accepts one connection, so there is exactly one of these per
+                // probe; connecting lazily (here, not at start) keeps the probe's single slot free until
+                // the debugger actually attaches.
+                let server = match target_port {
+                    Some(p) => match std::net::TcpStream::connect(("127.0.0.1", p)) {
+                        Ok(s) => Some(s),
+                        Err(_) => return,
+                    },
+                    None => None,
+                };
+                // Nagle would add its own delay on top of the one being measured, which is the one thing
+                // the latency mode must not do.
+                let _ = client.set_nodelay(true);
+                if let Some(s) = server.as_ref() {
+                    let _ = s.set_nodelay(true);
+                }
+                if let Ok(mut v) = acc_open.lock() {
+                    if let Ok(c) = client.try_clone() {
+                        v.push(c);
+                    }
+                    if let Some(Ok(s)) = server.as_ref().map(std::net::TcpStream::try_clone) {
+                        v.push(s);
+                    }
+                }
+                wire(client, server);
+            }
+        });
+        Ok(Self { port, stop, open })
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Shutting the sockets down is what actually ends the copy threads: they are parked in a blocking
+        // `read`, which a flag alone can never interrupt.
+        if let Ok(v) = self.open.lock() {
+            for s in v.iter() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        // Unblock the acceptor's own `accept` by connecting to it once.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+    }
+}
+
 /// A TCP relay in front of a probe's JDWP port that adds a round-trip delay to every forwarded chunk,
 /// so a test can drive the debugger against a JVM that behaves like one **across a network hop**.
 ///
@@ -371,10 +479,8 @@ pub struct LatencyRelay {
     /// The one-way delay in nanoseconds, read fresh by both copy threads before every write so
     /// [`set_rtt`](Self::set_rtt) can move the far end of the wire under a live connection.
     one_way_nanos: Arc<std::sync::atomic::AtomicU64>,
-    /// Set on drop so the acceptor loop stops; the copy threads end on EOF.
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    /// Live sockets, shut down on drop so a blocked `read` returns instead of leaking its thread.
-    open: Arc<Mutex<Vec<std::net::TcpStream>>>,
+    /// Held only so dropping this drops the listener and the sockets with it.
+    _relay: Relay,
 }
 
 impl LatencyRelay {
@@ -383,45 +489,18 @@ impl LatencyRelay {
     /// `rtt` is the round trip, so each direction sleeps half of it — a caller thinking in terms of
     /// "an instance 2ms away" passes `Duration::from_millis(2)` and gets what they expect.
     pub fn start(target_port: u16, rtt: Duration) -> Result<Self, String> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| format!("relay bind: {e}"))?;
-        let port = listener.local_addr().map_err(|e| format!("relay addr: {e}"))?.port();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let open: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
         let one_way = Arc::new(std::sync::atomic::AtomicU64::new(one_way_nanos(rtt)));
-
-        let (acc_stop, acc_open, acc_delay) =
-            (Arc::clone(&stop), Arc::clone(&open), Arc::clone(&one_way));
-        std::thread::spawn(move || {
-            for incoming in listener.incoming() {
-                if acc_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                let Ok(client) = incoming else { return };
-                // dt_socket with server=y accepts one connection, so there is exactly one of these per
-                // probe; connecting lazily (here, not at start) keeps the probe's single slot free until
-                // the debugger actually attaches.
-                let Ok(server) = std::net::TcpStream::connect(("127.0.0.1", target_port)) else { return };
-                // Nagle would add its own delay on top of the one being measured, which is the one thing
-                // this must not do.
-                let _ = client.set_nodelay(true);
-                let _ = server.set_nodelay(true);
-                if let (Ok(c2), Ok(s2)) = (client.try_clone(), server.try_clone()) {
-                    if let Ok(mut v) = acc_open.lock() {
-                        v.push(c2);
-                        v.push(s2);
-                    }
-                }
-                match (client.try_clone(), server.try_clone()) {
-                    (Ok(c_read), Ok(s_read)) => {
-                        pump_delayed(c_read, server, Arc::clone(&acc_delay));
-                        pump_delayed(s_read, client, Arc::clone(&acc_delay));
-                    }
-                    _ => return,
-                }
+        let wire_delay = Arc::clone(&one_way);
+        // The one mode that does NOT frame. See [`Relay`] for why that is deliberate rather than an
+        // omission: this relay's numbers are in ADR-0011 and framing would change what it measures.
+        let relay = Relay::start("relay", Some(target_port), move |client, server| {
+            let Some(server) = server else { return };
+            if let (Ok(c_read), Ok(s_read)) = (client.try_clone(), server.try_clone()) {
+                pump_delayed(c_read, server, Arc::clone(&wire_delay));
+                pump_delayed(s_read, client, Arc::clone(&wire_delay));
             }
-        });
-        Ok(Self { port, one_way_nanos: one_way, stop, open })
+        })?;
+        Ok(Self { port: relay.port, one_way_nanos: one_way, _relay: relay })
     }
 
     /// Move the round trip on a **live** relay: the next chunk in either direction pays the new one.
@@ -435,21 +514,6 @@ impl LatencyRelay {
     /// thing that makes a difference between two wall clocks mean the wire.
     pub fn set_rtt(&self, rtt: Duration) {
         self.one_way_nanos.store(one_way_nanos(rtt), std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-impl Drop for LatencyRelay {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        // Shutting the sockets down is what actually ends the copy threads: they are parked in a blocking
-        // `read`, which a flag alone can never interrupt.
-        if let Ok(v) = self.open.lock() {
-            for s in v.iter() {
-                let _ = s.shutdown(std::net::Shutdown::Both);
-            }
-        }
-        // Unblock the acceptor's own `accept` by connecting to it once.
-        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
     }
 }
 
@@ -514,17 +578,13 @@ pub enum Fault {
 ///
 /// Same seam as [`LatencyRelay`], used differently: sit in the middle of the JDWP stream and change what
 /// arrives. Unlike that one this must **frame** the protocol, because a reply carries only the request id —
-/// which command it answers is known only from the request that went the other way.
-///
-/// Deliberately a second proxy rather than a flag on the first: `LatencyRelay` is a *measuring instrument*
-/// whose numbers are already recorded in ADR-0011, and its chunk-level delay is documented as a lower
-/// bound. Framing it would change what it measures. They converge when cassette recording needs framing
-/// too — a third user is the point to unify, not the second.
+/// which command it answers is known only from the request that went the other way. That framing is now
+/// [`wire_framed`], shared with the cassette recorder (ADR-0014); this type is the fault policy on top of it.
 pub struct FaultRelay {
     /// The port a test attaches to instead of the probe's own.
     pub port: u16,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    open: Arc<Mutex<Vec<std::net::TcpStream>>>,
+    /// Held only so dropping this drops the listener and the sockets with it.
+    _relay: Relay,
 }
 
 /// The JDWP handshake both ends send before any packet framing begins.
@@ -540,54 +600,23 @@ impl FaultRelay {
     /// Listen on a fresh port, forwarding to `target_port` and applying `faults` — keyed by
     /// `(command set, command)` — to every reply answering a matching command.
     pub fn start(target_port: u16, faults: Vec<(u8, u8, Fault)>) -> Result<Self, String> {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("fault relay bind: {e}"))?;
-        let port = listener.local_addr().map_err(|e| format!("fault relay addr: {e}"))?.port();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let open: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let (acc_stop, acc_open) = (Arc::clone(&stop), Arc::clone(&open));
-        std::thread::spawn(move || {
-            for incoming in listener.incoming() {
-                if acc_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                let Ok(client) = incoming else { return };
-                let Ok(server) = std::net::TcpStream::connect(("127.0.0.1", target_port)) else { return };
-                let _ = client.set_nodelay(true);
-                let _ = server.set_nodelay(true);
-                if let (Ok(c2), Ok(s2)) = (client.try_clone(), server.try_clone()) {
-                    if let Ok(mut v) = acc_open.lock() {
-                        v.push(c2);
-                        v.push(s2);
-                    }
-                }
-                // Which command each id belongs to, learned from the request direction and read by the
-                // reply direction. A reply names no command, so this map is the only way to key a fault.
-                let pending: Arc<Mutex<std::collections::HashMap<u32, (u8, u8)>>> =
-                    Arc::new(Mutex::new(std::collections::HashMap::new()));
-                match (client.try_clone(), server.try_clone()) {
-                    (Ok(c_read), Ok(s_read)) => {
-                        pump_requests(c_read, server, Arc::clone(&pending));
-                        pump_replies(s_read, client, pending, faults.clone());
-                    }
-                    _ => return,
-                }
-            }
-        });
-        Ok(Self { port, stop, open })
-    }
-}
-
-impl Drop for FaultRelay {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(v) = self.open.lock() {
-            for s in v.iter() {
-                let _ = s.shutdown(std::net::Shutdown::Both);
-            }
-        }
-        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        let relay = Relay::start("fault relay", Some(target_port), move |client, server| {
+            let Some(server) = server else { return };
+            let faults = faults.clone();
+            wire_framed(client, server, move |seen| {
+                // Composite events arrive on this side too and are *command* packets (set 64), not
+                // replies; they answer nothing we asked and fall through untouched. Faulting them would
+                // break the event pump rather than test it.
+                let FromDebuggee::Reply { command, reply, .. } = seen else { return None };
+                let id = packet_id(reply)?;
+                let fault = faults.iter().find(|(s, c, _)| (*s, *c) == command).map(|(_, _, f)| f)?;
+                Some(match fault {
+                    Fault::Error(code) => reply_packet(id, *code, &[]),
+                    Fault::Payload(p) => reply_packet(id, 0, p),
+                })
+            });
+        })?;
+        Ok(Self { port: relay.port, _relay: relay })
     }
 }
 
@@ -609,110 +638,135 @@ fn take_packets(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
     out
 }
 
-/// Forward the handshake, then every request — recording each id's `(set, command)` so replies can be
-/// matched. Requests are never modified: the debugger's own traffic is not what is under test.
-fn pump_requests(
-    mut from: std::net::TcpStream,
-    mut to: std::net::TcpStream,
-    pending: Arc<Mutex<std::collections::HashMap<u32, (u8, u8)>>>,
-) {
-    std::thread::spawn(move || {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut chunk = vec![0u8; 1 << 16];
-        let mut shaken = false;
-        loop {
-            let n = match std::io::Read::read(&mut from, &mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
-            if !shaken {
-                if buf.len() < JDWP_HANDSHAKE.len() {
-                    continue;
-                }
-                let shake: Vec<u8> = buf.drain(..JDWP_HANDSHAKE.len()).collect();
-                if std::io::Write::write_all(&mut to, &shake).is_err() {
-                    break;
-                }
-                shaken = true;
-            }
-            for pkt in take_packets(&mut buf) {
-                if let (Some(id), Some(flags), Some(set), Some(cmd)) =
-                    (packet_id(&pkt), pkt.get(8).copied(), pkt.get(9).copied(), pkt.get(10).copied())
-                {
-                    if flags & JDWP_REPLY_FLAG == 0 {
-                        if let Ok(mut m) = pending.lock() {
-                            m.insert(id, (set, cmd));
-                        }
-                    }
-                }
-                if std::io::Write::write_all(&mut to, &pkt).is_err() {
-                    return;
-                }
-            }
-        }
-        let _ = to.shutdown(std::net::Shutdown::Both);
-    });
-}
-
-/// Forward the handshake, then every reply — rewriting the ones whose command matches a fault.
+/// One unit of the JDWP stream, as [`read_frames`] hands it over.
 ///
-/// Composite events arrive on this side too and are *command* packets (set 64), not replies; they carry no
-/// id we issued, so they fall through untouched. Faulting them would break the event pump rather than test
-/// it.
-fn pump_replies(
-    mut from: std::net::TcpStream,
-    mut to: std::net::TcpStream,
-    pending: Arc<Mutex<std::collections::HashMap<u32, (u8, u8)>>>,
-    faults: Vec<(u8, u8, Fault)>,
-) {
-    std::thread::spawn(move || {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut chunk = vec![0u8; 1 << 16];
-        let mut shaken = false;
-        loop {
-            let n = match std::io::Read::read(&mut from, &mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
-            if !shaken {
-                if buf.len() < JDWP_HANDSHAKE.len() {
-                    continue;
-                }
-                let shake: Vec<u8> = buf.drain(..JDWP_HANDSHAKE.len()).collect();
-                if std::io::Write::write_all(&mut to, &shake).is_err() {
-                    break;
-                }
-                shaken = true;
+/// The handshake is called out rather than folded into the packet case because it is not a packet: it is
+/// fourteen bare bytes in front of the framing, and every mode has to get past it before anything else it
+/// does makes sense. A proxy that treated it as a packet would read its first four bytes (`JDWP`) as a
+/// length of 1 246 906 704 and wait forever.
+enum Frame<'a> {
+    Handshake(&'a [u8]),
+    Packet(&'a [u8]),
+}
+
+/// Read one end of a JDWP connection: the handshake, then whole packets, one call to `on_frame` each.
+/// Returns when the peer hangs up, or as soon as `on_frame` answers `false`.
+///
+/// **The single framing implementation in this harness.** Fault injection, cassette recording and cassette
+/// replay all come through here; TEST-12 (#37) called adding a third copy the thing not to do.
+fn read_frames(mut from: std::net::TcpStream, mut on_frame: impl FnMut(Frame<'_>) -> bool) {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 1 << 16];
+    let mut shaken = false;
+    loop {
+        let n = match std::io::Read::read(&mut from, &mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+        if !shaken {
+            if buf.len() < JDWP_HANDSHAKE.len() {
+                continue;
             }
-            for pkt in take_packets(&mut buf) {
-                let out = faulted(&pkt, &pending, &faults).unwrap_or(pkt);
-                if std::io::Write::write_all(&mut to, &out).is_err() {
-                    return;
+            let shake: Vec<u8> = buf.drain(..JDWP_HANDSHAKE.len()).collect();
+            if !on_frame(Frame::Handshake(&shake)) {
+                return;
+            }
+            shaken = true;
+        }
+        for pkt in take_packets(&mut buf) {
+            if !on_frame(Frame::Packet(&pkt)) {
+                return;
+            }
+        }
+    }
+}
+
+/// Copy one framed direction, giving `transform` the chance to substitute each packet. `None` forwards the
+/// original untouched, which is what every packet nobody is interested in gets. The handshake is always
+/// forwarded as it arrived — it is fourteen fixed bytes and there is nothing in it to change.
+///
+/// The returned flag goes `true` when this direction has ended — the recorder needs to know the debugger
+/// has hung up before it writes a cassette, and the alternative (guessing with a sleep) is how a recording
+/// silently loses its last exchange.
+fn pump_framed(
+    from: std::net::TcpStream,
+    mut to: std::net::TcpStream,
+    mut transform: impl FnMut(&[u8]) -> Option<Vec<u8>> + Send + 'static,
+) -> Arc<std::sync::atomic::AtomicBool> {
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&finished);
+    std::thread::spawn(move || {
+        read_frames(from, |frame| match frame {
+            Frame::Handshake(b) => std::io::Write::write_all(&mut to, b).is_ok(),
+            Frame::Packet(p) => {
+                let out = transform(p);
+                std::io::Write::write_all(&mut to, out.as_deref().unwrap_or(p)).is_ok()
+            }
+        });
+        let _ = to.shutdown(std::net::Shutdown::Both);
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    finished
+}
+
+/// Requests still waiting for their reply: id → the command it was, and the payload it carried.
+///
+/// Shared by both directions of a framing proxy — written by the request pump, taken by the reply pump —
+/// which is why it is behind an `Arc<Mutex<…>>` rather than owned by either.
+type Pending = Arc<Mutex<std::collections::HashMap<u32, (u8, u8, Vec<u8>)>>>;
+
+/// What a framing proxy sees coming back from the debuggee.
+///
+/// The distinction is the whole reason framing is needed. A reply names no command — only the id it
+/// answers — so pairing it with the request that went the other way is the only way to know what it is a
+/// reply *to*. An event names no id of ours at all, because nobody asked for it.
+enum FromDebuggee<'a> {
+    /// A reply, with the `(command set, command)` and request payload it answers.
+    Reply { command: (u8, u8), request: &'a [u8], reply: &'a [u8] },
+    /// The debuggee speaking unprompted — a composite event packet.
+    Event(&'a [u8]),
+}
+
+/// Wire both directions of a **framing** proxy, calling `on_reply` for everything the debuggee sends back.
+/// `on_reply` returns a replacement packet, or `None` to forward what arrived.
+///
+/// Returns the flag from [`pump_framed`] for the debuggee direction: `true` once the debuggee side has
+/// closed, which is the last moment anything can still be recorded.
+fn wire_framed(
+    client: std::net::TcpStream,
+    server: std::net::TcpStream,
+    mut on_reply: impl FnMut(FromDebuggee<'_>) -> Option<Vec<u8>> + Send + 'static,
+) -> Arc<std::sync::atomic::AtomicBool> {
+    // Which command — and which request payload — each id belongs to, learned from the request direction
+    // and read by the reply direction. A reply carries neither, so this map is the only way to key one.
+    let pending: Pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (Ok(c_read), Ok(s_read)) = (client.try_clone(), server.try_clone()) else {
+        return Arc::new(std::sync::atomic::AtomicBool::new(true));
+    };
+
+    let outbound = Arc::clone(&pending);
+    pump_framed(c_read, server, move |pkt| {
+        if let (Some(id), Some(flags), Some(set), Some(cmd)) =
+            (packet_id(pkt), pkt.get(8).copied(), pkt.get(9).copied(), pkt.get(10).copied())
+        {
+            if flags & JDWP_REPLY_FLAG == 0 {
+                if let Ok(mut m) = outbound.lock() {
+                    m.insert(id, (set, cmd, pkt.get(JDWP_HEADER..).unwrap_or_default().to_vec()));
                 }
             }
         }
-        let _ = to.shutdown(std::net::Shutdown::Both);
+        None
     });
-}
 
-/// The rewritten packet, or `None` to forward the original untouched.
-fn faulted(
-    pkt: &[u8],
-    pending: &Arc<Mutex<std::collections::HashMap<u32, (u8, u8)>>>,
-    faults: &[(u8, u8, Fault)],
-) -> Option<Vec<u8>> {
-    if pkt.get(8).copied()? & JDWP_REPLY_FLAG == 0 {
-        return None; // an event, not a reply to us
-    }
-    let id = packet_id(pkt)?;
-    // Taken, not read: an id is answered once, so leaving it would grow the map for the whole session.
-    let (set, cmd) = pending.lock().ok()?.remove(&id)?;
-    let fault = faults.iter().find(|(s, c, _)| *s == set && *c == cmd).map(|(_, _, f)| f)?;
-    Some(match fault {
-        Fault::Error(code) => reply_packet(id, *code, &[]),
-        Fault::Payload(p) => reply_packet(id, 0, p),
+    pump_framed(s_read, client, move |pkt| {
+        if pkt.get(8).copied().is_some_and(|f| f & JDWP_REPLY_FLAG == 0) {
+            return on_reply(FromDebuggee::Event(pkt));
+        }
+        let id = packet_id(pkt)?;
+        // Taken, not read: an id is answered once, so leaving it would grow the map for the whole session.
+        let (set, cmd, request) = pending.lock().ok()?.remove(&id)?;
+        on_reply(FromDebuggee::Reply { command: (set, cmd), request: &request, reply: pkt })
     })
 }
 

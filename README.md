@@ -263,10 +263,43 @@ scripts/doctor.sh               # the rust-doctor health gate CI runs
 own probe JVMs from `examples/probes/` — no manual steps. It does need a JDK: without one every test
 prints `SKIP` and passes, so check for `SKIP` lines before reading a green run as coverage.
 
-`mcp-server/tests/stdio_protocol.rs` is the exception: it drives the real binary's JSON-RPC front door
+`mcp-server/tests/stdio_protocol.rs` is one exception: it drives the real binary's JSON-RPC front door
 with malformed input (unparseable lines, non-objects, missing `method`, EOF mid-message) and needs no JDK,
 so it runs in plain `cargo test`. Each case checks that an error came back **and** that the server is
 still serving afterwards, since one bad line from a client must not end the session.
+
+The **cassette** tests are the other (see below). They live in `mcp_integration.rs` but carry no `#[ignore]`
+— which means `scripts/integration-test.sh` does *not* run them, since `--ignored` runs only ignored tests.
+Both commands are needed to see the whole file.
+
+#### Recorded sessions: testing the debugger with no JVM at all
+
+A third proxy mode **records** every JDWP request/reply pair to a file, and a replay server answers from
+that file with nothing behind the port (ADR-0014, TEST-12
+[#37](https://github.com/YgorPerez/java-debugging-mcp/issues/37)):
+
+```bash
+cargo test --test mcp_integration list_methods_renders_java_signatures_from_a_cassette   # no JDK needed
+JDWP_RERECORD_CASSETTES=1 scripts/integration-test.sh a_recorded_session_replays          # re-record
+```
+
+The cassettes are in `mcp-server/tests/cassettes/` and are meant to be read and edited: JSON, one object
+per exchange, payloads as hex in 32-byte lines, each exchange labelled with its JDWP command name. Answers
+are keyed by `(command set, command, request payload)` rather than by arrival order, and **a request the
+cassette cannot answer gets no reply at all** — the connection drops, the command is named on stderr, and
+the test fails. A replay that quietly returned an error reply would make every test using it meaningless.
+
+Two things this buys that a probe cannot:
+
+- **One visit to a real instance becomes a permanent fixture.** Record once, replay forever, with no
+  access, no JDK and no JVM.
+- **Shapes nothing here can produce become testable by editing a file.**
+  `method_exit_on_a_jdwp_1_5_vm.json` is a hand edit of a five-exchange recording that makes the debuggee
+  answer `JDWP 1.5`, which reaches `debug.set_method_exit_stop`'s degraded arming — a branch a JDK matrix
+  cannot reach, because JDWP's version tracks the JDK's and the oldest JVM in the estate speaks 1.11.
+
+Events are **not** replayed: a composite event answers no request, so it has no key. The recorder counts
+them and writes the count into the cassette, and says so when it is non-zero.
 
 #### Testing shared-instance behaviour without a shared instance
 
