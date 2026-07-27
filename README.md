@@ -68,10 +68,37 @@ natural language.
 java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 -jar myapp.jar
 ```
 
-### 2. Build the MCP server
+### 2. Get the MCP server
+
+**Download a prebuilt binary** — no Rust toolchain needed — from the
+[latest release](https://github.com/YgorPerez/java-debugging-mcp/releases/latest):
+
+| Platform | Asset |
+| --- | --- |
+| Linux x86_64 | `jdwp-mcp-<tag>-linux-x86_64` |
+| macOS (Apple Silicon) | `jdwp-mcp-<tag>-macos-aarch64` |
+| macOS (Intel) | `jdwp-mcp-<tag>-macos-x86_64` |
+| Windows x86_64 | `jdwp-mcp-<tag>-windows-x86_64.exe` |
+
+The Linux build is statically linked against musl, so it runs on any x86_64 Linux whatever the
+distribution's glibc — including an app server older than the machine you downloaded it on. Every
+release ships a `SHA256SUMS` covering all four assets:
 
 ```bash
-cargo build --release
+tag=v0.1.0
+base=https://github.com/YgorPerez/java-debugging-mcp/releases/download/$tag
+curl -LO "$base/jdwp-mcp-$tag-linux-x86_64" && curl -LO "$base/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS   # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
+chmod +x "jdwp-mcp-$tag-linux-x86_64"
+```
+
+The macOS binaries are unsigned, so the first run needs `xattr -d com.apple.quarantine <file>` or
+Settings → Privacy & Security → "Open Anyway".
+
+**Or build from source** — needs Rust 1.82 or newer:
+
+```bash
+cargo build --release   # binary at target/release/jdwp-mcp
 ```
 
 ### 3. Configure Claude Code
@@ -83,7 +110,7 @@ The easiest way to enable the MCP server for your project:
 claude mcp add --scope project jdwp /path/to/jdwp-mcp/target/release/jdwp-mcp
 ```
 
-Adjust the path to match where you cloned this repository. The `--scope project` flag makes the debugger available only in your current Java project.
+Adjust the path to match where you saved the downloaded binary (or `target/release/jdwp-mcp` if you built from source). The `--scope project` flag makes the debugger available only in your current Java project.
 
 **Alternative**: Manual configuration via `.mcp.json`:
 
@@ -128,6 +155,8 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | `debug.force_return` | Force the current method to return a given value, skipping the rest of its body |
 | `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line, exception type, watched field's old → new) + `[suspended]`; events are buffered, so `limit` reads a backlog and `drain` discards it |
 | `debug.list_threads` | List threads by name; filter with `name_filter` / `only_suspended` / `limit` |
+| `debug.list_classes` | What the debuggee has actually **loaded** — the first step when you don't already know the FQN a stop point needs, and the only way to find a generated proxy, a shaded class, or a deployment that differs from your checkout. `filter` takes `com.example.*`, `*.OrderService` or a bare substring, matched against the dotted name. Bounded: the reply reports matched-against-loaded rather than dumping thousands of types. Arrays excluded unless `include_arrays:true` |
+| `debug.list_methods` | A class's methods with signatures rendered as **Java source types** (`static boolean matches(java.lang.String, int)`) — what you need to compose a `debug.evaluate` call, since overloads resolve on the runtime types you supply. All overloads listed; `static`/`abstract`/`native` marked (the latter two have no body to break on). Declared-only unless `inherited:true` walks the superclass chain, attributing each row |
 | `debug.thread_dump` | Every thread's stack in one call **plus** the monitors each holds and the one it is blocked entering, with the blocker named (`← held by 0x<id> "<name>"`) — a deadlock cycle is readable straight off it. JDWP can only read a *suspended* thread, so pass `suspend:true` (freeze, read, resume, verify) or `only_suspended:true`; it never suspends on its own. Bound the cost with `name_filter` / `limit` / `max_frames` / `package_filter`, and the freeze with `max_suspend_ms` (default 2000) — the reply reports how long it held the VM, the packets it spent, and any threads a budget made it skip. `monitors_only:true` reads the lock graph without the stacks for a fraction of the freeze (measured: 245 packets / 33 ms against 770 / 117 ms on a 60-thread dump) |
 | `debug.pause` | Pause execution (suspend all threads) — watchdog-covered, so a forgotten pause can't freeze the JVM |
 | `debug.panic` | Safety: clear all stop points and resume all threads |
