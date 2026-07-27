@@ -10,7 +10,7 @@
 //
 // Without a JDK each test prints SKIP and passes, so a JDK-less CI stays green rather than red.
 //
-// **Three tests here are NOT `#[ignore]`d**, and they are the point of TEST-12 (#37): they drive the same
+// **Four tests here are NOT `#[ignore]`d**, and they are the point of TEST-12 (#37): they drive the same
 // server against a recorded JDWP session instead of a JVM (`common/cassette.rs`, ADR-0014). They need no
 // JDK and no Java, so they run in the default `cargo test` — a test that needs no JDK must not hide behind
 // the flag that exists for tests that do (TEST-9, #25). Note the corollary:
@@ -4152,6 +4152,31 @@ fn arm_a_traced_method_exit_on_an_old_vm(server: &mut Server) -> String {
         "debug.set_method_exit_stop",
         serde_json::json!({"class_pattern": "EvalProbe$Subtask", "method": "run", "trace": true}),
     )
+}
+
+/// TEST-12 (#37): every checked-in cassette is exactly what the writer emits, hand edits included.
+///
+/// Two things at once, both cheap. It parses each fixture, which is the only guard a hand edit gets against
+/// a stray comma or an odd number of hex digits; and it re-serialises and compares, which says the edit
+/// stayed inside the format rather than drifting into something only this parser happens to accept. A
+/// format nobody can round-trip is not hand-editable, it is hand-breakable.
+///
+/// No JDK: it reads files.
+#[test]
+fn every_checked_in_cassette_round_trips_through_the_writer() {
+    for name in [DISC2_CASSETTE, MEXIT_CASSETTE, JDWP15_CASSETTE] {
+        let path = cassette_path(name);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let tape = Cassette::load(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!tape.is_empty(), "{name} has no exchanges on it");
+        assert_eq!(
+            tape.to_json(),
+            text,
+            "{name} is not in the shape the writer emits — re-record it, or match the layout by hand so \
+             the next reader can trust that what they see is what gets served"
+        );
+    }
 }
 
 /// Record `body` against a freshly started `EvalProbe`, then run it again from the recording with the probe

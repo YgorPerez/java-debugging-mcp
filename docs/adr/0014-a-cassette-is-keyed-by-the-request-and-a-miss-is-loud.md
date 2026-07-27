@@ -129,7 +129,7 @@ complete and tested against probe recordings first.
 
 ## Consequences
 
-- **Three tests in `mcp_integration.rs` now carry no `#[ignore]`** and run in the default `cargo test`. That
+- **Four tests in `mcp_integration.rs` now carry no `#[ignore]`** and run in the default `cargo test`. That
   file's header used to say every test in it needs a JDK; it says otherwise now, and `stdio_protocol.rs` is
   no longer the only exception.
 - **`scripts/integration-test.sh` does not run them.** It passes `--ignored`, which runs *only* ignored

@@ -715,6 +715,12 @@ fn pump_framed(
 /// The distinction is the whole reason framing is needed. A reply names no command — only the id it
 /// answers — so pairing it with the request that went the other way is the only way to know what it is a
 /// reply *to*. An event names no id of ours at all, because nobody asked for it.
+/// Requests still waiting for their reply: id → the command it was, and the payload it carried.
+///
+/// Shared by both directions of a framing proxy — written by the request pump, taken by the reply pump —
+/// which is why it is behind an `Arc<Mutex<…>>` rather than owned by either.
+type Pending = Arc<Mutex<std::collections::HashMap<u32, (u8, u8, Vec<u8>)>>>;
+
 enum FromDebuggee<'a> {
     /// A reply, with the `(command set, command)` and request payload it answers.
     Reply { command: (u8, u8), request: &'a [u8], reply: &'a [u8] },
@@ -734,8 +740,7 @@ fn wire_framed(
 ) -> Arc<std::sync::atomic::AtomicBool> {
     // Which command — and which request payload — each id belongs to, learned from the request direction
     // and read by the reply direction. A reply carries neither, so this map is the only way to key one.
-    let pending: Arc<Mutex<std::collections::HashMap<u32, (u8, u8, Vec<u8>)>>> =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let pending: Pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let (Ok(c_read), Ok(s_read)) = (client.try_clone(), server.try_clone()) else {
         return Arc::new(std::sync::atomic::AtomicBool::new(true));
     };

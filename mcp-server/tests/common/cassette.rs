@@ -159,25 +159,23 @@ impl Cassette {
     /// Parsing goes back through `serde_json` and does not care about order at all, so a hand edit that
     /// moves a field is still a valid cassette.
     pub fn to_json(&self) -> String {
+        use std::fmt::Write as _;
         let mut out = String::new();
         out.push_str("{\n");
-        out.push_str(&format!("  \"cassette\": {},\n", json_string(&self.title)));
-        out.push_str(&format!("  \"recorded_from\": {},\n", json_string(&self.recorded_from)));
-        out.push_str(&format!("  \"note\": {},\n", json_string(&self.note)));
-        out.push_str(&format!("  \"events_seen\": {},\n", self.events_seen));
+        let _ = writeln!(out, "  \"cassette\": {},", json_string(&self.title));
+        let _ = writeln!(out, "  \"recorded_from\": {},", json_string(&self.recorded_from));
+        let _ = writeln!(out, "  \"note\": {},", json_string(&self.note));
+        let _ = writeln!(out, "  \"events_seen\": {},", self.events_seen);
         out.push_str("  \"exchanges\": [\n");
         for (i, e) in self.exchanges.iter().enumerate() {
             let comma = if i + 1 == self.exchanges.len() { "" } else { "," };
             out.push_str("    {\n");
-            out.push_str(&format!(
-                "      \"command\": {},\n",
-                json_string(&command_name(e.set, e.command))
-            ));
-            out.push_str(&format!("      \"set\": {}, \"cmd\": {},\n", e.set, e.command));
-            out.push_str(&format!("      \"request\": {},\n", hex_field(&e.request, 6)));
-            out.push_str(&format!("      \"error\": {},\n", e.error));
-            out.push_str(&format!("      \"reply\": {}\n", hex_field(&e.reply, 6)));
-            out.push_str(&format!("    }}{comma}\n"));
+            let _ = writeln!(out, "      \"command\": {},", json_string(&command_name(e.set, e.command)));
+            let _ = writeln!(out, "      \"set\": {}, \"cmd\": {},", e.set, e.command);
+            let _ = writeln!(out, "      \"request\": {},", hex_field(&e.request, 6));
+            let _ = writeln!(out, "      \"error\": {},", e.error);
+            let _ = writeln!(out, "      \"reply\": {}", hex_field(&e.reply, 6));
+            let _ = writeln!(out, "    }}{comma}");
         }
         out.push_str("  ]\n}\n");
         out
@@ -318,7 +316,7 @@ impl CassetteRecorder {
             std::thread::sleep(Duration::from_millis(20));
         }
         let exchanges = self.exchanges.lock().map(|v| v.clone()).unwrap_or_default();
-        let events_seen = self.events.lock().map(|n| *n).unwrap_or(0);
+        let events_seen = self.events.lock().map_or(0, |n| *n);
         if events_seen > 0 {
             eprintln!(
                 "note: recorded {events_seen} composite event(s) that will NOT be replayed — this \
@@ -478,8 +476,9 @@ fn reply_error(pkt: &[u8]) -> u16 {
 /// Bytes as lowercase hex — the form a payload takes in a cassette, and what anything synthesising one
 /// by hand has to produce.
 pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
     bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
         s
     })
 }
@@ -556,10 +555,16 @@ pub fn command_name(set: u8, command: u8) -> String {
     format!("Set{set}.Cmd{command}")
 }
 
+/// One command inside a set: its number and its name.
+type NamedCommand = (u8, &'static str);
+
+/// One command set: its number, its name, and the commands in it.
+type NamedCommandSet = (u8, &'static str, &'static [NamedCommand]);
+
 /// The JDWP command sets, from the protocol specification. Only names — nothing here decodes a payload,
 /// because a cassette stores bytes and decoding them would be a second protocol implementation to keep
 /// honest.
-const COMMAND_SETS: &[(u8, &str, &[(u8, &str)])] = &[
+const COMMAND_SETS: &[NamedCommandSet] = &[
     (1, "VirtualMachine", &[
         (1, "Version"), (2, "ClassesBySignature"), (3, "AllClasses"), (4, "AllThreads"),
         (5, "TopLevelThreadGroups"), (6, "Dispose"), (7, "IDSizes"), (8, "Suspend"), (9, "Resume"),
