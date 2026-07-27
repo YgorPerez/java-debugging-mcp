@@ -20,7 +20,8 @@ these lazily, when decisions actually get resolved; that point arrived.
 | [0009](0009-thread-dump-suspends-only-when-asked.md) | `thread_dump` suspends only when asked, and verifies the resume |
 | [0010](0010-a-traced-stop-point-reports-its-own-measured-cost.md) | A traced stop point reports its own measured cost, and the timer wraps the capture only |
 | [0011](0011-line-tables-are-cached-per-dump-not-per-connection.md) | Line tables are cached per dump, not per connection — and the budget stays at 2000 ms |
-| [0012](0012-a-default-dump-selects-by-name-family-not-creation-order.md) | A default dump selects by name family, not by creation order |
+| [0012](0012-one-task-owns-stdout.md) | One task owns stdout |
+| [0013](0013-a-default-dump-selects-by-name-family-not-creation-order.md) | A default dump selects by name family, not by creation order |
 
 The root [`CONTEXT.md`](../../CONTEXT.md) now exists — the glossary reached the same point these did once
 TRACE-5, DUMP-1 and METH-1 forced `stop point`, `snapshot`, and the `suspended` / `blocked` distinction to be

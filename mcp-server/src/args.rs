@@ -381,7 +381,7 @@ pub struct ThreadDumpArgs {
     /// server creates its request pool last, so on a loaded `WildFly` the first 40 were measured to be
     /// entirely JVM internals, the service container and Undertow selectors, with **no application
     /// threads at all**, while 13 request workers sat 328 frames deep (TEST-8, #24; fixed in DUMP-3, #43,
-    /// see ADR-0012). Raising `limit` was never the answer to that — it buys more selectors before it
+    /// see ADR-0013). Raising `limit` was never the answer to that — it buys more selectors before it
     /// reaches the pool.
     ///
     /// `name_filter` (e.g. `'default task'`) is still the cheapest way to ask about one pool, and it

@@ -7554,7 +7554,7 @@ struct DumpCandidate {
 /// TEST-10's churning-pool test caught it immediately: across three runs of twelve dumps it could no
 /// longer observe a single `[zombie]` row, because every thread in the snapshot was already gone by the
 /// time the second pass reached it. Two packets per thread buys data that is about the JVM the caller
-/// asked about. See ADR-0012.
+/// asked about. See ADR-0013.
 ///
 /// **The pass gets at most half the remaining budget.** A dump that spent its entire suspension window
 /// deciding what to read and then read nothing would be a worse answer than the bug it fixes, and on a
