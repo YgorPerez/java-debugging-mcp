@@ -901,6 +901,9 @@ impl RequestHandler {
         let mut session = session_guard.lock().await;
 
         let before = session.connection.packets_sent();
+        // Same start as the packet counter, so `wire / cost` is a per-packet figure over exactly the
+        // packets it counts — including the suspend and resume, which are round trips like any other.
+        let wire_from = std::time::Instant::now();
         let all = session.connection.get_all_threads().await
             .map_err(|e| format!("Failed to get threads: {e}"))?;
         let total = all.len();
@@ -974,6 +977,7 @@ impl RequestHandler {
             }
         }
         let cost = session.connection.packets_sent().saturating_sub(before);
+        let wire = wire_from.elapsed();
         drop(session);
 
         let meta = DumpMeta {
@@ -981,6 +985,7 @@ impl RequestHandler {
             already_suspended: already,
             resume_note: &resume_note,
             cost,
+            wire,
             held,
             unread: dump.unread,
         };
@@ -6739,6 +6744,14 @@ struct DumpMeta<'a> {
     already_suspended: bool,
     resume_note: &'a str,
     cost: u32,
+    /// Wall time spent on JDWP traffic for this dump — every round trip in `cost`, from the thread list to
+    /// the resume. Divided by `cost` it gives this connection's **observed** per-packet price, which is the
+    /// one environment-specific term in `held ≈ packets × (our processing + RTT)` (TEST-8, ADR-0011).
+    ///
+    /// Reported because it is the number a caller would otherwise have to derive by hand, and the one that
+    /// makes a figure measured on loopback inapplicable to their instance. Present even when nothing was
+    /// suspended: the traffic happened either way.
+    wire: std::time::Duration,
     /// How long the VM was actually held. `None` when this dump did not suspend it — a default dump, or
     /// one reading a VM someone else already stopped, owns no freeze to report.
     held: Option<std::time::Duration>,
@@ -6988,8 +7001,8 @@ fn render_dump_header(
             out,
             "   ✂️  Stopped early — the {}ms suspension budget ran out with {} thread(s) still \
              unexamined, so this dump is INCOMPLETE. Raise max_suspend_ms for a deeper dump, or narrow \
-             with name_filter / limit / max_frames / package_filter, which costs nothing.",
-            a.max_suspend_ms, meta.unread
+             with name_filter / limit / max_frames / package_filter, which costs nothing.{}",
+            a.max_suspend_ms, meta.unread, truncation_estimate(rows.len(), meta)
         );
     }
     out.push_str(&dump_monitor_caveats(a, caps));
@@ -7003,6 +7016,49 @@ fn render_dump_header(
         );
     }
     out
+}
+
+/// The `, 0.42ms each` suffix on the cost line — this connection's observed per-packet price (TEST-8).
+///
+/// The whole point of reporting it: the ~0.2ms figure in this repo's notes is a **loopback** measurement,
+/// and the term that changes on a real instance is the round trip. A caller who can read what their own
+/// connection costs never has to wonder whether a documented number applies to them. Suppressed below two
+/// packets, where a mean is not a measurement.
+fn per_packet_note(meta: &DumpMeta<'_>) -> String {
+    if meta.cost < 2 {
+        return String::new();
+    }
+    let per = meta.wire.as_secs_f64() * 1000.0 / f64::from(meta.cost);
+    format!(", {per:.2}ms each (round trip + our own processing)")
+}
+
+/// What the threads a truncated dump never reached would have cost, extrapolated from the ones it did
+/// (TEST-8).
+///
+/// Not a guess: the rate comes from this dump's own held window and the threads it actually read, so it is
+/// the observed cost of this pool on this connection. It is the number that decides between the two ways
+/// out of a truncation — narrow the dump, or raise the budget — and deriving it by hand is exactly the
+/// arithmetic #24 was going to ask a human for.
+///
+/// Deliberately says "at the rate this dump ran", because a pool is not uniform: the estimate is honest
+/// about being one.
+fn truncation_estimate(rows_read: usize, meta: &DumpMeta<'_>) -> String {
+    let (Some(held), true) = (meta.held, rows_read > 0 && meta.unread > 0) else {
+        return String::new();
+    };
+    // Thread counts, not values near 2^53 — a pool that could lose precision here would not fit in memory.
+    #[allow(clippy::cast_precision_loss)]
+    let (read, skipped) = (rows_read as f64, meta.unread as f64);
+    let held_ms = held.as_secs_f64() * 1000.0;
+    let per_thread_ms = held_ms / read;
+    let remaining_ms = per_thread_ms * skipped;
+    let full_ms = per_thread_ms.mul_add(skipped, held_ms);
+    format!(
+        " At the rate this dump ran ({per_thread_ms:.1}ms per thread), the {} it skipped need \
+         ~{remaining_ms:.0}ms more — about {full_ms:.0}ms for the whole set, so either narrow it or raise \
+         max_suspend_ms past that.",
+        if meta.unread == 1 { "1 thread".to_string() } else { format!("{} threads", meta.unread) }
+    )
 }
 
 /// The ` name~"x" suspended-only frames~"y" monitors-only` suffix on a dump's title line — what the
@@ -7171,7 +7227,7 @@ fn render_thread_dump(
     if hidden > 0 {
         let _ = writeln!(out, "\n… +{hidden} more thread(s) (raise limit, or narrow with name_filter)");
     }
-    let _ = write!(out, "\nCost: {} JDWP packet(s).", meta.cost);
+    let _ = write!(out, "\nCost: {} JDWP packet(s){}.", meta.cost, per_packet_note(meta));
     out
 }
 
@@ -8014,6 +8070,9 @@ mod tests {
             already_suspended: false,
             resume_note: "",
             cost,
+            // A round number against the `cost` each test passes, so a per-packet figure in an assertion is
+            // arithmetic the reader can check rather than a magic constant.
+            wire: std::time::Duration::from_millis(u64::from(cost)),
             held: None,
             unread: 0,
         }
@@ -8205,6 +8264,57 @@ mod tests {
             !not_held.contains("Held the VM"),
             "a dump that suspended nothing must claim no freeze:\n{not_held}"
         );
+    }
+
+    // TEST-8: a dump reports what its OWN connection costs per packet, because the ~0.2ms in this repo's
+    // notes is a loopback figure and the round trip is the term that changes on a real instance. This is
+    // the reading #24 would otherwise have needed a human to take by hand.
+    #[test]
+    fn a_dump_reports_its_own_observed_per_packet_cost() {
+        // 500 packets over 1000ms is 2.00ms each — arithmetic the reader can check.
+        let mut meta = dump_meta(1, 500);
+        meta.wire = std::time::Duration::from_millis(1000);
+        let out = render_thread_dump(&[dump_row(0x8, "worker")], &dump_args(json!({})), None, &meta);
+        assert!(out.contains("Cost: 500 JDWP packet(s), 2.00ms each"), "per-packet price missing:\n{out}");
+        assert!(out.contains("round trip + our own processing"), "it must say what the figure covers:\n{out}");
+
+        // One packet is not a sample: a "mean" over it would be a number pretending to be a measurement.
+        let mut single = dump_meta(1, 1);
+        single.wire = std::time::Duration::from_millis(7);
+        let thin = render_thread_dump(&[dump_row(0x8, "worker")], &dump_args(json!({})), None, &single);
+        assert!(thin.contains("Cost: 1 JDWP packet(s)."), "expected a bare cost line:\n{thin}");
+        assert!(!thin.contains("each"), "a single packet must not carry a mean:\n{thin}");
+    }
+
+    // TEST-8: a truncated dump says what finishing would have cost, extrapolated from its own rate. That
+    // is the number that chooses between the two ways out — narrow it, or raise the budget — and #24 was
+    // otherwise going to ask a human to do this arithmetic against a live instance.
+    #[test]
+    fn a_truncated_dump_estimates_what_the_rest_would_have_cost() {
+        // 10 threads read in 1000ms is 100ms each; 20 skipped is ~2000ms more, ~3000ms for the whole set.
+        let mut meta = dump_meta(30, 900);
+        meta.held = Some(std::time::Duration::from_millis(1000));
+        meta.unread = 20;
+        let rows: Vec<DumpRow> = (0..10).map(|i| dump_row(0x8 + i, "worker")).collect();
+        let out = render_thread_dump(&rows, &dump_args(json!({"suspend": true})), None, &meta);
+        assert!(out.contains("100.0ms per thread"), "the observed rate must be stated:\n{out}");
+        assert!(out.contains("~2000ms more"), "and what the skipped threads need:\n{out}");
+        assert!(out.contains("about 3000ms for the whole set"), "and the total:\n{out}");
+        assert!(out.contains("20 threads"), "and how many were skipped:\n{out}");
+
+        // A dump that read nothing has no rate to extrapolate from, so it must not invent one.
+        let mut nothing = dump_meta(30, 4);
+        nothing.held = Some(std::time::Duration::from_millis(2001));
+        nothing.unread = 30;
+        let empty = render_thread_dump(&[], &dump_args(json!({"suspend": true})), None, &nothing);
+        assert!(empty.contains("Stopped early"), "the truncation is still announced:\n{empty}");
+        assert!(!empty.contains("per thread"), "with no rows there is no rate to report:\n{empty}");
+
+        // And a complete dump never speculates about threads it did not skip.
+        let mut done = dump_meta(1, 5);
+        done.held = Some(std::time::Duration::from_millis(12));
+        let complete = render_thread_dump(&[dump_row(0x8, "w")], &dump_args(json!({})), None, &done);
+        assert!(!complete.contains("per thread"), "nothing was skipped:\n{complete}");
     }
 
     // #17: an exhausted budget is announced, names what it skipped, and says the dump is INCOMPLETE.

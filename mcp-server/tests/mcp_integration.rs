@@ -1788,20 +1788,23 @@ fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
     });
     let rtt = std::time::Duration::from_millis(4);
 
-    let measure = |delay: std::time::Duration| -> (u64, u64) {
+    let measure = |delay: std::time::Duration| -> (u64, f64) {
         let relay = LatencyRelay::start(probe.port, delay).expect("start relay");
         let mut server = Server::start().expect("start server");
         // Attaching THROUGH the relay is the whole point: the debugger is told nothing about it.
         server.attach(relay.port);
         let dump = server.call("debug.thread_dump", workload.clone());
         let packets = dump_packet_cost(&dump).expect("no packet cost");
-        let held = dump_held_ms(&dump).expect("no held duration");
+        // The figure the dump reports about ITSELF, which is what a caller on a real instance reads
+        // instead of doing this arithmetic (TEST-8). Asserting on the reported number rather than a
+        // recomputed one is the point: it is the reading #24 wanted from the 8180.
+        let reported = dump_per_packet_ms(&dump).expect("the dump must report its own per-packet cost");
         server.panic_reset();
-        (packets, held)
+        (packets, reported)
     };
 
-    let (near_packets, near_held) = measure(std::time::Duration::ZERO);
-    let (far_packets, far_held) = measure(rtt);
+    let (near_packets, near_per_packet) = measure(std::time::Duration::ZERO);
+    let (far_packets, far_per_packet) = measure(rtt);
 
     // Same work either way — if the relay changed what was read, the comparison would be meaningless.
     assert!(
@@ -1809,19 +1812,17 @@ fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
         "the relay must not change the work done: {near_packets} packets direct vs {far_packets} through it"
     );
 
-    // Each packet crosses the wire once, so the added time is at least ~half a round trip per packet even
-    // allowing for coalescing, and at most a few round trips per packet allowing for sleep granularity.
-    //
-    // Milliseconds and packet counts, both far below f64's exact-integer range — the precision warning is
-    // about u64 values above 2^53, which neither of these can reach.
-    #[allow(clippy::cast_precision_loss)]
-    let per_packet_ms = far_held.saturating_sub(near_held) as f64 / far_packets as f64;
+    // Each packet crosses the wire once, so the round trip shows up in the per-packet figure the dump
+    // reports: at least ~half of it even allowing for coalescing, and at most a few times it allowing for
+    // sleep granularity. This is the linearity that makes packet count the lever.
     let rtt_ms = rtt.as_secs_f64() * 1000.0;
+    let added = far_per_packet - near_per_packet;
     assert!(
-        (rtt_ms * 0.4..rtt_ms * 3.0).contains(&per_packet_ms),
-        "a {rtt_ms}ms round trip should cost roughly that much per packet: {far_held}ms vs {near_held}ms \
-         over {far_packets} packets is {per_packet_ms:.2}ms/packet. If this is ~0, the relay is not \
-         delaying anything and every measurement taken through it is worthless."
+        (rtt_ms * 0.4..rtt_ms * 3.0).contains(&added),
+        "a {rtt_ms}ms round trip should show up as roughly that much per packet: the dump reported \
+         {near_per_packet:.2}ms/packet direct and {far_per_packet:.2}ms/packet through the relay, a \
+         difference of {added:.2}ms. If this is ~0, either the relay is not delaying anything or the dump \
+         is not measuring itself — and every measurement taken through it is worthless."
     );
 }
 
@@ -1840,10 +1841,10 @@ fn dump_packet_cost(dump: &str) -> Option<u64> {
     dump.get(at..)?.split_whitespace().next()?.parse().ok()
 }
 
-/// The `⏱  Held the VM suspended for Nms.` figure, when the dump suspended anything.
-fn dump_held_ms(dump: &str) -> Option<u64> {
-    let at = dump.find("suspended for ")? + "suspended for ".len();
-    dump.get(at..)?.split('m').next()?.trim().parse().ok()
+/// The `, 0.42ms each` figure the cost line reports — this connection's observed per-packet price.
+fn dump_per_packet_ms(dump: &str) -> Option<f64> {
+    let at = dump.find("packet(s), ")? + "packet(s), ".len();
+    dump.get(at..)?.split("ms each").next()?.trim().parse().ok()
 }
 
 /// A dump's header lines only — the whole thing is thousands of frames, which no assertion message wants.

@@ -258,8 +258,19 @@ with a slope of 1 packet per round trip. So **packet count is the lever**, which
 tables per call (ADR-0011) rather than being given a longer suspension budget. Assert packet counts, not
 durations: a packet count is deterministic and load-independent.
 
-What still needs the real instance is only its own parameters — thread count, stack depth, and RTT — which
-one dump at defaults and one `ping` supply.
+You do not have to take any of these figures on trust against your own instance, either: a dump reports
+what **it** cost there —
+
+```
+🧵 Thread dump — 40/306 thread(s)
+   ⏱  Held the VM suspended for 779ms.
+Cost: 258 JDWP packet(s), 3.08ms each (round trip + our own processing).
+```
+
+— and a dump the budget truncated says what finishing would have taken at the rate it was running, so the
+choice between narrowing it and raising `max_suspend_ms` is made against a number rather than a guess.
+Measured with the relay, the defaults hold the VM inside the 2000 ms budget up to roughly a **6 ms round
+trip**; past ~7 ms even a defaults dump truncates, which is the safety net working.
 
 For poking at the tools by hand against a realistic app, use the companion
 [java-example-for-k8s](../java-example-for-k8s) as a target:

@@ -56,6 +56,30 @@ stacks: at the defaults such a dump costs 258 packets and holds the VM ~65 ms. T
 never round trips — it is how much output a reader can use, and 306 threads × 60 frames is ~18,000 lines of
 stack. Cost stopped being the reason to keep them small; legibility remains one.
 
+**A dump reports its own per-packet cost, and extrapolates a truncation.** The remaining half of #24 was
+"read the real instance's thread count, stack depth and RTT, then do the arithmetic". A tool that can
+measure those should not be asking a human to. So the cost line now carries the observed per-packet price
+(`Cost: 258 JDWP packet(s), 3.13ms each`) — which is the RTT term, for the instance actually attached — and
+a truncated dump says what finishing would have cost at the rate it was running (`at 18.6ms per thread, the
+198 threads it skipped need ~3677ms more — about 5682ms for the whole set`). Both are extrapolations from
+measurements already in hand, not predictions: the packet counter and the held clock were already there.
+
+That reframes the defaults question. A default calibrated against one instance is a guess about every
+other; a default plus a reply that states what *this* instance costs needs no calibration. Swept with the
+relay, the **defaults hold the VM inside the 2000 ms budget up to roughly a 6 ms round trip** and truncate
+past ~7 ms:
+
+| nominal RTT | per-packet | held | outcome |
+| --- | --- | --- | --- |
+| 0 ms | 0.36 ms | 89 ms | complete |
+| 2 ms | 3.08 ms | 779 ms | complete |
+| 5 ms | 6.19 ms | 1,564 ms | complete |
+| 8 ms | 9.15 ms | 2,039 ms | truncated at 34/306 |
+| 12 ms | 13.19 ms | 2,017 ms | truncated at 20/306 |
+
+So 2000 ms is right for a LAN-local instance, and on a slower link even a defaults dump truncates — which
+is the safety net behaving correctly, and now says what it would have taken to finish.
+
 ## Rejected alternatives
 
 **Caching line tables on the connection**, which is where the reuse would be largest — a hot traced stop
@@ -73,6 +97,14 @@ made it look like the fix. But it answers a *different question* — locks, not 
 to callers who need stacks is telling them to ask for less because we were expensive. After the cache it is
 only ~1.3× cheaper in packets, which is the honest position: it is the right mode when you want the lock
 graph, not a workaround.
+
+**Predicting a dump's cost *before* running it**, and narrowing or refusing it automatically. Attractive on
+a shared instance, and rejected because the prediction is a range rather than a number: with line tables
+cached, cost depends on how many *distinct* methods the pool's stacks cover, which is unknowable in advance
+— anywhere between `threads × fixed + frames` and `threads × (fixed + frames)`, an order of magnitude apart
+on a uniform pool. Reporting what a dump did cost, and what finishing it would have cost, is measurement;
+reporting what one *would* cost is a guess wearing a bound's clothing. `max_suspend_ms` already caps the
+exposure, and it truncates loudly.
 
 **Caching the resolved line per frame** rather than the table. Two frames of the same method at different
 bytecode indexes resolve to different lines, so this produces a plausible dump in which every frame of a

@@ -238,9 +238,10 @@ deterministic and independent of machine load, a duration is neither. See
 `a_production_shaped_dump_costs_a_bounded_number_of_packets_per_thread`, whose ≤20-per-thread bound fails
 at ~70 if the cache is removed — verified by defeating it, not assumed.
 
-What still needs the real instance is only its **own parameters**: how many threads, how deep, and the RTT
-to it. One `debug.thread_dump` at defaults (~65 ms held, 258 packets) and one `ping` answer that, and
-`held ≈ packets × (our per-packet cost + RTT)` does the rest.
+What still needs the real instance is only its **own parameters**, and a dump now reports them: one
+`debug.thread_dump` at defaults gives the thread count in its header and the per-packet cost (hence the RTT)
+on its cost line, and a truncation states what finishing would have taken. No `ping`, no arithmetic. The
+figures below are what to compare that reading against.
 
 Note: the `mcp__jdwp__` tools in a running Claude Code session hold the OLD binary — a rebuild is only
 picked up after a Claude Code restart. That's why validation goes through tests/examples, not the live
@@ -838,6 +839,18 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   `one_cached_line_table_resolves_each_bytecode_index_to_its_own_line` covers the case no probe can
   construct on demand; `latency_added_to_the_wire_shows_up_as_held_time_per_packet` keeps the relay honest,
   since a relay that silently stopped delaying would make every measurement through it worthless.
+  **The other half of #24 was "read the real instance's parameters and do the arithmetic", so the dump does
+  it instead.** The cost line now carries its observed per-packet price — `Cost: 258 JDWP packet(s), 3.13ms
+  each` — which *is* the RTT term for whatever instance is attached, and a truncated dump reports what
+  finishing would have cost at the rate it ran: `at 18.6ms per thread, the 198 threads it skipped need
+  ~3677ms more — about 5682ms for the whole set`. Both extrapolate from the packet counter and the held
+  clock that were already there; neither predicts (see ADR-0011 for why a *pre*-dump prediction is a range,
+  not a bound). A default calibrated against one instance is a guess about every other one; a default plus a
+  reply stating what *this* instance costs needs no calibration.
+  Swept with the relay, the defaults hold the VM inside the 2000 ms budget **up to roughly a 6 ms round
+  trip**, and truncate past ~7 ms — 0.36 ms/packet and 89 ms held on loopback, 6.19 ms and 1,564 ms at 5 ms
+  RTT, truncating at 34 of 306 threads by 8 ms. So 2000 ms is right for a LAN-local instance, and on a
+  slower link even a defaults dump truncates, which is the net working and now says what finishing needed.
 - **`get_id_sizes` deleted (CLEAN-1, #27)** — the only function in the #19 coverage review with **zero hits
   anywhere**. Its one caller was `examples/test_vm_commands.rs`, a manual harness nothing runs, which is
   why it measured zero. Deleting it was the point: the reader assumes 8-byte ids outright, and an uncalled
@@ -857,7 +870,7 @@ above. Tracked as GitHub issues, not here:
 
 | issue | why it exists | what is actually left |
 | --- | --- | --- |
-| [#24](https://github.com/YgorPerez/java-debugging-mcp/issues/24) TEST-8 · P1 | Successor to the closed TEST-6/#13. Every shared-instance default (`max_suspend_ms` 2000, `limit` 40, `max_frames` 8) was calibrated on loopback against probes, and the monitors-only saving was measured at 3 frames deep. | **Mostly done without the 8180.** Thread count and stack depth are debuggee properties (`PoolShapeProbe`) and latency is now injectable (`LatencyRelay`); the defaults were tested against a production shape, the 13× packet waste that made them look wrong was fixed, and all three were reviewed and deliberately kept (ADR-0011). Left: read the real instance's own parameters — thread count, depth, RTT — from one defaults dump plus one ping, and confirm the freeze policy against them. |
+| [#24](https://github.com/YgorPerez/java-debugging-mcp/issues/24) TEST-8 · P1 | Successor to the closed TEST-6/#13. Every shared-instance default (`max_suspend_ms` 2000, `limit` 40, `max_frames` 8) was calibrated on loopback against probes, and the monitors-only saving was measured at 3 frames deep. | **Done except for taking the reading.** Thread count and stack depth are debuggee properties (`PoolShapeProbe`), latency is injectable (`LatencyRelay`), the 13× packet waste that made the defaults look wrong is fixed, all three defaults were reviewed and kept with measurements, and the dump now reports its own per-packet cost and what a truncation would have needed — so the calibration step is a normal dump rather than an exercise (ADR-0011). Left: run one against the real 8180 and confirm the freeze policy against what it says. |
 | [#28](https://github.com/YgorPerez/java-debugging-mcp/issues/28) LINT-2 · P2 | The #18 gate's maintenance debt: a pinned toolchain with no bump trigger, and per-crate `clippy.toml` that a third crate would not have. | Item 1 is a policy call about cadence and noise tolerance; item 2's best fix depends on the answer. |
 
 A **fifth** review found three more, shipped as issues
