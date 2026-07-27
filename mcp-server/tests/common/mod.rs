@@ -93,9 +93,34 @@ impl Jdk {
     /// #36). The sources are UTF-8, so saying so is correct on every JDK rather than a workaround for old
     /// ones.
     pub fn compile_probe(&self, name: &str, out_dir: &Path) -> Result<(), String> {
+        self.compile_probe_with_debug_info("-g", name, out_dir)
+    }
+
+    /// Compile a probe with **`-g:none`** — no `SourceFile`, no line table, no local-variable table.
+    ///
+    /// The one deliberate exception to the paragraph above, and it does not weaken it: `-g` stays the
+    /// default for every probe reached through [`compile_probe`](Self::compile_probe), and a caller has to
+    /// name this one to get anything else. Exactly one probe does (`StrippedProbe`, TEST-14 #39), because
+    /// until it existed `debug.source`'s `ABSENT_INFORMATION` branch was unreachable from this harness by
+    /// construction — every probe carried the very attribute the branch is about the absence of.
+    ///
+    /// A probe compiled this way can be attached to and listed, and that is all: with no line-number table
+    /// there is no line to hang a breakpoint on, and with no local-variable table there is nothing for an
+    /// expression to read. That is not a limitation to work around — it is the condition being reproduced,
+    /// and it is what a vendored jar on the shared 8180 actually looks like.
+    pub fn compile_probe_stripped(&self, name: &str, out_dir: &Path) -> Result<(), String> {
+        self.compile_probe_with_debug_info("-g:none", name, out_dir)
+    }
+
+    fn compile_probe_with_debug_info(
+        &self,
+        debug_info: &str,
+        name: &str,
+        out_dir: &Path,
+    ) -> Result<(), String> {
         let src = probe_source_path(name);
         let out = Command::new(&self.javac)
-            .arg("-g")
+            .arg(debug_info)
             .arg("-encoding")
             .arg("UTF-8")
             .arg("-d")
@@ -538,7 +563,6 @@ pub struct Probe {
 }
 
 impl Probe {
-    /// Compile and launch `examples/probes/<name>.java`, waiting until it is accepting JDWP.
     /// How long to wait for a freshly launched probe to accept a JDWP connection.
     ///
     /// 30s was enough for every warm run measured (a probe binds in about a second) but not for a
@@ -548,9 +572,31 @@ impl Probe {
     /// genuinely-broken case, which now at least explains itself.
     const PROBE_LISTEN_TIMEOUT: Duration = Duration::from_secs(90);
 
+    /// Compile and launch `examples/probes/<name>.java`, waiting until it is accepting JDWP.
     pub fn launch(jdk: &Jdk, name: &str) -> Result<Self, String> {
+        Self::launch_built_by(jdk, name, Jdk::compile_probe)
+    }
+
+    /// Like [`launch`](Self::launch) but compiled `-g:none` — see [`Jdk::compile_probe_stripped`] for
+    /// why exactly one probe wants that, and why it does not weaken the default for the rest.
+    pub fn launch_stripped(jdk: &Jdk, name: &str) -> Result<Self, String> {
+        Self::launch_built_by(jdk, name, Jdk::compile_probe_stripped)
+    }
+
+    /// Launch a probe whose class files `build` is responsible for putting in the run directory.
+    ///
+    /// The seam exists because two of `debug.source`'s branches are about what the **class file** says
+    /// rather than what the Java said, and no amount of different Java reaches them: one needs a different
+    /// `javac` flag (TEST-14, #39), the other an attribute `javac` has no option to emit at all (TEST-15,
+    /// #40). Everything downstream of the class files is identical — the port, the agent argument, the
+    /// reader threads, the listen wait — so it stays in one place rather than being copied per variant.
+    fn launch_built_by(
+        jdk: &Jdk,
+        name: &str,
+        build: impl FnOnce(&Jdk, &str, &Path) -> Result<(), String>,
+    ) -> Result<Self, String> {
         let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
-        jdk.compile_probe(name, dir.path())?;
+        build(jdk, name, dir.path())?;
 
         let port = free_port();
         // suspend=n so the probe runs immediately; the test attaches while it loops.
