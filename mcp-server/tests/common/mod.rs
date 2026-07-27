@@ -20,6 +20,12 @@
 
 #![allow(dead_code)] // each test file uses a subset of this harness
 
+/// Recording a JDWP session to a file and serving it back with no JVM (TEST-12, #37). A child module rather
+/// than more of this one: it is the only part of the harness a *reader* has to understand a file format for,
+/// and it reaches into the proxy seam here (`Relay`, `wire_framed`, `read_frames`) rather than reimplementing
+/// any of it — which was the whole condition #37 attached to building it.
+pub mod cassette;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
