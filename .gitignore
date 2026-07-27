@@ -33,3 +33,6 @@
 
 # Debug
 *.log
+
+# Agent worktrees (Claude Code) — nested checkouts, never part of the repo.
+.claude/worktrees/

@@ -90,6 +90,93 @@ cargo clippy --workspace --all-targets -- -W clippy::pedantic -W clippy::nursery
 plain `cargo clippy` looked clean throughout. Run `scripts/doctor.sh` as well for the custom rules; on
 Windows take the clippy findings from the command above and the rest from doctor.
 
+## Amendment (LINT-2, #28) — who bumps the pin, and one clippy config instead of one per crate
+
+The amendment above created two maintenance obligations and gave neither an owner. Both are settled here.
+
+### The pin is bumped by a monthly advisory job that files an issue
+
+`.github/workflows/toolchain-pin.yml` runs the same scan against whatever `stable` is now, once a month,
+with `--fail-on none`. When stable differs from the pin it opens one issue — titled with the version, so
+a re-run finds it rather than filing a second — carrying either the findings the newer clippy reports or
+the news that there are none. Labelled `ready-for-agent` when the bump is a clean one-liner and
+`needs-triage` when it is not.
+
+This preserves the exact property the pin was chosen for: a new lint arrives as a notification, never as
+a red build on code nobody touched. `schedule:` runs only on the default branch, produces no check run
+on a pull request, and is not called by `release.yml`, so nothing can come to depend on its conclusion.
+
+**The issue, rather than the run, is the notification** — because a scheduled job that goes red in a tab
+nobody opens is the same silent staleness the job exists to fix. GitHub's two alternatives both fail
+here: a run summary is only visible to someone who already went looking, and the failure email for a
+scheduled run goes to whoever last edited the cron, which is not a role anyone holds. The tracker is
+where this repo's work already lives.
+
+**Rejected alternatives:**
+
+- **Bump when it hurts** — raise the pin whenever someone wants a newer toolchain for something else.
+  Zero process, unbounded staleness. It is also, precisely, the status quo that produced this issue.
+- **A calendar reminder.** Cheap, but it lives outside the repo, so it survives exactly as long as one
+  person's calendar does and tells a new maintainer nothing.
+- **Dependabot / Renovate on the toolchain.** Most automatic, and it would open a PR whose CI answers
+  the question directly. Rejected as the most noise for the least added information: the question is
+  monthly, not per-commit, and a PR that fails the gate is the surprise breakage the pin exists to
+  avoid — arriving in the shape of a broken build, which is what trains people to weaken a gate.
+
+**Cost, stated plainly:** one more workflow, and up to a handful of issues a year. And a scheduled
+workflow is disabled by GitHub after 60 days without repository activity, so a repo quiet for two
+months has a staler pin than this job can fix.
+
+### One `clippy.toml`, at the workspace root, plus `CLIPPY_CONF_DIR`
+
+The two per-crate copies are gone. There is one `clippy.toml` at the root, and `scripts/doctor.sh`,
+`rust-doctor.yml` and `toolchain-pin.yml` each set `CLIPPY_CONF_DIR` to the repo root. Two files kept in
+sync by hand cannot drift apart when there is one file; a third crate needs nothing, because there is
+nothing per-crate to add.
+
+**The reason the copies existed was wrong, and the correction is the whole decision.** They carried a
+note saying a root `clippy.toml` "works for `cargo clippy` but NOT for rust-doctor's invocation",
+inferred from CI reporting the lint at `<crate>/clippy.toml:1` — "the path clippy looked in and did not
+find". The symptom was real and reproduces: with only a root config, rust-doctor 0.2.0 reports
+`multiple_crate_versions` once per member, while `cargo clippy --manifest-path <member>/Cargo.toml`
+against the same tree reports nothing.
+
+Shimming `cargo` under a doctor run shows why. **rust-doctor writes its own `<crate>/clippy.toml` into
+any member that has none** — seven `allow-*-in-tests` keys — runs clippy, then deletes it. Clippy stops
+at the first config it finds walking up from the crate, so that temporary file shadows the root one and
+the `syn` allowance never applies. `<crate>/clippy.toml:1` was not a path clippy failed to find. It was
+a file that existed for the length of the run, and the same mechanism would have shadowed any
+workspace-level solution built on the walk-up.
+
+`CLIPPY_CONF_DIR` points clippy at a directory instead of making it walk, so the injected file is never
+consulted. Verified on Linux against rust-doctor 0.2.0 and Rust 1.97.1: root config alone, two
+`multiple_crate_versions` warnings; root config plus `CLIPPY_CONF_DIR`, zero — and zero again with a
+third workspace member added that carries no config of its own and, without the fix, fails the gate on
+a duplication it did not cause.
+
+**Nothing here relaxes the gate.** The root file carries the same two keys the copies did, so the
+strictness is unchanged, and the `syn` allowance is still listed by name — the next duplicate is still a
+finding. Note that suppressing the injected file also drops rust-doctor's own test allowances
+(`allow-unwrap-in-tests` and five siblings); that costs nothing, because the copies already shadowed
+them, which is presumably why `allow-panic-in-tests` had to be written out by hand in the first place.
+
+**Rejected alternatives:**
+
+- **Keep the two copies and add a check that they match and that every member has one.** Detects drift
+  rather than preventing it, and still makes adding a crate a two-step operation someone has to be told
+  about. A check that a hand-maintained duplicate is still duplicated is work spent guarding a shape
+  there was no need to keep.
+- **Symlink each member's `clippy.toml` to the root file.** One real file, no env var. Rejected because
+  a Windows checkout without symlink support writes the link target as a text file, and clippy would
+  then parse a path as TOML — on a repo whose ADRs already record `windows-gnu` reading healthy while
+  measuring nothing.
+- **Suppress the rule in `rust-doctor.toml`.** rust-doctor's own config can ignore findings. That
+  silences the duplication everywhere instead of allowing one named crate, and is the "turn the gate
+  off rather than fix the finding" move #18 exists to prevent.
+
+**The failure mode if some future invocation forgets `CLIPPY_CONF_DIR`** is two `multiple_crate_versions`
+warnings and a failed gate — loud, and in the safe direction. It cannot go quietly green.
+
 ## Amendment (LINT-3, #42) — the score is not the gate, and `--findings` is how you find out
 
 The gate above only helps if you can see what it will fail on. Locally you could not. `scripts/doctor.sh`

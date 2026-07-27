@@ -28,6 +28,15 @@ jobs:
   health:
     name: Health scan
     runs-on: ubuntu-latest
+
+    # The workspace has ONE clippy.toml, at the root, and this is what makes rust-doctor read it
+    # (LINT-2, #28). rust-doctor writes a temporary `<crate>/clippy.toml` into any member that lacks
+    # one, and clippy stops at the first config it finds walking up — so without this the injected
+    # file shadows ours and the accepted `syn` duplication fails the gate. Pointing clippy at a
+    # directory skips the walk entirely. See clippy.toml for how that was established.
+    env:
+      CLIPPY_CONF_DIR: ${{ github.workspace }}
+
     steps:
       - uses: actions/checkout@v4
 
