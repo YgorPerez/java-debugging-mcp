@@ -22,12 +22,21 @@ TRACE-7 ([#26](https://github.com/YgorPerez/java-debugging-mcp/issues/26)) is th
 `debug.list_stop_points` reports, per **traced** stop point, what it has actually cost. Three figures,
 because none of them answers the question alone:
 
-1. **Mean capture per hit** — the observed version of the documented ~0.86 ms.
-2. **The rate it could sustain** (1/mean) — the observed counterpart of the documented ~720 hits/s ceiling.
-   This is *capture-only* by construction: idle time between hits cannot flatter it.
-3. **The rate hits are arriving at**, with the **share of the observation window spent capturing**. That
-   share is the answer to "is this hurting the instance?", which neither of the first two gives: a cheap
-   capture on a hot line and a costly capture on a quiet line are different problems with the same mean.
+1. **Mean capture per hit** — the observed version of the documented ~0.86 ms. Inverted, it is also the rate
+   past which hits queue, which is the form #22's ~720 hits/s is quoted in.
+2. **The rate hits are arriving at** — how hot the site actually is. Nothing else reveals it.
+3. **The share of the observation window spent capturing** — the product of the two, and the answer to "is
+   this hurting the instance?", which neither of the others gives: a cheap capture on a hot line and a
+   costly capture on a quiet line are different problems with the same mean.
+
+**Amended.** This originally reported a fourth figure between 1 and 2 — `sustains ~N/s`, i.e. 1/mean,
+presented as the observed counterpart of #22's documented ceiling. It has been **removed**. It was the one
+number on the line that was a re-expression of another rather than an independent measurement, and carrying
+two differently-scoped "rates" meant a reader had to work out which was which before either was useful.
+That ambiguity was inherited from #26's own acceptance criteria, which asked for "the observed hit rate" in
+one clause and for a rate that "reflects the capture window only, not idle time between hits" in another —
+two incompatible definitions, so the first implementation satisfied both by reporting both. Resolved in
+favour of the primitive: the mean is measured, the ceiling is arithmetic on it.
 
 Four properties fix how it is measured:
 
@@ -82,7 +91,7 @@ depth it explains.
 - The figures are per **arming**, not per session lifetime. A caller comparing two periods must read the
   listing at both, or clear and re-arm.
 - The documented ~720 hits/s now has an independent check. Against `CallerProbe`, whose traced line is
-  reached three times per ~150 ms iteration, the debugger measured **1.65 ms mean / ~608 hits/s / 20.5 hits/s
-  arriving / 3.4% of the window** — consistent with #22's ~1.39 ms and ~720/s on faster hardware. The
-  integration test asserts the reported arrival rate lands on the probe's *known* rate, so a plausible
-  constant cannot satisfy it.
+  reached three times per ~150 ms iteration, the debugger measured **1.65 ms mean / 20.5 hits/s arriving /
+  3.4% of the window** — and 1/1.65 ms is ~608 hits/s, consistent with #22's ~1.39 ms and ~720/s on faster
+  hardware. The integration test asserts the reported arrival rate lands on the probe's *known* rate, so a
+  plausible constant cannot satisfy it.

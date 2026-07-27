@@ -794,8 +794,8 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   descriptions; true figures, from one measurement, on one machine, against one endpoint. What a caller
   needs is what **their** stop point on **their** site costs, and the debugger was the only thing that could
   answer — it already counted hits for `trace_max_hits`, so it only lacked a clock. `list_stop_points` now
-  reports, per traced stop point: mean capture, the rate it could sustain before hits queue (1/mean, the
-  observed counterpart of the documented ceiling), the rate hits are **arriving** at, and the share of the
+  reports, per traced stop point: mean capture (invert it for the rate past which hits queue, which is the
+  form #22's figure is quoted in), the rate hits are **arriving** at, and the share of the
   window spent capturing — which is the number that answers "is this hurting the instance?", since a cheap
   capture on a hot line and a costly one on a quiet line are not the same problem. Same move #17 made for
   `thread_dump`'s held duration, and measured the same way: the timer wraps the **capture only**, never the
@@ -808,9 +808,15 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   Validated by `a_traced_stop_point_reports_its_observed_capture_cost` against `CallerProbe`, which reaches
   the traced line **three times per ~150 ms iteration** — so the arrival rate is known independently and the
   test asserts the reported numbers land on it (~20/s) rather than merely being present. It measured
-  **1.65 ms mean / ~608 hits/s / 20.5 hits/s arriving / 3.4% of the window** here, which corroborates #22's
-  ~1.39 ms and ~720/s on slower hardware — the first time those figures have been checked by anything but
-  the measurement that produced them.
+  **1.65 ms mean / 20.5 hits/s arriving / 3.4% of the window** here — 1/1.65 ms being ~608 hits/s, which
+  corroborates #22's ~1.39 ms and ~720/s on slower hardware, the first time those figures have been checked
+  by anything but the measurement that produced them.
+  A fourth figure, `sustains ~N/s`, was reported at first and then **cut**: being exactly 1/mean it was the
+  only number on the line that restated another instead of measuring something, and two differently-scoped
+  "rates" made a reader establish which was which before either helped. #26's own acceptance criteria asked
+  for both senses — "the observed hit rate" in one clause, a rate reflecting "the capture window only, not
+  idle time between hits" in another — so the first cut reported both rather than choosing. ADR-0010 records
+  the resolution: the mean is measured, the ceiling is arithmetic on it.
 - **The stdio front door, covered — and it was hiding a hang (TEST-9, #25)** — `main.rs` sat at 65% region
   because every test in the suite constructed a **valid** request, so the parsing between a buggy client and
   the debugger was the one thing nothing drove. `mcp-server/tests/stdio_protocol.rs` drives it with input a

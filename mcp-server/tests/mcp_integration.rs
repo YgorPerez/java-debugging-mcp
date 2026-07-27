@@ -1068,8 +1068,6 @@ fn a_traced_stop_point_reports_its_observed_capture_cost() {
     );
 
     let mean_ms = number_before(&hot, "ms mean").unwrap_or_else(|| panic!("no mean capture in: {hot}"));
-    let sustainable =
-        number_before(&hot, " hit(s)/s").unwrap_or_else(|| panic!("no sustainable rate in: {hot}"));
     let rate = number_before(&hot, "/s (").unwrap_or_else(|| panic!("no arrival rate in: {hot}"));
     let share = number_before(&hot, "% of the window").unwrap_or_else(|| panic!("no share in: {hot}"));
 
@@ -1080,11 +1078,12 @@ fn a_traced_stop_point_reports_its_observed_capture_cost() {
         (0.001..100.0).contains(&mean_ms),
         "implausible mean capture of {mean_ms}ms — is the capture window really what is timed? {hot}"
     );
-    // The ceiling is 1/mean by definition, so it must agree with the mean it was derived from.
-    let expected_ceiling = 1000.0 / mean_ms;
+    // A `sustains ~N/s` figure used to sit here and was removed as a re-expression of the mean, so the
+    // line must no longer carry one: two differently-scoped "rates" is what made #26's own acceptance
+    // criteria contradict each other.
     assert!(
-        (sustainable - expected_ceiling).abs() < expected_ceiling * 0.02 + 1.0,
-        "the sustainable rate ({sustainable}/s) disagrees with the {mean_ms}ms mean it comes from: {hot}"
+        !hot.contains("sustains"),
+        "the derived ceiling was removed; the mean is the primitive and 1/mean recovers it: {hot}"
     );
     // Three hits per ~150ms iteration ⇒ ~20/s. Wide bounds, because the JVM's own scheduling and the
     // capture cost itself both stretch the iteration — but not wide enough to accept "one per loop"

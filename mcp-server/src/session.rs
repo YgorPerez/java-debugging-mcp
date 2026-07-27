@@ -204,14 +204,12 @@ impl TraceCost {
         (self.captures > 0).then(|| self.total / u32::try_from(self.captures).unwrap_or(u32::MAX))
     }
 
-    /// Hits per second **this stop point could sustain** at its measured cost — the observed counterpart
-    /// of #22's documented ~720/s ceiling. Capture is serialised, so this is the rate past which hits
-    /// queue, and it reflects the capture window only: idle time between hits cannot flatter it.
-    #[allow(clippy::cast_precision_loss)] // a capture count that overflows f64's mantissa is not reachable
-    pub fn sustainable_rate(&self) -> Option<f64> {
-        let mean = self.mean_capture()?.as_secs_f64();
-        (mean > 0.0).then(|| 1.0 / mean)
-    }
+    // There was a `sustainable_rate` here — 1/mean, the rate past which hits queue, reported as
+    // `sustains ~608 hit(s)/s`. Removed deliberately: it is a re-expression of `mean_capture`, so it added
+    // a figure to the line without adding information, and every reader had to be told which of two
+    // "rates" they were looking at. The mean is the primitive; anyone comparing against #22's documented
+    // ~720 hits/s can invert it. `observed_rate` below is the one that cannot be derived from anything
+    // else on the line, and `capture_share` is what it is for.
 
     /// Hits per second actually **arriving**, over the window from the first capture to the last.
     ///
@@ -639,7 +637,6 @@ mod tests {
         let cost = TraceCost::default();
         assert_eq!(cost.captures, 0);
         assert!(cost.mean_capture().is_none(), "no captures means no mean, not a zero mean");
-        assert!(cost.sustainable_rate().is_none());
         assert!(cost.observed_rate().is_none());
         assert!(cost.capture_share().is_none());
     }
@@ -653,16 +650,13 @@ mod tests {
         let t0 = std::time::Instant::now();
         cost.record(t0, std::time::Duration::from_micros(800));
         assert_eq!(cost.mean_capture(), Some(std::time::Duration::from_micros(800)));
-        // 0.8ms per capture ⇒ ~1250/s sustainable, the observed counterpart of #22's documented ceiling.
-        let sustainable = cost.sustainable_rate().expect("a cost implies a ceiling");
-        assert!((sustainable - 1250.0).abs() < 1.0, "expected ~1250/s, got {sustainable}");
         assert!(cost.observed_rate().is_none(), "one capture spans no interval");
         assert!(cost.capture_share().is_none());
     }
 
-    // The two rates answer different questions and must not be conflated: 10 captures 100ms apart is an
-    // arrival rate of 10/s, while each costing 1ms means the stop point could sustain ~1000/s — so it is
-    // spending 1% of the window capturing. That product is the "is this hurting the instance?" number.
+    // Cost and arrival rate answer different questions and must not be conflated: 10 captures 100ms apart
+    // is an arrival rate of 10/s, and each costing 1ms means 1% of the window went on capturing. That
+    // product is the "is this hurting the instance?" number, and neither figure gives it alone.
     #[test]
     fn arrival_rate_and_capture_share_are_measured_over_the_observed_window() {
         let mut cost = TraceCost::default();
@@ -676,9 +670,6 @@ mod tests {
         // 10 captures span NINE 100ms intervals — 900ms, not a full second.
         let rate = cost.observed_rate().expect("ten captures span nine intervals");
         assert!((rate - 10.0).abs() < 0.01, "expected 10/s, got {rate}");
-
-        let sustainable = cost.sustainable_rate().expect("a cost implies a ceiling");
-        assert!((sustainable - 1000.0).abs() < 1.0, "expected ~1000/s, got {sustainable}");
 
         let share = cost.capture_share().expect("both figures are present");
         assert!((share - 0.01).abs() < 0.0005, "expected ~1% of the window, got {share}");

@@ -77,7 +77,7 @@ fn stop_point_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.list_stop_points".to_string(),
-            description: "List all active breakpoints, including deferred ones, exception breakpoints, and field watchpoints. Each traced (non-suspending) stop point also reports what it has ACTUALLY cost: the mean capture per hit, the rate it could sustain before hits queue, and the rate hits are arriving at with the share of the window spent capturing — measured on your JVM rather than taken from the ~720 hits/s figure in the other tools' descriptions. Call it after arming a trace on a hot site to find out whether it is hurting the instance. A traced stop point that has captured nothing says so explicitly rather than reporting zero.".to_string(),
+            description: "List all active breakpoints, including deferred ones, exception breakpoints, and field watchpoints. Each traced (non-suspending) stop point also reports what it has ACTUALLY cost: the mean capture per hit, the rate hits are arriving at, and the share of the window spent capturing — measured on your JVM rather than taken from the ~720 hits/s figure in the other tools' descriptions, which is 1/mean and so recoverable from the mean reported here. Call it after arming a trace on a hot site to find out whether it is hurting the instance. A traced stop point that has captured nothing says so explicitly rather than reporting zero.".to_string(),
             input_schema: empty(),
         },
         Tool {

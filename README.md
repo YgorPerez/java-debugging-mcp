@@ -46,8 +46,8 @@ natural language.
   *(loopback figures against a trivial endpoint; the ceiling is the durable part, not the percentage)*
   You do not have to take those figures on trust: once a traced stop point has fired,
   `debug.list_stop_points` reports what **it** is costing on **your** JVM — the mean capture per hit, the
-  rate it could sustain before hits queue, and the rate hits are arriving at with the share of the window
-  spent capturing. A traced stop point that has captured nothing says so, rather than reporting zero
+  rate hits are arriving at, and the share of the window spent capturing (invert the mean for the rate past
+  which hits queue). A traced stop point that has captured nothing says so, rather than reporting zero
 - **Thread Management**: tools default to the last thread that hit a breakpoint
 - **Thread dumps with lock ownership**: `debug.thread_dump` answers "it's wedged — which threads are
   blocked on what?" in one call: every thread's stack, the monitors it holds, the one it is blocked
@@ -113,7 +113,7 @@ Adjust the path to match where you cloned this repository. The `--scope project`
 | `debug.set_line_stop` | Set a breakpoint by class+line, or by method name; optional `hit_count`, thread filter, `condition` (with `&&`/`||`), or `trace:true` (non-suspending logpoint, with `trace_max_hits` and `trace_frames`) |
 | `debug.set_exception_stop` | Break when an exception (of a class + its subclasses, or all) is thrown; `caught`/`uncaught` selectable, an optional `thread_id` filter, or `trace:true` (with `trace_max_hits` / `trace_frames`) to collect throws without suspending |
 | `debug.get_traces` | Read snapshots captured by any `trace:true` stop point — line, exception or watchpoint, each with the caller chain above it (bounded ring buffer; narrow with `bp_id` / `class_filter` / `since`, optional `clear`) |
-| `debug.list_stop_points` | List active stop points (line, deferred, exception, watchpoint, method-exit) with trace budgets and thread filters — plus, for each traced one, its **measured** capture cost: mean per hit, the rate it can sustain, and the rate hits are arriving at |
+| `debug.list_stop_points` | List active stop points (line, deferred, exception, watchpoint, method-exit) with trace budgets and thread filters — plus, for each traced one, its **measured** capture cost: mean per hit, the rate hits are arriving at, and the share of the window spent capturing |
 | `debug.clear_stop_point` | Remove a stop point (line, deferred, exception, watchpoint, or method-exit) |
 | `debug.toggle_stop_point` | Silence or re-arm any stop point (`bp_…` / `exc_…` / `watch_…` / `mexit_…`) without losing its `condition`/`trace_expr`; the id stays the same across the round trip |
 | `debug.continue` | Resume execution |

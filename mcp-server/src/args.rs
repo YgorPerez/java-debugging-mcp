@@ -103,9 +103,9 @@ pub struct SetBreakpointArgs {
     /// sustained throttling**: it is the single setting that removes the protection, so choose it
     /// knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures
     /// move with hardware, the existence of a hits/s ceiling does not. **You do not have to trust those
-    /// figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture and the
-    /// ceiling measured on the JVM you are actually attached to, plus the rate hits are arriving at
-    /// (TRACE-7).
+    /// figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture measured
+    /// on the JVM you are actually attached to — invert it for this ceiling — plus the rate hits are
+    /// arriving at and the share of the window spent capturing (TRACE-7).
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
     /// Only with `trace:true` — how many CALLER frames to record above the hit, so a snapshot says
@@ -402,9 +402,9 @@ pub struct SetExceptionBreakpointArgs {
     /// sustained throttling**: it is the single setting that removes the protection, so choose it
     /// knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures
     /// move with hardware, the existence of a hits/s ceiling does not. **You do not have to trust those
-    /// figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture and the
-    /// ceiling measured on the JVM you are actually attached to, plus the rate hits are arriving at
-    /// (TRACE-7).
+    /// figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture measured
+    /// on the JVM you are actually attached to — invert it for this ceiling — plus the rate hits are
+    /// arriving at and the share of the window spent capturing (TRACE-7).
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
     /// Only with `trace:true` — how many CALLER frames to record above the throw, so a swallowed
@@ -465,9 +465,9 @@ pub struct SetWatchpointArgs {
     /// sustained throttling**: it is the single setting that removes the protection, so choose it
     /// knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures
     /// move with hardware, the existence of a hits/s ceiling does not. **You do not have to trust those
-    /// figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture and the
-    /// ceiling measured on the JVM you are actually attached to, plus the rate hits are arriving at
-    /// (TRACE-7).
+    /// figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture measured
+    /// on the JVM you are actually attached to — invert it for this ceiling — plus the rate hits are
+    /// arriving at and the share of the window spent capturing (TRACE-7).
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
     /// Only with `trace:true` — how many CALLER frames to record above the mutating frame, so "who
@@ -525,9 +525,9 @@ pub struct SetMethodBreakpointArgs {
     /// sustained throttling**: it is the single setting that removes the protection, so choose it
     /// knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures
     /// move with hardware, the existence of a hits/s ceiling does not. **You do not have to trust those
-    /// figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture and the
-    /// ceiling measured on the JVM you are actually attached to, plus the rate hits are arriving at
-    /// (TRACE-7).
+    /// figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture measured
+    /// on the JVM you are actually attached to — invert it for this ceiling — plus the rate hits are
+    /// arriving at and the share of the window spent capturing (TRACE-7).
     #[serde(default)]
     pub trace_max_hits: Option<u32>,
     /// Only with `trace:true` — how many caller frames to record above the return, as

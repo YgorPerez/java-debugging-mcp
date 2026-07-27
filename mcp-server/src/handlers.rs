@@ -2185,13 +2185,16 @@ fn trace_budget_tag(trace: bool, budget: Option<u32>) -> String {
 
 /// What a traced stop point has cost so far, on its own line under the stop point (TRACE-7).
 ///
-/// Three numbers, because no one of them answers the question on its own:
-///  - **mean capture** — the observed version of #22's documented ~0.86 ms, on this machine and this site;
-///  - **sustains ~N/s** — the rate past which hits queue, since capture is serialised. The observed
-///    counterpart of the documented ~720/s ceiling, and it reflects the capture window only;
-///  - **arriving at N/s**, with the share of the window spent capturing — what the site is *actually*
-///    doing. A cheap capture on a hot line and a costly one on a quiet line both matter, and only the
-///    product tells them apart.
+/// Three numbers, and each one is something the other two cannot give:
+///  - **mean capture** — what one hit costs here: the observed version of #22's documented ~0.86 ms. Invert
+///    it for the rate past which hits queue, which is the form #22's ~720 hits/s is quoted in;
+///  - **arriving at N/s** — how hot the site actually is. Nothing else on the line reveals it;
+///  - **the share of the window spent capturing** — their product, and the answer to "is this hurting the
+///    instance?", which neither gives alone: a cheap capture on a hot line and a costly one on a quiet line
+///    can cost the same.
+///
+/// A `sustains ~N/s` figure was reported here too and was **removed**: being exactly 1/mean, it added a
+/// number without adding information, and made a reader work out which of two "rates" they were reading.
 ///
 /// A traced stop point with **no** hits says so explicitly. "0.00 ms" would read as free, and unmeasured
 /// is not free — the same silence-is-not-a-finding rule the rest of this tool follows.
@@ -2215,15 +2218,13 @@ fn render_trace_cost(output: &mut String, trace: bool, cost: &crate::session::Tr
         cost.captures,
         mean.as_secs_f64() * 1000.0
     );
-    if let Some(ceiling) = cost.sustainable_rate() {
-        let _ = write!(line, " → sustains ~{ceiling:.0} hit(s)/s before hits queue");
-    }
     match (cost.observed_rate(), cost.capture_share()) {
         (Some(rate), Some(share)) => {
-            let _ = write!(line, "; arriving at {:.1}/s ({:.1}% of the window spent capturing)", rate, share * 100.0);
+            let _ =
+                write!(line, ", arriving at {:.1}/s ({:.1}% of the window spent capturing)", rate, share * 100.0);
         }
         // One capture establishes a cost but no interval, so there is no arrival rate to report yet.
-        _ => line.push_str("; one capture so far, so no arrival rate yet"),
+        _ => line.push_str(", one capture so far, so no arrival rate yet"),
     }
     let _ = writeln!(output, "{line}");
 }
@@ -8007,7 +8008,7 @@ mod tests {
         let mut out = String::new();
         render_trace_cost(&mut out, true, &cost);
         for want in
-            ["10 capture(s)", "1.00ms mean", "sustains ~1000", "arriving at 10.0/s", "(1.0% of the window"]
+            ["10 capture(s)", "1.00ms mean", "arriving at 10.0/s", "(1.0% of the window"]
         {
             assert!(out.contains(want), "missing {want:?} in: {out}");
         }
