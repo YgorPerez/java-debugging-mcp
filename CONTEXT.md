@@ -205,3 +205,15 @@ Each is named for the shape it reproduces, not the feature that uses it.
 **Tick**:
 A line a probe prints while running. The only evidence that a stop point left nothing suspended, because
 the debugger reports success either way.
+
+**Cassette**:
+A recorded JDWP session — every request and the reply it got — kept in a file and served back to the
+debugger with no JVM behind the port. A snapshot of one debuggee on one JVM, so it complements a probe
+rather than replacing one: it cannot notice the debuggee changing, and it can be *edited* into a shape no
+JVM here could be asked to produce. See ADR-0014.
+_Avoid_: mock, stub, fixture (the first two suggest something written to satisfy the test; a cassette is a
+transcript of a real session, and its authority comes from that)
+
+**Miss**:
+A request a cassette has no recorded answer for. Never answered — the connection is dropped and the command
+is named — because a plausible-looking error reply would let a replay test pass while proving nothing.

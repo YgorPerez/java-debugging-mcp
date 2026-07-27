@@ -9,6 +9,13 @@
 //     cargo test --test mcp_integration -- --ignored --nocapture   # also shows SKIP reasons
 //
 // Without a JDK each test prints SKIP and passes, so a JDK-less CI stays green rather than red.
+//
+// **Three tests here are NOT `#[ignore]`d**, and they are the point of TEST-12 (#37): they drive the same
+// server against a recorded JDWP session instead of a JVM (`common/cassette.rs`, ADR-0014). They need no
+// JDK and no Java, so they run in the default `cargo test` — a test that needs no JDK must not hide behind
+// the flag that exists for tests that do (TEST-9, #25). Note the corollary:
+// `scripts/integration-test.sh` passes `--ignored`, which runs ONLY ignored tests, so it does not run
+// them. Both commands are needed to see everything in this file.
 
 mod common;
 

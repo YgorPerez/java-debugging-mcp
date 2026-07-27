@@ -13,10 +13,14 @@
 //
 // They are `#[ignore]`d because they spawn JVMs and take seconds, not milliseconds.
 //
-// One exception, and it is deliberate: `stdio_protocol.rs` uses the [`Server`] half alone to drive the
-// process's JSON-RPC front door with malformed input. No `Probe`, no JVM, no `#[ignore]` — those tests
-// run in the default suite, because a test that needs no JDK must not be hidden behind the flag that
-// exists for tests that do (TEST-9, #25).
+// Two exceptions, both deliberate, both following the same rule: a test that needs no JDK must not be
+// hidden behind the flag that exists for tests that do (TEST-9, #25).
+//
+//  * `stdio_protocol.rs` uses the [`Server`] half alone to drive the process's JSON-RPC front door with
+//    malformed input. No `Probe`, no JVM, no `#[ignore]`.
+//  * The cassette tests in `mcp_integration.rs` drive the whole server against a **recorded** JDWP session
+//    served out of a file — see [`cassette`] and ADR-0014. Same server, same handlers, same assertions as
+//    the probe tests they were recorded from; no JVM anywhere.
 
 #![allow(dead_code)] // each test file uses a subset of this harness
 
