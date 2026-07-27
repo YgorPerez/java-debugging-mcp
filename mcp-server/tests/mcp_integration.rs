@@ -4273,6 +4273,11 @@ fn dump_row_count(dump: &str) -> u64 {
 /// repo has previously reported coverage it had not looked at. Fixing either should flip this test.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
+// Both outcomes a vanishing thread can produce — a `[zombie]` row and a dropped row — have to be asserted
+// against ONE churn window, because which one you get depends on whether the id was collected yet. Split
+// into two tests it would be two probes and two windows, and neither half could then claim the other's
+// outcome was even possible. The length is the single setup, not repetition.
+#[allow(clippy::too_many_lines)]
 fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
     let Some(jdk) = jdk_or_skip("a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it")
     else {
@@ -4752,6 +4757,10 @@ fn evaluated(reply: &str) -> &str {
 /// fractions, so the expected string does not depend on anyone's rounding.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
+// Six primitives read three ways each — local, field, array element — is eighteen assertions that only
+// mean something side by side: the point is that the SAME value renders identically by all three routes,
+// and that comparison cannot be made across separate test functions. One line per assertion is the floor.
+#[allow(clippy::too_many_lines)]
 fn every_primitive_and_its_array_renders_the_same_as_local_field_and_element() {
     let Some(jdk) = jdk_or_skip("every_primitive_and_its_array_renders_the_same_as_local_field_and_element")
     else {

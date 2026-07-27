@@ -407,7 +407,7 @@ pub struct ThreadDumpArgs {
     /// frame read adds ~3 more (method and line; class names are cached across the dump).
     ///
     /// That saving was predicted to widen against `WildFly`-depth stacks. **It does not** (TEST-8, #24). On
-    /// a real WildFly loaded to 267 threads it cut the full dump from 467ms to 198ms and the default from
+    /// a real `WildFly` loaded to 267 threads it cut the full dump from 467ms to 198ms and the default from
     /// 144ms to 35ms — 1.6–2.4x, *narrower* than the 3x on probes. On the **same VM idle it was slower**:
     /// 114ms against the full dump's 87ms, despite ~40% fewer packets. Monitor reads are per-thread JVM
     /// work, not just round trips, so with no deep stacks to skip there is nothing to save and the monitor
