@@ -156,10 +156,14 @@ jobs:
           mv "target/${{ matrix.target }}/release/jdwp-mcp${{ matrix.ext }}" "$asset"
           echo "ASSET=$asset" >> "$GITHUB_ENV"
 
+      # The artifact is named after the FILE it carries, not after the matrix slice, so that one glob —
+      # `jdwp-mcp-*` — selects this job's output at every stage: the download below, the checksum, the
+      # upload. Naming it `${{ matrix.name }}` (`linux-x86_64`) meant the download had no way to say
+      # "mine" without listing the slices, which is how REL-2 (#41) happened.
       - name: Upload the binary
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
+          name: ${{ env.ASSET }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
@@ -170,11 +174,38 @@ jobs:
     permissions:
       contents: write # create the release and upload its assets; nothing else is needed
     steps:
+      # `pattern` is the whole point: without it download-artifact takes EVERY artifact the run produced,
+      # and this run produces more than binaries — gate-lint calls rust-doctor.yml, which uploads its
+      # SARIF. That is not hypothetical. v0.2.1 shipped `rust-doctor.sarif` as a sixth downloadable asset
+      # (REL-2, #41), because merge-multiple flattened it into dist/ and `dist/*` uploaded it. Gating on a
+      # reusable workflow silently adopts that workflow's artifacts; naming what we want instead of taking
+      # what is there is what keeps the next gate's uploads out too.
       - name: Collect every platform's binary
         uses: actions/download-artifact@v4
         with:
           path: dist
-          merge-multiple: true # flatten the per-matrix directories into one upload set
+          pattern: jdwp-mcp-* # the build matrix names its artifacts after the file they carry
+          merge-multiple: true # flatten the per-artifact directories into one upload set
+
+      # A pattern only holds while the naming contract behind it does, so check the contract rather than
+      # trust it. This runs BEFORE SHA256SUMS exists, so the rule is exactly the one the next two steps
+      # use: everything in dist/ is a platform binary. A gate whose artifact happens to start `jdwp-mcp-`
+      # would slip past the pattern; it does not slip past this.
+      #
+      # The empty case needs no guard of its own: if the pattern matched nothing, `sha256sum jdwp-mcp-*`
+      # below fails on the unexpanded glob and the release never gets created.
+      - name: Fail on anything in dist/ that is not a platform binary
+        shell: bash
+        working-directory: dist
+        run: |
+          unexpected=$(ls -A | grep -v '^jdwp-mcp-' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::dist/ holds files this release does not publish. Nothing has been published."
+            echo "An artifact was renamed, or a gate started uploading something matching jdwp-mcp-*:"
+            echo "$unexpected"
+            exit 1
+          fi
+          ls -l
 
       # One SHA256SUMS over all of them rather than a .sha256 beside each: that is the form
       # `sha256sum -c SHA256SUMS` consumes directly. The glob is explicit so the file cannot list itself.
@@ -185,6 +216,10 @@ jobs:
           sha256sum jdwp-mcp-* > SHA256SUMS
           cat SHA256SUMS
 
+      # The upload globs `jdwp-mcp-*` plus SHA256SUMS by name — the same discipline the checksum step
+      # above uses — rather than `dist/*`. The two cannot disagree that way: what gets listed is what gets
+      # published. `dist/*` is how a file nobody checksummed ended up on the downloads page (#41).
+      #
       # --verify-tag matters more than it looks: without it `gh release create` happily CREATES a tag
       # that does not exist, so a typo would publish a release pointing at the default branch instead of
       # failing. --prerelease for anything with a hyphen in the version keeps an rc out of
@@ -202,4 +237,4 @@ jobs:
           case "$GITHUB_REF_NAME" in
             *-*) flags+=(--prerelease) ;;
           esac
-          gh release create "$GITHUB_REF_NAME" "${flags[@]}" dist/*
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}" dist/jdwp-mcp-* dist/SHA256SUMS
