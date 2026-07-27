@@ -3297,23 +3297,68 @@ fn explain_no_match(names: &[(String, bool)], filter: Option<&str>) -> String {
 /// it out itself: JDWP knows only what is *loaded*, so it genuinely cannot separate a wrong name from
 /// a class the VM has not touched yet. Picking one would be wrong about half the time, so the reply
 /// says both are possible and names the tool that can actually tell them apart.
+///
+/// It asks for each of `descriptor_candidates`' spellings in turn rather than building one descriptor,
+/// because a hidden class is spelled differently on JDK 11 and on 15+ (DISC-4, #50) — a normal class
+/// still costs exactly one lookup.
 async fn resolve_loaded_class(
     conn: &mut jdwp_client::JdwpConnection,
     class_name: &str,
 ) -> Result<u64, String> {
-    let signature = format!("L{};", class_name.replace('.', "/"));
-    let found = conn
-        .classes_by_signature(&signature)
-        .await
-        .map_err(|e| format!("Failed to resolve {class_name}: {e}"))?;
-    found.first().map(|c| c.type_id).ok_or_else(|| {
-        let simple = class_name.rsplit('.').next().unwrap_or(class_name);
-        format!(
-            "{class_name} is not loaded in the debuggee. Either the name is wrong, or the JVM has \
-             not loaded it yet — classes load on first use, so an untouched code path has none of \
-             its classes present. To tell those apart: debug.list_classes with filter \"*.{simple}\"."
-        )
-    })
+    for signature in descriptor_candidates(class_name) {
+        let found = conn
+            .classes_by_signature(&signature)
+            .await
+            .map_err(|e| format!("Failed to resolve {class_name}: {e}"))?;
+        if let Some(class) = found.first() {
+            return Ok(class.type_id);
+        }
+    }
+    let simple = class_name.rsplit('.').next().unwrap_or(class_name);
+    Err(format!(
+        "{class_name} is not loaded in the debuggee. Either the name is wrong, or the JVM has not \
+         loaded it yet — classes load on first use, so an untouched code path has none of its classes \
+         present. To tell those apart: debug.list_classes with filter \"*.{simple}\"."
+    ))
+}
+
+/// Every JNI descriptor a class name this tool printed could be spelled as on the wire, best-known
+/// first — the inverse of `decode_internal_name`, and the reason it hands back a list rather than one.
+///
+/// DISC-4 (#50), the step SIG-1 (#46) left reachable. Once a hidden class is rendered under the name the
+/// JVM answers to, a caller reads `SyntheticProbe$$Lambda/0x00007cd1e0001220` off a stack and naturally
+/// asks the next question about it — and `resolve_loaded_class` built a single ordinary descriptor,
+/// `L{name.replace('.', "/")};`, so the tool refused the very name it had just handed out and explained
+/// the refusal as "not loaded" about a class it was looking straight at.
+///
+/// **The two wire shapes `decode_internal_name` documents are the two candidates here**, and which one
+/// is right is a property of the JVM on the other end, not of the name:
+///
+/// * **JDK 11** (VM-anonymous classes): `LSyntheticProbe$$Lambda$3/574182878;` — a **slash**, which the
+///   ordinary rewrite already produces. This half was never broken, and it is why the plain descriptor
+///   stays first.
+/// * **JDK 15+** (hidden classes): `LSyntheticProbe$$Lambda.0x00007cd1e0001220;` — a **dot**, because a
+///   `/` there would not be a legal descriptor (JVMS §4.2.2). This is the one that missed.
+///
+/// **We do not decide which JVM we are talking to; we offer both spellings and let the debuggee answer.**
+/// The tempting shortcut is to read the suffix — hex means 15+, decimal means 11 — and that is precisely
+/// the JDK-locked reasoning #36's matrix already caught once, in #46's first pinned test. A lookup that
+/// misses is a cheap packet on a path that was about to return an error anyway, and the debuggee is the
+/// only authority that cannot be wrong about its own class list.
+///
+/// A normal class produces exactly one candidate and costs nothing new: the second is offered only when
+/// the last `/` segment begins with a digit, which is the same boundary rule the forward transform leans
+/// on — Java forbids a simple name starting with a digit, so such a segment is a suffix the VM assigned
+/// and never package structure.
+fn descriptor_candidates(class_name: &str) -> Vec<String> {
+    let internal = class_name.replace('.', "/");
+    let mut candidates = vec![format!("L{internal};")];
+    if let Some((binary_name, assigned_by_the_vm)) = internal.rsplit_once('/') {
+        if assigned_by_the_vm.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            candidates.push(format!("L{binary_name}.{assigned_by_the_vm};"));
+        }
+    }
+    candidates
 }
 
 /// Collect a class's methods as `(declaring class, rendered signature)` pairs (DISC-2).
@@ -6640,15 +6685,20 @@ async fn invoke_static_member(
 /// is a bare simple name (no dot), scans `all_classes` for a class whose signature ends in
 /// `/Name;` — so `ConfigDefaultUtils.dsUrlMotor` works without spelling out the package. Prefers a
 /// class (tag 1) over an interface when several match.
+///
+/// Shares `descriptor_candidates` with `resolve_loaded_class` rather than building its own descriptor:
+/// a hidden class is spelled two ways across the supported JDKs (DISC-4, #50), and the second resolver
+/// in this file is exactly where that would have been fixed in one place and not the other.
 async fn resolve_class_by_dotted(
     conn: &mut jdwp_client::JdwpConnection,
     dotted: &str,
 ) -> Result<Option<u64>, String> {
-    let sig = format!("L{};", dotted.replace('.', "/"));
-    let classes =
-        conn.classes_by_signature(&sig).await.map_err(|e| format!("classes_by_signature failed: {e}"))?;
-    if let Some(c) = classes.iter().find(|c| c.ref_type_tag == 1).or_else(|| classes.first()) {
-        return Ok(Some(c.type_id));
+    for sig in descriptor_candidates(dotted) {
+        let classes =
+            conn.classes_by_signature(&sig).await.map_err(|e| format!("classes_by_signature failed: {e}"))?;
+        if let Some(c) = classes.iter().find(|c| c.ref_type_tag == 1).or_else(|| classes.first()) {
+            return Ok(Some(c.type_id));
+        }
     }
 
     if !dotted.contains('.') {
@@ -9912,6 +9962,70 @@ mod tests {
         assert_eq!(decode_signature("Lcom/example/Outer$1;"), "com.example.Outer$1");
         assert_eq!(decode_signature("[[Ljava/lang/String;"), "java.lang.String[][]");
         assert_eq!(decode_signature("[I"), "int[]");
+    }
+
+    // DISC-4 (#50): the inverse of the two rules above. A name this tool PRINTS has to be a name the
+    // tool ACCEPTS, which is what `resolve_loaded_class` was failing at for a hidden class.
+    //
+    // Written as a round trip rather than as hand-written descriptors on purpose: the acceptance
+    // criterion is that the two transforms agree, and a literal expected-descriptor per case would
+    // still pass if both sides drifted together. The inputs are the same descriptors #46 measured off
+    // live JVMs, so each one asserts that the exact bytes a real JVM sent are among the spellings we
+    // would send back.
+    #[test]
+    fn a_name_this_tool_printed_resolves_back_to_the_descriptor_it_came_from() {
+        for measured in [
+            // JDK 15+ (measured on 21) — a DOT, and the case that used to miss entirely.
+            "LSyntheticProbe$$Lambda.0x0000000092040970;",
+            // JDK 11 (measured) — a SLASH, which the plain rewrite already produced.
+            "LSyntheticProbe$$Lambda$3/574182878;",
+            // Both separators in one name: the package dots go back to slashes, the VM's boundary does
+            // not.
+            "Ljava/lang/invoke/LambdaForm$MH.0x00007f2c4c0a1800;",
+            "Lcom/example/Handler$$Lambda$7/1234567;",
+            // Ordinary classes, which must keep costing exactly one lookup.
+            "Lcom/example/Order;",
+            "Lcom/example/Order$Line;",
+            "LSyntheticProbe$1;",
+        ] {
+            let printed = decode_signature(measured);
+            let candidates = descriptor_candidates(&printed);
+            assert!(
+                candidates.iter().any(|c| c == measured),
+                "the JVM sent {measured}, this tool printed it as {printed}, and asking about that name \
+                 must reach the same class — DISC-4 (#50) offered only {candidates:?}"
+            );
+        }
+    }
+
+    // DISC-4 (#50): and the JDK-generation trap, stated as the property that keeps it out. The suffix's
+    // shape (hex on 15+, decimal on 11) is deliberately NOT what decides the separator — both spellings
+    // are offered for both shapes and the debuggee picks. Keying on `0x` would pass on 21 and fail on
+    // 11, which is the exact failure #36's matrix caught in #46's first draft.
+    #[test]
+    fn both_hidden_class_spellings_are_offered_whatever_the_suffix_looks_like() {
+        assert_eq!(
+            descriptor_candidates("SyntheticProbe$$Lambda/0x0000000092040970"),
+            vec![
+                "LSyntheticProbe$$Lambda/0x0000000092040970;".to_string(),
+                "LSyntheticProbe$$Lambda.0x0000000092040970;".to_string(),
+            ],
+            "a hex suffix must not be assumed to mean JDK 15+"
+        );
+        assert_eq!(
+            descriptor_candidates("SyntheticProbe$$Lambda$3/574182878"),
+            vec![
+                "LSyntheticProbe$$Lambda$3/574182878;".to_string(),
+                "LSyntheticProbe$$Lambda$3.574182878;".to_string(),
+            ],
+            "nor a decimal one to mean JDK 11"
+        );
+        // A name with no VM-assigned suffix has one spelling and no extra packet — the digit rule is what
+        // separates them, because no Java simple name may begin with a digit.
+        assert_eq!(descriptor_candidates("com.example.Order"), vec!["Lcom/example/Order;".to_string()]);
+        assert_eq!(descriptor_candidates("SyntheticProbe$1"), vec!["LSyntheticProbe$1;".to_string()]);
+        // Internal spelling pasted straight in: still one candidate, because `Order` is not a suffix.
+        assert_eq!(descriptor_candidates("com/example/Order"), vec!["Lcom/example/Order;".to_string()]);
     }
 
     // DISC-2: a signature the caller can paste into debug.evaluate — dotted FQNs, arrays as `T[]`,

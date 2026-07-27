@@ -39,7 +39,10 @@ A class the JVM made rather than a compiler — what is actually behind a lambda
 generated proxy. Named `<class>/<a suffix the JVM assigned>`, where the `/` is part of the name rather
 than a package separator, and carrying no line table, so its frame is real but has nothing to look up.
 The name a caller is shown is always the one `Class.getName()` and a `jstack` dump use, even though the
-debuggee spells the boundary differently on the wire depending on its version.
+debuggee spells the boundary differently on the wire depending on its version. **A name this tool shows
+is a name it accepts** (DISC-4, #50): asking about a hidden class under the name a stack printed works on
+every supported JDK, because the resolver offers the debuggee both wire spellings instead of deciding for
+itself which JVM generation it is talking to.
 _Avoid_: synthetic class (the compiler's own inventions — a `lambda$…` body, an `Outer$1` — are ordinary
 classes and methods with real names and real source lines; one is actionable and the other is not, and
 a word covering both loses exactly that)

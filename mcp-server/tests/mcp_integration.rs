@@ -5315,6 +5315,127 @@ fn synthetic_frames_render_with_names_a_reader_can_act_on() {
     );
 }
 
+/// DISC-4 (#50): the name a stack printed for a hidden class, pasted into the tools that answer
+/// questions ABOUT a class — which is the step SIG-1 (#46) made reachable and did not take.
+///
+/// #46 ended with a caller able to read `SyntheticProbe$$Lambda/0x00007cd1e0001220` off a stack and find
+/// it again with `list_classes`. Asking anything about it still failed: `resolve_loaded_class` built one
+/// ordinary descriptor, `L<name with dots as slashes>;`, and on JDK 15+ the real descriptor carries a
+/// **dot** before the address, because a `/` there would not be a legal descriptor (JVMS §4.2.2). So the
+/// tool refused the very name it had just handed out, and refused it with "not loaded" — about a class it
+/// had just printed a frame for.
+///
+/// **This is the half of the matrix a single JDK cannot test.** On JDK 11 the descriptor genuinely uses a
+/// slash (`LSyntheticProbe$$Lambda$3/574182878;`), so the old code was already right there and a green run
+/// on 11 says nothing about 15+; pin either separator and the other leg of #36's matrix fails. Nothing
+/// here is spelled out for that reason: the class name comes off the live stack and goes straight back in,
+/// which is the criterion in the caller's terms and is JDK-agnostic by construction.
+///
+/// `debug.list_fields` is named in the issue and does not exist in this server — there is no field-listing
+/// MCP tool to fix. What both criteria are really about is the one resolver behind every tool that takes a
+/// class name, so the two that exist stand in for it: `list_methods`, and `debug.source` for the "answers
+/// plainly" criterion — a hidden class has no `SourceFile` attribute, and saying so is a real answer,
+/// where "not loaded" was not.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_hidden_class_answers_questions_asked_under_the_name_the_stack_printed() {
+    let Some(jdk) = jdk_or_skip("a_hidden_class_answers_questions_asked_under_the_name_the_stack_printed")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "SyntheticProbe").expect("launch SyntheticProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // Same barrier as the SIG-1 test above, and for the same reason: `parked` means the whole chain is on
+    // the worker's stack, and both waits must happen before the pause freezes the thread that prints them.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("parked"))
+        .unwrap_or_else(|| panic!("the worker never parked\n  output: {:?}", probe.output()));
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some())
+        .unwrap_or_else(|| panic!("the probe never ticked\n  output: {:?}", probe.output()));
+    let base = highest_tick(&probe).expect("a tick line just arrived");
+
+    let tid = thread_hex_for(&mut server, "synthetic-worker")
+        .unwrap_or_else(|| panic!("no synthetic-worker thread"));
+    server.call("debug.pause", serde_json::json!({}));
+    let stack = server.call(
+        "debug.get_stack",
+        serde_json::json!({"thread_id": tid, "max_frames": 20, "include_variables": false}),
+    );
+
+    // STEP ONE OF THE ROUND TRIP: read the name, exactly as a caller would — off the printed frame, with
+    // no reconstruction. A hidden-class frame is `#N <class>.run` and carries no line, so everything
+    // between the frame number and `.run` is the name the tool chose to show.
+    let frame = frame_line(&stack, "$$Lambda")
+        .unwrap_or_else(|| panic!("no hidden-class frame in the worker's stack:\n{stack}"));
+    let named = frame
+        .split_once(".run")
+        .unwrap_or_else(|| panic!("a hidden-class frame is a call to its generated `run`: {frame}"))
+        .0;
+    let printed =
+        named.split_once(' ').unwrap_or_else(|| panic!("a frame line starts with `#N `: {frame}")).1;
+
+    // STEP TWO: ask about it. The lambda's generated class implements `Runnable`, so its own `run` is the
+    // method that must come back — on JDK 11's VM-anonymous class as much as on 15+'s hidden one.
+    let methods = server.call("debug.list_methods", serde_json::json!({"class_name": printed}));
+    assert!(
+        !methods.contains("is not loaded"),
+        "DISC-4 (#50): {printed} is the name this tool printed for a frame in the stack it just read — \
+         calling it unloaded is wrong about a class the debugger is looking straight at:\n{methods}"
+    );
+    assert!(
+        methods.contains(&format!("method(s) on {printed}")),
+        "list_methods must answer under the name it was asked about:\n{methods}"
+    );
+    assert!(
+        methods.contains("void run()"),
+        "a lambda's hidden class implements Runnable, so its generated `run` is the method a caller came \
+         for — an empty listing would resolve and still answer nothing:\n{methods}"
+    );
+
+    // The other tool that resolves a class name this way, and the "says so plainly" criterion. A hidden
+    // class carries no `SourceFile` attribute: that is a real answer about a class that resolved, and it
+    // is the answer `debug.source` already gives for a stripped class (TEST-14, #39). The failure it must
+    // not fall back into is the unresolvable one. Asserted as "not that", plus whichever real answer this
+    // JDK gives, because a JVM that did attach a source file to its generated class would be answering
+    // too — what must not happen is the class going missing.
+    let source = server.call("debug.source", serde_json::json!({"class_name": printed, "source_roots": []}));
+    assert!(
+        !source.contains("is not loaded"),
+        "a class that just appeared in a stack must never come back as one the JVM has not loaded:\n{source}"
+    );
+    assert!(
+        source.contains("NO source file") || source.contains("reported by the JVM"),
+        "having resolved the class, source has to say something true about it — either the file the JVM \
+         names or that there is none:\n{source}"
+    );
+
+    // The control, on the same connection: an ordinary class still resolves through the same path, so a
+    // resolver that had started answering everything with the first class it found would fail here.
+    let ordinary = server.call("debug.list_methods", serde_json::json!({"class_name": "SyntheticProbe"}));
+    assert!(
+        ordinary.contains("static void park()") && ordinary.contains("method(s) on SyntheticProbe"),
+        "an ordinary class must be unaffected by the hidden-class spelling:\n{ordinary}"
+    );
+    // And a name nothing loaded still gets the honest "not loaded" answer, which the extra candidate must
+    // not have turned into a false hit.
+    let missing =
+        server.call("debug.list_methods", serde_json::json!({"class_name": "com.example.Nope$$Lambda/0x1"}));
+    assert!(
+        missing.contains("is not loaded"),
+        "trying a second spelling must not invent a class that is not there:\n{missing}"
+    );
+
+    server.panic_reset();
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 1)).is_some(),
+        "the probe stopped ticking after the pause was released\n  output: {:?}",
+        probe.output(),
+    );
+}
+
 /// The right-hand side of a `debug.evaluate` reply — `PrimitiveProbe.sByte = (byte) -7` → `(byte) -7`.
 fn evaluated(reply: &str) -> &str {
     reply.split_once(" = ").map_or(reply, |(_, v)| v).trim()
