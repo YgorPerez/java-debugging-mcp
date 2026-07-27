@@ -89,3 +89,47 @@ cargo clippy --workspace --all-targets -- -W clippy::pedantic -W clippy::nursery
 `-W clippy::cargo` is what surfaces `multiple_crate_versions`. Neither is on by default, which is why
 plain `cargo clippy` looked clean throughout. Run `scripts/doctor.sh` as well for the custom rules; on
 Windows take the clippy findings from the command above and the rest from doctor.
+
+## Amendment (LINT-3, #42) — the score is not the gate, and `--findings` is how you find out
+
+The gate above only helps if you can see what it will fail on. Locally you could not. `scripts/doctor.sh`
+ends in a summary box — `⚠ 5 warning(s)` — and the five findings behind that count were not reachable from
+the run: grepping it for `⚠`, for `warning`, for the rule name, for `threshold` all returned nothing. The
+mechanism, since it is worth knowing: the box goes to stdout, and what finding detail there is goes to
+**stderr**, aggregated to one line per message with an occurrence count and no `file:line`. So capturing a
+run the obvious way keeps the counts and discards the findings.
+
+**It cost the v0.2.0 release.** The tag build passed the version check, all four platform builds and the
+whole test suite, then failed this gate on five `excessive-clone` findings — every one of them already
+present in a local run. The count had been watched going 1 → 5 and dismissed, because
+`cargo clippy --all-targets` was clean (which is the *first* half of this ADR) and there was no cheap way
+to see what the five **were**. They only became legible in CI's step summary, which renders the SARIF
+properly. That is the tool that exists to catch things before CI, losing to CI at its own job.
+
+**Decision:** `scripts/doctor.sh --findings` renders rust-doctor's `--json` in the same two-line shape the
+workflow's step summary uses, so a finding reads identically wherever you meet it, and exits 3 when the
+gate would fail. Parsed with `node`, which the script already hard-requires, rather than the workflow's
+`python3`, which it does not: a findings mode that needs a second runtime is one that is missing when you
+want it.
+
+**And the score is not the gate.** It is a weighted heuristic; the gate is not weighted, and one warning
+fails the build at any score. The two have been observed disagreeing on the same scan — **100/100
+"Great" over 21 warnings** — so `--findings` prints a pass/fail verdict rather than a number, and the
+plain run now carries a footer saying which of the two you are looking at.
+
+**What the verdict is careful not to claim.** It is what the gate would say about *this scan*, not a
+prediction of CI, and the mode prints both reasons that gap exists:
+
+- **passes that did not run here** (the tool is not installed) — a pass that reports nothing reads exactly
+  like a pass that found nothing, which is this repo's whole recurring failure shape;
+- **passes that ran here and do not run in the gate** — the workflow installs no external tools, so a
+  locally-installed `cargo-geiger` contributes `unsafe-dependency` warnings that CI will never see. That
+  is not hypothetical either: it is where all 21 warnings in the 100/100 scan above came from.
+
+Whether CI installs them is read out of the workflow rather than asserted here, for the same reason the
+toolchain pin is: two copies of a fact drift.
+
+**On the Windows `✗`:** it is now told apart by the **host triple**, not by matching the message, and the
+warning says the half that is worth knowing — *your clippy findings are missing, not zero* — instead of
+being one more always-present error line that teaches you to skip error lines. Written from this ADR's own
+account of the failure; it has not been re-observed on a `windows-gnu` host since.
