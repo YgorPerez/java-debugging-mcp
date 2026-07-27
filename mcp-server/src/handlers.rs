@@ -6774,6 +6774,12 @@ async fn collect_dump_rows(
     // same frames, so this is where most of the lookup cost disappears.
     let mut class_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     let mut monitor_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    // Line tables, keyed by (class, method) — the single biggest cost in a dump, and one that was paid
+    // over and over for the same method (TEST-8, #24). A request pool's threads sit in the SAME code, so
+    // the reuse is across threads: 300 workers 60 frames deep asked for ~19,000 line tables covering ~60
+    // distinct methods. Held **for this call only** — see `dump_frame_method` for why that scope is the
+    // entire safety argument.
+    let mut line_tables: LineTableCache = std::collections::HashMap::new();
 
     let mut unread = 0usize;
     for (seen, tid) in all.iter().enumerate() {
@@ -6817,9 +6823,10 @@ async fn collect_dump_rows(
             // lookups that dominate a dump's packet cost and therefore its suspension window.
             (DumpStack::Omitted, 0)
         } else {
-            let (frames, hidden) =
-                read_dump_stack(conn, *tid, a.max_frames, package_filter.as_deref(), &mut class_names)
-                    .await;
+            let (frames, hidden) = read_dump_stack(
+                conn, *tid, a.max_frames, package_filter.as_deref(), &mut class_names, &mut line_tables,
+            )
+            .await;
             (frames.map_or_else(DumpStack::Unreadable, DumpStack::Frames), hidden)
         };
 
@@ -6893,6 +6900,7 @@ async fn read_dump_stack(
     max_frames: usize,
     package_filter: Option<&str>,
     class_names: &mut std::collections::HashMap<u64, String>,
+    line_tables: &mut LineTableCache,
 ) -> (Result<Vec<String>, String>, usize) {
     let frames = match conn.get_frames(tid, 0, -1).await {
         Ok(f) => f,
@@ -6912,7 +6920,7 @@ async fn read_dump_stack(
             hidden += 1;
             continue;
         }
-        let (method, line, _) = frame_method_info(conn, &f.location, false).await;
+        let (method, line) = dump_frame_method(conn, &f.location, line_tables).await;
         out.push(line.map_or_else(
             || format!("#{idx} {class}.{method}"),
             |l| format!("#{idx} {class}.{method}:{l}"),
@@ -7188,11 +7196,68 @@ async fn source_line(
     index: u64,
 ) -> Option<i32> {
     let lt = conn.get_line_table(class_id, method_id).await.ok()?;
+    line_at(&lt, index)
+}
+
+/// The source line covering bytecode `index`: the last table entry at or before it.
+///
+/// Split out so the cached and uncached paths cannot disagree about what a line table means.
+fn line_at(lt: &jdwp_client::method::LineTable, index: u64) -> Option<i32> {
     lt.lines
         .iter()
         .filter(|e| e.line_code_index <= index)
         .max_by_key(|e| e.line_code_index)
         .map(|e| e.line_number)
+}
+
+/// Line tables for one dump, keyed by (class, method). `None` records a method that HAS no table — a
+/// native or abstract one answers `ABSENT_INFORMATION`, and a refusal has to be remembered too, or every
+/// thread re-asks the same question and gets the same refusal.
+type LineTableCache = std::collections::HashMap<(u64, u64), Option<jdwp_client::method::LineTable>>;
+
+/// One dump frame's (method name, source line), reading each line table at most once per dump (TEST-8).
+///
+/// A dump's cost is dominated by `Method.LineTable`: one round trip per frame. Measured against a
+/// production-shaped pool (#24), that was ~19,000 of the 21,364 packets a 300-thread, 60-frame dump spent,
+/// while covering only ~60 distinct methods — because the threads of a request pool are all standing in the
+/// same code. Method *lists* were already cached on the connection; line tables were not, so the identical
+/// question was asked once per frame per thread.
+///
+/// **The cache is per call, and that is the point rather than an implementation detail.** ADR-0009 records
+/// #17's rejection of caching line tables *across* dumps on BP-4 grounds: `RedefineClasses` keeps the
+/// referenceTypeID and replaces the code, so a connection-lifetime entry can serve a line number that is
+/// quietly wrong, and a stale source line is worse than a round trip. Within one call there is no such
+/// window — the VM is suspended for the read when `suspend:true`, the map dies with the reply, and every
+/// hit is another thread standing in the very code just read. So this takes the win that decision declined
+/// without taking the risk it declined it for.
+async fn dump_frame_method(
+    conn: &mut jdwp_client::JdwpConnection,
+    loc: &Location,
+    line_tables: &mut LineTableCache,
+) -> (String, Option<i32>) {
+    // `get_methods` is already cached per connection, so this costs a round trip once per class, ever.
+    let method = conn
+        .get_methods(loc.class_id)
+        .await
+        .ok()
+        .and_then(|ms| ms.into_iter().find(|m| m.method_id == loc.method_id).map(|m| m.name))
+        .unwrap_or_else(|| format!("method@{:x}", loc.method_id));
+
+    // `get` then `insert` rather than the `entry` API: producing the value needs an `await`, and an
+    // occupied `Entry` would borrow the map across it. The lookup resolves to an owned `Option<i32>`
+    // immediately so the borrow ends before the miss branch inserts (edition 2021 keeps an `if let`
+    // condition's borrow alive through the `else` otherwise).
+    let key = (loc.class_id, loc.method_id);
+    let cached = line_tables.get(&key).map(|lt| lt.as_ref().and_then(|t| line_at(t, loc.index)));
+    let line = if let Some(line) = cached {
+        line
+    } else {
+        let fetched = conn.get_line_table(loc.class_id, loc.method_id).await.ok();
+        let line = fetched.as_ref().and_then(|lt| line_at(lt, loc.index));
+        line_tables.insert(key, fetched);
+        line
+    };
+    (method, line)
 }
 
 /// Resolve (class name, method name, source line) for a location.
@@ -7818,6 +7883,43 @@ mod tests {
         assert_eq!(trace_frames_tag(true, 3), " [+3 caller frame(s)]");
         assert_eq!(trace_frames_tag(true, 0), "", "depth 0 adds no cost, so it advertises nothing");
         assert_eq!(trace_frames_tag(false, 3), "", "a non-traced stop point has no snapshot depth");
+    }
+
+    // TEST-8: the per-dump line-table cache is keyed by (class, method) and the LINE is resolved per frame
+    // from the cached table. So the property that matters is that one table answers different bytecode
+    // indexes differently — a cache that stored a resolved line instead would give every frame of a method
+    // the same number, which still looks like a valid dump. No probe can construct two frames of one method
+    // at different indexes on demand, so it is asserted here instead.
+    #[test]
+    fn one_cached_line_table_resolves_each_bytecode_index_to_its_own_line() {
+        use jdwp_client::method::{LineTable, LineTableEntry};
+        let lt = LineTable {
+            start: 0,
+            end: 40,
+            lines: vec![
+                LineTableEntry { line_code_index: 0, line_number: 10 },
+                LineTableEntry { line_code_index: 8, line_number: 11 },
+                LineTableEntry { line_code_index: 20, line_number: 14 },
+            ],
+        };
+        // The covering entry is the last one at or before the index, not the nearest.
+        assert_eq!(line_at(&lt, 0), Some(10));
+        assert_eq!(line_at(&lt, 7), Some(10), "still inside line 10's range");
+        assert_eq!(line_at(&lt, 8), Some(11));
+        assert_eq!(line_at(&lt, 19), Some(11));
+        assert_eq!(line_at(&lt, 20), Some(14));
+        assert_eq!(line_at(&lt, 999), Some(14), "past the last entry is still that entry's line");
+
+        // A table with no entries has no answer, which must not be confused with line 0.
+        let empty = LineTable { start: 0, end: 0, lines: Vec::new() };
+        assert_eq!(line_at(&empty, 0), None);
+        // An index before the first entry — a synthetic or shifted table — is also no answer.
+        let late = LineTable {
+            start: 4,
+            end: 8,
+            lines: vec![LineTableEntry { line_code_index: 4, line_number: 7 }],
+        };
+        assert_eq!(line_at(&late, 0), None, "before the first entry, nothing covers the index");
     }
 
     // TRACE-7: the three states of a cost line. The middle one matters most — a traced stop point with no

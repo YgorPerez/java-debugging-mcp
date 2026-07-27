@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{assert_contains_all, jdk_or_skip, probe_line, probe_source, Jdk, Probe, Server, EVENT_TIMEOUT};
+use common::{assert_contains_all, jdk_or_skip, probe_line, probe_source, Jdk, LatencyRelay, Probe, Server, EVENT_TIMEOUT};
 
 /// EVAL-1 / EVAL-2: static-method invocation and object arguments, through the real handlers.
 #[test]
@@ -1625,6 +1625,230 @@ fn a_dump_reports_how_long_it_held_the_vm_and_a_budget_bounds_it() {
     );
 
     server.panic_reset();
+}
+
+/// TEST-8 (#24): a dump of a PRODUCTION-SHAPED pool costs a bounded number of packets per thread.
+///
+/// #24 said the shared-instance defaults could only be calibrated against the real 8180. Two of the three
+/// things that make the real instance different are properties of the debuggee — hundreds of threads, and
+/// stacks far deeper than 8 frames — so `PoolShapeProbe` presents them here: 300 workers, 60 distinct
+/// frames each, parked.
+///
+/// Measured against it, a whole-pool dump cost **21,364 packets and 4.7s**, and at the default 2000ms
+/// budget it TRUNCATED at 40% of the pool. Nearly all of it was `Method.LineTable`, asked once per frame
+/// per thread while covering ~60 distinct methods, because a request pool's threads stand in the same
+/// code. With those cached per dump it is **1,625 packets / ~0.7s**, and the same dump now completes
+/// inside the default budget.
+///
+/// **The assertion is a per-thread packet budget, not a duration.** Packet counts are deterministic and
+/// independent of what else the machine is doing, so this cannot flake — and it fails loudly at ~70/thread
+/// if the cache is removed or a new per-frame round trip is added. A timing assertion would be the flaky
+/// restatement of the same fact.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_production_shaped_dump_costs_a_bounded_number_of_packets_per_thread() {
+    let Some(jdk) = jdk_or_skip("a_production_shaped_dump_costs_a_bounded_number_of_packets_per_thread")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "PoolShapeProbe").expect("launch PoolShapeProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    // The workers descend 60 frames before parking; the tick line is printed only after all 300 are down.
+    probe
+        .wait_for_line(std::time::Duration::from_secs(60), |l| l.starts_with("tick "))
+        .expect("PoolShapeProbe never finished starting its pool");
+
+    // The whole pool, the whole depth, with the budget out of the way so this measures packets rather than
+    // the clock.
+    let deep = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"suspend": true, "limit": 400, "max_frames": 200, "max_suspend_ms": 120_000}),
+    );
+    let (read, total) = dump_thread_counts(&deep).expect("no thread count in the dump header");
+    assert!(read >= 300, "expected the whole pool, got {read}/{total}:\n{}", head_of(&deep));
+    let packets = dump_packet_cost(&deep).expect("no packet cost in the dump");
+    let per_thread = packets / read;
+    assert!(
+        per_thread <= 20,
+        "a dump cost {per_thread} packets per thread ({packets} for {read} threads). It was ~70 before line \
+         tables were cached per dump — has that cache been removed, or has a new per-frame round trip been \
+         added? On an instance 1ms away this is the difference between a 2s dump and a 26s one.\n{}",
+        head_of(&deep)
+    );
+
+    // Cheap because it reads no frames at all — ~4 packets per thread, as the header claims.
+    let monitors = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"suspend": true, "limit": 400, "monitors_only": true, "max_suspend_ms": 120_000}),
+    );
+    let m_packets = dump_packet_cost(&monitors).expect("no packet cost in the monitors-only dump");
+    let (m_read, _) = dump_thread_counts(&monitors).expect("no thread count");
+    assert!(
+        m_packets / m_read <= 6,
+        "monitors_only should cost ~4 packets per thread, got {}\n{}",
+        m_packets / m_read,
+        head_of(&monitors)
+    );
+    // It stays the cheaper of the two — the frame read is what it skips — but the gap is no longer the ~18x
+    // it was before the cache, which is the more useful fact: a deep dump is now affordable.
+    assert!(m_packets < packets, "monitors_only must remain the cheaper mode: {m_packets} vs {packets}");
+
+    // The probe must be running again afterwards; a dump that measured well and left the VM frozen is the
+    // ADR-0003 failure.
+    let base = highest_tick(&probe).unwrap_or(0);
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base))
+            .is_some(),
+        "probe stopped ticking after the dumps — it was left suspended\n  output: {:?}",
+        probe.output()
+    );
+
+    server.panic_reset();
+}
+
+/// TEST-8 (#24): the line numbers in a deep dump are the RIGHT ones, per frame.
+///
+/// The per-dump line-table cache is keyed by (class, method) and the line is resolved per frame from the
+/// cached table — so a cache keyed too coarsely, or one that stored the resolved *line* instead of the
+/// table, would still produce a plausible dump with every frame showing the same number. `PoolShapeProbe`'s
+/// 60 frames are 60 distinct one-line methods, so the correct answer is 60 *different* lines, each
+/// checkable against the probe's own source.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_deep_dump_resolves_each_frames_own_source_line() {
+    let Some(jdk) = jdk_or_skip("a_deep_dump_resolves_each_frames_own_source_line") else { return };
+    let probe = Probe::launch(&jdk, "PoolShapeProbe").expect("launch PoolShapeProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe
+        .wait_for_line(std::time::Duration::from_secs(60), |l| l.starts_with("tick "))
+        .expect("PoolShapeProbe never finished starting its pool");
+
+    // One worker is enough: the cache is shared across threads, so if it were wrong the first thread would
+    // show it. `name_filter` keeps this to one stack rather than 300.
+    let dump = server.call(
+        "debug.thread_dump",
+        serde_json::json!({
+            "suspend": true, "limit": 1, "max_frames": 200, "max_suspend_ms": 120_000,
+            "name_filter": "http-nio-8180-exec-0",
+        }),
+    );
+
+    let src = probe_source("PoolShapeProbe");
+    let mut checked = 0;
+    // Frames render as `#<idx> PoolShapeProbe.f12:<line>`; each fN is declared on exactly one source line.
+    for n in (1..60).rev() {
+        let needle = format!("PoolShapeProbe.f{n}:");
+        let Some(at) = dump.find(&needle) else { continue };
+        let got: i32 = dump
+            .get(at + needle.len()..)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or_else(|| panic!("f{n} has no line number in:\n{dump}"));
+        let want = probe_line(&src, &format!("static void f{n}() {{ f{}(); }}", n - 1));
+        assert_eq!(got, want, "f{n} reported line {got}, its body is on line {want}");
+        checked += 1;
+    }
+    assert!(
+        checked >= 50,
+        "expected ~59 chain frames to check, only found {checked} — is max_frames being applied?\n{}",
+        head_of(&dump)
+    );
+
+    server.panic_reset();
+}
+
+/// TEST-8 (#24): the harness can present an instance that is NOT on loopback, and the cost model holds.
+///
+/// This is the capability the issue was blocked on. `LatencyRelay` puts a measured round trip in front of
+/// the probe's JDWP port in userspace (`tc netem` needs `NET_ADMIN`, which a container does not have), so
+/// "how does this behave against an instance 4ms away" stops needing that instance.
+///
+/// The model it confirms is `held ≈ packets × (our per-packet cost + RTT)`. Measured with the sweep this
+/// test's assertion is drawn from: 0/1/2/4ms nominal RTT over the same workload gave ~1.0ms of extra held
+/// time per ms of RTT per packet. That linearity is why **packet count is the lever** and why the fix for a
+/// slow remote dump was caching, not a bigger budget.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
+    let Some(jdk) = jdk_or_skip("latency_added_to_the_wire_shows_up_as_held_time_per_packet") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "PoolShapeProbe").expect("launch PoolShapeProbe");
+    probe
+        .wait_for_line(std::time::Duration::from_secs(60), |l| l.starts_with("tick "))
+        .expect("PoolShapeProbe never finished starting its pool");
+
+    // A small slice, so the far end of the sweep stays in seconds. Same workload at both latencies, so the
+    // packet count is the same and the ONLY difference is the wire.
+    let workload = serde_json::json!({
+        "suspend": true, "limit": 20, "max_frames": 200, "max_suspend_ms": 120_000,
+    });
+    let rtt = std::time::Duration::from_millis(4);
+
+    let measure = |delay: std::time::Duration| -> (u64, u64) {
+        let relay = LatencyRelay::start(probe.port, delay).expect("start relay");
+        let mut server = Server::start().expect("start server");
+        // Attaching THROUGH the relay is the whole point: the debugger is told nothing about it.
+        server.attach(relay.port);
+        let dump = server.call("debug.thread_dump", workload.clone());
+        let packets = dump_packet_cost(&dump).expect("no packet cost");
+        let held = dump_held_ms(&dump).expect("no held duration");
+        server.panic_reset();
+        (packets, held)
+    };
+
+    let (near_packets, near_held) = measure(std::time::Duration::ZERO);
+    let (far_packets, far_held) = measure(rtt);
+
+    // Same work either way — if the relay changed what was read, the comparison would be meaningless.
+    assert!(
+        near_packets > 100 && far_packets.abs_diff(near_packets) * 10 < near_packets,
+        "the relay must not change the work done: {near_packets} packets direct vs {far_packets} through it"
+    );
+
+    // Each packet crosses the wire once, so the added time is at least ~half a round trip per packet even
+    // allowing for coalescing, and at most a few round trips per packet allowing for sleep granularity.
+    //
+    // Milliseconds and packet counts, both far below f64's exact-integer range — the precision warning is
+    // about u64 values above 2^53, which neither of these can reach.
+    #[allow(clippy::cast_precision_loss)]
+    let per_packet_ms = far_held.saturating_sub(near_held) as f64 / far_packets as f64;
+    let rtt_ms = rtt.as_secs_f64() * 1000.0;
+    assert!(
+        (rtt_ms * 0.4..rtt_ms * 3.0).contains(&per_packet_ms),
+        "a {rtt_ms}ms round trip should cost roughly that much per packet: {far_held}ms vs {near_held}ms \
+         over {far_packets} packets is {per_packet_ms:.2}ms/packet. If this is ~0, the relay is not \
+         delaying anything and every measurement taken through it is worthless."
+    );
+}
+
+/// `(threads read, threads total)` from a dump's `🧵 Thread dump — 40/306 thread(s)` header.
+fn dump_thread_counts(dump: &str) -> Option<(u64, u64)> {
+    let at = dump.find("dump — ")? + "dump — ".len();
+    let rest = dump.get(at..)?;
+    let (read, rest) = rest.split_once('/')?;
+    let total: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some((read.trim().parse().ok()?, total.parse().ok()?))
+}
+
+/// The `Cost: N JDWP packet(s).` figure a dump reports.
+fn dump_packet_cost(dump: &str) -> Option<u64> {
+    let at = dump.find("Cost: ")? + "Cost: ".len();
+    dump.get(at..)?.split_whitespace().next()?.parse().ok()
+}
+
+/// The `⏱  Held the VM suspended for Nms.` figure, when the dump suspended anything.
+fn dump_held_ms(dump: &str) -> Option<u64> {
+    let at = dump.find("suspended for ")? + "suspended for ".len();
+    dump.get(at..)?.split('m').next()?.trim().parse().ok()
+}
+
+/// A dump's header lines only — the whole thing is thousands of frames, which no assertion message wants.
+fn head_of(dump: &str) -> String {
+    dump.lines().take(6).collect::<Vec<_>>().join("\n")
 }
 
 /// DUMP-1 + SAFE-6: a thread dump reads only, so it must work in a read-only session — and it must not
