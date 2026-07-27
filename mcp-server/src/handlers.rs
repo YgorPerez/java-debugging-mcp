@@ -144,10 +144,14 @@ impl RequestHandler {
                 data: None,
             })?;
 
-        // Route to the appropriate handler, split into two dispatch groups to keep each small.
+        // Route to the appropriate handler, split into dispatch groups to keep each small — the split is
+        // for readability and for the complexity budget, and nothing else depends on which group a tool
+        // is in.
         let name = call_params.name.as_str();
         let args = call_params.arguments;
         let result = if let Some(r) = self.dispatch_control(name, args.clone()).await {
+            r
+        } else if let Some(r) = self.dispatch_discovery(name, args.clone()).await {
             r
         } else if let Some(r) = self.dispatch_inspect(name, args).await {
             r
@@ -192,6 +196,27 @@ impl RequestHandler {
         })
     }
 
+    /// The DISC series: questions about a **class** rather than about running state, every one of them
+    /// taking a class name and going through the same resolver. Returns `None` if `name` isn't one.
+    ///
+    /// Its own group as of DISC-5 (#53), when the fourth of them pushed `dispatch_inspect` past the
+    /// complexity budget. The line is a real one either way — these four answer "what is loaded, what
+    /// does it declare, what does it hold, what was it compiled from" without a suspended thread and
+    /// without invoking anything in the debuggee.
+    async fn dispatch_discovery(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Option<Result<String, String>> {
+        Some(match name {
+            "debug.list_classes" => self.handle_list_classes(args).await,
+            "debug.list_methods" => self.handle_list_methods(args).await,
+            "debug.list_fields" => self.handle_list_fields(args).await,
+            "debug.source" => self.handle_source(args).await,
+            _ => return None,
+        })
+    }
+
     /// State-inspection and mutation tools (stack, evaluate, threads, set value, traces).
     /// Returns `None` if `name` isn't one of these.
     async fn dispatch_inspect(&self, name: &str, args: serde_json::Value) -> Option<Result<String, String>> {
@@ -199,9 +224,6 @@ impl RequestHandler {
             "debug.get_stack" => self.handle_get_stack(args).await,
             "debug.evaluate" => self.handle_evaluate(args).await,
             "debug.list_threads" => self.handle_list_threads(args).await,
-            "debug.list_classes" => self.handle_list_classes(args).await,
-            "debug.list_methods" => self.handle_list_methods(args).await,
-            "debug.source" => self.handle_source(args).await,
             "debug.thread_dump" => self.handle_thread_dump(args).await,
             "debug.get_last_event" => self.handle_get_last_event(args).await,
             "debug.set_value" => self.handle_set_value(args).await,
@@ -1026,6 +1048,73 @@ impl RequestHandler {
         }
         if matched == 0 && name_filter.is_some() {
             output.push_str("No method name matched. Drop name_filter to see the whole class.\n");
+        }
+
+        Ok(output)
+    }
+
+    /// DISC-5: the fields of one loaded class — the other half of the question `list_methods` answers.
+    ///
+    /// `get_fields` had five internal callers before this existed (object expansion, static reads,
+    /// watchpoint resolution) and no caller-facing surface, so a debugger that knew exactly what a type
+    /// holds could only be asked what it can do. The gap bites where the source tree is not the
+    /// authority and there is **no instance to expand**: a static holder, a class you are about to
+    /// breakpoint into, a vendored or shaded class the checkout cannot show you.
+    ///
+    /// A second tool rather than a `fields:true` flag on `debug.list_methods` — see ADR-0015, and the
+    /// duplication is of *shape*, not logic: the resolver, the type renderer and the superclass walk
+    /// below are the same functions DISC-2 uses.
+    async fn handle_list_fields(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+
+        let mut session = session_guard.lock().await;
+
+        let a: crate::args::ListFieldsArgs = crate::args::parse(&args)?;
+        let class_name = a.class_name.trim();
+        if class_name.is_empty() {
+            return Err("class_name is required (e.g. com.example.OrderService)".to_string());
+        }
+        let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
+        let limit = a.limit.max(1);
+
+        let target_id = resolve_loaded_class(&mut session.connection, class_name).await?;
+
+        let mut rows =
+            collect_field_rows(&mut session.connection, target_id, a.inherited, name_filter.as_deref())
+                .await?;
+        drop(session);
+
+        // Statics first, then by name. Not the rendered form `list_methods` sorts on: that would order
+        // fields by their *type* (`boolean` before `java.lang.String`), which is nobody's question. The
+        // static block leads because those are the ones readable with no instance and no suspended
+        // thread — the case this tool exists for — and a listing cut off at `limit` should spend its
+        // budget on them first.
+        rows.sort_by(|x, y| y.is_static.cmp(&x.is_static).then_with(|| x.name.cmp(&y.name)));
+        let matched = rows.len();
+        let shown = matched.min(limit);
+
+        let mut note = String::new();
+        if let Some(f) = &name_filter {
+            let _ = write!(note, " name~\"{f}\"");
+        }
+        if a.inherited {
+            note.push_str(" +inherited");
+        }
+
+        let mut output = format!("{shown}/{matched} field(s) on {class_name}{note}:\n");
+        for row in rows.iter().take(limit) {
+            let _ = if a.inherited && &*row.owner != class_name {
+                writeln!(output, "{}  [from {}]", row.rendered, row.owner)
+            } else {
+                writeln!(output, "{}", row.rendered)
+            };
+        }
+        if matched > shown {
+            let _ = writeln!(output, "… +{} more (raise limit or use name_filter)", matched - shown);
+        }
+        if matched == 0 {
+            output.push_str(&explain_no_fields(name_filter.is_some(), a.inherited));
         }
 
         Ok(output)
@@ -3410,6 +3499,122 @@ async fn collect_method_rows(
     Ok(rows)
 }
 
+/// One field of a class listing (DISC-5).
+///
+/// A struct rather than the tuple `collect_method_rows` returns: the field rows are sorted on two keys
+/// the rendered text cannot supply — staticness and the bare name — and a four-tuple sorted by `.1`
+/// and `.2` is unreadable at the call site.
+struct FieldRow {
+    /// The class that declares it, for the `[from …]` attribution an inherited walk needs.
+    owner: std::sync::Arc<str>,
+    /// Sort key, and the distinction the whole tool turns on: a static is readable with no instance.
+    is_static: bool,
+    /// The bare field name, kept for sorting — `rendered` starts with the modifiers and the type.
+    name: String,
+    /// `static final java.lang.String infra`.
+    rendered: String,
+}
+
+/// Collect a class's fields (DISC-5), the shape [`collect_method_rows`] collects its methods in.
+///
+/// The superclass walk is the same one, and it is opt-in for the same reason — but note that the
+/// *default* answers differ from object expansion on purpose. `collect_instance_fields` always walks
+/// the chain, because an object's state genuinely includes what its parents declare; this answers
+/// "what does this type declare", which is the smaller question and the one a caller holding only a
+/// class name asked. `inherited:true` is how you ask the bigger one.
+async fn collect_field_rows(
+    conn: &mut jdwp_client::JdwpConnection,
+    start: u64,
+    inherited: bool,
+    name_filter: Option<&str>,
+) -> Result<Vec<FieldRow>, String> {
+    let mut rows = Vec::new();
+    let mut current = Some(start);
+    while let Some(type_id) = current {
+        // `Arc<str>` for the same reason as the method walk: every field of a class repeats its
+        // declaring class, and a clone per row would re-allocate that name once per field.
+        let owner: std::sync::Arc<str> = std::sync::Arc::from(
+            decode_signature(&conn.get_signature(type_id).await.unwrap_or_default()).as_str(),
+        );
+        let fields = conn
+            .get_fields(type_id)
+            .await
+            .map_err(|e| format!("Failed to read the fields of {owner}: {e}"))?;
+        // Consumed rather than borrowed, so the sort key can be the field's own `String` moved out of the
+        // reply instead of a copy of it — `get_fields` hands back an owned Vec and nothing below needs it
+        // again. (The `Arc::clone` is a refcount bump, not an allocation.)
+        for f in fields {
+            if name_filter.is_some_and(|n| !f.name.to_lowercase().contains(n)) {
+                continue;
+            }
+            rows.push(FieldRow {
+                owner: std::sync::Arc::clone(&owner),
+                is_static: f.mod_bits & ACC_STATIC != 0,
+                rendered: render_field(&f.name, &f.signature, f.mod_bits),
+                name: f.name,
+            });
+        }
+        if !inherited {
+            break;
+        }
+        current = conn
+            .get_superclass(type_id)
+            .await
+            .map_err(|e| format!("Failed to walk the superclass chain: {e}"))?;
+    }
+    Ok(rows)
+}
+
+/// One field as Java source would spell it: `static final java.lang.String infra`.
+///
+/// Pure, and takes the fields rather than the client's struct, so a unit test can drive it with a
+/// literal descriptor — same reason as [`render_method`].
+///
+/// Three modifiers, chosen because each changes what a caller can *do* with the field, which is the
+/// same rule `render_method` marks `static`/`abstract`/`native` by. `static` says it can be read with
+/// no instance and no suspended thread; `final` says a `debug.set_value` may be refused and a
+/// `debug.set_field_stop` will never fire; `volatile` says something else is writing it. `transient`
+/// and `synthetic` are left off — they say something about serialisation and about the compiler, not
+/// about debugging.
+fn render_field(name: &str, signature: &str, mod_bits: i32) -> String {
+    let mut out = String::new();
+    if mod_bits & ACC_STATIC != 0 {
+        out.push_str("static ");
+    }
+    if mod_bits & ACC_FINAL != 0 {
+        out.push_str("final ");
+    }
+    if mod_bits & ACC_VOLATILE != 0 {
+        out.push_str("volatile ");
+    }
+    let _ = write!(out, "{} {name}", decode_signature(signature));
+    out
+}
+
+/// What `debug.list_fields` says when it resolved the class and still has nothing to show (DISC-5).
+///
+/// `0/0 field(s) on X` is a *correct* answer that reads exactly like a failed one, and for this tool it
+/// is a common answer rather than an edge case: an interface with no constants, a lambda's hidden class
+/// that captured nothing, a subclass whose whole state lives on its parent. The class resolved — that
+/// is the part worth saying out loud, because the alternative reading ("not loaded") is the one the
+/// caller has been trained by every other discovery tool to reach for.
+fn explain_no_fields(filtered: bool, inherited: bool) -> String {
+    if filtered {
+        return "No field name matched. Drop name_filter to see the whole class.\n".to_string();
+    }
+    let mut note = "This class RESOLVED and declares no fields of its own — that is an answer, not a \
+                    lookup failure. An interface with no constants, a lambda's hidden class that \
+                    captured nothing, and a subclass whose state all lives on its parent each look like \
+                    this."
+        .to_string();
+    if inherited {
+        note.push_str(" Its superclass chain declares none either.\n");
+    } else {
+        note.push_str(" Pass inherited:true to walk the superclass chain.\n");
+    }
+    note
+}
+
 /// One method as Java source would spell it: `static boolean matches(java.lang.String, int)`.
 ///
 /// Takes the fields rather than the client's struct so this stays a pure formatting function that a
@@ -3850,6 +4055,10 @@ const ACC_STATIC: i32 = 0x0008;
 // either, which is the thing a caller reading a method list needs to know before trying.
 const ACC_NATIVE: i32 = 0x0100;
 const ACC_ABSTRACT: i32 = 0x0400;
+// The two DISC-5 renders on a FIELD (JVMS 4.5). Same rule as the pair above — each changes what a
+// caller can do with it, rather than merely being true of it.
+const ACC_FINAL: i32 = 0x0010;
+const ACC_VOLATILE: i32 = 0x0040;
 
 /// What an argument actually *is* at the moment of the call, which is what overload resolution
 /// scores against.
@@ -10218,6 +10427,50 @@ mod tests {
         );
         // A constructor keeps its JVM spelling — it is what evaluate and a stop point both name.
         assert_eq!(render_method("<init>", "(I)V", 0), "void <init>(int)");
+    }
+
+    // DISC-5: a field reads as its declaration would, and the type goes through the same decoder the
+    // method listing uses — so an array, a primitive and a dotted FQN all come back usable.
+    #[test]
+    fn field_rendering_reads_as_java_source() {
+        assert_eq!(render_field("qty", "I", 0), "int qty");
+        assert_eq!(render_field("name", "Ljava/lang/String;", 0), "java.lang.String name");
+        assert_eq!(
+            render_field("words", "[Ljava/lang/String;", ACC_STATIC),
+            "static java.lang.String[] words"
+        );
+        assert_eq!(render_field("grid", "[[J", 0), "long[][] grid");
+    }
+
+    // DISC-5: the three modifiers are marked because each changes what a caller can DO with the field,
+    // and they combine in Java's own order rather than overriding one another.
+    #[test]
+    fn field_rendering_marks_static_final_and_volatile() {
+        assert_eq!(render_field("MAX", "I", ACC_STATIC | ACC_FINAL), "static final int MAX");
+        assert_eq!(render_field("running", "Z", ACC_VOLATILE), "volatile boolean running");
+        // Flags this tool does not render must not leak in: 0x0002 is ACC_PRIVATE, 0x1000 ACC_SYNTHETIC.
+        assert_eq!(render_field("this$0", "Lcom/example/Outer;", 0x1002), "com.example.Outer this$0");
+    }
+
+    // DISC-5: `0/0 field(s)` is a correct answer that reads like a failed lookup, and the three ways to
+    // arrive at it want three different next moves. The one thing every wording must do is say the class
+    // resolved, because "not loaded" is what a caller has been trained to read into an empty listing.
+    #[test]
+    fn an_empty_field_listing_says_the_class_resolved() {
+        let filtered = explain_no_fields(true, false);
+        assert!(filtered.contains("name_filter"), "a filtered miss points at the filter: {filtered}");
+        assert!(!filtered.contains("RESOLVED"), "a filtered miss says nothing about the class: {filtered}");
+
+        let declared_none = explain_no_fields(false, false);
+        assert!(declared_none.contains("RESOLVED"), "{declared_none}");
+        assert!(
+            declared_none.contains("inherited:true"),
+            "the next move is the superclass walk: {declared_none}"
+        );
+
+        // Already walked: offering the walk again would be the only wrong thing to say here.
+        let walked = explain_no_fields(false, true);
+        assert!(walked.contains("RESOLVED") && !walked.contains("inherited:true"), "{walked}");
     }
 
     // DISC-3: the directory comes from the PACKAGE and the file name from the JVM, never from the

@@ -10,6 +10,13 @@ public class EvalProbe {
     static String infra = "PROD";
     static int base = 7;
 
+    // --- DISC-5 (#53): the three shapes debug.list_fields has to tell apart, in one class ---
+    // A `static final` (the marker that says a set_value may be refused and a field stop can never
+    // fire), and the probe's only INSTANCE field — EvalProbe is otherwise all statics, so without this
+    // there is nothing here to prove that statics are listed first.
+    static final int LIMIT = 3;
+    int seq;
+
     // --- static methods for EVAL-1 ---
     public static int twice(int n) { return n * 2; }
     public static String greet(String who) { return "hello " + who; }
@@ -45,6 +52,9 @@ public class EvalProbe {
     // Implements one interface directly and inherits another through its superclass, so the
     // transitive walk has something to find that a direct-superinterface query would miss.
     public static class Task implements Runnable {
+        // DISC-5 (#53): the one field a subclass INHERITS, so the field listing's superclass walk has
+        // something to attribute — and the probe's only `volatile`, the third modifier it marks.
+        volatile int runs;
         @Override public void run() { }
     }
 

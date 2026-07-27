@@ -1,0 +1,177 @@
+{
+  "cassette": "list_fields_disc5",
+  "recorded_from": "EvalProbe on openjdk version \"11.0.30\" 2026-01-20 LTS",
+  "note": "Recorded by mcp_integration.rs; re-record with JDWP_RERECORD_CASSETTES=1. Editing it by hand is a supported way to synthesise a shape no JVM here can produce.",
+  "events_seen": 0,
+  "exchanges": [
+    {
+      "command": "VirtualMachine.ClassesBySignature",
+      "set": 1, "cmd": 2,
+      "request": "0000000b4c4576616c50726f62653b",
+      "error": 0,
+      "reply": "0000000101000000000000000200000007"
+    },
+    {
+      "command": "ReferenceType.Signature",
+      "set": 2, "cmd": 1,
+      "request": "0000000000000002",
+      "error": 0,
+      "reply": "0000000b4c4576616c50726f62653b"
+    },
+    {
+      "command": "ReferenceType.Fields",
+      "set": 2, "cmd": 4,
+      "request": "0000000000000002",
+      "error": 0,
+      "reply": [
+        "00000008000076dae400567000000005696e667261000000124c6a6176612f6c",
+        "616e672f537472696e673b00000008000076dae4005650000000046261736500",
+        "0000014900000008000076dae4005630000000054c494d495400000001490000",
+        "0018000000000000003200000003736571000000014900000000000076dae400",
+        "561000000006686f6c646572000000104c4576616c50726f6265244974656d3b",
+        "00000008000076dae4003390000000047461736b000000104c4576616c50726f",
+        "6265245461736b3b00000008000076dacc0013b0000000077375627461736b00",
+        "0000134c4576616c50726f6265245375627461736b3b00000008000076dacc00",
+        "13d000000005776f726473000000135b4c6a6176612f6c616e672f537472696e",
+        "673b00000008"
+      ]
+    },
+    {
+      "command": "VirtualMachine.ClassesBySignature",
+      "set": 1, "cmd": 2,
+      "request": "000000104c4576616c50726f6265244974656d3b",
+      "error": 0,
+      "reply": "0000000101000000000000000300000007"
+    },
+    {
+      "command": "ReferenceType.Signature",
+      "set": 2, "cmd": 1,
+      "request": "0000000000000003",
+      "error": 0,
+      "reply": "000000104c4576616c50726f6265244974656d3b"
+    },
+    {
+      "command": "ReferenceType.Fields",
+      "set": 2, "cmd": 4,
+      "request": "0000000000000003",
+      "error": 0,
+      "reply": [
+        "000000020000000000000042000000046e616d65000000124c6a6176612f6c61",
+        "6e672f537472696e673b00000000000000000000003200000003717479000000",
+        "014900000000"
+      ]
+    },
+    {
+      "command": "VirtualMachine.ClassesBySignature",
+      "set": 1, "cmd": 2,
+      "request": "0000000b4c4576616c50726f62653b",
+      "error": 0,
+      "reply": "0000000101000000000000000200000007"
+    },
+    {
+      "command": "VirtualMachine.ClassesBySignature",
+      "set": 1, "cmd": 2,
+      "request": "0000000b4c4576616c50726f62653b",
+      "error": 0,
+      "reply": "0000000101000000000000000200000007"
+    },
+    {
+      "command": "VirtualMachine.ClassesBySignature",
+      "set": 1, "cmd": 2,
+      "request": "000000134c4576616c50726f6265245375627461736b3b",
+      "error": 0,
+      "reply": "0000000101000000000000000400000007"
+    },
+    {
+      "command": "ReferenceType.Signature",
+      "set": 2, "cmd": 1,
+      "request": "0000000000000004",
+      "error": 0,
+      "reply": "000000134c4576616c50726f6265245375627461736b3b"
+    },
+    {
+      "command": "ReferenceType.Fields",
+      "set": 2, "cmd": 4,
+      "request": "0000000000000004",
+      "error": 0,
+      "reply": "00000000"
+    },
+    {
+      "command": "VirtualMachine.ClassesBySignature",
+      "set": 1, "cmd": 2,
+      "request": "000000134c4576616c50726f6265245375627461736b3b",
+      "error": 0,
+      "reply": "0000000101000000000000000400000007"
+    },
+    {
+      "command": "ClassType.Superclass",
+      "set": 3, "cmd": 1,
+      "request": "0000000000000004",
+      "error": 0,
+      "reply": "0000000000000005"
+    },
+    {
+      "command": "ReferenceType.Signature",
+      "set": 2, "cmd": 1,
+      "request": "0000000000000005",
+      "error": 0,
+      "reply": "000000104c4576616c50726f6265245461736b3b"
+    },
+    {
+      "command": "ReferenceType.Fields",
+      "set": 2, "cmd": 4,
+      "request": "0000000000000005",
+      "error": 0,
+      "reply": "0000000100000000000000320000000472756e73000000014900000040"
+    },
+    {
+      "command": "ClassType.Superclass",
+      "set": 3, "cmd": 1,
+      "request": "0000000000000005",
+      "error": 0,
+      "reply": "0000000000000006"
+    },
+    {
+      "command": "ReferenceType.Signature",
+      "set": 2, "cmd": 1,
+      "request": "0000000000000006",
+      "error": 0,
+      "reply": "000000124c6a6176612f6c616e672f4f626a6563743b"
+    },
+    {
+      "command": "ReferenceType.Fields",
+      "set": 2, "cmd": 4,
+      "request": "0000000000000006",
+      "error": 0,
+      "reply": "00000000"
+    },
+    {
+      "command": "ClassType.Superclass",
+      "set": 3, "cmd": 1,
+      "request": "0000000000000006",
+      "error": 0,
+      "reply": "0000000000000000"
+    },
+    {
+      "command": "VirtualMachine.ClassesBySignature",
+      "set": 1, "cmd": 2,
+      "request": "000000194c636f6d2f6578616d706c652f4e6f537563685468696e673b",
+      "error": 0,
+      "reply": "00000000"
+    },
+    {
+      "command": "EventRequest.ClearAllBreakpoints",
+      "set": 15, "cmd": 3,
+      "request": "",
+      "error": 0,
+      "reply": ""
+    },
+    {
+      "command": "VirtualMachine.Resume",
+      "set": 1, "cmd": 9,
+      "request": "",
+      "error": 0,
+      "reply": ""
+    }
+  ]
+}
