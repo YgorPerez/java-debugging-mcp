@@ -186,6 +186,8 @@ impl RequestHandler {
             "debug.get_stack" => self.handle_get_stack(args).await,
             "debug.evaluate" => self.handle_evaluate(args).await,
             "debug.list_threads" => self.handle_list_threads(args).await,
+            "debug.list_classes" => self.handle_list_classes(args).await,
+            "debug.list_methods" => self.handle_list_methods(args).await,
             "debug.thread_dump" => self.handle_thread_dump(args).await,
             "debug.get_last_event" => self.handle_get_last_event(args).await,
             "debug.set_value" => self.handle_set_value(args).await,
@@ -868,6 +870,145 @@ impl RequestHandler {
         }
         if hidden > 0 {
             let _ = writeln!(output, "… +{hidden} more (raise limit or use name_filter)");
+        }
+
+        Ok(output)
+    }
+
+    /// DISC-1: what the debuggee has actually loaded.
+    ///
+    /// Every stop point here is addressed by a fully-qualified class name, and until this existed the
+    /// caller had to already know that name. The cases where they cannot are the ones that matter: a
+    /// generated proxy, a shaded or relocated class, an EAR whose deployed build differs from the
+    /// checkout in front of you. Only the debuggee knows what it loaded.
+    ///
+    /// Bounded rather than complete. A real app server loads thousands of types, so the reply reports
+    /// matched-against-loaded and shows a page — truncating loudly, per DUMP-1, so a page is never
+    /// mistaken for the whole answer.
+    async fn handle_list_classes(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.resolve_session(&args).await
+            .ok_or_else(|| "No active debug session".to_string())?;
+
+        let mut session = session_guard.lock().await;
+
+        let a: crate::args::ListClassesArgs = crate::args::parse(&args)?;
+        let filter = a.filter.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let limit = a.limit.max(1);
+
+        let all = session.connection.all_classes().await
+            .map_err(|e| format!("Failed to list classes: {e}"))?;
+        drop(session);
+        let loaded = all.len();
+
+        // Arrays outnumber the interesting entries on a real heap and are never the answer to "what do
+        // I arm a stop point on", so they are excluded unless asked for.
+        let mut rows: Vec<(String, bool)> = all.into_iter()
+            .filter(|c| a.include_arrays || c.ref_type_tag != REF_TAG_ARRAY)
+            .map(|c| (decode_signature(&c.signature), c.ref_type_tag == REF_TAG_INTERFACE))
+            .collect();
+        if let Some(f) = filter {
+            rows.retain(|(fqn, _)| class_matches(fqn, f));
+        }
+        rows.sort_by(|x, y| x.0.cmp(&y.0));
+        let matched = rows.len();
+        let shown = matched.min(limit);
+
+        let note = filter.map_or_else(String::new, |f| format!(" matching \"{f}\""));
+        let mut output = format!("{shown}/{matched} class(es){note} — {loaded} loaded in the VM:\n");
+        for (fqn, is_interface) in rows.iter().take(limit) {
+            let _ = if *is_interface {
+                writeln!(output, "{fqn} (interface)")
+            } else {
+                writeln!(output, "{fqn}")
+            };
+        }
+        if matched > shown {
+            let _ = writeln!(
+                output, "… +{} more (raise limit, or narrow with filter)", matched - shown,
+            );
+        }
+        if matched == 0 {
+            output.push_str(
+                "Nothing matched. Note that a class the JVM has not loaded yet does not appear here \
+                 at all — classes load on first use, so an untouched code path contributes none of \
+                 its classes. That is different from the class not existing.\n",
+            );
+        }
+
+        Ok(output)
+    }
+
+    /// DISC-2: the methods of one loaded class, spelled the way Java source spells them.
+    ///
+    /// The method table was already being read — `debug.evaluate` resolves overloads against it — and
+    /// the caller composing that call was the one person who could not see it. Resolution by runtime
+    /// type is the most intricate machinery in this server, and composing arguments for it blind means
+    /// a refused argument sends you back to guessing.
+    async fn handle_list_methods(&self, args: serde_json::Value) -> Result<String, String> {
+        let session_guard = self.resolve_session(&args).await
+            .ok_or_else(|| "No active debug session".to_string())?;
+
+        let mut session = session_guard.lock().await;
+
+        let a: crate::args::ListMethodsArgs = crate::args::parse(&args)?;
+        let class_name = a.class_name.trim();
+        if class_name.is_empty() {
+            return Err("class_name is required (e.g. com.example.OrderService)".to_string());
+        }
+        let name_filter = a.name_filter.as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
+        let limit = a.limit.max(1);
+
+        let signature = format!("L{};", class_name.replace('.', "/"));
+        let found = session.connection.classes_by_signature(&signature).await
+            .map_err(|e| format!("Failed to resolve {class_name}: {e}"))?;
+        let Some(class) = found.first() else {
+            // JDWP knows only what is loaded, so it genuinely cannot separate "wrong name" from "not
+            // loaded yet". Saying which one it is would be a guess; saying that both are possible, and
+            // how to tell them apart, is the honest answer — and DISC-1 is the tool that tells them apart.
+            let simple = class_name.rsplit('.').next().unwrap_or(class_name);
+            return Err(format!(
+                "{class_name} is not loaded in the debuggee. Either the name is wrong, or the JVM has \
+                 not loaded it yet — classes load on first use, so an untouched code path has none of \
+                 its classes present. To tell those apart: debug.list_classes with filter \"*.{simple}\"."
+            ));
+        };
+        let target_id = class.type_id;
+
+        let mut rows = collect_method_rows(
+            &mut session.connection, target_id, a.inherited, name_filter.as_deref(),
+        ).await?;
+        drop(session);
+
+        // Sorted by rendered form so overloads land together, which is the comparison being made.
+        rows.sort_by(|x, y| x.1.cmp(&y.1));
+        let matched = rows.len();
+        let shown = matched.min(limit);
+
+        let mut note = String::new();
+        if let Some(f) = &name_filter {
+            let _ = write!(note, " name~\"{f}\"");
+        }
+        if a.inherited {
+            note.push_str(" +inherited");
+        }
+
+        let mut output = format!("{shown}/{matched} method(s) on {class_name}{note}:\n");
+        for (owner, rendered) in rows.iter().take(limit) {
+            let _ = if a.inherited && owner != class_name {
+                writeln!(output, "{rendered}  [from {owner}]")
+            } else {
+                writeln!(output, "{rendered}")
+            };
+        }
+        if matched > shown {
+            let _ = writeln!(
+                output, "… +{} more (raise limit or use name_filter)", matched - shown,
+            );
+        }
+        if matched == 0 && name_filter.is_some() {
+            output.push_str("No method name matched. Drop name_filter to see the whole class.\n");
         }
 
         Ok(output)
@@ -2941,6 +3082,88 @@ fn parse_expr(expr: &str) -> Result<Vec<Seg>, String> {
     raws.iter().map(|r| parse_seg(r)).collect()
 }
 
+// JDWP reference type tags (`ClassInfo::ref_type_tag`).
+const REF_TAG_INTERFACE: u8 = 2;
+const REF_TAG_ARRAY: u8 = 3;
+
+/// Match a dotted FQN against a DISC-1 filter: `com.example.*` (prefix), `*.OrderService` (suffix),
+/// or a bare substring.
+///
+/// The suffix form also accepts the bare simple name, so `*.Order` finds a top-level `Order` in the
+/// default package rather than silently missing it.
+fn class_matches(fqn: &str, filter: &str) -> bool {
+    match (filter.strip_suffix('*'), filter.strip_prefix('*')) {
+        // Both anchors (`*Order*`) is a substring test with the stars removed.
+        (Some(_), Some(_)) => fqn.contains(filter.trim_matches('*')),
+        (Some(prefix), None) => fqn.starts_with(prefix),
+        (None, Some(suffix)) => fqn.ends_with(suffix) || fqn == suffix.trim_start_matches('.'),
+        (None, None) => fqn.contains(filter),
+    }
+}
+
+/// Collect a class's methods as `(declaring class, rendered signature)` pairs (DISC-2).
+///
+/// Kept flat rather than grouped by declaring class: an overload set spread across a class and its
+/// parent is exactly the comparison the caller is trying to make, so splitting it into sections would
+/// hide the thing they came for.
+///
+/// Split out of the handler because the superclass walk is the only real logic in it — the rest is
+/// argument handling and formatting, and the two do not need to be read together.
+async fn collect_method_rows(
+    conn: &mut jdwp_client::JdwpConnection,
+    start: u64,
+    inherited: bool,
+    name_filter: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut rows = Vec::new();
+    let mut current = Some(start);
+    while let Some(type_id) = current {
+        let owner = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+        let methods = conn.get_methods(type_id).await
+            .map_err(|e| format!("Failed to read the methods of {owner}: {e}"))?;
+        for m in &methods {
+            // `<clinit>` is the static initialiser: nothing can call it and nothing can usefully break
+            // on it. `<init>` stays — a constructor is a real target for both evaluate and a stop point.
+            if m.name == "<clinit>" {
+                continue;
+            }
+            if name_filter.is_some_and(|f| !m.name.to_lowercase().contains(f)) {
+                continue;
+            }
+            rows.push((owner.clone(), render_method(&m.name, &m.signature, m.mod_bits)));
+        }
+        if !inherited {
+            break;
+        }
+        current = conn.get_superclass(type_id).await
+            .map_err(|e| format!("Failed to walk the superclass chain: {e}"))?;
+    }
+    Ok(rows)
+}
+
+/// One method as Java source would spell it: `static boolean matches(java.lang.String, int)`.
+///
+/// Takes the fields rather than the client's struct so this stays a pure formatting function that a
+/// unit test can drive with a literal descriptor.
+fn render_method(name: &str, signature: &str, mod_bits: i32) -> String {
+    // The return descriptor is everything after ')' — the same slice `force_return` takes.
+    let ret = signature.rsplit(')').next().unwrap_or("V");
+    let params: Vec<String> = sig_param_types(signature).iter().map(|p| decode_signature(p)).collect();
+
+    let mut out = String::new();
+    if mod_bits & ACC_STATIC != 0 {
+        out.push_str("static ");
+    }
+    if mod_bits & ACC_ABSTRACT != 0 {
+        out.push_str("abstract ");
+    }
+    if mod_bits & ACC_NATIVE != 0 {
+        out.push_str("native ");
+    }
+    let _ = write!(out, "{} {}({})", decode_signature(ret), name, params.join(", "));
+    out
+}
+
 /// JNI signature -> readable type name. "Lpkg/Cls;" -> "pkg.Cls"; "[I" -> "int[]".
 fn decode_signature(sig: &str) -> String {
     let bytes = sig.as_bytes();
@@ -2963,6 +3186,9 @@ fn decode_signature(sig: &str) -> String {
         Some(b'J') => "long".to_string(),
         Some(b'F') => "float".to_string(),
         Some(b'D') => "double".to_string(),
+        // Only ever appears as a method's return descriptor, which is why nothing needed it until
+        // DISC-2 rendered whole signatures — `force_return` tests the raw byte instead.
+        Some(b'V') => "void".to_string(),
         _ => sig.to_string(),
     };
     format!("{}{}", base, "[]".repeat(dims))
@@ -3087,6 +3313,10 @@ fn tag_compatible(param: u8, arg: u8) -> bool {
 
 /// `ACC_STATIC` in a JVM method's access flags (JVMS 4.6).
 const ACC_STATIC: i32 = 0x0008;
+// The other two flags DISC-2 renders. Both mean "no body": you cannot put a line breakpoint in
+// either, which is the thing a caller reading a method list needs to know before trying.
+const ACC_NATIVE: i32 = 0x0100;
+const ACC_ABSTRACT: i32 = 0x0400;
 
 /// What an argument actually *is* at the moment of the call, which is what overload resolution
 /// scores against.
@@ -8457,5 +8687,64 @@ mod tests {
             assert!(!env_readonly(), "{v:?} should be falsey");
         }
         std::env::remove_var("JDWP_READONLY");
+    }
+
+    // DISC-1: the three filter shapes are anchored differently, and a prefix must not behave as a
+    // substring — `com.example.*` matching `org.acme.com.example.Foo` would be wrong.
+    #[test]
+    fn class_filter_anchors_prefix_suffix_and_substring() {
+        assert!(class_matches("com.example.Order", "com.example.*"));
+        assert!(!class_matches("org.acme.com.example.Order", "com.example.*"));
+
+        assert!(class_matches("com.example.OrderService", "*.OrderService"));
+        assert!(!class_matches("com.example.OrderServiceImpl", "*.OrderService"));
+
+        assert!(class_matches("com.example.OrderService", "Order"));
+        assert!(class_matches("com.example.OrderService", "example.Order"));
+        assert!(!class_matches("com.example.OrderService", "Ordr"));
+
+        // Both anchors is a substring test, not an impossible starts-and-ends-with.
+        assert!(class_matches("com.example.OrderService", "*Order*"));
+    }
+
+    // DISC-1: `*.Order` should still find a top-level Order in the default package, where there is no
+    // dot to match. Missing it silently is the failure mode worth a test.
+    #[test]
+    fn class_filter_suffix_finds_a_default_package_class() {
+        assert!(class_matches("Order", "*.Order"));
+        assert!(!class_matches("Reorder", "*.Order"));
+    }
+
+    // DISC-2: a signature the caller can paste into debug.evaluate — dotted FQNs, arrays as `T[]`,
+    // primitives by name, and `void` rather than the raw `V` descriptor.
+    #[test]
+    fn method_rendering_reads_as_java_source() {
+        assert_eq!(
+            render_method("matches", "(Ljava/lang/String;I)Z", 0),
+            "boolean matches(java.lang.String, int)"
+        );
+        assert_eq!(render_method("run", "()V", 0), "void run()");
+        assert_eq!(
+            render_method("main", "([Ljava/lang/String;)V", ACC_STATIC),
+            "static void main(java.lang.String[])"
+        );
+        // Multi-dimensional arrays and the wide primitives, which the descriptor packs tightly.
+        assert_eq!(
+            render_method("grid", "([[JD)[Ljava/lang/Object;", 0),
+            "java.lang.Object[] grid(long[][], double)"
+        );
+    }
+
+    // DISC-2: abstract and native both mean "no body", which is what stops a caller wasting a
+    // debug.set_line_stop on them. Flags combine rather than overriding one another.
+    #[test]
+    fn method_rendering_marks_bodyless_and_static_methods() {
+        assert_eq!(render_method("size", "()I", ACC_ABSTRACT), "abstract int size()");
+        assert_eq!(
+            render_method("currentTimeMillis", "()J", ACC_STATIC | ACC_NATIVE),
+            "static native long currentTimeMillis()"
+        );
+        // A constructor keeps its JVM spelling — it is what evaluate and a stop point both name.
+        assert_eq!(render_method("<init>", "(I)V", 0), "void <init>(int)");
     }
 }

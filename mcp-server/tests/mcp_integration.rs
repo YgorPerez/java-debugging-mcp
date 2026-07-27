@@ -3842,3 +3842,99 @@ fn rearming_survives_a_classloader_reload() {
 
     server.panic_reset();
 }
+
+/// DISC-1 (#29): class discovery. The debuggee is the only thing that knows what it loaded, and
+/// until this tool existed the caller had to already know every name they wanted to arm.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn list_classes_finds_loaded_types_and_bounds_the_answer() {
+    let Some(jdk) = jdk_or_skip("list_classes_finds_loaded_types_and_bounds_the_answer") else { return };
+    let probe = Probe::launch(&jdk, "EvalProbe").expect("launch EvalProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // Substring match finds the probe and its nested classes.
+    let mine = server.call("debug.list_classes", serde_json::json!({"filter": "EvalProbe"}));
+    assert_contains_all("probe classes", &mine, &["EvalProbe", "EvalProbe$Item", "EvalProbe$Task"]);
+    // Dotted FQNs, never the `Lpkg/Cls;` form the JVM actually reports — the caller composes against
+    // the former and JDWP speaks the latter, which is the whole reason this renders anything.
+    assert!(!mine.contains("LEvalProbe"), "signatures must be decoded, not raw JNI: {mine}");
+
+    // A prefix anchors at the start, so it must not behave as a substring.
+    let prefixed = server.call("debug.list_classes", serde_json::json!({"filter": "java.util.*", "limit": 200}));
+    assert!(prefixed.contains("java.util."), "prefix filter found nothing: {prefixed}");
+    for line in prefixed.lines().skip(1).filter(|l| !l.starts_with('…')) {
+        assert!(
+            line.starts_with("java.util."),
+            "a prefix filter matched something it should not have: {line}"
+        );
+    }
+
+    // An unfiltered call is bounded and says so — a page must never read as the whole answer (DUMP-1).
+    let bounded = server.call("debug.list_classes", serde_json::json!({"limit": 5}));
+    assert_contains_all("bounded listing", &bounded, &["loaded in the VM", "more (raise limit"]);
+
+    // Arrays are excluded by default and available on request.
+    let no_arrays = server.call("debug.list_classes", serde_json::json!({"filter": "*[]"}));
+    assert!(no_arrays.starts_with("0/0 "), "arrays must be excluded by default: {no_arrays}");
+    let arrays = server.call(
+        "debug.list_classes",
+        serde_json::json!({"filter": "*[]", "include_arrays": true, "limit": 5}),
+    );
+    assert!(arrays.contains("[]"), "include_arrays must surface array types: {arrays}");
+
+    // Nothing matched must not read as "no such class" — the JVM only knows what it has loaded.
+    let absent = server.call("debug.list_classes", serde_json::json!({"filter": "com.nosuch.*"}));
+    assert_contains_all("absent class", &absent, &["Nothing matched", "not loaded yet"]);
+}
+
+/// DISC-2 (#30): a method listing the caller can compose a `debug.evaluate` call from, rather than
+/// guessing at parameter lists that overload resolution will then refuse.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn list_methods_renders_java_signatures_and_marks_static() {
+    let Some(jdk) = jdk_or_skip("list_methods_renders_java_signatures_and_marks_static") else { return };
+    let probe = Probe::launch(&jdk, "EvalProbe").expect("launch EvalProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let m = server.call("debug.list_methods", serde_json::json!({"class_name": "EvalProbe", "limit": 100}));
+    // Primitives, arrays and void all render as Java source types.
+    assert_contains_all("rendered signatures", &m, &[
+        "static int twice(int)",
+        "static java.lang.String greet(java.lang.String)",
+        "static void main(java.lang.String[])",
+    ]);
+    assert!(!m.contains("(I)"), "raw JVM descriptors must not leak into the listing: {m}");
+
+    // Every overload appears — comparing their parameter lists side by side is the point.
+    assert_eq!(m.matches("pick(").count(), 4, "all four pick overloads should be listed: {m}");
+    // The instance overload is the one with no `static` marker.
+    assert!(m.contains("java.lang.String pick(int)"), "instance overload missing: {m}");
+    // The static initialiser is not callable and not breakable, so it is not listed.
+    assert!(!m.contains("<clinit>"), "<clinit> is noise and should be omitted: {m}");
+
+    let twice = server.call(
+        "debug.list_methods",
+        serde_json::json!({"class_name": "EvalProbe", "name_filter": "twice"}),
+    );
+    assert_contains_all("name_filter", &twice, &["twice(int)", "name~\"twice\""]);
+    assert!(!twice.contains("greet"), "name_filter must exclude non-matches: {twice}");
+
+    // Declared-only by default; the superclass chain is opt-in and attributes each inherited row.
+    let own = server.call("debug.list_methods", serde_json::json!({"class_name": "EvalProbe$Subtask"}));
+    assert!(!own.contains("void run()"), "run() is declared on Task, not Subtask: {own}");
+    let chain = server.call(
+        "debug.list_methods",
+        serde_json::json!({"class_name": "EvalProbe$Subtask", "inherited": true, "limit": 100}),
+    );
+    assert_contains_all("inherited walk", &chain, &["void run()", "[from EvalProbe$Task]"]);
+
+    // "Not loaded" and "no such class" are indistinguishable over JDWP, so the reply must say that
+    // rather than pick one — and point at the tool that can tell them apart.
+    let missing = server.call(
+        "debug.list_methods",
+        serde_json::json!({"class_name": "com.example.NoSuchThing"}),
+    );
+    assert_contains_all("unloaded class", &missing, &["is not loaded", "debug.list_classes"]);
+}

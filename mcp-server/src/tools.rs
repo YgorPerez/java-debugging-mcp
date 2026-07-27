@@ -4,7 +4,7 @@
 // advertised schema always matches what the handler deserializes. Tools with no arguments use an
 // empty object schema.
 
-use crate::args::{AttachArgs, SetBreakpointArgs, ClearBreakpointArgs, StepArgs, GetStackArgs, EvaluateArgs, GetLastEventArgs, ListThreadsArgs, SetValueArgs, GetTracesArgs, SetExceptionBreakpointArgs, SetWatchpointArgs, ForceReturnArgs, ToggleBreakpointArgs, ThreadDumpArgs, SetMethodBreakpointArgs};
+use crate::args::{AttachArgs, SetBreakpointArgs, ClearBreakpointArgs, StepArgs, GetStackArgs, EvaluateArgs, GetLastEventArgs, ListThreadsArgs, ListClassesArgs, ListMethodsArgs, SetValueArgs, GetTracesArgs, SetExceptionBreakpointArgs, SetWatchpointArgs, ForceReturnArgs, ToggleBreakpointArgs, ThreadDumpArgs, SetMethodBreakpointArgs};
 use crate::protocol::Tool;
 use serde_json::json;
 
@@ -163,6 +163,16 @@ fn inspection_tools() -> Vec<Tool> {
             input_schema: to_val(schemars::schema_for!(ListThreadsArgs)),
         },
         Tool {
+            name: "debug.list_classes".to_string(),
+            description: "List the classes the debuggee has actually LOADED — the first step when you do not already know the fully-qualified name a stop point needs. Only the JVM can answer this for a generated proxy, a shaded/relocated class, or a deployment whose build differs from your checkout. Narrow with filter, matched against the dotted name (com.example.Order), never the JNI signature: prefix 'com.example.*', suffix '*.OrderService', or a bare substring. A JVM like WildFly loads thousands of types, so the reply shows a page and reports matched-against-loaded rather than dumping everything — raise limit or narrow the filter to see more. Array types are excluded unless include_arrays:true. A class the JVM has not loaded yet does not appear at all (classes load on first use), which is NOT the same as the class not existing.".to_string(),
+            input_schema: to_val(schemars::schema_for!(ListClassesArgs)),
+        },
+        Tool {
+            name: "debug.list_methods".to_string(),
+            description: "List a loaded class's methods with signatures rendered as Java source types (static boolean matches(java.lang.String, int)) — what you need to compose a debug.evaluate call, since overload resolution matches on the runtime types of the arguments you supply, or to check a method name before naming it in debug.set_line_stop. Overloads all appear, so the parameter lists can be compared side by side. static/abstract/native are marked; abstract and native have no body to put a line breakpoint in. Declared methods only unless inherited:true walks the superclass chain (each inherited row says which class it came from). <clinit> is omitted; constructors (<init>) are kept. If the class is not loaded the reply says so and points at debug.list_classes, because JDWP cannot tell a wrong name from a not-yet-loaded one.".to_string(),
+            input_schema: to_val(schemars::schema_for!(ListMethodsArgs)),
+        },
+        Tool {
             name: "debug.thread_dump".to_string(),
             description: "Every thread's stack in ONE call, plus which monitors each thread holds and which one it is blocked entering — the \"it's wedged, who is blocked on what?\" question, which list_threads (names only) and get_stack (one thread) can't answer. A thread waiting on a lock someone else holds is annotated `← held by 0x<id> \"<name>\"`, so a deadlock cycle is readable off the output. IMPORTANT: JDWP can only read a SUSPENDED thread's stack and locks, so on a running VM every thread comes back unreadable — pass suspend:true to freeze it briefly (it is resumed and verified before the reply) or only_suspended:true to list just the readable ones. It never suspends on its own. Narrow the cost with name_filter / limit / max_frames / package_filter; for the deadlock question alone, monitors_only:true reads the lock graph without the frames. The reply reports how many JDWP packets it spent, WHAT EACH ONE COST on this connection (round trip plus our processing), and, when it suspended, how many milliseconds it held the VM — bounded by max_suspend_ms (default 2000), which truncates loudly rather than silently and tells you what finishing would have cost at the rate it was running. Those figures are measured against the JVM you are attached to, so you never have to judge whether a number measured elsewhere applies: a dump of a 306-thread pool with 60-frame stacks costs ~258 packets and ~65ms at the defaults, or ~1,625 packets and ~700ms for every thread and every frame. Works in a read-only session (it invokes nothing).".to_string(),
             input_schema: to_val(schemars::schema_for!(ThreadDumpArgs)),
@@ -209,6 +219,8 @@ mod tests {
             "debug.get_stack",
             "debug.evaluate",
             "debug.list_threads",
+            "debug.list_classes",
+            "debug.list_methods",
             "debug.thread_dump",
             "debug.get_traces",
         ] {

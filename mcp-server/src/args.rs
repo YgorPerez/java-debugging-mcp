@@ -15,6 +15,9 @@ const fn default_max_frames() -> usize { 20 }
 const fn default_true() -> bool { true }
 const fn default_max_result_length() -> usize { 2000 }
 const fn default_limit() -> usize { 40 }
+// Higher than `default_limit`: a class listing is one short line each, and an app server loads
+// thousands, so the useful default shows enough of a package to recognise it without a second call.
+const fn default_class_limit() -> usize { 100 }
 const fn default_trace_limit() -> usize { 50 }
 const fn default_event_limit() -> usize { 1 }
 const fn default_max_depth() -> usize { 2 }
@@ -268,6 +271,41 @@ pub struct ListThreadsArgs {
     #[serde(default)]
     pub only_suspended: bool,
     /// Max threads to return; the rest are reported as a hidden count.
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
+/// Arguments for `debug.list_classes` (DISC-1).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListClassesArgs {
+    /// Narrow by class name. Matched against the dotted FQN (com.example.Order), never the JNI
+    /// signature the JVM reports. Three shapes: prefix 'com.example.*', suffix `*.OrderService`,
+    /// or a bare substring. Case-sensitive, because Java names are.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Max classes to return; the rest are reported as a hidden count.
+    #[serde(default = "default_class_limit")]
+    pub limit: usize,
+    /// Include array types (java.lang.String[]). Off by default — they are noise when the question
+    /// is which class to arm a stop point on.
+    #[serde(default)]
+    pub include_arrays: bool,
+}
+
+/// Arguments for `debug.list_methods` (DISC-2).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListMethodsArgs {
+    /// Fully-qualified class name, e.g. com.example.OrderService. Must already be loaded — find it
+    /// with `debug.list_classes` if unsure.
+    pub class_name: String,
+    /// Only methods whose name contains this substring (case-insensitive).
+    #[serde(default)]
+    pub name_filter: Option<String>,
+    /// Also walk the superclass chain. Off by default: the class's own methods are what was asked
+    /// for, and Object's contribute noise to every listing.
+    #[serde(default)]
+    pub inherited: bool,
+    /// Max methods to return; the rest are reported as a hidden count.
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
