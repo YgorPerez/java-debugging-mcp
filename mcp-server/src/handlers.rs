@@ -8273,7 +8273,7 @@ mod tests {
     fn a_dump_reports_its_own_observed_per_packet_cost() {
         // 500 packets over 1000ms is 2.00ms each — arithmetic the reader can check.
         let mut meta = dump_meta(1, 500);
-        meta.wire = std::time::Duration::from_millis(1000);
+        meta.wire = std::time::Duration::from_secs(1);
         let out = render_thread_dump(&[dump_row(0x8, "worker")], &dump_args(json!({})), None, &meta);
         assert!(out.contains("Cost: 500 JDWP packet(s), 2.00ms each"), "per-packet price missing:\n{out}");
         assert!(out.contains("round trip + our own processing"), "it must say what the figure covers:\n{out}");
@@ -8293,7 +8293,7 @@ mod tests {
     fn a_truncated_dump_estimates_what_the_rest_would_have_cost() {
         // 10 threads read in 1000ms is 100ms each; 20 skipped is ~2000ms more, ~3000ms for the whole set.
         let mut meta = dump_meta(30, 900);
-        meta.held = Some(std::time::Duration::from_millis(1000));
+        meta.held = Some(std::time::Duration::from_secs(1));
         meta.unread = 20;
         let rows: Vec<DumpRow> = (0..10).map(|i| dump_row(0x8 + i, "worker")).collect();
         let out = render_thread_dump(&rows, &dump_args(json!({"suspend": true})), None, &meta);

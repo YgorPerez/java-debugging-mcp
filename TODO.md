@@ -153,6 +153,24 @@ cargo clippy --workspace --all-targets -- -W clippy::pedantic -W clippy::nursery
 `multiple_crate_versions`. Neither is on by default, which is why plain `cargo clippy` looked clean the
 whole time. Then run `scripts/doctor.sh` for the custom rules.
 
+**And on any platform, `scripts/doctor.sh` on the wrong toolchain cannot verify it either.** The gate is
+pinned to **1.97.1** (LINT-1's whole point: a new lint should be a scheduled bump, not a surprise
+build break). The cost of that pin is the mirror image: an **older** local toolchain does not have the
+newer lints, so it reports 0 for code the gate fails on. That cost a red `main` — two
+`Duration::from_millis(1000)` in test code passed a local 1.94 run at 100/100 and failed CI on
+`clippy::duration_suboptimal_units`, added in 1.97. `doctor.sh` now compares the active rustc against the
+pinned one (read out of the workflow, so they cannot drift) and says so loudly rather than letting a clean
+run be believed:
+
+```
+rustup toolchain install 1.97.1 --component clippy
+RUSTUP_TOOLCHAIN=1.97.1 scripts/doctor.sh --fail-on warning
+```
+
+Same family as the rest: SIGKILL'd coverage counters, an undetectable JDK, a filter matching no tests, a
+warm cache linting only what it rebuilt. **Five** ways to get a green run that examined nothing, and every
+one of them was found by something other than the check itself.
+
 ## The resume-honesty invariant (read this before touching a resume path)
 
 Five reviews in, **every round's most serious bug was in the previous round's safety work**, and the
