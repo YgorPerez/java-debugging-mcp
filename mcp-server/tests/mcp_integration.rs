@@ -22,7 +22,8 @@ mod common;
 use common::cassette::{cassette_path, rerecording, Cassette, CassetteRecorder, ReplayServer, RERECORD_ENV};
 use common::{
     assert_contains_all, jdk_or_skip, probe_line, probe_source, probe_source_path, refusal_verdict,
-    resume_verdict, EventFault, Fault, FaultRelay, Jdk, JvmState, LatencyRelay, Probe, Server, EVENT_TIMEOUT,
+    resume_verdict, EventFault, Fault, FaultRelay, Jdk, JvmState, LatencyRelay, Probe, Server,
+    EVENT_KIND_BREAKPOINT, EVENT_TIMEOUT,
 };
 
 /// EVAL-1 / EVAL-2: static-method invocation and object arguments, through the real handlers.
@@ -7090,20 +7091,24 @@ fn every_refused_attach_world_gets_its_own_verdict() {
 /// reproduce.
 ///
 /// The sighting was `[pending] 2 older event(s)` where the test staged one, on a JDK this machine does not
-/// have. Rather than soak for it, [`EventFault::Duplicate`] puts the extra event on the wire, which is what
+/// have. Rather than soak for it, [`EventFault::DuplicateKind`] puts the extra event on the wire, which is
 /// the debugger would see if two armed requests had matched one location. What that pins down is everything
 /// downstream of the extra event: that the buffer keeps both, that the backlog count follows, and that
 /// nothing silently coalesces them — so when the real thing recurs, the reading is about *why a second
 /// event existed* rather than about whether the buffer can be trusted.
 ///
-/// It does **not** show that a JVM sends an event twice. See [`EventFault::Duplicate`] for that limit.
+/// It does **not** show that a JVM sends an event twice. See [`EventFault::DuplicateKind`] for that limit.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_duplicated_hit_is_buffered_twice_rather_than_coalesced() {
     let Some(jdk) = jdk_or_skip("a_duplicated_hit_is_buffered_twice_rather_than_coalesced") else { return };
     let probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
-    let relay = FaultRelay::start_with_events(probe.port, vec![], Some(EventFault::Duplicate(1)))
-        .expect("start the fault relay");
+    let relay = FaultRelay::start_with_events(
+        probe.port,
+        vec![],
+        Some(EventFault::DuplicateKind { kind: EVENT_KIND_BREAKPOINT, times: 1 }),
+    )
+    .expect("start the fault relay");
     let mut server = Server::start().expect("start server");
     server.attach(relay.port);
 
@@ -7113,13 +7118,24 @@ fn a_duplicated_hit_is_buffered_twice_rather_than_coalesced() {
         .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
         .expect("breakpoint in ExcProbe.main never fired");
 
+    // The instrument first. Without this the assertion below reports `got 1` for two opposite worlds —
+    // a fault that never fired and a debugger that coalesced the copies — and the first cut of this test
+    // failed in CI with exactly that ambiguity, because it matched events by position and the leading
+    // event on that runner was not the breakpoint.
+    assert_eq!(
+        relay.duplicated(),
+        1,
+        "the fault never fired, so this test proves nothing about the buffer: no composite event of kind \
+         {EVENT_KIND_BREAKPOINT} (breakpoint) crossed the relay. Fix the instrument, not the assertion."
+    );
+
     // One hit, delivered twice. Both copies must be in the buffer: a debugger that quietly dropped the
     // second would be *hiding* the anomaly, which is worse than reporting a backlog nobody expected.
     let buffered = server.call("debug.get_last_event", serde_json::json!({"limit": 10}));
     let hits = buffered.matches("\"event\":\"breakpoint\"").count();
     assert_eq!(
         hits, 2,
-        "the duplicated hit should be buffered twice, not coalesced or dropped — got {hits}:\n{buffered}"
+        "the fault fired, so the debugger coalesced or dropped a copy — got {hits}:\n{buffered}"
     );
 
     // And the newest-event view must announce the backlog rather than pretend there is one event.

@@ -751,7 +751,7 @@ pub enum Fault {
 /// policy has to be positional instead.
 #[derive(Clone, Debug)]
 pub enum EventFault {
-    /// Deliver the first `n` composite event packets **twice**.
+    /// Deliver the first `times` composite events **whose first event is of `kind`** twice.
     ///
     /// This is the debugger-side shape of TEST-23 ([#64](https://github.com/YgorPerez/java-debugging-mcp/issues/64)):
     /// one breakpoint hit that arrives as two buffered events. A real JVM would produce it by having two
@@ -762,7 +762,30 @@ pub enum EventFault {
     /// So this reproduces the *observable* faithfully and the *cause* only by analogy, which is the honest
     /// limit of it: it proves what the buffer and the diagnostics do with an extra event. It does not prove
     /// a JVM ever sends one.
-    Duplicate(usize),
+    ///
+    /// **`kind` is not optional, and the first cut of this learned that the hard way.** It was originally
+    /// "the first `n` composite events", which duplicated whichever event happened to arrive first — and
+    /// what arrives first is not a property of the test. It passed on JDK 11.0.30 and 25 locally and failed
+    /// on CI's Temurin 11.0.31, where the leading event was something else (a `CLASS_PREPARE` from the
+    /// deferred-arming watch, or a `VM_START`), so the breakpoint was never duplicated at all. A positional
+    /// policy across JVMs is exactly the kind of accidental dependency this suite keeps getting bitten by;
+    /// naming the kind makes the target the *event* rather than its position in a stream nobody controls.
+    DuplicateKind { kind: u8, times: usize },
+}
+
+/// JDWP `eventKind` values, for [`EventFault::DuplicateKind`].
+///
+/// Only the ones used are named. The full table is in the JDWP spec's `EventKind` constant.
+pub const EVENT_KIND_BREAKPOINT: u8 = 2;
+
+/// The `eventKind` of the **first** event in a composite event packet, if it has one.
+///
+/// The layout is fixed and reachable without knowing the VM's id sizes, which is what makes this cheap:
+/// an 11-byte packet header, then `suspendPolicy` (1 byte), then `events` (a 4-byte count), then the first
+/// event's `eventKind`. Everything after that is kind-dependent and needs id sizes — which is precisely why
+/// this fault duplicates whole packets instead of editing inside one.
+fn composite_event_kind(pkt: &[u8]) -> Option<u8> {
+    pkt.get(JDWP_HEADER + 1 + 4).copied()
 }
 
 /// A JDWP proxy that rewrites chosen replies, so the debugger can be driven through failures a healthy
@@ -786,6 +809,13 @@ pub struct FaultRelay {
     /// Dropping this drops the listener and the sockets with it — and [`sever`](Self::sever) reaches
     /// through it to end a live connection without that teardown.
     relay: Relay,
+    /// How many event packets [`EventFault`] has actually duplicated.
+    ///
+    /// Exposed because without it a test cannot tell **the fault never fired** from **the debugger
+    /// coalesced the copies**, and those are opposite conclusions: the first is a broken instrument, the
+    /// second a finding about the product. That ambiguity is exactly what made this test's own CI failure
+    /// unreadable — it reported `got 1` and left which of the two open.
+    duplicated: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The JDWP handshake both ends send before any packet framing begins.
@@ -811,24 +841,33 @@ impl FaultRelay {
         faults: Vec<(u8, u8, Fault)>,
         on_events: Option<EventFault>,
     ) -> Result<Self, String> {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let for_relay = Arc::clone(&counter);
         let relay = Relay::start("fault relay", Some(target_port), move |client, server| {
             let Some(server) = server else { return };
             let faults = faults.clone();
             let on_events = on_events.clone();
-            // Counted across the whole session rather than per packet, so `Duplicate(1)` means "the first
-            // event only" and a test can stage a second, clean event after it.
-            let mut duplicated = 0usize;
+            let counter = Arc::clone(&for_relay);
+            // Counted across the whole session rather than per packet, so `times: 1` means "one event
+            // only" and a test can stage a second, clean event after it.
+            let duplicated = Arc::clone(&counter);
             wire_framed(client, server, move |seen| {
                 let (command, reply) = match seen {
                     // Composite events are *command* packets (set 64) from the debuggee's side. Untouched
                     // unless a policy asks for them: faulting them blindly breaks the event pump rather
                     // than testing it.
                     FromDebuggee::Event(pkt) => {
-                        let Some(EventFault::Duplicate(n)) = on_events else { return None };
-                        if duplicated >= n {
+                        let Some(EventFault::DuplicateKind { kind, times }) = on_events else {
+                            return None;
+                        };
+                        // Matched by kind, not by position: see `DuplicateKind` for the CI failure that
+                        // taught this. An event of another kind is forwarded and does not count.
+                        if duplicated.load(std::sync::atomic::Ordering::Relaxed) >= times
+                            || composite_event_kind(pkt) != Some(kind)
+                        {
                             return None;
                         }
-                        duplicated += 1;
+                        duplicated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // Two copies in one write. The debugger frames by length, so this is
                         // indistinguishable from the debuggee having sent the event twice.
                         return Some([pkt, pkt].concat());
@@ -843,7 +882,7 @@ impl FaultRelay {
                 })
             });
         })?;
-        Ok(Self { port: relay.port, relay })
+        Ok(Self { port: relay.port, relay, duplicated: counter })
     }
 
     /// Cut the live connection without tearing the relay down, so the debugger sees the debuggee vanish.
@@ -854,6 +893,11 @@ impl FaultRelay {
     /// ([#65](https://github.com/YgorPerez/java-debugging-mcp/issues/65)) is exactly this state.
     pub fn sever(&self) {
         self.relay.sever();
+    }
+
+    /// How many event packets the [`EventFault`] has duplicated so far.
+    pub fn duplicated(&self) -> usize {
+        self.duplicated.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
