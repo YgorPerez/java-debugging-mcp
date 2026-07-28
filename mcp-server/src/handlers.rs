@@ -732,10 +732,14 @@ impl RequestHandler {
         // depth and report honestly if it couldn't (SAFE-7).
         let note = resume_and_verify(&mut session).await?;
         session.mark_resumed();
+        // Panic reads as "put everything back", and for stop points and suspension it is. It cannot
+        // un-redefine a class, so it must say what it is leaving in place rather than let the caller infer
+        // from a clean-looking reply that the JVM is as it found it (SWAP-2).
+        let residue = describe_outstanding_redefinitions(&session.redefinitions);
         drop(session);
 
         Ok(format!(
-            "🧯 Panic: cleared {} breakpoint(s){}{}{}{} and resumed all threads.{}",
+            "🧯 Panic: cleared {} breakpoint(s){}{}{}{} and resumed all threads.{}{residue}",
             n,
             if np > 0 { format!(" + {np} deferred") } else { String::new() },
             if ne > 0 { format!(" + {ne} exception") } else { String::new() },
@@ -1463,8 +1467,11 @@ impl RequestHandler {
                 )
             };
             session.mark_resumed();
+            // Read the residue before the session is removed, because removing it is what destroys the
+            // only record that these redefinitions happened (SWAP-2).
+            let residue = describe_outstanding_redefinitions(&session.redefinitions);
             drop(session);
-            Some((note, was_suspended))
+            Some((note, was_suspended, residue))
         } else {
             None
         };
@@ -1472,8 +1479,8 @@ impl RequestHandler {
         self.session_manager.remove_session(&session_id).await;
 
         Ok(match safety {
-            Some((note, was_suspended)) => format!(
-                "✅ Disconnected from debug session: {session_id}\n   {note}{}",
+            Some((note, was_suspended, residue)) => format!(
+                "✅ Disconnected from debug session: {session_id}\n   {note}{}{residue}",
                 if was_suspended {
                     "\n   The VM was suspended at a stop point — it is now running."
                 } else {
@@ -1738,6 +1745,9 @@ impl RequestHandler {
             .map_err(|e| explain_redefine_failure(&class_name, &path, &e))?;
 
         // Everything below is reporting, and none of it may fail the swap — it already happened.
+        // Recording it is part of that: SWAP-2's residue report is the reason a redefinition needs no
+        // permission axis of its own, so it must be noted on the success path and nowhere else.
+        session.note_redefinition(&class_name);
         let thread = crate::args::parse_thread_id(a.thread_id.as_deref()).or(session.last_thread);
         let live = live_frames_of(&mut session.connection, thread, type_id).await;
         let armed = stop_points_on(&session, &class_name);
@@ -1837,6 +1847,9 @@ impl RequestHandler {
                 a.frame
             )
         })?;
+        // A pop of a class this session redefined means the swap is certainly live now, rather than
+        // possibly masked by frames that entered with the old bytecode (SWAP-2).
+        session.note_pop(&class);
         drop(session);
 
         let above = a.frame;
@@ -2334,6 +2347,52 @@ fn env_readonly() -> bool {
 
 /// The refusal a read-only session returns for a mutating tool (SAFE-3). Names what was refused and
 /// how to lift the guard, and is explicit that it is a guard against accident, not a security boundary.
+/// Render an elapsed time the way a human reads it off a report. Coarse on purpose: the question this
+/// answers is "has this JVM been like this for minutes or for hours", and a millisecond would be noise.
+fn ago(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s ago"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        _ => format!("{}h {}m ago", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+/// SWAP-2: name the classes this session redefined and cannot restore.
+///
+/// Empty string when nothing was redefined, because the overwhelming majority of sessions never redefine
+/// anything and a line saying so on every disconnect is the kind of noise that trains a reader to skip the
+/// whole reply — the same reasoning ADR-0010 applies to a traced stop point that captured nothing.
+///
+/// The wording commits to the two things a reader cannot work out for themselves: that the debugger cannot
+/// undo this, and that a redeploy is what can.
+fn describe_outstanding_redefinitions(
+    redefinitions: &std::collections::BTreeMap<String, crate::session::Redefinition>,
+) -> String {
+    if redefinitions.is_empty() {
+        return String::new();
+    }
+
+    let mut out = format!(
+        "\n⚠️  {} class(es) are still running bytecode this session installed. Nothing here can put them \
+         back — only redeploying the artifact restores the original code:\n",
+        redefinitions.len()
+    );
+    for (class, r) in redefinitions {
+        let times = if r.count == 1 { "once".to_string() } else { format!("{}× times", r.count) };
+        // A swap nobody popped may never have reached the frames that were already running, so it is
+        // reported as an uncertainty rather than as a smaller problem: the class is still swapped either
+        // way, and which of the two it is decides what the next person should check.
+        let liveness = if r.popped_since {
+            "a frame was popped since, so the new code is live"
+        } else {
+            "no frame popped since, so frames that were already running may still hold the old code"
+        };
+        let _ = writeln!(out, "   {class} — reloaded {times}, {}, {liveness}", ago(r.at.elapsed()));
+    }
+    out
+}
+
 fn readonly_refusal(action: &str) -> String {
     format!(
         "🔒 Read-only session: {action}, which is refused. Reattach without read_only (or unset \
@@ -2713,6 +2772,12 @@ fn render_session_line(
     }
     if !s.events.is_empty() {
         let _ = write!(line, ", {} event(s)", s.events.len());
+    }
+    // SWAP-2. Deliberately not gated on being the current session: a session *someone else* left behind
+    // is the case that matters, and this listing is the only place a third party can discover that a JVM
+    // is running bytecode a debugger installed.
+    if !s.redefinitions.is_empty() {
+        let _ = write!(line, ", ⚠️ {} class(es) still reloaded", s.redefinitions.len());
     }
     if is_current {
         line.push_str(" ← current");
@@ -11151,6 +11216,83 @@ mod tests {
         assert!(explained.contains("locals, fields, statics"), "must say what still works: {explained}");
         let untouched = explain_readonly("Unknown local variable 'foo'".to_string());
         assert_eq!(untouched, "Unknown local variable 'foo'");
+    }
+
+    /// `at` is always "now" on purpose. Building an age with `Instant::now() - 4min` would make these
+    /// tests depend on how long the machine has been up — `Instant` has no portable origin, and
+    /// `checked_sub` returns `None` when the result would precede it. How an age *renders* is covered by
+    /// `ago_is_coarse_and_never_reports_milliseconds`, which works in pure `Duration`s and cannot flake.
+    fn redefinition(count: u32, popped_since: bool) -> crate::session::Redefinition {
+        crate::session::Redefinition { count, at: std::time::Instant::now(), popped_since }
+    }
+
+    // SWAP-2: the silent case is the one that decides whether anyone reads the loud one. Nearly every
+    // session redefines nothing, and a "0 classes redefined" line on every disconnect is how a reader
+    // learns to skip the whole reply — the same argument ADR-0010 makes for a trace that captured nothing.
+    #[test]
+    fn a_session_that_redefined_nothing_says_nothing_about_it() {
+        assert_eq!(describe_outstanding_redefinitions(&std::collections::BTreeMap::new()), "");
+    }
+
+    // The two facts a reader cannot deduce: the debugger cannot undo this, and a redeploy can. If this
+    // test ever fails on wording, the wording is what needs defending — not the test.
+    #[test]
+    fn an_outstanding_redefinition_names_the_class_and_the_only_remedy() {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("com.acme.OrderService".to_string(), redefinition(1, false));
+
+        let out = describe_outstanding_redefinitions(&m);
+
+        assert!(out.contains("com.acme.OrderService"), "must name the class:\n{out}");
+        assert!(out.contains("redeploy"), "must name the only remedy:\n{out}");
+        assert!(out.contains("once"), "one swap reads as 'once', not '1× times':\n{out}");
+        assert!(out.contains("ago"), "must say how long the JVM has been like this:\n{out}");
+    }
+
+    // A swap nobody popped may never have reached the frames that were already running. Both states are
+    // residue; they differ in what the next person should check, so they must not render alike.
+    #[test]
+    fn a_popped_redefinition_reads_differently_from_an_unpopped_one() {
+        let mut popped = std::collections::BTreeMap::new();
+        popped.insert("com.acme.A".to_string(), redefinition(3, true));
+        let mut unpopped = std::collections::BTreeMap::new();
+        unpopped.insert("com.acme.A".to_string(), redefinition(3, false));
+
+        let popped = describe_outstanding_redefinitions(&popped);
+        let unpopped = describe_outstanding_redefinitions(&unpopped);
+
+        assert!(popped.contains("the new code is live"), "{popped}");
+        assert!(unpopped.contains("may still hold the old code"), "{unpopped}");
+        assert_ne!(popped, unpopped, "the two states must not render identically");
+        assert!(popped.contains("3× times"), "a repeated swap reports its count:\n{popped}");
+    }
+
+    // Ordering is stable so two runs of the same report are comparable, and the count in the header must
+    // agree with the number of lines under it.
+    #[test]
+    fn every_outstanding_class_is_listed_in_a_stable_order() {
+        let mut m = std::collections::BTreeMap::new();
+        for c in ["com.acme.Zebra", "com.acme.Apple", "com.acme.Mango"] {
+            m.insert(c.to_string(), redefinition(1, false));
+        }
+
+        let out = describe_outstanding_redefinitions(&m);
+
+        assert!(out.contains("3 class(es)"), "header must agree with the list:\n{out}");
+        let apple = out.find("Apple").expect("Apple listed");
+        let mango = out.find("Mango").expect("Mango listed");
+        let zebra = out.find("Zebra").expect("Zebra listed");
+        assert!(apple < mango && mango < zebra, "must be alphabetical, not hash order:\n{out}");
+    }
+
+    #[test]
+    fn ago_is_coarse_and_never_reports_milliseconds() {
+        assert_eq!(ago(std::time::Duration::from_secs(0)), "0s ago");
+        assert_eq!(ago(std::time::Duration::from_secs(59)), "59s ago");
+        assert_eq!(ago(std::time::Duration::from_secs(60)), "1m ago");
+        assert_eq!(ago(std::time::Duration::from_secs(3599)), "59m ago");
+        assert_eq!(ago(std::time::Duration::from_secs(3600)), "1h 0m ago");
+        assert_eq!(ago(std::time::Duration::from_secs(7_384)), "2h 3m ago");
     }
 
     // SAFE-3: JDWP_READONLY parsing accepts the common truthy spellings and nothing else.

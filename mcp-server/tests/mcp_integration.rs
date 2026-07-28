@@ -6230,6 +6230,93 @@ fn a_hot_reload_changes_what_a_running_jvm_prints() {
     assert!(tick > after_dry.1, "the probe must have kept ticking across the swap, not been frozen by it");
 }
 
+/// SWAP-2 (#61): the residue is reported at the end of the session that caused it.
+///
+/// This is the mitigation that let SWAP-1 keep a single read-only gate instead of a third permission
+/// axis. The argument was that reporting an unrepairable side effect is more honest than a mode nobody
+/// remembers to set — which is only true while the report exists, so it is worth a test that drives the
+/// whole path rather than only the renderer.
+///
+/// Asserted through the real tool replies because that is where the claim is made. `list_sessions` is
+/// checked too: a session *someone else* left behind is the case that matters, and the listing is the
+/// only place a third party can discover it.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_reloaded_class_is_reported_as_outstanding_when_the_session_ends() {
+    let Some(jdk) = jdk_or_skip("a_reloaded_class_is_reported_as_outstanding_when_the_session_ends") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let classes = swap_probe_returning(&jdk, 2);
+    let root = classes.path().display().to_string();
+
+    // Before any reload, nothing anywhere should mention outstanding bytecode.
+    let quiet = server.call("debug.list_sessions", serde_json::json!({}));
+    assert!(
+        !quiet.contains("still reloaded"),
+        "a session that has redefined nothing must not be flagged:\n{quiet}"
+    );
+
+    // A dry run must not create residue either — it ships nothing, which is exactly why it is allowed
+    // in a read-only session.
+    server.call(
+        "debug.reload_class",
+        serde_json::json!({"class_name": "SwapProbe", "class_roots": [root], "dry_run": true}),
+    );
+    let after_dry = server.call("debug.list_sessions", serde_json::json!({}));
+    assert!(
+        !after_dry.contains("still reloaded"),
+        "a dry run installs nothing, so it must leave no residue:\n{after_dry}"
+    );
+
+    server.call("debug.reload_class", serde_json::json!({"class_name": "SwapProbe", "class_roots": [root]}));
+
+    let listed = server.call("debug.list_sessions", serde_json::json!({}));
+    assert_contains_all(
+        "the listing flags a session holding installed bytecode",
+        &listed,
+        &["still reloaded"],
+    );
+
+    let disconnected = server.call("debug.disconnect", serde_json::json!({}));
+    assert_contains_all(
+        "disconnecting names the class, says nothing here can undo it, and names the remedy",
+        &disconnected,
+        &["SwapProbe", "redeploy", "once"],
+    );
+    assert!(
+        disconnected.contains("may still hold the old code"),
+        "no frame was popped, so the report must say the running frames may be masking the swap:\n\
+         {disconnected}"
+    );
+}
+
+/// The other half of SWAP-2, and the one that keeps the report from being noise: a session that
+/// redefined nothing must say nothing about redefinitions. A line on every disconnect is how a reader
+/// learns to skip the reply, at which point the loud case stops working too.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_session_that_reloaded_nothing_mentions_no_residue_on_disconnect() {
+    let Some(jdk) = jdk_or_skip("a_session_that_reloaded_nothing_mentions_no_residue_on_disconnect") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let disconnected = server.call("debug.disconnect", serde_json::json!({}));
+
+    assert!(
+        !disconnected.contains("redeploy") && !disconnected.contains("still running bytecode"),
+        "nothing was redefined, so the disconnect must not mention residue at all:\n{disconnected}"
+    );
+}
+
 /// SWAP-1 (#58): the refusals, which are most of the feature's worth.
 ///
 /// `HotSpot` accepts method **body** changes only, and the three edits below are the ones a developer
@@ -6398,6 +6485,23 @@ fn a_reload_of_the_method_you_are_stopped_in_takes_effect_when_the_frame_is_popp
         "re-entering the popped method did not run the new bytecode.\n  reload said: {reloaded}\n  \
          pop said: {popped}\n  last 5 lines: {:?}",
         probe.output().iter().rev().take(5).collect::<Vec<_>>(),
+    );
+
+    // SWAP-2: this is the one scenario that reaches the *popped* branch of the residue report, and it is
+    // reached here rather than in a second test because a pop is only meaningful after a reload — the
+    // setup above is the whole cost of testing it. The distinction being asserted is not cosmetic: an
+    // un-popped swap may never have reached the frames that were already running, and this one certainly
+    // did, which is a different thing for the next person to check.
+    let disconnected = server.call("debug.disconnect", serde_json::json!({}));
+    assert_contains_all(
+        "the residue report survives a pop and names the class",
+        &disconnected,
+        &["SwapProbe", "redeploy"],
+    );
+    assert!(
+        disconnected.contains("the new code is live"),
+        "a frame was popped, so the report must say the swap is certainly live rather than possibly \
+         masked:\n{disconnected}"
     );
 }
 

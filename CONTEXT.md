@@ -241,6 +241,17 @@ nothing, writes no field and forces no return, yet replaces the running program 
 described the mode as permitting the one change nothing can undo. A `dry_run` reload is the deliberate
 exception, because it installs nothing.
 
+**Outstanding redefinition**:
+A class a session hot-reloaded and cannot restore. Its own term because every other mutation here ends when
+the debuggee resumes, while this one outlives the resume, the disconnect and the session, and changes
+behaviour for everyone else on a shared instance until the artifact is redeployed. Reported when a session
+ends and by `debug.list_sessions`, on the same principle that makes a counted suspension verify its resume:
+the debugger states what it has left behind. **Load-bearing** (SWAP-2, #61) — it is why redefinition needs
+no permission axis of its own, since reporting an unrepairable side effect is more honest than a mode
+nobody remembers to set.
+_Avoid_: leaked, dirty (both suggest a fault; the swap was asked for, and the residue is a fact about the
+JVM rather than a defect in it)
+
 ### Testing
 
 **Probe**:

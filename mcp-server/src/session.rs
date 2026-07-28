@@ -77,6 +77,21 @@ pub struct DebugSession {
     /// nothing about the other. Same per-session reasoning otherwise: the build output belongs to the
     /// JVM you attached to.
     pub class_roots: Vec<std::path::PathBuf>,
+    /// Classes this session redefined and **cannot restore** (SWAP-2), keyed by class name.
+    ///
+    /// Its own bookkeeping because a redefinition is the only mutation here that outlives the thing that
+    /// made it. Every other one — a field write, a forced return, an invoked method — is finished when the
+    /// debuggee resumes; a redefined class keeps serving new bytecode after the resume, after the
+    /// disconnect, and to everyone else on a shared instance, and only redeploying the artifact undoes it.
+    ///
+    /// This exists because of what it bought. SWAP-1's triage considered a third permission axis — a mode
+    /// allowing `set_value` while still refusing to change the program — and rejected it on the grounds
+    /// that reporting the residue is the honest answer to an unrepairable side effect, not a mode nobody
+    /// remembers to set. That argument is only true if the reporting exists, which is this.
+    ///
+    /// A `BTreeMap` so a report lists classes in a stable order rather than a hash order, matching
+    /// [`trace_disarms`](Self::trace_disarms).
+    pub redefinitions: std::collections::BTreeMap<String, Redefinition>,
     /// Breakpoints requested on classes not yet loaded. Each holds a `CLASS_PREPARE` request that
     /// fires when the class loads; the event pump then arms the real breakpoint. See handlers.rs.
     pub pending_breakpoints: Vec<PendingBreakpoint>,
@@ -136,7 +151,47 @@ pub enum SuspendCause {
     ManualPause,
 }
 
+/// One class this session redefined, and what is worth saying about it afterwards (SWAP-2).
+#[derive(Debug, Clone)]
+pub struct Redefinition {
+    /// How many times this session redefined the class. An iterating caller reloads the same class
+    /// repeatedly, and "17 times" is a different situation to report than "once".
+    pub count: u32,
+    /// When the most recent redefinition landed, for rendering "how long has this JVM been like this".
+    pub at: std::time::Instant,
+    /// Whether a frame in this class has been popped since the most recent redefinition.
+    ///
+    /// Worth tracking separately from the swap because the two failures are opposite. A redefinition
+    /// nobody popped may not have taken effect at all in frames that were already running — the footgun
+    /// `debug.reload_class` warns about — while one that *was* popped is fully live. The residue is real
+    /// either way, so this changes what the report says, not whether it says anything.
+    pub popped_since: bool,
+}
+
 impl DebugSession {
+    /// Record a successful redefinition of `class_name` (SWAP-2). Repeated swaps of one class collapse
+    /// into a count, and any earlier pop stops counting — a pop applies to the bytecode that was live
+    /// when it happened, not to whatever replaced it afterwards.
+    pub fn note_redefinition(&mut self, class_name: &str) {
+        let entry = self.redefinitions.entry(class_name.to_string()).or_insert_with(|| Redefinition {
+            count: 0,
+            at: std::time::Instant::now(),
+            popped_since: false,
+        });
+        entry.count += 1;
+        entry.at = std::time::Instant::now();
+        entry.popped_since = false;
+    }
+
+    /// Record that a frame in `class_name` was popped, so a later report can distinguish a swap that is
+    /// certainly live from one that may still be masked by frames that were already running. A pop in a
+    /// class this session never redefined is not tracked — there is no residue to describe.
+    pub fn note_pop(&mut self, class_name: &str) {
+        if let Some(entry) = self.redefinitions.get_mut(class_name) {
+            entry.popped_since = true;
+        }
+    }
+
     /// Push a reportable event, evicting the oldest if the buffer is full. Returns the assigned seq.
     pub fn push_event(&mut self, set: EventSet) -> u64 {
         self.event_seq += 1;
@@ -514,6 +569,7 @@ impl SessionManager {
             read_only,
             source_roots,
             class_roots,
+            redefinitions: std::collections::BTreeMap::new(),
             pending_breakpoints: Vec::new(),
             exception_requests: HashMap::new(),
             watchpoints: HashMap::new(),
