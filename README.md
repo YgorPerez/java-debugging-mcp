@@ -569,7 +569,7 @@ instead.
       code (SWAP-1)
 - [x] **Staleness detection** — per-method line tables from the JVM against a parsed `.class`, so "the
       deployed bytecode is older than your build" stops looking like a wrong hypothesis (DISC-7)
-- [x] **Safety**: `panic` + idle watchdog auto-resume (clears breakpoints, exception breakpoints and watchpoints)
+- [x] **Safety**: `panic` + idle watchdog auto-resume (clears breakpoints, exception breakpoints, watchpoints and method-exit requests; names any class left hot-reloaded, which it cannot undo)
 - [x] **Performance**: type cache, `package_filter`, single-threaded `invoke_method`, token-trimmed output
 - [x] Architecture independence (big-endian protocol; Intel & ARM)
 

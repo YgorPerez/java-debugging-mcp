@@ -45,12 +45,12 @@ fn session_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.list_sessions".to_string(),
-            description: "List every live debug session — its host:port, whether it is the current one (all tools default to that), whether it is suspended, how many stop points/traces/events it holds, and how many JDWP packets it has cost. Use it when you have lost a session_id, or to check what is still attached before walking away. A session whose JVM has gone is shown as DEAD.".to_string(),
+            description: "List every live debug session — its host:port, whether it is the current one (all tools default to that), whether it is suspended, how many stop points/traces/events it holds, and how many JDWP packets it has cost. Use it when you have lost a session_id, or to check what is still attached before walking away. A session whose JVM has gone is shown as DEAD. A session that has hot-reloaded a class is flagged with the count, deliberately regardless of whose session it is: a session someone ELSE left behind is the case that matters, and this listing is the only place a third party can discover that a JVM is running installed bytecode.".to_string(),
             input_schema: empty(),
         },
         Tool {
             name: "debug.disconnect".to_string(),
-            description: "Disconnect from JVM debug session".to_string(),
+            description: "Disconnect from a JVM debug session, leaving the JVM RUNNING with nothing armed: it clears every event request and resumes every thread in one round trip before dropping the session, so disconnecting while suspended at a breakpoint cannot freeze the debuggee forever (SAFE-1). Reports whether the VM had been suspended, and names any class this session installed with debug.reload_class — that outlives the session and only a redeploy restores it, so this is the last moment anyone is told.".to_string(),
             input_schema: empty(),
         },
     ]
@@ -97,7 +97,7 @@ fn stop_point_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.panic".to_string(),
-            description: "Safety: clear ALL breakpoints, exception breakpoints and watchpoints, and resume ALL threads. Use to unfreeze a JVM if a breakpoint left a thread suspended.".to_string(),
+            description: "Safety: clear ALL stop points — breakpoints, exception breakpoints, watchpoints AND method-exit requests, traced or not — and resume ALL threads. Use to unfreeze a JVM if a breakpoint left a thread suspended. Method-exit requests matter most here: a suspending one on a hot method re-freezes the VM on the very next return, so resuming without clearing them would be no rescue at all. ONE THING IT CANNOT PUT BACK: a class installed by debug.reload_class keeps serving that bytecode through the panic and after you disconnect, to everyone else on the instance, until the artifact is redeployed — so the reply NAMES any such class rather than letting a clean-looking result imply the JVM is as you found it.".to_string(),
             input_schema: empty(),
         },
     ]
