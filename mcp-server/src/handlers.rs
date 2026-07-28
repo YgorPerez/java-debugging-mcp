@@ -11143,7 +11143,9 @@ mod tests {
     #[test]
     fn readonly_errors_are_explained_and_others_are_not() {
         let explained = explain_readonly(
-            "invoke toString() failed: read-only connection: refusing to invoke an instance method".into(),
+            "invoke toString() failed: read-only connection: refusing an instance method invocation in \
+             the debuggee"
+                .into(),
         );
         assert!(explained.contains("Read-only session"));
         assert!(explained.contains("locals, fields, statics"), "must say what still works: {explained}");

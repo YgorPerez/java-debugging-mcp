@@ -180,7 +180,7 @@ impl JdwpConnection {
     ) -> JdwpResult<()> {
         // ClassType.SetValues = command set 3 (CLASS_TYPE), command 2.
         const CLASS_TYPE_SET_VALUES: u8 = 2;
-        self.guard_invocation("a static field write")?;
+        self.guard_mutation("a static field write")?;
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::CLASS_TYPE, CLASS_TYPE_SET_VALUES);
         packet.data.put_u64(class_id);
@@ -206,7 +206,7 @@ impl JdwpConnection {
         object_id: ObjectId,
         updates: Vec<(FieldId, Value)>,
     ) -> JdwpResult<()> {
-        self.guard_invocation("an instance field write")?;
+        self.guard_mutation("an instance field write")?;
         let id = self.next_id();
         let mut packet =
             CommandPacket::new(id, command_sets::OBJECT_REFERENCE, object_reference_commands::SET_VALUES);

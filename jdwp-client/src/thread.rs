@@ -327,7 +327,7 @@ impl JdwpConnection {
         thread_id: ThreadId,
         value: &crate::types::Value,
     ) -> JdwpResult<()> {
-        self.guard_invocation("a forced early return")?;
+        self.guard_mutation("a forced early return")?;
         let id = self.next_id();
         let mut packet =
             CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::FORCE_EARLY_RETURN);

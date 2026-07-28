@@ -193,6 +193,10 @@ impl JdwpConnection {
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the JVM refuses the redefinition.
     pub async fn redefine_classes(&mut self, defs: &[(ReferenceTypeId, Vec<u8>)]) -> JdwpResult<()> {
+        // SAFE-9: at the wire, not above it (ADR-0001). A redefinition installs code, and it is the one
+        // mutation on this connection that outlives the connection — nothing here can undo it.
+        self.guard_mutation("a class redefinition")?;
+
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::REDEFINE_CLASSES);
 

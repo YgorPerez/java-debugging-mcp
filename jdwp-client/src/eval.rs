@@ -94,7 +94,7 @@ impl JdwpConnection {
         method_id: MethodId,
         args: Vec<Value>,
     ) -> JdwpResult<(Value, ObjectId)> {
-        self.guard_invocation("an instance method")?;
+        self.guard_mutation("an instance method invocation")?;
         let id = self.next_id();
         let mut packet =
             CommandPacket::new(id, command_sets::OBJECT_REFERENCE, object_reference_commands::INVOKE_METHOD);
@@ -132,7 +132,7 @@ impl JdwpConnection {
         method_id: MethodId,
         args: Vec<Value>,
     ) -> JdwpResult<(Value, ObjectId)> {
-        self.guard_invocation("a static method")?;
+        self.guard_mutation("a static method invocation")?;
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::CLASS_TYPE, CLASS_TYPE_INVOKE_METHOD);
         packet.data.put_u64(class_id);

@@ -11,10 +11,26 @@ calls a method", plus a separate switch that disabled `expand_objects`.
 
 ## Decision
 
-Read-only is a flag on `JdwpConnection`. The invocation and write primitives — `invoke_method`,
+Read-only is a flag on `JdwpConnection`. Every primitive that mutates the debuggee — `invoke_method`,
 `invoke_static_method`, `set_reference_values`, `set_object_values`, `set_array_values`, `set_frame_value`,
-`force_early_return` — return `JdwpError::ReadOnly` when it is set. The MCP layer does not decide what
-counts as mutation; the wire does.
+`force_early_return`, `redefine_classes`, `pop_frames` — returns `JdwpError::ReadOnly` when it is set. The
+MCP layer does not decide what counts as mutation; the wire does.
+
+**Amended by SAFE-9 ([#60](https://github.com/YgorPerez/java-debugging-mcp/issues/60)).** The last two
+arrived with SWAP-1 (#58) gated in the MCP handlers that call them instead, which is what this ADR
+forbids. There was no live bypass — those handlers were the only callers — but the invariant was broken and
+nothing failed when it was, which is the whole failure mode this ADR exists to prevent. Two things came out
+of the repair and are worth keeping:
+
+- The guard was called `guard_invocation`, and **five of its seven call sites were already writes rather
+  than calls**. A name narrower than the rule it enforces is how a new mutating primitive gets added
+  without anyone noticing it skipped the guard; it is now `guard_mutation`. The error text lost "to
+  invoke" for the same reason — it had been rendering "refusing to invoke a static field write".
+- Read-only had **no wire-level test at all**: every assertion lived in the JVM-dependent integration
+  suite, driven through MCP tool handlers, where a handler-level check satisfies the test and the missing
+  wire guard is invisible. The refusals are now asserted against the connection API with no JVM, and on
+  `packets_sent()` rather than only on the error — "refused" and "sent nothing" are different claims, and
+  only the second is the contract.
 
 ## Rejected alternative
 

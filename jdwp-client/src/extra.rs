@@ -189,7 +189,7 @@ impl JdwpConnection {
         first: i32,
         values: &[Value],
     ) -> JdwpResult<()> {
-        self.guard_invocation("an array element write")?;
+        self.guard_mutation("an array element write")?;
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::ARRAY_REFERENCE, ARRAY_SET_VALUES);
         packet.data.put_u64(array_id);
@@ -230,7 +230,7 @@ impl JdwpConnection {
         slot: i32,
         value: &Value,
     ) -> JdwpResult<()> {
-        self.guard_invocation("a local variable write")?;
+        self.guard_mutation("a local variable write")?;
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::STACK_FRAME, 2 /* SetValues */);
         packet.data.put_u64(thread_id);

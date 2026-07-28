@@ -28,9 +28,9 @@ pub struct JdwpConnection {
     /// Shared across clones on purpose — the event-pump clone and the request path describe the same
     /// JVM, so they should warm one cache rather than two.
     types: Arc<TypeCache>,
-    /// Read-only guard: when set, the invocation primitives refuse instead of executing code in the
-    /// debuggee. `Arc` so it is shared with every clone — including the event pump's, which is what
-    /// evaluates a breakpoint condition or a `trace_expr` on a hit.
+    /// Read-only guard: when set, every primitive that mutates the debuggee refuses instead of sending.
+    /// `Arc` so it is shared with every clone — including the event pump's, which is what evaluates a
+    /// breakpoint condition or a `trace_expr` on a hit.
     read_only: Arc<AtomicBool>,
     /// How long a debuggee invocation may take before it is abandoned, in milliseconds.
     ///
@@ -67,12 +67,18 @@ impl JdwpConnection {
         })
     }
 
-    /// Refuse every invocation on this connection from now on (and on every clone of it).
+    /// Refuse every mutation of the debuggee on this connection from now on (and on every clone of it).
     ///
-    /// This is the enforcement point for read-only debugging: `invoke_method` /
-    /// `invoke_static_method` return [`JdwpError::ReadOnly`] instead of running code in the target. It
-    /// deliberately does **not** restrict reads — fields, locals, arrays and type metadata are all
-    /// plain JDWP reads and keep working.
+    /// This is the enforcement point for read-only debugging, and per ADR-0001 it is the **only** one:
+    /// the MCP layer above does not decide what counts as mutation, the wire does. Every primitive that
+    /// changes the debuggee returns [`JdwpError::ReadOnly`] instead of sending its packet — the two
+    /// invocations, the four writes, a forced early return, and, since SAFE-9, a class redefinition and
+    /// a frame pop. It deliberately does **not** restrict reads — fields, locals, arrays and type
+    /// metadata are all plain JDWP reads and keep working.
+    ///
+    /// "Mutation" here is wider than "runs code". A class redefinition invokes nothing, writes no field
+    /// and forces no return, yet replaces the running program — and unlike every other entry on that
+    /// list it outlives the connection, so it is the one that least tolerates being missed.
     ///
     /// A guard against accident, **not** a security boundary: anyone who can reach the JDWP port can
     /// open their own connection without it.
@@ -80,15 +86,20 @@ impl JdwpConnection {
         self.read_only.store(read_only, Ordering::SeqCst);
     }
 
-    /// Whether this connection refuses invocation.
+    /// Whether this connection refuses to mutate the debuggee.
     #[must_use]
     pub fn is_read_only(&self) -> bool {
         self.read_only.load(Ordering::SeqCst)
     }
 
-    /// Fail with [`JdwpError::ReadOnly`] if invocation is not allowed. `what` names the call site for
-    /// the message (e.g. `"toString()"`, `"List.get(int)"`).
-    pub(crate) fn guard_invocation(&self, what: &str) -> JdwpResult<()> {
+    /// Fail with [`JdwpError::ReadOnly`] if mutating the debuggee is not allowed. `what` is a noun phrase
+    /// naming the operation for the message (e.g. `"an instance method invocation"`, `"a class
+    /// redefinition"`), because five of this guard's call sites are writes rather than calls and a
+    /// message built around "invoke" was already wrong for them.
+    ///
+    /// Named for mutation rather than invocation on purpose: the narrower name is what let SAFE-9's two
+    /// primitives be added without anyone noticing they had skipped the guard entirely.
+    pub(crate) fn guard_mutation(&self, what: &str) -> JdwpResult<()> {
         if self.is_read_only() {
             return Err(JdwpError::ReadOnly(what.to_string()));
         }
@@ -397,5 +408,118 @@ mod tests {
         assert_eq!(counter.fetch_add(1, Ordering::SeqCst), 1);
         assert_eq!(counter.fetch_add(1, Ordering::SeqCst), 2);
         assert_eq!(counter.fetch_add(1, Ordering::SeqCst), 3);
+    }
+
+    /// A peer that completes the JDWP handshake and then answers nothing, ever.
+    ///
+    /// That silence is the whole instrument. Every assertion below is that a read-only connection fails
+    /// *before* it sends, so a peer that would reply to a command could not tell a working guard from a
+    /// guard that sent the packet and got an answer. Any test here that hangs has found a missing guard.
+    async fn deaf_jdwp_peer() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a loopback port");
+        let port = listener.local_addr().expect("read back the bound port").port();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; JDWP_HANDSHAKE.len()];
+                if socket.read_exact(&mut buf).await.is_ok() {
+                    let _ = socket.write_all(JDWP_HANDSHAKE).await;
+                    let _ = socket.flush().await;
+                }
+                // Hold the socket open and stay silent, so a leaked packet cannot be answered.
+                std::future::pending::<()>().await;
+            }
+        });
+        port
+    }
+
+    /// SAFE-9. These two primitives were gated in the MCP handlers that call them, which ADR-0001
+    /// forbids: the layer above does not decide what counts as mutation. The regression this test exists
+    /// to catch is invisible from an MCP tool test, because the handler's own check would pass it.
+    ///
+    /// `packets_sent()` is the assertion that matters. "Returned an error" would also be satisfied by a
+    /// primitive that sent its packet and then failed; "sent nothing" is the actual contract.
+    /// The timeout is not the assertion — it is what turns a missing guard from a 30-second hang on the
+    /// event loop's reply timeout into an immediate, legible failure. A guard that is present refuses in
+    /// microseconds and never approaches the budget.
+    const REFUSAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+    #[tokio::test]
+    async fn a_read_only_connection_refuses_a_redefinition_without_sending_a_packet() {
+        let port = deaf_jdwp_peer().await;
+        let mut conn = JdwpConnection::connect("127.0.0.1", port).await.expect("handshake with the peer");
+        conn.set_read_only(true);
+        let before = conn.packets_sent();
+
+        let err =
+            tokio::time::timeout(REFUSAL_BUDGET, conn.redefine_classes(&[(1, vec![0xCA, 0xFE, 0xBA, 0xBE])]))
+                .await
+                .expect("no refusal: the packet went to the peer and this is waiting for a reply")
+                .expect_err("a read-only connection must refuse a class redefinition");
+
+        assert!(matches!(err, JdwpError::ReadOnly(_)), "expected ReadOnly, got {err:?}");
+        assert_eq!(conn.packets_sent(), before, "refused, but the bytes went out anyway");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_connection_refuses_a_frame_pop_without_sending_a_packet() {
+        let port = deaf_jdwp_peer().await;
+        let mut conn = JdwpConnection::connect("127.0.0.1", port).await.expect("handshake with the peer");
+        conn.set_read_only(true);
+        let before = conn.packets_sent();
+
+        let err = tokio::time::timeout(REFUSAL_BUDGET, conn.pop_frames(1, 2))
+            .await
+            .expect("no refusal: the packet went to the peer and this is waiting for a reply")
+            .expect_err("a read-only connection must refuse a frame pop");
+
+        assert!(matches!(err, JdwpError::ReadOnly(_)), "expected ReadOnly, got {err:?}");
+        assert_eq!(conn.packets_sent(), before, "refused, but the bytes went out anyway");
+    }
+
+    /// The other half of the contract: the flag is what refuses, not the primitive. Without this, a
+    /// primitive hard-wired to fail would pass the two tests above and nobody would notice that read-only
+    /// had stopped being a *mode*.
+    ///
+    /// On a writable connection each primitive gets past the guard, sends, and then waits forever for a
+    /// reply the deaf peer will never send — so the timeout *is* the pass condition, and `packets_sent()`
+    /// proves it timed out with the bytes on the wire rather than somewhere short of it.
+    #[tokio::test]
+    async fn the_same_primitives_send_when_the_connection_is_writable() {
+        let port = deaf_jdwp_peer().await;
+        let conn = JdwpConnection::connect("127.0.0.1", port).await.expect("handshake with the peer");
+        assert!(!conn.is_read_only(), "a fresh connection must not be read-only");
+        let budget = std::time::Duration::from_millis(250);
+
+        let mut a = conn.clone();
+        let defs = [(1, vec![0xCA, 0xFE, 0xBA, 0xBE])];
+        let before = a.packets_sent();
+        assert!(
+            tokio::time::timeout(budget, a.redefine_classes(&defs)).await.is_err(),
+            "a writable connection must get past the guard and wait for the peer's reply"
+        );
+        assert_eq!(a.packets_sent(), before + 1, "it waited without having sent anything");
+
+        let mut b = conn.clone();
+        let before = b.packets_sent();
+        assert!(
+            tokio::time::timeout(budget, b.pop_frames(1, 2)).await.is_err(),
+            "a writable connection must get past the guard and wait for the peer's reply"
+        );
+        assert_eq!(b.packets_sent(), before + 1, "it waited without having sent anything");
+    }
+
+    /// The flag is shared with every clone, including the event pump's — the property ADR-0001 relies on
+    /// for a breakpoint condition evaluated inside the pump. Worth asserting for the new primitives too,
+    /// since a clone that kept its own copy would be refused nowhere.
+    #[tokio::test]
+    async fn read_only_set_on_one_handle_refuses_on_a_clone() {
+        let port = deaf_jdwp_peer().await;
+        let conn = JdwpConnection::connect("127.0.0.1", port).await.expect("handshake with the peer");
+        let mut clone = conn.clone();
+
+        conn.set_read_only(true);
+
+        let err = clone.redefine_classes(&[(1, vec![])]).await.expect_err("the clone must refuse too");
+        assert!(matches!(err, JdwpError::ReadOnly(_)), "expected ReadOnly, got {err:?}");
     }
 }

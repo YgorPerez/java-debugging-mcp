@@ -43,7 +43,7 @@ pub enum JdwpError {
     #[error("invocation did not return within {0}ms (the debuggee thread may be blocked on a monitor held by another suspended thread)")]
     InvokeTimeout(u64),
 
-    #[error("read-only connection: refusing to invoke {0} in the debuggee")]
+    #[error("read-only connection: refusing {0} in the debuggee")]
     ReadOnly(String),
 }
 
