@@ -6170,6 +6170,113 @@ fn swap_probe_returning(jdk: &Jdk, value: i32) -> tempfile::TempDir {
     dir
 }
 
+/// Compile `SwapProbe` with two lines inserted above `answer()`, which moves every line number in it
+/// without changing the class's shape. The same edit `a_stale_build_is_detected_and_a_current_one_is_not`
+/// uses, because it is the drift `debug.source` cannot see: same class, same file name, older bytecode.
+fn swap_probe_with_shifted_lines(jdk: &Jdk) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir for the shifted probe");
+    jdk.compile_probe_variant("SwapProbe", dir.path(), |src| {
+        src.replace("    static int answer() {", "    // shifted\n    // shifted\n    static int answer() {")
+    })
+    .expect("compile the shifted SwapProbe");
+    dir
+}
+
+/// Attach with `class_roots` set, which `Server::attach` does not do.
+fn attach_with_class_roots(server: &mut Server, port: u16, root: Option<&std::path::Path>) {
+    let mut args = serde_json::json!({"host": "127.0.0.1", "port": port});
+    if let Some(r) = root {
+        args["class_roots"] = serde_json::json!([r.display().to_string()]);
+    }
+    let out = server.call("debug.attach", args);
+    assert!(out.contains("Connected"), "attach failed: {out}");
+}
+
+/// DISC-8 (#62): arming a line breakpoint reports stale bytecode **without being asked**.
+///
+/// `debug.check_stale` already answers this, but only for a caller who suspects drift — and the whole
+/// failure is that an agent does not. It arms `:39`, sees it never fire or fire with nonsense locals, and
+/// spends its next twenty calls debugging the program instead of the deployment. Arming is where that
+/// starts, and it is also the call that has already paid for the line table, so the check is free here.
+///
+/// `trace:true` keeps the probe running: this test is about the reply, and a suspending breakpoint would
+/// freeze the JVM for the rest of it.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn arming_a_breakpoint_against_a_stale_build_says_so_unasked() {
+    let Some(jdk) = jdk_or_skip("arming_a_breakpoint_against_a_stale_build_says_so_unasked") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let shifted = swap_probe_with_shifted_lines(&jdk);
+    let mut server = Server::start().expect("start server");
+    attach_with_class_roots(&mut server, probe.port, Some(shifted.path()));
+
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "SwapProbe", "line": 39, "trace": true}),
+    );
+
+    assert_contains_all(
+        "arming reports drift nobody asked about, and names the file",
+        &armed,
+        &["STALE BYTECODE", "SwapProbe.class", "check_stale", "reload_class"],
+    );
+    // The warning is an aside, not a refusal: the breakpoint the caller asked for must still be armed.
+    assert!(armed.contains("Stop-point ID"), "the breakpoint must still have been set:\n{armed}");
+}
+
+/// The two silences, which are what make the warning above worth reading. A detector that fires on a
+/// current build is discounted forever after the first time it misleads someone.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn arming_says_nothing_about_drift_on_a_current_build() {
+    let Some(jdk) = jdk_or_skip("arming_says_nothing_about_drift_on_a_current_build") else { return };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    // The running source, recompiled. `compile_probe_variant` refuses a no-op edit, so the change is a
+    // comment: it moves no line and alters no bytecode.
+    let current = tempfile::tempdir().expect("tempdir");
+    jdk.compile_probe_variant("SwapProbe", current.path(), |src| {
+        src.replace("// SWAP_VALUE", "// SWAP_VALUE (control build)")
+    })
+    .expect("recompile the unmodified probe");
+    let mut server = Server::start().expect("start server");
+    attach_with_class_roots(&mut server, probe.port, Some(current.path()));
+
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "SwapProbe", "line": 39, "trace": true}),
+    );
+
+    assert!(armed.contains("Stop-point ID"), "the breakpoint must have been set:\n{armed}");
+    assert!(!armed.contains("STALE"), "false positive on a rebuild of the running source:\n{armed}");
+}
+
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn arming_says_nothing_about_drift_when_no_class_root_is_configured() {
+    let Some(jdk) = jdk_or_skip("arming_says_nothing_about_drift_when_no_class_root_is_configured") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    attach_with_class_roots(&mut server, probe.port, None);
+
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "SwapProbe", "line": 39, "trace": true}),
+    );
+
+    assert!(armed.contains("Stop-point ID"), "the breakpoint must have been set:\n{armed}");
+    assert!(
+        !armed.contains("STALE"),
+        "with nothing to compare against, the reply must not mention drift at all:\n{armed}"
+    );
+}
+
 /// SWAP-1 (#58): the headline claim — a Java change reaches a JVM that was never restarted.
 ///
 /// The assertion is over the **debuggee's own stdout**, not over what the server reported about itself.

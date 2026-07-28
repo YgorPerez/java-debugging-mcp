@@ -381,8 +381,9 @@ impl RequestHandler {
         };
         let class_type_id = first_class.type_id;
 
+        let armed = arm_and_insert(&mut session, class_type_id, &spec, bp_id).await?;
         let (bp_id, line, method_name, request_id) =
-            arm_and_insert(&mut session, class_type_id, &spec, bp_id).await?;
+            (armed.bp_id, armed.line, armed.method_name, armed.request_id);
         drop(session);
 
         let mut extra = describe_trace_mode(&spec, frames_note.as_deref());
@@ -404,7 +405,7 @@ impl RequestHandler {
             bp_id,
             request_id,
             extra
-        ))
+        ) + armed.drift.as_deref().unwrap_or(""))
     }
 
     async fn handle_list_stop_points(&self, args: serde_json::Value) -> Result<String, String> {
@@ -4479,6 +4480,83 @@ async fn one_line_table(
     }
 }
 
+/// DISC-8: the drift caveat for the one method a breakpoint was just armed in, or `None`.
+///
+/// `check_stale` exists and is good, but it only answers when asked — and the caller this failure ruins is
+/// the one who does not suspect drift at all. Arming a line breakpoint is where that springs: you set
+/// `:412`, it never fires or fires with locals that make no sense, and the next twenty tool calls go into
+/// the program instead of the deployment. So the proof runs here, unasked.
+///
+/// **Silence is the default and it is load-bearing.** This returns `None` for every reason short of a
+/// proof: no class root configured, no class file under the roots, an unreadable or unparseable file, a
+/// file declaring a different class, no line table on either side. An unsolicited aside that is sometimes
+/// wrong is worse than no aside, because a reader who has been misled once discounts it forever — and the
+/// four distinct answers `debug.source` and `debug.check_stale` carefully separate belong in the tools a
+/// caller *asked*, not in a footnote on a different question.
+///
+/// Costs no JDWP packets: `jvm_lines` was already fetched to resolve the line, and everything else is a
+/// local file read. That is what makes it affordable to do on every arming against a shared instance.
+async fn drift_caveat_for_armed_method(
+    session: &crate::session::DebugSession,
+    class_name: &str,
+    method: &jdwp_client::reftype::MethodInfo,
+    jvm_lines: Vec<(u64, i32)>,
+) -> Option<String> {
+    if session.class_roots.is_empty() || jvm_lines.is_empty() {
+        return None;
+    }
+    let path = resolve_class_file(class_name, None, &session.class_roots).ok()?;
+    let bytes = tokio::fs::read(&path).await.ok()?;
+    let built = crate::classfile::parse(&bytes).ok()?;
+    if built.this_class != class_name {
+        return None;
+    }
+
+    let jvm = MethodLines {
+        name: method.name.clone(),
+        descriptor: method.signature.clone(),
+        lines: jvm_lines,
+        comparable: true,
+    };
+    drift_caveat_from_tables(&jvm, built.methods, &path)
+}
+
+/// The verdict and wording of the arming-path caveat, with the session and the filesystem taken out.
+///
+/// Split from [`drift_caveat_for_armed_method`] for the reason `compare_line_tables` is split from the
+/// JDWP reads: this is where the answer is decided, and a detector that cries stale on a current build
+/// gets ignored within a day, so it has to be testable without a JVM or a class file on disk.
+fn drift_caveat_from_tables(
+    jvm: &MethodLines,
+    built_methods: Vec<crate::classfile::ClassFileMethod>,
+    path: &std::path::Path,
+) -> Option<String> {
+    // Reuse `compare_line_tables` rather than re-deciding what drift means: narrowing the build side to
+    // the one method under test makes the whole-class comparison answer a single-method question, so the
+    // two paths cannot disagree about what counts as drift. A method the build does not have at all lands
+    // in `only_in_jvm`, which `is_stale` already counts — correctly, since a method appearing or
+    // vanishing is a real change to the class.
+    let same_method: Vec<crate::classfile::ClassFileMethod> =
+        built_methods.into_iter().filter(|m| (m.name.as_str(), m.descriptor.as_str()) == jvm.key()).collect();
+    let report = compare_line_tables(std::slice::from_ref(jvm), &same_method);
+    if !report.is_stale() {
+        return None;
+    }
+
+    let detail = report
+        .differing
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("{}{} is not in your build at all", jvm.name, jvm.descriptor));
+    Some(format!(
+        "\n   ⚠️  STALE BYTECODE: the JVM's line table for this method does not match {}.\n       \
+         {detail}\n       The line above was resolved against the DEPLOYED build, so it may not be the \
+         line you are reading. debug.check_stale for the whole class; debug.reload_class to install your \
+         build without a redeploy.",
+        path.display(),
+    ))
+}
+
 /// Compare the running line tables against the compiled ones, method by method.
 ///
 /// Pure, and separate from both the JDWP reads and the rendering, because this is where the answer is
@@ -5279,7 +5357,8 @@ async fn try_arm_deferred_breakpoints(
         session.pending_breakpoints.iter().filter(|p| p.signature == cp_sig).cloned().collect();
     for pend in pending {
         match resolve_bp_location(&mut session.connection, cp_ref, pend.line, pend.method.as_deref()).await {
-            Ok((method, index, line)) => {
+            Ok(loc) => {
+                let (method, index, line) = (loc.method, loc.code_index, loc.line);
                 let sp = suspend_policy_for(pend.trace);
                 match session
                     .connection
@@ -5885,10 +5964,10 @@ async fn rearm_breakpoint_location(
     };
     let line_opt = i32::try_from(bp.line).ok();
     match resolve_bp_location(&mut session.connection, class.type_id, line_opt, bp.method.as_deref()).await {
-        Ok((method, index, _line)) => Ok(crate::session::BreakpointArm {
+        Ok(loc) => Ok(crate::session::BreakpointArm {
             class_id: class.type_id,
-            method_id: method.method_id,
-            bytecode_index: index,
+            method_id: loc.method.method_id,
+            bytecode_index: loc.code_index,
             ..bp.arm.clone()
         }),
         // The class is loaded but the location didn't resolve; the old ids are the best guess left, and
@@ -6306,16 +6385,30 @@ struct BreakpointSpec {
     suspend_policy: jdwp_client::SuspendPolicy,
 }
 
+/// What arming produced, for the reply to render.
+///
+/// A struct rather than a growing tuple: DISC-8 added a fifth thing to carry back, and four positional
+/// values was already the point where a caller had to count them.
+struct ArmedBreakpoint {
+    bp_id: String,
+    /// The line actually resolved, which is not always the line asked for.
+    line: i32,
+    method_name: String,
+    request_id: i32,
+    /// DISC-8: the stale-bytecode caveat, when there is a proof of drift. `None` the rest of the time,
+    /// including every case where the answer is merely unknown.
+    drift: Option<String>,
+}
+
 /// Resolve the location on a loaded class, set the JDWP breakpoint, and record it in the session under
 /// the caller-facing `bp_id` (allocated by the caller so it survives a later disable/re-arm — BP-3).
-/// Returns `(bp_id, resolved source line, method name, JDWP request id)`.
 async fn arm_and_insert(
     session: &mut crate::session::DebugSession,
     class_type_id: u64,
     spec: &BreakpointSpec,
     bp_id: String,
-) -> Result<(String, i32, String, i32), String> {
-    let (method, index, line) = resolve_bp_location(
+) -> Result<ArmedBreakpoint, String> {
+    let loc = resolve_bp_location(
         &mut session.connection,
         class_type_id,
         spec.line_opt,
@@ -6323,6 +6416,7 @@ async fn arm_and_insert(
     )
     .await
     .map_err(|e| format!("{e} in {}", spec.class_pattern))?;
+    let (method, index, line, jvm_lines) = (loc.method, loc.code_index, loc.line, loc.lines);
     let request_id = session
         .connection
         .set_breakpoint_ex(
@@ -6360,7 +6454,11 @@ async fn arm_and_insert(
             },
         },
     );
-    Ok((bp_id, line, method.name, request_id))
+    // After arming, not before: the breakpoint is the thing the caller asked for, and a drift check that
+    // could fail must never be able to prevent it. Everything this call does is fallible-but-ignorable by
+    // construction, and it returns `None` rather than an error for the same reason.
+    let drift = drift_caveat_for_armed_method(session, &spec.class_pattern, &method, jvm_lines).await;
+    Ok(ArmedBreakpoint { bp_id, line, method_name: method.name, request_id, drift })
 }
 
 /// The target class isn't loaded yet: register a `CLASS_PREPARE` watch (`EventThread` suspend, so the
@@ -6382,7 +6480,8 @@ async fn register_deferred_breakpoint(
     if let Some(c) = recheck.first() {
         let ctid = c.type_id;
         let _ = session.connection.clear_class_prepare(cp_req).await;
-        let (bp_id, line, method_name, _req) = arm_and_insert(session, ctid, spec, bp_id).await?;
+        let armed = arm_and_insert(session, ctid, spec, bp_id).await?;
+        let (bp_id, line, method_name) = (armed.bp_id, armed.line, armed.method_name);
         return Ok(format!(
             "✅ {} set at {}:{} (class had just loaded)\n   Method: {}\n   Stop-point ID: {}",
             if spec.trace { "Trace breakpoint" } else { "Breakpoint" },
@@ -6422,16 +6521,39 @@ async fn register_deferred_breakpoint(
 /// Resolve a breakpoint location (method, bytecode index, source line) on an already-loaded class,
 /// by explicit line, by method name (first executable line), or a named method containing the line.
 /// Shared by the immediate path and the deferred (class-prepare) arming path.
+/// Where a breakpoint resolved to, and the line table it was resolved against.
+///
+/// `lines` comes back with the rest because it was already fetched to find the line and then thrown away
+/// (DISC-8). Returning it is what lets the staleness check on the arming path cost **zero** extra JDWP
+/// packets, which is what makes it affordable to run unasked against a shared JVM.
+struct ResolvedLocation {
+    method: jdwp_client::reftype::MethodInfo,
+    code_index: u64,
+    /// The line actually resolved, which is not always the line asked for.
+    line: i32,
+    /// The chosen method's line table as `(bytecode index, line)`, normalised to the shape the staleness
+    /// comparison uses. Empty when the JVM has no table for it.
+    lines: Vec<(u64, i32)>,
+}
+
+/// The resolution loop's best candidate so far: a **borrowed** method plus the values found with it.
+///
+/// A named alias rather than the tuple written inline, because the borrow is load-bearing — it is what
+/// keeps the winning method cloned once *after* the loop instead of once per iteration — while the inline
+/// type is complex enough that `clippy::type_complexity` is right to object to it. Both lints are
+/// satisfied by naming the thing rather than by giving up one for the other.
+type BpCandidate<'a> = (&'a jdwp_client::reftype::MethodInfo, u64, i32, Vec<(u64, i32)>);
+
 async fn resolve_bp_location(
     conn: &mut jdwp_client::JdwpConnection,
     class_type_id: u64,
     line_opt: Option<i32>,
     method_hint: Option<&str>,
-) -> Result<(jdwp_client::reftype::MethodInfo, u64, i32), String> {
+) -> Result<ResolvedLocation, String> {
     let methods = conn.get_methods(class_type_id).await.map_err(|e| format!("Failed to get methods: {e}"))?;
-    // Hold a reference to the winning method and clone it once after the loop, rather than cloning
-    // on every candidate.
-    let mut chosen: Option<(&jdwp_client::reftype::MethodInfo, u64, i32)> = None;
+    // Hold a reference to the winning method and clone it once after the loop, rather than cloning on
+    // every candidate.
+    let mut chosen: Option<BpCandidate> = None;
     for method in &methods {
         if let Some(hint) = method_hint {
             if method.name != hint {
@@ -6441,24 +6563,33 @@ async fn resolve_bp_location(
         let Ok(line_table) = conn.get_line_table(class_type_id, method.method_id).await else {
             continue;
         };
+        // Normalised to the shape the staleness comparison uses, so the caller can hand it straight over
+        // without this function knowing anything about drift.
+        let lines: Vec<(u64, i32)> =
+            line_table.lines.iter().map(|e| (e.line_code_index, e.line_number)).collect();
         if let Some(want) = line_opt {
             if let Some(e) = line_table.lines.iter().find(|e| e.line_number == want) {
-                chosen = Some((method, e.line_code_index, want));
+                chosen = Some((method, e.line_code_index, want, lines));
                 break;
             }
             if method_hint.is_some() {
                 if let Some(e) = line_table.lines.iter().min_by_key(|e| e.line_code_index) {
-                    chosen = Some((method, e.line_code_index, e.line_number));
+                    chosen = Some((method, e.line_code_index, e.line_number, lines));
                     break;
                 }
             }
         } else if let Some(e) = line_table.lines.iter().min_by_key(|e| e.line_code_index) {
-            chosen = Some((method, e.line_code_index, e.line_number));
+            chosen = Some((method, e.line_code_index, e.line_number, lines));
             break;
         }
     }
     match chosen {
-        Some((method, code_index, line)) => Ok((method.clone(), code_index, line)),
+        // The single clone, outside the loop: `excessive-clone` is about repeated allocation, and this
+        // runs once per call. Destructured rather than `map_or_else` because the Err arm below already
+        // uses one and nesting two reads worse than the match.
+        Some((method, code_index, line, lines)) => {
+            Ok(ResolvedLocation { method: method.clone(), code_index, line, lines })
+        }
         None => Err(line_opt.map_or_else(
             || format!("Method '{}' not found", method_hint.unwrap_or("")),
             |l| format!("No method contains line {l}"),
@@ -11222,6 +11353,73 @@ mod tests {
     /// tests depend on how long the machine has been up — `Instant` has no portable origin, and
     /// `checked_sub` returns `None` when the result would precede it. How an age *renders* is covered by
     /// `ago_is_coarse_and_never_reports_milliseconds`, which works in pure `Duration`s and cannot flake.
+    fn jvm_method(lines: &[(u64, i32)], comparable: bool) -> MethodLines {
+        MethodLines {
+            name: "save".to_string(),
+            descriptor: "(Ljava/lang/String;)I".to_string(),
+            lines: lines.to_vec(),
+            comparable,
+        }
+    }
+
+    fn built_method(name: &str, lines: &[(u64, i32)]) -> crate::classfile::ClassFileMethod {
+        crate::classfile::ClassFileMethod {
+            name: name.to_string(),
+            descriptor: "(Ljava/lang/String;)I".to_string(),
+            lines: lines.to_vec(),
+            has_code: true,
+            has_line_table: !lines.is_empty(),
+        }
+    }
+
+    fn caveat(jvm: &MethodLines, built: Vec<crate::classfile::ClassFileMethod>) -> Option<String> {
+        drift_caveat_from_tables(jvm, built, std::path::Path::new("/build/com/acme/OrderService.class"))
+    }
+
+    // DISC-8: the current-build case is the one that decides whether the warning is worth having. An
+    // unsolicited aside that fires on a good build is worse than no aside, because a reader who has been
+    // misled once discounts it forever.
+    #[test]
+    fn arming_against_the_running_build_produces_no_caveat() {
+        let lines = [(0, 10), (4, 11), (9, 12)];
+        assert_eq!(caveat(&jvm_method(&lines, true), vec![built_method("save", &lines)]), None);
+    }
+
+    #[test]
+    fn arming_against_a_stale_build_names_the_file_and_the_first_difference() {
+        let jvm = jvm_method(&[(0, 10), (4, 11)], true);
+        let built = vec![built_method("save", &[(0, 12), (4, 13)])];
+
+        let out = caveat(&jvm, built).expect("a moved line is a proof of drift");
+
+        assert!(out.contains("STALE BYTECODE"), "{out}");
+        assert!(out.contains("OrderService.class"), "must name the file it compared against:\n{out}");
+        assert!(out.contains("line 10"), "must quote the concrete disagreement:\n{out}");
+        assert!(out.contains("check_stale"), "must point at the whole-class answer:\n{out}");
+        assert!(out.contains("reload_class"), "must point at the remedy:\n{out}");
+    }
+
+    // A method the build does not have is drift too — but `differing` is empty in that case, so this is
+    // the branch where a naive `report.differing[0]` would panic.
+    #[test]
+    fn a_method_missing_from_the_build_is_reported_without_a_line_difference() {
+        let out = caveat(&jvm_method(&[(0, 10)], true), vec![built_method("somethingElse", &[(0, 10)])])
+            .expect("a method the build lacks is drift");
+        assert!(out.contains("not in your build at all"), "{out}");
+    }
+
+    // The three silences. Each is a case where the honest answer is "cannot tell", and the four distinct
+    // answers `check_stale` separates belong in the tool a caller asked, not in a footnote on arming.
+    #[test]
+    fn nothing_is_claimed_when_either_side_has_no_line_table() {
+        // -g:none on the running class: a valid reply with zero entries, which is not drift.
+        assert_eq!(caveat(&jvm_method(&[], false), vec![built_method("save", &[(0, 10)])]), None);
+        // -g:none in the build: has code, no lines.
+        assert_eq!(caveat(&jvm_method(&[(0, 10)], true), vec![built_method("save", &[])]), None);
+        // Nothing on either side.
+        assert_eq!(caveat(&jvm_method(&[], false), vec![built_method("save", &[])]), None);
+    }
+
     fn redefinition(count: u32, popped_since: bool) -> crate::session::Redefinition {
         crate::session::Redefinition { count, at: std::time::Instant::now(), popped_since }
     }

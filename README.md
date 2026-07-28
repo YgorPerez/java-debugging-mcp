@@ -55,7 +55,10 @@ natural language.
   and each of the twelve ways it can refuse is turned into what to do next instead of a bare error code
 - **Staleness detection**: `debug.check_stale` answers whether the JVM is running the build on your
   disk, by comparing line tables method by method — the failure that otherwise costs twenty tool calls
-  debugging the *program* while the deployed bytecode is last week's
+  debugging the *program* while the deployed bytecode is last week's. With a class root configured,
+  `debug.set_line_stop` also reports it **unasked** when the method you just armed has drifted (DISC-8),
+  since the caller this ruins is the one who never thought to check; it speaks only when it has a proof,
+  so a quiet reply is not a promise that your build is current
 - **Thread Management**: tools default to the last thread that hit a breakpoint
 - **Thread dumps with lock ownership**: `debug.thread_dump` answers "it's wedged — which threads are
   blocked on what?" in one call: every thread's stack, the monitors it holds, the one it is blocked
