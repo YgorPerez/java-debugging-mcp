@@ -59,24 +59,45 @@ pub struct CommandRequest {
 pub struct EventLoopHandle {
     command_tx: mpsc::Sender<CommandRequest>,
     event_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<EventSet>>>,
+    /// Why the loop stopped, written once by the loop as it exits and readable by every clone of this
+    /// handle — including the ones that arrive afterwards.
+    ///
+    /// Without it, a caller that shows up after the loop is gone can only be told *that* it is gone,
+    /// which is the same message a healthy-but-slow session would produce if anything ever went wrong
+    /// there. The loop knows the reason; this is how the reason outlives it.
+    shutdown: Arc<std::sync::OnceLock<String>>,
 }
 
 impl EventLoopHandle {
     /// Send a command and wait for reply
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the event loop has shut down or the reply channel closes before a reply arrives.
+    /// Returns a [`JdwpError`] if the event loop has shut down or the reply is lost before it arrives.
+    /// Both cases name the reason the loop stopped when it recorded one.
     pub async fn send_command(&self, packet: CommandPacket) -> JdwpResult<ReplyPacket> {
         let (reply_tx, reply_rx) = oneshot::channel();
 
         let request = CommandRequest { packet, reply_tx };
 
-        self.command_tx
-            .send(request)
-            .await
-            .map_err(|_| JdwpError::Protocol("Event loop shut down".to_string()))?;
+        self.command_tx.send(request).await.map_err(|_| self.lost("the command was never sent"))?;
 
-        reply_rx.await.map_err(|_| JdwpError::Protocol("Reply channel closed".to_string()))?
+        reply_rx.await.map_err(|_| self.lost("the command was sent and its reply was dropped"))?
+    }
+
+    /// The error for a command that will never be answered, naming the reason the loop stopped.
+    ///
+    /// Both ways a command dies arrive here — one whose reply channel was dropped as the loop exited,
+    /// and one sent after it had already gone — because both are the same fact about the debuggee and
+    /// deserve the same words. `what` says how far this one got, since "sent" and "never sent" differ.
+    ///
+    /// The `None` arm should be unreachable: `event_loop_task` records its cause before anything it owns
+    /// can drop. It is worded as the anomaly it would be rather than as a plausible-looking default,
+    /// because a reassuring message on an impossible branch is how the original defect read.
+    fn lost(&self, what: &str) -> JdwpError {
+        self.shutdown.get().map_or_else(
+            || JdwpError::Protocol(format!("the event loop stopped without recording a reason, and {what}")),
+            |cause| JdwpError::ConnectionClosed(cause.clone()),
+        )
     }
 
     /// Try to receive an event (non-blocking)
@@ -99,10 +120,11 @@ pub fn spawn_event_loop(reader: OwnedReadHalf, writer: OwnedWriteHalf) -> EventL
     // Use larger buffer for events to avoid loss under load
     // Events are critical (breakpoints, exceptions) and shouldn't be dropped
     let (event_tx, event_rx) = mpsc::channel(256);
+    let shutdown = Arc::new(std::sync::OnceLock::new());
 
-    tokio::spawn(event_loop_task(reader, writer, command_rx, event_tx));
+    tokio::spawn(event_loop_task(reader, writer, command_rx, event_tx, Arc::clone(&shutdown)));
 
-    EventLoopHandle { command_tx, event_rx: Arc::new(tokio::sync::Mutex::new(event_rx)) }
+    EventLoopHandle { command_tx, event_rx: Arc::new(tokio::sync::Mutex::new(event_rx)), shutdown }
 }
 
 /// Pending reply with timestamp for timeout tracking
@@ -117,13 +139,14 @@ async fn event_loop_task(
     mut writer: OwnedWriteHalf,
     mut command_rx: mpsc::Receiver<CommandRequest>,
     event_tx: mpsc::Sender<EventSet>,
+    shutdown: Arc<std::sync::OnceLock<String>>,
 ) {
     info!("Event loop started");
 
     let mut pending_replies: HashMap<u32, PendingReply> = HashMap::new();
     let mut cleanup_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
-    loop {
+    let cause = loop {
         tokio::select! {
             // Handle outgoing commands
             Some(cmd) = command_rx.recv() => {
@@ -137,14 +160,21 @@ async fn event_loop_task(
 
             // Handle incoming packets
             result = read_packet(&mut reader) => {
-                if handle_incoming_packet(&mut pending_replies, &event_tx, result) {
-                    break;
+                if let Some(cause) = handle_incoming_packet(&mut pending_replies, &event_tx, result) {
+                    break cause;
                 }
             }
         }
-    }
+    };
 
-    info!("Event loop shutting down");
+    info!("Event loop shutting down: {}", cause);
+    // Recorded *before* `pending_replies` drops, which is what makes the drop legible. Dropping a
+    // `oneshot` sender wakes its caller with no payload — that is the whole of the old
+    // `Reply channel closed` — so the cause is published here and rendered by
+    // [`EventLoopHandle::lost`], which is also the only thing a caller arriving later can consult.
+    // One mechanism serves both, so there is no second notification pass to keep in step with it.
+    let _ = shutdown.set(cause);
+    drop(pending_replies);
 }
 
 /// Encode and write an outgoing command, then track it for reply routing.
@@ -176,23 +206,30 @@ async fn handle_outgoing_command(
         .insert(packet_id, PendingReply { sender: cmd.reply_tx, sent_at: tokio::time::Instant::now() });
 }
 
-/// Drop any pending replies that have exceeded [`REPLY_TIMEOUT`].
+/// Abandon any pending replies that have exceeded [`REPLY_TIMEOUT`], telling each one so.
 ///
-/// Dropping a sender notifies the waiting command that its reply was lost.
+/// This used to drop the sender and rely on that to wake the caller. It did wake them — with
+/// `Reply channel closed`, the same words a dead socket produced, which is how a JVM that simply never
+/// answered came to look like a transport failure. The connection is still open here, and
+/// [`JdwpError::ReplyTimeout`] says which of the two this is.
 fn cleanup_pending_replies(pending_replies: &mut HashMap<u32, PendingReply>) {
     let now = tokio::time::Instant::now();
     let before_count = pending_replies.len();
 
-    pending_replies.retain(|packet_id, pending| {
-        let elapsed = now.duration_since(pending.sent_at);
-        if elapsed > REPLY_TIMEOUT {
-            warn!("Command {} timed out after {:?}, removing from pending replies", packet_id, elapsed);
-            // Note: sender is dropped here, which will notify the waiting command
-            false
-        } else {
-            true
+    // Identified first, then removed — `retain` would drop each sender as it returned `false`, which is
+    // exactly the payload-less wake this function exists to stop doing.
+    let lapsed: Vec<(u32, tokio::time::Duration)> = pending_replies
+        .iter()
+        .map(|(id, pending)| (*id, now.duration_since(pending.sent_at)))
+        .filter(|(_, elapsed)| *elapsed > REPLY_TIMEOUT)
+        .collect();
+
+    for (packet_id, elapsed) in lapsed {
+        warn!("Command {} timed out after {:?}, removing from pending replies", packet_id, elapsed);
+        if let Some(pending) = pending_replies.remove(&packet_id) {
+            pending.sender.send(Err(JdwpError::ReplyTimeout(REPLY_TIMEOUT.as_secs()))).ok();
         }
-    });
+    }
 
     let removed = before_count - pending_replies.len();
     if removed > 0 {
@@ -202,25 +239,31 @@ fn cleanup_pending_replies(pending_replies: &mut HashMap<u32, PendingReply>) {
 
 /// Handle the result of reading a packet from the socket.
 ///
-/// Returns `true` when the event loop should break (fatal read error or the event
-/// receiver has been dropped), `false` to keep looping.
+/// Returns `Some(cause)` when the event loop should stop — a fatal read error, or the event receiver
+/// having been dropped — and `None` to keep looping. The cause is a value rather than a log line
+/// because the callers waiting on this loop cannot read logs, and by default nothing enables them: the
+/// `error!` below is emitted by `jdwp_client`, which the server's filter only turns on at `warn` and a
+/// library consumer may not turn on at all.
 fn handle_incoming_packet(
     pending_replies: &mut HashMap<u32, PendingReply>,
     event_tx: &mpsc::Sender<EventSet>,
     result: JdwpResult<(bool, u32, Vec<u8>)>,
-) -> bool {
+) -> Option<String> {
     match result {
         Ok((is_reply, packet_id, data)) => {
             if is_reply {
                 route_reply(pending_replies, packet_id, &data);
-                false
+                None
             } else {
                 handle_event_packet(event_tx, &data)
             }
         }
         Err(e) => {
             error!("Failed to read packet: {}", e);
-            true
+            // `e` is the diagnosis — an EOF means the debuggee went away, a reset means it was killed,
+            // and a size violation means the peer is not speaking JDWP. Discarding it here is what made
+            // the whole class of failure unattributable.
+            Some(format!("reading from the debuggee failed: {e}"))
         }
     }
 }
@@ -248,8 +291,8 @@ fn route_reply(pending_replies: &mut HashMap<u32, PendingReply>, packet_id: u32,
 ///
 /// Uses non-blocking [`try_send`](mpsc::Sender::try_send) to avoid deadlocking against a
 /// consumer that is concurrently sending commands; a full channel drops the event.
-/// Returns `true` when the event receiver has been dropped and the loop should break.
-fn handle_event_packet(event_tx: &mpsc::Sender<EventSet>, data: &[u8]) -> bool {
+/// Returns `Some(cause)` when the event receiver has been dropped and the loop should stop.
+fn handle_event_packet(event_tx: &mpsc::Sender<EventSet>, data: &[u8]) -> Option<String> {
     debug!("Received event packet, len={}", data.len());
 
     // Event packets have command_set and command in header
@@ -268,23 +311,23 @@ fn handle_event_packet(event_tx: &mpsc::Sender<EventSet>, data: &[u8]) -> bool {
             // Send event without blocking to avoid deadlock
             // If consumer is sending commands while we're reading, blocking here would deadlock
             match event_tx.try_send(event_set) {
-                Ok(()) => false,
+                Ok(()) => None,
                 Err(mpsc::error::TrySendError::Full(dropped_event)) => {
                     // Event channel is full - this is critical
                     error!("Event channel full ({} buffered), dropping event with {} events. Consumer not keeping up!",
                           event_tx.capacity(), dropped_event.events.len());
                     // TODO: Consider adding backpressure or alerting mechanism
-                    false
+                    None
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     info!("Event receiver dropped, shutting down event loop");
-                    true
+                    Some("the event consumer was dropped, so the session was torn down".to_string())
                 }
             }
         }
         Err(e) => {
             warn!("Failed to parse event: {}", e);
-            false
+            None
         }
     }
 }
@@ -324,4 +367,142 @@ async fn read_packet(reader: &mut OwnedReadHalf) -> JdwpResult<(bool, u32, Vec<u
     let is_reply = flags == REPLY_FLAG;
 
     Ok((is_reply, packet_id, full_packet))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::CommandPacket;
+
+    /// An event loop talking to a peer that reads commands, never answers them, and hangs up on cue.
+    ///
+    /// Needs no JVM and no handshake: [`spawn_event_loop`] is handed an already-handshaked socket by
+    /// [`crate::connection`], so a bare TCP peer reproduces the state exactly. What it manufactures is
+    /// the one condition CI hit and this box never did — a debuggee whose connection dies with a command
+    /// in flight.
+    struct HangingUpPeer {
+        handle: EventLoopHandle,
+        /// Fires once the peer has read a command it is never going to answer, so a test can hang up at
+        /// the one moment that exercises the in-flight path rather than racing it.
+        read: oneshot::Receiver<()>,
+        hangup: oneshot::Sender<()>,
+    }
+
+    async fn hanging_up_peer() -> HangingUpPeer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a loopback port");
+        let addr = listener.local_addr().expect("read back the bound address");
+        let (read_tx, read) = oneshot::channel();
+        let (hangup, mut hangup_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept the event loop's connection");
+            let mut buf = vec![0u8; 1024];
+            let mut announced = Some(read_tx);
+            loop {
+                tokio::select! {
+                    result = socket.read(&mut buf) => match result {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => if let Some(tx) = announced.take() { let _ = tx.send(()); },
+                    },
+                    _ = &mut hangup_rx => break,
+                }
+            }
+            // Dropping the socket is the hang-up: our side's `read_packet` sees EOF.
+            drop(socket);
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect to the peer");
+        let (reader, writer) = stream.into_split();
+        HangingUpPeer { handle: spawn_event_loop(reader, writer), read, hangup }
+    }
+
+    /// The regression behind an unattributable CI flake: a command in flight when the debuggee's
+    /// connection died reported `Reply channel closed`, which said nothing about the debuggee at all.
+    ///
+    /// The assertion is on the *cause*, not on "it returned an error" — the old code also returned an
+    /// error, and that is precisely why nobody could tell a dead JVM from a bug in this crate.
+    #[tokio::test]
+    async fn a_command_in_flight_when_the_debuggee_hangs_up_is_told_why() {
+        let peer = hanging_up_peer().await;
+        let handle = peer.handle.clone();
+        let in_flight = tokio::spawn(async move { handle.send_command(CommandPacket::new(1, 1, 1)).await });
+
+        // Hang up only once the command is provably registered as pending, so this test cannot pass by
+        // way of the "arrived after the loop was gone" path, which is a different branch.
+        peer.read.await.expect("the peer should have read the command");
+        peer.hangup.send(()).expect("the peer should still be listening for the hang-up");
+
+        let err = in_flight.await.expect("the command task should not panic").expect_err(
+            "a command whose connection died cannot succeed — the peer never sent a reply packet",
+        );
+        let JdwpError::ConnectionClosed(cause) = &err else {
+            panic!("expected ConnectionClosed carrying the reason, got {err:?}");
+        };
+        assert!(
+            cause.contains("reading from the debuggee failed"),
+            "the cause must name what happened to the connection, not just that it ended: {cause}"
+        );
+    }
+
+    /// The second half: the reason has to outlive the loop that discovered it.
+    ///
+    /// A session does not stop being asked questions the moment its debuggee dies — the MCP layer has a
+    /// queue of them. Each used to get `Event loop shut down`, which reads as an internal fault rather
+    /// than as the debuggee having gone away.
+    #[tokio::test]
+    async fn a_question_asked_after_the_debuggee_hung_up_still_names_the_cause() {
+        let peer = hanging_up_peer().await;
+        let handle = peer.handle.clone();
+        let in_flight = tokio::spawn(async move { handle.send_command(CommandPacket::new(1, 1, 1)).await });
+        peer.read.await.expect("the peer should have read the command");
+        peer.hangup.send(()).expect("the peer should still be listening for the hang-up");
+        let _ = in_flight.await.expect("the command task should not panic");
+
+        // The loop has now recorded its cause and exited. Ask again.
+        let err = peer
+            .handle
+            .send_command(CommandPacket::new(2, 1, 1))
+            .await
+            .expect_err("the connection is gone; nothing can answer this");
+        let JdwpError::ConnectionClosed(cause) = &err else {
+            panic!("expected ConnectionClosed carrying the reason, got {err:?}");
+        };
+        assert!(
+            cause.contains("reading from the debuggee failed"),
+            "a later caller must get the same diagnosis as the first: {cause}"
+        );
+    }
+
+    /// A JVM that stays connected and simply never answers is a different fault from one that hung up,
+    /// and used to be reported with the same words.
+    ///
+    /// Time is paused rather than waited out: the real budget is [`REPLY_TIMEOUT`] (30s), which is worth
+    /// asserting on and not worth spending. `cleanup_pending_replies` is called directly because it is
+    /// the whole mechanism — the loop's only other job here is to tick it.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_that_never_arrives_is_reported_as_a_lapsed_reply_not_a_dead_connection() {
+        let mut pending = HashMap::new();
+        let (sender, receiver) = oneshot::channel();
+        pending.insert(7, PendingReply { sender, sent_at: tokio::time::Instant::now() });
+
+        // Not yet due: a cleanup pass before the budget must leave the command alone, or a slow-but-fine
+        // debuggee would be abandoned mid-question. Halved rather than "budget minus a second" because
+        // subtracting from a `Duration` is the underflow this repo already got bitten by once.
+        tokio::time::advance(REPLY_TIMEOUT / 2).await;
+        cleanup_pending_replies(&mut pending);
+        assert_eq!(pending.len(), 1, "abandoned a command that still had time left");
+
+        tokio::time::advance(REPLY_TIMEOUT).await;
+        cleanup_pending_replies(&mut pending);
+        assert!(pending.is_empty(), "a lapsed command must be dropped from the pending map");
+
+        let err = receiver
+            .await
+            .expect("the lapsed command must be told, not left to a dropped sender")
+            .expect_err("a lapsed reply is not a success");
+        assert!(
+            matches!(err, JdwpError::ReplyTimeout(secs) if secs == REPLY_TIMEOUT.as_secs()),
+            "expected ReplyTimeout naming the budget, got {err:?}"
+        );
+    }
 }

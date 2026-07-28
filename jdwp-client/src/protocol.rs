@@ -24,15 +24,28 @@ pub enum JdwpError {
     #[error("JDWP error code {0}: {1}")]
     JdwpErrorCode(u16, String),
 
-    #[error("Connection closed")]
-    ConnectionClosed,
-
-    /// The connection is in read-only mode and something tried to execute code in the debuggee.
+    /// The connection to the debuggee ended, carrying **why** it ended.
     ///
-    /// Enforced at the point of invocation rather than by inspecting expressions up in the MCP layer,
-    /// because invocation is reached from many directions — a `toString()` render, a `List.get`
-    /// subscript, `valueOf` boxing, a breakpoint condition — and a text-level guard misses whichever
-    /// one nobody thought of.
+    /// The payload is the point. Every one of these was once reported as `Reply channel closed`, a
+    /// message produced by four different worlds — a dead socket, a dropped event consumer, a lapsed
+    /// reply, and a loop that had already gone — none of which the reader could tell apart. The event
+    /// loop is the only thing that knows which, and it used to log the cause at a level nobody enables
+    /// and then throw the value away, so a debuggee that died mid-question was indistinguishable from a
+    /// bug in this crate. See [`crate::eventloop`].
+    #[error("connection to the debuggee closed: {0}")]
+    ConnectionClosed(String),
+
+    /// A command was sent, the connection stayed up, and no reply arrived within the budget.
+    ///
+    /// Distinct from [`ConnectionClosed`](Self::ConnectionClosed) because the remedy differs: the socket
+    /// is still there, so the session is worth keeping and the *question* is what failed. Distinct from
+    /// [`InvokeTimeout`](Self::InvokeTimeout) because nothing was being executed in the debuggee — this
+    /// is the JVM not answering a question it should have answered.
+    #[error(
+        "no reply from the debuggee within {0}s (the connection is still open; the command was abandoned)"
+    )]
+    ReplyTimeout(u64),
+
     /// A debuggee invocation did not return within its budget.
     ///
     /// Distinct from a lost reply on purpose. `INVOKE_SINGLE_THREADED` runs only the target thread, so a
@@ -43,6 +56,12 @@ pub enum JdwpError {
     #[error("invocation did not return within {0}ms (the debuggee thread may be blocked on a monitor held by another suspended thread)")]
     InvokeTimeout(u64),
 
+    /// The connection is in read-only mode and something tried to execute code in the debuggee.
+    ///
+    /// Enforced at the point of invocation rather than by inspecting expressions up in the MCP layer,
+    /// because invocation is reached from many directions — a `toString()` render, a `List.get`
+    /// subscript, `valueOf` boxing, a breakpoint condition — and a text-level guard misses whichever
+    /// one nobody thought of.
     #[error("read-only connection: refusing {0} in the debuggee")]
     ReadOnly(String),
 }

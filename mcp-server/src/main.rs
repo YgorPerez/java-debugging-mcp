@@ -51,8 +51,15 @@ const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 #[tokio::main]
 async fn main() -> Result<()> {
     // Tracing to stderr only - stdout is reserved for JSON-RPC protocol
-    let env_filter =
-        tracing_subscriber::EnvFilter::from_default_env().add_directive("jdwp_mcp=info".parse()?);
+    //
+    // `jdwp_client=warn` is here because leaving it out silenced the one crate that witnesses transport
+    // failure. The event loop logs a lost connection at `error!`, and with only a `jdwp_mcp` directive
+    // that line went nowhere by default — so the operator saw neither the cause in the reply (fixed by
+    // carrying it in `JdwpError::ConnectionClosed`) nor a log line naming it. `warn` and above is quiet
+    // in a healthy session: the loop logs at `debug`/`info` per packet, which stays off.
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("jdwp_mcp=info".parse()?)
+        .add_directive("jdwp_client=warn".parse()?);
     tracing_subscriber::fmt().with_env_filter(env_filter).with_writer(std::io::stderr).init();
 
     info!("Starting JDWP MCP Server...");

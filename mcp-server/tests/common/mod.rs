@@ -1339,6 +1339,31 @@ fn compile_slow_start(jdk: &Jdk, dir: &Path) -> Result<(), String> {
 }
 
 /// Drain one of the probe's output streams into `sink`, notifying `tx` per line.
+/// How much of the server's stderr to keep. Enough to cover the exchange a failure happened during,
+/// bounded because a whole test's worth of `jdwp_mcp=info` is thousands of lines nobody reads.
+const SERVER_LOG_TAIL: usize = 60;
+
+/// Drain a stream for its whole life, keeping only the last `keep` lines.
+///
+/// Draining is the requirement, not the tail: an unread pipe fills at 64 KiB and blocks the process
+/// writing to it. The bound is just so what is kept stays readable in a panic message.
+fn pump_tail<R: std::io::Read + Send + 'static>(
+    stream: R,
+    sink: Arc<Mutex<std::collections::VecDeque<String>>>,
+    keep: usize,
+) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            if let Ok(mut v) = sink.lock() {
+                if v.len() == keep {
+                    v.pop_front();
+                }
+                v.push_back(line);
+            }
+        }
+    });
+}
+
 fn pump<R: std::io::Read + Send + 'static>(
     stream: R,
     sink: Arc<Mutex<Vec<String>>>,
@@ -1368,6 +1393,9 @@ pub struct Server {
     /// Lines read by that drain and not yet consumed by [`read_reply`](Server::read_reply), oldest
     /// first — so closing stdin does not swallow the replies a test still means to assert on.
     drained: std::collections::VecDeque<String>,
+    /// The server's own stderr, most recent [`SERVER_LOG_TAIL`] lines. Diagnostic only: no assertion
+    /// reads it, and it is printed by the failure paths that used to report a symptom with no context.
+    log: Arc<Mutex<std::collections::VecDeque<String>>>,
     next_id: i64,
 }
 
@@ -1388,16 +1416,25 @@ impl Server {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Captured rather than discarded. This was `Stdio::null()`, which threw away the only
+            // account of what the server thought was happening — so a test that failed because the
+            // debuggee's connection died reported the symptom and nothing else. Piped output *must* be
+            // drained (a full pipe blocks the writer, which is the deadlock `close_stdin_and_wait`
+            // documents), so `pump_tail` reads it on a thread for as long as the server lives.
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("failed to start jdwp-mcp: {e}"))?;
         let stdin = child.stdin.take().ok_or("server has no stdin")?;
         let stdout = BufReader::new(child.stdout.take().ok_or("server has no stdout")?);
+        let stderr = child.stderr.take().ok_or("server has no stderr")?;
+        let log = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        pump_tail(stderr, Arc::clone(&log), SERVER_LOG_TAIL);
         let mut server = Self {
             child,
             stdin: Some(stdin),
             stdout: Some(stdout),
             drained: std::collections::VecDeque::new(),
+            log,
             next_id: 1,
         };
         server.request(
@@ -1554,14 +1591,29 @@ impl Server {
                 }
                 resp["result"]["content"][0]["text"].as_str().unwrap_or("<no text>").to_string()
             }
-            Err(e) => format!("<transport error> {e}"),
+            Err(e) => format!("<transport error> {e}{}", self.log_tail()),
         }
+    }
+
+    /// The server's recent stderr, formatted for a panic message, or an empty string if it said nothing.
+    ///
+    /// Appended to failure text rather than asserted on. A test that depended on log wording would break
+    /// every time a log line was reworded, which is how diagnostics turn into maintenance.
+    pub fn log_tail(&self) -> String {
+        let lines = match self.log.lock() {
+            Ok(l) => l.iter().cloned().collect::<Vec<_>>(),
+            Err(_) => return String::new(),
+        };
+        if lines.is_empty() {
+            return String::new();
+        }
+        format!("\n--- the server's last {} stderr line(s) ---\n{}", lines.len(), lines.join("\n"))
     }
 
     /// Attach to a probe, panicking with the server's own message if it fails.
     pub fn attach(&mut self, port: u16) -> String {
         let out = self.call("debug.attach", serde_json::json!({"host": "127.0.0.1", "port": port}));
-        assert!(out.contains("Connected"), "attach to port {port} failed: {out}");
+        assert!(out.contains("Connected"), "attach to port {port} failed: {out}{}", self.log_tail());
         out
     }
 

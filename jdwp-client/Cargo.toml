@@ -22,6 +22,10 @@ bytes.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+# `test-util` is not part of tokio's "full", and the event loop's reply budget is 30s. Paused time lets
+# that budget be asserted on at its real value instead of either waiting it out or reaching for
+# `Instant::now() - 30s`, which underflows on a freshly started runtime.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[example]]
 name = "test_connection"

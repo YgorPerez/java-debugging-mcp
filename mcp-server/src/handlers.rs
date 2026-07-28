@@ -12420,8 +12420,11 @@ mod tests {
         assert!(names.contains("wrong file"), "{names}");
 
         // A transport failure is not a refusal, and must not be dressed up as one.
-        let io =
-            explain_redefine_failure("com.example.Order", path, &jdwp_client::JdwpError::ConnectionClosed);
+        let io = explain_redefine_failure(
+            "com.example.Order",
+            path,
+            &jdwp_client::JdwpError::ConnectionClosed("early eof".to_string()),
+        );
         assert!(io.contains("nothing changed"), "{io}");
     }
 
