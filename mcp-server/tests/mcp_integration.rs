@@ -926,7 +926,10 @@ fn traced_watchpoints_record_writes_without_suspending() {
     let Some(jdk) = jdk_or_skip("traced_watchpoints_record_writes_without_suspending") else { return };
     let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    // `probe.attach(&mut server)` rather than `server.attach(probe.port)`: this is one of the two tests
+    // that has been seen failing at attach with `Connection refused` (TEST-21, #56), and the difference
+    // is what the failure says — the probe's own log and whether anything is listening on the port.
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let base = highest_tick(&probe).expect("no tick to count from");
@@ -3769,7 +3772,10 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
     let watchdog = if matches!(resume, Resume::Watchdog) { "1" } else { "0" };
     let probe = Probe::launch(jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", watchdog)]).expect("start server");
-    server.attach(probe.port);
+    // The other test seen failing at attach with `Connection refused` (TEST-21, #56) runs through here —
+    // `disconnect_is_honest_from_every_suspended_state` is four of these. `probe.attach` captures what
+    // the probe said and whether anything holds the port; `server.attach` cannot.
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
     let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");

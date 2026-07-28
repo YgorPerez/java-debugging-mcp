@@ -1227,6 +1227,52 @@ impl Probe {
         stdin.flush().map_err(|e| format!("probe stdin flush: {e}"))
     }
 
+    /// Attach `server` to **this** probe, and if that fails, say what the probe itself said.
+    ///
+    /// TEST-21 ([#56](https://github.com/YgorPerez/java-debugging-mcp/issues/56)), first acceptance
+    /// criterion: both sightings of `attach to port N failed: Connection refused` are after-the-fact test
+    /// output, and *"nobody has yet seen what the probe's own log said at the moment of refusal"*.
+    /// `Server::attach` cannot say — it is handed a port and no probe. This is.
+    ///
+    /// #55 narrowed the causes to two, and the evidence separates them:
+    ///
+    /// - **A live handshaked session holds the port**, which provably refuses a second attach. Then
+    ///   *something is listening*, and the raw connect below succeeds.
+    /// - **[`free_port`]'s documented race**: a stranger took the port and the JVM never bound it. Then
+    ///   nothing of ours is listening, the connect fails too, and the probe's log — which since #55 comes
+    ///   from *this* JVM and names *this* port — should carry a bind failure rather than the
+    ///   `Listening for transport` banner.
+    ///
+    /// The raw connect is deliberate and is only done on the failure path. #55 measured that a connection
+    /// which never handshakes costs the agent nothing, so it cannot make a bad situation worse; what it
+    /// does do is make the JVM print its `handshake failed` line, which is why the log is captured
+    /// *before* the connect and why the message says the last line may be this probe's own doing.
+    pub fn attach(&self, server: &mut Server) -> String {
+        let out = server.call("debug.attach", serde_json::json!({"host": "127.0.0.1", "port": self.port}));
+        if out.contains("Connected") {
+            return out;
+        }
+        let log = self.output();
+        let listening = std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], self.port)),
+            Duration::from_millis(500),
+        );
+        panic!(
+            "attach to {} on port {} failed: {out}\n  \
+             Something IS listening on that port: {}\n  \
+             — if yes, the port is taken: either a live handshaked session (which provably refuses a \
+             second attach) or a stranger that won free_port's race.\n  \
+             — if no, this JVM never bound it, and its log should say so.\n  \
+             The probe's last 12 lines, as of BEFORE this diagnosis connected to it (#55 made the \
+             `Listening for transport … at address:` banner come from this JVM and name this port, so \
+             its absence is itself the finding):\n{}",
+            self.name,
+            self.port,
+            if listening.is_ok() { "yes" } else { "no" },
+            log.iter().rev().take(12).rev().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n"),
+        );
+    }
+
     /// Every stdout line the probe has printed so far.
     pub fn output(&self) -> Vec<String> {
         self.lines.lock().map(|v| v.clone()).unwrap_or_default()
