@@ -1274,7 +1274,12 @@ pub struct Server {
     /// `Option` so `Drop` can *close* it (by dropping it) to shut the server down cleanly, rather than
     /// reaching for `kill()`. See the `Drop` impl for why that matters.
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    /// `Option` so [`close_stdin_and_wait`](Server::close_stdin_and_wait) can hand it to a draining
+    /// thread; `None` afterwards, and the lines it read are in `drained`.
+    stdout: Option<BufReader<ChildStdout>>,
+    /// Lines read by that drain and not yet consumed by [`read_reply`](Server::read_reply), oldest
+    /// first — so closing stdin does not swallow the replies a test still means to assert on.
+    drained: std::collections::VecDeque<String>,
     next_id: i64,
 }
 
@@ -1300,7 +1305,13 @@ impl Server {
             .map_err(|e| format!("failed to start jdwp-mcp: {e}"))?;
         let stdin = child.stdin.take().ok_or("server has no stdin")?;
         let stdout = BufReader::new(child.stdout.take().ok_or("server has no stdout")?);
-        let mut server = Self { child, stdin: Some(stdin), stdout, next_id: 1 };
+        let mut server = Self {
+            child,
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+            drained: std::collections::VecDeque::new(),
+            next_id: 1,
+        };
         server.request(
             "initialize",
             serde_json::json!({
@@ -1325,14 +1336,8 @@ impl Server {
         let stdin = self.stdin.as_mut().ok_or("server stdin already closed")?;
         writeln!(stdin, "{req}").map_err(|e| format!("server stdin: {e}"))?;
         stdin.flush().map_err(|e| format!("server flush: {e}"))?;
-        let mut line = String::new();
         loop {
-            line.clear();
-            match self.stdout.read_line(&mut line) {
-                Ok(0) => return Err("server closed stdout".to_string()),
-                Ok(_) => {}
-                Err(e) => return Err(format!("server stdout: {e}")),
-            }
+            let line = self.next_line()?;
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue };
             if v.get("id").and_then(serde_json::Value::as_i64) == Some(id) {
                 return Ok(v);
@@ -1368,11 +1373,23 @@ impl Server {
     ///
     /// Blocks until a line arrives or stdout closes.
     pub fn read_reply(&mut self) -> Result<serde_json::Value, String> {
+        let line = self.next_line()?;
+        serde_json::from_str(line.trim()).map_err(|e| format!("server wrote a non-JSON line ({e}): {line:?}"))
+    }
+
+    /// The next line the server wrote, from the drain buffer first and the pipe second.
+    ///
+    /// The buffer exists because [`close_stdin_and_wait`](Self::close_stdin_and_wait) has to read the
+    /// pipe to let the server exit, and the replies it reads while doing so are still the test's.
+    fn next_line(&mut self) -> Result<String, String> {
+        if let Some(line) = self.drained.pop_front() {
+            return Ok(line);
+        }
+        let stdout = self.stdout.as_mut().ok_or("server closed stdout without replying")?;
         let mut line = String::new();
-        match self.stdout.read_line(&mut line) {
+        match stdout.read_line(&mut line) {
             Ok(0) => Err("server closed stdout without replying".to_string()),
-            Ok(_) => serde_json::from_str(line.trim())
-                .map_err(|e| format!("server wrote a non-JSON line ({e}): {line:?}")),
+            Ok(_) => Ok(line),
             Err(e) => Err(format!("server stdout: {e}")),
         }
     }
@@ -1389,17 +1406,53 @@ impl Server {
     /// relies on for coverage counters, so it is worth asserting directly rather than only using it
     /// (TEST-9, #25). `Err` on timeout, which is the failure that matters: a server that hangs on EOF
     /// leaks a process per session.
+    ///
+    /// **stdout is drained while waiting, and that is load-bearing rather than tidy.** A pipe holds
+    /// 64 KiB on Linux; a writer that fills it blocks until somebody reads. Waiting for exit without
+    /// reading therefore deadlocks the moment a pending reply is larger than the buffer — and one
+    /// silently became so: adding three tools took `tools/list` from 58,408 bytes to 66,334, and
+    /// `a_final_request_without_a_trailing_newline_is_answered_at_eof` began failing with *"server still
+    /// running 10s after EOF"*, which reads as a shutdown bug in the server and was a full pipe in the
+    /// harness. The lines read here are kept for [`read_reply`](Self::read_reply), so a test that closes
+    /// stdin and then asserts on the reply still gets it.
+    ///
+    /// The drain runs on its own thread because a blocking read cannot be given a deadline, and the
+    /// deadline is the whole point of this function: on timeout the thread is abandoned rather than
+    /// joined, so a genuinely hung server still fails in `timeout` rather than hanging the suite.
     pub fn close_stdin_and_wait(&mut self, timeout: Duration) -> Result<std::process::ExitStatus, String> {
         drop(self.stdin.take());
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Ok(status),
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-                Ok(None) => return Err(format!("server still running {timeout:?} after EOF on stdin")),
-                Err(e) => return Err(format!("waiting for server: {e}")),
-            }
+        let (tx, rx) = channel();
+        if let Some(mut stdout) = self.stdout.take() {
+            std::thread::spawn(move || loop {
+                let mut line = String::new();
+                match stdout.read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        if tx.send(line).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
         }
+        let deadline = Instant::now() + timeout;
+        let outcome = loop {
+            while let Ok(line) = rx.try_recv() {
+                self.drained.push_back(line);
+            }
+            match self.child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Ok(None) => break Err(format!("server still running {timeout:?} after EOF on stdin")),
+                Err(e) => break Err(format!("waiting for server: {e}")),
+            }
+        };
+        // The process exiting does not mean the drain has caught up, and the reply a caller is about to
+        // assert on may be the last thing through the pipe.
+        while let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+            self.drained.push_back(line);
+        }
+        outcome
     }
 
     /// Call a `debug.*` tool and return its text content. A tool-level error comes back as text too

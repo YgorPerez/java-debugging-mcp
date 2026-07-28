@@ -1656,9 +1656,9 @@ fn a_thread_filter_holds_against_a_real_pool_of_reused_threads() {
     );
     assert!(armed.contains("exc_"), "filtered exception breakpoint failed to arm: {armed}");
 
-    let traces = server
-        .wait_for_traces("PoolProbe.doWork", EVENT_TIMEOUT)
-        .unwrap_or_else(|| panic!("the filtered stop point never recorded a throw"));
+    let traces = server.wait_for_traces("PoolProbe.doWork", EVENT_TIMEOUT).unwrap_or_else(|| {
+        panic!("{}", diagnose_missing_trace(&mut server, &probe, base, &target));
+    });
 
     // The assertion that matters: exactly ONE thread reported, out of 200 running the same code.
     let seen: std::collections::BTreeSet<&str> = traces
@@ -2510,6 +2510,55 @@ fn subscript_writes_and_map_entry_filters() {
     );
 
     server.panic_reset();
+}
+
+/// Why a trace that was expected never arrived (TEST-22, #57).
+///
+/// `the filtered stop point never recorded a throw` was the whole of this failure's message, and it
+/// covers at least four different worlds: the request was never armed, it armed and then disarmed
+/// itself, the debuggee stopped running, or the filter is pinned to a thread that has died — which is
+/// the ordinary fate of a pool worker and the thing a *filtered* stop point is most exposed to. Each has
+/// a different next step, and picking between them cost a soak run every time it fired.
+///
+/// So the evidence is gathered at the moment of failure, from the three places that can distinguish
+/// them: the stop-point listing (armed? disabled? filtered to a dead thread?), the unfiltered trace
+/// buffer (did the site fire at all, for anyone?), and the probe's own tick counter (is the debuggee
+/// still working?). Nothing here fixes the flake; it makes its next sighting worth having.
+fn diagnose_missing_trace(server: &mut Server, probe: &Probe, base_tick: i64, target: &str) -> String {
+    let stop_points = server.call("debug.list_stop_points", serde_json::json!({}));
+    let all_traces = server.call("debug.get_traces", serde_json::json!({}));
+    let threads =
+        server.call("debug.list_threads", serde_json::json!({"name_filter": "pool-worker", "limit": 400}));
+    let target_alive = threads.lines().any(|l| l.starts_with(target));
+    let now = highest_tick(probe);
+    let advanced = now.is_some_and(|n| n > base_tick);
+
+    format!(
+        "the filtered stop point never recorded a throw from PoolProbe.doWork within {EVENT_TIMEOUT:?}. \
+         Which of these is true decides what to look at next:\n  \
+         (1) the debuggee: tick was {base_tick}, is now {now:?} — {}\n  \
+         (2) the filter's thread {target}: {} in the pool listing. A pool that retires idle workers \
+         invalidates the id, and the stop point then reports nothing at all (FILT-2)\n  \
+         (3) the request: does the listing below show it armed and enabled, or disarmed?\n{stop_points}\n  \
+         (4) the throw site: the UNFILTERED trace buffer holds {} record(s) — if it is empty the site \
+         never fired for anyone (a probe problem), if it has records from other threads the filter is \
+         what dropped them (a filtering problem)\n{}",
+        if advanced { "still running" } else { "NOT advancing, so nothing could have thrown" },
+        if target_alive { "still alive" } else { "GONE" },
+        all_traces.lines().filter(|l| l.contains("thread=")).count(),
+        head_of(&all_traces),
+    )
+}
+
+/// How many `stable-worker-*` threads the debuggee has alive right now, read straight from the JVM.
+///
+/// Used to tell a selection-rule failure apart from a probe that never reached its steady state
+/// (TEST-22, #57). Deliberately asks with a wide `limit` and a name filter, so the answer cannot itself
+/// be truncated by the very default the caller is testing.
+fn stable_workers_in_debuggee(server: &mut Server) -> usize {
+    let all =
+        server.call("debug.list_threads", serde_json::json!({"name_filter": "stable-worker", "limit": 400}));
+    all.lines().filter(|l| l.contains("stable-worker-")).count()
 }
 
 /// The `<n>` of `ExcProbe`'s / `WatchProbe`'s `tick <n> …` line. Both count something that only advances
@@ -5208,12 +5257,20 @@ fn a_default_dump_and_a_default_listing_reach_a_pool_the_debuggee_started_last()
         "ChurnProbe must have more threads than the default limit, or truncation never happens: {read}/{total}"
     );
     let stable = dump.lines().filter(|l| l.contains("\"stable-worker-")).count();
+    // TEST-22 (#57): the count alone cannot say WHY it is not 8, and the two causes call for opposite
+    // responses. If the debuggee has fewer than 8 stable workers at this moment, the premise failed and
+    // the selection rule is not implicated at all; if it has 8 and the dump reached fewer, the rule is.
+    // Establish that from the debuggee before blaming either.
+    let existing = stable_workers_in_debuggee(&mut server);
     assert_eq!(
         stable,
         8,
-        "a default dump reached {stable} of the 8 threads this debuggee started LAST. That is the WildFly \
+        "a default dump reached {stable} of the 8 threads this debuggee started LAST, and the debuggee \
+         has {existing} stable worker(s) alive right now.\n  If that count is 8, this is the WildFly \
          reading (#43): 40 slots spent on the least interesting end of the list because `AllThreads` is \
-         creation order.\n{}",
+         creation order.\n  If it is fewer, the PROBE never reached its steady state and the selection \
+         rule is not what failed — the wait above passed on retirements, which does not prove the stable \
+         eight have started.\n{}",
         head_of(&dump)
     );
     // …and it did not get there by reading everything: the churn population is still mostly withheld, so
@@ -5253,9 +5310,11 @@ fn a_default_dump_and_a_default_listing_reach_a_pool_the_debuggee_started_last()
     let listed_stable = listed.lines().filter(|l| l.contains("stable-worker-")).count();
     assert_eq!(
         listed_stable, 8,
-        "a default listing reached {listed_stable} of the 8 threads this debuggee started LAST. Before \
-         #51 it reached 0, for the same reason the dump did: forty slots spent on the least interesting \
-         end of a list that is in creation order.\n{listed}"
+        "a default listing reached {listed_stable} of the 8 threads this debuggee started LAST, with \
+         {existing} alive in the debuggee when the dump above was taken. Before #51 it reached 0, for the \
+         same reason the dump did: forty slots spent on the least interesting end of a list that is in \
+         creation order. A count below 8 ALIVE is a different finding — the probe, not the rule \
+         (TEST-22, #57).\n{listed}"
     );
     // The whole of #51 in one assertion: a caller lists, picks a thread, then dumps. If the two tools
     // chose by different rules the thread they picked would not be in the dump.
