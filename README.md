@@ -48,6 +48,14 @@ natural language.
   `debug.list_stop_points` reports what **it** is costing on **your** JVM — the mean capture per hit, the
   rate hits are arriving at, and the share of the window spent capturing (invert the mean for the rate past
   which hits queue). A traced stop point that has captured nothing says so, rather than reporting zero
+- **Hot reload**: `debug.reload_class` installs freshly compiled bytecode into the running JVM
+  (`RedefineClasses`) — no redeploy, no restart, warm state intact, and a request suspended at a
+  breakpoint survives the fix: swap the method, `debug.pop_frame`, `debug.continue`, and it re-runs with
+  the new code without re-issuing the call that got you there. HotSpot accepts **method bodies only**,
+  and each of the twelve ways it can refuse is turned into what to do next instead of a bare error code
+- **Staleness detection**: `debug.check_stale` answers whether the JVM is running the build on your
+  disk, by comparing line tables method by method — the failure that otherwise costs twenty tool calls
+  debugging the *program* while the deployed bytecode is last week's
 - **Thread Management**: tools default to the last thread that hit a breakpoint
 - **Thread dumps with lock ownership**: `debug.thread_dump` answers "it's wedged — which threads are
   blocked on what?" in one call: every thread's stack, the monitors it holds, the one it is blocked
@@ -157,12 +165,15 @@ Adjust the path to match where you saved the downloaded binary (or `target/relea
 | `debug.set_field_stop` | Break when a field is written (or read) — reports the mutating location + old → new value; optional `thread_id` filter; `trace:true` (with `trace_max_hits` / `trace_frames`) collects hits without suspending |
 | `debug.set_method_exit_stop` | Report what a method **returned**, and from which `return` — for a method with several exits, or a value from a chain you can't break on. `class_pattern` + `method`; `trace` defaults to **true** here (a suspending method exit on a hot method freezes a VM fastest), and a broad suspending request is refused with the reason |
 | `debug.force_return` | Force the current method to return a given value, skipping the rest of its body |
+| `debug.reload_class` | **Hot reload**: ship a freshly compiled `.class` into the running JVM (`VirtualMachine.RedefineClasses` — what an IDE calls "reload changed classes"), with no redeploy and no restart. Warm state, pools, app context and any in-flight request survive, including one suspended at a breakpoint. Compiling stays yours; this reads the output, at `<class root>/<package as directories>/<SimpleName>.class` from `debug.attach {class_roots:[…]}`, `JDWP_CLASS_ROOTS`, the call, or an explicit `class_file`. HotSpot takes **method bodies only** — add a method or a field, change a modifier or the hierarchy, and the reply names which of those you did and says a redeploy is the only route, rather than leaving a bare `SCHEMA_CHANGE_NOT_IMPLEMENTED` to be re-tried forever. A refusal changes nothing (redefinition is all-or-nothing). Reports whether the thread you are stopped on is *inside* the class, since a frame already on the stack keeps the bytecode it entered with. `dry_run:true` sends nothing; refused read-only |
+| `debug.pop_frame` | Rewind a suspended thread to the **call site** of a frame (`StackFrame.PopFrames`), so `debug.continue` re-executes the call. The other half of a hot reload — a frame already running keeps its old bytecode, so a swap of the method you are stopped in looks like it did nothing until the frame is popped — and useful alone for re-running a method you stepped past. Every frame above the named one goes too (JDWP's behaviour, not a convenience). Side effects are **not** undone; refused read-only |
 | `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line, exception type, watched field's old → new) + `[suspended]`; events are buffered, so `limit` reads a backlog and `drain` discards it |
 | `debug.list_threads` | List threads by name; filter with `name_filter` / `only_suspended` / `limit`. A listing too big for `limit` picks **one thread per name family** rather than the first `limit` in JDWP's creation order — the same rule as `debug.thread_dump`, stated in the reply the same way (ADR-0013). It reads one packet per thread *name* to do that: measured on `ChurnProbe`, 103 packets against the 381 of a dump of the same JVM, and it reaches all 8 workers the debuggee starts last where the old creation-order listing reached 0 |
 | `debug.list_classes` | What the debuggee has actually **loaded** — the first step when you don't already know the FQN a stop point needs, and the only way to find a generated proxy, a shaded class, or a deployment that differs from your checkout. `filter` takes `com.example.*`, `*.OrderService` or a bare substring, matched against the dotted name. Bounded: the reply reports matched-against-loaded rather than dumping thousands of types. Arrays excluded unless `include_arrays:true` |
 | `debug.list_methods` | A class's methods with signatures rendered as **Java source types** (`static boolean matches(java.lang.String, int)`) — what you need to compose a `debug.evaluate` call, since overloads resolve on the runtime types you supply. All overloads listed; `static`/`abstract`/`native` marked (the latter two have no body to break on). Declared-only unless `inherited:true` walks the superclass chain, attributing each row |
 | `debug.list_fields` | What state a class **holds**, for when you have a type and no instance to expand — a static holder, a class you're about to breakpoint into, a vendored or shaded class the checkout can't show you. Rendered as a Java declaration (`static final java.lang.String INFRA`, `int qty`), so static and instance are told apart at a glance; `final` and `volatile` are marked too. **Statics are listed first** — they're the ones `debug.evaluate` reads with no instance and no suspended thread. Declared-only unless `inherited:true` walks the superclass chain, attributing each row. Reads no *values*; bounded like the other discovery tools. A class that declares nothing says so as an answer rather than looking like a failed lookup (ADR-0015) |
 | `debug.source` | What file a class was **compiled from**, and optionally the source lines around one. Two independent halves: the JVM half needs no local files and is what settles whether your checkout is the code actually running — a class reporting `Order.java` in a tree where that file was renamed months ago is the answer, and reading local source would never have shown it. A JSR-45 source debug extension (JSP, Kotlin, Groovy) is reported when the class carries one, meaning the `.java` name is only an intermediate. The disk half turns a frame's `class.method:line` into text: pass `line` for a bounded window (`context`, default 20 either side) rather than pulling a whole file into context; `whole_file:true` is capped by `max_lines` (default 400) and the reply always states which lines of how many. Roots come from `debug.attach {source_roots:[…]}`, `JDWP_SOURCE_ROOTS`, or the call itself, and a root is where the **package tree** starts. Not loaded / compiled with no `SourceFile` / no root holds it / found-but-unreadable stay four distinct answers |
+| `debug.check_stale` | **Is this JVM running the code you just compiled?** Compares the JVM's per-method line tables against the ones in your `.class`, from the same roots `debug.reload_class` reads. The half `debug.source` cannot answer: `SourceFile` is a compile-time string, identical across every build of the file, so it settles *which file* and never *which build of it* — and same-class-same-file-older-bytecode is the case a redeploy loop actually produces. It catches an edit that **moved a line** (which is what makes a stop point at `:412` mean something else) and is blind to one that moves none, so a clean result means "no line moved", not "byte-for-byte identical", and says so. A method on one side only is reported apart, as a class-shape change a hot reload could not fix; a class with no line tables at all (`-g:none`, an interface) reports **cannot tell** rather than a match |
 | `debug.thread_dump` | Every thread's stack in one call **plus** the monitors each holds and the one it is blocked entering, with the blocker named (`← held by 0x<id> "<name>"`) — a deadlock cycle is readable straight off it. JDWP can only read a *suspended* thread, so pass `suspend:true` (freeze, read, resume, verify) or `only_suspended:true`; it never suspends on its own. Bound the cost with `name_filter` / `limit` / `max_frames` / `package_filter`, and the freeze with `max_suspend_ms` (default 2000) — the reply reports how long it held the VM, the packets it spent, and any threads a budget made it skip. A dump too big for `limit` chooses **one thread per name family** (digits ignored) rather than the first `limit` in JDWP order, states that rule in its header, and names the groups it withheld (ADR-0013). `monitors_only:true` reads the lock graph without the stacks for a fraction of the freeze (measured: 245 packets / 33 ms against 770 / 117 ms on a 60-thread dump) |
 | `debug.pause` | Pause execution (suspend all threads) — watchdog-covered, so a forgotten pause can't freeze the JVM |
 | `debug.panic` | Safety: clear all stop points and resume all threads |
@@ -193,7 +204,10 @@ the same applies when a `trace:true` stop point hits its `trace_max_hits` budget
 shared JVM frozen.
 
 **Read-only sessions.** Set `JDWP_READONLY=1` (or `read_only:true` on `debug.attach`) to refuse
-everything that would execute code in the target: method invocation, writes, and `force_return`.
+everything that would execute code in or install code into the target: method invocation, writes,
+`force_return`, `debug.pop_frame`, and `debug.reload_class` — on a shared instance a redefinition is an
+unannounced deploy, not a debugger read, so it is refused first and `dry_run:true` is the one part that
+still answers.
 Enforced on the connection itself rather than by inspecting expressions, so the indirect paths are
 covered too — `toString()` rendering, `List`/`Map` subscripts, and breakpoint `condition`/`trace_expr`
 (refused when you arm them, not silently on each hit). The honest cost is shallower output: objects
@@ -515,16 +529,16 @@ instead.
 
 ## Status
 
-✅ **Functionally complete** — 16 debug tools, integrated and validated against a live JVM.
+✅ **Functionally complete** — 19 debug tools, integrated and validated against a live JVM.
 
 ### Implemented
 - [x] JDWP protocol (handshake, packets, encoding/decoding)
-- [x] MCP server with 16 debug tools (stdio transport)
-- [x] VirtualMachine commands (Version, IDSizes, AllThreads, Suspend/Resume, CreateString)
+- [x] MCP server with 19 debug tools (stdio transport)
+- [x] VirtualMachine commands (Version, IDSizes, AllThreads, Suspend/Resume, CreateString, Capabilities/**CapabilitiesNew**, **RedefineClasses**)
 - [x] ClassesBySignature, ReferenceType.Methods/Fields/Signature, ClassType.Superclass
 - [x] Method.LineTable / VariableTable
 - [x] EventRequest.Set/Clear/ClearAllBreakpoints — breakpoints with location, **count**, **thread**, **exception**, and **field** modifiers
-- [x] ThreadReference.Frames, StackFrame.GetValues/SetValues/ThisObject
+- [x] ThreadReference.Frames, StackFrame.GetValues/SetValues/ThisObject/**PopFrames**
 - [x] ObjectReference.ReferenceType/GetValues/**InvokeMethod**, ClassType.**InvokeMethod** (statics), ArrayReference.Length/GetValues, StringReference.Value
 - [x] **Event loop** for async breakpoint/step notifications
 - [x] **Stepping** (step over/into/out)
@@ -545,6 +559,11 @@ instead.
 - [x] **Arguments** in `evaluate` / conditions: literals (int, long `123L`, boolean, null, `"string"`) or expressions
 - [x] **Field watchpoints** — `FIELD_MODIFICATION` / `FIELD_ACCESS` requests; a write hit reports the
       mutating location and the old → new pair (the old value is read before the pending store commits)
+- [x] **Hot reload** — `RedefineClasses` from a class root, with the twelve refusals mapped onto what to
+      do next, type-cache invalidation on success, and `PopFrames` so a suspended frame re-enters the new
+      code (SWAP-1)
+- [x] **Staleness detection** — per-method line tables from the JVM against a parsed `.class`, so "the
+      deployed bytecode is older than your build" stops looking like a wrong hypothesis (DISC-7)
 - [x] **Safety**: `panic` + idle watchdog auto-resume (clears breakpoints, exception breakpoints and watchpoints)
 - [x] **Performance**: type cache, `package_filter`, single-threaded `invoke_method`, token-trimmed output
 - [x] Architecture independence (big-endian protocol; Intel & ARM)

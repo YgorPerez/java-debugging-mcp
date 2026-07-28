@@ -52,6 +52,28 @@ The checkout in front of you not being the build that is running. A finding, not
 reports which file a class was compiled from, and a mismatch is the answer to a question rather than a
 failure to answer it.
 
+**Stale bytecode**:
+The narrower and commoner case of the above, and the one `SourceFile` cannot see: the same class, from the
+same file, compiled *earlier* than the build on disk. `debug.source` answers "which file"; `debug.check_stale`
+answers "which build of it", by comparing line tables (DISC-7). Worth keeping distinct from source drift
+because the remedies differ — one means you are reading the wrong file, the other that the JVM is running
+last week's compile, and only the second is fixable with `debug.reload_class`.
+_Avoid_: "out of date", which does not say which side is behind.
+
+**Class root**:
+Where the package tree starts in the **build output** (`target/classes`), as against a **source root**
+(`src/main/java`), which is where it starts in the sources. A compiled class is looked for at
+`<class root>/<package as directories>/<SimpleName>.class` — note that this uses the class's own name,
+including `$` for inner classes, where a source lookup uses the file name the JVM reports. Two lists, not
+one, per ADR-0016.
+
+**Hot reload**:
+Replacing a loaded class's bytecode in a running JVM (`RedefineClasses`) — no redeploy, no restart, warm
+state intact. `HotSpot` accepts **method bodies only**. Not the same as a *redeploy*, which discards the
+classloader and everything it held, and not the same as a **classloader reload** (what `ReloadProbe` does),
+where a new type with new JDWP ids replaces the old one; a hot reload keeps the `referenceTypeID` and
+replaces the code behind it, which is exactly why ADR-0011 refuses to cache line tables per connection.
+
 ### Stop points
 
 **Stop point**:

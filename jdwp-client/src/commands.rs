@@ -42,6 +42,8 @@ pub mod vm_commands {
     pub const DISPOSE_OBJECTS: u8 = 14;
     pub const HOLD_EVENTS: u8 = 15;
     pub const RELEASE_EVENTS: u8 = 16;
+    pub const CAPABILITIES_NEW: u8 = 17;
+    pub const REDEFINE_CLASSES: u8 = 18;
 }
 
 // ReferenceType commands (set 2)

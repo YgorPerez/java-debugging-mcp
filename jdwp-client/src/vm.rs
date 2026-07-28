@@ -22,10 +22,11 @@ pub struct VmVersion {
 
 /// What the target JVM says it supports (`VirtualMachine.Capabilities`).
 ///
-/// Only the seven original capabilities: they are the ones this crate's features actually depend on,
-/// and `CapabilitiesNew` adds nothing needed here. Note that JDI's `canGetMethodReturnValues` is **not**
-/// a capability bit at all — it is a JDWP *version* check (≥ 1.6), so [`get_version`](JdwpConnection::get_version)
-/// answers that one.
+/// The seven original capabilities, which is all this command reports. The newer bits — including the
+/// ones hot reload depends on — live in [`VmCapabilitiesNew`] behind `CapabilitiesNew` (command 17);
+/// until SWAP-1 (#58) nothing here needed them, and this comment said so. Note that JDI's
+/// `canGetMethodReturnValues` is **not** a capability bit at all — it is a JDWP *version* check (≥ 1.6),
+/// so [`get_version`](JdwpConnection::get_version) answers that one.
 ///
 /// Worth asking before a feature that depends on one: a JVM without the capability answers
 /// `NOT_IMPLEMENTED` (99) to the actual command, and "this JVM can't tell us" is a far more useful
@@ -45,6 +46,32 @@ pub struct VmCapabilities {
     /// Whether [`current_contended_monitor`](JdwpConnection::current_contended_monitor) will work.
     pub can_get_current_contended_monitor: bool,
     pub can_get_monitor_info: bool,
+}
+
+/// The capabilities `VirtualMachine.CapabilitiesNew` (command 17) adds on top of [`VmCapabilities`].
+///
+/// The reply repeats the original seven booleans and then adds twenty-five more, of which the last
+/// eleven are reserved. Only the ones a feature here turns on are named: decoding a bit nothing
+/// consults would be the same uncalled-command mistake `IDSizes` was deleted for (CLEAN-1, #27).
+///
+/// Asked before hot reload rather than after a failure, per the rule [`VmCapabilities`] states: a JVM
+/// without `canRedefineClasses` answers `NOT_IMPLEMENTED` (99) to the command, and "this JVM cannot
+/// `HotSwap`" is a far more useful report than a bare error code.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+// Same reasoning as `VmCapabilities`: this is a decoded wire structure, in the spec's order.
+#[allow(clippy::struct_excessive_bools)]
+pub struct VmCapabilitiesNew {
+    /// Whether [`redefine_classes`](JdwpConnection::redefine_classes) will work at all. Every `HotSpot`
+    /// this project has met says yes; a JVM in the field may not.
+    pub can_redefine_classes: bool,
+    /// Whether a redefinition may **add** a method. `HotSpot` says no, which is most of why a swap gets
+    /// refused: method *bodies* are all it will accept.
+    pub can_add_method: bool,
+    /// Whether the JVM lifts the method-bodies-only restriction entirely. `HotSpot` says no.
+    pub can_unrestrictedly_redefine_classes: bool,
+    /// Whether [`pop_frames`](JdwpConnection::pop_frames) will work — the other half of a useful swap,
+    /// since a frame already on the stack keeps running the code it entered with.
+    pub can_pop_frames: bool,
 }
 
 /// Class information from `ClassesBySignature`
@@ -111,6 +138,78 @@ impl JdwpConnection {
             can_get_current_contended_monitor: flag()?,
             can_get_monitor_info: flag()?,
         })
+    }
+
+    /// Ask the JVM for the *newer* capability bits (VirtualMachine.CapabilitiesNew, command 17).
+    ///
+    /// The reply repeats [`capabilities`](Self::capabilities)' seven booleans before the ones that are
+    /// only here, so the first seven bytes are read past rather than decoded twice — the two commands
+    /// answer about the same JVM and disagreeing about the overlap is not a state worth representing.
+    /// Everything from the twelfth bit on is skipped for the reason [`VmCapabilitiesNew`] gives.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn capabilities_new(&mut self) -> JdwpResult<VmCapabilitiesNew> {
+        let id = self.next_id();
+        let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::CAPABILITIES_NEW);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let mut flag = || -> JdwpResult<bool> { Ok(read_u8(&mut data)? != 0) };
+        // The seven `Capabilities` bits, in the same order, first.
+        for _ in 0..7 {
+            flag()?;
+        }
+        Ok(VmCapabilitiesNew {
+            can_redefine_classes: flag()?,
+            can_add_method: flag()?,
+            can_unrestrictedly_redefine_classes: flag()?,
+            can_pop_frames: flag()?,
+        })
+    }
+
+    /// Install new bytecode for already-loaded classes (VirtualMachine.RedefineClasses, command 18) —
+    /// `HotSwap`, what an IDE calls "reload changed classes".
+    ///
+    /// All-or-nothing: the JVM either accepts every definition in the batch or changes nothing, which is
+    /// why this takes a slice rather than being called in a loop. On `HotSpot` it accepts **method body
+    /// changes only** — add or remove a method or a field, change a signature, a modifier or the
+    /// hierarchy, and it refuses with one of the twelve codes at 60-71 in
+    /// [`ERROR_MESSAGES`](crate::protocol). Translating those into what the caller should do next is the
+    /// MCP layer's job; this reports them as they came.
+    ///
+    /// **Frames already on the stack keep running the code they entered with.** A method suspended at a
+    /// breakpoint is unaffected by its own redefinition until it is re-entered — see
+    /// [`pop_frames`](Self::pop_frames), which is how it gets re-entered without re-issuing the request
+    /// that got there.
+    ///
+    /// On success every redefined type is dropped from the [type cache](crate::connection): the cache
+    /// holds each type's methods, fields, signature and interfaces, and a redefinition is one of the two
+    /// events its own documentation names as making those stale. Method ids for changed methods become
+    /// *obsolete* rather than invalid, so a cached list would keep naming code the JVM no longer runs.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the JVM refuses the redefinition.
+    pub async fn redefine_classes(&mut self, defs: &[(ReferenceTypeId, Vec<u8>)]) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::REDEFINE_CLASSES);
+
+        packet.data.put_i32(i32::try_from(defs.len()).unwrap_or(i32::MAX));
+        for (type_id, bytes) in defs {
+            packet.data.put_u64(*type_id);
+            packet.data.put_u32(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+            packet.data.extend_from_slice(bytes);
+        }
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        for (type_id, _) in defs {
+            self.types().invalidate(*type_id);
+        }
+        Ok(())
     }
 
     /// Dispose of the debugger connection (VirtualMachine.Dispose command).

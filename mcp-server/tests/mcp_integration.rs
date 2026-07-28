@@ -6130,3 +6130,459 @@ fn every_primitive_and_its_array_renders_the_same_as_local_field_and_element() {
         probe.output(),
     );
 }
+
+/// The tick number out of one `SwapProbe` line (`answer 1 tick 12`), or `None` if it is not one.
+///
+/// Separate from [`tick_index`] because this probe prints the swapped value *before* the tick, and a
+/// test that cannot read the tick cannot tell "the swap did nothing" from "the JVM never resumed".
+fn swap_tick(line: &str) -> Option<i64> {
+    let (_, after) = line.split_once(" tick ")?;
+    after.split_whitespace().next()?.parse().ok()
+}
+
+/// The answer `SwapProbe` last printed, and the tick it printed it on.
+fn last_answer(probe: &Probe) -> Option<(i64, i64)> {
+    probe.output().iter().rev().find_map(|l| {
+        let answer = l.strip_prefix("answer ")?.split_whitespace().next()?.parse().ok()?;
+        Some((answer, swap_tick(l)?))
+    })
+}
+
+/// One edit to a probe's source, boxed so a table of cases can hold several.
+type SourceEdit = Box<dyn Fn(String) -> String>;
+
+/// Compile a `SwapProbe` whose `answer()` returns `value`, into a fresh class root.
+///
+/// Returns the temp dir (the *class root*, which is what `debug.reload_class` wants) — the caller must
+/// hold it, since dropping it deletes the bytes the JVM is being asked to load.
+fn swap_probe_returning(jdk: &Jdk, value: i32) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir for the recompiled probe");
+    jdk.compile_probe_variant("SwapProbe", dir.path(), |src| {
+        src.replace("int v = 1; // SWAP_VALUE", &format!("int v = {value}; // SWAP_VALUE"))
+    })
+    .expect("compile the modified SwapProbe");
+    dir
+}
+
+/// SWAP-1 (#58): the headline claim — a Java change reaches a JVM that was never restarted.
+///
+/// The assertion is over the **debuggee's own stdout**, not over what the server reported about itself.
+/// A tool that answered "✅ Reloaded" while the JVM kept running the old bytecode would pass any
+/// assertion made against the reply, and that is precisely the failure this feature is most likely to
+/// have: `RedefineClasses` succeeding for a class nobody re-enters looks identical to it doing nothing.
+///
+/// The tick counter is what separates the two ways this can fail. `answer 2` never appearing is one
+/// finding if the probe stopped printing (the JVM froze — a harness or resume bug) and quite another if
+/// it kept printing `answer 1` (the swap did nothing — a real bug in this feature), and the assertion
+/// message has to be able to say which, per TEST-19 (#54)'s lesson.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_hot_reload_changes_what_a_running_jvm_prints() {
+    let Some(jdk) = jdk_or_skip("a_hot_reload_changes_what_a_running_jvm_prints") else { return };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let classes = swap_probe_returning(&jdk, 2);
+    let root = classes.path().display().to_string();
+
+    // A dry run first, which is what a caller should do against a shared JVM: it must name the file and
+    // the capability, and it must not change anything.
+    let dry = server.call(
+        "debug.reload_class",
+        serde_json::json!({"class_name": "SwapProbe", "class_roots": [root], "dry_run": true}),
+    );
+    assert_contains_all(
+        "a dry run reports what would be shipped and sends nothing",
+        &dry,
+        &["Dry run", "Would ship", "SwapProbe.class", "canRedefineClasses=true"],
+    );
+    let after_dry = last_answer(&probe).expect("the probe prints an answer");
+    assert_eq!(after_dry.0, 1, "a dry run must not have changed the running bytecode: {dry}");
+
+    let reloaded = server
+        .call("debug.reload_class", serde_json::json!({"class_name": "SwapProbe", "class_roots": [root]}));
+    assert_contains_all(
+        "the reload reports success and where the bytes came from",
+        &reloaded,
+        &["✅ Reloaded SwapProbe", "SwapProbe.class"],
+    );
+
+    let seen = probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("answer 2 tick "));
+    let (answer, tick) = last_answer(&probe).expect("the probe prints an answer");
+    assert!(
+        seen.is_some(),
+        "the JVM never printed the new value after a reload that reported success.\n  \
+         reload said: {reloaded}\n  \
+         last line: answer {answer} tick {tick} — if the tick is still advancing the swap did nothing \
+         (a bug in reload_class); if it stopped, the probe froze (a harness or resume bug).\n  \
+         last 5 lines: {:?}",
+        probe.output().iter().rev().take(5).collect::<Vec<_>>(),
+    );
+    // Nothing was suspended at any point, so the swap landed on a JVM that never stopped running.
+    assert!(tick > after_dry.1, "the probe must have kept ticking across the swap, not been frozen by it");
+}
+
+/// SWAP-1 (#58): the refusals, which are most of the feature's worth.
+///
+/// `HotSpot` accepts method **body** changes only, and the three edits below are the ones a developer
+/// actually makes by accident — add a field, add a method, change a modifier. What the JVM answers is
+/// accurate and useless (`SCHEMA_CHANGE_NOT_IMPLEMENTED`), and an agent handed that will recompile and
+/// re-try a swap that can never land. Each assertion here is that the reply names the edit and says a
+/// redeploy is the route, not that some error occurred.
+///
+/// The probe is checked after every refusal: `RedefineClasses` is all-or-nothing, and a refusal that
+/// had partially landed would be far worse than one that reported badly.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_swap_hotspot_cannot_accept_names_the_edit_and_says_a_redeploy_is_needed() {
+    let Some(jdk) = jdk_or_skip("a_swap_hotspot_cannot_accept_names_the_edit_and_says_a_redeploy_is_needed")
+    else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // (what the edit does, how to make it, what the reply must say)
+    let cases: [(&str, SourceEdit, &str); 3] = [
+        (
+            "adds a field",
+            Box::new(|src: String| {
+                src.replace(
+                    "    static int answer() {",
+                    "    static int extra = 7;\n\n    static int answer() {",
+                )
+            }),
+            "FIELD",
+        ),
+        (
+            "adds a method",
+            Box::new(|src: String| {
+                src.replace(
+                    "    static int answer() {",
+                    "    static int added() { return 9; }\n\n    static int answer() {",
+                )
+            }),
+            "ADDED a method",
+        ),
+        (
+            "changes a method modifier",
+            Box::new(|src: String| {
+                src.replace("    static int answer() {", "    static synchronized int answer() {")
+            }),
+            "METHOD modifier",
+        ),
+    ];
+
+    for (what, edit, expected) in cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        jdk.compile_probe_variant("SwapProbe", dir.path(), edit).expect("compile the variant");
+        let refusal = server.call(
+            "debug.reload_class",
+            serde_json::json!({"class_name": "SwapProbe", "class_roots": [dir.path().display().to_string()]}),
+        );
+        assert_contains_all(
+            &format!("a variant that {what} is refused with advice, not a bare code"),
+            &refusal,
+            &["was NOT reloaded", expected, "redeploy", "all-or-nothing"],
+        );
+
+        // All-or-nothing is a claim about the debuggee, so read it from the debuggee: `answer()` still
+        // returns 1, and nothing about the class changed.
+        let before = last_answer(&probe).expect("the probe prints an answer");
+        assert_eq!(before.0, 1, "a refused swap must leave the old bytecode running: {refusal}");
+        assert!(
+            probe.wait_for_line(EVENT_TIMEOUT, |l| swap_tick(l).is_some_and(|t| t > before.1)).is_some(),
+            "the probe stopped running after a refused swap — a refusal must cost the debuggee nothing"
+        );
+    }
+
+    // The local guard, which never reaches the JVM: a path that resolved to something that is not a
+    // class file. Distinguished from a JVM refusal on purpose — the fix is a different one.
+    let not_a_class = tempfile::tempdir().expect("tempdir");
+    std::fs::write(not_a_class.path().join("SwapProbe.class"), b"public class SwapProbe {}").expect("write");
+    let refused = server.call(
+        "debug.reload_class",
+        serde_json::json!({
+            "class_name": "SwapProbe",
+            "class_roots": [not_a_class.path().display().to_string()],
+        }),
+    );
+    assert_contains_all(
+        "a file that is not a class file is refused before the wire",
+        &refused,
+        &["0xCAFEBABE", "Nothing was sent"],
+    );
+}
+
+/// SWAP-1 (#58), piece 4: the whole point of the feature, and the part that looks broken without
+/// `debug.pop_frame` — a request **suspended at a breakpoint** gets the fix without being re-issued.
+///
+/// The sequence is the one a developer runs: stop inside the method, discover it is wrong, swap it, and
+/// re-enter it. What makes it worth a test rather than a paragraph is the middle step: immediately after
+/// a successful redefinition the suspended frame is still executing the OLD bytecode, so a caller who
+/// resumes here sees their fix do nothing on this request. The reload's reply has to say that, and the
+/// pop has to fix it.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_reload_of_the_method_you_are_stopped_in_takes_effect_when_the_frame_is_popped() {
+    let Some(jdk) =
+        jdk_or_skip("a_reload_of_the_method_you_are_stopped_in_takes_effect_when_the_frame_is_popped")
+    else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let line = probe_line(&probe_source("SwapProbe"), "// SWAP_VALUE");
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "SwapProbe", "line": line}));
+    assert!(
+        server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).is_some(),
+        "the breakpoint inside SwapProbe.answer never fired; probe said {:?}",
+        probe.output().iter().rev().take(5).collect::<Vec<_>>(),
+    );
+
+    let classes = swap_probe_returning(&jdk, 3);
+    let reloaded = server.call(
+        "debug.reload_class",
+        serde_json::json!({
+            "class_name": "SwapProbe",
+            "class_roots": [classes.path().display().to_string()],
+        }),
+    );
+    assert_contains_all(
+        "the reload warns that the suspended thread is inside the class it just replaced",
+        &reloaded,
+        &["✅ Reloaded SwapProbe", "INSIDE SwapProbe", "debug.pop_frame", "stop point(s) are armed"],
+    );
+
+    // The outermost frame cannot be popped, and the refusal must say so rather than reporting whatever
+    // JDWP's NO_MORE_FRAMES looks like from the wire. main → tick → answer, so #2 is `main`.
+    let too_far = server.call("debug.pop_frame", serde_json::json!({"frame": 2}));
+    assert_contains_all(
+        "popping the outermost frame is refused with the reason",
+        &too_far,
+        &["outermost frame", "NO_MORE_FRAMES"],
+    );
+
+    // Clear the stop point first: leaving it armed re-suspends inside `answer()` the moment the popped
+    // call is re-executed, and the test would then be waiting for output the probe cannot reach.
+    server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": "bp_1"}));
+    let popped = server.call("debug.pop_frame", serde_json::json!({"frame": 0}));
+    // The method is reported as OBSOLETE rather than by name, and that is the JVM's own answer rather
+    // than a gap in this tool: after a redefinition `HotSpot` gives the suspended frame method id 0,
+    // because the code it entered with is no longer part of the class. Asserted deliberately — it is
+    // the clearest available evidence that the frame really was running the pre-swap bytecode, which is
+    // the fact this whole test exists to establish.
+    assert_contains_all(
+        "the pop reports where the thread now is and what it does not undo",
+        &popped,
+        &["Popped frame #0", "SwapProbe.<obsolete method", "CALL SITE", "Side effects are not rewound"],
+    );
+
+    server.call("debug.continue", serde_json::json!({}));
+    let seen = probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("answer 3 tick "));
+    assert!(
+        seen.is_some(),
+        "re-entering the popped method did not run the new bytecode.\n  reload said: {reloaded}\n  \
+         pop said: {popped}\n  last 5 lines: {:?}",
+        probe.output().iter().rev().take(5).collect::<Vec<_>>(),
+    );
+}
+
+/// SWAP-1 (#58) under SAFE-3: redefinition is the most far-reaching mutation this server can perform —
+/// on a shared instance it is an unannounced deploy — so read-only must refuse it, and refuse
+/// `pop_frame` with it.
+///
+/// `dry_run` is the deliberate exception and is asserted as such rather than left to be discovered: it
+/// ships nothing, and "what would this swap do" is a question a read-only session should be able to ask.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn read_only_refuses_a_reload_but_still_answers_a_dry_run() {
+    let Some(jdk) = jdk_or_skip("read_only_refuses_a_reload_but_still_answers_a_dry_run") else { return };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start_with_env(&[("JDWP_READONLY", "1")]).expect("start server");
+    server.attach(probe.port);
+
+    let classes = swap_probe_returning(&jdk, 4);
+    let root = classes.path().display().to_string();
+
+    let refused = server
+        .call("debug.reload_class", serde_json::json!({"class_name": "SwapProbe", "class_roots": [&root]}));
+    assert_contains_all(
+        "a reload is refused in a read-only session, and says how to lift the guard",
+        &refused,
+        &["Read-only", "unannounced deploy", "JDWP_READONLY"],
+    );
+    assert_contains_all(
+        "pop_frame is refused too",
+        &server.call("debug.pop_frame", serde_json::json!({"thread_id": "0x1"})),
+        &["Read-only"],
+    );
+
+    assert_contains_all(
+        "a dry run still answers, because it ships nothing",
+        &server.call(
+            "debug.reload_class",
+            serde_json::json!({"class_name": "SwapProbe", "class_roots": [root], "dry_run": true}),
+        ),
+        &["Dry run", "SwapProbe.class"],
+    );
+
+    // The refusal is a claim about the debuggee: it is still running what it was running.
+    let (answer, tick) = last_answer(&probe).expect("the probe prints an answer");
+    assert_eq!(answer, 1, "a refused reload must not have changed anything");
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| swap_tick(l).is_some_and(|t| t > tick)).is_some(),
+        "the probe stopped running after a refused reload"
+    );
+}
+
+/// DISC-7 (#59): the detector, against a JVM whose bytecode is provably older than the build on disk.
+///
+/// Both directions in one test, because each is meaningless without the other. A detector that always
+/// says STALE passes the drift half; one that always says MATCH passes the clean half. The clean half is
+/// the one that decides whether anybody keeps using it: a detector that cries stale on a current build
+/// is ignored within a day.
+///
+/// The drift is made the way it happens in a redeploy loop — **the same source, recompiled after lines
+/// moved** — rather than by editing a method's behaviour. That is the case `debug.source` provably
+/// cannot see: same class, same `SwapProbe.java`, older bytecode.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_stale_build_is_detected_and_a_current_one_is_not() {
+    let Some(jdk) = jdk_or_skip("a_stale_build_is_detected_and_a_current_one_is_not") else { return };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // The control: the very source the running JVM was built from, compiled again. Anything but "match"
+    // here is a false positive, and a false positive is what kills a detector.
+    let current = tempfile::tempdir().expect("tempdir");
+    jdk.compile_probe_variant("SwapProbe", current.path(), |src| {
+        // `compile_probe_variant` refuses a no-op edit (a stale copy would pass for the wrong reason),
+        // so change a comment: it moves no line and alters no bytecode.
+        src.replace("// SWAP_VALUE", "// SWAP_VALUE (control build)")
+    })
+    .expect("recompile the unmodified probe");
+    let clean = server.call(
+        "debug.check_stale",
+        serde_json::json!({
+            "class_name": "SwapProbe",
+            "class_roots": [current.path().display().to_string()],
+        }),
+    );
+    assert_contains_all(
+        "a rebuild of the running source must not be reported as drift",
+        &clean,
+        &["matches your build", "SwapProbe.class"],
+    );
+    assert!(!clean.contains("STALE"), "false positive on a current build: {clean}");
+    // The claim has to be the one that was checked, or the next reader will over-trust it.
+    assert!(clean.contains("byte-for-byte"), "the reply must bound its own claim: {clean}");
+
+    // Now the drift: two lines inserted above `answer()`, which moves every line number in it. Nothing
+    // about the class's shape changes, and `debug.source` would report the same `SwapProbe.java` for
+    // both — this is precisely the half #31 could not answer.
+    let stale = tempfile::tempdir().expect("tempdir");
+    jdk.compile_probe_variant("SwapProbe", stale.path(), |src| {
+        src.replace("    static int answer() {", "    // shifted\n    // shifted\n    static int answer() {")
+    })
+    .expect("compile the shifted probe");
+    let drifted = server.call(
+        "debug.check_stale",
+        serde_json::json!({
+            "class_name": "SwapProbe",
+            "class_roots": [stale.path().display().to_string()],
+        }),
+    );
+    assert_contains_all(
+        "a build whose lines moved is reported stale, naming the method and one difference",
+        &drifted,
+        &["🚨 STALE", "answer()I", "the JVM has line", "your build has line", "debug.reload_class"],
+    );
+
+    // A method the build has and the JVM does not is a class SHAPE change, reported separately because
+    // the remedy differs — a hot reload cannot install it.
+    let widened = tempfile::tempdir().expect("tempdir");
+    jdk.compile_probe_variant("SwapProbe", widened.path(), |src| {
+        src.replace(
+            "    static int answer() {",
+            "    static int added() { return 9; }\n\n    static int answer() {",
+        )
+    })
+    .expect("compile the widened probe");
+    let shape = server.call(
+        "debug.check_stale",
+        serde_json::json!({
+            "class_name": "SwapProbe",
+            "class_roots": [widened.path().display().to_string()],
+        }),
+    );
+    assert_contains_all(
+        "a method only the build has is reported as a shape change",
+        &shape,
+        &["BUILD declares", "added()I", "redeploy, not a swap"],
+    );
+
+    // A root that holds a different class is a wrong path, not drift, and must not be reported as it.
+    let wrong = tempfile::tempdir().expect("tempdir");
+    jdk.compile_probe("ForceProbe", wrong.path()).expect("compile a different probe");
+    std::fs::rename(wrong.path().join("ForceProbe.class"), wrong.path().join("SwapProbe.class"))
+        .expect("rename");
+    let mismatched = server.call(
+        "debug.check_stale",
+        serde_json::json!({
+            "class_name": "SwapProbe",
+            "class_roots": [wrong.path().display().to_string()],
+        }),
+    );
+    assert_contains_all(
+        "a class file declaring another class is a wrong path, not drift",
+        &mismatched,
+        &["declares ForceProbe", "Nothing was compared"],
+    );
+}
+
+/// DISC-7 (#59): the answer that must never be dressed up as a pass.
+///
+/// A class compiled `-g:none` has no line tables, so there is nothing to compare and the honest reply is
+/// "cannot tell". Reporting that as a match would be the worst possible outcome for this tool — it is
+/// the exact reassurance it exists to withhold — and it is easy to write by accident, since zero
+/// differences is indistinguishable from a clean build if you only count differences.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_class_with_no_debug_info_cannot_be_checked_and_says_so() {
+    let Some(jdk) = jdk_or_skip("a_class_with_no_debug_info_cannot_be_checked_and_says_so") else { return };
+    let probe = Probe::launch_stripped(&jdk, "StrippedProbe").expect("launch StrippedProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // Compiled with -g here, deliberately: the JVM side has no line tables (the probe is launched
+    // `-g:none`), so this is the *asymmetric* case — a build that could be compared against and a
+    // running class that cannot. It must still answer "cannot tell" rather than counting zero
+    // differences as agreement.
+    let built = tempfile::tempdir().expect("tempdir");
+    jdk.compile_probe("StrippedProbe", built.path()).expect("compile StrippedProbe with debug info");
+
+    let verdict = server.call(
+        "debug.check_stale",
+        serde_json::json!({
+            "class_name": "StrippedProbe",
+            "class_roots": [built.path().display().to_string()],
+        }),
+    );
+    assert_contains_all(
+        "a class with no line tables is reported as unanswerable, not as a match",
+        &verdict,
+        &["Cannot tell", "-g:none", "NOT a report that the build matches"],
+    );
+    assert!(!verdict.contains("✅"), "a skipped comparison must not read as a pass: {verdict}");
+}

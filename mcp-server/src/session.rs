@@ -69,6 +69,14 @@ pub struct DebugSession {
     /// the question you are asking: the same list would otherwise be repeated on every call, and two
     /// sessions against different deployments need different lists.
     pub source_roots: Vec<std::path::PathBuf>,
+    /// Directories `debug.reload_class` reads freshly compiled `.class` files from (SWAP-1), resolved
+    /// once at attach from the tool argument or `JDWP_CLASS_ROOTS`.
+    ///
+    /// Separate from [`source_roots`](Self::source_roots) rather than shared with it, because they name
+    /// different trees — `target/classes` against `src/main/java` — and a caller who set one has said
+    /// nothing about the other. Same per-session reasoning otherwise: the build output belongs to the
+    /// JVM you attached to.
+    pub class_roots: Vec<std::path::PathBuf>,
     /// Breakpoints requested on classes not yet loaded. Each holds a `CLASS_PREPARE` request that
     /// fires when the class loads; the event pump then arms the real breakpoint. See handlers.rs.
     pub pending_breakpoints: Vec<PendingBreakpoint>,
@@ -484,6 +492,7 @@ impl SessionManager {
         endpoint: String,
         read_only: bool,
         source_roots: Vec<std::path::PathBuf>,
+        class_roots: Vec<std::path::PathBuf>,
     ) -> SessionId {
         let session_id = format!("session_{}", uuid::v4());
         let session = DebugSession {
@@ -504,6 +513,7 @@ impl SessionManager {
             trace_disarms_dropped: 0,
             read_only,
             source_roots,
+            class_roots,
             pending_breakpoints: Vec::new(),
             exception_requests: HashMap::new(),
             watchpoints: HashMap::new(),

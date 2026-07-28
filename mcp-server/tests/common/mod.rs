@@ -250,6 +250,48 @@ impl Jdk {
         self.compile_probe_with_debug_info("-g:none", name, out_dir)
     }
 
+    /// Compile a **modified copy** of a checked-in probe into `out_dir` — the build output a hot-reload
+    /// test ships to a JVM that is already running the unmodified one (SWAP-1, #58).
+    ///
+    /// The edit is applied to the probe's real source rather than to a second `.java` kept in step by
+    /// hand, because the two versions differing in exactly one intended way is the whole experiment: a
+    /// stale copy would make a swap that changed nothing look like a swap that worked, or the reverse.
+    /// The modified source is written under `out_dir/src` so the caller can read what was actually
+    /// compiled when an assertion fails, and so `out_dir` itself stays a clean class root.
+    pub fn compile_probe_variant(
+        &self,
+        name: &str,
+        out_dir: &Path,
+        edit: impl FnOnce(String) -> String,
+    ) -> Result<PathBuf, String> {
+        let original = std::fs::read_to_string(probe_source_path(name))
+            .map_err(|e| format!("cannot read the source of probe {name}: {e}"))?;
+        let modified = edit(original.clone());
+        assert_ne!(
+            modified, original,
+            "the edit for probe {name} changed nothing, so the variant would be identical to what the \
+             JVM is already running and any assertion over it would pass for the wrong reason"
+        );
+        let src_dir = out_dir.join("src");
+        std::fs::create_dir_all(&src_dir).map_err(|e| format!("mkdir {}: {e}", src_dir.display()))?;
+        let src = src_dir.join(format!("{name}.java"));
+        std::fs::write(&src, modified).map_err(|e| format!("write {}: {e}", src.display()))?;
+
+        let out = Command::new(&self.javac)
+            .arg("-g")
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-d")
+            .arg(out_dir)
+            .arg(&src)
+            .output()
+            .map_err(|e| format!("failed to run javac: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("javac {} failed: {}", src.display(), String::from_utf8_lossy(&out.stderr)));
+        }
+        Ok(out_dir.join(format!("{name}.class")))
+    }
+
     fn compile_probe_with_debug_info(
         &self,
         debug_info: &str,

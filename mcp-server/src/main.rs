@@ -28,6 +28,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, info};
 
 mod args;
+mod classfile;
 mod handlers;
 mod protocol;
 mod session;

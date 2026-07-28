@@ -5,10 +5,10 @@
 // empty object schema.
 
 use crate::args::{
-    AttachArgs, ClearBreakpointArgs, EvaluateArgs, ForceReturnArgs, GetLastEventArgs, GetStackArgs,
-    GetTracesArgs, ListClassesArgs, ListFieldsArgs, ListMethodsArgs, ListThreadsArgs, SetBreakpointArgs,
-    SetExceptionBreakpointArgs, SetMethodBreakpointArgs, SetValueArgs, SetWatchpointArgs, SourceArgs,
-    StepArgs, ThreadDumpArgs, ToggleBreakpointArgs,
+    AttachArgs, CheckStaleArgs, ClearBreakpointArgs, EvaluateArgs, ForceReturnArgs, GetLastEventArgs,
+    GetStackArgs, GetTracesArgs, ListClassesArgs, ListFieldsArgs, ListMethodsArgs, ListThreadsArgs,
+    PopFrameArgs, ReloadClassArgs, SetBreakpointArgs, SetExceptionBreakpointArgs, SetMethodBreakpointArgs,
+    SetValueArgs, SetWatchpointArgs, SourceArgs, StepArgs, ThreadDumpArgs, ToggleBreakpointArgs,
 };
 use crate::protocol::Tool;
 use serde_json::json;
@@ -141,6 +141,16 @@ fn execution_tools() -> Vec<Tool> {
             description: "Force the current method (top frame of a suspended thread) to return immediately with the given value, skipping the rest of its body — e.g. make a rejecting salvar() return true without redeploying. Value is coerced to the method's return type; omit for void. Then debug.continue.".to_string(),
             input_schema: to_val(schemars::schema_for!(ForceReturnArgs)),
         },
+        Tool {
+            name: "debug.reload_class".to_string(),
+            description: "HOT RELOAD: ship a freshly compiled .class into the running JVM and have it replace the loaded one, with no redeploy and no restart — JDWP's RedefineClasses, what an IDE calls \"reload changed classes\". Warm state, connection pools, the app context and any in-flight request all survive, including a request suspended at a breakpoint: change the method, debug.pop_frame, debug.continue, and the fix is exercised without re-issuing the call that got you there. Compiling is still yours (mvn compile / gradle classes); this reads the OUTPUT. Give class_name (must already be loaded) and the bytes are looked for at <class root>/<package as directories>/<SimpleName>.class — roots come from debug.attach {class_roots:[...]} or JDWP_CLASS_ROOTS, class_roots on the call overrides both, and class_file names one file directly. THE LIMIT THAT MATTERS: HotSpot accepts METHOD BODY changes only. Add or remove a method or a field, change a signature, a modifier or the hierarchy, and the JVM refuses — the reply says which of those you did and that a real redeploy is the only route, rather than leaving you to re-try a swap that can never land. A refusal changes nothing: redefinition is all-or-nothing. Also reports whether the thread you are stopped on is INSIDE the class, because a frame already on the stack keeps running the bytecode it entered with. dry_run:true reports what would be shipped and sends nothing. Refused in a read-only session (dry_run still works) — on a shared instance this is an unannounced deploy, not a debugger read.".to_string(),
+            input_schema: to_val(schemars::schema_for!(ReloadClassArgs)),
+        },
+        Tool {
+            name: "debug.pop_frame".to_string(),
+            description: "Rewind a suspended thread to the CALL SITE of a method it is running: the frame is discarded, the operand stack restored, and debug.continue re-executes the call. Two uses. After debug.reload_class, it is how the new bytecode actually gets entered — a frame already on the stack keeps the code it entered with, so a swap of the very method you are stopped in looks like it did nothing until the frame is popped. On its own, it re-runs a method you stepped through, with locals or fields you have since changed via debug.set_value. frame is indexed as debug.get_stack numbers them (0 = innermost), and every frame above the one you name goes too — that is JDWP's behaviour, not a convenience. Needs a suspended thread and canPopFrames; a native frame in the way (OPAQUE_FRAME) and the outermost frame both refuse, and the reply says which. WHAT IT DOES NOT UNDO: side effects. Anything the popped invocation already wrote to a field, a file, a queue or the network stays written — only the frame is rewound. Refused in a read-only session.".to_string(),
+            input_schema: to_val(schemars::schema_for!(PopFrameArgs)),
+        },
     ]
 }
 
@@ -188,6 +198,11 @@ fn inspection_tools() -> Vec<Tool> {
             input_schema: to_val(schemars::schema_for!(SourceArgs)),
         },
         Tool {
+            name: "debug.check_stale".to_string(),
+            description: "Is the JVM running the code you just compiled, or an older build? Compares the line tables the JVM holds for a loaded class against the ones in your freshly compiled .class, method by method. This is the check that stops twenty tool calls being spent debugging the PROGRAM when the fact is that the deployed bytecode is last week's — a breakpoint that never fires, or fires with locals that make no sense for the code you are reading, looks identical to a wrong hypothesis, and nothing else here can tell them apart. Different from debug.source, which settles WHICH FILE a class was compiled from: SourceFile is a compile-time string and is identical across every build of the file, so it cannot see the common case of same class, same Order.java, older bytecode. Bytes come from the same place debug.reload_class reads them — <class root>/<package as directories>/<SimpleName>.class, from debug.attach {class_roots:[...]}, JDWP_CLASS_ROOTS, class_roots on the call, or class_file directly. WHAT THE ANSWER MEANS: it compares line tables, so it catches an edit that MOVED a line (which is what makes a stop point at :412 point somewhere else) and is blind to one that changes a body without moving any line — a clean result means \"no line moved\", not \"byte-for-byte identical\", and the reply says so. A method the running class has and your build does not (or the reverse) is reported separately, because that is a different class shape and not something a hot reload could fix. A class with no line tables at all (javac -g:none, an interface, all-abstract) is reported as CANNOT TELL rather than as a match. Costs one JDWP packet per method, and says how many it spent.".to_string(),
+            input_schema: to_val(schemars::schema_for!(CheckStaleArgs)),
+        },
+        Tool {
             name: "debug.thread_dump".to_string(),
             description: "Every thread's stack in ONE call, plus which monitors each thread holds and which one it is blocked entering — the \"it's wedged, who is blocked on what?\" question, which list_threads (names only) and get_stack (one thread) can't answer. A thread waiting on a lock someone else holds is annotated `← held by 0x<id> \"<name>\"`, so a deadlock cycle is readable off the output. IMPORTANT: JDWP can only read a SUSPENDED thread's stack and locks, so on a running VM every thread comes back unreadable — pass suspend:true to freeze it briefly (it is resumed and verified before the reply) or only_suspended:true to list just the readable ones. It never suspends on its own. Narrow the cost with name_filter / limit / max_frames / package_filter; for the deadlock question alone, monitors_only:true reads the lock graph without the frames. The reply reports how many JDWP packets it spent, WHAT EACH ONE COST on this connection (round trip plus our processing), and, when it suspended, how many milliseconds it held the VM — bounded by max_suspend_ms (default 2000), which truncates loudly rather than silently and tells you what finishing would have cost at the rate it was running. Those figures are measured against the JVM you are attached to, so you never have to judge whether a number measured elsewhere applies: a dump of a 306-thread pool with 60-frame stacks costs ~258 packets and ~65ms at the defaults, or ~1,625 packets and ~700ms for every thread and every frame. Works in a read-only session (it invokes nothing).".to_string(),
             input_schema: to_val(schemars::schema_for!(ThreadDumpArgs)),
@@ -230,6 +245,8 @@ mod tests {
             "debug.step_out",
             "debug.set_value",
             "debug.force_return",
+            "debug.reload_class",
+            "debug.pop_frame",
             "debug.get_last_event",
             "debug.get_stack",
             "debug.evaluate",
@@ -238,6 +255,7 @@ mod tests {
             "debug.list_methods",
             "debug.list_fields",
             "debug.source",
+            "debug.check_stale",
             "debug.thread_dump",
             "debug.get_traces",
         ] {

@@ -100,6 +100,14 @@ pub struct AttachArgs {
     /// `JDWP_SOURCE_ROOTS` environment default for this session; omitted, that default applies.
     #[serde(default)]
     pub source_roots: Option<Vec<String>>,
+    /// Directories holding freshly COMPILED classes, e.g. `["/srv/app/target/classes"]` — where
+    /// `debug.reload_class` reads the bytes it ships to the JVM. Same shape as `source_roots` and a
+    /// different tree: a class root is where the package tree starts in the *build output*
+    /// (`target/classes`), not in the sources (`src/main/java`). The file is looked for at
+    /// `<root>/<package as directories>/<SimpleName>.class`. Given here they replace the
+    /// `JDWP_CLASS_ROOTS` environment default for this session; omitted, that default applies.
+    #[serde(default)]
+    pub class_roots: Option<Vec<String>>,
 }
 
 /// Arguments for `debug.set_line_stop`.
@@ -730,6 +738,60 @@ pub struct ForceReturnArgs {
     pub thread_id: Option<String>,
 }
 
+/// Arguments for `debug.reload_class` (SWAP-1).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReloadClassArgs {
+    /// Fully-qualified class name, e.g. com.example.OrderService. Must already be LOADED — a class
+    /// the JVM has never loaded has nothing to redefine, and loading it is the application's job.
+    pub class_name: String,
+    /// Read the new bytecode from exactly this `.class` file, bypassing `class_roots`. For a build
+    /// output that is not laid out as a package tree, or a one-off.
+    #[serde(default)]
+    pub class_file: Option<String>,
+    /// Directories to search for this call only, replacing the session's class roots (set at
+    /// `debug.attach` or by `JDWP_CLASS_ROOTS`).
+    #[serde(default)]
+    pub class_roots: Option<Vec<String>>,
+    /// Report what WOULD be shipped — the resolved file, its size, and whether the JVM can `HotSwap` at
+    /// all — and send nothing. The safe first call against a shared JVM.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Thread to check for frames still running the old bytecode after a successful swap (defaults to
+    /// the last-hit thread). A redefinition does not touch frames already on the stack, so this is how
+    /// the reply can tell you that the method you just changed is one of them.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
+
+/// Arguments for `debug.check_stale` (DISC-7).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CheckStaleArgs {
+    /// Fully-qualified class name, e.g. com.example.OrderService. Must already be loaded.
+    pub class_name: String,
+    /// Compare against exactly this `.class` file, bypassing `class_roots`.
+    #[serde(default)]
+    pub class_file: Option<String>,
+    /// Directories to search for this call only, replacing the session's class roots (set at
+    /// `debug.attach` or by `JDWP_CLASS_ROOTS`).
+    #[serde(default)]
+    pub class_roots: Option<Vec<String>>,
+    /// Max drifting methods to name; the rest are reported as a count.
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
+/// Arguments for `debug.pop_frame` (SWAP-1).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PopFrameArgs {
+    /// Frame index to pop, as numbered by `debug.get_stack` (0 = innermost). Every frame above it goes
+    /// too — that is what JDWP does, not a convenience added here.
+    #[serde(default)]
+    pub frame: usize,
+    /// Thread id (optional; defaults to last-hit thread). Must be suspended.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,6 +816,8 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(ToggleBreakpointArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(ThreadDumpArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(SetMethodBreakpointArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(ReloadClassArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(PopFrameArgs)).unwrap(),
         ];
         for s in schemas {
             assert_eq!(s.get("type").and_then(|t| t.as_str()), Some("object"));

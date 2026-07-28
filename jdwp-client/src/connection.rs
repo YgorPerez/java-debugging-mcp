@@ -227,12 +227,14 @@ impl JdwpConnection {
 /// Values are deliberately **not** cached: a field's contents change as the program runs, so a cached
 /// value would be a lie. Only the shape of the type is cached, and a loaded type's shape is fixed.
 ///
-/// Two ways this could go stale, both accepted:
+/// Two ways this could go stale, and they are no longer treated the same:
 /// - **Class unload** — the type id becomes invalid and we would serve metadata for a type that no
 ///   longer exists. Any actual *use* of it (reading a field by its id) fails at the JVM anyway.
-/// - **`RedefineClasses` / `HotSwap`** — would change fields or methods. This crate never calls it, but
-///   another debugger attached to the same JVM could. Reattaching gets a fresh cache, since the cache
-///   belongs to the connection.
+/// - **`RedefineClasses` / `HotSwap`** — changes methods, and could change fields. This crate used to
+///   say it "never calls it, but another debugger attached to the same JVM could"; SWAP-1 (#58) makes it
+///   the caller, so [`redefine_classes`](JdwpConnection::redefine_classes) now [`invalidate`](TypeCache::invalidate)s
+///   each redefined type on success. A *second* debugger swapping classes underneath us is still
+///   unhandled and still only fixed by reattaching, since the cache belongs to the connection.
 #[derive(Debug, Default)]
 pub(crate) struct TypeCache {
     signatures: Mutex<HashMap<ReferenceTypeId, String>>,
@@ -303,6 +305,25 @@ impl TypeCache {
 
     pub(crate) fn put_superclass(&self, id: ClassId, parent: Option<ClassId>) {
         guard!(self.superclasses).insert(id, parent);
+    }
+
+    /// Forget everything cached about one type, because its shape may just have changed under us.
+    ///
+    /// Called by [`redefine_classes`](JdwpConnection::redefine_classes). Deliberately drops the
+    /// signature and the superclass/interface entries too, not only the methods a `HotSpot` swap can
+    /// touch: a JVM answering `canUnrestrictedlyRedefineClasses` may change more than `HotSpot` allows,
+    /// and a cache entry that survives *because we assumed the restriction* would be wrong exactly on
+    /// the JVM that lifted it. Dropping four extra entries costs one round trip each if they are asked
+    /// for again.
+    ///
+    /// Note what is NOT here: line tables. ADR-0011 settled that they are cached per dump rather than
+    /// per connection, on this very ground, so there is nothing connection-scoped to invalidate.
+    pub(crate) fn invalidate(&self, id: ReferenceTypeId) {
+        guard!(self.signatures).remove(&id);
+        guard!(self.fields).remove(&id);
+        guard!(self.methods).remove(&id);
+        guard!(self.superclasses).remove(&id);
+        guard!(self.interfaces).remove(&id);
     }
 
     pub(crate) fn interfaces(&self, id: ReferenceTypeId) -> Option<Vec<ReferenceTypeId>> {

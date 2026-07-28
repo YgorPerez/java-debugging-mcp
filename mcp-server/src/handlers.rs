@@ -213,6 +213,7 @@ impl RequestHandler {
             "debug.list_methods" => self.handle_list_methods(args).await,
             "debug.list_fields" => self.handle_list_fields(args).await,
             "debug.source" => self.handle_source(args).await,
+            "debug.check_stale" => self.handle_check_stale(args).await,
             _ => return None,
         })
     }
@@ -228,6 +229,8 @@ impl RequestHandler {
             "debug.get_last_event" => self.handle_get_last_event(args).await,
             "debug.set_value" => self.handle_set_value(args).await,
             "debug.force_return" => self.handle_force_return(args).await,
+            "debug.reload_class" => self.handle_reload_class(args).await,
+            "debug.pop_frame" => self.handle_pop_frame(args).await,
             "debug.set_exception_stop" => self.handle_set_exception_stop(args).await,
             "debug.set_field_stop" => self.handle_set_field_stop(args).await,
             "debug.set_method_exit_stop" => self.handle_set_method_exit_stop(args).await,
@@ -263,9 +266,16 @@ impl RequestHandler {
             .source_roots
             .as_ref()
             .map_or_else(env_source_roots, |v| v.iter().map(std::path::PathBuf::from).collect());
+        // Class roots (SWAP-1) combine the same way as source roots and for the same reason, but they
+        // are a SEPARATE list: `target/classes` is not `src/main/java`, and a caller who configured one
+        // has said nothing about the other.
+        let class_roots = a
+            .class_roots
+            .as_ref()
+            .map_or_else(env_class_roots, |v| v.iter().map(std::path::PathBuf::from).collect());
         let session_id = self
             .session_manager
-            .create_session(connection, format!("{host}:{port}"), read_only, source_roots)
+            .create_session(connection, format!("{host}:{port}"), read_only, source_roots, class_roots)
             .await;
         // Get the session guard once so the listener/watchdog handles are stored before we return.
         let session_guard = self
@@ -1193,6 +1203,65 @@ impl RequestHandler {
         Ok(output)
     }
 
+    /// DISC-7: is this JVM running the build on your disk, or last week's bytecode?
+    ///
+    /// The trap this exists for is agent-shaped. A human notices "my change isn't deployed" within a
+    /// minute, because they remember editing the file. An agent sets a stop point at `class.method:412`,
+    /// watches it never fire — or fire with locals that make no sense for the code it just read — and
+    /// spends its next twenty tool calls debugging a hypothesis about the *program* when the fact is
+    /// that the JVM is running an older compile. Nothing else on this tool surface can tell those two
+    /// apart.
+    ///
+    /// **Why `debug.source` does not already cover it.** DISC-3 (#31) settles drift at *file*
+    /// granularity: a class reporting `Order.java` in a tree where that file was renamed is the answer.
+    /// `SourceFile` is a compile-time string, identical across every build of the file, so it cannot see
+    /// the case that actually fires in a redeploy loop — same class, same `Order.java`, older bytecode.
+    ///
+    /// **What it compares, and what that misses.** Per-method `LineNumberTable`s: the JVM's, from
+    /// `Method.LineTable`, against the compiler's, parsed out of the `.class` on disk. That catches what
+    /// hurts most — lines have moved, so `:412` means something else now — and it is blind to an edit
+    /// that changes a body without moving a line. `Method.Bytecodes` would settle those too and is the
+    /// named follow-up; the reply says which claim it is making rather than implying the stronger one.
+    async fn handle_check_stale(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::CheckStaleArgs = crate::args::parse(&args)?;
+        let class_name = a.class_name.trim().to_string();
+        if class_name.is_empty() {
+            return Err("class_name is required (e.g. com.example.OrderService)".to_string());
+        }
+
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+
+        let type_id = resolve_loaded_class(&mut session.connection, &class_name).await?;
+        let roots: Vec<std::path::PathBuf> = a.class_roots.as_ref().map_or_else(
+            || session.class_roots.clone(),
+            |v| v.iter().map(std::path::PathBuf::from).collect(),
+        );
+        let path = resolve_class_file(&class_name, a.class_file.as_deref(), &roots)?;
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| format!("Found {} but could not read it: {e}", path.display()))?;
+        let built = crate::classfile::parse(&bytes)
+            .map_err(|e| format!("Could not read {} as a class file: {e}", path.display()))?;
+        if built.this_class != class_name {
+            return Err(format!(
+                "{} declares {}, not {class_name}. That is a wrong path rather than drift — a class root \
+                 is where the package tree starts in the BUILD OUTPUT. Nothing was compared.",
+                path.display(),
+                built.this_class,
+            ));
+        }
+
+        let before = session.connection.packets_sent();
+        let running = read_jvm_line_tables(&mut session.connection, type_id).await?;
+        let packets = session.connection.packets_sent().saturating_sub(before);
+        drop(session);
+
+        let report = compare_line_tables(&running, &built.methods);
+        Ok(render_stale_report(&class_name, &path, &report, a.limit, packets))
+    }
+
     /// DUMP-1: every thread's stack in one call, plus which monitors each thread holds and which one it
     /// is blocked on — the "it's wedged, who is blocked on what?" question.
     ///
@@ -1583,6 +1652,201 @@ impl RequestHandler {
         Ok(format!(
             "✅ Forced {}() to return {} — thread still suspended; call debug.continue to let it proceed.",
             method.name, shown
+        ))
+    }
+
+    /// SWAP-1: install freshly compiled bytecode for a loaded class without redeploying or restarting.
+    ///
+    /// The order of the checks is the interesting part, and each one exists because its failure reads as
+    /// something else if it is left to the JVM:
+    ///
+    /// 1. **Read-only first** (SAFE-3). Redefinition is the most far-reaching mutation this server can
+    ///    perform — on a shared instance it is an unannounced deploy — so it is refused before anything
+    ///    is read. `dry_run` is exempt: it ships nothing, and "what would this swap do" is a question a
+    ///    read-only session should be able to ask.
+    /// 2. **Is the class loaded**, via the same resolver every DISC tool uses. There is no deferred
+    ///    redefinition: a class the JVM has never loaded has no bytecode to replace.
+    /// 3. **Can this JVM `HotSwap` at all**, from `CapabilitiesNew`. A JVM without the capability answers
+    ///    `NOT_IMPLEMENTED` (99) to the command itself, which reads like a protocol failure rather than
+    ///    "this VM cannot do that" — the rule `VmCapabilities` states, applied.
+    /// 4. **Locate the bytes**, and say where it looked when it cannot.
+    ///
+    /// The reply's real work starts after success, because the two things that make a swap look broken
+    /// are both invisible at the wire level: **frames already on the stack keep running the old
+    /// bytecode** until they are re-entered (hence the frame check and `debug.pop_frame`), and a stop
+    /// point armed in a redefined method is now pointing at code the JVM has replaced.
+    async fn handle_reload_class(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::ReloadClassArgs = crate::args::parse(&args)?;
+        let class_name = a.class_name.trim().to_string();
+        if class_name.is_empty() {
+            return Err("class_name is required (e.g. com.example.OrderService)".to_string());
+        }
+
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+        if session.read_only && !a.dry_run {
+            return Err(readonly_refusal(
+                "reload_class installs new bytecode in the running JVM — on a shared instance that is an \
+                 unannounced deploy, not a debugger read. dry_run:true still works and ships nothing",
+            ));
+        }
+
+        let type_id = resolve_loaded_class(&mut session.connection, &class_name).await?;
+        let caps = session
+            .connection
+            .capabilities_new()
+            .await
+            .map_err(|e| format!("Failed to ask the JVM what it supports (CapabilitiesNew): {e}"))?;
+        if !caps.can_redefine_classes {
+            return Err(format!(
+                "This JVM cannot HotSwap: it reports canRedefineClasses=false, so \
+                 VirtualMachine.RedefineClasses would answer NOT_IMPLEMENTED and {class_name} would be \
+                 unchanged. Nothing was sent. A redeploy is the only route on this VM."
+            ));
+        }
+
+        let roots: Vec<std::path::PathBuf> = a.class_roots.as_ref().map_or_else(
+            || session.class_roots.clone(),
+            |v| v.iter().map(std::path::PathBuf::from).collect(),
+        );
+        let path = resolve_class_file(&class_name, a.class_file.as_deref(), &roots)?;
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| format!("Found {} but could not read it: {e}", path.display()))?;
+        check_class_file_bytes(&path, &bytes)?;
+
+        if a.dry_run {
+            drop(session);
+            return Ok(format!(
+                "🧪 Dry run — nothing was sent to the JVM.\n   Class: {class_name} (loaded, type id \
+                 0x{type_id:x})\n   Would ship: {} ({} bytes)\n   This JVM can HotSwap \
+                 (canRedefineClasses=true, canPopFrames={}, canAddMethod={}). HotSpot accepts METHOD BODY \
+                 changes only, and it is the JVM — not this check — that decides: run without dry_run to \
+                 find out.",
+                path.display(),
+                bytes.len(),
+                caps.can_pop_frames,
+                caps.can_add_method,
+            ));
+        }
+
+        session
+            .connection
+            .redefine_classes(&[(type_id, bytes.clone())])
+            .await
+            .map_err(|e| explain_redefine_failure(&class_name, &path, &e))?;
+
+        // Everything below is reporting, and none of it may fail the swap — it already happened.
+        let thread = crate::args::parse_thread_id(a.thread_id.as_deref()).or(session.last_thread);
+        let live = live_frames_of(&mut session.connection, thread, type_id).await;
+        let armed = stop_points_on(&session, &class_name);
+        drop(session);
+
+        let mut out = format!(
+            "✅ Reloaded {class_name} — {} bytes from {} are now the running bytecode. No redeploy, no \
+             restart, warm state intact.\n",
+            bytes.len(),
+            path.display(),
+        );
+        out.push_str(&describe_live_frames(&class_name, thread, live.as_deref()));
+        out.push_str(&describe_armed_stop_points(&armed));
+        Ok(out)
+    }
+
+    /// SWAP-1's other half: pop a frame off a suspended thread so the method is re-entered — with the
+    /// bytecode a reload just installed, since a frame already running keeps the code it entered with.
+    ///
+    /// Its own tool rather than a `pop_frames:true` flag on `debug.reload_class`, per ADR-0015: a flag
+    /// may change how an answer is bounded or rendered, not what the question was, and "rewind this
+    /// thread to the call site" is a different question from "install these bytes". It is also useful on
+    /// its own — re-running a method you stepped past is the everyday use — and pairing it with a reload
+    /// would have hidden it from anyone who wanted just that.
+    ///
+    /// Gated by read-only for the same reason `force_return` is (SAFE-3, ADR-0001): it changes what the
+    /// program does. It is in fact the *less* reversible of the two — whatever the popped invocation
+    /// already wrote to a field, a file or the network stays written, and only the frame is rewound.
+    async fn handle_pop_frame(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::PopFrameArgs = crate::args::parse(&args)?;
+
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+        if session.read_only {
+            return Err(readonly_refusal(
+                "pop_frame rewinds a thread to the call site of a method it is running, which changes \
+                 what the JVM does",
+            ));
+        }
+        let thread_id = crate::args::parse_thread_id(a.thread_id.as_deref())
+            .or(session.last_thread)
+            .ok_or_else(|| "No thread. Pass thread_id, or hit a breakpoint first.".to_string())?;
+
+        let caps = session
+            .connection
+            .capabilities_new()
+            .await
+            .map_err(|e| format!("Failed to ask the JVM what it supports (CapabilitiesNew): {e}"))?;
+        if !caps.can_pop_frames {
+            return Err(
+                "This JVM cannot pop frames: it reports canPopFrames=false. Nothing was sent. After a \
+                 debug.reload_class the running frames will keep the old bytecode until they return \
+                 normally and the method is called again."
+                    .to_string(),
+            );
+        }
+
+        let frames = session
+            .connection
+            .get_frames(thread_id, 0, -1)
+            .await
+            .map_err(|e| format!("Failed to get frames (is the thread suspended?): {e}"))?;
+        let frame = frames.get(a.frame).cloned().ok_or_else(|| {
+            format!(
+                "Thread 0x{thread_id:x} has {} frame(s), so there is no frame #{}. debug.get_stack \
+                 numbers them from 0 (innermost).",
+                frames.len(),
+                a.frame
+            )
+        })?;
+        if a.frame + 1 >= frames.len() {
+            return Err(format!(
+                "Frame #{} is the outermost frame of thread 0x{thread_id:x} — popping it would leave the \
+                 thread with nowhere to return to, and JDWP refuses (NO_MORE_FRAMES). Pop an inner frame.",
+                a.frame
+            ));
+        }
+        let mut names = std::collections::HashMap::new();
+        let class = resolve_class_name(&mut session.connection, frame.location.class_id, &mut names).await;
+        // A frame whose method was replaced by a `debug.reload_class` comes back with **method id 0**
+        // — measured on `HotSpot` 21, and it is the JVM saying this frame is running bytecode the class
+        // no longer has. Reporting it as `method@0` would be the one moment the tool looks broken while
+        // being right, and it would hide the fact that most justifies the pop: the frame IS obsolete.
+        let method = if frame.location.method_id == 0 {
+            "<obsolete method — the bytecode this frame entered with has been replaced>".to_string()
+        } else {
+            frame_method_info(&mut session.connection, &frame.location, false).await.0
+        };
+
+        session.connection.pop_frames(thread_id, frame.frame_id).await.map_err(|e| {
+            format!(
+                "PopFrames failed on frame #{} ({class}.{method}) of thread 0x{thread_id:x}: {e}\n   \
+                 OPAQUE_FRAME means a native frame is in the way — a native method cannot be popped, and \
+                 neither can anything below one. THREAD_NOT_SUSPENDED means the thread is running; only a \
+                 suspended thread can be rewound.",
+                a.frame
+            )
+        })?;
+        drop(session);
+
+        let above = a.frame;
+        let also = if above == 0 { String::new() } else { format!(" (and the {above} frame(s) above it)") };
+        Ok(format!(
+            "✅ Popped frame #{} {class}.{method}{also} on thread 0x{thread_id:x}. The thread is back at \
+             the CALL SITE with its operand stack restored and is still suspended — debug.continue \
+             re-executes the call, entering the method with whatever bytecode is loaded now.\n   Side \
+             effects are not rewound: anything that invocation already wrote stays written.",
+            a.frame
         ))
     }
 
@@ -3752,6 +4016,565 @@ fn sig_arg_count(sig: &str) -> usize {
 fn env_source_roots() -> Vec<std::path::PathBuf> {
     std::env::var_os("JDWP_SOURCE_ROOTS")
         .map_or_else(Vec::new, |v| std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect())
+}
+
+/// A new session's default class roots (SWAP-1): `JDWP_CLASS_ROOTS`, read exactly like
+/// [`env_source_roots`] reads `JDWP_SOURCE_ROOTS` — a path list in this platform's spelling. Unset means
+/// no roots, and `debug.reload_class` then needs an explicit `class_file` per call.
+fn env_class_roots() -> Vec<std::path::PathBuf> {
+    std::env::var_os("JDWP_CLASS_ROOTS")
+        .map_or_else(Vec::new, |v| std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect())
+}
+
+/// Where a class's compiled `.class` sits under a root: the package as directories, then the class's
+/// own simple name.
+///
+/// **Built from the class name, and that is the difference from [`source_relative_path`].** A source
+/// file is named by the JVM (`Order.java` holds `Order$Line` and `OrderRow` alike), but every class —
+/// inner, anonymous, package-private — gets its own `.class` named exactly after it, `$` included. So
+/// this needs no round trip and no `SourceFile` attribute, and it is right for the cases where asking
+/// the JVM would have been wrong.
+///
+/// `None` under the same rule as source paths: any segment that is empty, `.`, `..`, or carrying a path
+/// separator or drive/stream marker. The class name here comes from the *caller* rather than the
+/// debuggee, which lowers the stakes but not the check — a tool argument is still untrusted input, and
+/// the roots are directories an operator named.
+fn class_relative_path(class_name: &str) -> Option<std::path::PathBuf> {
+    let (package, simple) = class_name.rsplit_once('.').map_or(("", class_name), |(p, s)| (p, s));
+    let mut path = std::path::PathBuf::new();
+    if !package.is_empty() {
+        for segment in package.split('.') {
+            if !is_safe_path_segment(segment) {
+                return None;
+            }
+            path.push(segment);
+        }
+    }
+    if !is_safe_path_segment(simple) {
+        return None;
+    }
+    path.push(format!("{simple}.class"));
+    Some(path)
+}
+
+/// The `.class` file `debug.reload_class` should ship, or a message saying why there isn't one.
+///
+/// `class_file` wins over the roots when given, because it is the escape hatch for a build output that
+/// is not laid out as a package tree — and it is taken literally, including the containment rule the
+/// roots impose. There is no root to be contained by, so the caller's path IS the decision.
+fn resolve_class_file(
+    class_name: &str,
+    class_file: Option<&str>,
+    roots: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, String> {
+    if let Some(explicit) = class_file.map(str::trim).filter(|s| !s.is_empty()) {
+        let path = std::path::PathBuf::from(explicit);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "class_file {} is not a readable file. Nothing was sent to the JVM.",
+            path.display()
+        ));
+    }
+    if roots.is_empty() {
+        return Err(format!(
+            "No class roots are configured, so there is nowhere to read {class_name}'s new bytecode \
+             from. Set them per session with debug.attach {{\"class_roots\":[...]}}, deploy-wide with \
+             JDWP_CLASS_ROOTS (a path list in this platform's spelling), or pass class_file with the \
+             path to one .class file. A class root is where the PACKAGE TREE starts in the BUILD OUTPUT \
+             — for com.example.Order that is target/classes, the directory containing `com`, not \
+             src/main/java and not the project root."
+        ));
+    }
+    let Some(rel) = class_relative_path(class_name) else {
+        return Err(format!(
+            "Refusing to build a path from {class_name:?}: a segment of it is empty, `.`, `..`, or \
+             carries a path separator or a drive/stream marker, so the result could point outside every \
+             configured root."
+        ));
+    };
+    match find_under_roots(roots, &rel) {
+        SourceLookup::Found(p) => Ok(p),
+        SourceLookup::Missing => {
+            let searched: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
+            Err(format!(
+                "Not found on disk: no configured class root holds {}. Searched {} root(s): {}. Either \
+                 the root list is wrong (a class root is where the package tree starts in the build \
+                 output, e.g. target/classes) or this class has not been COMPILED yet — this server does \
+                 not run your build, so `mvn compile` (or your equivalent) is still yours to run.",
+                rel.display(),
+                roots.len(),
+                searched.join(", "),
+            ))
+        }
+        SourceLookup::Escaped(p) => Err(format!(
+            "⚠ Refusing to read {}: it is under a configured class root but resolves outside it — a \
+             symlink out of the tree. Nothing was sent to the JVM.",
+            p.display(),
+        )),
+    }
+}
+
+/// Refuse a file that is not a class file before it costs a round trip.
+///
+/// Only the four magic bytes, deliberately: anything more would be a class-file parser, and the JVM's
+/// verifier is a better one than this crate will ever have. What this catches is the mistake worth
+/// catching locally — a path that resolved to a `.java`, a jar, an empty file left by a failed build —
+/// because from the JVM it comes back as a bare `INVALID_CLASS_FORMAT` that reads like a compiler bug.
+fn check_class_file_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    if bytes.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE]) {
+        return Ok(());
+    }
+    Err(format!(
+        "{} does not start with the class-file magic 0xCAFEBABE ({} bytes read), so it is not a \
+         compiled class. Nothing was sent to the JVM. A path that resolved to a source file, a jar, or \
+         a zero-length file left by a failed build all land here.",
+        path.display(),
+        bytes.len(),
+    ))
+}
+
+/// Turn a refused `RedefineClasses` into what the caller should do next.
+///
+/// This is most of the feature's worth, and the reason is in the shape of the failure: `HotSpot` permits
+/// **method body changes only**, and every other edit comes back as one of twelve codes whose names are
+/// accurate and useless — an agent handed `SCHEMA_CHANGE_NOT_IMPLEMENTED` will re-try the swap, and
+/// re-try it again after recompiling, because nothing in those words says the JVM will never accept it.
+///
+/// Each arm therefore says three things: what the class file did, that the JVM changed **nothing** (the
+/// command is all-or-nothing), and whether recompiling could help or a redeploy is the only route.
+fn explain_redefine_failure(class_name: &str, path: &std::path::Path, e: &jdwp_client::JdwpError) -> String {
+    let jdwp_client::JdwpError::JdwpErrorCode(code, name) = e else {
+        return format!(
+            "Failed to reload {class_name} from {}: {e}. The JVM applies a redefinition all-or-nothing, \
+             so nothing changed.",
+            path.display()
+        );
+    };
+    let advice = match code {
+        60 => {
+            "the bytes are not a class file this JVM can parse. Recompile and check the path resolved \
+               to the class you meant."
+        }
+        62 => {
+            "the class file parses but the JVM's verifier rejected it. This is usually a build \
+               problem rather than an edit the JVM disallows — a class compiled against a different \
+               version of something it calls. Rebuild the whole module, not just this file."
+        }
+        63 => {
+            "you ADDED a method. HotSpot permits method BODY changes only. Note that a new lambda, an \
+               anonymous class body or a new switch arm can add a synthetic method without looking like \
+               a new method in the source. This needs a real redeploy."
+        }
+        64 => {
+            "you added or removed a FIELD (a schema change). HotSpot permits method body changes \
+               only, and it cannot re-shape objects that already exist. This needs a real redeploy."
+        }
+        65 => {
+            "the JVM refused the redefinition in its current state (INVALID_TYPESTATE) — this is what \
+               it answers when the change cannot be applied to instances that already exist. Treat it \
+               as needing a redeploy."
+        }
+        66 => {
+            "you changed the class HIERARCHY — a different superclass or a different interface list. \
+               HotSpot permits method body changes only. This needs a real redeploy."
+        }
+        67 => {
+            "you REMOVED a method. HotSpot permits method body changes only. This needs a real \
+               redeploy."
+        }
+        68 => {
+            "the class file's version is one this JVM cannot read: it was compiled by a newer JDK than \
+               the one running. Compile with the target JVM's --release, then try again."
+        }
+        69 => {
+            "the class file declares a DIFFERENT class than the one being redefined. The path resolved \
+               to the wrong file — check the class root really is where the package tree starts in the \
+               build output."
+        }
+        70 => {
+            "you changed a CLASS modifier (public/final/abstract). HotSpot permits method body changes \
+               only. This needs a real redeploy."
+        }
+        71 => {
+            "you changed a METHOD modifier — static, final, synchronized, or an access level. HotSpot \
+               permits method BODY changes only, and a modifier is not a body. This needs a real \
+               redeploy."
+        }
+        99 => {
+            "this JVM does not implement RedefineClasses at all. A redeploy is the only route on this \
+               VM."
+        }
+        _ => "the JVM refused the redefinition.",
+    };
+    format!(
+        "❌ {class_name} was NOT reloaded — the JVM refused the bytes in {}: {name} ({code}).\n   \
+         {advice}\n   A redefinition is all-or-nothing, so the JVM is running exactly what it was \
+         running before this call.",
+        path.display(),
+    )
+}
+
+/// Frame indexes on `thread` that are executing `type_id`, innermost first.
+///
+/// Best-effort by construction: a running (unsuspended) thread has no readable frames, and that is the
+/// ordinary case rather than an error — the answer is then "nothing checked", not "nothing found", and
+/// [`describe_live_frames`] keeps those apart.
+async fn live_frames_of(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread: Option<u64>,
+    type_id: u64,
+) -> Option<Vec<usize>> {
+    let tid = thread?;
+    let frames = conn.get_frames(tid, 0, -1).await.ok()?;
+    Some(frames.iter().enumerate().filter(|(_, f)| f.location.class_id == type_id).map(|(i, _)| i).collect())
+}
+
+/// The paragraph a successful reload owes the caller about frames already on the stack.
+///
+/// Without it the first thing anyone does is swap the method they are stopped in, observe nothing
+/// change, and conclude that reloading is broken — the footgun SWAP-1 named as the reason to ship
+/// `debug.pop_frame` alongside this at all.
+fn describe_live_frames(class_name: &str, thread: Option<u64>, live: Option<&[usize]>) -> String {
+    let Some(tid) = thread else {
+        return "   No thread has stopped in this session, so nothing is suspended in the old bytecode. \
+                Calls made from now on run the new code.\n"
+            .to_string();
+    };
+    match live {
+        None => format!(
+            "   Could not read thread 0x{tid:x}'s frames — it is running, not suspended. That also means \
+             nothing of yours is parked in the old bytecode: calls made from now on run the new code.\n"
+        ),
+        Some([]) => format!(
+            "   Thread 0x{tid:x} has no frame in {class_name}, so nothing is running the old bytecode \
+             there. Calls made from now on run the new code.\n"
+        ),
+        Some(frames) => {
+            let list: Vec<String> = frames.iter().map(|i| format!("#{i}")).collect();
+            let first = frames.first().copied().unwrap_or(0);
+            format!(
+                "   ⚠ Thread 0x{tid:x} is INSIDE {class_name} right now — frame(s) {}. A frame already on \
+                 the stack keeps running the bytecode it entered with, so the change you just made is \
+                 invisible in that frame no matter how many times you inspect it. Re-enter the method to \
+                 see it: debug.pop_frame {{\"frame\":{first}}} rewinds the thread to the call site, then \
+                 debug.continue re-executes the call with the new code.\n",
+                list.join(", "),
+            )
+        }
+    }
+}
+
+/// Stop points armed on a class that was just redefined, as caller-facing ids.
+///
+/// Reported rather than silently re-armed. A redefined method's `methodID` becomes *obsolete* rather
+/// than invalid, so a breakpoint set in it is in an ambiguous state the JVM does not report: it may
+/// fire, at a line that has moved. The re-arm machinery for exactly this already exists and is already
+/// the caller's to drive (`debug.toggle_stop_point`, BP-4 re-resolves by name), so pointing at it beats
+/// this handler quietly disarming and rearming things the caller did not mention.
+fn stop_points_on(session: &crate::session::DebugSession, class_name: &str) -> Vec<String> {
+    let mut ids: Vec<String> = session
+        .breakpoints
+        .iter()
+        .filter(|(_, bp)| bp.class_pattern == class_name)
+        .map(|(id, bp)| format!("{id} ({}:{})", bp.class_pattern, bp.line))
+        .collect();
+    ids.extend(
+        session
+            .watchpoints
+            .iter()
+            .filter(|(_, wp)| wp.class_name == class_name)
+            .map(|(id, wp)| format!("{id} ({}.{})", wp.class_name, wp.field_name)),
+    );
+    ids.extend(
+        session
+            .method_exits
+            .values()
+            .filter(|me| me.class_pattern == class_name)
+            .map(|me| format!("{} (method-exit)", me.id)),
+    );
+    ids.sort();
+    ids
+}
+
+/// The note a reload owes about stop points it may have invalidated. Empty when there are none.
+fn describe_armed_stop_points(armed: &[String]) -> String {
+    if armed.is_empty() {
+        return String::new();
+    }
+    format!(
+        "   ⚠ {} stop point(s) are armed on this class: {}. Their locations were resolved against the \
+         bytecode you just replaced, so a line breakpoint may now sit on a different statement. \
+         debug.toggle_stop_point (off, then on) re-resolves one by name against the new code.\n",
+        armed.len(),
+        armed.join(", "),
+    )
+}
+
+/// One method's line table, from either side of a staleness comparison (DISC-7).
+///
+/// The two sides arrive from completely different places — a JDWP reply and a parsed `.class` — and are
+/// normalised into one shape here so the comparison itself is pure, testable, and cannot accidentally
+/// depend on which side it is looking at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MethodLines {
+    name: String,
+    /// JVM descriptor. JDWP calls it a signature and the class file calls it a descriptor; they are the
+    /// same string, which is what makes matching methods across the two sides exact rather than fuzzy.
+    descriptor: String,
+    lines: Vec<(u64, i32)>,
+    /// Whether this method has a line table to compare at all. An abstract or native method never does,
+    /// and a `-g:none` build has code with no lines — neither is drift, and both must be excluded from
+    /// the count rather than silently counted as matching.
+    ///
+    /// **An EMPTY table counts as absent**, and that is measured rather than assumed: a `-g:none` class
+    /// on `HotSpot` 21 answers `Method.LineTable` with a perfectly valid reply containing zero entries,
+    /// *not* with `ABSENT_INFORMATION`. Treating the two differently made the detector report every
+    /// method of a stripped class as drifting against a build that had lines — a false positive, on the
+    /// exact class of build (a vendored jar, a `-g:none` deployment) where a wrong stale verdict is
+    /// least checkable.
+    comparable: bool,
+}
+
+impl MethodLines {
+    fn key(&self) -> (&str, &str) {
+        (self.name.as_str(), self.descriptor.as_str())
+    }
+}
+
+/// What a line-table comparison found. Counts rather than a bool, because "3 of 40 methods drifted" and
+/// "40 of 40 drifted" mean different things: the first is one stale class file, the second is usually a
+/// whole deployment behind.
+#[derive(Debug, Default)]
+struct StaleReport {
+    matched: usize,
+    /// Rendered one-line descriptions of each drifting method, with the first differing entry.
+    differing: Vec<String>,
+    only_in_jvm: Vec<String>,
+    only_in_build: Vec<String>,
+    /// Methods with no line table on either side (abstract, native, `-g:none`).
+    skipped: usize,
+}
+
+impl StaleReport {
+    fn is_stale(&self) -> bool {
+        !self.differing.is_empty() || !self.only_in_jvm.is_empty() || !self.only_in_build.is_empty()
+    }
+}
+
+/// Read every loaded method's line table off the JVM (DISC-7).
+///
+/// One `Method.LineTable` per method, which is the whole cost of this tool and why the reply reports it.
+/// `ABSENT_INFORMATION` is an answer rather than a failure — abstract and native methods have no table,
+/// and neither does anything compiled `-g:none` — so it marks the method as not comparable and the walk
+/// continues.
+async fn read_jvm_line_tables(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+) -> Result<Vec<MethodLines>, String> {
+    let methods = conn
+        .get_methods(type_id)
+        .await
+        .map_err(|e| format!("Failed to list the running class's methods: {e}"))?;
+    let mut out = Vec::with_capacity(methods.len());
+    for m in methods {
+        let (lines, comparable) = one_line_table(conn, type_id, m.method_id)
+            .await
+            .map_err(|e| format!("Failed to read the line table of {}: {e}", m.name))?;
+        out.push(MethodLines { name: m.name, descriptor: m.signature, lines, comparable });
+    }
+    Ok(out)
+}
+
+/// One method's line table, with "the JVM has none" as an answer rather than an error.
+///
+/// Split out of the walk above so the two absent shapes sit next to each other and are read as the pair
+/// they are: `ABSENT_INFORMATION` (an abstract or native method) and a valid reply with **zero entries**
+/// (a `-g:none` class, measured on `HotSpot` 21). Both mean not comparable; treating only the first as
+/// absent made every method of a stripped class look like drift.
+async fn one_line_table(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+    method_id: u64,
+) -> jdwp_client::JdwpResult<(Vec<(u64, i32)>, bool)> {
+    match conn.get_line_table(type_id, method_id).await {
+        Ok(t) => {
+            let lines: Vec<(u64, i32)> =
+                t.lines.into_iter().map(|e| (e.line_code_index, e.line_number)).collect();
+            let present = !lines.is_empty();
+            Ok((lines, present))
+        }
+        Err(jdwp_client::JdwpError::JdwpErrorCode(code, _))
+            if code == jdwp_client::protocol::ERR_ABSENT_INFORMATION =>
+        {
+            Ok((Vec::new(), false))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Compare the running line tables against the compiled ones, method by method.
+///
+/// Pure, and separate from both the JDWP reads and the rendering, because this is where the answer is
+/// decided and a detector that cries stale on a current build will be ignored within a day.
+fn compare_line_tables(running: &[MethodLines], built: &[crate::classfile::ClassFileMethod]) -> StaleReport {
+    let built: Vec<MethodLines> = built
+        .iter()
+        .map(|m| MethodLines {
+            name: m.name.clone(),
+            descriptor: m.descriptor.clone(),
+            lines: m.lines.clone(),
+            comparable: m.has_code && m.has_line_table && !m.lines.is_empty(),
+        })
+        .collect();
+
+    let mut report = StaleReport::default();
+    for jvm in running {
+        let Some(file) = built.iter().find(|b| b.key() == jvm.key()) else {
+            // `<clinit>` is generated, so a build with no static initialiser genuinely has no
+            // counterpart for a running one and vice versa; it is reported like any other, because a
+            // static initialiser appearing or vanishing IS a change to the class.
+            report.only_in_jvm.push(format!("{}{}", jvm.name, jvm.descriptor));
+            continue;
+        };
+        if !jvm.comparable || !file.comparable {
+            report.skipped += 1;
+            continue;
+        }
+        if jvm.lines == file.lines {
+            report.matched += 1;
+            continue;
+        }
+        report.differing.push(format!("{}{} — {}", jvm.name, jvm.descriptor, first_difference(jvm, file)));
+    }
+    for file in &built {
+        if !running.iter().any(|j| j.key() == file.key()) {
+            report.only_in_build.push(format!("{}{}", file.name, file.descriptor));
+        }
+    }
+    report
+}
+
+/// Describe the first place two line tables disagree, in the terms a caller acts on.
+///
+/// The *first* difference rather than all of them: what a reader needs is one concrete "the JVM thinks
+/// this bytecode is line 39, your build says 41", which is enough to know the build is behind. Dumping
+/// two whole tables would bury that in a page of numbers.
+fn first_difference(jvm: &MethodLines, file: &MethodLines) -> String {
+    for (i, (j, f)) in jvm.lines.iter().zip(file.lines.iter()).enumerate() {
+        if j != f {
+            return format!(
+                "entry {i} differs: the JVM has line {} at bytecode {}, your build has line {} at {}",
+                j.1, j.0, f.1, f.0
+            );
+        }
+    }
+    format!(
+        "the JVM's table has {} entr(ies), your build's has {} — same prefix, different length",
+        jvm.lines.len(),
+        file.lines.len()
+    )
+}
+
+/// Render a staleness verdict.
+///
+/// Three obligations, in order of how easily each is got wrong:
+/// - **The clean case must be quiet and unambiguous.** A detector that hedges on a matching build is one
+///   nobody reads twice.
+/// - **The claim must be the one that was actually checked.** Line tables catch moved lines; they cannot
+///   see an edit that moves none, and saying "identical" would be a stronger claim than the evidence.
+/// - **"Nothing was comparable" is not "nothing drifted".** A `-g:none` build has no line tables at all,
+///   and reporting that as a match would be the worst possible answer.
+fn render_stale_report(
+    class_name: &str,
+    path: &std::path::Path,
+    report: &StaleReport,
+    limit: usize,
+    packets: u32,
+) -> String {
+    let comparable = report.matched + report.differing.len();
+    let mut out = String::new();
+    if comparable == 0 && !report.is_stale() {
+        let _ = writeln!(
+            out,
+            "⚠ Cannot tell: {class_name} and {} have no line tables to compare ({} method(s) skipped). \
+             That is what a build compiled with javac -g:none looks like, and it is also what an \
+             interface or a class of abstract/native methods looks like. This is NOT a report that the \
+             build matches.",
+            path.display(),
+            report.skipped,
+        );
+        return out;
+    }
+
+    if report.is_stale() {
+        let _ = writeln!(
+            out,
+            "🚨 STALE: the JVM is NOT running the build in {}.\n   {} of {} comparable method(s) match; \
+             {} differ.",
+            path.display(),
+            report.matched,
+            comparable,
+            report.differing.len(),
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "✅ {class_name} matches your build: all {comparable} comparable method(s) have identical \
+             line tables to {}.",
+            path.display(),
+        );
+    }
+
+    for line in report.differing.iter().take(limit) {
+        let _ = writeln!(out, "   ✗ {line}");
+    }
+    if report.differing.len() > limit {
+        let _ =
+            writeln!(out, "   … +{} more drifting method(s) (raise limit)", report.differing.len() - limit);
+    }
+    if !report.only_in_jvm.is_empty() {
+        let _ = writeln!(
+            out,
+            "   ✗ the RUNNING class declares {} method(s) your build does not: {}. That is a different \
+             class shape, not a moved line — debug.reload_class cannot fix it either, since HotSpot \
+             takes method bodies only.",
+            report.only_in_jvm.len(),
+            report.only_in_jvm.iter().take(limit).cloned().collect::<Vec<_>>().join(", "),
+        );
+    }
+    if !report.only_in_build.is_empty() {
+        let _ = writeln!(
+            out,
+            "   ✗ your BUILD declares {} method(s) the running class does not: {}. Same conclusion: this \
+             is a redeploy, not a swap.",
+            report.only_in_build.len(),
+            report.only_in_build.iter().take(limit).cloned().collect::<Vec<_>>().join(", "),
+        );
+    }
+    if report.skipped > 0 {
+        let _ = writeln!(
+            out,
+            "   {} method(s) had no line table on one side or the other (abstract, native, or compiled \
+             without debug info) and were not compared.",
+            report.skipped
+        );
+    }
+    let _ = writeln!(
+        out,
+        "   Basis: per-method line tables, {packets} JDWP packet(s). This catches an edit that MOVED a \
+         line, which is what makes a stop point at :N mean something else. An edit that changes a body \
+         without moving any line is invisible to it, so a clean result means \"no line moved\", not \
+         \"byte-for-byte identical\".",
+    );
+    if report.is_stale() {
+        out.push_str(
+            "   Next: debug.reload_class installs the build you just compared against, if the drift is \
+             method bodies only.\n",
+        );
+    }
+    out
 }
 
 /// Where a class's source sits *under* a root: the package as directories, then the file name the JVM
@@ -10678,6 +11501,287 @@ mod tests {
 
         let missing = find_under_roots(&roots, std::path::Path::new("com/example/Nope.java"));
         assert!(matches!(missing, SourceLookup::Missing), "an absent file is a miss, not an escape");
+    }
+
+    // SWAP-1: a class root is searched by CLASS name, which is the opposite of the rule above — every
+    // class gets its own `.class`, inner and anonymous ones included, so `Order$Line.class` is exactly
+    // the file to look for and no `SourceFile` round trip is involved.
+    #[test]
+    fn class_path_is_built_from_the_class_name_including_inner_classes() {
+        let p = |c| {
+            class_relative_path(c)
+                .map(|p| p.iter().map(|s| s.to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"))
+        };
+
+        assert_eq!(p("com.example.Order").as_deref(), Some("com/example/Order.class"));
+        // The inner-class case that `source_relative_path` deliberately answers differently.
+        assert_eq!(p("com.example.Order$Line").as_deref(), Some("com/example/Order$Line.class"));
+        assert_eq!(p("com.example.Order$1").as_deref(), Some("com/example/Order$1.class"));
+        assert_eq!(p("SwapProbe").as_deref(), Some("SwapProbe.class"));
+
+        // Same traversal rules as the source half: the roots are directories an operator named, and a
+        // tool argument is still untrusted input.
+        for bad in ["com.example.../etc/passwd", "..", ".", "", "com..Order", "C:Order", "a.b:c"] {
+            assert!(class_relative_path(bad).is_none(), "{bad:?} must be refused, not turned into a path");
+        }
+    }
+
+    // SWAP-1: with no roots and no `class_file` there is nowhere to read from, and the message has to
+    // say which of the three ways to configure one is missing — a bare "not found" would send the
+    // caller looking for a build problem they do not have.
+    #[test]
+    fn a_reload_with_nowhere_to_read_from_says_how_to_configure_a_root() {
+        let e = resolve_class_file("com.example.Order", None, &[]).expect_err("no roots must refuse");
+        assert!(e.contains("class_roots") && e.contains("JDWP_CLASS_ROOTS") && e.contains("class_file"));
+        // The distinction that costs the most time when it is missed: build output, not sources.
+        assert!(e.contains("target/classes"), "{e}");
+
+        // An explicit file that is not there is a different failure from a root that does not hold it.
+        let e = resolve_class_file("com.example.Order", Some("/nope/Order.class"), &[])
+            .expect_err("a missing class_file must refuse");
+        assert!(e.contains("not a readable file") && e.contains("Nothing was sent"), "{e}");
+    }
+
+    // SWAP-1: a root that exists but does not hold the class is the "you have not compiled yet" case,
+    // and it must not read as "this tool is broken". It also must not read as "the class is not
+    // loaded", which is a different check that already passed by the time we get here.
+    #[test]
+    fn a_class_root_that_does_not_hold_the_class_names_what_it_searched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("classes");
+        std::fs::create_dir_all(root.join("com/example")).expect("mkdir");
+        let roots = vec![root.clone()];
+
+        let e = resolve_class_file("com.example.Order", None, &roots).expect_err("absent file refuses");
+        assert!(e.contains("com/example/Order.class") || e.contains("com\\example\\Order.class"), "{e}");
+        assert!(e.contains(&root.display().to_string()), "the searched root must be named: {e}");
+        assert!(e.contains("COMPILED"), "the likeliest cause is an unbuilt class: {e}");
+
+        // And the file being there is the whole of the happy path — no JVM involved.
+        std::fs::write(root.join("com/example/Order.class"), [0xCA, 0xFE, 0xBA, 0xBE]).expect("write");
+        let found = resolve_class_file("com.example.Order", None, &roots).expect("present file resolves");
+        assert!(found.ends_with("Order.class"), "{}", found.display());
+    }
+
+    // SWAP-1: four bytes of local validation, so the commonest wrong file (a `.java`, an empty file
+    // left by a failed build) is named as such instead of coming back as INVALID_CLASS_FORMAT from the
+    // JVM, which reads like the compiler produced something broken.
+    #[test]
+    fn a_file_that_is_not_a_class_file_is_refused_before_the_wire() {
+        let path = std::path::Path::new("/tmp/Order.class");
+        assert!(check_class_file_bytes(path, &[0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 65]).is_ok());
+
+        let e = check_class_file_bytes(path, b"public class Order {}").expect_err("source must refuse");
+        assert!(e.contains("0xCAFEBABE") && e.contains("Nothing was sent"), "{e}");
+        let e = check_class_file_bytes(path, &[]).expect_err("an empty file must refuse");
+        assert!(e.contains("0 bytes"), "{e}");
+    }
+
+    // SWAP-1's core claim: a refusal is turned into what to do next. The codes themselves are accurate
+    // and useless — an agent handed SCHEMA_CHANGE_NOT_IMPLEMENTED re-tries the swap, because nothing in
+    // those words says the JVM will never accept it.
+    #[test]
+    fn each_redefine_refusal_says_what_changed_and_whether_to_stop_trying() {
+        let path = std::path::Path::new("/build/Order.class");
+        let explain = |code: u16, name: &str| {
+            explain_redefine_failure(
+                "com.example.Order",
+                path,
+                &jdwp_client::JdwpError::JdwpErrorCode(code, name.to_string()),
+            )
+        };
+
+        // The four HotSpot refuses that a caller can only fix by redeploying. Each must name the edit
+        // AND say the swap can never land, or the next call is the same call.
+        for (code, name, edit) in [
+            (63u16, "ADD_METHOD_NOT_IMPLEMENTED", "ADDED a method"),
+            (64, "SCHEMA_CHANGE_NOT_IMPLEMENTED", "FIELD"),
+            (66, "HIERARCHY_CHANGE_NOT_IMPLEMENTED", "HIERARCHY"),
+            (71, "METHOD_MODIFIERS_CHANGE_NOT_IMPLEMENTED", "METHOD modifier"),
+        ] {
+            let m = explain(code, name);
+            assert!(m.contains(edit), "{code} must name the edit: {m}");
+            assert!(m.contains("redeploy"), "{code} must say a redeploy is the route: {m}");
+            assert!(m.contains(name) && m.contains("was NOT reloaded"), "{m}");
+            // All-or-nothing is the fact that stops a caller wondering what half-landed.
+            assert!(m.contains("all-or-nothing"), "{m}");
+        }
+
+        // Two that are NOT the method-bodies-only rule, and must not be reported as if they were: one
+        // is a build problem, one is a wrong path.
+        let verify = explain(62, "FAILS_VERIFICATION");
+        assert!(verify.contains("Rebuild") && !verify.contains("needs a real redeploy"), "{verify}");
+        let names = explain(69, "NAMES_DONT_MATCH");
+        assert!(names.contains("wrong file"), "{names}");
+
+        // A transport failure is not a refusal, and must not be dressed up as one.
+        let io =
+            explain_redefine_failure("com.example.Order", path, &jdwp_client::JdwpError::ConnectionClosed);
+        assert!(io.contains("nothing changed"), "{io}");
+    }
+
+    // SWAP-1, piece 4: the footgun. Swapping the method you are stopped in changes nothing observable
+    // until the frame is re-entered, so the reply has to say so — and must tell "no frame is in it"
+    // apart from "we could not look", which is what an unsuspended thread gives.
+    #[test]
+    fn a_reload_reports_frames_still_running_the_old_bytecode() {
+        // Inside the class: the caller is told which frames and given the exact next call.
+        let inside = describe_live_frames("com.example.Order", Some(0x2a), Some(&[0, 3]));
+        assert!(inside.contains("#0, #3"), "{inside}");
+        assert!(inside.contains("debug.pop_frame") && inside.contains("\"frame\":0"), "{inside}");
+
+        // Not inside it: an answer, not a silence.
+        let outside = describe_live_frames("com.example.Order", Some(0x2a), Some(&[]));
+        assert!(outside.contains("no frame in com.example.Order"), "{outside}");
+        assert!(!outside.contains("pop_frame"), "nothing to pop: {outside}");
+
+        // Could not look — a running thread. Distinct from "nothing found", and the reason it is fine.
+        let unread = describe_live_frames("com.example.Order", Some(0x2a), None);
+        assert!(unread.contains("running, not suspended"), "{unread}");
+
+        // Nothing has ever stopped: no thread to check, and no warning to give.
+        let none = describe_live_frames("com.example.Order", None, None);
+        assert!(none.contains("No thread has stopped"), "{none}");
+    }
+
+    // SWAP-1: stop points armed in a redefined method are in a state the JVM does not report — the
+    // methodID goes *obsolete* rather than invalid. Say so and point at the re-arm that already exists,
+    // rather than silently toggling stop points the caller did not mention.
+    #[test]
+    fn a_reload_warns_about_stop_points_armed_on_the_class_it_replaced() {
+        assert_eq!(describe_armed_stop_points(&[]), "", "no stop points, no paragraph");
+        let note = describe_armed_stop_points(&["bp_1 (com.example.Order:42)".to_string()]);
+        assert!(note.contains("bp_1") && note.contains("toggle_stop_point"), "{note}");
+    }
+
+    // DISC-7: the comparison itself, away from any JVM. A detector that cries stale on a current build
+    // is ignored within a day, so the clean case is asserted first and asserted hardest.
+    #[test]
+    fn a_matching_build_is_reported_as_matching_and_nothing_else() {
+        let running = vec![MethodLines {
+            name: "answer".to_string(),
+            descriptor: "()I".to_string(),
+            lines: vec![(0, 39), (2, 40)],
+            comparable: true,
+        }];
+        let built = vec![crate::classfile::ClassFileMethod {
+            name: "answer".to_string(),
+            descriptor: "()I".to_string(),
+            lines: vec![(0, 39), (2, 40)],
+            has_code: true,
+            has_line_table: true,
+        }];
+
+        let report = compare_line_tables(&running, &built);
+        assert!(!report.is_stale() && report.matched == 1);
+        let out = render_stale_report("Probe", std::path::Path::new("/b/Probe.class"), &report, 20, 3);
+        assert!(out.contains("matches your build"), "{out}");
+        // The claim has to be the one that was checked: line tables, not bytes.
+        assert!(out.contains("not \"byte-for-byte identical\""), "{out}");
+        assert!(!out.contains("STALE"), "{out}");
+    }
+
+    // DISC-7: lines moved. The reply must name the method and give one concrete disagreement — enough
+    // to act on, without printing two whole tables.
+    #[test]
+    fn a_build_whose_lines_moved_is_reported_stale_with_the_first_difference() {
+        let running = vec![MethodLines {
+            name: "answer".to_string(),
+            descriptor: "()I".to_string(),
+            lines: vec![(0, 39)],
+            comparable: true,
+        }];
+        let built = vec![crate::classfile::ClassFileMethod {
+            name: "answer".to_string(),
+            descriptor: "()I".to_string(),
+            lines: vec![(0, 41)],
+            has_code: true,
+            has_line_table: true,
+        }];
+
+        let report = compare_line_tables(&running, &built);
+        assert!(report.is_stale() && report.differing.len() == 1);
+        let out = render_stale_report("Probe", std::path::Path::new("/b/Probe.class"), &report, 20, 3);
+        assert!(out.contains("STALE") && out.contains("answer()I"), "{out}");
+        assert!(out.contains("line 39") && out.contains("line 41"), "both sides must be named: {out}");
+        // Drift that a swap could fix should point at the swap.
+        assert!(out.contains("debug.reload_class"), "{out}");
+    }
+
+    // DISC-7: a method on one side only is a different class SHAPE, which is a bigger finding than a
+    // moved line and has a different remedy — a hot reload cannot fix it.
+    #[test]
+    fn a_method_present_on_only_one_side_is_reported_as_a_shape_change() {
+        let running = vec![MethodLines {
+            name: "gone".to_string(),
+            descriptor: "()V".to_string(),
+            lines: vec![(0, 5)],
+            comparable: true,
+        }];
+        let built = vec![crate::classfile::ClassFileMethod {
+            name: "added".to_string(),
+            descriptor: "()V".to_string(),
+            lines: vec![(0, 5)],
+            has_code: true,
+            has_line_table: true,
+        }];
+
+        let report = compare_line_tables(&running, &built);
+        assert_eq!(report.only_in_jvm, vec!["gone()V"]);
+        assert_eq!(report.only_in_build, vec!["added()V"]);
+        let out = render_stale_report("Probe", std::path::Path::new("/b/Probe.class"), &report, 20, 3);
+        assert!(out.contains("RUNNING class declares") && out.contains("BUILD declares"), "{out}");
+        assert!(out.contains("redeploy, not a swap"), "{out}");
+    }
+
+    // DISC-7's most important negative: nothing comparable is NOT a match. A `-g:none` build has no
+    // line tables at all, and answering "matches" there would be the worst available answer — it is the
+    // exact reassurance the tool exists to withhold.
+    #[test]
+    fn a_class_with_no_line_tables_says_it_cannot_tell_rather_than_matching() {
+        let running = vec![MethodLines {
+            name: "answer".to_string(),
+            descriptor: "()I".to_string(),
+            lines: Vec::new(),
+            comparable: false,
+        }];
+        let built = vec![crate::classfile::ClassFileMethod {
+            name: "answer".to_string(),
+            descriptor: "()I".to_string(),
+            lines: Vec::new(),
+            has_code: true,
+            has_line_table: false,
+        }];
+
+        let report = compare_line_tables(&running, &built);
+        assert!(!report.is_stale() && report.skipped == 1 && report.matched == 0);
+        let out = render_stale_report("Probe", std::path::Path::new("/b/Probe.class"), &report, 20, 3);
+        assert!(out.contains("Cannot tell") && out.contains("-g:none"), "{out}");
+        assert!(out.contains("NOT a report that the build matches"), "{out}");
+        assert!(!out.contains("✅"), "a skipped comparison must not read as a pass: {out}");
+
+        // The measured shape of the same case, and a regression guard: `HotSpot` 21 answers a `-g:none`
+        // class's `Method.LineTable` with an EMPTY table rather than ABSENT_INFORMATION. Read
+        // literally, an empty table against a build that has lines is a difference — and the first cut
+        // of this reported every method of a stripped class as drift.
+        let stripped_jvm = vec![MethodLines {
+            name: "answer".to_string(),
+            descriptor: "()I".to_string(),
+            lines: Vec::new(),
+            comparable: false,
+        }];
+        let with_lines = vec![crate::classfile::ClassFileMethod {
+            name: "answer".to_string(),
+            descriptor: "()I".to_string(),
+            lines: vec![(0, 39)],
+            has_code: true,
+            has_line_table: true,
+        }];
+        let asymmetric = compare_line_tables(&stripped_jvm, &with_lines);
+        assert!(
+            !asymmetric.is_stale() && asymmetric.skipped == 1,
+            "a stripped running class must be unanswerable, not stale against a build that has lines"
+        );
     }
 
     // DISC-3: the window arithmetic, which is where this can be wrong in a way no probe would catch —

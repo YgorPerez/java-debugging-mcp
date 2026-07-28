@@ -290,6 +290,16 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## ✅ Shipped (context)
 
+- **Hot reload (SWAP-1)** — `debug.reload_class` installs freshly compiled bytecode into a running JVM
+  (`VirtualMachine.RedefineClasses`), with `CapabilitiesNew` asked first, type-cache invalidation on
+  success, and each of HotSpot's twelve refusals turned into what to do next. `debug.pop_frame`
+  (`StackFrame.PopFrames`) ships with it so a suspended frame re-enters the new code — see ADR-0016 for
+  why that is a second tool and not a flag. Refused read-only; `dry_run` still answers. Validated against
+  a JVM that was never restarted (`a_hot_reload_changes_what_a_running_jvm_prints` and three siblings).
+- **Staleness detection (DISC-7)** — `debug.check_stale` compares the JVM's line tables against a parsed
+  `.class` from the same class roots, so "the deployed bytecode is older than your build" stops being
+  indistinguishable from a wrong hypothesis. Reports **cannot tell** rather than a match when there is
+  nothing comparable, and states that it checks moved lines rather than bytes.
 - **Static-field reads in `debug.evaluate`** — `ConfigDefaultUtils.dsUrlMotor`, with or without a
   suspended frame. Primitives `get_reference_values` (ReferenceType.GetValues) + `all_classes`.
   Validated (`examples/test_static_field.rs`).
@@ -1065,6 +1075,54 @@ each ships with an automated test (unit for the pure logic, MCP-level integratio
 behaviour) driven against a real probe JVM the way `docs/agents/domain.md` and the house pattern
 require. The former backlog entries are preserved below, collapsed, as the record of what was asked for
 versus what was built.
+
+### The redeploy pair (SWAP-1/#58, DISC-7/#59) — both shipped
+
+The two halves of the same 20-30s-per-Java-change loop: **stop running the wrong bytecode** and **stop
+having to redeploy to change it**. Filed a day apart, deliberately sharing one piece of plumbing (map a
+loaded type to its compiled `.class` and read the bytes), and settled together in ADR-0016.
+
+**SWAP-1 — hot reload.** `debug.reload_class` sends `VirtualMachine.RedefineClasses` with bytes read from
+a class root. `CapabilitiesNew` (command 17) is decoded and asked first, so a JVM that cannot HotSwap is
+*reported* rather than answering `NOT_IMPLEMENTED` to the real command; the type cache is invalidated on
+success, which makes true the thing `connection.rs` had documented as hypothetical ("this crate never
+calls it, but another debugger could"); and the twelve refusals at 60-71 — an error table that had no
+caller since the day it was written — are each mapped onto what to do next. That mapping is most of the
+feature: `SCHEMA_CHANGE_NOT_IMPLEMENTED` tells an agent nothing about whether to re-try, and the reply now
+says *you added or removed a field, and this needs a real redeploy*. Verified against a running JVM that
+was never restarted: the probe prints a different value, and the tick counter keeps advancing across the
+swap so "the swap did nothing" and "the JVM froze" cannot be confused. Three refusals (added field, added
+method, changed modifier) are asserted the same way, each followed by a check that the debuggee is still
+running the old code — all-or-nothing is a claim about the debuggee, so it is read from the debuggee.
+
+**`debug.pop_frame` shipped with it, as its own tool** (ADR-0016, applying ADR-0015's rule). Without it
+the first thing anyone does is swap the method they are stopped in, see nothing change, and conclude
+reloading is broken — a frame already on the stack keeps the bytecode it entered with. So `reload_class`
+also *checks* whether the target thread has frames in the class it just replaced and quotes the exact pop.
+The end-to-end test is the headline claim: stop at a breakpoint inside a method, swap it, pop, continue,
+and the new code runs without re-issuing the call that got there.
+
+**Measured, and worth knowing**: after a redefinition `HotSpot` reports a suspended frame's method as
+**id 0**. The tool renders that as an obsolete method rather than `method@0` — it is the JVM confirming
+the frame was running replaced code.
+
+**DISC-7 — staleness detection.** `debug.check_stale` compares the JVM's per-method line tables against
+the ones parsed out of the `.class` on disk (`mcp-server/src/classfile.rs`, a deliberately narrow reader:
+constant pool, method table, `LineNumberTable`, nothing else). This is the half `debug.source`/#31
+provably cannot do — `SourceFile` is a compile-time string, identical across every build of the file, so
+it settles *which file* and never *which build of it*.
+
+The clean case is the one that decides whether anyone keeps using it, so it is tested first: the running
+source recompiled must **not** report drift. It also produced a false positive worth recording, caught by
+the `-g:none` test rather than by reasoning: **a stripped class answers `Method.LineTable` with an EMPTY
+table, not with `ABSENT_INFORMATION`** — so the first cut reported every method of a stripped class as
+drifting against a build that had lines. Empty now counts as absent, and the verdict for a class with
+nothing comparable is **"cannot tell"**, never a match.
+
+Left, and named rather than implied: this compares line tables, so an edit that changes a body without
+moving a line is invisible. `Method.Bytecodes` (declared at `commands.rs:70`, still uncalled) plus
+`can_get_bytecodes` (decoded at `vm.rs:41`, still unconsulted) would turn "probably current" into
+"byte-for-byte identical". Every reply says which claim it is making.
 
 Priority key: **P1** = highest payoff for the infotravel/integraWS investigations (shared 8180 +
 silent-failure debugging); **P2** = solid follow-ups; effort is rough (S/M).
