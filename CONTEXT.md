@@ -236,10 +236,10 @@ re-armed, and deliberately not the stop point's identity.
 A mode in which nothing changes the debuggee — no method invocation, no writes, no forced returns, no hot
 reload, and no popped frame. A guard against accident, **not** a security boundary: anyone who can reach the
 debug port can do anything.
-_Avoid_: "nothing executes code in the debuggee", the wording before SWAP-1 (#58). A hot reload invokes
-nothing, writes no field and forces no return, yet replaces the running program — so that phrasing
-described the mode as permitting the one change nothing can undo. A `dry_run` reload is the deliberate
-exception, because it installs nothing.
+A `dry_run` reload is the deliberate exception, because it installs nothing.
+_Avoid_: "nothing executes code in the debuggee" (the wording before SWAP-1, #58 — a hot reload invokes
+nothing, writes no field and forces no return, yet replaces the running program, so it satisfied that
+phrasing while being the one change nothing can undo)
 
 **Outstanding redefinition**:
 A class a session hot-reloaded and cannot restore. Its own term because every other mutation here ends when

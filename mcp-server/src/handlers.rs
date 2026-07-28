@@ -2781,8 +2781,20 @@ fn render_session_line(
     // SWAP-2. Deliberately not gated on being the current session: a session *someone else* left behind
     // is the case that matters, and this listing is the only place a third party can discover that a JVM
     // is running bytecode a debugger installed.
+    //
+    // NAMED, not counted. "2 class(es) still reloaded" tells a third party that something is wrong and
+    // nothing about what, which leaves them no next step — and #61 asked for the classes to be named.
+    // Bounded, because this is one line of a listing: the first few names, then a count of the rest.
     if !s.redefinitions.is_empty() {
-        let _ = write!(line, ", ⚠️ {} class(es) still reloaded", s.redefinitions.len());
+        const NAMED: usize = 3;
+        let names: Vec<&str> = s.redefinitions.keys().take(NAMED).map(std::string::String::as_str).collect();
+        let rest = s.redefinitions.len().saturating_sub(names.len());
+        let _ = write!(
+            line,
+            ", ⚠️ still reloaded: {}{}",
+            names.join(", "),
+            if rest > 0 { format!(" +{rest} more") } else { String::new() }
+        );
     }
     if is_current {
         line.push_str(" ← current");
@@ -2825,6 +2837,11 @@ fn render_breakpoint_line(
     }
     if let Some(e) = &bp.trace_expr {
         let _ = writeln!(output, "     Trace expr: {e}");
+    }
+    // DISC-8. Rendered here as well as in the arm reply, because a deferred stop point arms in the event
+    // pump where no reply exists — this is the only place its caller can learn the build had drifted.
+    if let Some(d) = &bp.drift {
+        let _ = writeln!(output, "    {}", d.trim_start_matches('\n').trim_end());
     }
     if bp.hit_count > 0 {
         let _ = writeln!(output, "     Hits: {}", bp.hit_count);
@@ -4079,21 +4096,28 @@ fn sig_arg_count(sig: &str) -> usize {
     count
 }
 
-/// A new session's default source roots (DISC-3): `JDWP_SOURCE_ROOTS`, a path list in this platform's
-/// spelling — `:`-separated on Unix, `;` on Windows, which is what `std::env::split_paths` reads and
-/// what the JVM's own `-cp` already uses, so an operator sets it the way they set every other path
-/// list. Unset means no roots, and `debug.source` then reports only what the JVM knows.
-fn env_source_roots() -> Vec<std::path::PathBuf> {
-    std::env::var_os("JDWP_SOURCE_ROOTS")
+/// A path list from the environment, in this platform's spelling — `:`-separated on Unix, `;` on
+/// Windows, which is what `std::env::split_paths` reads and what the JVM's own `-cp` already uses, so an
+/// operator sets it the way they set every other path list. Unset, or set to nothing, means no roots.
+///
+/// One reader for both root variables rather than two identical bodies: they differ only in the name of
+/// the variable, and a second copy is a second place for the empty-segment filter to be forgotten.
+fn env_path_list(var: &str) -> Vec<std::path::PathBuf> {
+    std::env::var_os(var)
         .map_or_else(Vec::new, |v| std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect())
 }
 
-/// A new session's default class roots (SWAP-1): `JDWP_CLASS_ROOTS`, read exactly like
-/// [`env_source_roots`] reads `JDWP_SOURCE_ROOTS` — a path list in this platform's spelling. Unset means
-/// no roots, and `debug.reload_class` then needs an explicit `class_file` per call.
+/// A new session's default source roots (DISC-3): `JDWP_SOURCE_ROOTS`. Unset means no roots, and
+/// `debug.source` then reports only what the JVM knows.
+fn env_source_roots() -> Vec<std::path::PathBuf> {
+    env_path_list("JDWP_SOURCE_ROOTS")
+}
+
+/// A new session's default class roots (SWAP-1): `JDWP_CLASS_ROOTS`. A *class* root is where the package
+/// tree starts in the build output (`target/classes`), which is a different tree from a source root —
+/// ADR-0016 is why they are two lists and not one.
 fn env_class_roots() -> Vec<std::path::PathBuf> {
-    std::env::var_os("JDWP_CLASS_ROOTS")
-        .map_or_else(Vec::new, |v| std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect())
+    env_path_list("JDWP_CLASS_ROOTS")
 }
 
 /// Where a class's compiled `.class` sits under a root: the package as directories, then the class's
@@ -4744,6 +4768,60 @@ fn first_difference(jvm: &MethodLines, file: &MethodLines) -> String {
     )
 }
 
+/// The headline verdict of a staleness reply: stale, cannot-tell, or match.
+///
+/// Extracted for the same reason as the two section renderers — DISC-9's "asked for bytecode and the JVM
+/// refused" case is a third verdict, and adding it pushed `render_stale_report` past the length gate. Its
+/// own function also makes the three mutually exclusive by construction, which is the property that was
+/// wrong before: an unavailable capability used to fall through to the match arm.
+fn render_stale_verdict(
+    class_name: &str,
+    path: &std::path::Path,
+    report: &StaleReport,
+    comparable: usize,
+    bytecode_compared: usize,
+) -> String {
+    let mut out = String::new();
+    let bytecode_unavailable = report.bytecode.as_ref().is_some_and(|b| b.unavailable);
+    if report.is_stale() {
+        let _ = writeln!(
+            out,
+            "🚨 STALE: the JVM is NOT running the build in {}.\n   {} of {} comparable method(s) match; \
+             {} differ.",
+            path.display(),
+            report.matched,
+            comparable,
+            report.differing.len(),
+        );
+    } else if bytecode_unavailable {
+        // NOT a match. The line tables agreeing is a real finding and is stated as one, but the caller
+        // asked for the stronger evidence and this JVM would not give it, so the answer to the question
+        // they actually asked is "cannot tell" (DISC-9).
+        let _ = writeln!(
+            out,
+            "⚠ Cannot tell: all {comparable} line-comparable method(s) of {class_name} have identical line \
+             tables to {}, but you asked for a bytecode comparison and this JVM refused it \
+             (canGetBytecodes=false). Matching line tables mean NO LINE MOVED — not that the code is the \
+             same — so the question you asked is unanswered here.",
+            path.display(),
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "✅ {class_name} matches your build: all {comparable} comparable method(s) have identical \
+             line tables to {}{}.",
+            path.display(),
+            if bytecode_compared > 0 {
+                format!(", and all {bytecode_compared} have identical bytecode")
+            } else {
+                String::new()
+            },
+        );
+    }
+
+    out
+}
+
 /// The line-table findings of a staleness reply: the drifting methods, the two shape differences, and
 /// what could not be compared.
 ///
@@ -4821,11 +4899,15 @@ fn render_bytecode_section(report: &StaleReport, limit: usize) -> String {
             if !b.differing.is_empty() && report.differing.is_empty() {
                 let _ = writeln!(
                     out,
-                    "   NOTE: the line tables MATCH and the bytecode does not — an edit that changed a \
-                     body without moving a line, which is what bytecode:true exists to catch. One other \
-                     thing produces this: a build compiled by a different javac than the deployed one, \
-                     since constant-pool indices live in the operands. Same compiler and same source is \
-                     byte-identical."
+                    "   NOTE: the line tables MATCH and the bytecode does not. The likely cause is the edit \
+                     bytecode:true exists to catch — a body changed without moving a line. But bytecode is \
+                     NOT a fingerprint of source: constant-pool indices live in the operands, so a method \
+                     you did not touch can differ because the pool was renumbered by an unrelated change \
+                     ELSEWHERE IN THE SAME CLASS (adding a method, a string, a call), or because the two \
+                     builds came from different javac versions. Read a bytecode-only difference as \"the \
+                     code bytes differ\", not as \"this method's source changed\" — if it matters which, \
+                     the differing method's own line table and debug.source will say whether anything \
+                     moved."
                 );
             }
             if b.skipped > 0 {
@@ -4859,6 +4941,10 @@ fn render_stale_report(
 ) -> String {
     let comparable = report.matched + report.differing.len();
     let bytecode_compared = report.bytecode.as_ref().map_or(0, |b| b.compared);
+    // Asked for and refused by the JVM. Kept distinct from "not asked for" everywhere below, because the
+    // caller who passed `bytecode:true` is owed a different answer than the one who did not: theirs is
+    // "cannot tell", never "matches" (DISC-9's acceptance criterion).
+    let bytecode_unavailable = report.bytecode.as_ref().is_some_and(|b| b.unavailable);
     let mut out = String::new();
     // DISC-9: "no line tables" is only "cannot tell" while nothing else answered. A `-g:none` build has
     // code and no lines, which is exactly the case bytecode comparison exists for — reporting it as
@@ -4869,10 +4955,17 @@ fn render_stale_report(
             "⚠ Cannot tell: {class_name} and {} have no line tables to compare ({} method(s) skipped). \
              That is what a build compiled with javac -g:none looks like, and it is also what an \
              interface or a class of abstract/native methods looks like. This is NOT a report that the \
-             build matches.{}",
+             build matches.{}\n   Basis: nothing could be compared, {packets} JDWP packet(s).",
             path.display(),
             report.skipped,
-            if report.bytecode.is_some() {
+            if bytecode_unavailable {
+                // Both evidences failed, for two different reasons, and this used to return before saying
+                // so — the caller asked for the one thing that survives -g:none and was told only that
+                // there were no line tables.
+                " You DID ask for bytecode, and this JVM refused it: it reports canGetBytecodes=false, so \
+                 the one evidence that survives -g:none was unavailable too. Nothing about this class is \
+                 known."
+            } else if report.bytecode.is_some() {
                 ""
             } else {
                 " Pass bytecode:true to compare the code itself, which a -g:none build still has."
@@ -4881,30 +4974,7 @@ fn render_stale_report(
         return out;
     }
 
-    if report.is_stale() {
-        let _ = writeln!(
-            out,
-            "🚨 STALE: the JVM is NOT running the build in {}.\n   {} of {} comparable method(s) match; \
-             {} differ.",
-            path.display(),
-            report.matched,
-            comparable,
-            report.differing.len(),
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "✅ {class_name} matches your build: all {comparable} comparable method(s) have identical \
-             line tables to {}{}.",
-            path.display(),
-            if bytecode_compared > 0 {
-                format!(", and all {bytecode_compared} have identical bytecode")
-            } else {
-                String::new()
-            },
-        );
-    }
-
+    out.push_str(&render_stale_verdict(class_name, path, report, comparable, bytecode_compared));
     out.push_str(&render_line_table_section(report, limit));
     out.push_str(&render_bytecode_section(report, limit));
     let basis = match &report.bytecode {
@@ -5593,7 +5663,9 @@ async fn try_arm_deferred_breakpoints(
     for pend in pending {
         match resolve_bp_location(&mut session.connection, cp_ref, pend.line, pend.method.as_deref()).await {
             Ok(loc) => {
-                let (method, index, line) = (loc.method, loc.code_index, loc.line);
+                // Destructured rather than cloned: `method` is needed three times below and `lines`
+                // once, and taking both by value costs nothing per iteration.
+                let ResolvedLocation { method, code_index: index, line, lines } = loc;
                 let sp = suspend_policy_for(pend.trace);
                 match session
                     .connection
@@ -5616,6 +5688,11 @@ async fn try_arm_deferred_breakpoints(
                             "Armed deferred breakpoint {} on {} (line {})",
                             pend.bp_id, pend.class_pattern, line
                         );
+                        // DISC-8: the class has only just loaded, so this is the first moment the
+                        // comparison is even possible — and there is no reply to append it to, since
+                        // this runs in the event pump. Stored for `list_stop_points` to render.
+                        let drift =
+                            drift_caveat_for_armed_method(session, &pend.class_pattern, &method, lines).await;
                         session.breakpoints.insert(
                             pend.bp_id,
                             crate::session::BreakpointInfo {
@@ -5623,6 +5700,7 @@ async fn try_arm_deferred_breakpoints(
                                 class_pattern: pend.class_pattern,
                                 line: u32::try_from(line).unwrap_or(0),
                                 method: Some(method.name),
+                                drift,
                                 enabled: true,
                                 hit_count: 0,
                                 condition: pend.condition,
@@ -6664,6 +6742,8 @@ async fn arm_and_insert(
         )
         .await
         .map_err(|e| format!("Failed to set breakpoint: {e}"))?;
+    // Computed before the insert so the stop point carries it too, not only this reply (DISC-8).
+    let drift = drift_caveat_for_armed_method(session, &spec.class_pattern, &method, jvm_lines).await;
     session.breakpoints.insert(
         bp_id.clone(),
         crate::session::BreakpointInfo {
@@ -6671,6 +6751,7 @@ async fn arm_and_insert(
             class_pattern: spec.class_pattern.clone(),
             line: u32::try_from(line).unwrap_or(0),
             method: Some(method.name.clone()),
+            drift: drift.clone(),
             enabled: true,
             hit_count: 0,
             condition: spec.condition.clone(),
@@ -6692,7 +6773,6 @@ async fn arm_and_insert(
     // After arming, not before: the breakpoint is the thing the caller asked for, and a drift check that
     // could fail must never be able to prevent it. Everything this call does is fallible-but-ignorable by
     // construction, and it returns `None` rather than an error for the same reason.
-    let drift = drift_caveat_for_armed_method(session, &spec.class_pattern, &method, jvm_lines).await;
     Ok(ArmedBreakpoint { bp_id, line, method_name: method.name, request_id, drift })
 }
 
@@ -11729,16 +11809,43 @@ mod tests {
         assert!(lines_only.contains("comment"), "{lines_only}");
     }
 
-    // A JVM that cannot answer must not have its silence read as agreement.
+    // A JVM that cannot answer must not have its silence read as agreement — and, the part this test
+    // originally missed, must not have it read as a MATCH either. DISC-9's criterion is "a JVM lacking the
+    // bytecode capability reports 'cannot tell', not a match", and the first version of this test asserted
+    // only that the ⚠ aside was present. That passes just as happily against a reply whose headline says
+    // `✅ matches your build`, which is what shipped. The verdict is what needs asserting, not the aside.
     #[test]
-    fn an_unavailable_bytecode_capability_is_reported_as_unavailable() {
+    fn an_unavailable_bytecode_capability_is_not_reported_as_a_match() {
         let b = BytecodeReport { unavailable: true, ..Default::default() };
         let out = render(&stale_report_with(&[], Some(b), 4));
 
-        assert!(out.contains("canGetBytecodes=false"), "{out}");
-        assert!(out.contains("not confirmed by the code"), "{out}");
+        assert!(!out.contains('✅'), "asked for bytecode and refused is NOT a match:\n{out}");
+        assert!(!out.contains("matches your build"), "must not claim a match:\n{out}");
+        assert!(out.contains("Cannot tell"), "the verdict must be cannot-tell:\n{out}");
+        assert!(out.contains("canGetBytecodes=false"), "and must say why:\n{out}");
         assert!(!out.contains("Both evidences agree"), "unavailable is not agreement:\n{out}");
         assert!(out.contains("line tables only"), "the basis must not claim bytecode:\n{out}");
+        // The line tables DID agree, and saying so is still useful — it just is not the answer asked for.
+        assert!(out.contains("identical line tables"), "the partial finding is still reported:\n{out}");
+    }
+
+    // The two-failures case, which used to return before mentioning the second. A -g:none class has no
+    // line tables, so bytecode is the only evidence that could answer — and if the JVM also refuses that,
+    // the reply has to say both things rather than only "no line tables".
+    #[test]
+    fn no_line_tables_and_no_capability_says_both_and_reports_its_cost() {
+        let stripped = StaleReport {
+            skipped: 6,
+            bytecode: Some(BytecodeReport { unavailable: true, ..Default::default() }),
+            ..Default::default()
+        };
+
+        let out = render(&stripped);
+
+        assert!(out.contains("Cannot tell"), "{out}");
+        assert!(out.contains("You DID ask for bytecode"), "must not swallow the second failure:\n{out}");
+        assert!(out.contains("canGetBytecodes=false"), "{out}");
+        assert!(out.contains("JDWP packet(s)"), "packets were spent, so they must be reported:\n{out}");
     }
 
     // Without the flag, the reply must keep pointing at what it did not check — the DISC-8 discipline

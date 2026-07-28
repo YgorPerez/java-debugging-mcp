@@ -40,7 +40,7 @@ See `docs/agents/triage-labels.md`.
 
 Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
-### Downstream consumer
+## Downstream consumer
 
 `infotravel-dev-toolkit` installs this server from a **pinned release** and documents its tools in Claude
 Code skills. Nothing here depends on it and it can never break this CI — but five of its six failure modes

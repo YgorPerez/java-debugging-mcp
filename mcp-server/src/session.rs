@@ -506,6 +506,14 @@ pub struct BreakpointInfo {
     pub trace_frames: usize,
     /// Observed capture cost, reported by `list_stop_points` (TRACE-7).
     pub trace_cost: TraceCost,
+    /// DISC-8: the stale-bytecode caveat found when this stop point was armed, if there was a proof.
+    ///
+    /// Stored as well as reported, because the two arming paths differ in what they *can* report. The
+    /// immediate path returns a reply and says it there; the **deferred** path arms inside the event pump
+    /// when the class finally loads, where there is no reply to append to — so without this the caller who
+    /// most needs the warning (they armed against a class that was not loaded yet) is the one who never
+    /// sees it. `debug.list_stop_points` renders it for both.
+    pub drift: Option<String>,
     /// Everything needed to re-arm this breakpoint at the same location after a `toggle_stop_point`
     /// disable (BP-1). Kept for every armed breakpoint so disable→enable round-trips exactly.
     pub arm: BreakpointArm,
