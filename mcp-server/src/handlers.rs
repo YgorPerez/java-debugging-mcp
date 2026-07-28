@@ -1260,10 +1260,14 @@ impl RequestHandler {
 
         let before = session.connection.packets_sent();
         let running = read_jvm_line_tables(&mut session.connection, type_id).await?;
+        let mut report = compare_line_tables(&running, &built.methods);
+        // DISC-9, opt-in: the second evidence, which costs a packet per method with code on both sides.
+        // Inside the packet window so the reported cost is the whole cost, not the cheap half of it.
+        if a.bytecode {
+            report.bytecode = Some(bytecode_report(&mut session.connection, type_id, &built.methods).await?);
+        }
         let packets = session.connection.packets_sent().saturating_sub(before);
         drop(session);
-
-        let report = compare_line_tables(&running, &built.methods);
         Ok(render_stale_report(&class_name, &path, &report, a.limit, packets))
     }
 
@@ -4421,11 +4425,34 @@ struct StaleReport {
     only_in_build: Vec<String>,
     /// Methods with no line table on either side (abstract, native, `-g:none`).
     skipped: usize,
+    /// DISC-9: the bytecode half, present only when `bytecode:true` asked for it.
+    bytecode: Option<BytecodeReport>,
+}
+
+/// What a per-method bytecode comparison found (DISC-9, #63).
+///
+/// Separate from the line-table counts rather than merged into them, because the two answer differently
+/// and a reader has to be able to tell which one spoke. A method can match on lines and differ on code —
+/// that is the entire point — and reporting "1 of 40 drifted" without saying by which evidence would make
+/// the two indistinguishable.
+#[derive(Debug, Default)]
+struct BytecodeReport {
+    /// Methods whose code arrays differ, named.
+    differing: Vec<String>,
+    compared: usize,
+    /// Methods with no code on one side or the other (abstract, native, or absent from the build).
+    skipped: usize,
+    /// The JVM cannot answer `Method.Bytecodes` at all (`canGetBytecodes=false`), so this evidence is
+    /// unavailable rather than negative — a distinction that must survive into the reply.
+    unavailable: bool,
 }
 
 impl StaleReport {
     fn is_stale(&self) -> bool {
-        !self.differing.is_empty() || !self.only_in_jvm.is_empty() || !self.only_in_build.is_empty()
+        !self.differing.is_empty()
+            || !self.only_in_jvm.is_empty()
+            || !self.only_in_build.is_empty()
+            || self.bytecode.as_ref().is_some_and(|b| !b.differing.is_empty())
     }
 }
 
@@ -4557,6 +4584,103 @@ fn drift_caveat_from_tables(
     ))
 }
 
+/// DISC-9: compare each method's bytecode against the compiled class file, method by method.
+///
+/// The evidence a line table cannot give. An edit that changes a body without moving a line — `<` to
+/// `<=`, a changed constant, a swapped operator — leaves the line table identical, and that is also the
+/// commonest edit in a compile-and-retest loop, so it is precisely where the cheaper comparison is
+/// quietest.
+///
+/// `get_methods` is served from the connection's type cache here (the line-table walk populated it), so
+/// the only packets this spends are the `Method.Bytecodes` calls themselves — one per method that has code
+/// on **both** sides. Methods the build declares without code (abstract, native) are skipped without
+/// asking, since they are abstract or native on the running side too.
+///
+/// **One way this can mislead, stated because the reply has to state it.** Bytecode carries constant-pool
+/// indices in its operands, so the same source compiled by two *different* javac versions can produce
+/// different bytes. Same compiler and same source is byte-identical — javac is deterministic — so a local
+/// rebuild does not trip it; a build produced by a different JDK than the one you are comparing with can.
+/// That is why a bytecode-only difference is reported as "the code differs" and not as "your source
+/// differs".
+async fn bytecode_report(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+    built: &[crate::classfile::ClassFileMethod],
+) -> Result<BytecodeReport, String> {
+    let mut report = BytecodeReport::default();
+
+    // Asked before the first command, per `VmCapabilities`' own rule: a JVM without the capability
+    // answers NOT_IMPLEMENTED, and "this JVM cannot tell us" is a better report than an error code.
+    // `canGetBytecodes` is one of the original seven, so this is `capabilities`, not `capabilities_new`.
+    match conn.capabilities().await {
+        Ok(caps) if !caps.can_get_bytecodes => {
+            report.unavailable = true;
+            return Ok(report);
+        }
+        Ok(_) => {}
+        Err(e) => return Err(format!("Failed to ask the JVM what it supports (Capabilities): {e}")),
+    }
+
+    let methods =
+        conn.get_methods(type_id).await.map_err(|e| format!("Failed to list the running methods: {e}"))?;
+    for m in methods {
+        // Compared as a pair rather than two `&&`ed equalities: JDWP calls it a signature and the class
+        // file calls it a descriptor, so field names differ across the two sides by nature.
+        let key = (m.name.as_str(), m.signature.as_str());
+        let Some(file) = built.iter().find(|b| (b.name.as_str(), b.descriptor.as_str()) == key) else {
+            // Already reported as a shape difference by the line-table pass; not counted twice.
+            continue;
+        };
+        if !file.has_code {
+            report.skipped += 1;
+            continue;
+        }
+        match conn.get_bytecodes(type_id, m.method_id).await {
+            Ok(running) => {
+                report.compared += 1;
+                if running != file.code {
+                    report.differing.push(format!(
+                        "{}{} — {}",
+                        m.name,
+                        m.signature,
+                        first_code_difference(&running, &file.code)
+                    ));
+                }
+            }
+            // An abstract or native method has no code to fetch. Not drift, and not comparable.
+            Err(jdwp_client::JdwpError::JdwpErrorCode(code, _))
+                if code == jdwp_client::protocol::ERR_ABSENT_INFORMATION =>
+            {
+                report.skipped += 1;
+            }
+            Err(e) => return Err(format!("Failed to read the bytecode of {}: {e}", m.name)),
+        }
+    }
+    Ok(report)
+}
+
+/// Describe where two code arrays first disagree, in the terms a caller acts on.
+///
+/// A differing length is reported as such rather than as a byte offset: "your build is 4 bytes longer" is
+/// a fact about the edit, while "differs at byte 12" on arrays of different lengths invites the reader to
+/// think the rest matched.
+fn first_code_difference(running: &[u8], built: &[u8]) -> String {
+    if let Some((at, (r, b))) = running.iter().zip(built.iter()).enumerate().find(|(_, (a, b))| a != b) {
+        return format!(
+            "code differs at bytecode index {at} (the JVM has 0x{r:02x}, your build has 0x{b:02x})"
+        );
+    }
+    if running.len() == built.len() {
+        return "code is identical".to_string();
+    }
+    format!(
+        "code is identical for the first {} byte(s), then the JVM has {} and your build has {}",
+        running.len().min(built.len()),
+        running.len(),
+        built.len(),
+    )
+}
+
 /// Compare the running line tables against the compiled ones, method by method.
 ///
 /// Pure, and separate from both the JDWP reads and the rendering, because this is where the answer is
@@ -4620,56 +4744,13 @@ fn first_difference(jvm: &MethodLines, file: &MethodLines) -> String {
     )
 }
 
-/// Render a staleness verdict.
+/// The line-table findings of a staleness reply: the drifting methods, the two shape differences, and
+/// what could not be compared.
 ///
-/// Three obligations, in order of how easily each is got wrong:
-/// - **The clean case must be quiet and unambiguous.** A detector that hedges on a matching build is one
-///   nobody reads twice.
-/// - **The claim must be the one that was actually checked.** Line tables catch moved lines; they cannot
-///   see an edit that moves none, and saying "identical" would be a stronger claim than the evidence.
-/// - **"Nothing was comparable" is not "nothing drifted".** A `-g:none` build has no line tables at all,
-///   and reporting that as a match would be the worst possible answer.
-fn render_stale_report(
-    class_name: &str,
-    path: &std::path::Path,
-    report: &StaleReport,
-    limit: usize,
-    packets: u32,
-) -> String {
-    let comparable = report.matched + report.differing.len();
+/// Extracted alongside `render_bytecode_section` for the same reason — the reply is three self-contained
+/// sections and one summary, and keeping them in one function put it past the length gate.
+fn render_line_table_section(report: &StaleReport, limit: usize) -> String {
     let mut out = String::new();
-    if comparable == 0 && !report.is_stale() {
-        let _ = writeln!(
-            out,
-            "⚠ Cannot tell: {class_name} and {} have no line tables to compare ({} method(s) skipped). \
-             That is what a build compiled with javac -g:none looks like, and it is also what an \
-             interface or a class of abstract/native methods looks like. This is NOT a report that the \
-             build matches.",
-            path.display(),
-            report.skipped,
-        );
-        return out;
-    }
-
-    if report.is_stale() {
-        let _ = writeln!(
-            out,
-            "🚨 STALE: the JVM is NOT running the build in {}.\n   {} of {} comparable method(s) match; \
-             {} differ.",
-            path.display(),
-            report.matched,
-            comparable,
-            report.differing.len(),
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "✅ {class_name} matches your build: all {comparable} comparable method(s) have identical \
-             line tables to {}.",
-            path.display(),
-        );
-    }
-
     for line in report.differing.iter().take(limit) {
         let _ = writeln!(out, "   ✗ {line}");
     }
@@ -4704,13 +4785,167 @@ fn render_stale_report(
             report.skipped
         );
     }
-    let _ = writeln!(
-        out,
-        "   Basis: per-method line tables, {packets} JDWP packet(s). This catches an edit that MOVED a \
-         line, which is what makes a stop point at :N mean something else. An edit that changes a body \
-         without moving any line is invisible to it, so a clean result means \"no line moved\", not \
-         \"byte-for-byte identical\".",
-    );
+    out
+}
+
+/// DISC-9: the bytecode half of a staleness reply.
+///
+/// Extracted from `render_stale_report` because adding it pushed that function past both the line and the
+/// cyclomatic-complexity gates — and because the bytecode findings are a self-contained section: they are
+/// either absent, unavailable, or a list with its own notes.
+fn render_bytecode_section(report: &StaleReport, limit: usize) -> String {
+    let mut out = String::new();
+    // DISC-9: the bytecode findings, and then a basis line that names the evidence actually used. A
+    // reader has to be able to tell which comparison spoke, because they answer differently: a method can
+    // match on lines and differ on code, and that pairing is the whole reason this evidence exists.
+    let Some(b) = &report.bytecode else { return out };
+    {
+        if b.unavailable {
+            let _ = writeln!(
+                out,
+                "   ⚠ bytecode NOT compared: this JVM reports canGetBytecodes=false, so that evidence is \
+                 unavailable here. The line-table result above stands on its own; it is not confirmed by \
+                 the code."
+            );
+        } else {
+            for line in b.differing.iter().take(limit) {
+                let _ = writeln!(out, "   ✗ {line}");
+            }
+            if b.differing.len() > limit {
+                let _ = writeln!(
+                    out,
+                    "   … +{} more method(s) differing in bytecode (raise limit)",
+                    b.differing.len() - limit
+                );
+            }
+            if !b.differing.is_empty() && report.differing.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "   NOTE: the line tables MATCH and the bytecode does not — an edit that changed a \
+                     body without moving a line, which is what bytecode:true exists to catch. One other \
+                     thing produces this: a build compiled by a different javac than the deployed one, \
+                     since constant-pool indices live in the operands. Same compiler and same source is \
+                     byte-identical."
+                );
+            }
+            if b.skipped > 0 {
+                let _ = writeln!(
+                    out,
+                    "   {} method(s) had no code on one side or the other (abstract or native) and their \
+                     bytecode was not compared.",
+                    b.skipped
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Render a staleness verdict.
+///
+/// Three obligations, in order of how easily each is got wrong:
+/// - **The clean case must be quiet and unambiguous.** A detector that hedges on a matching build is one
+///   nobody reads twice.
+/// - **The claim must be the one that was actually checked.** Line tables catch moved lines; they cannot
+///   see an edit that moves none, and saying "identical" would be a stronger claim than the evidence.
+/// - **"Nothing was comparable" is not "nothing drifted".** A `-g:none` build has no line tables at all,
+///   and reporting that as a match would be the worst possible answer.
+fn render_stale_report(
+    class_name: &str,
+    path: &std::path::Path,
+    report: &StaleReport,
+    limit: usize,
+    packets: u32,
+) -> String {
+    let comparable = report.matched + report.differing.len();
+    let bytecode_compared = report.bytecode.as_ref().map_or(0, |b| b.compared);
+    let mut out = String::new();
+    // DISC-9: "no line tables" is only "cannot tell" while nothing else answered. A `-g:none` build has
+    // code and no lines, which is exactly the case bytecode comparison exists for — reporting it as
+    // unknowable after successfully comparing the code would throw away the answer.
+    if comparable == 0 && bytecode_compared == 0 && !report.is_stale() {
+        let _ = writeln!(
+            out,
+            "⚠ Cannot tell: {class_name} and {} have no line tables to compare ({} method(s) skipped). \
+             That is what a build compiled with javac -g:none looks like, and it is also what an \
+             interface or a class of abstract/native methods looks like. This is NOT a report that the \
+             build matches.{}",
+            path.display(),
+            report.skipped,
+            if report.bytecode.is_some() {
+                ""
+            } else {
+                " Pass bytecode:true to compare the code itself, which a -g:none build still has."
+            },
+        );
+        return out;
+    }
+
+    if report.is_stale() {
+        let _ = writeln!(
+            out,
+            "🚨 STALE: the JVM is NOT running the build in {}.\n   {} of {} comparable method(s) match; \
+             {} differ.",
+            path.display(),
+            report.matched,
+            comparable,
+            report.differing.len(),
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "✅ {class_name} matches your build: all {comparable} comparable method(s) have identical \
+             line tables to {}{}.",
+            path.display(),
+            if bytecode_compared > 0 {
+                format!(", and all {bytecode_compared} have identical bytecode")
+            } else {
+                String::new()
+            },
+        );
+    }
+
+    out.push_str(&render_line_table_section(report, limit));
+    out.push_str(&render_bytecode_section(report, limit));
+    let basis = match &report.bytecode {
+        Some(b) if !b.unavailable => format!(
+            "per-method line tables AND bytecode ({comparable} line-comparable, {} code-comparable)",
+            b.compared
+        ),
+        _ => format!("per-method line tables only ({comparable} comparable)"),
+    };
+    let _ = writeln!(out, "   Basis: {basis}, {packets} JDWP packet(s).");
+    if let Some(b) = report.bytecode.as_ref().filter(|b| !b.unavailable) {
+        // Four combinations, and three of them mean something a reader would otherwise have to infer.
+        let lines_differ = !report.differing.is_empty();
+        let code_differs = !b.differing.is_empty();
+        let _ = writeln!(
+            out,
+            "   {}",
+            match (lines_differ, code_differs) {
+                (false, false) =>
+                    "Both evidences agree: identical line tables AND identical bytecode. That is the \
+                     strongest answer this tool can give.",
+                (true, true) => "Both evidences agree: the build on disk is not what the JVM is running.",
+                (false, true) =>
+                    "The two evidences disagree, and the bytecode is the one to believe — see the note \
+                     above.",
+                (true, false) =>
+                    "Lines moved but the bytecode is IDENTICAL. That is a source edit which changed no \
+                     code — a comment, a blank line, a reformat. Behaviour is the same; only line \
+                     numbers shifted, so a stop point at :N lands somewhere else while the program does \
+                     not differ.",
+            }
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "   This catches an edit that MOVED a line, which is what makes a stop point at :N mean \
+             something else. An edit that changes a body without moving any line is invisible to it, so a \
+             clean result means \"no line moved\", not \"byte-for-byte identical\" — pass bytecode:true \
+             for that, at one more JDWP packet per method."
+        );
+    }
     if report.is_stale() {
         out.push_str(
             "   Next: debug.reload_class installs the build you just compared against, if the drift is \
@@ -11367,6 +11602,7 @@ mod tests {
             name: name.to_string(),
             descriptor: "(Ljava/lang/String;)I".to_string(),
             lines: lines.to_vec(),
+            code: Vec::new(),
             has_code: true,
             has_line_table: !lines.is_empty(),
         }
@@ -11418,6 +11654,126 @@ mod tests {
         assert_eq!(caveat(&jvm_method(&[(0, 10)], true), vec![built_method("save", &[])]), None);
         // Nothing on either side.
         assert_eq!(caveat(&jvm_method(&[], false), vec![built_method("save", &[])]), None);
+    }
+
+    // DISC-9: the byte-level difference has to be actionable, and a length change must not read as
+    // "differs at byte N" with the rest implied to match.
+    #[test]
+    fn a_code_difference_names_the_index_or_the_length() {
+        assert_eq!(first_code_difference(&[0x03, 0x2a], &[0x03, 0x2a]), "code is identical");
+
+        let at = first_code_difference(&[0x03, 0x04], &[0x03, 0x05]);
+        assert!(at.contains("bytecode index 1"), "{at}");
+        assert!(at.contains("0x04") && at.contains("0x05"), "must show both opcodes: {at}");
+
+        // A same-length one-token edit is the whole point of this evidence: `iconst_1` -> `iconst_2`.
+        let token = first_code_difference(&[0x04, 0xac], &[0x05, 0xac]);
+        assert!(token.contains("bytecode index 0"), "{token}");
+
+        let longer = first_code_difference(&[0x03, 0x2a, 0xb1], &[0x03, 0x2a]);
+        assert!(longer.contains("first 2 byte(s)"), "{longer}");
+        assert!(longer.contains(" 3 ") && longer.contains(" 2"), "must give both lengths: {longer}");
+    }
+
+    fn stale_report_with(
+        line_differing: &[&str],
+        bytecode: Option<BytecodeReport>,
+        matched: usize,
+    ) -> StaleReport {
+        StaleReport {
+            matched,
+            differing: line_differing.iter().map(|s| (*s).to_string()).collect(),
+            only_in_jvm: Vec::new(),
+            only_in_build: Vec::new(),
+            skipped: 0,
+            bytecode,
+        }
+    }
+
+    fn bc(differing: &[&str], compared: usize) -> BytecodeReport {
+        BytecodeReport {
+            differing: differing.iter().map(|s| (*s).to_string()).collect(),
+            compared,
+            skipped: 0,
+            unavailable: false,
+        }
+    }
+
+    fn render(report: &StaleReport) -> String {
+        render_stale_report("com.acme.A", std::path::Path::new("/build/A.class"), report, 10, 7)
+    }
+
+    // The four combinations of the two evidences. Three of them mean something a reader would otherwise
+    // have to infer, and the last one is the reason this evidence was added at all.
+    #[test]
+    fn the_two_evidences_are_reported_as_agreeing_or_disagreeing() {
+        let both_clean = render(&stale_report_with(&[], Some(bc(&[], 4)), 4));
+        assert!(both_clean.contains("Both evidences agree"), "{both_clean}");
+        assert!(both_clean.contains("strongest answer"), "{both_clean}");
+        assert!(both_clean.contains("identical bytecode"), "the clean line must say so:\n{both_clean}");
+
+        let both_stale = render(&stale_report_with(&["save() — moved"], Some(bc(&["save() — code"], 4)), 3));
+        assert!(both_stale.contains("Both evidences agree"), "{both_stale}");
+        assert!(both_stale.contains("not what the JVM is running"), "{both_stale}");
+
+        // Lines match, code differs: the case bytecode:true exists for.
+        let code_only = render(&stale_report_with(&[], Some(bc(&["save() — code"], 4)), 4));
+        assert!(code_only.contains("bytecode is the one to believe"), "{code_only}");
+        assert!(code_only.contains("different javac"), "must own the one way it can mislead:\n{code_only}");
+        assert!(code_only.contains("🚨 STALE"), "a code-only difference is still stale:\n{code_only}");
+
+        // Lines moved, code identical: a comment or reformat. Behaviour is the same and saying otherwise
+        // would send a reader hunting a behavioural change that does not exist.
+        let lines_only = render(&stale_report_with(&["save() — moved"], Some(bc(&[], 4)), 3));
+        assert!(lines_only.contains("bytecode is IDENTICAL"), "{lines_only}");
+        assert!(lines_only.contains("comment"), "{lines_only}");
+    }
+
+    // A JVM that cannot answer must not have its silence read as agreement.
+    #[test]
+    fn an_unavailable_bytecode_capability_is_reported_as_unavailable() {
+        let b = BytecodeReport { unavailable: true, ..Default::default() };
+        let out = render(&stale_report_with(&[], Some(b), 4));
+
+        assert!(out.contains("canGetBytecodes=false"), "{out}");
+        assert!(out.contains("not confirmed by the code"), "{out}");
+        assert!(!out.contains("Both evidences agree"), "unavailable is not agreement:\n{out}");
+        assert!(out.contains("line tables only"), "the basis must not claim bytecode:\n{out}");
+    }
+
+    // Without the flag, the reply must keep pointing at what it did not check — the DISC-8 discipline
+    // applied to this tool's own blind spot.
+    #[test]
+    fn a_line_table_only_run_says_what_it_did_not_compare() {
+        let out = render(&stale_report_with(&[], None, 4));
+
+        assert!(out.contains("line tables only"), "{out}");
+        assert!(out.contains("no line moved"), "{out}");
+        assert!(out.contains("bytecode:true"), "must name the flag that closes the gap:\n{out}");
+    }
+
+    // -g:none: no line tables anywhere, which was "cannot tell" before this evidence existed. Having
+    // compared the code, reporting it as unknowable would throw the answer away.
+    #[test]
+    fn a_class_with_no_line_tables_is_answered_by_bytecode_alone() {
+        let stripped = StaleReport {
+            matched: 0,
+            differing: Vec::new(),
+            only_in_jvm: Vec::new(),
+            only_in_build: Vec::new(),
+            skipped: 6,
+            bytecode: Some(bc(&[], 6)),
+        };
+
+        let out = render(&stripped);
+
+        assert!(!out.contains("Cannot tell"), "bytecode answered; this is not unknowable:\n{out}");
+        assert!(out.contains("identical bytecode"), "{out}");
+
+        // And the same class with no bytecode evidence still says it cannot tell, now naming the way out.
+        let no_evidence = render(&StaleReport { skipped: 6, ..Default::default() });
+        assert!(no_evidence.contains("Cannot tell"), "{no_evidence}");
+        assert!(no_evidence.contains("bytecode:true"), "{no_evidence}");
     }
 
     fn redefinition(count: u32, popped_since: bool) -> crate::session::Redefinition {
@@ -12012,6 +12368,7 @@ mod tests {
             lines: vec![(0, 39), (2, 40)],
             has_code: true,
             has_line_table: true,
+            code: Vec::new(),
         }];
 
         let report = compare_line_tables(&running, &built);
@@ -12039,6 +12396,7 @@ mod tests {
             lines: vec![(0, 41)],
             has_code: true,
             has_line_table: true,
+            code: Vec::new(),
         }];
 
         let report = compare_line_tables(&running, &built);
@@ -12066,6 +12424,7 @@ mod tests {
             lines: vec![(0, 5)],
             has_code: true,
             has_line_table: true,
+            code: Vec::new(),
         }];
 
         let report = compare_line_tables(&running, &built);
@@ -12093,6 +12452,7 @@ mod tests {
             lines: Vec::new(),
             has_code: true,
             has_line_table: false,
+            code: Vec::new(),
         }];
 
         let report = compare_line_tables(&running, &built);
@@ -12118,6 +12478,7 @@ mod tests {
             lines: vec![(0, 39)],
             has_code: true,
             has_line_table: true,
+            code: Vec::new(),
         }];
         let asymmetric = compare_line_tables(&stripped_jvm, &with_lines);
         assert!(

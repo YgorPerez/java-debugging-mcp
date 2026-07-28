@@ -66,6 +66,46 @@ impl JdwpConnection {
         Ok(LineTable { start, end, lines })
     }
 
+    /// A method's bytecode, exactly as the JVM holds it (`Method.Bytecodes`, command 3).
+    ///
+    /// The evidence a line table cannot give (DISC-9, #63): an edit that changes a method's code without
+    /// moving any line — `<` to `<=`, a changed constant, a swapped operator — leaves the line table
+    /// identical and the code array different. That is also the commonest edit in a redeploy loop, so it
+    /// is the case a line-table comparison is quietest about.
+    ///
+    /// Gated on `canGetBytecodes` (see [`VmCapabilities`](crate::VmCapabilities)); a JVM without it
+    /// answers `NOT_IMPLEMENTED`, which is worth reporting as "cannot tell" rather than as a match. An
+    /// abstract or native method has no code and answers `ABSENT_INFORMATION` for the same reason.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn get_bytecodes(
+        &mut self,
+        ref_type_id: ReferenceTypeId,
+        method_id: MethodId,
+    ) -> JdwpResult<Vec<u8>> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::METHOD, method_commands::BYTECODES);
+
+        packet.data.put_u64(ref_type_id);
+        packet.data.put_u64(method_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let count = read_i32(&mut data)?;
+        let count = usize::try_from(count).unwrap_or(0);
+        // Read against what the reply actually holds rather than trusting the count, which is the same
+        // rule `read_string` follows for a lying length: a truncated reply must error, not over-read.
+        data.get(..count).map(<[u8]>::to_vec).ok_or_else(|| {
+            crate::protocol::JdwpError::Protocol(format!(
+                "Method.Bytecodes claimed {count} byte(s) but the reply holds {}",
+                data.len()
+            ))
+        })
+    }
+
     /// Get variable table for a method (Method.VariableTable command)
     /// Returns info about local variables (names, types, slots)
     ///

@@ -6170,6 +6170,95 @@ fn swap_probe_returning(jdk: &Jdk, value: i32) -> tempfile::TempDir {
     dir
 }
 
+/// DISC-9 (#63): the edit a line-table comparison cannot see, and bytecode can.
+///
+/// `int v = 1;` to `int v = 2;` is `iconst_1` to `iconst_2` — one byte, same length, same line, so the
+/// line table is **identical** and `check_stale`'s default answer is a clean "no line moved". That is not
+/// an exotic case: a changed constant, a flipped comparison, a swapped operator are what you actually
+/// iterate on in a compile-and-retest loop, so the cheaper evidence is quietest exactly where the loop
+/// lives.
+///
+/// Both halves are asserted in one test on purpose — the claim is a *contrast* between the two evidences
+/// on one build, and splitting it across two tests would let either half drift without the pairing failing.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn bytecode_catches_a_same_line_edit_that_the_line_table_calls_clean() {
+    let Some(jdk) = jdk_or_skip("bytecode_catches_a_same_line_edit_that_the_line_table_calls_clean") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // The JVM is running `v = 1`; the build on disk says `v = 2`. Nothing else differs.
+    let edited = swap_probe_returning(&jdk, 2);
+    let root = edited.path().display().to_string();
+    let args = serde_json::json!({"class_name": "SwapProbe", "class_roots": [root]});
+
+    let lines_only = server.call("debug.check_stale", args.clone());
+    assert!(
+        !lines_only.contains("🚨 STALE"),
+        "the premise of this test is that line tables MISS this edit; if they now catch it, the test is \
+         no longer testing anything:\n{lines_only}"
+    );
+    assert_contains_all(
+        "the default answer bounds its own claim",
+        &lines_only,
+        &["no line moved", "bytecode:true"],
+    );
+
+    let mut with_bytecode = args;
+    with_bytecode["bytecode"] = serde_json::json!(true);
+    let both = server.call("debug.check_stale", with_bytecode);
+
+    assert_contains_all(
+        "bytecode catches what the line table could not",
+        &both,
+        &["🚨 STALE", "bytecode index", "bytecode is the one to believe", "different javac"],
+    );
+    // The cost claim is part of the interface, so the reply has to carry it.
+    assert!(both.contains("JDWP packet(s)"), "the reply must report what it spent:\n{both}");
+}
+
+/// The control for the above: with `bytecode:true` on a build that IS running, both evidences must agree
+/// and neither may cry stale. A false positive here would be worse than the blind spot it replaces.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn bytecode_comparison_does_not_cry_stale_on_the_running_build() {
+    let Some(jdk) = jdk_or_skip("bytecode_comparison_does_not_cry_stale_on_the_running_build") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // The running source, recompiled by the same javac. A comment-only edit moves no line and changes no
+    // byte, so both evidences must come back clean.
+    let current = tempfile::tempdir().expect("tempdir");
+    jdk.compile_probe_variant("SwapProbe", current.path(), |src| {
+        src.replace("// SWAP_VALUE", "// SWAP_VALUE (control build)")
+    })
+    .expect("recompile the unmodified probe");
+
+    let out = server.call(
+        "debug.check_stale",
+        serde_json::json!({
+            "class_name": "SwapProbe",
+            "class_roots": [current.path().display().to_string()],
+            "bytecode": true,
+        }),
+    );
+
+    assert!(!out.contains("STALE"), "false positive with bytecode comparison on a current build:\n{out}");
+    assert_contains_all(
+        "both evidences answer, and agree",
+        &out,
+        &["Both evidences agree", "identical bytecode", "strongest answer"],
+    );
+}
+
 /// Compile `SwapProbe` with two lines inserted above `answer()`, which moves every line number in it
 /// without changing the class's shape. The same edit `a_stale_build_is_detected_and_a_current_one_is_not`
 /// uses, because it is the drift `debug.source` cannot see: same class, same file name, older bytecode.

@@ -778,6 +778,17 @@ pub struct CheckStaleArgs {
     /// Max drifting methods to name; the rest are reported as a count.
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// Also compare each method's **bytecode**, not just its line table (DISC-9).
+    ///
+    /// Off by default because it doubles the JDWP cost — one `Method.Bytecodes` per method on top of the
+    /// one `Method.LineTable` — and the line table already catches the edit that hurts most, a moved
+    /// line. Turn it on for the edit the line table cannot see at all: one that changes a body without
+    /// moving any line (`<` to `<=`, a changed constant, a swapped operator), which is also the
+    /// commonest edit in a compile-and-retest loop.
+    ///
+    /// It is the only evidence that works on a `-g:none` build, which has code and no line numbers.
+    #[serde(default)]
+    pub bytecode: bool,
 }
 
 /// Arguments for `debug.pop_frame` (SWAP-1).

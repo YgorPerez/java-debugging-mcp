@@ -58,7 +58,9 @@ natural language.
   debugging the *program* while the deployed bytecode is last week's. With a class root configured,
   `debug.set_line_stop` also reports it **unasked** when the method you just armed has drifted (DISC-8),
   since the caller this ruins is the one who never thought to check; it speaks only when it has a proof,
-  so a quiet reply is not a promise that your build is current
+  so a quiet reply is not a promise that your build is current. `bytecode:true` adds the evidence line
+  tables cannot give (DISC-9) — a body edit that moved no line, like `x < 5` to `x <= 5` — and is the only
+  one that answers at all on a `-g:none` build
 - **Thread Management**: tools default to the last thread that hit a breakpoint
 - **Thread dumps with lock ownership**: `debug.thread_dump` answers "it's wedged — which threads are
   blocked on what?" in one call: every thread's stack, the monitors it holds, the one it is blocked

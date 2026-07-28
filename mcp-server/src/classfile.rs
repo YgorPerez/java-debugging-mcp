@@ -34,6 +34,12 @@ pub struct ClassFileMethod {
     /// Whether the `Code` attribute carried a `LineNumberTable`. A method compiled `-g:none` has code
     /// and no lines, which is a third state and not the same as either of the above.
     pub has_line_table: bool,
+    /// The method's bytecode, for comparison against `Method.Bytecodes` (DISC-9, #63). Empty when the
+    /// method has no `Code` attribute at all.
+    ///
+    /// This is the evidence that survives `-g:none`: a stripped build has code and no lines, so it is
+    /// exactly where a line-table comparison must answer "cannot tell" and this one can answer.
+    pub code: Vec<u8>,
 }
 
 /// The parts of a `.class` file the staleness check compares.
@@ -225,28 +231,41 @@ fn parse_one_method(c: &mut Cursor, pool: &[Constant]) -> Result<ClassFileMethod
     let mut lines = Vec::new();
     let mut has_code = false;
     let mut has_line_table = false;
+    let mut code = Vec::new();
     for _ in 0..attrs {
         let attr_name = utf8(pool, c.u16()?)?;
         let len = c.u32()? as usize;
         if attr_name == "Code" {
             has_code = true;
             let body = c.take(len)?;
-            let (found, present) = parse_code_line_table(body, pool)?;
-            has_line_table = present;
-            lines = found;
+            let attr = parse_code_body(body, pool)?;
+            has_line_table = attr.has_line_table;
+            lines = attr.lines;
+            code = attr.code;
         } else {
             c.skip(len)?;
         }
     }
-    Ok(ClassFileMethod { name, descriptor, lines, has_code, has_line_table })
+    Ok(ClassFileMethod { name, descriptor, lines, has_code, has_line_table, code })
 }
 
-/// Pull the `LineNumberTable` out of a `Code` attribute's body, if it has one.
-fn parse_code_line_table(body: &[u8], pool: &[Constant]) -> Result<(Vec<(u64, i32)>, bool), String> {
+/// What a `Code` attribute yields to the staleness comparison.
+struct CodeAttribute {
+    lines: Vec<(u64, i32)>,
+    /// Whether a `LineNumberTable` was present at all — `-g:none` has code and no lines, a third state.
+    has_line_table: bool,
+    code: Vec<u8>,
+}
+
+/// Pull the bytecode and the `LineNumberTable` out of a `Code` attribute's body.
+///
+/// The code array was already being measured in order to skip past it, so keeping it costs one copy and
+/// no extra parsing (DISC-9).
+fn parse_code_body(body: &[u8], pool: &[Constant]) -> Result<CodeAttribute, String> {
     let mut c = Cursor::new(body);
     c.skip(4)?; // max_stack, max_locals
     let code_len = c.u32()? as usize;
-    c.skip(code_len)?;
+    let code = c.take(code_len)?.to_vec();
     let exceptions = c.u16()? as usize;
     c.skip(exceptions * 8)?;
 
@@ -255,11 +274,12 @@ fn parse_code_line_table(body: &[u8], pool: &[Constant]) -> Result<(Vec<(u64, i3
         let name = utf8(pool, c.u16()?)?;
         let len = c.u32()? as usize;
         if name == "LineNumberTable" {
-            return Ok((read_line_number_table(c.take(len)?)?, true));
+            let lines = read_line_number_table(c.take(len)?)?;
+            return Ok(CodeAttribute { lines, has_line_table: true, code });
         }
         c.skip(len)?;
     }
-    Ok((Vec::new(), false))
+    Ok(CodeAttribute { lines: Vec::new(), has_line_table: false, code })
 }
 
 /// The `(start_pc, line)` pairs inside a `LineNumberTable` attribute's body.
