@@ -21,8 +21,8 @@ mod common;
 
 use common::cassette::{cassette_path, rerecording, Cassette, CassetteRecorder, ReplayServer, RERECORD_ENV};
 use common::{
-    assert_contains_all, jdk_or_skip, probe_line, probe_source, probe_source_path, Fault, FaultRelay, Jdk,
-    LatencyRelay, Probe, Server, EVENT_TIMEOUT,
+    assert_contains_all, jdk_or_skip, probe_line, probe_source, probe_source_path, resume_verdict, Fault,
+    FaultRelay, Jdk, LatencyRelay, Probe, Server, EVENT_TIMEOUT,
 };
 
 /// EVAL-1 / EVAL-2: static-method invocation and object arguments, through the real handlers.
@@ -476,13 +476,7 @@ fn force_return_changes_what_the_caller_receives() {
              recent output: {:?}",
             probe.output().iter().rev().take(8).collect::<Vec<_>>(),
             delta = printed_after - printed_before,
-            verdict = if printed_after == printed_before {
-                "it never ran again — read this as a resume/liveness failure (or a dead probe), NOT as \
-                 force_return returning the wrong value"
-            } else {
-                "it DID run and still never produced the forced value — force_return reported success \
-                 without changing what the caller received, which is exactly what this test exists to catch"
-            },
+            verdict = resume_verdict(printed_before, printed_after),
         );
     }
 
@@ -924,7 +918,7 @@ fn traced_exception_breakpoints_record_throws_without_suspending() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn traced_watchpoints_record_writes_without_suspending() {
     let Some(jdk) = jdk_or_skip("traced_watchpoints_record_writes_without_suspending") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start().expect("start server");
     // `probe.attach(&mut server)` rather than `server.attach(probe.port)`: this is one of the two tests
     // that has been seen failing at attach with `Connection refused` (TEST-21, #56), and the difference
@@ -2323,8 +2317,12 @@ fn events_are_buffered_so_a_second_hit_doesnt_erase_the_first() {
 
     // A bare call still means "the newest event", as it always did — plus a note that there is more.
     let latest = server.last_event();
+    // TEST-23 (#64): this assertion failed in CI reporting `[pending] 2 older event(s)` where it staged
+    // one, and a *count* is not a diagnosis — three events existed and nothing said what the third was.
+    // The whole buffer is read here (no `drain`, so it changes nothing) purely so the failure names it.
+    let buffered = server.call("debug.get_last_event", serde_json::json!({"limit": 10}));
     assert_contains_all(
-        "newest event, and the backlog is announced",
+        &format!("newest event, and the backlog is announced\nthe whole buffer was:\n{buffered}"),
         &latest,
         &["\"event\":\"step\"", "[pending] 1 older event"],
     );
@@ -3770,7 +3768,7 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
     // The watchdog must be ON for its own case and OFF for the others — otherwise it would rescue a
     // broken `continue`/`panic` and the test would pass on someone else's work.
     let watchdog = if matches!(resume, Resume::Watchdog) { "1" } else { "0" };
-    let probe = Probe::launch(jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", watchdog)]).expect("start server");
     // The other test seen failing at attach with `Connection refused` (TEST-21, #56) runs through here —
     // `disconnect_is_honest_from_every_suspended_state` is four of these. `probe.attach` captures what
@@ -6891,4 +6889,155 @@ fn a_class_with_no_debug_info_cannot_be_checked_and_says_so() {
         &["Cannot tell", "-g:none", "NOT a report that the build matches"],
     );
     assert!(!verdict.contains("✅"), "a skipped comparison must not read as a pass: {verdict}");
+}
+
+/// TEST-21 ([#56](https://github.com/YgorPerez/java-debugging-mcp/issues/56)), first two acceptance
+/// criteria, for the world where the probe's JVM is **gone**.
+///
+/// This issue has never been reproduced on demand — one occurrence in a 20-run soak, none in 15 CI legs
+/// since. So the failure is *manufactured* instead: kill the JVM and attach to the port it used, which is
+/// the same state a probe that died on its own would leave. What is asserted is not that attach fails —
+/// of course it does — but that the diagnosis **names which world this is**, because
+/// `Connection refused` alone is what made both sightings undiagnosable.
+///
+/// The reply the MCP server gives is byte-identical to the live-session case below
+/// (`Failed to connect: IO error: Connection refused (os error 111)`), and so is "nothing is listening".
+/// The JVM's exit status is the only thing that separates them, which is why it is read at all.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_refused_attach_says_so_when_the_probe_jvm_has_died() {
+    let Some(jdk) = jdk_or_skip("a_refused_attach_says_so_when_the_probe_jvm_has_died") else { return };
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    // Killed *after* a successful launch, so the log carries the banner. That is the point: the banner
+    // proves the port was bound once, so its presence must not be read as "it bound it, therefore a
+    // session holds it" when the JVM behind it has since died.
+    probe.kill_and_wait();
+
+    let mut server = Server::start().expect("start server");
+    let out = server.call("debug.attach", serde_json::json!({"host": "127.0.0.1", "port": probe.port}));
+    assert!(!out.contains("Connected"), "attaching to a dead JVM's port must not succeed: {out}");
+
+    let diagnosis = probe.diagnose_refusal(&out);
+    assert_contains_all(
+        "a refused attach names the dead JVM",
+        &diagnosis,
+        &["THE PROBE JVM IS GONE", "port went with it"],
+    );
+    assert!(
+        !diagnosis.contains("THE PORT WAS NEVER BOUND") && !diagnosis.contains("SESSION IS ALREADY TAKEN"),
+        "a dead JVM must not be reported as a port race — that is the wrong half of the system:\n{diagnosis}"
+    );
+}
+
+/// The same, for the world where a **live handshaked session** already owns the port.
+///
+/// #55 measured that a second connection to a probe with a live session is refused. One step it did not
+/// take: the agent also *stops listening* for that session's life, so this world reports **nothing
+/// listening on the port** — and the first cut of this diagnosis keyed its "the port is taken" branch on
+/// something being listening, which made that branch unreachable for the one mechanism it named. This
+/// test is what caught that, and is why it asserts the verdict rather than the evidence.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_refused_attach_says_the_session_is_taken_when_one_is_already_live() {
+    let Some(jdk) = jdk_or_skip("a_refused_attach_says_the_session_is_taken_when_one_is_already_live") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut holder = Server::start().expect("start the holding server");
+    let held = probe.attach(&mut holder);
+    assert!(held.contains("Connected"), "the first attach must succeed: {held}");
+
+    let mut second = Server::start().expect("start the second server");
+    let out = second.call("debug.attach", serde_json::json!({"host": "127.0.0.1", "port": probe.port}));
+    assert!(!out.contains("Connected"), "a second attach to a held session must not succeed: {out}");
+
+    let diagnosis = probe.diagnose_refusal(&out);
+    assert_contains_all(
+        "a refused attach names the live session",
+        &diagnosis,
+        &["THE SESSION IS ALREADY TAKEN", "closes the listener"],
+    );
+    assert!(
+        !diagnosis.contains("THE PROBE JVM IS GONE") && !diagnosis.contains("THE PORT WAS NEVER BOUND"),
+        "a held session must not be reported as a dead JVM or an unbound port:\n{diagnosis}"
+    );
+}
+
+/// TEST-16 (#45): the two worlds behind *"the caller never observed the forced value"* must not read
+/// alike, because one is a debugger bug and the other is the harness failing to resume the VM.
+///
+/// Needs no JVM: the discriminator is a line count, and that is the whole point — it is cheap enough that
+/// there is no excuse for it having been verified once by hand and never again.
+#[test]
+fn a_missing_forced_value_says_whether_the_debuggee_ran_at_all() {
+    let never_ran = resume_verdict(7, 7);
+    let ran = resume_verdict(7, 9);
+
+    assert!(
+        never_ran.contains("never ran again") && never_ran.contains("NOT as"),
+        "a probe that printed nothing must be reported as a resume failure, and must say plainly that \
+         this is not force_return's doing: {never_ran}"
+    );
+    assert!(
+        ran.contains("DID run") && ran.contains("without changing what the caller received"),
+        "a probe that ran and still did not produce the value is the accusation this test exists to \
+         make, and must be worded as one: {ran}"
+    );
+    // The two verdicts must not be confusable by a reader skimming for a keyword. This is the assertion
+    // that would have caught the shape of bug this repo shipped once already: an aside that was present
+    // in both worlds, asserted on, and therefore load-bearing for nothing.
+    assert_ne!(never_ran, ran);
+    assert!(
+        !never_ran.contains("DID run") && !ran.contains("never ran again"),
+        "the verdicts overlap, so a failure could match both:\n  {never_ran}\n  {ran}"
+    );
+}
+
+/// TEST-24 ([#65](https://github.com/YgorPerez/java-debugging-mcp/issues/65)): a debuggee that dies
+/// mid-session must be reported as a debuggee that died, all the way up to the MCP reply.
+///
+/// The CI sighting was `Failed to list classes: Protocol error: Reply channel closed` — a message four
+/// unrelated worlds produced, with the real `io::Error` logged at a level nothing enabled and then
+/// discarded. `e0db036` fixed that in `jdwp-client`, and its own tests cover the event loop directly. This
+/// covers the part those cannot: that the cause survives the handler, the MCP serialisation and the
+/// transport, and reaches the caller who has to act on it.
+///
+/// Manufactured rather than waited for, because the sighting was one leg in 24 and this is the same state:
+/// the JVM is killed after a successful attach, which is what a probe that dies on its own leaves behind.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_question_asked_after_the_debuggee_dies_names_the_lost_connection() {
+    let Some(jdk) = jdk_or_skip("a_question_asked_after_the_debuggee_dies_names_the_lost_connection") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start().expect("start server");
+    let attached = probe.attach(&mut server);
+    assert!(attached.contains("Connected"), "the session has to exist before it can be lost: {attached}");
+
+    probe.kill_and_wait();
+
+    // Either ordering is fine and both are the same fact: the command may be written before the loop
+    // notices EOF (then the pending reply is answered as the loop exits) or after (then it is refused on
+    // the way in). Retried a few times only because the *first* call is the one that races; a session
+    // whose debuggee is gone cannot recover, so a later call must say the same thing.
+    let mut reply = String::new();
+    for _ in 0..5 {
+        reply = server.call("debug.list_classes", serde_json::json!({"filter": "WatchProbe"}));
+        if reply.contains("closed") || reply.contains("Reply channel") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    assert!(
+        !reply.contains("Reply channel closed"),
+        "the message this issue was filed on is back: it names none of the four worlds that produce it\n  \
+         got: {reply}"
+    );
+    assert_contains_all(
+        "a dead debuggee is reported as one",
+        &reply,
+        &["connection to the debuggee closed", "reading from the debuggee failed"],
+    );
 }

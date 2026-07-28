@@ -1247,30 +1247,116 @@ impl Probe {
     /// which never handshakes costs the agent nothing, so it cannot make a bad situation worse; what it
     /// does do is make the JVM print its `handshake failed` line, which is why the log is captured
     /// *before* the connect and why the message says the last line may be this probe's own doing.
-    pub fn attach(&self, server: &mut Server) -> String {
+    pub fn attach(&mut self, server: &mut Server) -> String {
         let out = server.call("debug.attach", serde_json::json!({"host": "127.0.0.1", "port": self.port}));
         if out.contains("Connected") {
             return out;
         }
+        let diagnosis = self.diagnose_refusal(&out);
+        panic!("{diagnosis}");
+    }
+
+    /// Why an attach to this probe might have failed, as text.
+    ///
+    /// Separate from [`attach`](Self::attach) so the worlds it distinguishes can be *tested* rather than
+    /// hoped for — a diagnosis nobody has exercised is as trustworthy as the `Connection refused` it
+    /// replaces. See the `a_refused_attach_*` tests, which manufacture each world and assert this names
+    /// it. Takes `&mut self` for one reason: [`Child::try_wait`], below.
+    ///
+    /// **Three readings, not two — and the first version of this got the tree backwards.** #56 enumerated
+    /// a live session and [`free_port`]'s race, both of which assume a JVM that is still running. A third
+    /// is at least as likely under CI's parallelism and was not on the list: **the JVM is gone**, because
+    /// its `main` returned, it threw, or something killed it.
+    ///
+    /// What the tree keyed on was whether anything was listening — *"listening ⇒ the port is taken by a
+    /// live handshaked session"*. Measured (`a_refused_attach_*` below), both worlds report **nothing
+    /// listening**, so that branch was unreachable for the mechanism it named. It follows from #55's own
+    /// finding, one step further on than #55 took it: the agent serves one handshaked session at a time and
+    /// **closes its listener for that session's life**. So "nothing listening" is the *expected* signature
+    /// of a live session, not evidence of a failure to bind — and the old wording read it as the latter,
+    /// sending the reader after a bind error while the banner sat in the log contradicting it.
+    ///
+    /// What actually separates them is whether the JVM is still running, and then whether it ever
+    /// announced the port. Both are cheap, and this returns the verdict rather than the tree, because a
+    /// reader who has to evaluate three branches by hand is a reader who will pick the wrong one.
+    pub fn diagnose_refusal(&mut self, out: &str) -> String {
+        // Read before connecting: the connect below makes the agent print its own `handshake failed`
+        // line, and #55 was filed on mistaking exactly that for evidence.
         let log = self.output();
+        let announced = log.iter().any(|l| l.contains("Listening for transport"));
+        let exit = self.child.try_wait();
         let listening = std::net::TcpStream::connect_timeout(
             &std::net::SocketAddr::from(([127, 0, 0, 1], self.port)),
             Duration::from_millis(500),
-        );
-        panic!(
+        )
+        .is_ok();
+
+        let verdict = match (&exit, listening, announced) {
+            (Err(e), _, _) => {
+                format!(
+                    "UNDETERMINED — could not read the JVM's status ({e}); the facts below are all there is."
+                )
+            }
+            (Ok(Some(status)), _, _) => format!(
+                "THE PROBE JVM IS GONE — it exited with {status}, and the port went with it. This is not a \
+                 port race and `free_port` explains none of it; find out why a JVM that had announced \
+                 itself stopped running."
+            ),
+            (_, true, _) => "SOMETHING ELSE HOLDS THE PORT — something is listening, and it is not this \
+                 probe's agent, which stops listening the moment a debugger completes a handshake. A \
+                 stranger won free_port's race after this JVM bound and released it, or never let it bind."
+                .to_string(),
+            (_, false, true) => "THE SESSION IS ALREADY TAKEN — the JVM is alive and its banner names this \
+                 port, so it did bind it. A live handshaked session refuses a second attach *and* closes \
+                 the listener, so \"nothing listening\" is this world's signature rather than a fault. Find \
+                 what is already attached: a leaked session from an earlier test, a `Relay`, or a debugger \
+                 the harness believes it disconnected."
+                .to_string(),
+            (_, false, false) => "THE PORT WAS NEVER BOUND — the JVM is alive but never printed the \
+                 `Listening for transport` banner for this port, which is `free_port`'s documented TOCTOU. \
+                 Its log should carry the bind failure; nothing portable removes this race, so the \
+                 remedy is that this message exists."
+                .to_string(),
+        };
+
+        format!(
             "attach to {} on port {} failed: {out}\n  \
-             Something IS listening on that port: {}\n  \
-             — if yes, the port is taken: either a live handshaked session (which provably refuses a \
-             second attach) or a stranger that won free_port's race.\n  \
-             — if no, this JVM never bound it, and its log should say so.\n  \
+             verdict: {verdict}\n  \
+             the facts it was read from — JVM: {}; listening on the port: {}; announced this port: {}\n  \
              The probe's last 12 lines, as of BEFORE this diagnosis connected to it (#55 made the \
              `Listening for transport … at address:` banner come from this JVM and name this port, so \
              its absence is itself the finding):\n{}",
             self.name,
             self.port,
-            if listening.is_ok() { "yes" } else { "no" },
+            match &exit {
+                Ok(None) => "alive".to_string(),
+                Ok(Some(status)) => format!("exited with {status}"),
+                Err(e) => format!("try_wait failed: {e}"),
+            },
+            if listening { "yes" } else { "no" },
+            if announced { "yes" } else { "no" },
             log.iter().rev().take(12).rev().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n"),
-        );
+        )
+    }
+
+    /// Stop the probe's JVM and wait for it to be gone, so a test can manufacture the "JVM died" world.
+    ///
+    /// Returns once the process has been reaped *and* the port stops accepting, because a killed JVM's
+    /// listener outlives it by a moment and a test that raced that would be the flake it is investigating.
+    pub fn kill_and_wait(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let dialled = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], self.port)),
+                Duration::from_millis(200),
+            );
+            if dialled.is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Every stdout line the probe has printed so far.
@@ -1342,6 +1428,26 @@ fn compile_slow_start(jdk: &Jdk, dir: &Path) -> Result<(), String> {
 /// How much of the server's stderr to keep. Enough to cover the exchange a failure happened during,
 /// bounded because a whole test's worth of `jdwp_mcp=info` is thousands of lines nobody reads.
 const SERVER_LOG_TAIL: usize = 60;
+
+/// Which of two worlds a missing debuggee effect is in, decided by whether the debuggee ran at all.
+///
+/// TEST-16 ([#45](https://github.com/YgorPerez/java-debugging-mcp/issues/45)). *"The caller never observed
+/// the forced value"* reads as an accusation against `debug.force_return`, and **a VM that was never
+/// resumed is silent in exactly the same way** — a debugger bug and a harness bug wearing one message. The
+/// discriminator is the debuggee's own output across the resume: a probe that printed nothing never ran.
+///
+/// Extracted from the assertion it was written inside so it can be *tested*. It was originally verified by
+/// fault injection at a keyboard, which proves it worked once and nothing thereafter — and this repo has
+/// already shipped one bug behind a test that asserted the presence of an aside rather than the verdict.
+pub const fn resume_verdict(printed_before: usize, printed_after: usize) -> &'static str {
+    if printed_after == printed_before {
+        "it never ran again — read this as a resume/liveness failure (or a dead probe), NOT as \
+         force_return returning the wrong value"
+    } else {
+        "it DID run and still never produced the forced value — force_return reported success \
+         without changing what the caller received, which is exactly what this test exists to catch"
+    }
+}
 
 /// Drain a stream for its whole life, keeping only the last `keep` lines.
 ///
