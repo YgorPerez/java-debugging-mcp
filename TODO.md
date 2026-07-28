@@ -1026,8 +1026,12 @@ nothing. Making the failure name its own cause is cheap, always works, and is wh
 by running an arm locally, and that is the cheapest instrument available: the matrix runs three JDK legs per
 push, so ~3 integration legs accumulate per commit at no cost, on hardware and under parallelism no
 developer box reproduces. Both #64 and #65 are version-locked in the way #36 was filed to catch — each
-failed on one JDK while the other two passed the same commit. Read `gh run list --workflow tests` before
-building a soak.
+failed on one JDK while the other two passed the same commit. **Run `scripts/flake-report.sh` before
+building a soak.** It harvests that window, names each failing test with its assertion, maps it to an issue
+or marks it `UNFILED`, and prints the leg count as the denominator — which is the part hand-counting got
+wrong, since every rate in this section needed one and "24 legs" was previously counted by eye. It also
+refuses to count a job that failed while running no tests, which is how an arm once reported eight failures
+that were really its author's own compile errors.
 
 | issue | why it exists | what is actually left |
 | --- | --- | --- |
