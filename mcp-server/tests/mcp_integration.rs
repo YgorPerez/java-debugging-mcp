@@ -21,8 +21,8 @@ mod common;
 
 use common::cassette::{cassette_path, rerecording, Cassette, CassetteRecorder, ReplayServer, RERECORD_ENV};
 use common::{
-    assert_contains_all, jdk_or_skip, probe_line, probe_source, probe_source_path, resume_verdict, Fault,
-    FaultRelay, Jdk, LatencyRelay, Probe, Server, EVENT_TIMEOUT,
+    assert_contains_all, jdk_or_skip, probe_line, probe_source, probe_source_path, refusal_verdict,
+    resume_verdict, EventFault, Fault, FaultRelay, Jdk, JvmState, LatencyRelay, Probe, Server, EVENT_TIMEOUT,
 };
 
 /// EVAL-1 / EVAL-2: static-method invocation and object arguments, through the real handlers.
@@ -7039,5 +7039,154 @@ fn a_question_asked_after_the_debuggee_dies_names_the_lost_connection() {
         "a dead debuggee is reported as one",
         &reply,
         &["connection to the debuggee closed", "reading from the debuggee failed"],
+    );
+}
+
+/// TEST-21 (#56): every world a refused attach can be in, including the two that **no test can build with
+/// a real JVM** — a stranger winning `free_port`'s race, and this JVM losing it.
+///
+/// Those two shipped with no coverage at all, and the first cut of this diagnosis had its tree backwards,
+/// so "it looks right" has already been shown to be worth nothing here. No JVM, no ports, no timing.
+#[test]
+fn every_refused_attach_world_gets_its_own_verdict() {
+    let dead = refusal_verdict(JvmState::Exited("signal: 9 (SIGKILL)".into()), false, true);
+    let taken = refusal_verdict(JvmState::Alive, false, true);
+    let unbound = refusal_verdict(JvmState::Alive, false, false);
+    let stranger = refusal_verdict(JvmState::Alive, true, false);
+    let unknown = refusal_verdict(JvmState::Unknown("no such process".into()), false, false);
+
+    assert!(dead.contains("THE PROBE JVM IS GONE") && dead.contains("signal: 9"), "{dead}");
+    assert!(taken.contains("THE SESSION IS ALREADY TAKEN"), "{taken}");
+    assert!(unbound.contains("THE PORT WAS NEVER BOUND"), "{unbound}");
+    assert!(stranger.contains("SOMETHING ELSE HOLDS THE PORT"), "{stranger}");
+    assert!(unknown.contains("UNDETERMINED") && unknown.contains("no such process"), "{unknown}");
+
+    // A dead JVM outranks every other fact: the port is gone either way, and reporting it as a race sends
+    // the reader to the wrong half of the system. Asserted rather than left to arm order.
+    for (listening, announced) in [(false, false), (false, true), (true, false), (true, true)] {
+        let v = refusal_verdict(JvmState::Exited("exit status: 1".into()), listening, announced);
+        assert!(
+            v.contains("THE PROBE JVM IS GONE"),
+            "a dead JVM must outrank listening={listening}/announced={announced}: {v}"
+        );
+    }
+
+    // The four verdicts must be mutually exclusive, or a reader grepping for one could match another.
+    let all = [&dead, &taken, &unbound, &stranger];
+    let headlines = [
+        "THE PROBE JVM IS GONE",
+        "THE SESSION IS ALREADY TAKEN",
+        "THE PORT WAS NEVER BOUND",
+        "SOMETHING ELSE HOLDS THE PORT",
+    ];
+    for (i, verdict) in all.iter().enumerate() {
+        let matched: Vec<_> = headlines.iter().filter(|h| verdict.contains(**h)).collect();
+        assert_eq!(matched.len(), 1, "verdict {i} matches {matched:?}, so the worlds overlap:\n{verdict}");
+    }
+}
+
+/// TEST-23 ([#64](https://github.com/YgorPerez/java-debugging-mcp/issues/64)): what the event buffer does
+/// when a hit arrives twice — the debugger-side shape of the failure CI caught and this box will not
+/// reproduce.
+///
+/// The sighting was `[pending] 2 older event(s)` where the test staged one, on a JDK this machine does not
+/// have. Rather than soak for it, [`EventFault::Duplicate`] puts the extra event on the wire, which is what
+/// the debugger would see if two armed requests had matched one location. What that pins down is everything
+/// downstream of the extra event: that the buffer keeps both, that the backlog count follows, and that
+/// nothing silently coalesces them — so when the real thing recurs, the reading is about *why a second
+/// event existed* rather than about whether the buffer can be trusted.
+///
+/// It does **not** show that a JVM sends an event twice. See [`EventFault::Duplicate`] for that limit.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_duplicated_hit_is_buffered_twice_rather_than_coalesced() {
+    let Some(jdk) = jdk_or_skip("a_duplicated_hit_is_buffered_twice_rather_than_coalesced") else { return };
+    let probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
+    let relay = FaultRelay::start_with_events(probe.port, vec![], Some(EventFault::Duplicate(1)))
+        .expect("start the fault relay");
+    let mut server = Server::start().expect("start server");
+    server.attach(relay.port);
+
+    let line = probe_line(&probe_source("ExcProbe"), "// BP2");
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "ExcProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in ExcProbe.main never fired");
+
+    // One hit, delivered twice. Both copies must be in the buffer: a debugger that quietly dropped the
+    // second would be *hiding* the anomaly, which is worse than reporting a backlog nobody expected.
+    let buffered = server.call("debug.get_last_event", serde_json::json!({"limit": 10}));
+    let hits = buffered.matches("\"event\":\"breakpoint\"").count();
+    assert_eq!(
+        hits, 2,
+        "the duplicated hit should be buffered twice, not coalesced or dropped — got {hits}:\n{buffered}"
+    );
+
+    // And the newest-event view must announce the backlog rather than pretend there is one event.
+    let latest = server.last_event();
+    assert!(
+        latest.contains("[pending] 1 older event"),
+        "an unread older copy must be announced as pending: {latest}"
+    );
+
+    // Now finish the sequence the flaky test performs, and the result is CI's failure **verbatim**: three
+    // events, newest a step, `[pending] 2 older event(s)` where one was staged. That is the value of this
+    // simulation — the fingerprint is reproducible on demand, so the remaining question for #64 is only
+    // whether a real JVM can deliver a hit twice, and not what such a delivery would look like.
+    server.call("debug.step_over", serde_json::json!({}));
+    server.wait_for_event("\"event\":\"step\"", EVENT_TIMEOUT).expect("step never reported");
+    let after_step = server.last_event();
+    assert_contains_all(
+        "the injected duplicate reproduces the CI fingerprint exactly",
+        &after_step,
+        &["\"event\":\"step\"", "[pending] 2 older event(s)"],
+    );
+}
+
+/// TEST-24 ([#65](https://github.com/YgorPerez/java-debugging-mcp/issues/65)) again, severed at the wire
+/// instead of by killing the JVM.
+///
+/// The kill-based test proves the same message, and this one is the more robust instrument for three
+/// reasons: the connection dies at a moment the test picks rather than whenever a killed process is
+/// reaped; the probe survives, so it can still be questioned afterwards; and it reproduces the shape the
+/// CI sighting actually had — a **connection** that died under a JVM that was very much alive — rather
+/// than a dead process, which is a different world (see `refusal_verdict`).
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_severed_connection_is_reported_as_one_while_the_debuggee_lives_on() {
+    let Some(jdk) = jdk_or_skip("a_severed_connection_is_reported_as_one_while_the_debuggee_lives_on") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let relay = FaultRelay::start(probe.port, vec![]).expect("start the fault relay");
+    let mut server = Server::start().expect("start server");
+    let attached = server.attach(relay.port);
+    assert!(attached.contains("Connected"), "the session has to exist before it can be lost: {attached}");
+
+    relay.sever();
+
+    let mut reply = String::new();
+    for _ in 0..10 {
+        reply = server.call("debug.list_classes", serde_json::json!({"filter": "WatchProbe"}));
+        if reply.contains("closed") || reply.contains("Reply channel") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    assert!(
+        !reply.contains("Reply channel closed"),
+        "the message #65 was filed on is back, naming none of the worlds that produce it: {reply}"
+    );
+    assert_contains_all(
+        "a severed connection is reported as one",
+        &reply,
+        &["connection to the debuggee closed"],
+    );
+    // The JVM was never touched, so it must still be running — otherwise this test is quietly the
+    // kill-based one and proves nothing the other did not.
+    assert!(
+        probe.output().iter().any(|l| l.contains("Listening for transport")),
+        "the probe should still be alive and its log intact"
     );
 }

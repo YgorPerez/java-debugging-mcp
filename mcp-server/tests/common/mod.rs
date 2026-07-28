@@ -604,6 +604,20 @@ impl Relay {
     }
 }
 
+impl Relay {
+    /// Shut down every live socket, ending the copy threads, but leave the relay standing.
+    ///
+    /// The same shutdown [`Drop`] performs, minus the teardown — factored out so a test can sever a
+    /// connection deliberately and still hold the relay (and the probe behind it) to inspect afterwards.
+    fn sever(&self) {
+        if let Ok(v) = self.open.lock() {
+            for s in v.iter() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
 impl Drop for Relay {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -730,6 +744,27 @@ pub enum Fault {
     Payload(Vec<u8>),
 }
 
+/// What a [`FaultRelay`] does to the debuggee's **unprompted** traffic — its composite event packets.
+///
+/// Separate from [`Fault`] because events are keyed by nothing. A reply is identified by the command it
+/// answers; an event answers no question of ours, so there is no `(set, command)` to match on and the
+/// policy has to be positional instead.
+#[derive(Clone, Debug)]
+pub enum EventFault {
+    /// Deliver the first `n` composite event packets **twice**.
+    ///
+    /// This is the debugger-side shape of TEST-23 ([#64](https://github.com/YgorPerez/java-debugging-mcp/issues/64)):
+    /// one breakpoint hit that arrives as two buffered events. A real JVM would produce it by having two
+    /// armed requests match one location — in which case it sends *one* composite carrying two events
+    /// rather than two composites — but the debugger's buffer cannot tell those apart, and duplicating
+    /// whole packets needs no knowledge of the VM's id sizes, which per-event surgery would.
+    ///
+    /// So this reproduces the *observable* faithfully and the *cause* only by analogy, which is the honest
+    /// limit of it: it proves what the buffer and the diagnostics do with an extra event. It does not prove
+    /// a JVM ever sends one.
+    Duplicate(usize),
+}
+
 /// A JDWP proxy that rewrites chosen replies, so the debugger can be driven through failures a healthy
 /// `HotSpot` will not produce on demand.
 ///
@@ -748,8 +783,9 @@ pub enum Fault {
 pub struct FaultRelay {
     /// The port a test attaches to instead of the probe's own.
     pub port: u16,
-    /// Held only so dropping this drops the listener and the sockets with it.
-    _relay: Relay,
+    /// Dropping this drops the listener and the sockets with it — and [`sever`](Self::sever) reaches
+    /// through it to end a live connection without that teardown.
+    relay: Relay,
 }
 
 /// The JDWP handshake both ends send before any packet framing begins.
@@ -765,14 +801,40 @@ impl FaultRelay {
     /// Listen on a fresh port, forwarding to `target_port` and applying `faults` — keyed by
     /// `(command set, command)` — to every reply answering a matching command.
     pub fn start(target_port: u16, faults: Vec<(u8, u8, Fault)>) -> Result<Self, String> {
+        Self::start_with_events(target_port, faults, None)
+    }
+
+    /// As [`start`](Self::start), and additionally apply `on_events` to the debuggee's composite event
+    /// packets — the traffic nobody asked for, which [`Fault`] cannot key on.
+    pub fn start_with_events(
+        target_port: u16,
+        faults: Vec<(u8, u8, Fault)>,
+        on_events: Option<EventFault>,
+    ) -> Result<Self, String> {
         let relay = Relay::start("fault relay", Some(target_port), move |client, server| {
             let Some(server) = server else { return };
             let faults = faults.clone();
+            let on_events = on_events.clone();
+            // Counted across the whole session rather than per packet, so `Duplicate(1)` means "the first
+            // event only" and a test can stage a second, clean event after it.
+            let mut duplicated = 0usize;
             wire_framed(client, server, move |seen| {
-                // Composite events arrive on this side too and are *command* packets (set 64), not
-                // replies; they answer nothing we asked and fall through untouched. Faulting them would
-                // break the event pump rather than test it.
-                let FromDebuggee::Reply { command, reply, .. } = seen else { return None };
+                let (command, reply) = match seen {
+                    // Composite events are *command* packets (set 64) from the debuggee's side. Untouched
+                    // unless a policy asks for them: faulting them blindly breaks the event pump rather
+                    // than testing it.
+                    FromDebuggee::Event(pkt) => {
+                        let Some(EventFault::Duplicate(n)) = on_events else { return None };
+                        if duplicated >= n {
+                            return None;
+                        }
+                        duplicated += 1;
+                        // Two copies in one write. The debugger frames by length, so this is
+                        // indistinguishable from the debuggee having sent the event twice.
+                        return Some([pkt, pkt].concat());
+                    }
+                    FromDebuggee::Reply { command, reply, .. } => (command, reply),
+                };
                 let id = packet_id(reply)?;
                 let fault = faults.iter().find(|(s, c, _)| (*s, *c) == command).map(|(_, _, f)| f)?;
                 Some(match fault {
@@ -781,7 +843,17 @@ impl FaultRelay {
                 })
             });
         })?;
-        Ok(Self { port: relay.port, _relay: relay })
+        Ok(Self { port: relay.port, relay })
+    }
+
+    /// Cut the live connection without tearing the relay down, so the debugger sees the debuggee vanish.
+    ///
+    /// The robust way to manufacture a lost connection: no JVM is killed, so the probe stays available to
+    /// be inspected afterwards, and the debugger's socket dies at a moment the test chooses rather than
+    /// whenever a killed process happens to be reaped. TEST-24
+    /// ([#65](https://github.com/YgorPerez/java-debugging-mcp/issues/65)) is exactly this state.
+    pub fn sever(&self) {
+        self.relay.sever();
     }
 }
 
@@ -1291,33 +1363,15 @@ impl Probe {
         )
         .is_ok();
 
-        let verdict = match (&exit, listening, announced) {
-            (Err(e), _, _) => {
-                format!(
-                    "UNDETERMINED — could not read the JVM's status ({e}); the facts below are all there is."
-                )
-            }
-            (Ok(Some(status)), _, _) => format!(
-                "THE PROBE JVM IS GONE — it exited with {status}, and the port went with it. This is not a \
-                 port race and `free_port` explains none of it; find out why a JVM that had announced \
-                 itself stopped running."
-            ),
-            (_, true, _) => "SOMETHING ELSE HOLDS THE PORT — something is listening, and it is not this \
-                 probe's agent, which stops listening the moment a debugger completes a handshake. A \
-                 stranger won free_port's race after this JVM bound and released it, or never let it bind."
-                .to_string(),
-            (_, false, true) => "THE SESSION IS ALREADY TAKEN — the JVM is alive and its banner names this \
-                 port, so it did bind it. A live handshaked session refuses a second attach *and* closes \
-                 the listener, so \"nothing listening\" is this world's signature rather than a fault. Find \
-                 what is already attached: a leaked session from an earlier test, a `Relay`, or a debugger \
-                 the harness believes it disconnected."
-                .to_string(),
-            (_, false, false) => "THE PORT WAS NEVER BOUND — the JVM is alive but never printed the \
-                 `Listening for transport` banner for this port, which is `free_port`'s documented TOCTOU. \
-                 Its log should carry the bind failure; nothing portable removes this race, so the \
-                 remedy is that this message exists."
-                .to_string(),
-        };
+        let verdict = refusal_verdict(
+            match &exit {
+                Ok(None) => JvmState::Alive,
+                Ok(Some(status)) => JvmState::Exited(status.to_string()),
+                Err(e) => JvmState::Unknown(e.to_string()),
+            },
+            listening,
+            announced,
+        );
 
         format!(
             "attach to {} on port {} failed: {out}\n  \
@@ -1428,6 +1482,56 @@ fn compile_slow_start(jdk: &Jdk, dir: &Path) -> Result<(), String> {
 /// How much of the server's stderr to keep. Enough to cover the exchange a failure happened during,
 /// bounded because a whole test's worth of `jdwp_mcp=info` is thousands of lines nobody reads.
 const SERVER_LOG_TAIL: usize = 60;
+
+/// What [`Probe::diagnose_refusal`] could learn about the probe's process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JvmState {
+    Alive,
+    /// Rendered rather than a `std::process::ExitStatus`, because an `ExitStatus` cannot be constructed
+    /// portably and a verdict that cannot be unit-tested is the thing this refactor exists to prevent.
+    Exited(String),
+    Unknown(String),
+}
+
+/// Which world a refused attach is in, from the three facts that distinguish them.
+///
+/// TEST-21 ([#56](https://github.com/YgorPerez/java-debugging-mcp/issues/56)). Pulled out of
+/// [`Probe::diagnose_refusal`] because **two of these four verdicts could not be reached from any state a
+/// test can build with a real JVM**: a stranger holding the port needs a `free_port` race to be won on
+/// purpose, and a JVM that never bound its port needs the JVM to lose one. Both were shipped unverified,
+/// which is precisely the position the first version of this diagnosis was in when it turned out to have
+/// its decision tree backwards.
+///
+/// The split is deliberate: this decides, and is unit-tested over all four worlds with no JVM at all; the
+/// two `a_refused_attach_*` integration tests prove that a real refusal produces the right *inputs*. A
+/// simulation is only as good as the seam it plugs into, and this is the seam.
+pub fn refusal_verdict(jvm: JvmState, listening: bool, announced: bool) -> String {
+    match (jvm, listening, announced) {
+        (JvmState::Unknown(e), _, _) => {
+            format!("UNDETERMINED — could not read the JVM's status ({e}); the facts below are all there is.")
+        }
+        (JvmState::Exited(status), _, _) => format!(
+            "THE PROBE JVM IS GONE — it exited with {status}, and the port went with it. This is not a \
+             port race and `free_port` explains none of it; find out why a JVM that had announced \
+             itself stopped running."
+        ),
+        (JvmState::Alive, true, _) => "SOMETHING ELSE HOLDS THE PORT — something is listening, and it is \
+             not this probe's agent, which stops listening the moment a debugger completes a handshake. A \
+             stranger won free_port's race after this JVM bound and released it, or never let it bind."
+            .to_string(),
+        (JvmState::Alive, false, true) => "THE SESSION IS ALREADY TAKEN — the JVM is alive and its banner \
+             names this port, so it did bind it. A live handshaked session refuses a second attach *and* \
+             closes the listener, so \"nothing listening\" is this world's signature rather than a fault. \
+             Find what is already attached: a leaked session from an earlier test, a `Relay`, or a \
+             debugger the harness believes it disconnected."
+            .to_string(),
+        (JvmState::Alive, false, false) => "THE PORT WAS NEVER BOUND — the JVM is alive but never printed \
+             the `Listening for transport` banner for this port, which is `free_port`'s documented TOCTOU. \
+             Its log should carry the bind failure; nothing portable removes this race, so the remedy is \
+             that this message exists."
+            .to_string(),
+    }
+}
 
 /// Which of two worlds a missing debuggee effect is in, decided by whether the debuggee ran at all.
 ///
