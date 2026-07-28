@@ -208,14 +208,30 @@ WROTE="$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))[
 step "Committing and tagging"
 
 git add Cargo.toml Cargo.lock
-# No release notes are written here. `gh release create --generate-notes` in the workflow builds them from
-# the commits, and this repo's commit bodies are where the reasoning already lives — a summary retyped by
-# hand at tag time is a second place for it to be wrong. Amend this commit if you want a written rationale
-# (0.4.0's commit body is the precedent).
-git commit --quiet -m "chore(release): $VERSION"
+
+# The subject only. Every release in this repo carries a written rationale in its commit body (0.4.0 is
+# the precedent), but it is prose about what shipped and this script has no way to know that — so it
+# writes the one line it can be sure of and hands the body over below.
+#
+# `-e` opens an editor when there is one, which is the common interactive case. Under a non-interactive
+# shell (`GIT_EDITOR=true`, CI, an agent) that is a no-op and the subject stands, so the script never
+# hangs waiting for input that will not come.
+if [ -t 0 ] && [ -t 1 ]; then
+  git commit --quiet -e -m "chore(release): $VERSION" ||
+    die "the release commit was abandoned. Cargo.toml and Cargo.lock are still bumped and staged;
+       'git checkout -- Cargo.toml Cargo.lock' restores them."
+else
+  git commit --quiet -m "chore(release): $VERSION"
+  echo "    no tty: committed the subject alone. See the note about amending below."
+fi
+
+# Tagged AFTER the commit is final, which is the whole reason the editor opens first. An annotated tag
+# names one commit; amending afterwards rewrites that commit and leaves the tag pointing at an object no
+# longer on the branch — a release that builds from a commit nobody can find. The instructions at the end
+# therefore never suggest amending without re-tagging.
 git tag -a "$TAG" -m "$TAG"
 echo "    $(git log --oneline -1)"
-echo "    tagged $TAG"
+echo "    tagged $TAG -> $(git rev-parse --short "$TAG^{commit}")"
 
 # --- the irreversible step, left to a human ------------------------------------------------------------
 
@@ -236,6 +252,11 @@ cat <<EOF
     To undo before pushing:
 
         git tag -d $TAG && git reset --hard HEAD~1
+
+    To reword the release notes before pushing, RE-TAG afterwards — an annotated tag names one commit,
+    and amending rewrites it, leaving $TAG pointing at an object no longer on the branch:
+
+        git tag -d $TAG && git commit --amend && git tag -a $TAG -m $TAG
 
     Consumers to update after the release publishes:
       - infotravel-dev-toolkit pins JDWP_VERSION in install.sh against the release's own SHA256SUMS
