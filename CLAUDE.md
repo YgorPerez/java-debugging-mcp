@@ -39,3 +39,11 @@ See `docs/agents/triage-labels.md`.
 ### Domain docs
 
 Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Downstream consumer
+
+`infotravel-dev-toolkit` installs this server from a **pinned release** and documents its tools in Claude
+Code skills. Nothing here depends on it and it can never break this CI — but five of its six failure modes
+are silent, so a caller-visible change (a renamed tool or argument, a changed reply, new behaviour behind an
+existing name) has to be stated in the release notes, and a behaviour change has to update the **tool
+description** in the same commit. See `docs/toolkit-contract.md`.

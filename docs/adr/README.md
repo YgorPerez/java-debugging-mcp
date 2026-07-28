@@ -26,6 +26,9 @@ these lazily, when decisions actually get resolved; that point arrived.
 | [0015](0015-a-second-tool-not-a-flag-that-changes-the-subject.md) | A field listing is a second tool, because a flag may not change what the question was |
 | [0016](0016-a-class-root-is-not-a-source-root-and-a-pop-is-not-a-flag.md) | Compiled output gets its own `class_roots`, and `pop_frame` is its own tool rather than a flag on a reload |
 
+The downstream consumer's contract is [`docs/toolkit-contract.md`](../toolkit-contract.md) — what shipping
+a change here costs the toolkit that packages it.
+
 The root [`CONTEXT.md`](../../CONTEXT.md) now exists — the glossary reached the same point these did once
 TRACE-5, DUMP-1 and METH-1 forced `stop point`, `snapshot`, and the `suspended` / `blocked` distinction to be
 pinned down. It is a glossary only; decisions live here.
