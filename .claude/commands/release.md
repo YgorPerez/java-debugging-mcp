@@ -23,9 +23,12 @@ different repo, the part that is this machine, and the traps below, every one of
    re-run the failed jobs — never re-cut the tag.
 4. **`gh issue close` takes `--comment`, not `--body-file`.** With `--body-file` it errors, and in a
    `||`/`&&` chain the close can still happen while the explanation is silently dropped.
-5. **A pushed pin is not an installed pin.** `install.sh` has to be run, and even then it will *not*
-   re-point an already-registered MCP — so a stale binary survives every release until someone looks.
-   Step 8, and it is not optional: v0.6.0 and v0.6.1 both shipped without it.
+5. **A pushed pin is not an installed pin**, and *nothing in `install.sh` fetches the binary any more.*
+   The plugin declares the MCP and a **SessionStart hook** downloads the pin — so after a successful
+   `install.sh` the pin file says the new version while the binary on disk is still the old one, until a
+   session starts. v0.7.0 hit exactly that: pin `v0.7.0`, binary v0.6.1 with 32 tools. Step 8 runs the
+   hook's own script so the release is installed *now*, and checks it by capability. Not optional:
+   v0.6.0 and v0.6.1 both shipped without any of this.
 
 ## 1. Preconditions
 
@@ -149,10 +152,15 @@ Four platform binaries plus `SHA256SUMS`, not a draft. The asset **names** are t
 `docs/jdwp-contract.md` requires the pin bump and the skill audit **in one commit** — documenting a tool
 the pin lacks advertises something nobody can call; bumping without documenting hides what people gained.
 
+**The pin is a file, not a line in `install.sh`.** It moved to `jdwp-version` because two things read it
+now — the installer and the plugin's SessionStart hook — and two copies of a version string was the drift
+that repo kept paying for. A `sed` against `JDWP_VERSION=` in `install.sh` silently matches nothing today;
+that line reads the file.
+
 ```bash
 cd ~/html/infotravel-dev-toolkit
 V=v<version>
-sed -i "s/^JDWP_VERSION=.*/JDWP_VERSION=\"$V\"/" install.sh && bash -n install.sh
+echo "$V" > jdwp-version && bash -n install.sh
 
 # Integrity: the release's own SHA256SUMS is the whole story (their ADR-0001). Never vendor or patch it.
 B=/tmp/jdwp-$V
@@ -177,44 +185,60 @@ commit the installer will not see.
 
 ## 8. Install it, or the release changed nothing on this machine
 
-Bumping the pin is a promise; `install.sh` is what keeps it. Skip this and the pin says one version while the
-`jdwp` tools you and the user actually call are whatever was installed months ago — which is exactly what
-happened after v0.6.0 and v0.6.1: the pin read `v0.6.1` while the registered binary was a pre-0.6 build with
-31 tools and no `debug.evaluate_chain`.
+Bumping the pin is a promise, and **`install.sh` is no longer what keeps it.** Since the plugin migration it
+neither downloads the binary nor registers the MCP: the plugin declares the server
+(`mcp/jdwp.mcp.json`, `command: ${CLAUDE_PLUGIN_DATA}/bin/jdwp-mcp`) and a **SessionStart hook** puts the
+pinned binary at that path — `hooks/hooks.json` diffs `${CLAUDE_PLUGIN_ROOT}/jdwp-version` against
+`${CLAUDE_PLUGIN_DATA}/jdwp-version` and runs `scripts/ensure-jdwp.sh` only when they differ.
+
+So the installer updates the plugin checkout, and that is all it does for jdwp:
 
 ```bash
-cd ~/html/infotravel-dev-toolkit && ./install.sh
+cd ~/html/infotravel-dev-toolkit && ./install.sh    # note the plugin commit it reports
 ```
 
-**Then check the registration, because `install.sh` deliberately will not fix it.** If the `jdwp` MCP is
-already registered it leaves the command alone and only prints a note — correct behaviour (it must not
-hijack a source build), and also how a stale path survives every release you ever cut. It printed this,
-and the note is easy to read past:
-
-```
-jdwp MCP already registered -> /tmp/jdwptest-bin/jdwp-mcp (leaving as-is)
-```
-
-A `/tmp` path is the giveaway — a leftover from testing that also vanishes on reboot. Verify, and re-point
-if it is not the managed binary and the user has not opted into a source build (`IT_JDWP_FROM_SOURCE=1` in
-`~/.config/infotravel-dev.env`; **if they have, leave it and say so** — they develop the debugger):
+**The binary is still the old one at this point.** The hook has not fired — that needs a session start — so
+the pin file reads the new version while `${CLAUDE_PLUGIN_DATA}/bin/jdwp-mcp` is whatever the last pin
+installed. This is the old stale-binary trap wearing new clothes, and it is why "I ran install.sh" is not
+evidence of anything. Run what the hook runs, and the release is installed now:
 
 ```bash
-python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude.json')))['mcpServers']['jdwp']['command'])"
-cp ~/.claude.json ~/.claude.json.bak     # it is the user's config
-claude mcp remove jdwp && claude mcp add jdwp --scope user -- ~/.local/share/infotravel-dev-toolkit/bin/jdwp-mcp
+R=~/.claude/plugins/cache/infotravel-dev-toolkit/infotravel-dev/<plugin-commit>
+D=~/.claude/plugins/data/infotravel-dev-infotravel-dev-toolkit
+cat "$R/jdwp-version"        # must be the version you just cut; if not, the plugin didn't update
+CLAUDE_PLUGIN_ROOT="$R" CLAUDE_PLUGIN_DATA="$D" "$R/scripts/ensure-jdwp.sh" \
+  && cp "$R/jdwp-version" "$D/jdwp-version"
 ```
 
-Prove the running binary carries the release, by capability rather than by the version stamp — a stamp is
-written by the installer and says nothing about what is registered:
+That is byte-for-byte what the hook would do — `ensure-jdwp.sh` matches the asset name against the
+release's own `SHA256SUMS`, downloads to a temp dir, and moves it into place only after the checksum
+matches — so doing it by hand costs nothing and removes a whole restart's worth of uncertainty. The `cp` is
+the hook's second half: skip it and the next session re-downloads.
+
+Prove what is installed by **capability**, never by the pin file or the installer's stamp:
 
 ```bash
-printf '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n' \
-  | ~/.local/share/infotravel-dev-toolkit/bin/jdwp-mcp 2>/dev/null | grep -c '<a tool new in this release>'
+printf '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n' | "$D/bin/jdwp-mcp" 2>/dev/null \
+  | python3 -c "import json,sys; t=[x['name'] for x in json.load(sys.stdin)['result']['tools']]; \
+print(len(t), 'tools'); print('<a tool new in this release>' in t)"
 ```
 
-Finally, **tell the user to restart Claude Code.** Nothing above reaches the running session; the tools in
-*this* conversation are still the old ones until they do.
+**`~/.claude.json` is not part of this any more.** There is no user-scoped `jdwp` entry to inspect or
+re-point: `install.sh` §4 removes the one older versions of it created, and the plugin's server is
+namespaced `plugin:infotravel-dev:jdwp`, so its tools arrive as `mcp__plugin_infotravel-dev_jdwp__*`. Do
+not `claude mcp add` anything, and do not edit that file.
+
+One case still needs a human, and the installer will tell you: a **source build**. With
+`IT_JDWP_FROM_SOURCE=1` in `~/.config/infotravel-dev.env`, or a registered command ending
+`/target/release/jdwp-mcp`, `install.sh` deliberately leaves it alone and both servers connect — two
+debuggers' worth of tools in context. That is the source-build user's call to make, so report it and leave
+it; they develop the debugger.
+
+Finally, **tell the user to restart Claude Code**, and when they have, spend four calls proving the
+*registered* MCP works rather than only the file on disk — the release notes name what is new, so exercise
+it. For v0.7.0 that was `debug.launch` on a throwaway class, a breakpoint that came back **deferred**
+(nothing has loaded yet at `suspend=y`), `debug.continue`, and a hit at `{"method":"<clinit>"}` — which no
+amount of `tools/list` grepping would have established.
 
 ## 9. Close what shipped
 
