@@ -5,8 +5,8 @@ name: rust-doctor
 # via `scripts/doctor.sh`.
 #
 # We invoke the CLI directly rather than the official `arthjean/rust-doctor` composite action,
-# because that action's v0.2.0 action.yml currently fails to parse on the runner. `npx` fetches a
-# prebuilt binary (no source build); rust-doctor still shells out to the runner's `cargo clippy`.
+# because that action's v0.2.0 action.yml currently fails to parse on the runner. A prebuilt binary is
+# downloaded from the release (no source build); rust-doctor still shells out to the runner's `cargo clippy`.
 
 on:
   push:
@@ -89,8 +89,19 @@ jobs:
       #
       # SARIF is written to the file either way and uploaded below (`if: always()`), so a failing gate
       # still publishes the findings to code scanning rather than hiding them.
+      # Fetched from the upstream GitHub release rather than npm (BUILD-1, #66): the npm package was
+      # *unpublished* on 2026-07-29, so `npx -y rust-doctor@0.2.0` began failing with ETARGET and this gate
+      # could not run at all while nothing in the repo had changed. Same version, same binary, a source that
+      # takes a deliberate act to remove. `scripts/doctor.sh` fetches identically, so local and CI agree.
+      - name: Fetch rust-doctor
+        run: |
+          curl -fsSL -o /tmp/rd.tar.gz \
+            "https://github.com/arthjean/rust-doctor/releases/download/v0.2.0/rust-doctor-x86_64-unknown-linux-gnu.tar.gz"
+          tar xzf /tmp/rd.tar.gz -C /tmp
+          /tmp/rust-doctor --version
+
       - name: Run rust-doctor
-        run: npx -y rust-doctor@0.2.0 --sarif --fail-on warning > rust-doctor.sarif
+        run: /tmp/rust-doctor --sarif --fail-on warning > rust-doctor.sarif
 
       # A failing gate prints nothing useful: --sarif sends every finding to the file, so the step log
       # ends at "exit code 3" and the findings are only readable via the code-scanning API. Print them,

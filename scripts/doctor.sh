@@ -1,8 +1,23 @@
 #!/usr/bin/env bash
 #
 # Local rust-doctor health check — the same tool the CI runs (arthjean/rust-doctor), pinned to the
-# latest stable release. Uses `npx` to fetch a prebuilt native binary, so no Rust build of the tool
-# is needed (it still shells out to your local `cargo clippy`). Requires Node/npx.
+# latest stable release. Fetches a prebuilt native binary, so no Rust build of the tool is needed (it
+# still shells out to your local `cargo clippy`). Requires curl and tar.
+#
+# **Fetched from the upstream GitHub release, not from npm** (BUILD-1, #66). This used to be
+# `npx -y rust-doctor@0.2.0`, and on 2026-07-29T10:49Z the package was *unpublished* from the npm
+# registry — not yanked to a different version, removed. `npx` then failed with `ETARGET` for every value
+# of RUST_DOCTOR_VERSION, so ADR-0007's gate could not run at all, locally or in CI, while nothing in this
+# repo had changed. The tool itself was fine; only its distribution disappeared.
+#
+# GitHub release assets are the more durable source: same v0.2.0, same binary, and deleting a published
+# release asset is a deliberate act rather than a one-command `npm unpublish`. The binary is cached under
+# the user's cache dir keyed by version, so a re-run costs nothing and an offline machine keeps working
+# once it has fetched.
+#
+# What this does NOT fix: the asset is unverified. Upstream publishes no SHA256SUMS with the release, so
+# unlike the toolkit's own installer there is no manifest to check the download against, and pinning by
+# version is all that is available. Worth stating rather than implying a chain of trust that is not there.
 #
 # Usage:
 #   scripts/doctor.sh                  # 0–100 score card for the whole workspace
@@ -19,9 +34,53 @@ set -euo pipefail
 
 RUST_DOCTOR_VERSION="${RUST_DOCTOR_VERSION:-0.2.0}"
 
-if ! command -v npx >/dev/null 2>&1; then
-  echo "error: npx (Node.js) not found — install Node, or 'cargo install rust-doctor'." >&2
-  exit 1
+for tool in curl tar; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "error: $tool not found — needed to fetch rust-doctor's prebuilt binary." >&2
+    exit 1
+  fi
+done
+
+# The release publishes one asset per target triple; pick this machine's.
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64) RD_TARGET="x86_64-unknown-linux-gnu"; RD_EXT="tar.gz" ;;
+  Linux-aarch64 | Linux-arm64) RD_TARGET="aarch64-unknown-linux-gnu"; RD_EXT="tar.gz" ;;
+  Darwin-arm64) RD_TARGET="aarch64-apple-darwin"; RD_EXT="tar.gz" ;;
+  Darwin-x86_64) RD_TARGET="x86_64-apple-darwin"; RD_EXT="tar.gz" ;;
+  *)
+    echo "error: no rust-doctor release asset for $(uname -s)-$(uname -m)." >&2
+    echo "       Set RUST_DOCTOR_BIN to a rust-doctor binary you built yourself." >&2
+    exit 1
+    ;;
+esac
+
+# `RUST_DOCTOR_BIN` short-circuits the fetch entirely — for an unsupported platform, an air-gapped
+# machine, or bisecting against a locally built tool.
+RD_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/rust-doctor/${RUST_DOCTOR_VERSION}"
+RUST_DOCTOR_BIN="${RUST_DOCTOR_BIN:-$RD_CACHE/rust-doctor}"
+
+if [ ! -x "$RUST_DOCTOR_BIN" ]; then
+  RD_URL="https://github.com/arthjean/rust-doctor/releases/download/v${RUST_DOCTOR_VERSION}/rust-doctor-${RD_TARGET}.${RD_EXT}"
+  echo "fetching rust-doctor ${RUST_DOCTOR_VERSION} (${RD_TARGET})…" >&2
+  mkdir -p "$RD_CACHE"
+  # Into a temp dir first, so an interrupted download cannot leave a half-extracted binary in the cache
+  # that later runs would treat as good.
+  RD_TMP="$(mktemp -d)"
+  trap 'rm -rf "$RD_TMP"' EXIT
+  if ! curl -fsSL "$RD_URL" -o "$RD_TMP/rd.${RD_EXT}"; then
+    echo "error: could not download $RD_URL" >&2
+    echo "       If the release moved or was withdrawn, see BUILD-1 (#66) — the npm distribution was" >&2
+    echo "       already lost this way. Set RUST_DOCTOR_BIN to a binary you have." >&2
+    exit 1
+  fi
+  tar xzf "$RD_TMP/rd.${RD_EXT}" -C "$RD_TMP"
+  RD_FOUND="$(find "$RD_TMP" -type f -name 'rust-doctor*' -perm -u+x | head -1)"
+  if [ -z "$RD_FOUND" ]; then
+    echo "error: the release asset contained no rust-doctor binary." >&2
+    exit 1
+  fi
+  mv "$RD_FOUND" "$RUST_DOCTOR_BIN"
+  chmod +x "$RUST_DOCTOR_BIN"
 fi
 
 # Run from the repo root regardless of the caller's cwd.
@@ -93,9 +152,12 @@ esac
 # clean and there was no cheap way to see WHAT the five were. They only became legible afterwards, in CI's
 # step summary. This prints those same lines from the same structured output, before the push (#42).
 #
-# Parsed with `node` rather than `python3` (which is what the workflow uses) because Node is already a hard
-# requirement of this script — see the `npx` check at the top — and python3 is not. A findings mode that
-# needs a second runtime is a findings mode that is not there when you want it.
+# Parsed with `node` rather than `python3` (which is what the workflow uses). That choice was originally
+# free: the script fetched the tool with `npx`, so Node was already a hard requirement. It is no longer —
+# BUILD-1 (#66) replaced `npx` with a plain release download, needing only curl and tar — so `--findings`
+# now checks for Node itself, below, instead of relying on a requirement that has since been removed.
+# Left as Node rather than switched to python3 because that is a behaviour change to the parsing on a day
+# the gate is already being repaired; the check makes the dependency honest either way.
 #
 # `--findings` is ours, so it is stripped before the rest is handed on; `--json` too, since this mode adds
 # its own. Everything else passes through in order, which is what keeps `--diff main` and friends working.
@@ -117,7 +179,7 @@ if [ "$FINDINGS" -eq 1 ]; then
   # no scan to read, and printing "0 findings" over the top of a crash is the failure shape this repo keeps
   # paying for.
   status=0
-  npx -y "rust-doctor@${RUST_DOCTOR_VERSION}" ${PASSTHRU[@]+"${PASSTHRU[@]}"} --json >"$SCAN" || status=$?
+  "$RUST_DOCTOR_BIN" ${PASSTHRU[@]+"${PASSTHRU[@]}"} --json >"$SCAN" || status=$?
   if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
     echo "error: rust-doctor exited ${status} without completing a scan — no findings to report." >&2
     exit "$status"
@@ -131,6 +193,12 @@ if [ "$FINDINGS" -eq 1 ]; then
   fi
 
   verdict=0
+  if ! command -v node >/dev/null 2>&1; then
+    echo "error: --findings needs 'node' to parse the scan (see the note above; #66 removed the npx" >&2
+    echo "       requirement that used to guarantee it). Install Node, or use 'scripts/doctor.sh --json'" >&2
+    echo "       and read the findings from that." >&2
+    exit 1
+  fi
   SCAN_JSON="$SCAN" CI_INSTALLS_TOOLS="$CI_INSTALLS_TOOLS" node <<'JS' || verdict=$?
 const fs = require("fs");
 const scan = JSON.parse(fs.readFileSync(process.env.SCAN_JSON, "utf8"));
@@ -232,12 +300,12 @@ fi
 # this script does not sit in the middle of a long-lived one (`--mcp` serves stdio until it is killed).
 for arg in "$@"; do
   case "$arg" in
-  --json | --sarif | --score | --mcp) exec npx -y "rust-doctor@${RUST_DOCTOR_VERSION}" "$@" ;;
+  --json | --sarif | --score | --mcp) exec "$RUST_DOCTOR_BIN" "$@" ;;
   esac
 done
 
 status=0
-npx -y "rust-doctor@${RUST_DOCTOR_VERSION}" "$@" || status=$?
+"$RUST_DOCTOR_BIN" "$@" || status=$?
 
 # The score card's headline is a weighted heuristic, and the gate is not weighted: one warning fails the
 # build at any score. Those two facts have already been observed disagreeing on the same scan — 100/100
