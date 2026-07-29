@@ -9,7 +9,7 @@ Version requested: **$ARGUMENTS** (empty means: work out the right bump and say 
 
 `scripts/release.sh` does the bump, the gates, the commit and the tag. It deliberately stops before
 pushing. This command is everything around it — the parts that are judgement, the parts that are a
-different repo, and the four traps that have actually bitten.
+different repo, the part that is this machine, and the traps below, every one of which has actually bitten.
 
 ## The traps, up front
 
@@ -23,6 +23,9 @@ different repo, and the four traps that have actually bitten.
    re-run the failed jobs — never re-cut the tag.
 4. **`gh issue close` takes `--comment`, not `--body-file`.** With `--body-file` it errors, and in a
    `||`/`&&` chain the close can still happen while the explanation is silently dropped.
+5. **A pushed pin is not an installed pin.** `install.sh` has to be run, and even then it will *not*
+   re-point an already-registered MCP — so a stale binary survives every release until someone looks.
+   Step 8, and it is not optional: v0.6.0 and v0.6.1 both shipped without it.
 
 ## 1. Preconditions
 
@@ -169,9 +172,51 @@ Also list tools the docs never mention — a new tool nobody names is invisible.
 
 Then update the prose the audit cannot verify — behavioural claims, cost figures, "the reply says X" —
 from the release body, and commit the pin and the docs together. Say in the commit which tools you left
-undocumented and why, if any.
+undocumented and why, if any. **Push it** — the next step re-pulls the repo, so an unpushed commit is a
+commit the installer will not see.
 
-## 8. Close what shipped
+## 8. Install it, or the release changed nothing on this machine
+
+Bumping the pin is a promise; `install.sh` is what keeps it. Skip this and the pin says one version while the
+`jdwp` tools you and the user actually call are whatever was installed months ago — which is exactly what
+happened after v0.6.0 and v0.6.1: the pin read `v0.6.1` while the registered binary was a pre-0.6 build with
+31 tools and no `debug.evaluate_chain`.
+
+```bash
+cd ~/html/infotravel-dev-toolkit && ./install.sh
+```
+
+**Then check the registration, because `install.sh` deliberately will not fix it.** If the `jdwp` MCP is
+already registered it leaves the command alone and only prints a note — correct behaviour (it must not
+hijack a source build), and also how a stale path survives every release you ever cut. It printed this,
+and the note is easy to read past:
+
+```
+jdwp MCP already registered -> /tmp/jdwptest-bin/jdwp-mcp (leaving as-is)
+```
+
+A `/tmp` path is the giveaway — a leftover from testing that also vanishes on reboot. Verify, and re-point
+if it is not the managed binary and the user has not opted into a source build (`IT_JDWP_FROM_SOURCE=1` in
+`~/.config/infotravel-dev.env`; **if they have, leave it and say so** — they develop the debugger):
+
+```bash
+python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude.json')))['mcpServers']['jdwp']['command'])"
+cp ~/.claude.json ~/.claude.json.bak     # it is the user's config
+claude mcp remove jdwp && claude mcp add jdwp --scope user -- ~/.local/share/infotravel-dev-toolkit/bin/jdwp-mcp
+```
+
+Prove the running binary carries the release, by capability rather than by the version stamp — a stamp is
+written by the installer and says nothing about what is registered:
+
+```bash
+printf '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n' \
+  | ~/.local/share/infotravel-dev-toolkit/bin/jdwp-mcp 2>/dev/null | grep -c '<a tool new in this release>'
+```
+
+Finally, **tell the user to restart Claude Code.** Nothing above reaches the running session; the tools in
+*this* conversation are still the old ones until they do.
+
+## 9. Close what shipped
 
 ```bash
 gh issue close <n> --reason completed --comment "Shipped in v<version> (<sha>). …"
