@@ -74,6 +74,22 @@ classloader and everything it held, and not the same as a **classloader reload**
 where a new type with new JDWP ids replaces the old one; a hot reload keeps the `referenceTypeID` and
 replaces the code behind it, which is exactly why ADR-0011 refuses to cache line tables per connection.
 
+### The wire
+
+**Packet**:
+One JDWP message, and **the unit this server reports its own cost in** — a dump is "~8 packets per thread",
+`list_threads` is "one packet per thread name". Packets rather than bytes or milliseconds because the cost
+that matters is round trips against a JVM someone else is using, and that is what a caller can reason about
+before making a call.
+
+**Framing**:
+JDWP messages are length-prefixed with **no delimiter between them**, so the reader's position is only
+correct if every preceding message was consumed exactly. There is no marker to seek forward to, which is
+what makes losing alignment unrecoverable rather than a hiccup: the next read interprets whatever it lands
+on — usually the middle of a real reply — as a length. So a lost byte does not corrupt one answer, it ends
+the session (ADR-0018).
+_Avoid_: resync, recover (there is nothing to resync *to*; the instinct this term exists to correct)
+
 ### Stop points
 
 **Stop point**:
@@ -153,8 +169,12 @@ without the suspension that reading a full stack would need.
 _Avoid_: stack, backtrace (both imply the whole stack, with locals)
 
 **Trace budget**:
-How many hits a traced stop point will record before disarming itself. Bounds work done in the debuggee,
+How many hits a traced stop point will **charge** before disarming itself. Bounds work done in the debuggee,
 not memory.
+
+Charged, not recorded — the two diverged and the difference is the point. A hit skipped by a condition or a
+method filter is neither recorded nor charged, and a folded rethrow *is* recorded but not charged, so a
+budget of 30 can leave more than 30 snapshots behind. What it counts is **failures**, not sightings.
 
 **Rethrow chain**:
 The run of hits produced by **one exception instance** being thrown and then rethrown as it unwinds — an
@@ -164,16 +184,30 @@ once (EXC-3).
 _Avoid_: duplicate throws (they are not duplicates — each is a real throw at a real site)
 
 **Fold**:
-What a rethrow chain is recorded as: the first capture, the latest sighting, and a count of the sightings
-replaced in between. Both ends are kept because they answer different questions — where the failure started
-(the application frame and the cause) and where it left (which wrapper let it out) — and only the plumbing
-between them is collapsed. The latest sighting is *rolling*: nothing can know which rethrow is the last, so
-each supersedes the one before and whichever turns out to be final is the one left standing.
+What a rethrow chain is recorded as: the first capture, the latest sighting, and a count standing in for the
+sightings between them. Both ends are kept because they answer different questions — where the failure
+started (the application frame and the cause) and where it left (which wrapper let it out).
+
+**A fold is not deduplication**, and the distinction is load-bearing rather than pedantic. Nothing here is a
+duplicate: every sighting is a real throw at a real site, and #68 rejected dedupe-by-instance precisely
+because a rethrow at a *different* site can be the interesting one. A fold discards a **middle**, keeping
+both endpoints; dedupe keeps one representative of things treated as identical. The latest sighting is
+*rolling* — nothing can know which rethrow is the last, so each supersedes the one before and whichever
+turns out to be final is the one left standing.
+_Avoid_: dedupe, deduplicate (see above); collapse on its own (this codebase already collapses hidden
+frames, disarm notes and thread-name families, and those are three other mechanisms)
 
 **Link**:
 One step of a chained expression — `.getConfigUhList()`, `[0]`, `.getSqQuarto()`. The unit
 `debug.evaluate_chain` reports in, and the thing named when a chain goes null.
 _Avoid_: segment (the parser's word for the same thing; a caller never sees it)
+
+**In-flight hit**:
+A hit the debuggee has already generated but this server has not finished handling — so it can outlive the
+stop point that caused it, and arrives after that stop point is disarmed and gone. Its stop point cannot be
+looked up, which is not the same as the hit being spurious: it was real, it may have suspended a thread, and
+something still has to resume it.
+_Avoid_: stale hit, orphaned hit (both suggest it can be discarded; a traced one must still be resumed)
 
 **Capture**:
 The work one traced hit costs: reading the hit frame's snapshot and the caller chain, between the JVM
@@ -183,7 +217,7 @@ _Avoid_: hit (a hit is the event; a capture is the work), snapshot (that is the 
 
 ### Arming and disarming
 
-These three are distinct on purpose, and conflating them loses a caller's typed-in condition.
+These four are distinct on purpose, and conflating the first three loses a caller's typed-in condition.
 
 **Arm**:
 To create the stop point's request in the debuggee, so it can fire.
@@ -198,6 +232,10 @@ To remove the stop point and its definition entirely. Unlike disable, nothing su
 **Disarm**:
 To disable a stop point *automatically* — by the watchdog, or on a trace budget running out. Named
 separately from disable because it is never the caller's instruction.
+
+**Disarming stops future hits, not hits that already exist.** A stop point can be armed and gone while hits
+it caused are still unhandled — see **in-flight hit**. Treating "disarmed" as "silent" is what froze a
+debuggee in #72.
 
 ### Suspension
 
@@ -248,6 +286,12 @@ stop point's whole life, including across a disable and re-arm.
 **Request id**:
 The debuggee's own identifier for an armed request. An internal detail that changes when a stop point is
 re-armed, and deliberately not the stop point's identity.
+
+**Allocated by the debuggee, so a value may recur.** JDWP promises nothing about reuse — `HotSpot` happens
+to hand them out monotonically, and this server talks to whatever is on the port. So a request id is only
+meaningful *while* its request is live: remembering one and matching on it later can silently name a
+different request, which is why anything keeping a set of past ids must also check that the id is not
+currently in use (#72).
 
 ### Safety posture
 
