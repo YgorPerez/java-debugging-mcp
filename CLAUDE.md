@@ -12,9 +12,16 @@ chosen — comments are *not* reflowed, so the narrative doc comments are safe t
 
 **Run `scripts/doctor.sh --findings`**, not just `cargo clippy`. Doctor is the gate (ADR-0007), it
 fails on *warnings*, and the score is not the verdict — 100/100 "Great" has sat on top of 21 warnings.
-`--findings` prints what the gate will fail on and says whether it would pass. The baseline is 21
-`unsafe-dependency` findings from a locally-installed `cargo-geiger` that CI does not install; anything
-beyond that baseline is yours.
+`--findings` prints what the gate will fail on and says whether it would pass.
+
+**There is no baseline any more: a clean tree prints `would pass`, so any finding is yours.** It used to
+be "21 `unsafe-dependency` findings, anything beyond that is yours" — a pass condition you had to decode
+against a number written down here, and one that was never constant, since it is whatever subset of the
+dependency tree `cargo-geiger` flags and it moves with every `Cargo.lock` change. Those findings were all
+about *third-party* crates (`tokio`, `syn`, `serde_json`…), none of which anyone was going to replace, and
+CI never even ran the pass. `rust-doctor.toml` now ignores the rule and explains it at length, including
+why the `Warning: unknown rule(s) in ignore config` the tool prints on every run is **false** — the entry
+works, and was measured working. Our own `unsafe` is a different rule and still fails the gate.
 
 **Run the suite on more than one JDK.** `scripts/integration-test.sh` covers the `#[ignore]`d
 JVM tests; plain `cargo test` covers the unit and cassette tests, and you need both to see all of

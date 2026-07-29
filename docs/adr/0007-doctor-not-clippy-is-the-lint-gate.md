@@ -213,6 +213,19 @@ prediction of CI, and the mode prints both reasons that gap exists:
   locally-installed `cargo-geiger` contributes `unsafe-dependency` warnings that CI will never see. That
   is not hypothetical either: it is where all 21 warnings in the 100/100 scan above came from.
 
+**Those 21 are gone, and the reason is worth keeping.** Naming them in this ADR and again in `CLAUDE.md`
+made the local gate's pass condition "21 warnings, no more, no fewer" — a verdict you decode against a
+written-down number rather than read. It was also never a constant: it is whatever subset of the dependency
+tree crosses `cargo-geiger`'s threshold, so it moves with any `Cargo.lock` change, and the count would have
+drifted away from both documents silently. Every one was about a *third-party* crate — `tokio`, `syn`,
+`serde_json`, `socket2` — with "consider alternatives" as the only advice on offer, and none of them ever
+failed a build, because the gate does not run the pass. `rust-doctor.toml` ignores the rule, which was
+measured to remove exactly those findings and nothing else (the A/B/C table is in that file, along with why
+the tool's `unknown rule(s) in ignore config` warning is false). A clean tree now prints `would pass`, so
+the mode this ADR exists to add finally says something. First-party `unsafe` is a *different* rule and still
+fails the gate — verified with an injected `unsafe` block, which trips both
+`clippy::undocumented_unsafe_blocks` and doctor's own `unsafe-block-audit`.
+
 Whether CI installs them is read out of the workflow rather than asserted here, for the same reason the
 toolchain pin is: two copies of a fact drift.
 

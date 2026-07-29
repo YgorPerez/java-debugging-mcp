@@ -1,0 +1,75 @@
+# rust-doctor configuration. The gate is `scripts/doctor.sh` (ADR-0007), and this file is how the gate's
+# verdict is made to mean something locally.
+#
+# ## Why `unsafe-dependency` is ignored
+#
+# It was 21 permanent warnings, and their only effect was to make the local gate unreadable.
+#
+# **They are not about this code.** Every one is a `cargo-geiger` count of `unsafe` inside a *third-party*
+# crate, attributed to `Cargo.toml` because that is the only file it can point at. The full set was
+# `anyhow`, `bytes`, `dyn-clone`, `errno`, `itoa`, `lazy_static`, `libc`, `lock_api`, `log`, `matchers`,
+# `memchr`, `mio`, `once_cell`, `parking_lot`, `parking_lot_core`, `pin-project-lite`, `proc-macro2`,
+# `regex-automata`, `scopeguard`, `serde_core`, `serde_json`, `sharded-slab`, `signal-hook-registry`,
+# `smallvec`, `socket2`, `syn` ×2, `thread_local`, `tokio`, `tracing`, `tracing-core`, `tracing-log`,
+# `tracing-subscriber`, `unicode-ident`, `zmij` — 35 findings, of which 21 land at `warning` and the other
+# 14 at `info`. The advice attached to each is "review unsafe usage in X or consider alternatives", and
+# nobody is going to replace `tokio` or `syn` over it. This workspace contains **zero** first-party
+# `unsafe` (`grep -rE '\bunsafe\s*(\{|fn|impl)' */src` is empty), so there is no finding here being
+# waved through — only a standing description of everyone else's crates.
+#
+# **They never gated anything.** `.github/workflows/rust-doctor.yml` does not install `cargo-geiger`, so
+# the pass does not run in CI and these findings have never failed a build. They appeared only on a
+# machine where someone had installed the tool, which `scripts/doctor.sh --findings` already says out
+# loud under "ran here, but not in the gate".
+#
+# **What they cost.** `--findings` printed `gate: WOULD FAIL` on a pristine tree. The only way to read
+# that was to know the number 21 — which `CLAUDE.md` carried as a written-down baseline, and which is not
+# a constant: it is whatever subset of the dependency tree crosses the tool's threshold, so it moves with
+# any `Cargo.lock` change and drifts silently the moment a dependency is added or bumped. A gate whose
+# pass condition is "21 warnings, no more, no fewer" is decoded, not read — and this repo has paid for
+# exactly that shape before, in the five findings that were watched going 1 → 5 and waved off (#42).
+#
+# Ignoring the rule makes the local verdict the same verdict CI reaches, which is the only verdict worth
+# printing. `would pass` now means it.
+#
+# **What still covers unsafe, so this is a narrowing and not a hole.** Our own `unsafe` is a different
+# rule and stays on: doctor's `unsafe_code` AST rule flags any `unsafe {}` block or `unsafe fn` we write,
+# and clippy's `undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` are both in doctor's
+# enabled set. Adding the first first-party `unsafe` to this workspace still fails the gate.
+#
+# **To see the dependency numbers anyway** — which is a reasonable thing to want before adding a
+# dependency, just not a build gate — ask the tool that produces them directly:
+#
+#     cargo geiger --all-features
+#
+# ## `Warning: unknown rule(s) in ignore config: unsafe-dependency` is FALSE — do not act on it
+#
+# rust-doctor 0.2.0 prints that on every run, and the entry works anyway. Its validator checks the name
+# against the clippy + custom-AST catalog only, and rules sourced from an *external tool* are not in that
+# catalog — `unsafe-dependency` comes from `cargo-geiger`. The filter, however, matches on the rule string
+# and does not consult the catalog, so the ignore takes effect while the validation complains.
+#
+# Do not take that on trust; it was measured three ways on the same tree (2026-07-29, v0.2.0):
+#
+#   | config                                   | total diagnostics | gated warnings |
+#   |------------------------------------------|-------------------|----------------|
+#   | A: this file, with the ignore below      | 94                | **0**          |
+#   | B: this file, `verbose` only, no ignore   | 129               | 21             |
+#   | C: no `rust-doctor.toml` at all           | 129               | 21             |
+#
+# B and C are identical, so the file's mere presence suppresses nothing — the entry is doing the work. And
+# A removes *only* this rule: the 21 `warning` plus 14 `info` `unsafe-dependency` findings go, while
+# `excessive-clone` ×91 and the three `skipped-pass` notes are still there, unchanged. Reproduce with:
+#
+#     scripts/doctor.sh --json | node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8"));
+#       const t={}; for (const d of s.diagnostics) t[d.rule+"/"+d.severity]=(t[d.rule+"/"+d.severity]||0)+1;
+#       console.log(s.warning_count, t)'
+#
+# So the warning is noise from an incomplete catalog, not a rejected setting. It is left un-suppressed
+# rather than filtered out of `scripts/doctor.sh`, because silencing a tool's own complaint about our
+# config is a worse habit than reading past one documented line — but it is documented *here*, next to the
+# thing it is wrong about, so the next person does not delete a working entry to chase it.
+#
+# Reinstate the gate finding by deleting the entry below; nothing else here depends on it.
+[ignore]
+rules = ["unsafe-dependency"]
