@@ -100,6 +100,36 @@ jobs:
           tar xzf /tmp/rd.tar.gz -C /tmp
           /tmp/rust-doctor --version
 
+      # Two of rust-doctor's passes need a tool it does not carry, and until now the gate ran without
+      # either — reporting `skipped-pass`, which reads exactly like a pass that found nothing. Prebuilt
+      # binaries, so this costs seconds rather than the minutes `cargo install` would.
+      #
+      # `cargo-machete` earned its place immediately: it found `anyhow` and `serde_json` declared and never
+      # used by `jdwp-client`, which had been paying for two dependencies for nothing.
+      #
+      # `cargo-deny` means an advisory published against a dependency can turn this gate red on a day
+      # nothing in the repo changed. That is the point of it, and is why it belongs in the gate rather than
+      # in a nightly nobody reads — but it is the one entry here that can fail a build you did not cause.
+      #
+      # THREE PASSES STAY UNRUN ON PURPOSE, and each `skipped-pass` note below is this decision, not an
+      # oversight:
+      #   - cargo-geiger — feeds `unsafe-dependency`, which rust-doctor.toml ignores at length: 21 warnings
+      #     counting `unsafe` inside tokio/syn/serde, none of which anyone will replace. Installing it would
+      #     spend build minutes producing findings we have already decided not to act on.
+      #   - cargo-semver-checks — its baseline is `jdwp-client` on crates.io, which is
+      #     bonk-dev/jdwp-client, an unrelated project that happens to hold the name. Ours are unpublished
+      #     (distribution is the release binaries), so the pass compares against a stranger's crate and
+      #     reports "no semver update required" — a confident answer built on the wrong package, which is
+      #     worse than a skip. `cargo semver-checks --baseline-rev <last tag>` is the version that would
+      #     mean something, and rust-doctor's pass has no way to ask for it.
+      #   - coverage — `coverage.yml` owns it, produces `target/coverage/lcov.info`, and knows about the
+      #     atexit-handler trap TEST-5 found. Generating coverage again here would double the test run to
+      #     tell doctor something another workflow already publishes.
+      - name: Install the tools rust-doctor's passes need
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete
+
       - name: Run rust-doctor
         run: /tmp/rust-doctor --sarif --fail-on warning > rust-doctor.sarif
 

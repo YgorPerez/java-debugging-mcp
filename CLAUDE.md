@@ -33,6 +33,15 @@ workspace. The script resolves the paths, publishes `warning`/`error` only, and 
 the job summary — so nothing is silently dropped. Notes still reach you two other ways: the full SARIF is
 the `rust-doctor-sarif` artifact, and `--findings` prints locally.
 
+**CI now installs `cargo-deny` and `cargo-machete`** (prebuilt, seconds), so those two passes are part of the
+gate — machete's first run found `anyhow` and `serde_json` declared and unused by `jdwp-client`. Three passes
+stay off deliberately and `rust-doctor.yml` says why at each one: `cargo-geiger` feeds the
+`unsafe-dependency` rule this repo ignores, `cargo-semver-checks` would compare against **bonk-dev's**
+unrelated `jdwp-client` on crates.io (ours are unpublished) and answer confidently from the wrong package,
+and coverage belongs to `coverage.yml`. `--findings` works this out **per tool** from the workflow's install
+list, so "ran here, but not in the gate" stays true as that list changes — it used to be a yes/no grep for
+`cargo install` anywhere in the file, which a *comment* containing those words silently flipped.
+
 **Run the suite on more than one JDK.** `scripts/integration-test.sh` covers the `#[ignore]`d
 JVM tests; plain `cargo test` covers the unit and cassette tests, and you need both to see all of
 `mcp_integration.rs`. CI runs JDK 11/17/21 and has caught version-locked tests that passed on one JDK

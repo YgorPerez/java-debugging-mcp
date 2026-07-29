@@ -11,9 +11,13 @@ they were found by reading the alerts the tab had accumulated (115 of them) rath
 nothing to resolve the URI against. GitHub falls back to treating it as repo-root-relative, where
 `src/handlers.rs` does not exist: this is a Cargo *workspace*, and the file is `mcp-server/src/handlers.rs`.
 Every alert in that tab pointed at a path that is not in the tree, so none of them could be clicked
-through to code, and `src/handlers.rs` is ambiguous between the two crates besides. A few results carry
-absolute paths (`/var/www/html/java-debugging-mcp/mcp-server/clippy.toml`) under the same base id, which
-is the same bug from the other end.
+through to code, and `src/handlers.rs` is ambiguous between the two crates besides.
+
+A second kind of unresolvable path is **not** a bug in the URI, and mistaking it for one wastes the time
+`clippy.toml` was written to save: results anchored to `<crate>/clippy.toml` point at a file rust-doctor
+*writes into every member that has none, runs clippy against, and then deletes*. That path is accurate for
+the length of the run and gone by the time anything reads the SARIF. Re-anchoring is still the right move —
+an alert on a file that no longer exists links nowhere — but there is nothing upstream to report.
 
 **Note-level results do not belong in code scanning.** The gate is `--fail-on warning`, so `note` findings
 never fail anything — but the upload published them anyway, and they accumulated into a security tab
@@ -62,10 +66,27 @@ def workspace_dirs(root: Path) -> list[Path]:
     return [root, *sorted(set(members))]
 
 
+def reanchor(rel: Path, root: Path) -> tuple[str, str] | None:
+    """A path that is gone, mapped to the manifest of the crate it was inside.
+
+    For the one finding this happens to — a `<crate>/clippy.toml` rust-doctor created and deleted — the
+    crate's `Cargo.toml` is not a consolation prize: `clippy::multiple_crate_versions` is *about* the
+    dependency graph that manifest declares, so the alert lands closer to its subject than the temporary
+    config file ever was. Returns None when the parent is not a crate, because inventing a location for a
+    finding whose location is unknown is the thing this file exists to stop.
+    """
+    for parent in rel.parents:
+        manifest = root / parent / "Cargo.toml"
+        if manifest.exists():
+            return manifest.relative_to(root).as_posix(), f"re-anchored to {parent / 'Cargo.toml'}"
+    return None
+
+
 def resolve(uri: str, root: Path, candidates: list[Path]) -> tuple[str, str]:
     """Map one SARIF URI to a repo-root-relative path.
 
-    Returns (path, why) where `why` is empty on success and explains the failure otherwise. Ambiguity is a
+    Returns (path, why) where `why` is empty on a clean resolve and describes what happened otherwise —
+    a re-anchor is reported too, since a moved alert must not look like an accurate one. Ambiguity is a
     failure, not a coin flip: `src/lib.rs` exists in both crates, and guessing would put an alert on the
     wrong file, which is worse than leaving it where a human can see it is wrong.
     """
@@ -75,11 +96,13 @@ def resolve(uri: str, root: Path, candidates: list[Path]) -> tuple[str, str]:
             rel = raw.relative_to(root)
         except ValueError:
             return uri, f"absolute path outside the workspace: {uri}"
-        return (rel.as_posix(), "") if (root / rel).exists() else (rel.as_posix(), f"no such file: {rel}")
+        if (root / rel).exists():
+            return rel.as_posix(), ""
+        return reanchor(rel, root) or (rel.as_posix(), f"no such file: {rel}")
 
     hits = [d for d in candidates if (d / raw).exists()]
     if not hits:
-        return uri, f"no such file under the workspace root or any crate: {uri}"
+        return reanchor(raw, root) or (uri, f"no such file under the workspace root or any crate: {uri}")
     if len(hits) > 1:
         where = ", ".join((h.relative_to(root).as_posix() or ".") for h in hits)
         return uri, f"ambiguous across crates ({where}): {uri}"
@@ -145,8 +168,9 @@ def main() -> int:
             print(f"- `{rule}` × {n} ({level})")
         print()
     if unresolved:
-        print("**Paths that could not be resolved to a file in this tree** — published as-is, so the alert")
-        print("exists but will not link to code. Fix the emitter, not this list:")
+        print("**Paths that were not in this tree.** A re-anchored one is published against the crate")
+        print("manifest, so the alert links somewhere real but not where the tool said; anything else is")
+        print("published as-is and will not link to code at all:")
         print()
         for line in sorted(set(unresolved)):
             print(f"- {line}")

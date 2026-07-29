@@ -185,12 +185,18 @@ if [ "$FINDINGS" -eq 1 ]; then
     exit "$status"
   fi
 
-  # Whether the gate's environment installs the optional external tools, read from the workflow rather than
-  # asserted here, for the same reason the toolchain pin is read from it: two copies of a fact drift.
-  CI_INSTALLS_TOOLS=0
-  if grep -qE 'install-deps|cargo +install' .github/workflows/rust-doctor.yml 2>/dev/null; then
-    CI_INSTALLS_TOOLS=1
-  fi
+  # WHICH optional tools the gate's environment installs, read from the workflow rather than asserted here,
+  # for the same reason the toolchain pin is read from it: two copies of a fact drift.
+  #
+  # It reads the install step's `tool:` list, and it used to be a yes/no `grep -E 'install-deps|cargo
+  # +install'` over the whole file. That was wrong in both directions and failed in the direction that
+  # matters: the workflow gained a COMMENT containing the words "cargo install" and the answer flipped to
+  # yes, which silenced the "ran here, but not in the gate" section below — the section whose entire job is
+  # to stop a local verdict being read as CI's. Prose cannot be allowed to answer a question about
+  # configuration. Yes/no was also too coarse to be true any more: CI installs cargo-deny and cargo-machete
+  # and deliberately does not install cargo-geiger or cargo-semver-checks, so the honest answer is a list.
+  CI_TOOLS="$(sed -n 's/^[[:space:]]*tool:[[:space:]]*//p' .github/workflows/rust-doctor.yml 2>/dev/null |
+    tr -d '[:space:]' | paste -sd, -)"
 
   verdict=0
   if ! command -v node >/dev/null 2>&1; then
@@ -199,7 +205,7 @@ if [ "$FINDINGS" -eq 1 ]; then
     echo "       and read the findings from that." >&2
     exit 1
   fi
-  SCAN_JSON="$SCAN" CI_INSTALLS_TOOLS="$CI_INSTALLS_TOOLS" node <<'JS' || verdict=$?
+  SCAN_JSON="$SCAN" CI_TOOLS="$CI_TOOLS" node <<'JS' || verdict=$?
 const fs = require("fs");
 const scan = JSON.parse(fs.readFileSync(process.env.SCAN_JSON, "utf8"));
 
@@ -244,10 +250,14 @@ const byRule = [...tally.entries()]
 // mode exists at all is a number that was read past what it knew.
 const skipped = Array.isArray(scan.skipped_passes) ? scan.skipped_passes : [];
 const ran = [...new Set((scan.pass_timings || []).map((p) => p.pass))];
-const localOnly =
-  process.env.CI_INSTALLS_TOOLS === "0"
-    ? ran.filter((p) => /\(cargo-[a-z-]+\)/.test(p) && !skipped.some((s) => s.startsWith(p)))
-    : [];
+// Per tool, not per run: a pass that ran here is only outside the gate if CI does not install the tool it
+// needs. The pass label carries the tool name ("dependencies (cargo-machete)"), which is what makes this
+// checkable rather than a list somebody keeps in sync by hand.
+const ciTools = (process.env.CI_TOOLS || "").split(",").filter(Boolean);
+const localOnly = ran.filter((p) => {
+  const tool = (p.match(/\((cargo-[a-z-]+)\)/) || [])[1];
+  return tool && !ciTools.includes(tool) && !skipped.some((s) => s.startsWith(p));
+});
 
 if (gated.length) {
   out.push(
