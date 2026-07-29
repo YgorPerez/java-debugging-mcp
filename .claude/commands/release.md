@@ -21,8 +21,14 @@ different repo, the part that is this machine, and the traps below, every one of
    *re-runs* the gates; finding out there is the expensive moment.
 3. **The release gate can fail on a known flake.** Check it against the open issues before re-running, and
    re-run the failed jobs — never re-cut the tag.
-4. **`gh issue close` takes `--comment`, not `--body-file`.** With `--body-file` it errors, and in a
-   `||`/`&&` chain the close can still happen while the explanation is silently dropped.
+4. **Closing an issue loses your explanation in three different ways.** `gh issue close` takes
+   `--comment`, not `--body-file` — with `--body-file` it errors, and in a `||`/`&&` chain the close can
+   still happen while the explanation is silently dropped. Worse, **`--comment` on an issue that is
+   *already* closed prints `! Issue … is already closed` and posts nothing at all**, which is the normal
+   case here because the release commit's trailer closes them before you get to step 9. And the trailer
+   itself only half works: **GitHub needs a closing keyword per number**, so `Closes #73, #74, #75, #76`
+   closes `#73` and merely *references* the rest. All three bit on v0.7.0. Step 9 has the order that
+   survives them: comment first, close second, then verify both.
 5. **A pushed pin is not an installed pin**, and *nothing in `install.sh` fetches the binary any more.*
    The plugin declares the MCP and a **SessionStart hook** downloads the pin — so after a successful
    `install.sh` the pin file says the new version while the binary on disk is still the old one, until a
@@ -242,12 +248,34 @@ amount of `tools/list` grepping would have established.
 
 ## 9. Close what shipped
 
+**Comment first, close second** — never in one call. Trap 4 is three separate ways to lose the explanation,
+and the one that actually happens is this: the release commit's trailer has usually closed the issue
+already, and `gh issue close --comment` on a closed issue posts nothing while looking like it worked.
+
 ```bash
-gh issue close <n> --reason completed --comment "Shipped in v<version> (<sha>). …"
+gh issue comment <n> --body "Shipped in v<version> (<sha>). …"    # always lands, open or closed
+gh issue close <n> --reason completed                             # no-op with a warning if already closed
 ```
 
-`--comment`, not `--body-file`. Reference the release and the implementing commit, and if an issue's brief
-asked for something different from what was done, say so on the issue rather than only in the commit.
+Then **verify both happened**, because neither step fails loudly:
+
+```bash
+for n in <numbers>; do
+  echo -n "#$n: "
+  gh issue view "$n" --json state,comments --jq '.state + " (" + (.comments|length|tostring) + " comment)"'
+done
+```
+
+A `CLOSED (0 comment)` row means the account of the work is gone and only the tracker's silence is left.
+
+On the trailer: give **every** number its own keyword (`Closes #73, closes #74, closes #75`) or accept that
+only the first closes and close the rest here. Either is fine; believing the list closed them all is not.
+
+Reference the release and the implementing commit, and **if an issue's brief asked for something different
+from what was done, say so on the issue** rather than only in the commit. That is the part worth the tokens:
+#74 offered a doc-only fallback that was not taken, #75 was filed with the case *against* building it, and
+#76 asked a question ("whose problem does this solve?") whose answer moved during implementation. An issue
+closed with "shipped" and none of that loses the reasoning the triage paid for.
 
 ## If it goes wrong
 

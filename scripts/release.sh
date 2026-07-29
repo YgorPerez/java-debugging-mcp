@@ -262,5 +262,5 @@ cat <<EOF
         git tag -d $TAG && git commit --amend && git tag -a $TAG -m $TAG
 
     Consumers to update after the release publishes:
-      - infotravel-dev-toolkit pins JDWP_VERSION in install.sh against the release's own SHA256SUMS
+      - infotravel-dev-toolkit pins this tag in its jdwp-version file, verified against this release's SHA256SUMS
 EOF
