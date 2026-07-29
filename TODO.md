@@ -290,6 +290,47 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## ✅ Shipped (context)
 
+- **Wildcard and batched arming (FILT-3/#74, FILT-4/#75)** — `class_pattern` on all four arming tools now
+  takes an exact class, a **wildcard**, or a **list** of either. A wildcard on `debug.set_line_stop` requires
+  `method` and refuses `line` (`:412` is a different statement in every class it matches), arms one `bp_` per
+  matching loaded class, and keeps a `CLASS_PREPARE` watch so matching classes that load *later* arm too —
+  which is the case that motivated it: a generated proxy, or every implementation of an interface. The family
+  is addressable as one `bpset_` id (a fifth id KIND, not a second way to address a breakpoint — BP-3's
+  one-id-per-stop-point rule is intact), so one call clears or toggles all of it *and* the watch. `max_classes`
+  (default 20, ceiling 200) bounds the expansion because N is invisible to the caller before the call, and the
+  reply states what it armed and what it left out. Exception and field stops expand a wildcard over LOADED
+  classes only — those event kinds need a concrete reference type and cannot be deferred at all —
+  and `set_method_exit_stop` needed no expansion, because JDWP's own `ClassMatch` was already doing the
+  matching. Batched replies report every pattern's outcome, since 2-armed-1-deferred-1-refused is the normal
+  result and an error would discard the two that worked. One exact class still gets the byte-identical old
+  reply. Validated by `a_wildcard_family_arms_every_match_grows_with_class_loading_and_clears_as_one`, which
+  proves all three promises against a live JVM: two loaded classes armed from one call, a third armed only
+  because the watch caught its load, and the whole family dropped by its `bpset_` id.
+- **Launch mode (LAUNCH-1/#76)** — `debug.launch` starts a JVM under the debugger instead of attaching to
+  one. It exists for the thing attaching can never do: `suspend` defaults to **true**, so the VM is held
+  before its first instruction and a breakpoint inside a *static initialiser* can actually fire — proven that
+  way in `launch_suspends_before_the_first_instruction_and_disconnect_terminates_it`, where the main class is
+  not even loaded when the breakpoint is set, so it defers and arms on the first `debug.continue`. The
+  lifetime question that LAUNCH-1's triage weighed is answered in three places rather than assumed away:
+  termination is decided at spawn via `kill_on_drop`, so a session going away for any reason takes the JVM
+  with it (`detach_on_disconnect: true` inverts it, and says so); a `SIGKILL`ed server still orphans the JVM,
+  which needs `pre_exec` to prevent and so `unsafe` — so the reply names the pid instead of staying silent;
+  and output is **captured**, never inherited, because this server's stdout is the MCP transport. That capture
+  is what turns "could not connect" into the JVM's own words, and it settles the `get_output`/`send_input`
+  pair the 2026-07-26 pass declined for want of a process handle: the handle now exists, the diagnostic half
+  of what they wanted is served by the launch/disconnect/`list_sessions` replies, and neither is filed.
+  **What testing this found:** with `suspend=y` the JVM is held *before* it resolves the main class, so a
+  launch with a bogus `main_class` succeeds and only dies on the first continue. The reply now says a
+  successful launch is not evidence the program can run, and `debug.list_sessions` carries a dead launched
+  JVM's last output, so `DEAD` is never the whole answer.
+- **Blast-radius descriptions for the six VM-wide tools (DOC-5/#73)** — `debug.attach`, `continue`, `pause`
+  and the three steppers had the only one-line descriptions among 33 tools, and they were the six that
+  suspend or resume the whole VM: description quality was inversely correlated with blast radius. Each now
+  states what it holds, what ends it (`debug.continue`, `debug.panic`, or `JDWP_WATCHDOG_SECS`), and the
+  cheaper alternative — a traced stop point for a snapshot, `thread_dump {suspend:true}` for the lock graph.
+  `debug.attach` leads with the shared-vs-isolated question, since that single fact decides whether the rest
+  of the session should be `trace:true` only, and nothing in the server can work it out for you. No behaviour
+  change.
 - **Hot reload (SWAP-1)** — `debug.reload_class` installs freshly compiled bytecode into a running JVM
   (`VirtualMachine.RedefineClasses`), with `CapabilitiesNew` asked first, type-cache invalidation on
   success, and each of HotSpot's twelve refusals turned into what to do next. `debug.pop_frame`
@@ -946,7 +987,10 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## Backlog
 
-**Eleven open, from three sources.** Tracked as GitHub issues, not here.
+**Four open, and all four are the flake family.** Tracked as GitHub issues, not here — `gh issue list
+--state open` is the authority, and this count has been stale before (it said eleven when five were open).
+Every non-flake issue on the board shipped on 2026-07-29 (DOC-5/#73, FILT-3/#74, FILT-4/#75, LAUNCH-1/#76 —
+see the shipped entries above), which leaves TEST-16/#45, TEST-21/#56, TEST-23/#64 and TEST-25/#71.
 
 **From #17–#22's evidence — two open, one of them nearly closed.** Three of the five have shipped
 (#25, #26, #27), and most of #24 turned out not to need what it said it needed — see the shipped entries
@@ -997,6 +1041,24 @@ Four other candidates were checked against the code and not filed at all:
 `smartStep` (already the last-hit-thread default), JDK 7 support (n/a on the wire protocol),
 `get_output`/`send_input` (no process handle on an attach-only connection — dead code upstream too),
 and bilingual docs.
+
+**From a *roadmap* comparison against the same two projects (2026-07-29) — three filed, ALL THREE NOW
+SHIPPED, two already settled.** Written while adding the README's comparison section, so the sources were each project's
+**TODO/Next Steps** rather than its shipped tool surface — which is why the 2026-07-26 pass above did not
+reach these. Upstream's four *Next Steps* (event loop, stepping, expression evaluation, string/object
+dereferencing) are all implemented here, so only `jdb-mcp`'s roadmap produced candidates: three filed,
+three already done (expression evaluation, multi-session, conditional + thread-filtered breakpoints).
+
+| issue | why it exists | what is actually left |
+| --- | --- | --- |
+| [#74](https://github.com/YgorPerez/java-debugging-mcp/issues/74) FILT-3 · P3 · M | `debug.set_line_stop` builds a JNI signature straight from `class_pattern` (`handlers.rs:341`), so `com.example.*` becomes `Lcom/example/*;` and matches nothing — while `debug.set_method_exit_stop` takes a real `ClassMatch`. The argument is *named* `class_pattern` and documented as "Class name pattern", so it promises matching the code does not do. | **Shipped 2026-07-29** — built, not partially fixed. Every open question got an answer rather than a workaround: N armings are **bounded** by `max_classes` and the count is stated (the caller could not see it, so the reply says it); the permanent deferral is owned by the *family* rather than by a breakpoint, so disabling it clears the watch too; and BP-3 is untouched — each member keeps its own `bp_` id, with `bpset_` added as a distinct id KIND for the family. The stale-bytecode question ("what does the reply look like when 3 of 40 are stale?") is answered as a roll-call naming them, with the full caveat kept per stop point. |
+| [#75](https://github.com/YgorPerez/java-debugging-mcp/issues/75) FILT-4 · P3 · S | One `class_pattern` per arming call, so covering five classes is five calls. | **Shipped 2026-07-29**, against the case stated here — so the two objections had to be answered rather than accepted. The id model: N stop points from one call, each with its own id, no group id invented (a wildcard family's `bpset_` is #74's, and is a different thing from a batch). Partial failure got the **shape it lacked**: one row per pattern, armed/deferred/refused/not-a-target each said differently, and no entry aborts the others. One exact class still gets the byte-identical single reply, so the ordinary call did not pay for the batch. |
+| [#76](https://github.com/YgorPerez/java-debugging-mcp/issues/76) LAUNCH-1 · P3 · M | No launch mode; `debug.attach` takes `host` + `port` and the JVM must already exist. First item on `jdb-mcp`'s TODO list. | **Shipped 2026-07-29** as `debug.launch`. Whose problem: someone debugging a small local program — and, more sharply, anyone who needs to break on code that runs *during startup*, which is unreachable by attaching at all. The second lifetime is owned explicitly (`kill_on_drop` at spawn, `detach_on_disconnect` to invert it, the pid named for the `SIGKILL` case we cannot cover without `unsafe`) rather than left implicit, which is the difference from TRANS-1/#33, where client lifetime *was* the safety model. `get_output`/`send_input` stay unfiled: the process handle now exists, but the diagnostic half of what they wanted — a dead debuggee's own words — is served by the launch, `disconnect` and `list_sessions` replies. |
+
+Both 2026-07-26 rejections were **re-derived** by this pass and correctly not refiled — which is the
+`.out-of-scope/` KB doing its job, since `http-transport.md` and `method-entry-events.md` each already
+record being raised from a `jdb-mcp` comparison. The README now states both as deliberate positions
+rather than gaps, so a reader comparing tool tables does not have to rediscover them either.
 
 ### The flake family (TEST-16/19/20/21/22/23/24/25) — five open
 

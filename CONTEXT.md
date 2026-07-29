@@ -17,6 +17,15 @@ _Avoid_: target, remote, server (the last belongs to the MCP server, which is th
 The `WildFly` instance several people use at once. Not an environment name — the constraint that decides
 every safety default, because freezing it stalls other people's requests.
 
+**Attached** / **launched**:
+Whose JVM it is, which is the fact every safety default here is derived from. An **attached** debuggee was
+started by somebody else and is presumed shared: suspending it is somebody else's stalled request, which is why
+suspensions are bounded, announced and rescued. A **launched** debuggee (LAUNCH-1) is one `debug.launch` started
+for this session — nobody else is on it, so suspending it costs nothing, `suspend=y` becomes reachable, and its
+lifetime is this process's problem instead of nobody's. `debug.list_sessions` states which a session is, because
+no other fact changes the advice on so many tools.
+_Avoid_: spawned, forked (the JVM is a child process, but the word that matters to a caller is who owns it)
+
 **Loaded**:
 Present in the debuggee, as opposed to present in a source tree. A class loads on first use, so an
 untouched code path contributes none of its classes, and the debuggee is the only authority on the
@@ -132,6 +141,20 @@ produced.
 A line breakpoint whose class is not loaded yet. It holds a class-load watch instead of a real request, and
 arms itself when the class appears.
 _Avoid_: pending (used for the internal bookkeeping, not the concept)
+
+**Wildcard family**:
+The N line breakpoints one wildcard `class_pattern` arms — one per matching class — plus the class-load watch
+that arms matching classes as they load (FILT-3). Every member is an ordinary line breakpoint with its own
+`bp_` id; the family adds a second, coarser handle (`bpset_`) that clears or toggles all of them and the watch
+together. A family is *permanently* deferred: unlike a deferred breakpoint, which drops its watch once its one
+class appears, a family's watch never goes away while the family is enabled, because every future matching
+class is new work.
+_Avoid_: group, set (`set` is the field name, not the concept — the caller-facing word is family)
+
+**Expansion**:
+Turning one wildcard into the concrete classes it arms. Bounded by `max_classes`, because the count is
+invisible to the caller before the call: `com.*` on an app server is thousands of line-table lookups and
+thousands of live requests. A reply that expanded says what it left out.
 
 ### Hits, and where they go
 
@@ -282,6 +305,11 @@ stop point cannot hold a shared instance indefinitely.
 **Stop-point id**:
 The caller-facing handle for a stop point (`bp_1`, `exc_2`, `watch_modify_3`, `mexit_4`). Stable for the
 stop point's whole life, including across a disable and re-arm.
+
+`bpset_1` is a fifth kind, added by FILT-3 for a **wildcard family**. It is a distinct KIND of id in the same
+namespace `clear_stop_point` already dispatches on by prefix — *not* a second way to address a breakpoint.
+BP-3's one-id-per-stop-point rule is intact: each member still has its own `bp_` id and behaves exactly like a
+breakpoint armed by name.
 
 **Request id**:
 The debuggee's own identifier for an armed request. An internal detail that changes when a stop point is

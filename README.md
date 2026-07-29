@@ -87,7 +87,8 @@ natural language.
   VM (`JDWP_WATCHDOG_SECS`, default 120) so a forgotten breakpoint can't freeze a shared instance
 
 > This fork implements `debug.evaluate` and `debug.step_*` (stubs upstream) plus the safety,
-> structured-event, array, set-value, and breakpoint-modifier features above.
+> structured-event, array, set-value, and breakpoint-modifier features above. See
+> [Compared with the other Java debugging MCP servers](#compared-with-the-other-java-debugging-mcp-servers).
 
 ## Quick Start
 
@@ -166,12 +167,13 @@ Adjust the path to match where you saved the downloaded binary (or `target/relea
 | Tool | Description |
 |------|-------------|
 | `debug.attach` | Connect to a JVM via JDWP |
-| `debug.set_line_stop` | Set a breakpoint by class+line, or by method name; optional `hit_count`, thread filter, `condition` (with `&&`/`||`), or `trace:true` (non-suspending logpoint, with `trace_max_hits` and `trace_frames`) |
+| `debug.launch` | **Start** a JVM under the debugger and attach to it — `main_class` + `classpath`, or `jar`, plus optional `jvm_args` / `args` / `working_dir` / `java_home`. `suspend` defaults to true, holding the VM before its first instruction, which is the only way to break on code that runs during startup. `debug.disconnect` terminates it unless `detach_on_disconnect:true`; its stdout/stderr are captured (never inherited — this server's stdout is the MCP transport) and reported if it dies |
+| `debug.set_line_stop` | Set a breakpoint by class+line, or by method name. `class_pattern` takes an exact class, a **wildcard** (`com.example.*` — arms one breakpoint per matching loaded class, keeps arming ones that load later, and is clearable as one `bpset_` id; needs `method`, refuses `line`, bounded by `max_classes`), or a **list** of either; optional `hit_count`, thread filter, `condition` (with `&&`/`||`), or `trace:true` (non-suspending logpoint, with `trace_max_hits` and `trace_frames`) |
 | `debug.set_exception_stop` | Break when an exception (of a class + its subclasses, or all) is thrown; `caught`/`uncaught` selectable, an optional `thread_id` filter, or `trace:true` (with `trace_max_hits` / `trace_frames`) to collect throws without suspending. Each hit reports the exception's **message** as well as its type and catch site — on JDK 15+ that is usually the diagnosis itself, since a `NullPointerException` names the failing subexpression (`because the return value of "X.getY()" is null`). On a framework that rethrows, the sightings of one instance are **folded**: the original throw and the escape point are both kept, the layers between become a count, and a collapsed rethrow does not spend `trace_max_hits` |
 | `debug.get_traces` | Read snapshots captured by any `trace:true` stop point — line, exception or watchpoint, each with the caller chain above it (bounded ring buffer; narrow with `bp_id` / `class_filter` / `since`, optional `clear`). A record marked `↻ rethrow of #<seq>` is the escaping end of a rethrow chain, and `#<seq>` is the original throw — the one with the application frame and the cause |
 | `debug.list_stop_points` | List active stop points (line, deferred, exception, watchpoint, method-exit) with trace budgets and thread filters — plus, for each traced one, its **measured** capture cost: mean per hit, the rate hits are arriving at, and the share of the window spent capturing |
-| `debug.clear_stop_point` | Remove a stop point (line, deferred, exception, watchpoint, or method-exit) |
-| `debug.toggle_stop_point` | Silence or re-arm any stop point (`bp_…` / `exc_…` / `watch_…` / `mexit_…`) without losing its `condition`/`trace_expr`; the id stays the same across the round trip |
+| `debug.clear_stop_point` | Remove a stop point (line, deferred, exception, watchpoint, method-exit) — or a whole wildcard family by its `bpset_…` id, which also drops its watch for classes that load later |
+| `debug.toggle_stop_point` | Silence or re-arm any stop point (`bp_…` / `exc_…` / `watch_…` / `mexit_…` / `bpset_…`) without losing its `condition`/`trace_expr`; the id stays the same across the round trip |
 | `debug.continue` | Resume execution |
 | `debug.step_over` | Step over current line (defaults to last-hit thread) |
 | `debug.step_into` | Step into a method call |
@@ -233,6 +235,69 @@ render as `Type (id=0x…)`, because pretty-printing one means invoking it. Read
 invocation are unaffected — locals, fields, statics, array indexing, `get_stack`, and
 watchpoint/exception reporting. A guard against accidentally mutating a production JVM, **not** a
 security boundary: anyone who can reach the JDWP port can open their own connection without it.
+
+## Compared with the other Java debugging MCP servers
+
+Two other projects solve the same problem, and one of them is this repository's **parent**: this is a
+fork of [`navicore/jdwp-mcp`](https://github.com/navicore/jdwp-mcp), which is where the JDWP client,
+the 13 original tool names and the architecture diagram above come from. The other is
+[`d4n-sec/jdb-mcp`](https://github.com/d4n-sec/jdb-mcp), an independent implementation built on JDI
+instead of the wire protocol. All three are MIT. The rows below were read off each repository — code,
+not just README — on **29 Jul 2026**; the two upstreams move, so re-check before quoting this.
+
+| | **this fork** | `navicore/jdwp-mcp` | `d4n-sec/jdb-mcp` |
+| --- | --- | --- | --- |
+| Talks to the JVM through | JDWP, implemented natively (Rust) | JDWP, implemented natively (Rust) | JDI, the JDK's own debug API (Java) |
+| Needs a JDK to run *the debugger* | no — one self-contained binary | no | **yes**, JDK 17+ (a JDK 7 build exists for legacy targets) |
+| Debug tools | 33 | 13 | 13+ (11 listed, `tools/list` for the rest) |
+| Stepping | yes | tool exists; the handler returns `"Step over not yet implemented"` | yes |
+| Expression evaluation | chains, static and instance methods, overload resolution on runtime types, subscripts, deep expansion | same stub as stepping | not yet — `debug_calc` is the first item on its TODO list |
+| Watchpoints / method-exit values | field read+write with old → new; return value **and which `return`** | no | `debug_set_watchpoint`, method entry/exit monitors |
+| Conditional, hit-count and thread-filtered stop points | yes | no | on the TODO list |
+| Wildcard / batched class patterns when arming | **yes** — one wildcard arms every matching loaded class *and* keeps arming ones that load later, addressable as one id; every arming tool also takes a list of patterns | no | on the TODO list (as "package prefix filtering" and "batch class filtering") |
+| Non-suspending trace mode | yes, on breakpoints, exception stops and watchpoints, with measured per-hit cost | no | not documented |
+| Hot reload / frame rewind | `RedefineClasses` + `PopFrames`, with all twelve HotSpot refusals mapped | no | no |
+| Concurrent sessions | yes, with `debug.list_sessions` | single | single — explicitly, "eliminating the need for complex `sessionId` management" |
+| Transports | stdio | stdio | stdio **and HTTP** |
+| A hit reaches the agent by | `notifications/message` **push**, plus the buffered `debug.get_last_event` — push for *suspending* hits only, since a traced stop point is built to fire hundreds of times a second (EVT-2) | event loop is listed as a next step | **MCP notifications** |
+| Launching the target for you | **yes** — `debug.launch`, and it holds the JVM *before its first instruction* (`suspend=y`), so a breakpoint in a static initialiser can fire | no | no (`debug_launch` is on its TODO list) |
+| `METHOD_ENTRY` monitors across a class pattern | **no**, deliberately (METH-1) | no | `debug_set_method_entry` |
+| Maintenance | this repo | GitHub copy **archived 28 Apr 2026**, moved to `git.navicore.tech` (last commit there 6 Oct 2025) | active, last push 30 Jan 2026 |
+
+**What the fork actually changed.** Upstream's README still lists "event loop for async breakpoint
+notifications", "stepping commands", "expression evaluation" and "string and object dereferencing" under
+*Next Steps*, and its `handle_evaluate` / `handle_step_*` return their TODO strings — so upstream is a
+working JDWP client and a set of tool names, and every capability in the Features list above except
+attach, line breakpoints and `get_stack` was written here. The largest additions are the ones a shared,
+long-running app server forces on you: an expression evaluator that resolves overloads the way `javac`
+would, non-suspending trace mode, the watchdog and read-only mode, hot reload with `pop_frame`,
+staleness detection, and a thread dump that names lock owners.
+
+**Where the others are ahead.** `jdb-mcp` ships an **HTTP transport**; stdio is the only way into this
+server. It also has `debug_set_method_entry`, a `METHOD_ENTRY` monitor across a class pattern, which
+here is a deliberate omission rather than a gap — with a `ClassMatch` it is the noisiest event in JDWP,
+and "what called this?" is answered far more cheaply by a traced breakpoint's caller chain (METH-1,
+TRACE-5) — but if you want that firehose, it has one and this does not. Being JDI-based it also
+inherits Oracle's implementation of the hard parts: a wire-protocol bug here is ours to find, and some
+have been (the packet reader had to become its own task because `select!` was cancelling it mid-packet).
+Upstream, for its part, is a much smaller codebase and still the clearest place to read how JDWP framing
+works in Rust.
+
+**Their roadmaps, measured against this.** Upstream's four *Next Steps* — event loop, stepping,
+expression evaluation, string/object dereferencing — are all implemented here. `jdb-mcp`'s six TODO items
+are now **all** implemented here: expression evaluation, multi-session, and conditional + thread-filtered
+breakpoints already were; package-prefix filtering, batch class filtering and `debug_launch` were built on
+2026-07-29 (FILT-3, FILT-4, LAUNCH-1) *because* this comparison surfaced them. That is not a claim about
+`jdb-mcp` — a TODO list is a statement of intent, and theirs may well arrive with a better shape than ours.
+
+**Where the three differ on starting the JVM.** The upstreams are attach-only: you start the JVM with
+`-agentlib:jdwp` yourself. This fork does both, and the difference is not convenience — attaching can never
+break on code that runs *during* startup, because by the time a connection is possible the static
+initialisers have run. `debug.launch` holds the VM before its first instruction. A launched JVM also has no
+one else on it, so the shared-instance cautions that shape everything else here do not apply to it.
+
+**Where none of the three differ.** None is a security boundary — anyone who can reach a JDWP port owns the
+JVM.
 
 ## Example: Debugging with kubectl port-forward
 
@@ -547,11 +612,11 @@ instead.
 
 ## Status
 
-✅ **Functionally complete** — 19 debug tools, integrated and validated against a live JVM.
+✅ **Functionally complete** — 33 debug tools, integrated and validated against a live JVM.
 
 ### Implemented
 - [x] JDWP protocol (handshake, packets, encoding/decoding)
-- [x] MCP server with 19 debug tools (stdio transport)
+- [x] MCP server with 33 debug tools (stdio transport)
 - [x] VirtualMachine commands (Version, IDSizes, AllThreads, Suspend/Resume, CreateString, Capabilities/**CapabilitiesNew**, **RedefineClasses**)
 - [x] ClassesBySignature, ReferenceType.Methods/Fields/Signature, ClassType.Superclass
 - [x] Method.LineTable / VariableTable
