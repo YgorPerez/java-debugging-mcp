@@ -212,7 +212,7 @@ impl Jdk {
     /// incident ran through. A `PATH` hit is the bare word `javac` and names no directory at all. The snap
     /// runtime is reached through a `current` symlink, so only `java.home` pins the answer to a revision
     /// (`/snap/intellij-idea-ultimate/800/jbr`) rather than to whatever `current` meant that afternoon.
-    fn home(&self) -> PathBuf {
+    pub fn home(&self) -> PathBuf {
         Command::new(&self.java)
             .args(["-XshowSettings:properties", "-version"])
             .output()

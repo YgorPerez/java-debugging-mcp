@@ -135,6 +135,11 @@ pub struct DebugSession {
     /// Breakpoints requested on classes not yet loaded. Each holds a `CLASS_PREPARE` request that
     /// fires when the class loads; the event pump then arms the real breakpoint. See handlers.rs.
     pub pending_breakpoints: Vec<PendingBreakpoint>,
+    /// Wildcard line-breakpoint families (FILT-3), keyed by their `bpset_` id.
+    pub pattern_sets: HashMap<String, PatternStopSet>,
+    /// The JVM this session STARTED, if any (LAUNCH-1) — `None` for an ordinary `debug.attach`, which is
+    /// the difference between a debuggee whose lifetime is ours and one that belongs to somebody else.
+    pub launched: Option<LaunchedJvm>,
     /// Active exception breakpoints (EXCEPTION event requests), keyed by their `exc_` id.
     pub exception_requests: HashMap<String, ExceptionRequestInfo>,
     /// Active field watchpoints (`FIELD_ACCESS` / `FIELD_MODIFICATION` requests), keyed by `watch_` id.
@@ -699,6 +704,139 @@ pub struct PendingBreakpoint {
     pub trace_frames: usize,
 }
 
+/// A **family** of line breakpoints armed from one wildcard class pattern (FILT-3).
+///
+/// The thing a wildcard actually is: one caller intent (`break at the entry of handle on every
+/// implementation of this interface`) that becomes N breakpoints, N JDWP requests and N line-table
+/// lookups — plus an open-ended promise about classes that have not loaded yet.
+///
+/// **Why the members keep their own ids.** BP-3 says one id per stop point and the addressing tools lean
+/// on it: `clear_stop_point`, `toggle_stop_point` and `list_stop_points`' per-request cost accounting
+/// (ADR-0010) all key on a single `bp_…`. A wildcard does not change that — every armed location is an
+/// ordinary [`BreakpointInfo`] under its own `bp_…` id and behaves exactly like one armed by name. This
+/// record is what makes the *family* addressable as well, under a `bpset_…` id, and it exists because the
+/// alternative is worse: a caller who armed 40 locations with one call and cannot un-arm them with one
+/// call has been handed a mess, and a family that keeps arming new classes with no way to stop it would
+/// be a stop point nobody can turn off — which is not something this server is allowed to build.
+///
+/// It is a distinct KIND of id, not a second way to address a breakpoint: `exc_`, `watch_` and `mexit_`
+/// are already distinct kinds that `clear_stop_point` dispatches on by prefix, and `bpset_` joins them.
+/// Clearing a member by its own `bp_…` still works and the family notices.
+#[derive(Debug, Clone)]
+pub struct PatternStopSet {
+    /// The caller-facing `bpset_` id, stable for the family's whole life.
+    pub id: String,
+    /// The dotted wildcard pattern as the caller wrote it (`com.example.*`).
+    pub class_pattern: String,
+    /// The `CLASS_PREPARE` request that arms classes loading from now on; `None` while disabled.
+    ///
+    /// The same primitive a deferred breakpoint uses, with one difference that matters: a deferred
+    /// breakpoint clears its watch the moment its one class loads, and this one never does. A wildcard is
+    /// *permanently* deferred — every future matching class is new work — so the watch is the family's,
+    /// not one breakpoint's, and disabling the family has to clear it or the family would keep growing
+    /// while reporting itself silenced.
+    pub class_prepare_request_id: Option<i32>,
+    pub enabled: bool,
+    /// `bp_` ids this family has armed, in arming order.
+    pub members: Vec<String>,
+    /// Classes armed AFTER the arming reply was written, by the event pump — a bounded sample of names.
+    ///
+    /// Reported by `list_stop_points` because it is the one part of a wildcard's cost that no reply could
+    /// have stated: the caller was told "3 classes" and may now hold 9. Bounded like every other buffer
+    /// here, with [`armed_later_total`](Self::armed_later_total) carrying the count the sample cannot.
+    pub armed_later: Vec<String>,
+    /// How many classes have been armed since the arming reply — the true count, never truncated.
+    pub armed_later_total: usize,
+    /// The location and behaviour every member is armed with — the family's definition, kept so a class
+    /// loading in an hour is armed the same way the first one was.
+    pub method: Option<String>,
+    pub hit_count: Option<i32>,
+    pub thread_filter: Option<u64>,
+    pub condition: Option<String>,
+    pub trace: bool,
+    pub trace_expr: Option<String>,
+    pub trace_budget: Option<u32>,
+    pub trace_frames: usize,
+    /// Ceiling on live members, from `max_classes`.
+    pub max_classes: usize,
+    /// Matching classes NOT armed because the family was already full — reported, never silent.
+    pub skipped_at_cap: usize,
+    /// Matching classes that do not have the target method at all, which for a broad pattern is the
+    /// expected majority rather than a failure.
+    pub no_method: usize,
+}
+
+/// How many lines of a launched JVM's own output are kept.
+pub const MAX_DEBUGGEE_OUTPUT: usize = 200;
+
+/// A JVM **this server started**, owned by the session that started it (LAUNCH-1).
+///
+/// The thing that makes a launched JVM different from every other session here is that its lifetime is now
+/// this process's problem. That was the argument against building this at all, and it is answered in three
+/// places rather than assumed away:
+///
+/// - **Termination is decided at spawn time**, via `Command::kill_on_drop`. With the default
+///   (`detach_on_disconnect: false`) dropping this record kills the JVM, so a session that goes away for any
+///   reason — `debug.disconnect`, a dropped session map, a clean server exit — takes the process with it and
+///   cannot leak a JVM with an open JDWP port. With `detach_on_disconnect: true` it is never killed, and the
+///   caller has been told the lifetime is theirs.
+/// - **A `SIGKILL`ed server still orphans it.** Putting the child in its own process group needs `pre_exec`,
+///   which is `unsafe` and fails this workspace's lint gate (ADR-0007), so the honest answer is to say so:
+///   the launch reply names the pid for exactly this case. Silence would have been the alternative, and
+///   silence must never read as an answer.
+/// - **Its output is captured, not inherited.** Inheriting is not an option: this server's stdout *is* the
+///   MCP transport, and a debuggee printing to it would corrupt the protocol. So both streams are piped and
+///   drained into this bounded buffer, which also stops a chatty program from filling a pipe and blocking on
+///   a debugger that never reads it.
+#[derive(Debug)]
+pub struct LaunchedJvm {
+    /// OS process id — reported so a caller can kill it themselves if this server dies badly.
+    pub pid: Option<u32>,
+    /// The full command line, for reporting: "which JDK, which classpath" is the question a
+    /// version-dependent bug turns on.
+    pub command: String,
+    /// The child handle. Killing on drop is configured at spawn from `detach_on_disconnect`.
+    pub child: tokio::process::Child,
+    /// The debuggee's own stdout/stderr, most recent last, bounded by [`MAX_DEBUGGEE_OUTPUT`].
+    ///
+    /// A `std::sync::Mutex` rather than the async one used elsewhere here, and for a reason that shows up in
+    /// the reply: `debug.list_sessions` renders a session line synchronously, and a launched JVM that has
+    /// DIED needs its last words on that line — the alternative is a session reported `DEAD` with the
+    /// explanation sitting in a buffer nothing can reach. Nothing holds this lock across an await.
+    pub output: std::sync::Arc<std::sync::Mutex<VecDeque<String>>>,
+    /// Leave the JVM running when the session ends.
+    pub detach_on_disconnect: bool,
+}
+
+impl LaunchedJvm {
+    /// The last `n` captured output lines, oldest first. Empty if the buffer is poisoned — a debuggee's
+    /// stdout is never worth propagating a panic for.
+    pub fn tail(&self, n: usize) -> Vec<String> {
+        let Ok(buf) = self.output.lock() else {
+            return Vec::new();
+        };
+        buf.iter().skip(buf.len().saturating_sub(n)).cloned().collect()
+    }
+}
+
+/// How many newly-armed class names one family keeps for reporting.
+const MAX_ARMED_LATER_SAMPLE: usize = 25;
+
+impl PatternStopSet {
+    /// Is there room for another member?
+    pub fn has_room(&self) -> bool {
+        self.members.len() < self.max_classes
+    }
+
+    /// Record a class armed after the arming reply: the count always, the name while there is room.
+    pub fn note_armed_later(&mut self, class: &str) {
+        self.armed_later_total += 1;
+        if self.armed_later.len() < MAX_ARMED_LATER_SAMPLE {
+            self.armed_later.push(class.to_string());
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BreakpointInfo {
     /// The live JDWP request id, or `None` when the breakpoint is disabled — its definition is kept
@@ -800,6 +938,8 @@ impl SessionManager {
             class_roots,
             redefinitions: std::collections::BTreeMap::new(),
             pending_breakpoints: Vec::new(),
+            pattern_sets: HashMap::new(),
+            launched: None,
             exception_requests: HashMap::new(),
             watchpoints: HashMap::new(),
             method_exits: HashMap::new(),

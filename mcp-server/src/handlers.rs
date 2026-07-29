@@ -180,6 +180,7 @@ impl RequestHandler {
     async fn dispatch_control(&self, name: &str, args: serde_json::Value) -> Option<Result<String, String>> {
         Some(match name {
             "debug.attach" => self.handle_attach(args).await,
+            "debug.launch" => self.handle_launch(args).await,
             "debug.set_line_stop" => self.handle_set_line_stop(args).await,
             "debug.list_stop_points" => self.handle_list_stop_points(args).await,
             "debug.clear_stop_point" => self.handle_clear_stop_point(args).await,
@@ -256,6 +257,40 @@ impl RequestHandler {
         // than by inspecting expression text up here (SAFE-6). The flag is shared with every clone,
         // including the event pump's — which is what evaluates a condition or `trace_expr` on a hit.
         let read_only = a.read_only || env_readonly();
+        let session_id = self
+            .open_session(
+                &args,
+                connection,
+                format!("{host}:{port}"),
+                read_only,
+                a.source_roots.as_ref(),
+                a.class_roots.as_ref(),
+            )
+            .await?;
+
+        let ro = if read_only {
+            "\n   🔒 Read-only: method invocation, set_value and force_return are refused; collection expansion falls back to shallow. A guard against accident, not a security boundary."
+        } else {
+            ""
+        };
+        Ok(format!("Connected to JVM at {host}:{port} (session: {session_id}){ro}"))
+    }
+
+    /// Create a session around an established connection and start the two tasks it cannot live without.
+    ///
+    /// Shared by `debug.attach` and `debug.launch` (LAUNCH-1), because everything below the connection is
+    /// identical: a launched JVM needs the same event pump and the same watchdog as one that belonged to
+    /// somebody else. Only the *reason* the connection exists differs, and that lives on the session as
+    /// `launched`.
+    async fn open_session(
+        &self,
+        args: &serde_json::Value,
+        connection: jdwp_client::JdwpConnection,
+        endpoint: String,
+        read_only: bool,
+        source_roots: Option<&Vec<String>>,
+        class_roots: Option<&Vec<String>>,
+    ) -> Result<crate::session::SessionId, String> {
         if read_only {
             connection.set_read_only(true);
         }
@@ -263,24 +298,20 @@ impl RequestHandler {
         // how `read_only` combines above — and deliberately so. `JDWP_READONLY` is a deploy-wide guard
         // that must not be relaxable per-attach; `JDWP_SOURCE_ROOTS` is only a convenience default, so
         // a caller who names roots for this JVM means those and not also whatever the environment held.
-        let source_roots = a
-            .source_roots
-            .as_ref()
-            .map_or_else(env_source_roots, |v| v.iter().map(std::path::PathBuf::from).collect());
+        let source_roots =
+            source_roots.map_or_else(env_source_roots, |v| v.iter().map(std::path::PathBuf::from).collect());
         // Class roots (SWAP-1) combine the same way as source roots and for the same reason, but they
         // are a SEPARATE list: `target/classes` is not `src/main/java`, and a caller who configured one
         // has said nothing about the other.
-        let class_roots = a
-            .class_roots
-            .as_ref()
-            .map_or_else(env_class_roots, |v| v.iter().map(std::path::PathBuf::from).collect());
+        let class_roots =
+            class_roots.map_or_else(env_class_roots, |v| v.iter().map(std::path::PathBuf::from).collect());
         let session_id = self
             .session_manager
-            .create_session(connection, format!("{host}:{port}"), read_only, source_roots, class_roots)
+            .create_session(connection, endpoint, read_only, source_roots, class_roots)
             .await;
         // Get the session guard once so the listener/watchdog handles are stored before we return.
         let session_guard = self
-            .resolve_session(&args)
+            .resolve_session(args)
             .await
             .ok_or_else(|| "Failed to get session after creation".to_string())?;
 
@@ -298,12 +329,98 @@ impl RequestHandler {
             session.watchdog_task = Some(spawn_watchdog(self.session_manager.clone(), session_id.clone()));
         }
 
-        let ro = if read_only {
-            "\n   🔒 Read-only: method invocation, set_value and force_return are refused; collection expansion falls back to shallow. A guard against accident, not a security boundary."
-        } else {
-            ""
+        Ok(session_id)
+    }
+
+    /// LAUNCH-1: start a JVM under the debugger, rather than attaching to one somebody else started.
+    ///
+    /// **Why this is a sibling tool and not a flag on `debug.attach`.** Attaching and launching differ in the
+    /// one thing this server's safety model is built around: whose JVM it is. An attached JVM is presumed
+    /// shared, which is why every suspension here is bounded, announced and rescued. A launched JVM is the
+    /// caller's alone, so `suspend=y` — otherwise unreachable, and the only way to break on code that runs
+    /// during initialisation — becomes a sensible default, and this process now owns a lifetime it did not
+    /// before. Those are different tools with different advice, and folding them into one argument would have
+    /// left the advice averaged.
+    ///
+    /// The failure this is most careful about is the JVM that dies during startup. A missing main class, a
+    /// bad classpath, a port already taken: all of them look identical from here — a connect that never
+    /// succeeds — so the child is polled alongside the port, and when it has exited its own output is what
+    /// the reply reports. Without that, the caller gets a timeout and no reason for it.
+    async fn handle_launch(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::LaunchArgs = crate::args::parse(&args)?;
+        let target = launch_target(&a)?;
+        let java = resolve_java_binary(a.java_home.as_deref())?;
+        let port = if a.port == 0 { free_local_port()? } else { a.port };
+
+        let (mut command, printable) = build_launch_command(&a, &target, &java, port);
+        let mut child = command.spawn().map_err(|e| {
+            format!(
+                "Failed to start the JVM: {e}\n   Command: {printable}\n   If that is not a usable java \
+                 binary, pass java_home, or set JAVA_HOME."
+            )
+        })?;
+        let pid = child.id();
+
+        let output = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        if let Some(out) = child.stdout.take() {
+            spawn_output_drain(std::sync::Arc::clone(&output), out, "out");
+        }
+        if let Some(err) = child.stderr.take() {
+            spawn_output_drain(std::sync::Arc::clone(&output), err, "err");
+        }
+
+        let connection = match connect_to_launched(&mut child, port).await {
+            Ok(c) => c,
+            Err(why) => {
+                // The child is killed by `Drop` when `detach_on_disconnect` is false; when it is true nothing
+                // else will ever own this process, so a failed launch must not leave it behind either.
+                let _ = child.start_kill();
+                let tail = tail_of(&output, 30);
+                return Err(format!(
+                    "{why}\n   Command: {printable}{}",
+                    if tail.is_empty() {
+                        "\n   The JVM printed nothing at all before this.".to_string()
+                    } else {
+                        format!("\n   Its own output:\n{}", indent_lines(&tail, "     "))
+                    }
+                ));
+            }
         };
-        Ok(format!("Connected to JVM at {host}:{port} (session: {session_id}){ro}"))
+
+        let read_only = a.read_only || env_readonly();
+        let session_id = self
+            .open_session(
+                &args,
+                connection,
+                format!("127.0.0.1:{port}"),
+                read_only,
+                a.source_roots.as_ref(),
+                a.class_roots.as_ref(),
+            )
+            .await?;
+
+        let session_guard = self
+            .resolve_session(&args)
+            .await
+            .ok_or_else(|| "Failed to get session after launch".to_string())?;
+        {
+            let mut session = session_guard.lock().await;
+            session.launched = Some(crate::session::LaunchedJvm {
+                pid,
+                command: printable.clone(),
+                child,
+                output,
+                detach_on_disconnect: a.detach_on_disconnect,
+            });
+            // `suspend=y` means every thread really is held, and holding it is the caller's intent — but the
+            // state still has to be TRUE on the session, or `list_sessions` would call a frozen VM running
+            // and the watchdog would never rescue a caller who walked away mid-setup (SAFE-4/SAFE-7).
+            if a.suspend {
+                session.mark_suspended(crate::session::SuspendCause::ManualPause);
+            }
+        }
+
+        Ok(render_launch_reply(&a, &target, &LaunchReply { session_id: &session_id, port, pid, read_only }))
     }
 
     /// List every live session, so a caller who lost a `session_id` can find it again.
@@ -332,22 +449,35 @@ impl RequestHandler {
 
     async fn handle_set_line_stop(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::SetBreakpointArgs = crate::args::parse(&args)?;
-        let class_pattern = a.class_pattern.as_str();
+        let patterns = a.class_pattern.list();
+        if patterns.is_empty() {
+            return Err("Provide a class_pattern — one class name, a wildcard like \"com.example.*\", or \
+                        a list of either."
+                .to_string());
+        }
 
         if a.line.is_none() && a.method.is_none() {
             return Err("Provide 'line' and/or 'method'".to_string());
         }
+        // A line number is not portable across classes, so a wildcard refuses one (FILT-3): `:412` is a
+        // different statement in every class the pattern matches, and arming it everywhere would produce N
+        // stop points with N unrelated meanings — the kind of result that looks like it worked. `method` is
+        // the argument that means the same thing in every match, which is why a wildcard needs it.
+        if let (Some(line), Some(w)) = (a.line, patterns.iter().find(|p| is_wildcard(p))) {
+            return Err(format!(
+                "'{w}' is a wildcard, so it can't be combined with 'line': line {line} is a different \
+                 statement in every class it matches. Name the 'method' instead — a wildcard breaks at the \
+                 first line of that method in each matching class — or give one exact class name."
+            ));
+        }
 
-        let signature = if class_pattern.starts_with('L') && class_pattern.ends_with(';') {
-            class_pattern.to_string()
-        } else {
-            format!("L{};", class_pattern.replace('.', "/"))
-        };
         let suspend_policy = suspend_policy_for(a.trace);
         let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
-        let spec = BreakpointSpec {
-            class_pattern: class_pattern.to_string(),
-            signature,
+        let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
+        // One definition, pointed at each pattern in turn below.
+        let base = BreakpointSpec {
+            class_pattern: String::new(),
+            signature: String::new(),
             line_opt: a.line,
             method_hint: a.method.clone(),
             hit_count: a.hit_count,
@@ -365,48 +495,34 @@ impl RequestHandler {
             .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
-        check_readonly_exprs(session.read_only, spec.condition.as_deref(), spec.trace_expr.as_deref())?;
-        check_thread_filter(&mut session.connection, spec.thread_filter).await?;
+        check_readonly_exprs(session.read_only, base.condition.as_deref(), base.trace_expr.as_deref())?;
+        check_thread_filter(&mut session.connection, base.thread_filter).await?;
 
-        // One id for this breakpoint's whole life, allocated before we know whether it arms now or is
-        // deferred — and kept across any later disable/re-arm (BP-3).
-        let bp_id = session.next_stop_id("bp_");
+        // ONE EXACT CLASS KEEPS THE REPLY IT HAS ALWAYS HAD, down to the wording — including the error
+        // when it fails. FILT-4 widened what this tool accepts; it must not have widened what the ordinary
+        // call returns, or every caller and skill written against it would have to be re-read.
+        if let (1, Some(only)) = (patterns.len(), patterns.first().filter(|p| !is_wildcard(p))) {
+            let spec = base.for_pattern(only);
+            let out = arm_single_named(&mut session, &spec, frames_note.as_deref()).await;
+            drop(session);
+            return out;
+        }
 
-        let classes = session
-            .connection
-            .classes_by_signature(&spec.signature)
-            .await
-            .map_err(|e| format!("Failed to find class: {e}"))?;
-        let Some(first_class) = classes.first() else {
-            return register_deferred_breakpoint(&mut session, &spec, bp_id).await;
+        // Anything that CAN produce several stop points gets the per-pattern breakdown, because partial
+        // success is the normal outcome and an error would discard the patterns that worked.
+        let index = if patterns.iter().any(|p| is_wildcard(p)) {
+            load_class_index(&mut session.connection).await?
+        } else {
+            Vec::new()
         };
-        let class_type_id = first_class.type_id;
-
-        let armed = arm_and_insert(&mut session, class_type_id, &spec, bp_id).await?;
-        let (bp_id, line, method_name, request_id) =
-            (armed.bp_id, armed.line, armed.method_name, armed.request_id);
+        let mut outcomes = Vec::with_capacity(patterns.len());
+        for p in &patterns {
+            let spec = base.for_pattern(p);
+            outcomes.push(arm_one_pattern(&mut session, &spec, &index, max_classes).await);
+        }
         drop(session);
 
-        let mut extra = describe_trace_mode(&spec, frames_note.as_deref());
-        if let Some(c) = spec.hit_count {
-            let _ = write!(extra, "\n   Stops on hit #{c}");
-        }
-        if let Some(t) = spec.thread_filter {
-            let _ = write!(extra, "\n   Thread filter: 0x{t:x}");
-        }
-        if let Some(c) = &spec.condition {
-            let _ = write!(extra, "\n   Condition: {c}");
-        }
-        Ok(format!(
-            "✅ {} set at {}:{}\n   Method: {}\n   Stop-point ID: {}\n   JDWP Request ID: {}{}",
-            if spec.trace { "Trace breakpoint" } else { "Breakpoint" },
-            spec.class_pattern,
-            line,
-            method_name,
-            bp_id,
-            request_id,
-            extra
-        ) + armed.drift.as_deref().unwrap_or(""))
+        Ok(render_pattern_outcomes(&base, &patterns, &outcomes, frames_note.as_deref(), max_classes))
     }
 
     async fn handle_list_stop_points(&self, args: serde_json::Value) -> Result<String, String> {
@@ -420,6 +536,7 @@ impl RequestHandler {
             && session.exception_requests.is_empty()
             && session.watchpoints.is_empty()
             && session.method_exits.is_empty()
+            && session.pattern_sets.is_empty()
         {
             return Ok(session.last_watchdog_note.as_ref().map_or_else(
                 || "No breakpoints set".to_string(),
@@ -439,33 +556,20 @@ impl RequestHandler {
         }
         let _ = write!(
             output,
-            "📍 {} breakpoint(s), {} deferred, {} exception, {} watchpoint(s), {} method-exit:\n\n",
+            "📍 {} breakpoint(s), {} deferred, {} exception, {} watchpoint(s), {} method-exit{}:\n\n",
             session.breakpoints.len(),
             session.pending_breakpoints.len(),
             session.exception_requests.len(),
             session.watchpoints.len(),
-            session.method_exits.len()
+            session.method_exits.len(),
+            if session.pattern_sets.is_empty() {
+                String::new()
+            } else {
+                format!(", {} wildcard family(ies)", session.pattern_sets.len())
+            }
         );
 
-        for (bp_id, bp) in &session.breakpoints {
-            render_breakpoint_line(&mut output, bp_id, bp, &dead);
-        }
-
-        for pb in &session.pending_breakpoints {
-            render_pending_line(&mut output, pb, &dead);
-        }
-
-        for er in session.exception_requests.values() {
-            render_exception_line(&mut output, er, &dead);
-        }
-
-        for (watch_id, wp) in &session.watchpoints {
-            render_watchpoint_line(&mut output, watch_id, wp, &dead);
-        }
-
-        for me in session.method_exits.values() {
-            render_method_exit_line(&mut output, me, &dead);
-        }
+        render_every_stop_point(&mut output, &session, &dead);
         if !dead.is_empty() {
             let _ = write!(
                 output,
@@ -529,6 +633,14 @@ impl RequestHandler {
             ));
         }
 
+        // A wildcard family (FILT-3) owns N breakpoints AND a class-prepare watch under one id, so
+        // clearing it has to take all of them: a caller who armed 40 locations with one call must be able
+        // to drop them with one, and a watch left behind would keep arming new classes for a family the
+        // caller believes is gone.
+        if let Some(set) = session.pattern_sets.remove(bp_id) {
+            return Ok(clear_pattern_family(&mut session, bp_id, &set).await);
+        }
+
         // A deferred (not-yet-armed) breakpoint lives in pending_breakpoints with only a
         // CLASS_PREPARE watch — clear that watch instead of a real breakpoint request.
         if let Some(pos) = session.pending_breakpoints.iter().position(|p| p.bp_id == bp_id) {
@@ -553,6 +665,11 @@ impl RequestHandler {
 
         // Remove from session
         session.breakpoints.remove(bp_id);
+        // If it belonged to a wildcard family, the family's member list must stop claiming it (FILT-3).
+        // That also frees a slot under `max_classes`, which is correct: the location is genuinely gone.
+        for set in session.pattern_sets.values_mut() {
+            set.members.retain(|m| m != bp_id);
+        }
         drop(session);
 
         Ok(format!(
@@ -576,6 +693,22 @@ impl RequestHandler {
         let session_guard =
             self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
+
+        // A wildcard family toggles as a unit (FILT-3): its members AND its watch for future classes, or
+        // silencing it would leave it quietly still growing.
+        if let Some(set) = session.pattern_sets.get(&id) {
+            let current = set.enabled;
+            let want = a.enabled.unwrap_or(!current);
+            if want == current {
+                return Ok(format!(
+                    "No change: {id} is already {}.",
+                    if current { "armed" } else { "disabled" }
+                ));
+            }
+            let out = toggle_pattern_family(&mut session, &id, want).await;
+            drop(session);
+            return out;
+        }
 
         // Current state, whichever map owns this id.
         let current = if let Some(b) = session.breakpoints.get(&id) {
@@ -695,6 +828,7 @@ impl RequestHandler {
         }
         let n = session.breakpoints.len();
         let np = session.pending_breakpoints.len();
+        let nf = session.pattern_sets.len();
         let ne = session.exception_requests.len();
         let nw = session.watchpoints.len();
         let nm = session.method_exits.len();
@@ -704,6 +838,14 @@ impl RequestHandler {
         let pend: Vec<i32> =
             session.pending_breakpoints.drain(..).map(|p| p.class_prepare_request_id).collect();
         for req in pend {
+            let _ = session.connection.clear_class_prepare(req).await;
+        }
+        // A wildcard family's members are BREAKPOINT requests, so `ClearAllBreakpoints` above already took
+        // them — but its class-prepare watch is a different event kind and would survive, re-arming new
+        // classes on a VM the caller just asked to be left alone (FILT-3).
+        let sets: Vec<i32> =
+            session.pattern_sets.drain().filter_map(|(_, s)| s.class_prepare_request_id).collect();
+        for req in sets {
             let _ = session.connection.clear_class_prepare(req).await;
         }
         // ClearAllBreakpoints only removes BREAKPOINT requests — clear exception requests too. A
@@ -741,8 +883,9 @@ impl RequestHandler {
         drop(session);
 
         Ok(format!(
-            "🧯 Panic: cleared {} breakpoint(s){}{}{}{} and resumed all threads.{}{residue}",
+            "🧯 Panic: cleared {} breakpoint(s){}{}{}{}{} and resumed all threads.{}{residue}",
             n,
+            if nf > 0 { format!(" + {nf} wildcard family(ies)") } else { String::new() },
             if np > 0 { format!(" + {np} deferred") } else { String::new() },
             if ne > 0 { format!(" + {ne} exception") } else { String::new() },
             if nw > 0 { format!(" + {nw} watchpoint") } else { String::new() },
@@ -1493,7 +1636,8 @@ impl RequestHandler {
             let stops = session.breakpoints.len()
                 + session.pending_breakpoints.len()
                 + session.exception_requests.len()
-                + session.watchpoints.len();
+                + session.watchpoints.len()
+                + session.pattern_sets.len();
             if let Some(req) = session.pending_step.take() {
                 let _ = session.connection.clear_step(req).await;
             }
@@ -1513,8 +1657,12 @@ impl RequestHandler {
             // Read the residue before the session is removed, because removing it is what destroys the
             // only record that these redefinitions happened (SWAP-2).
             let residue = describe_outstanding_redefinitions(&session.redefinitions);
+            // A JVM we STARTED is ours to end (LAUNCH-1). Done here, explicitly, rather than left to
+            // `kill_on_drop` — the caller has to be told which it was, and a launched JVM's last output is
+            // often the whole point of the run.
+            let launched = end_launched_jvm(&mut session).await;
             drop(session);
-            Some((note, was_suspended, residue))
+            Some((note, was_suspended, format!("{residue}{launched}")))
         } else {
             None
         };
@@ -1920,6 +2068,7 @@ impl RequestHandler {
                 "Set at least one of caught/uncaught to true — otherwise nothing is reported.".to_string()
             );
         }
+        let patterns = a.class_pattern.as_ref().map(crate::args::ClassPatterns::list).unwrap_or_default();
 
         let session_guard = self
             .resolve_session(&args)
@@ -1928,82 +2077,73 @@ impl RequestHandler {
         let mut session = session_guard.lock().await;
         check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
 
-        // Resolve the target exception class to a ref type id (None => all exceptions). The class
-        // must be loaded; unlike a line breakpoint we don't defer, because an exception request
-        // needs a concrete referenceTypeID up front.
-        let pattern = a.class_pattern.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        let ref_type = match pattern {
-            Some(p) => {
-                let tid = resolve_class_by_dotted(&mut session.connection, p).await?
-                    .ok_or_else(|| format!(
-                        "Exception class '{p}' is not loaded yet — trigger it once so the JVM loads it, then retry (exception breakpoints can't be deferred)."
-                    ))?;
-                Some(tid)
-            }
-            None => None,
-        };
-
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
         check_thread_filter(&mut session.connection, thread_filter).await?;
         let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
+        let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
 
-        // A traced request suspends only the throwing thread, which the pump snapshots and resumes —
-        // so a shared JVM keeps serving while you collect throws. An optional ThreadOnly restricts it
-        // to one thread (FILT-1); the trace budget lives on our side (see try_record_trace) rather
-        // than as a JDWP Count, because Count reports only the *Nth* throw, not the first N.
-        let request_id = session
-            .connection
-            .set_exception_request_ex(
-                ref_type,
-                a.caught,
-                a.uncaught,
-                suspend_policy_for(a.trace),
-                None,
-                thread_filter,
-            )
-            .await
-            .map_err(|e| format!("Failed to set exception breakpoint: {e}"))?;
+        // The catch-all and the one named class keep exactly the reply they have always had.
+        if patterns.len() <= 1 && !patterns.first().is_some_and(|p| is_wildcard(p)) {
+            let pattern = patterns.first().map(String::as_str);
+            // The class must be loaded; unlike a line breakpoint we don't defer, because an exception
+            // request needs a concrete referenceTypeID up front.
+            let ref_type = match pattern {
+                Some(p) => Some(resolve_exception_class(&mut session, p).await?),
+                None => None,
+            };
+            let class_pattern = pattern.unwrap_or("*").to_string();
+            let exc_id =
+                arm_one_exception(&mut session, &a, ref_type, &class_pattern, thread_filter, trace_frames)
+                    .await?;
+            drop(session);
+            return Ok(render_exception_stop_reply(
+                &a,
+                &ExceptionStopReply {
+                    class_pattern: &class_pattern,
+                    exc_id: &exc_id,
+                    matches_all: pattern.is_none(),
+                    trace_frames,
+                    frames_note: frames_note.as_deref(),
+                    thread_filter,
+                },
+            ));
+        }
 
-        let class_pattern = pattern.unwrap_or("*").to_string();
-        let exc_id = session.next_stop_id("exc_");
-        session.exception_requests.insert(
-            exc_id.clone(),
-            crate::session::ExceptionRequestInfo {
-                id: exc_id.clone(),
-                request_id: Some(request_id),
-                enabled: true,
-                ref_type,
-                class_pattern: class_pattern.clone(),
-                caught: a.caught,
-                uncaught: a.uncaught,
-                trace: a.trace,
-                trace_expr: a.trace_expr.clone(),
-                trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
-                trace_frames,
-                trace_cost: crate::session::TraceCost::default(),
-                thread_filter,
-            },
-        );
+        // Several patterns, or a wildcard: one exc_ per resolved class, and a row per class (FILT-3/FILT-4).
+        let index = if patterns.iter().any(|p| is_wildcard(p)) {
+            load_class_index(&mut session.connection).await?
+        } else {
+            Vec::new()
+        };
+        let mut batches = Vec::with_capacity(patterns.len());
+        for p in &patterns {
+            batches.push(
+                exception_rows_for_pattern(
+                    &mut session,
+                    &a,
+                    p,
+                    &index,
+                    &BatchLimits { max_classes, thread_filter, trace_frames },
+                )
+                .await,
+            );
+        }
         drop(session);
 
-        Ok(render_exception_stop_reply(
-            &a,
-            &ExceptionStopReply {
-                class_pattern: &class_pattern,
-                exc_id: &exc_id,
-                matches_all: pattern.is_none(),
-                trace_frames,
-                frames_note: frames_note.as_deref(),
-                thread_filter,
-            },
-        ))
+        let trailer = exception_batch_trailer(&a, thread_filter, trace_frames, frames_note.as_deref());
+        Ok(render_batch_arming("exception stop(s)", &batches, max_classes, &trailer))
     }
 
     async fn handle_set_field_stop(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::SetWatchpointArgs = crate::args::parse(&args)?;
         let kinds = watch_kinds(&a)?;
-        let class_name = a.class_name.trim();
-        let field_name = a.field_name.trim();
+        let classes = a.class_name.list();
+        if classes.is_empty() {
+            return Err("Provide a class_name — one class, a wildcard like \"com.example.*\", or a list of \
+                        either."
+                .to_string());
+        }
+        let field_name = a.field_name.trim().to_string();
 
         let session_guard = self
             .resolve_session(&args)
@@ -2012,62 +2152,53 @@ impl RequestHandler {
         let mut session = session_guard.lock().await;
         check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
 
-        // A watchpoint needs a concrete fieldID up front, so — unlike a line breakpoint — it can't
-        // be deferred until the class loads.
-        let type_id = resolve_class_by_dotted(&mut session.connection, class_name).await?
-            .ok_or_else(|| format!(
-                "Class '{class_name}' is not loaded yet — exercise it once so the JVM loads it, then retry (watchpoints can't be deferred)."
-            ))?;
-        let (declaring_type, field) =
-            find_field_info(&mut session.connection, type_id, field_name, None).await?.ok_or_else(|| {
-                format!("Class '{class_name}' has no field '{field_name}' (nor does any superclass)")
-            })?;
-        let is_static = (field.mod_bits & ACC_STATIC) != 0;
-
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
         check_thread_filter(&mut session.connection, thread_filter).await?;
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
         let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
+        let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
+        let arm = FieldArm { field_name: &field_name, kinds: &kinds, trace_budget, trace_frames };
 
-        let spec = WatchSpec {
-            arm: (declaring_type, field.field_id),
-            class_name: class_name.to_string(),
-            field_name: field_name.to_string(),
-            is_static,
-            trace: a.trace,
-            trace_expr: a.trace_expr.as_deref(),
-            trace_budget,
-            trace_frames,
-            thread_filter,
+        // One named class keeps exactly the reply it has always had.
+        if let (1, Some(only)) = (classes.len(), classes.first().filter(|c| !is_wildcard(c))) {
+            let out =
+                arm_field_on_named_class(&mut session, &a, only, &arm, thread_filter, frames_note.as_deref())
+                    .await;
+            drop(session);
+            return out;
+        }
+
+        // Several classes, or a wildcard: one watch per kind per class that HAS the field (FILT-3/FILT-4).
+        let index = if classes.iter().any(|p| is_wildcard(p)) {
+            load_class_index(&mut session.connection).await?
+        } else {
+            Vec::new()
         };
-        let mut ids = Vec::with_capacity(kinds.len());
-        for kind in kinds {
-            ids.push(arm_one_field_watch(&mut session, kind, &spec).await?);
+        let limits = BatchLimits { max_classes, thread_filter, trace_frames };
+        let mut batches = Vec::with_capacity(classes.len());
+        for pattern in &classes {
+            batches.push(field_rows_for_pattern(&mut session, &a, pattern, &index, &arm, &limits).await);
         }
         drop(session);
 
-        Ok(render_field_stop_reply(&a, &spec, &ids, &field, frames_note.as_deref()))
+        let trailer =
+            field_batch_trailer(&a, trace_budget, thread_filter, trace_frames, frames_note.as_deref());
+        Ok(render_batch_arming("watchpoint(s)", &batches, max_classes, &trailer))
     }
 
-    /// METH-1: report what a method actually returned, without having to guess which `return` runs.
-    ///
-    /// Two things make this kind different from every other stop point here, and both are safety:
-    /// - **`trace` defaults to true.** A suspending `MethodExit` on a hot method is the fastest way to
-    ///   freeze a shared JVM this tool offers, so the safe mode is the default and the dangerous one is
-    ///   opt-in — the reverse of the other stop points.
-    /// - **A broad suspending request is refused outright**, naming what would make it acceptable. JDWP
-    ///   has no method-name modifier, so `ClassMatch` alone fires on *every method of every matching
-    ///   class*; suspending on that is not a thing anyone means to ask for.
     async fn handle_set_method_exit_stop(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::SetMethodBreakpointArgs = crate::args::parse(&args)?;
-        let class_pattern = a.class_pattern.trim();
-        if class_pattern.is_empty() {
+        let patterns = a.class_pattern.list();
+        if patterns.is_empty() {
             return Err("Provide a class_pattern (e.g. \"br.com.infotravel.IntegraSrv\").".to_string());
         }
         let method = a.method.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
 
-        // The refusal, before anything is armed.
-        refuse_broad_suspending_method_exit(a.trace, class_pattern, method.as_deref())?;
+        // The refusal, before anything is armed — and for EVERY pattern, because one broad entry in a list
+        // is exactly as dangerous as one broad entry on its own.
+        for p in &patterns {
+            refuse_broad_suspending_method_exit(a.trace, p, method.as_deref())?;
+        }
 
         let session_guard = self
             .resolve_session(&args)
@@ -2085,78 +2216,31 @@ impl RequestHandler {
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
         let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
 
-        let request_id = session
-            .connection
-            .set_method_exit_request(
-                class_pattern,
-                with_return_value,
-                suspend_policy_for(a.trace),
-                None,
-                thread_filter,
-            )
-            .await
-            .map_err(|e| format!("Failed to set method-exit request on '{class_pattern}': {e}"))?;
+        let mexit = MethodExitArm { with_return_value, thread_filter, trace_budget, trace_frames };
+        let (extra, mode) = describe_method_exit_arm(&a, method.as_ref(), &mexit, frames_note.as_deref());
 
-        let mexit_id = session.next_stop_id("mexit_");
-        session.method_exits.insert(
-            mexit_id.clone(),
-            crate::session::MethodExitRequestInfo {
-                id: mexit_id.clone(),
-                request_id: Some(request_id),
-                enabled: true,
-                class_pattern: class_pattern.to_string(),
-                method: method.clone(),
-                with_return_value,
-                trace: a.trace,
-                trace_expr: a.trace_expr.clone(),
-                trace_budget,
-                trace_frames,
-                trace_cost: crate::session::TraceCost::default(),
-                thread_filter,
-            },
-        );
+        // One pattern keeps exactly the reply it has always had — including a WILDCARD one, which has
+        // always worked here: JDWP's `ClassMatch` does the matching, so a pattern costs one request and
+        // covers classes that load later. That is why this tool needed nothing from FILT-3.
+        if let (1, Some(class_pattern)) = (patterns.len(), patterns.first()) {
+            let (mexit_id, request_id) =
+                arm_one_method_exit(&mut session, &a, class_pattern, method.as_ref(), &mexit).await?;
+            drop(session);
+            return Ok(format!(
+                "✅ Method-exit reporting armed on {class_pattern}\n   Stop-point ID: {mexit_id}\n   JDWP \
+                 Request ID: {request_id}{mode}{extra}"
+            ));
+        }
+
+        // Several patterns: one request each, and no expansion — see above.
+        let mut batches = Vec::with_capacity(patterns.len());
+        for p in &patterns {
+            batches.push(method_exit_rows_for_pattern(&mut session, &a, p, method.as_ref(), &mexit).await);
+        }
         drop(session);
 
-        let mut extra = String::new();
-        let _ = match &method {
-            Some(m) => write!(extra, "\n   Method filter: {m} (all overloads — JDWP compares names only)"),
-            None => write!(
-                extra,
-                "\n   Method filter: none — EVERY method of every matching class reports its return. \
-                 Pass `method` to narrow it."
-            ),
-        };
-        if !with_return_value {
-            let _ = write!(
-                extra,
-                "\n   ⚠️  This JVM speaks JDWP < 1.6, so it cannot report return VALUES \
-                 (METHOD_EXIT_WITH_RETURN_VALUE). Degraded to a plain MethodExit: you get the return \
-                 site — which `return` was taken — but not the value."
-            );
-        }
-        if let Some(t) = thread_filter {
-            let _ = write!(extra, "\n   Thread filter: 0x{t:x} (only returns on this thread)");
-        }
-        extra.push_str(&describe_trace_budget(a.trace, trace_budget));
-        extra.push_str(&describe_trace_frames(
-            a.trace,
-            trace_frames,
-            frames_note.as_deref(),
-            "returning frame only",
-        ));
-        if a.trace {
-            if let Some(e) = &a.trace_expr {
-                let _ = write!(extra, "\n   Trace expr: {e}");
-            }
-        }
-        let mode = if a.trace {
-            "\n   Mode: trace (non-suspending) — each return is snapshotted with its value and the thread resumed; read them with debug.get_traces"
-        } else {
-            "\n   Mode: SUSPENDING — every matching return freezes all threads until you continue. Hits come back via debug.get_last_event.\n   ⚠️  On a shared JVM use trace:true (the default) instead."
-        };
-        Ok(format!(
-            "✅ Method-exit reporting armed on {class_pattern}\n   Stop-point ID: {mexit_id}\n   JDWP Request ID: {request_id}{mode}{extra}"
-        ))
+        let trailer = format!("{mode}{extra}");
+        Ok(render_batch_arming("method-exit request(s)", &batches, 0, &trailer))
     }
 
     async fn handle_get_traces(&self, args: serde_json::Value) -> Result<String, String> {
@@ -2656,6 +2740,191 @@ async fn arm_one_field_watch(
     Ok(label)
 }
 
+/// What every watch in one `debug.set_field_stop` call shares: the field, the kinds, and the trace settings.
+struct FieldArm<'a> {
+    field_name: &'a str,
+    kinds: &'a [jdwp_client::WatchKind],
+    trace_budget: Option<u32>,
+    trace_frames: usize,
+}
+
+/// The one-named-class path, with the reply and the two error messages `debug.set_field_stop` has always used.
+async fn arm_field_on_named_class(
+    session: &mut crate::session::DebugSession,
+    a: &crate::args::SetWatchpointArgs,
+    class_name: &str,
+    arm: &FieldArm<'_>,
+    thread_filter: Option<u64>,
+    frames_note: Option<&str>,
+) -> Result<String, String> {
+    // A watchpoint needs a concrete fieldID up front, so — unlike a line breakpoint — it can't be deferred
+    // until the class loads.
+    let type_id = resolve_class_by_dotted(&mut session.connection, class_name).await?.ok_or_else(|| {
+        format!(
+            "Class '{class_name}' is not loaded yet — exercise it once so the JVM loads it, then retry \
+             (watchpoints can't be deferred)."
+        )
+    })?;
+    let (declaring_type, field) =
+        find_field_info(&mut session.connection, type_id, arm.field_name, None).await?.ok_or_else(|| {
+            format!("Class '{class_name}' has no field '{}' (nor does any superclass)", arm.field_name)
+        })?;
+    let spec = WatchSpec {
+        arm: (declaring_type, field.field_id),
+        class_name: class_name.to_string(),
+        field_name: arm.field_name.to_string(),
+        is_static: (field.mod_bits & ACC_STATIC) != 0,
+        trace: a.trace,
+        trace_expr: a.trace_expr.as_deref(),
+        trace_budget: arm.trace_budget,
+        trace_frames: arm.trace_frames,
+        thread_filter,
+    };
+    let mut ids = Vec::with_capacity(arm.kinds.len());
+    for kind in arm.kinds {
+        ids.push(arm_one_field_watch(session, *kind, &spec).await?);
+    }
+    Ok(render_field_stop_reply(a, &spec, &ids, &field, frames_note))
+}
+
+/// Arm one field pattern: a watch per kind on every matching loaded class that HAS the field.
+async fn field_rows_for_pattern(
+    session: &mut crate::session::DebugSession,
+    a: &crate::args::SetWatchpointArgs,
+    pattern: &str,
+    index: &[(String, u64)],
+    arm: &FieldArm<'_>,
+    limits: &BatchLimits,
+) -> BatchRows {
+    let wildcard = is_wildcard(pattern);
+    let mut rows = Vec::new();
+    let (matched, targets) = if wildcard {
+        let hits: Vec<(String, u64)> =
+            index.iter().filter(|(fqn, _)| class_matches(fqn, pattern)).cloned().collect();
+        (Some(hits.len()), hits)
+    } else {
+        match resolve_class_by_dotted(&mut session.connection, pattern).await {
+            Ok(Some(tid)) => (None, vec![(pattern.to_string(), tid)]),
+            Ok(None) => {
+                rows.push(BatchRow::Failed(format!(
+                    "'{pattern}' is not loaded yet — exercise it once so the JVM loads it, then retry \
+                     (watchpoints can't be deferred)."
+                )));
+                (None, Vec::new())
+            }
+            Err(e) => {
+                rows.push(BatchRow::Failed(e));
+                (None, Vec::new())
+            }
+        }
+    };
+
+    let mut skipped_at_cap = 0usize;
+    let mut armed = 0usize;
+    for (fqn, type_id) in targets {
+        if armed >= limits.max_classes {
+            skipped_at_cap += 1;
+            continue;
+        }
+        let row =
+            arm_field_on_one_class(session, a, &fqn, type_id, arm, limits.thread_filter, wildcard).await;
+        if matches!(row, BatchRow::Armed(_)) {
+            armed += 1;
+        }
+        rows.push(row);
+    }
+    BatchRows { pattern: pattern.to_string(), matched, rows, skipped_at_cap }
+}
+
+/// Arm every requested watch kind on ONE class, as a row for the batch reply.
+///
+/// A class that matches the pattern but declares no such field is a NOTE for a wildcard and a REFUSAL for a
+/// name the caller typed: the same fact means different things depending on whether they chose the class.
+async fn arm_field_on_one_class(
+    session: &mut crate::session::DebugSession,
+    a: &crate::args::SetWatchpointArgs,
+    fqn: &str,
+    type_id: u64,
+    arm: &FieldArm<'_>,
+    thread_filter: Option<u64>,
+    wildcard: bool,
+) -> BatchRow {
+    let found = find_field_info(&mut session.connection, type_id, arm.field_name, None).await;
+    let (declaring_type, field) = match found {
+        Ok(Some(pair)) => pair,
+        Ok(None) if wildcard => {
+            return BatchRow::Note(format!("{fqn} has no field '{}' — not armed", arm.field_name));
+        }
+        Ok(None) => {
+            return BatchRow::Failed(format!(
+                "{fqn} has no field '{}' (nor does any superclass)",
+                arm.field_name
+            ));
+        }
+        Err(e) => return BatchRow::Failed(format!("{fqn}: {e}")),
+    };
+
+    let is_static = (field.mod_bits & ACC_STATIC) != 0;
+    let spec = WatchSpec {
+        arm: (declaring_type, field.field_id),
+        class_name: fqn.to_string(),
+        field_name: arm.field_name.to_string(),
+        is_static,
+        trace: a.trace,
+        trace_expr: a.trace_expr.as_deref(),
+        trace_budget: arm.trace_budget,
+        trace_frames: arm.trace_frames,
+        thread_filter,
+    };
+    let mut ids = Vec::with_capacity(arm.kinds.len());
+    for kind in arm.kinds {
+        match arm_one_field_watch(session, *kind, &spec).await {
+            Ok(id) => ids.push(id),
+            Err(e) => return BatchRow::Failed(format!("{fqn}.{}: {e}", arm.field_name)),
+        }
+    }
+    BatchRow::Armed(format!(
+        "{}  {fqn}.{} ({} {})",
+        ids.join(", "),
+        arm.field_name,
+        if is_static { "static" } else { "instance" },
+        decode_signature(&field.signature)
+    ))
+}
+
+/// What applies to every watchpoint a batch armed.
+fn field_batch_trailer(
+    a: &crate::args::SetWatchpointArgs,
+    trace_budget: Option<u32>,
+    thread_filter: Option<u64>,
+    trace_frames: usize,
+    frames_note: Option<&str>,
+) -> String {
+    let mut trailer = String::new();
+    if let Some(t) = thread_filter {
+        let _ = write!(trailer, "\n   Thread filter: 0x{t:x} (only touches on this thread)");
+    }
+    trailer.push_str(&describe_trace_budget(a.trace, trace_budget));
+    trailer.push_str(&describe_trace_frames(
+        a.trace,
+        trace_frames,
+        frames_note,
+        "mutating frame only — pass trace_frames to see who called it",
+    ));
+    if !a.trace {
+        trailer.push_str(
+            "\n   ⚠️  Each of these suspends ALL threads on every hit — on a shared JVM use trace:true \
+             instead.",
+        );
+    }
+    // The reason to keep a wildcard narrow here, and it is stronger than for a line breakpoint.
+    trailer.push_str(
+        "\n   ⚠️  A watched field can't be JIT-optimised, and a wildcard de-optimises the field in EVERY \
+         class it armed — clear these as soon as you are done.",
+    );
+    trailer
+}
+
 /// Which watch kinds a `debug.set_field_stop` call asked for, or the refusal when it asked for neither.
 ///
 /// "modify + access" is two independent JDWP requests over one field, so this returns a list rather than
@@ -2672,6 +2941,119 @@ fn watch_kinds(a: &crate::args::SetWatchpointArgs) -> Result<Vec<jdwp_client::Wa
         return Err("Set at least one of modify/access to true — otherwise nothing is reported.".to_string());
     }
     Ok(kinds)
+}
+
+/// How every method-exit request in one call is armed — the part that does not vary per pattern.
+struct MethodExitArm {
+    with_return_value: bool,
+    thread_filter: Option<u64>,
+    trace_budget: Option<u32>,
+    trace_frames: usize,
+}
+
+/// Arm one `METHOD_EXIT` request on one class pattern and register it, returning its `mexit_` id and the
+/// JDWP request id.
+async fn arm_one_method_exit(
+    session: &mut crate::session::DebugSession,
+    a: &crate::args::SetMethodBreakpointArgs,
+    class_pattern: &str,
+    method: Option<&String>,
+    arm: &MethodExitArm,
+) -> Result<(String, i32), String> {
+    let request_id = session
+        .connection
+        .set_method_exit_request(
+            class_pattern,
+            arm.with_return_value,
+            suspend_policy_for(a.trace),
+            None,
+            arm.thread_filter,
+        )
+        .await
+        .map_err(|e| format!("Failed to set method-exit request on '{class_pattern}': {e}"))?;
+
+    let mexit_id = session.next_stop_id("mexit_");
+    session.method_exits.insert(
+        mexit_id.clone(),
+        crate::session::MethodExitRequestInfo {
+            id: mexit_id.clone(),
+            request_id: Some(request_id),
+            enabled: true,
+            class_pattern: class_pattern.to_string(),
+            method: method.cloned(),
+            with_return_value: arm.with_return_value,
+            trace: a.trace,
+            trace_expr: a.trace_expr.clone(),
+            trace_budget: arm.trace_budget,
+            trace_frames: arm.trace_frames,
+            trace_cost: crate::session::TraceCost::default(),
+            thread_filter: arm.thread_filter,
+        },
+    );
+    Ok((mexit_id, request_id))
+}
+
+/// One method-exit pattern's row: exactly one request, armed or refused.
+///
+/// No expansion and no `matched` count, because JDWP does the matching for this event kind — one `ClassMatch`
+/// covers every class the pattern matches, including ones that load later, so there is nothing here to count.
+async fn method_exit_rows_for_pattern(
+    session: &mut crate::session::DebugSession,
+    a: &crate::args::SetMethodBreakpointArgs,
+    pattern: &str,
+    method: Option<&String>,
+    arm: &MethodExitArm,
+) -> BatchRows {
+    let row = match arm_one_method_exit(session, a, pattern, method, arm).await {
+        Ok((id, req)) => BatchRow::Armed(format!("{id}  (JDWP request {req})")),
+        Err(e) => BatchRow::Failed(e),
+    };
+    BatchRows { pattern: pattern.to_string(), matched: None, rows: vec![row], skipped_at_cap: 0 }
+}
+
+/// Everything a method-exit reply says about HOW it was armed, shared by the single and batched replies.
+///
+/// Returns `(detail, mode)` — the mode line is separate because it leads the reply, being the one thing that
+/// decides whether this stop point can freeze the VM.
+fn describe_method_exit_arm(
+    a: &crate::args::SetMethodBreakpointArgs,
+    method: Option<&String>,
+    arm: &MethodExitArm,
+    frames_note: Option<&str>,
+) -> (String, &'static str) {
+    let mut extra = String::new();
+    let _ = match method {
+        Some(m) => write!(extra, "\n   Method filter: {m} (all overloads — JDWP compares names only)"),
+        None => write!(
+            extra,
+            "\n   Method filter: none — EVERY method of every matching class reports its return. Pass \
+             `method` to narrow it."
+        ),
+    };
+    if !arm.with_return_value {
+        let _ = write!(
+            extra,
+            "\n   ⚠️  This JVM speaks JDWP < 1.6, so it cannot report return VALUES \
+             (METHOD_EXIT_WITH_RETURN_VALUE). Degraded to a plain MethodExit: you get the return site — \
+             which `return` was taken — but not the value."
+        );
+    }
+    if let Some(t) = arm.thread_filter {
+        let _ = write!(extra, "\n   Thread filter: 0x{t:x} (only returns on this thread)");
+    }
+    extra.push_str(&describe_trace_budget(a.trace, arm.trace_budget));
+    extra.push_str(&describe_trace_frames(a.trace, arm.trace_frames, frames_note, "returning frame only"));
+    if a.trace {
+        if let Some(e) = &a.trace_expr {
+            let _ = write!(extra, "\n   Trace expr: {e}");
+        }
+    }
+    let mode = if a.trace {
+        "\n   Mode: trace (non-suspending) — each return is snapshotted with its value and the thread resumed; read them with debug.get_traces"
+    } else {
+        "\n   Mode: SUSPENDING — every matching return freezes all threads until you continue. Hits come back via debug.get_last_event.\n   ⚠️  On a shared JVM use trace:true (the default) instead."
+    };
+    (extra, mode)
 }
 
 /// What `render_exception_stop_reply` needs beyond the caller's own arguments.
@@ -2721,6 +3103,239 @@ fn render_exception_stop_reply(
     ));
     let (class_pattern, exc_id) = (r.class_pattern, r.exc_id);
     format!("✅ Exception breakpoint set on {class_pattern} ({which})\n   Stop-point ID: {exc_id}{mode}{noisy}{extra}")
+}
+
+/// One row of a batched arming reply.
+enum BatchRow {
+    /// A stop point was armed; the text is its id plus whatever identifies the target.
+    Armed(String),
+    /// Nothing was armed and nothing is wrong — a matched class that isn't a target.
+    Note(String),
+    /// This target was refused, and why.
+    Failed(String),
+}
+
+/// One pattern's rows in a batched arming reply (FILT-3/FILT-4).
+struct BatchRows {
+    pattern: String,
+    /// Loaded classes the pattern matched — `Some` for a wildcard, `None` for an exact name, because
+    /// "1 class matched" is noise when the caller wrote the class name themselves.
+    matched: Option<usize>,
+    rows: Vec<BatchRow>,
+    /// Matching classes not attempted because `max_classes` was reached.
+    skipped_at_cap: usize,
+}
+
+impl BatchRows {
+    fn armed(&self) -> usize {
+        self.rows.iter().filter(|r| matches!(r, BatchRow::Armed(_))).count()
+    }
+
+    fn failed(&self) -> usize {
+        self.rows.iter().filter(|r| matches!(r, BatchRow::Failed(_))).count()
+    }
+}
+
+/// The reply for an arming call that resolved several targets — shared by the exception, field and
+/// method-exit tools (FILT-4).
+///
+/// Shared because the shape of the answer is the same for all three and the shape is the hard part: a
+/// batch's normal outcome is *partial*, so every pattern needs its own line, a failure must not hide the
+/// successes, and a cap must say what it left out. `trailer` carries what is specific to the kind — trace
+/// budget, thread filter, the caveat about de-optimised fields.
+fn render_batch_arming(kind: &str, batches: &[BatchRows], max_classes: usize, trailer: &str) -> String {
+    let armed: usize = batches.iter().map(BatchRows::armed).sum();
+    let failed: usize = batches.iter().map(BatchRows::failed).sum();
+
+    let mut out = format!("📍 {} pattern(s) → {armed} {kind} armed", batches.len());
+    if failed > 0 {
+        let _ = write!(out, ", {failed} refused");
+    }
+    out.push_str(":\n\n");
+
+    for b in batches {
+        let _ = match b.matched {
+            Some(n) => writeln!(out, "{}  ({n} loaded class(es) matched)", b.pattern),
+            None => writeln!(out, "{}", b.pattern),
+        };
+        for r in &b.rows {
+            let _ = match r {
+                BatchRow::Armed(t) => writeln!(out, "   ✅ {t}"),
+                BatchRow::Note(t) => writeln!(out, "   ℹ️  {t}"),
+                BatchRow::Failed(t) => writeln!(out, "   ❌ {t}"),
+            };
+        }
+        if b.matched == Some(0) {
+            let _ = writeln!(
+                out,
+                "   ℹ️  No loaded class matches this pattern. `debug.list_classes {{filter:\"{}\"}}` shows \
+                 what the JVM has — a class it has not needed yet does not appear at all.",
+                b.pattern
+            );
+        }
+        if b.skipped_at_cap > 0 {
+            let _ = writeln!(
+                out,
+                "   ⚠️  {} more matching class(es) were NOT armed — max_classes: {max_classes}. Raise it if \
+                 you mean it, or narrow the pattern.",
+                b.skipped_at_cap
+            );
+        }
+    }
+    if !trailer.is_empty() {
+        let _ = write!(out, "\nEvery stop point above:{trailer}");
+        out.push('\n');
+    }
+    out
+}
+
+/// Resolve one exception class name to a reference type id, with the wording this tool has always used
+/// for a class the JVM has not loaded.
+async fn resolve_exception_class(
+    session: &mut crate::session::DebugSession,
+    pattern: &str,
+) -> Result<u64, String> {
+    resolve_class_by_dotted(&mut session.connection, pattern).await?.ok_or_else(|| {
+        format!(
+            "Exception class '{pattern}' is not loaded yet — trigger it once so the JVM loads it, then \
+             retry (exception breakpoints can't be deferred)."
+        )
+    })
+}
+
+/// Arm one `EXCEPTION` request and register it, returning its `exc_` id.
+///
+/// A traced request suspends only the throwing thread, which the pump snapshots and resumes — so a shared
+/// JVM keeps serving while you collect throws. An optional `ThreadOnly` restricts it to one thread
+/// (FILT-1); the trace budget lives on our side (see `try_record_trace`) rather than as a JDWP `Count`,
+/// because `Count` reports only the *Nth* throw, not the first N.
+async fn arm_one_exception(
+    session: &mut crate::session::DebugSession,
+    a: &crate::args::SetExceptionBreakpointArgs,
+    ref_type: Option<u64>,
+    class_pattern: &str,
+    thread_filter: Option<u64>,
+    trace_frames: usize,
+) -> Result<String, String> {
+    let request_id = session
+        .connection
+        .set_exception_request_ex(
+            ref_type,
+            a.caught,
+            a.uncaught,
+            suspend_policy_for(a.trace),
+            None,
+            thread_filter,
+        )
+        .await
+        .map_err(|e| format!("Failed to set exception breakpoint: {e}"))?;
+
+    let exc_id = session.next_stop_id("exc_");
+    session.exception_requests.insert(
+        exc_id.clone(),
+        crate::session::ExceptionRequestInfo {
+            id: exc_id.clone(),
+            request_id: Some(request_id),
+            enabled: true,
+            ref_type,
+            class_pattern: class_pattern.to_string(),
+            caught: a.caught,
+            uncaught: a.uncaught,
+            trace: a.trace,
+            trace_expr: a.trace_expr.clone(),
+            trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
+            trace_frames,
+            trace_cost: crate::session::TraceCost::default(),
+            thread_filter,
+        },
+    );
+    Ok(exc_id)
+}
+
+/// The parts of a batched arming call that are the same for every pattern in it (FILT-4).
+struct BatchLimits {
+    max_classes: usize,
+    thread_filter: Option<u64>,
+    trace_frames: usize,
+}
+
+/// Arm one exception pattern — one `exc_` per resolved class — and describe what happened to each.
+///
+/// A wildcard resolves against classes that are LOADED, because a JDWP exception request needs a concrete
+/// reference type: there is no `ClassMatch` for this event kind, which is the same reason none of them can be
+/// deferred.
+async fn exception_rows_for_pattern(
+    session: &mut crate::session::DebugSession,
+    a: &crate::args::SetExceptionBreakpointArgs,
+    pattern: &str,
+    index: &[(String, u64)],
+    limits: &BatchLimits,
+) -> BatchRows {
+    let mut rows = Vec::new();
+    let (matched, targets) = if is_wildcard(pattern) {
+        let hits: Vec<(String, u64)> =
+            index.iter().filter(|(fqn, _)| class_matches(fqn, pattern)).cloned().collect();
+        (Some(hits.len()), hits)
+    } else {
+        match resolve_exception_class(session, pattern).await {
+            Ok(tid) => (None, vec![(pattern.to_string(), tid)]),
+            Err(e) => {
+                rows.push(BatchRow::Failed(e));
+                (None, Vec::new())
+            }
+        }
+    };
+
+    let mut skipped_at_cap = 0usize;
+    let mut armed = 0usize;
+    for (fqn, tid) in targets {
+        if armed >= limits.max_classes {
+            skipped_at_cap += 1;
+            continue;
+        }
+        match arm_one_exception(session, a, Some(tid), &fqn, limits.thread_filter, limits.trace_frames).await
+        {
+            Ok(id) => {
+                armed += 1;
+                rows.push(BatchRow::Armed(format!("{id}  {fqn}")));
+            }
+            Err(e) => rows.push(BatchRow::Failed(format!("{fqn}: {e}"))),
+        }
+    }
+    BatchRows { pattern: pattern.to_string(), matched, rows, skipped_at_cap }
+}
+
+/// What applies to every exception stop a batch armed.
+fn exception_batch_trailer(
+    a: &crate::args::SetExceptionBreakpointArgs,
+    thread_filter: Option<u64>,
+    trace_frames: usize,
+    frames_note: Option<&str>,
+) -> String {
+    let mut trailer = String::new();
+    if let Some(t) = thread_filter {
+        let _ = write!(trailer, "\n   Thread filter: 0x{t:x} (only throws on this thread)");
+    }
+    trailer.push_str(&describe_trace_budget(a.trace, trace_budget_for(a.trace, a.trace_max_hits)));
+    trailer.push_str(&describe_trace_frames(
+        a.trace,
+        trace_frames,
+        frames_note,
+        "throwing frame only — pass trace_frames to see which path reached the catch",
+    ));
+    if !a.trace {
+        trailer.push_str(
+            "\n   ⚠️  Each of these suspends ALL threads on every throw — on a shared JVM use trace:true \
+             instead.",
+        );
+    }
+    // Said once, here, because a wildcard is where it bites: the exception class you care about may simply
+    // not have been loaded yet, and this kind of stop point has no deferral to fall back on.
+    trailer.push_str(
+        "\n   ℹ️  A wildcard matches only what is LOADED NOW — an exception request needs a concrete \
+         reference type, so nothing here arms itself later the way a deferred line breakpoint does.",
+    );
+    trailer
 }
 
 /// The `debug.set_field_stop` reply: what was armed, under which id(s), and what it will cost.
@@ -2805,8 +3420,13 @@ fn render_session_line(
     } else {
         "running"
     };
-    let stops =
-        s.breakpoints.len() + s.pending_breakpoints.len() + s.exception_requests.len() + s.watchpoints.len();
+    // A wildcard family's members are already counted in `breakpoints`, so only the family record itself is
+    // added — the alternative double-counts the same locations twice for one call (FILT-3).
+    let stops = s.breakpoints.len()
+        + s.pending_breakpoints.len()
+        + s.exception_requests.len()
+        + s.watchpoints.len()
+        + s.pattern_sets.len();
     let mut line = format!(
         "  {} [{}] {} — {}{}, {} stop point(s), {} JDWP packet(s)",
         if is_current { "▶" } else { " " },
@@ -2817,12 +3437,41 @@ fn render_session_line(
         stops,
         s.connection.packets_sent(),
     );
+    // LAUNCH-1: whether this JVM is OURS is the single fact that decides how the rest of the session may
+    // behave — freely suspendable, and terminated on disconnect — so it belongs on the line that identifies
+    // the session, not only in the launch reply nobody re-reads.
+    if let Some(l) = &s.launched {
+        let _ = write!(
+            line,
+            ", LAUNCHED by us (pid {}{})",
+            l.pid.map_or_else(|| "?".to_string(), |p| p.to_string()),
+            if l.detach_on_disconnect { ", detached on disconnect" } else { ", dies with this session" }
+        );
+    }
     // Buffer counts only when there is something to read, so a quiet session stays one short line.
     if !s.traces.is_empty() {
         let _ = write!(line, ", {} trace(s)", s.traces.len());
     }
     if !s.events.is_empty() {
         let _ = write!(line, ", {} event(s)", s.events.len());
+    }
+    // The command that produced a launched JVM, on its own line: "which JDK, which classpath" is the question
+    // a version-dependent bug turns on, and for a session someone else opened this listing is the only place
+    // left to read it (LAUNCH-1).
+    if let Some(l) = &s.launched {
+        let _ = write!(line, "\n      Launched with: {}", l.command);
+        // A launched JVM that has DIED is the case this matters for, and it has a specific cause: with
+        // `suspend=y` the JVM is held before it resolves the main class, so a launch can succeed and the
+        // program still be unrunnable — the failure lands on the first `debug.continue`, long after the reply
+        // that would have carried it. Its own stderr is the answer, and `DEAD` on its own is not.
+        if dead {
+            let tail = l.tail(10);
+            let _ = if tail.is_empty() {
+                write!(line, "\n      It exited without printing anything.")
+            } else {
+                write!(line, "\n      Its last output:\n{}", indent_lines(&tail, "        "))
+            };
+        }
     }
     // SWAP-2. Deliberately not gated on being the current session: a session *someone else* left behind
     // is the case that matters, and this listing is the only place a third party can discover that a JVM
@@ -2914,6 +3563,111 @@ fn render_pending_line(
         where_,
         dead_filter_tag(pb.thread_filter, dead)
     );
+}
+
+/// Format one wildcard family into the `debug.list_stop_points` output (FILT-3).
+///
+/// This line is the only place a caller can learn what a wildcard has become since they armed it: how many
+/// classes it holds now, how many arrived after the reply they read, and whether it has stopped taking new
+/// ones because it is full. All three are invisible from the members alone.
+fn render_pattern_set_line(
+    output: &mut String,
+    set: &crate::session::PatternStopSet,
+    dead: &std::collections::BTreeSet<u64>,
+) {
+    let _ = writeln!(
+        output,
+        "  {} [{}] {} — family of {} breakpoint(s){}{}{}",
+        if set.enabled { "✓" } else { "✗" },
+        set.id,
+        set.class_pattern,
+        set.members.len(),
+        if set.trace { " (trace)" } else { "" },
+        if set.class_prepare_request_id.is_some() {
+            ", watching for matching classes that load later"
+        } else if set.enabled {
+            ", NOT watching for new classes (its watch could not be registered)"
+        } else {
+            ", not watching (disabled)"
+        },
+        if set.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
+    );
+    let tag = dead_filter_tag(set.thread_filter, dead);
+    if !tag.is_empty() {
+        let _ = writeln!(output, "   {tag}");
+    }
+    if let Some(m) = &set.method {
+        let _ = writeln!(output, "     Method: {m}");
+    }
+    if let Some(t) = set.thread_filter {
+        let _ = writeln!(output, "     Thread filter: 0x{t:x}");
+    }
+    if let Some(c) = &set.condition {
+        let _ = writeln!(output, "     Condition: {c}");
+    }
+    if let Some(e) = &set.trace_expr {
+        let _ = writeln!(output, "     Trace expr: {e}");
+    }
+    if !set.members.is_empty() {
+        let _ = writeln!(output, "     Members: {}", set.members.join(", "));
+    }
+    if set.armed_later_total > 0 {
+        let sample = if set.armed_later.len() < set.armed_later_total {
+            format!("{}, …", set.armed_later.join(", "))
+        } else {
+            set.armed_later.join(", ")
+        };
+        let _ = writeln!(
+            output,
+            "     +{} class(es) armed since this family was set: {sample}",
+            set.armed_later_total
+        );
+    }
+    if set.no_method > 0 {
+        let _ = writeln!(
+            output,
+            "     {} matching class(es) have no method '{}' — not armed, and not an error.",
+            set.no_method,
+            set.method.as_deref().unwrap_or("?")
+        );
+    }
+    if set.skipped_at_cap > 0 {
+        let _ = writeln!(
+            output,
+            "     ⚠️  FULL at max_classes: {} — {} matching class(es) were not armed, and new matches are \
+             being skipped. Clear members you don't need, or re-arm with a higher max_classes.",
+            set.max_classes, set.skipped_at_cap
+        );
+    }
+}
+
+/// Every stop point of every kind, in the order `debug.list_stop_points` reports them.
+///
+/// Families come after the individual breakpoints deliberately: their members ARE some of those `bp_` lines,
+/// and the family line is what explains why one call produced nine of them — and what to clear to undo it.
+fn render_every_stop_point(
+    output: &mut String,
+    session: &crate::session::DebugSession,
+    dead: &std::collections::BTreeSet<u64>,
+) {
+    for (bp_id, bp) in &session.breakpoints {
+        render_breakpoint_line(output, bp_id, bp, dead);
+    }
+    for pb in &session.pending_breakpoints {
+        render_pending_line(output, pb, dead);
+    }
+    for set in session.pattern_sets.values() {
+        render_pattern_set_line(output, set, dead);
+    }
+    for er in session.exception_requests.values() {
+        render_exception_line(output, er, dead);
+    }
+    for (watch_id, wp) in &session.watchpoints {
+        render_watchpoint_line(output, watch_id, wp, dead);
+    }
+    for me in session.method_exits.values() {
+        render_method_exit_line(output, me, dead);
+    }
 }
 
 /// Format one exception breakpoint into the `debug.list_stop_points` output.
@@ -5939,8 +6693,90 @@ async fn try_arm_deferred_breakpoints(
             ),
         }
     }
+    arm_pattern_set_members(session, cp_ref, &cp_sig).await;
     let _ = session.connection.resume_thread(cp_thread).await;
     true
+}
+
+/// A class just loaded: arm it for every wildcard family whose pattern it matches (FILT-3).
+///
+/// This is the half of a wildcard no reply could ever have reported. The caller was told "3 classes", and
+/// this is what quietly makes it four — so every outcome is recorded on the family rather than only logged:
+/// a stop-point count that grew where nobody can see it is a stop-point count nobody can trust, and on a
+/// shared JVM it is also a cost nobody agreed to. `list_stop_points` reads all of it back.
+///
+/// The cap is enforced here as well as at arming time, for the same reason it exists there: a family
+/// watching `com.example.*` on a deploying app server would otherwise grow without limit hours after the
+/// call that created it.
+async fn arm_pattern_set_members(
+    session: &mut crate::session::DebugSession,
+    class_ref: u64,
+    signature: &str,
+) {
+    let fqn = decode_signature(signature);
+    // Ids first: arming borrows the session mutably, so the set cannot stay borrowed across it.
+    let candidates: Vec<String> = session
+        .pattern_sets
+        .values()
+        .filter(|s| s.enabled && class_matches(&fqn, &s.class_pattern))
+        .map(|s| s.id.clone())
+        .collect();
+
+    for set_id in candidates {
+        let spec = {
+            let Some(set) = session.pattern_sets.get(&set_id) else {
+                continue;
+            };
+            if !set.has_room() {
+                if let Some(s) = session.pattern_sets.get_mut(&set_id) {
+                    s.skipped_at_cap += 1;
+                }
+                continue;
+            }
+            spec_from_pattern_set(set, &fqn, signature)
+        };
+        let bp_id = session.next_stop_id("bp_");
+        match arm_and_insert(session, class_ref, &spec, bp_id).await {
+            Ok(armed) => {
+                info!("Armed {} on newly loaded {} for family {}", armed.bp_id, fqn, set_id);
+                if let Some(s) = session.pattern_sets.get_mut(&set_id) {
+                    s.members.push(armed.bp_id);
+                    s.note_armed_later(&fqn);
+                }
+            }
+            // The pattern matched a class that is not a target — the common case for a broad pattern, and
+            // not a failure. Counted so the listing can say how much of the pattern's reach is irrelevant.
+            Err(ArmError::NoSuchMethod(_)) => {
+                if let Some(s) = session.pattern_sets.get_mut(&set_id) {
+                    s.no_method += 1;
+                }
+            }
+            Err(ArmError::Other(msg)) => {
+                warn!("Family {set_id}: {fqn} loaded but could not be armed: {msg}");
+            }
+        }
+    }
+}
+
+/// A family's stored definition, pointed at one newly-loaded class (FILT-3).
+///
+/// `line_opt` is `None` because a wildcard family is always a `method` family: a line number is refused at
+/// arming time, since `:412` is a different statement in every class the pattern matches.
+fn spec_from_pattern_set(set: &crate::session::PatternStopSet, fqn: &str, signature: &str) -> BreakpointSpec {
+    BreakpointSpec {
+        class_pattern: fqn.to_string(),
+        signature: signature.to_string(),
+        line_opt: None,
+        method_hint: set.method.clone(),
+        hit_count: set.hit_count,
+        thread_filter: set.thread_filter,
+        condition: set.condition.clone(),
+        trace: set.trace,
+        trace_expr: set.trace_expr.clone(),
+        trace_budget: set.trace_budget,
+        trace_frames: set.trace_frames,
+        suspend_policy: suspend_policy_for(set.trace),
+    }
 }
 
 /// What a traced (non-suspending) stop point needs at hit time, whichever kind registered it.
@@ -6066,6 +6902,7 @@ async fn dead_filter_threads(session: &mut crate::session::DebugSession) -> std:
     filters.extend(session.watchpoints.values().filter_map(|w| w.thread_filter));
     filters.extend(session.method_exits.values().filter_map(|m| m.thread_filter));
     filters.extend(session.pending_breakpoints.iter().filter_map(|p| p.thread_filter));
+    filters.extend(session.pattern_sets.values().filter_map(|s| s.thread_filter));
 
     let mut dead = std::collections::BTreeSet::new();
     for tid in filters {
@@ -6311,6 +7148,129 @@ async fn rearm_stop_point(session: &mut crate::session::DebugSession, id: &str) 
         return rearm_method_exit(session, id, &me).await;
     }
     Err(format!("Stop point not found: {id}"))
+}
+
+/// Silence or re-arm a whole wildcard family (FILT-3): every member, plus the watch for classes that load
+/// later.
+///
+/// **The watch is the part that must not be forgotten.** A family disabled without clearing its
+/// `CLASS_PREPARE` watch would keep arming new classes while reporting itself silenced — a stop point that
+/// says it is off and is not, which is the exact shape of failure this codebase treats as worst. Re-arming
+/// re-installs it, so a family that was silenced during a deployment picks the new classes back up.
+async fn toggle_pattern_family(
+    session: &mut crate::session::DebugSession,
+    set_id: &str,
+    want: bool,
+) -> Result<String, String> {
+    let Some((members, pattern)) =
+        session.pattern_sets.get(set_id).map(|s| (s.members.clone(), s.class_pattern.clone()))
+    else {
+        return Err(format!("Stop point not found: {set_id}"));
+    };
+
+    let mut changed = 0usize;
+    let mut failed = 0usize;
+    for member in &members {
+        let outcome = if want {
+            rearm_stop_point(session, member).await
+        } else {
+            disable_stop_point(session, member).await
+        };
+        match outcome {
+            Ok(_) => changed += 1,
+            // One member failing must not abandon the rest: a half-silenced family is worse than either
+            // state, so the loop finishes and the count is reported.
+            Err(e) => {
+                warn!("Family {set_id}: member {member} could not be toggled: {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    let watch_note = if want {
+        let (jdwp_pattern, _) = jdwp_class_match_for(&pattern);
+        match session
+            .connection
+            .set_class_prepare(&jdwp_pattern, jdwp_client::SuspendPolicy::EventThread)
+            .await
+        {
+            Ok(req) => {
+                if let Some(s) = session.pattern_sets.get_mut(set_id) {
+                    s.class_prepare_request_id = Some(req);
+                }
+                " and is watching for matching classes again"
+            }
+            Err(e) => {
+                warn!("Family {set_id}: class-prepare watch not re-registered: {e}");
+                " — but its watch for classes loading later could NOT be re-registered, so only the \
+                 breakpoints above are live"
+            }
+        }
+    } else {
+        let req = session.pattern_sets.get(set_id).and_then(|s| s.class_prepare_request_id);
+        if let Some(req) = req {
+            let _ = session.connection.clear_class_prepare(req).await;
+        }
+        if let Some(s) = session.pattern_sets.get_mut(set_id) {
+            s.class_prepare_request_id = None;
+        }
+        " and stopped watching for new classes"
+    };
+
+    if let Some(s) = session.pattern_sets.get_mut(set_id) {
+        s.enabled = want;
+    }
+
+    let failures = if failed > 0 {
+        format!(" ({failed} member(s) could not be changed — see the server log)")
+    } else {
+        String::new()
+    };
+    Ok(if want {
+        format!(
+            "✅ Re-armed family {set_id} ({pattern}) — {changed} breakpoint(s){watch_note}{failures}. Same \
+             ids, so anything holding them keeps working."
+        )
+    } else {
+        format!(
+            "🔕 Disabled family {set_id} ({pattern}) — {changed} breakpoint(s){watch_note}{failures}. Their \
+             definitions are kept; toggle it back on to re-arm."
+        )
+    })
+}
+
+/// Drop every breakpoint a wildcard family armed, and its watch for classes that load later (FILT-3).
+///
+/// The set has already been removed from the session by the caller, so this cannot half-succeed into a family
+/// that still lists members it no longer owns.
+async fn clear_pattern_family(
+    session: &mut crate::session::DebugSession,
+    set_id: &str,
+    set: &crate::session::PatternStopSet,
+) -> String {
+    if let Some(req) = set.class_prepare_request_id {
+        let _ = session.connection.clear_class_prepare(req).await;
+    }
+    let mut cleared = 0usize;
+    for member in &set.members {
+        if let Some(info) = session.breakpoints.remove(member) {
+            if let Some(req) = info.request_id {
+                let _ = session.connection.clear_breakpoint(req).await;
+            }
+            cleared += 1;
+        }
+    }
+    let already = set.members.len().saturating_sub(cleared);
+    format!(
+        "✅ Breakpoint family cleared: {set_id} ({}) — {cleared} breakpoint(s), plus its watch for matching \
+         classes that load later.{}",
+        set.class_pattern,
+        if already > 0 {
+            format!(" ({already} had already been cleared by their own id.)")
+        } else {
+            String::new()
+        }
+    )
 }
 
 /// Re-arm a method-exit request (METH-1).
@@ -6926,6 +7886,10 @@ fn spawn_watchdog(
 }
 
 /// Everything needed to arm one breakpoint, resolved once from the tool arguments.
+///
+/// A wildcard arms the same definition on many classes (FILT-3), so the spec is re-pointed per class by
+/// [`for_pattern`](BreakpointSpec::for_pattern): each member carries one concrete class, which is why a
+/// member's stop point reads `com.example.OrderRepo:88` rather than the pattern it came from.
 struct BreakpointSpec {
     class_pattern: String,
     signature: String,
@@ -6940,6 +7904,28 @@ struct BreakpointSpec {
     /// Caller-frame depth for traced hits (TRACE-5), already clamped to `MAX_TRACE_FRAMES`.
     trace_frames: usize,
     suspend_policy: jdwp_client::SuspendPolicy,
+}
+
+impl BreakpointSpec {
+    /// This definition, pointed at one class or pattern (FILT-3/FILT-4).
+    ///
+    /// The one place a spec is copied, so a batch or a family allocates per target here and nowhere else.
+    fn for_pattern(&self, pattern: &str) -> Self {
+        Self {
+            class_pattern: pattern.to_string(),
+            signature: signature_for_dotted(pattern),
+            line_opt: self.line_opt,
+            method_hint: self.method_hint.clone(),
+            hit_count: self.hit_count,
+            thread_filter: self.thread_filter,
+            condition: self.condition.clone(),
+            trace: self.trace,
+            trace_expr: self.trace_expr.clone(),
+            trace_budget: self.trace_budget,
+            trace_frames: self.trace_frames,
+            suspend_policy: self.suspend_policy,
+        }
+    }
 }
 
 /// What arming produced, for the reply to render.
@@ -6964,7 +7950,7 @@ async fn arm_and_insert(
     class_type_id: u64,
     spec: &BreakpointSpec,
     bp_id: String,
-) -> Result<ArmedBreakpoint, String> {
+) -> Result<ArmedBreakpoint, ArmError> {
     let loc = resolve_bp_location(
         &mut session.connection,
         class_type_id,
@@ -6972,7 +7958,7 @@ async fn arm_and_insert(
         spec.method_hint.as_deref(),
     )
     .await
-    .map_err(|e| format!("{e} in {}", spec.class_pattern))?;
+    .map_err(|e| ArmError::from_location(&e, &spec.class_pattern))?;
     let (method, index, line, jvm_lines) = (loc.method, loc.code_index, loc.line, loc.lines);
     let request_id = session
         .connection
@@ -6985,7 +7971,7 @@ async fn arm_and_insert(
             spec.thread_filter,
         )
         .await
-        .map_err(|e| format!("Failed to set breakpoint: {e}"))?;
+        .map_err(|e| ArmError::Other(format!("Failed to set breakpoint: {e}")))?;
     // Computed before the insert so the stop point carries it too, not only this reply (DISC-8).
     let drift = drift_caveat_for_armed_method(session, &spec.class_pattern, &method, jvm_lines).await;
     session.breakpoints.insert(
@@ -7029,6 +8015,38 @@ async fn register_deferred_breakpoint(
     spec: &BreakpointSpec,
     bp_id: String,
 ) -> Result<String, String> {
+    match defer_breakpoint(session, spec, bp_id).await? {
+        DeferResult::ArmedOnRecheck(armed) => Ok(format!(
+            "✅ {} set at {}:{} (class had just loaded)\n   Method: {}\n   Stop-point ID: {}",
+            if spec.trace { "Trace breakpoint" } else { "Breakpoint" },
+            spec.class_pattern,
+            armed.line,
+            armed.method_name,
+            armed.bp_id
+        )),
+        DeferResult::Deferred { bp_id } => Ok(format!(
+            "⏳ Deferred breakpoint for {0} ({1}) — {0} is not loaded yet. It will arm automatically when the class loads (trigger the request that loads it), then hit normally.\n   Stop-point ID: {bp_id}",
+            spec.class_pattern,
+            describe_where(spec.line_opt, spec.method_hint.as_deref())
+        )),
+    }
+}
+
+/// What deferring produced: the class had already appeared, or the watch is now waiting for it.
+enum DeferResult {
+    /// The load race closed in our favour — the class appeared between the lookup and the watch.
+    ArmedOnRecheck(ArmedBreakpoint),
+    /// Waiting on `CLASS_PREPARE`.
+    Deferred { bp_id: String },
+}
+
+/// [`register_deferred_breakpoint`] with the reply text taken out, so a batch (FILT-4) can render one
+/// line for this pattern among several instead of a paragraph addressed to a single caller.
+async fn defer_breakpoint(
+    session: &mut crate::session::DebugSession,
+    spec: &BreakpointSpec,
+    bp_id: String,
+) -> Result<DeferResult, String> {
     let cp_req = session
         .connection
         .set_class_prepare(&spec.class_pattern, jdwp_client::SuspendPolicy::EventThread)
@@ -7039,16 +8057,8 @@ async fn register_deferred_breakpoint(
     if let Some(c) = recheck.first() {
         let ctid = c.type_id;
         let _ = session.connection.clear_class_prepare(cp_req).await;
-        let armed = arm_and_insert(session, ctid, spec, bp_id).await?;
-        let (bp_id, line, method_name) = (armed.bp_id, armed.line, armed.method_name);
-        return Ok(format!(
-            "✅ {} set at {}:{} (class had just loaded)\n   Method: {}\n   Stop-point ID: {}",
-            if spec.trace { "Trace breakpoint" } else { "Breakpoint" },
-            spec.class_pattern,
-            line,
-            method_name,
-            bp_id
-        ));
+        let armed = arm_and_insert(session, ctid, spec, bp_id).await.map_err(ArmError::into_message)?;
+        return Ok(DeferResult::ArmedOnRecheck(armed));
     }
 
     session.pending_breakpoints.push(crate::session::PendingBreakpoint {
@@ -7066,15 +8076,812 @@ async fn register_deferred_breakpoint(
         trace_budget: spec.trace_budget,
         trace_frames: spec.trace_frames,
     });
-    let where_ = match (spec.line_opt, spec.method_hint.as_deref()) {
+    Ok(DeferResult::Deferred { bp_id })
+}
+
+/// `line 412` / `method handle` — how a stop point's target reads when it has no resolved location yet.
+fn describe_where(line: Option<i32>, method: Option<&str>) -> String {
+    match (line, method) {
         (Some(l), _) => format!("line {l}"),
         (None, Some(m)) => format!("method {m}"),
         _ => String::new(),
+    }
+}
+
+/// The platform's classpath separator.
+const CLASSPATH_SEPARATOR: &str = if cfg!(windows) { ";" } else { ":" };
+
+/// How long a launched JVM has to start listening before the launch is called a failure.
+const LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a launched JVM is going to run (LAUNCH-1).
+#[derive(Debug)]
+enum LaunchTarget {
+    MainClass(String),
+    Jar(String),
+}
+
+impl LaunchTarget {
+    fn label(&self) -> &str {
+        match self {
+            Self::MainClass(m) | Self::Jar(m) => m,
+        }
+    }
+}
+
+/// Exactly one of `main_class` / `jar`, refused clearly rather than resolved by precedence.
+///
+/// Precedence would have been easy and wrong: a caller who passed both has a mistaken belief about what will
+/// run, and silently honouring one of them leaves them debugging the wrong program.
+fn launch_target(a: &crate::args::LaunchArgs) -> Result<LaunchTarget, String> {
+    let main = a.main_class.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let jar = a.jar.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    match (main, jar) {
+        (Some(m), None) => Ok(LaunchTarget::MainClass(m.to_string())),
+        (None, Some(j)) => Ok(LaunchTarget::Jar(j.to_string())),
+        (Some(m), Some(j)) => Err(format!(
+            "Give main_class OR jar, not both — you passed main_class '{m}' and jar '{j}', and only one of \
+             them can be what runs."
+        )),
+        (None, None) => Err("Give main_class (with classpath, e.g. {main_class:\"com.example.Main\", \
+             classpath:[\"target/classes\"]}) or jar (e.g. {jar:\"build/app.jar\"})."
+            .to_string()),
+    }
+}
+
+/// Which `java` to run: the named home, then `JAVA_HOME`, then `PATH`.
+///
+/// A named `java_home` that is not usable is an ERROR rather than a fallback, for the reason TEST-18 settled
+/// for the test harness: quietly running a different JDK than the one you asked for turns a version-dependent
+/// bug into a mystery.
+fn resolve_java_binary(java_home: Option<&str>) -> Result<std::path::PathBuf, String> {
+    let exe = if cfg!(windows) { "java.exe" } else { "java" };
+    if let Some(home) = java_home.map(str::trim).filter(|s| !s.is_empty()) {
+        let candidate = std::path::Path::new(home).join("bin").join(exe);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        return Err(format!(
+            "java_home '{home}' has no {exe} at bin/{exe}. Point it at a JDK/JRE home directory (the one \
+             holding bin/), not at the binary itself."
+        ));
+    }
+    if let Some(home) = std::env::var_os("JAVA_HOME") {
+        let candidate = std::path::Path::new(&home).join("bin").join(exe);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    // Left to `PATH` — an unusable name fails at spawn, where the error names the command.
+    Ok(std::path::PathBuf::from(exe))
+}
+
+/// A free local TCP port, by binding one and letting go.
+///
+/// Inherently racy — something else can take it in between — which is why `port` is an argument: a caller who
+/// needs certainty can name one.
+fn free_local_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("Could not find a free port to give the JVM: {e}"))?;
+    listener.local_addr().map(|a| a.port()).map_err(|e| format!("Could not read the chosen port: {e}"))
+}
+
+/// Build the `java …` command for a launch, and the printable form of it.
+///
+/// The printable form is returned rather than reconstructed, because it is what every failure path shows the
+/// caller — and a command line rebuilt separately from the one that ran is a command line that can disagree
+/// with it.
+fn build_launch_command(
+    a: &crate::args::LaunchArgs,
+    target: &LaunchTarget,
+    java: &std::path::Path,
+    port: u16,
+) -> (tokio::process::Command, String) {
+    let mut cmdline: Vec<String> = vec![format!(
+        "-agentlib:jdwp=transport=dt_socket,server=y,suspend={},address=127.0.0.1:{port}",
+        if a.suspend { "y" } else { "n" }
+    )];
+    if let Some(extra) = &a.jvm_args {
+        cmdline.extend(extra.iter().cloned());
+    }
+    if let Some(cp) = &a.classpath {
+        if !cp.is_empty() {
+            cmdline.push("-cp".to_string());
+            cmdline.push(cp.join(CLASSPATH_SEPARATOR));
+        }
+    }
+    match target {
+        LaunchTarget::Jar(j) => {
+            cmdline.push("-jar".to_string());
+            cmdline.push(j.clone());
+        }
+        LaunchTarget::MainClass(m) => cmdline.push(m.clone()),
+    }
+    if let Some(program_args) = &a.args {
+        cmdline.extend(program_args.iter().cloned());
+    }
+
+    let mut command = tokio::process::Command::new(java);
+    command.args(&cmdline);
+    if let Some(dir) = &a.working_dir {
+        command.current_dir(dir);
+    }
+    // stdout must NOT be inherited: this server's stdout is the MCP transport, and a debuggee printing to it
+    // would corrupt the protocol. Both streams are drained into a bounded buffer by the caller.
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // The whole lifetime policy, in one call, decided before the process exists (see `LaunchedJvm`).
+        .kill_on_drop(!a.detach_on_disconnect);
+
+    let printable = format!("{} {}", java.display(), cmdline.join(" "));
+    (command, printable)
+}
+
+/// Drain one of the debuggee's streams into the bounded buffer, tagged with which stream it was.
+///
+/// Draining is not optional bookkeeping: an undrained pipe fills and then BLOCKS the debuggee on its next
+/// `println`, which would look exactly like the program hanging in the code you are debugging.
+fn spawn_output_drain(
+    buf: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    tag: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            // Scoped so the (synchronous) lock is never held across the next await.
+            if let Ok(mut held) = buf.lock() {
+                if held.len() >= crate::session::MAX_DEBUGGEE_OUTPUT {
+                    held.pop_front();
+                }
+                held.push_back(format!("[{tag}] {line}"));
+            }
+        }
+    })
+}
+
+/// The last `n` lines of a debuggee's captured output.
+fn tail_of(
+    buf: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    n: usize,
+) -> Vec<String> {
+    let Ok(held) = buf.lock() else {
+        return Vec::new();
     };
+    held.iter().skip(held.len().saturating_sub(n)).cloned().collect()
+}
+
+/// Indent captured output so it reads as the debuggee's voice rather than ours.
+fn indent_lines(lines: &[String], prefix: &str) -> String {
+    lines.iter().map(|l| format!("{prefix}{l}")).collect::<Vec<_>>().join("\n")
+}
+
+/// Connect to a JVM we just started, polling the CHILD as well as the port.
+///
+/// Polling both is the whole point. A JVM that died on a bad classpath and a JVM that is merely slow to
+/// initialise are the same observation from the socket's side — a connect that does not succeed yet — and
+/// waiting the full timeout to report "could not connect" throws away the fact that the process is gone and
+/// its stderr says why.
+async fn connect_to_launched(
+    child: &mut tokio::process::Child,
+    port: u16,
+) -> Result<jdwp_client::JdwpConnection, String> {
+    let deadline = std::time::Instant::now() + LAUNCH_TIMEOUT;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "The JVM exited before the debugger could attach ({status}). Nothing is running, so there is \
+                 no session."
+            ));
+        }
+        if let Ok(c) = jdwp_client::JdwpConnection::connect("127.0.0.1", port).await {
+            return Ok(c);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "The JVM started but nothing accepted a JDWP connection on 127.0.0.1:{port} within {}s. It is \
+                 still running — if it is merely slow, attach to that port with debug.attach; if the agent \
+                 never armed, check the -agentlib line in the command below.",
+                LAUNCH_TIMEOUT.as_secs()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// What `render_launch_reply` needs beyond the caller's own arguments.
+struct LaunchReply<'a> {
+    session_id: &'a str,
+    port: u16,
+    pid: Option<u32>,
+    read_only: bool,
+}
+
+/// The `debug.launch` reply.
+///
+/// Longer than an attach reply on purpose: three facts about a launched JVM are true of nothing else here and
+/// none of them can be discovered by asking. It is suspended before its first instruction (or deliberately
+/// not). Disconnecting *terminates* it. And a `SIGKILL`ed server orphans it, which is the one case this tool
+/// cannot clean up after — so the pid is named while there is still somebody to read it.
+fn render_launch_reply(a: &crate::args::LaunchArgs, target: &LaunchTarget, r: &LaunchReply<'_>) -> String {
+    let mut out = format!("🚀 Launched {} on port {} (session: {})", target.label(), r.port, r.session_id);
+    if let Some(pid) = r.pid {
+        let _ = write!(out, ", pid {pid}");
+    }
+    if a.suspend {
+        let secs = watchdog_secs();
+        let _ = write!(
+            out,
+            "\n   ⏸️  SUSPENDED BEFORE ITS FIRST INSTRUCTION (suspend=y) — nothing has run yet, which is the \
+             one thing attaching can never give you: static initialisers, framework bootstrap and anything \
+             else that runs once are all still ahead. Arm your stop points now, then debug.continue.\n   \
+             ⚠️  Because it is held that early, the JVM has NOT resolved your main class yet — so this reply \
+             is not evidence that the program can run. A missing class or a wrong classpath surfaces on the \
+             first debug.continue, and debug.list_sessions then shows the session DEAD with the JVM's own \
+             words.{}",
+            if secs == 0 {
+                " The watchdog is disabled (JDWP_WATCHDOG_SECS=0), so nothing will resume it but you."
+                    .to_string()
+            } else {
+                format!(" The watchdog will auto-resume it after {secs}s if you don't.")
+            }
+        );
+    } else {
+        out.push_str("\n   ▶️  Running (suspend=n) — it may already be past the code you wanted to see.");
+    }
+    out.push_str(
+        "\n   This JVM IS YOURS: no other requests are on it, so suspending it freely — debug.pause, the \
+         steppers, a suspending stop point — costs nobody anything. The shared-instance cautions on those \
+         tools are about somebody else's JVM, not this one.",
+    );
+    if a.detach_on_disconnect {
+        out.push_str(
+            "\n   ⚠️  detach_on_disconnect: it will KEEP RUNNING after debug.disconnect, and nothing here \
+             will clean it up. Its lifetime is yours now.",
+        );
+    } else {
+        out.push_str(
+            "\n   debug.disconnect TERMINATES it — this server started it, so it owns it. Pass \
+             detach_on_disconnect:true at launch if you want it to outlive the session.",
+        );
+    }
+    if let Some(pid) = r.pid {
+        let _ = write!(
+            out,
+            "\n   ⚠️  If this server is SIGKILLed, this JVM survives as an orphan: it is not in our process \
+             group (that needs `unsafe`, which this workspace's lint gate refuses), and a fresh server cannot \
+             find it. Kill pid {pid} yourself in that case."
+        );
+    }
+    out.push_str(
+        "\n   Its stdout/stderr are captured, not printed: this server's stdout is the MCP transport. The \
+         last lines come back with debug.disconnect, and immediately if it dies at startup.",
+    );
+    if r.read_only {
+        out.push_str(
+            "\n   🔒 Read-only: method invocation, set_value and force_return are refused (JDWP_READONLY, or \
+             read_only:true).",
+        );
+    }
+    out
+}
+
+/// End (or deliberately release) the JVM this session launched, and say which happened (LAUNCH-1).
+///
+/// Returns the paragraph `debug.disconnect` appends. It is never empty for a launched session, because both
+/// outcomes are news: a JVM that has just been killed, or one that is still running with nobody watching it.
+async fn end_launched_jvm(session: &mut crate::session::DebugSession) -> String {
+    let Some(mut launched) = session.launched.take() else {
+        return String::new();
+    };
+    let pid = launched.pid.map_or_else(|| "?".to_string(), |p| p.to_string());
+    let tail = launched.tail(20);
+    let output = if tail.is_empty() {
+        "\n   It printed nothing.".to_string()
+    } else {
+        format!("\n   Its last output:\n{}", indent_lines(&tail, "     "))
+    };
+
+    if launched.detach_on_disconnect {
+        return format!(
+            "\n   ▶️  The JVM this session launched (pid {pid}) is STILL RUNNING — detach_on_disconnect was \
+             set, so it was left alone. Nothing here tracks it any more; its lifetime is yours.{output}"
+        );
+    }
+
+    // Already gone is not a failure — a program that ran to completion is the normal end of a launch.
+    if let Ok(Some(status)) = launched.child.try_wait() {
+        format!("\n   🛑 The JVM this session launched (pid {pid}) had already exited ({status}).{output}")
+    } else {
+        {
+            let killed = launched.child.kill().await.is_ok();
+            if killed {
+                format!(
+                    "\n   🛑 TERMINATED the JVM this session launched (pid {pid}) — this server started it, so \
+                     disconnecting ends it. Pass detach_on_disconnect:true at launch to keep it.{output}"
+                )
+            } else {
+                format!(
+                    "\n   ⚠️  Could not terminate the JVM this session launched (pid {pid}) — it may still be \
+                     running, and nothing here tracks it any more. Kill it yourself.{output}"
+                )
+            }
+        }
+    }
+}
+
+/// Does this class argument name ONE class, or match many (FILT-3)?
+///
+/// A star is the whole test, deliberately. [`class_matches`] — shared with `debug.list_classes` — also
+/// treats a bare word as a substring, but an *arming* argument must not: `Order` has always meant the
+/// class `Order` here, and quietly promoting it to "every class whose name contains Order" would arm stop
+/// points on a shared JVM that nobody asked for.
+fn is_wildcard(pattern: &str) -> bool {
+    pattern.contains('*')
+}
+
+/// The JNI signature for a dotted class name.
+fn signature_for_dotted(dotted: &str) -> String {
+    if dotted.starts_with('L') && dotted.ends_with(';') {
+        dotted.to_string()
+    } else {
+        format!("L{};", dotted.replace('.', "/"))
+    }
+}
+
+/// Loaded classes as `(dotted name, reference type id)`, arrays excluded, sorted by name.
+///
+/// Read **once per call** and shared by every wildcard in it: a batch of five patterns must not cost five
+/// reads of a list that has thousands of entries on a real app server (ADR-0010). Interfaces are kept —
+/// a default method has a line table and can hold a breakpoint.
+async fn load_class_index(conn: &mut jdwp_client::JdwpConnection) -> Result<Vec<(String, u64)>, String> {
+    let all = conn.all_classes().await.map_err(|e| format!("Failed to list classes: {e}"))?;
+    let mut out: Vec<(String, u64)> = all
+        .into_iter()
+        .filter(|c| c.ref_type_tag != REF_TAG_ARRAY)
+        .map(|c| (decode_signature(&c.signature), c.type_id))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// The tightest JDWP `ClassMatch` that is a **superset** of `pattern`, and whether it had to widen.
+///
+/// JDWP's `ClassMatch` understands an exact name, `prefix*`, or `*suffix` — and nothing else. Our matcher
+/// also accepts `*Order*`, which JDWP cannot express, so the watch widens to `*` and every arriving
+/// `ClassPrepare` is filtered our side by the real pattern. Widening is not free: every class the JVM loads
+/// then becomes an event that briefly suspends the loading thread. So it is reported rather than left as a
+/// mysteriously busy watch — a caller told "narrow it to `com.example.*`" can act, a caller who only sees
+/// a slow deployment cannot.
+fn jdwp_class_match_for(pattern: &str) -> (String, bool) {
+    let one_star = pattern.matches('*').count() == 1;
+    if one_star && (pattern.starts_with('*') || pattern.ends_with('*')) {
+        (pattern.to_string(), false)
+    } else {
+        ("*".to_string(), true)
+    }
+}
+
+/// One armed member of a wildcard family: the concrete class, and what arming it produced.
+struct FamilyMember {
+    class: String,
+    armed: ArmedBreakpoint,
+}
+
+/// What arming one wildcard pattern produced (FILT-3).
+struct FamilyOutcome {
+    set_id: String,
+    members: Vec<FamilyMember>,
+    /// Loaded classes the pattern matched, before the method filter or the cap.
+    matched: usize,
+    /// Matches not even attempted because the family was already full.
+    skipped: usize,
+    /// Matches that do not declare the target method — the expected majority for a broad pattern.
+    no_method: usize,
+    /// Real per-class failures, already worded.
+    failures: Vec<String>,
+    broadened_watch: bool,
+    /// The family is armed but not watching for future classes, because the watch itself failed.
+    watch_error: Option<String>,
+}
+
+/// Arm one wildcard pattern: a breakpoint per matching loaded class, plus a `CLASS_PREPARE` watch that
+/// arms the ones loading later (FILT-3).
+///
+/// **What the cap is protecting.** A wildcard is N line-table lookups and N live event requests whose N
+/// the caller could not see when they typed it, on a JVM that is usually someone else's. So the expansion
+/// stops at `max_classes` and the reply says what it left out — the same bargain `debug.list_threads` and
+/// `debug.thread_dump` already make, and the reason this is not simply "arm everything that matches".
+///
+/// **Why a failed watch does not fail the call.** The members that armed are real and useful; refusing the
+/// whole thing because future classes cannot be covered would throw away the part that worked. It is
+/// reported instead, because a family silently not growing is exactly the silence-as-an-answer this
+/// codebase forbids.
+async fn arm_pattern_family(
+    session: &mut crate::session::DebugSession,
+    spec: &BreakpointSpec,
+    index: &[(String, u64)],
+    max_classes: usize,
+) -> FamilyOutcome {
+    let set_id = session.next_stop_id("bpset_");
+    let hits: Vec<(String, u64)> =
+        index.iter().filter(|(fqn, _)| class_matches(fqn, &spec.class_pattern)).cloned().collect();
+    let matched = hits.len();
+
+    let mut members = Vec::new();
+    let mut failures = Vec::new();
+    let mut no_method = 0usize;
+    let mut skipped = 0usize;
+    for (fqn, type_id) in hits {
+        if members.len() >= max_classes {
+            skipped += 1;
+            continue;
+        }
+        let per_class = spec.for_pattern(&fqn);
+        let bp_id = session.next_stop_id("bp_");
+        match arm_and_insert(session, type_id, &per_class, bp_id).await {
+            Ok(armed) => members.push(FamilyMember { class: fqn, armed }),
+            // Not a failure: the pattern matched a class that is not a target. Counted, never listed —
+            // a broad pattern would otherwise bury the real failures under dozens of these.
+            Err(ArmError::NoSuchMethod(_)) => no_method += 1,
+            Err(ArmError::Other(msg)) => failures.push(msg),
+        }
+    }
+
+    let (jdwp_pattern, broadened_watch) = jdwp_class_match_for(&spec.class_pattern);
+    let watch =
+        session.connection.set_class_prepare(&jdwp_pattern, jdwp_client::SuspendPolicy::EventThread).await;
+    let (class_prepare_request_id, watch_error) = match watch {
+        Ok(req) => (Some(req), None),
+        Err(e) => (None, Some(format!("{e}"))),
+    };
+
+    session.pattern_sets.insert(
+        set_id.clone(),
+        crate::session::PatternStopSet {
+            id: set_id.clone(),
+            class_pattern: spec.class_pattern.clone(),
+            class_prepare_request_id,
+            enabled: true,
+            members: members.iter().map(|m| m.armed.bp_id.clone()).collect(),
+            armed_later: Vec::new(),
+            armed_later_total: 0,
+            method: spec.method_hint.clone(),
+            hit_count: spec.hit_count,
+            thread_filter: spec.thread_filter,
+            condition: spec.condition.clone(),
+            trace: spec.trace,
+            trace_expr: spec.trace_expr.clone(),
+            trace_budget: spec.trace_budget,
+            trace_frames: spec.trace_frames,
+            max_classes,
+            skipped_at_cap: skipped,
+            no_method,
+        },
+    );
+
+    FamilyOutcome { set_id, members, matched, skipped, no_method, failures, broadened_watch, watch_error }
+}
+
+/// What one entry of a `class_pattern` produced (FILT-3/FILT-4).
+enum PatternOutcome {
+    /// An exact class, armed now.
+    Armed(ArmedBreakpoint),
+    /// An exact class that is not loaded yet, waiting on its own `CLASS_PREPARE` watch.
+    Deferred { bp_id: String },
+    /// A wildcard: a family of breakpoints under one `bpset_` id.
+    Family(FamilyOutcome),
+    /// This pattern armed nothing, and why. Never aborts the other patterns in the call.
+    Failed(String),
+}
+
+impl PatternOutcome {
+    /// Stop points this pattern armed.
+    fn armed(&self) -> usize {
+        match self {
+            Self::Armed(_) => 1,
+            Self::Family(f) => f.members.len(),
+            Self::Deferred { .. } | Self::Failed(_) => 0,
+        }
+    }
+
+    /// Targets this pattern refused. A family can refuse some classes and arm others.
+    fn failed(&self) -> usize {
+        match self {
+            Self::Failed(_) => 1,
+            Self::Family(f) => f.failures.len(),
+            Self::Armed(_) | Self::Deferred { .. } => 0,
+        }
+    }
+}
+
+/// Resolve and arm ONE pattern, whatever shape it is — the unit a batch iterates over.
+///
+/// `index` is the shared loaded-class list, read only when the call contains at least one wildcard.
+async fn arm_one_pattern(
+    session: &mut crate::session::DebugSession,
+    spec: &BreakpointSpec,
+    index: &[(String, u64)],
+    max_classes: usize,
+) -> PatternOutcome {
+    if is_wildcard(&spec.class_pattern) {
+        return PatternOutcome::Family(arm_pattern_family(session, spec, index, max_classes).await);
+    }
+    let bp_id = session.next_stop_id("bp_");
+    let classes = match session.connection.classes_by_signature(&spec.signature).await {
+        Ok(c) => c,
+        Err(e) => return PatternOutcome::Failed(format!("Failed to find class: {e}")),
+    };
+    match classes.first() {
+        Some(c) => {
+            let type_id = c.type_id;
+            match arm_and_insert(session, type_id, spec, bp_id).await {
+                Ok(armed) => PatternOutcome::Armed(armed),
+                Err(e) => PatternOutcome::Failed(e.into_message()),
+            }
+        }
+        None => match defer_breakpoint(session, spec, bp_id).await {
+            Ok(DeferResult::ArmedOnRecheck(armed)) => PatternOutcome::Armed(armed),
+            Ok(DeferResult::Deferred { bp_id }) => PatternOutcome::Deferred { bp_id },
+            Err(e) => PatternOutcome::Failed(e),
+        },
+    }
+}
+
+/// Arm ONE exact, named class — the path `debug.set_line_stop` had before FILT-3/FILT-4, reply text and
+/// error text unchanged.
+///
+/// Split out rather than folded into the batch renderer on purpose. This is the overwhelmingly common call,
+/// its reply is what every skill and every saved transcript was written against, and a batch shape that
+/// "also covers" it is exactly how such a reply drifts.
+async fn arm_single_named(
+    session: &mut crate::session::DebugSession,
+    spec: &BreakpointSpec,
+    frames_note: Option<&str>,
+) -> Result<String, String> {
+    // One id for this breakpoint's whole life, allocated before we know whether it arms now or is
+    // deferred — and kept across any later disable/re-arm (BP-3).
+    let bp_id = session.next_stop_id("bp_");
+
+    let classes = session
+        .connection
+        .classes_by_signature(&spec.signature)
+        .await
+        .map_err(|e| format!("Failed to find class: {e}"))?;
+    let Some(first_class) = classes.first() else {
+        return register_deferred_breakpoint(session, spec, bp_id).await;
+    };
+    let class_type_id = first_class.type_id;
+
+    let armed = arm_and_insert(session, class_type_id, spec, bp_id).await.map_err(ArmError::into_message)?;
+    let (bp_id, line, method_name, request_id) =
+        (armed.bp_id, armed.line, armed.method_name, armed.request_id);
+
+    let mut extra = describe_trace_mode(spec, frames_note);
+    if let Some(c) = spec.hit_count {
+        let _ = write!(extra, "\n   Stops on hit #{c}");
+    }
+    if let Some(t) = spec.thread_filter {
+        let _ = write!(extra, "\n   Thread filter: 0x{t:x}");
+    }
+    if let Some(c) = &spec.condition {
+        let _ = write!(extra, "\n   Condition: {c}");
+    }
     Ok(format!(
-        "⏳ Deferred breakpoint for {0} ({where_}) — {0} is not loaded yet. It will arm automatically when the class loads (trigger the request that loads it), then hit normally.\n   Stop-point ID: {bp_id}",
-        spec.class_pattern
-    ))
+        "✅ {} set at {}:{}\n   Method: {}\n   Stop-point ID: {}\n   JDWP Request ID: {}{}",
+        if spec.trace { "Trace breakpoint" } else { "Breakpoint" },
+        spec.class_pattern,
+        line,
+        method_name,
+        bp_id,
+        request_id,
+        extra
+    ) + armed.drift.as_deref().unwrap_or(""))
+}
+
+fn render_pattern_outcomes(
+    base: &BreakpointSpec,
+    patterns: &[String],
+    outcomes: &[PatternOutcome],
+    frames_note: Option<&str>,
+    max_classes: usize,
+) -> String {
+    let armed: usize = outcomes.iter().map(PatternOutcome::armed).sum();
+    let deferred = outcomes.iter().filter(|o| matches!(o, PatternOutcome::Deferred { .. })).count();
+    let failed: usize = outcomes.iter().map(PatternOutcome::failed).sum();
+
+    let kind = if base.trace { "trace breakpoint(s)" } else { "breakpoint(s)" };
+    let mut out = format!("📍 {} pattern(s) → {armed} {kind} armed", outcomes.len());
+    if deferred > 0 {
+        let _ = write!(out, ", {deferred} deferred");
+    }
+    if failed > 0 {
+        let _ = write!(out, ", {failed} refused");
+    }
+    out.push_str(":\n\n");
+
+    // Stale bytecode, gathered across every class armed by this call (DISC-8). One armed class prints the
+    // whole caveat; several print a roll-call, because 40 paragraphs is not a warning anyone reads.
+    let mut stale: Vec<(&str, &str)> = Vec::new();
+    for (pattern, outcome) in patterns.iter().zip(outcomes) {
+        render_one_pattern_outcome(&mut out, pattern, outcome, max_classes, &mut stale);
+    }
+
+    let shared = describe_shared_arming_settings(base, frames_note);
+    if !shared.is_empty() {
+        let _ = write!(out, "\nEvery stop point above:{shared}");
+        out.push('\n');
+    }
+
+    render_stale_summary(&mut out, &stale);
+    render_family_footer(&mut out, outcomes);
+    out
+}
+
+/// One pattern's block in the arming reply, plus whatever drift it turned up.
+fn render_one_pattern_outcome<'a>(
+    out: &mut String,
+    pattern: &'a str,
+    outcome: &'a PatternOutcome,
+    max_classes: usize,
+    stale: &mut Vec<(&'a str, &'a str)>,
+) {
+    match outcome {
+        PatternOutcome::Armed(a) => {
+            let _ = writeln!(
+                out,
+                "{pattern}\n   ✅ {} at {pattern}:{} ({}) — JDWP request {}",
+                a.bp_id, a.line, a.method_name, a.request_id
+            );
+            if let Some(d) = &a.drift {
+                stale.push((pattern, d));
+            }
+        }
+        PatternOutcome::Deferred { bp_id } => {
+            let _ = writeln!(
+                out,
+                "{pattern}\n   ⏳ {bp_id} deferred — {pattern} is not loaded yet; it arms itself when the \
+                 class loads (trigger the request that loads it)."
+            );
+        }
+        PatternOutcome::Failed(msg) => {
+            let _ = writeln!(out, "{pattern}\n   ❌ {msg}");
+        }
+        PatternOutcome::Family(f) => {
+            render_family_block(out, pattern, f, max_classes);
+            for m in &f.members {
+                if let Some(d) = &m.armed.drift {
+                    stale.push((m.class.as_str(), d));
+                }
+            }
+        }
+    }
+}
+
+/// The note that says a `bpset_` id is the handle on a whole family — printed only when there is one.
+fn render_family_footer(out: &mut String, outcomes: &[PatternOutcome]) {
+    let families: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            PatternOutcome::Family(f) => Some(f.set_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    if families.is_empty() {
+        return;
+    }
+    let _ = write!(
+        out,
+        "\nThe {} above ({}) each address a whole family: clearing or toggling one covers every breakpoint \
+         it armed AND its watch for classes that load later. The individual bp_ ids work on their own too.\n",
+        if families.len() == 1 { "bpset_ id" } else { "bpset_ ids" },
+        families.join(", ")
+    );
+}
+
+/// One wildcard family's block in the arming reply.
+fn render_family_block(out: &mut String, pattern: &str, f: &FamilyOutcome, max_classes: usize) {
+    let _ = writeln!(
+        out,
+        "{pattern}   [{}] — {} of {} matching loaded class(es) armed{}",
+        f.set_id,
+        f.members.len(),
+        f.matched,
+        if f.watch_error.is_none() { ", and watching for more" } else { "" }
+    );
+    for m in &f.members {
+        let _ =
+            writeln!(out, "      {} {}:{} ({})", m.armed.bp_id, m.class, m.armed.line, m.armed.method_name);
+    }
+    if f.members.is_empty() && f.matched == 0 {
+        let _ = writeln!(
+            out,
+            "      No class matching this pattern is loaded yet — nothing is armed, but the watch is set, \
+             so matches that load later (a generated proxy, a lazily-initialised implementation) arm \
+             themselves. `debug.list_classes {{filter:\"{pattern}\"}}` shows what the JVM has now."
+        );
+    }
+    if f.no_method > 0 {
+        let _ = writeln!(
+            out,
+            "      {} matching class(es) have no method '{}' — not armed, and not an error: a broad pattern \
+             is expected to match classes that aren't targets.",
+            f.no_method,
+            f.members.first().map_or("", |m| m.armed.method_name.as_str())
+        );
+    }
+    if f.skipped > 0 {
+        let _ = writeln!(
+            out,
+            "      ⚠️  {} more matched but were NOT armed — the family is full at max_classes: {max_classes}. \
+             Raise max_classes if you mean it, or narrow the pattern; `debug.list_classes \
+             {{filter:\"{pattern}\"}}` shows all of them. The cap also applies to classes that load later.",
+            f.skipped
+        );
+    }
+    for msg in &f.failures {
+        let _ = writeln!(out, "      ❌ {msg}");
+    }
+    if let Some(e) = &f.watch_error {
+        let _ = writeln!(
+            out,
+            "      ⚠️  The class-prepare watch could not be registered ({e}), so classes matching this \
+             pattern that load LATER will not be armed. The breakpoints above are unaffected."
+        );
+    } else if f.broadened_watch {
+        let _ = writeln!(
+            out,
+            "      ℹ️  JDWP can only watch `prefix*` or `*suffix`, so this pattern's watch matches EVERY \
+             class load and is filtered our side. Correct, but it means every class the JVM loads now costs \
+             an event — narrow it to `prefix*` or `*suffix` if the JVM is loading classes heavily."
+        );
+    }
+}
+
+/// The settings that apply to every stop point a batch armed, printed once instead of per target.
+fn describe_shared_arming_settings(base: &BreakpointSpec, frames_note: Option<&str>) -> String {
+    let mut extra = describe_trace_mode(base, frames_note);
+    if let Some(c) = base.hit_count {
+        let _ = write!(extra, "\n   Stops on hit #{c}");
+    }
+    if let Some(t) = base.thread_filter {
+        let _ = write!(extra, "\n   Thread filter: 0x{t:x}");
+    }
+    if let Some(c) = &base.condition {
+        let _ = write!(extra, "\n   Condition: {c}");
+    }
+    extra
+}
+
+/// DISC-8 across many classes: the whole caveat for one, a roll-call for several.
+///
+/// The issue this answers (#74) asked what the reply should look like when 3 of 40 matches are stale. It
+/// cannot be 40 paragraphs, and it must not be silence — so it is a count, the class names, and a pointer
+/// to the tool that gives the detail per class.
+fn render_stale_summary(out: &mut String, stale: &[(&str, &str)]) {
+    match stale.len() {
+        0 => {}
+        1 => {
+            if let Some((_, caveat)) = stale.first() {
+                let _ = writeln!(out, "{}", caveat.trim_end());
+            }
+        }
+        n => {
+            let names: Vec<&str> = stale.iter().map(|(c, _)| *c).collect();
+            let _ = writeln!(
+                out,
+                "\n⚠️  STALE BYTECODE: {n} of the classes armed above are running code whose line table \
+                 does not match your compiled .class — {}. A breakpoint there resolves against an older \
+                 build, so it may never fire or may report locals that make no sense for the code you are \
+                 reading. `debug.check_stale {{class_name}}` gives the detail per class, and \
+                 `debug.list_stop_points` keeps the caveat on each stop point.",
+                names.join(", ")
+            );
+        }
+    }
 }
 
 /// Resolve a breakpoint location (method, bytecode index, source line) on an already-loaded class,
@@ -7108,8 +8915,11 @@ async fn resolve_bp_location(
     class_type_id: u64,
     line_opt: Option<i32>,
     method_hint: Option<&str>,
-) -> Result<ResolvedLocation, String> {
-    let methods = conn.get_methods(class_type_id).await.map_err(|e| format!("Failed to get methods: {e}"))?;
+) -> Result<ResolvedLocation, BpLocationError> {
+    let methods = conn
+        .get_methods(class_type_id)
+        .await
+        .map_err(|e| BpLocationError::Unreadable(format!("Failed to get methods: {e}")))?;
     // Hold a reference to the winning method and clone it once after the loop, rather than cloning on
     // every candidate.
     let mut chosen: Option<BpCandidate> = None;
@@ -7150,9 +8960,64 @@ async fn resolve_bp_location(
             Ok(ResolvedLocation { method: method.clone(), code_index, line, lines })
         }
         None => Err(line_opt.map_or_else(
-            || format!("Method '{}' not found", method_hint.unwrap_or("")),
-            |l| format!("No method contains line {l}"),
+            || BpLocationError::NoSuchMethod(method_hint.unwrap_or("").to_string()),
+            BpLocationError::NoSuchLine,
         )),
+    }
+}
+
+/// Why a location could not be resolved — a type rather than a message (FILT-3).
+///
+/// A wildcard pattern matches classes that simply do not declare the method: for `*.Service` + `handle`
+/// that is the expected majority of matches, not a fault, and a family that reported 37 "errors" for it
+/// would be unreadable. So the family path has to tell "this class is not a target" apart from "this class
+/// is a target and arming it went wrong" — and a distinction that lives in the *text* of an error is one
+/// refactor away from being lost silently, which is the failure mode this codebase least wants.
+///
+/// `Display` reproduces the wording the single-class path has always used, so no reply text changes.
+enum BpLocationError {
+    /// The class has no method by that name at all.
+    NoSuchMethod(String),
+    /// The class has no method whose line table contains that line.
+    NoSuchLine(i32),
+    /// The method table could not be read at all — a connection-level failure, not a miss.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for BpLocationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSuchMethod(m) => write!(f, "Method '{m}' not found"),
+            Self::NoSuchLine(l) => write!(f, "No method contains line {l}"),
+            Self::Unreadable(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Why arming one class failed, carrying the caller-ready message and the one distinction a wildcard
+/// family needs to make (see [`BpLocationError`]).
+enum ArmError {
+    /// The class does not have the target method — for a wildcard, not an error at all.
+    NoSuchMethod(String),
+    /// Anything else, already worded for the caller.
+    Other(String),
+}
+
+impl ArmError {
+    /// The location failure, worded exactly as the single-class path words it.
+    fn from_location(e: &BpLocationError, class: &str) -> Self {
+        let msg = format!("{e} in {class}");
+        match e {
+            BpLocationError::NoSuchMethod(_) => Self::NoSuchMethod(msg),
+            BpLocationError::NoSuchLine(_) | BpLocationError::Unreadable(_) => Self::Other(msg),
+        }
+    }
+
+    /// The message to show the caller.
+    fn into_message(self) -> String {
+        match self {
+            Self::NoSuchMethod(m) | Self::Other(m) => m,
+        }
     }
 }
 
@@ -11348,6 +13213,265 @@ mod tests {
         assert_eq!(trace_frames_tag(true, 3), " [+3 caller frame(s)]");
         assert_eq!(trace_frames_tag(true, 0), "", "depth 0 adds no cost, so it advertises nothing");
         assert_eq!(trace_frames_tag(false, 3), "", "a non-traced stop point has no snapshot depth");
+    }
+
+    // LAUNCH-1: both or neither is refused rather than resolved by precedence — a caller who passed both has
+    // a wrong belief about what will run, and honouring one silently leaves them debugging the other program.
+    #[test]
+    fn a_launch_needs_exactly_one_of_main_class_and_jar() {
+        let parse = |v: serde_json::Value| -> Result<LaunchTarget, String> {
+            launch_target(&serde_json::from_value::<crate::args::LaunchArgs>(v).unwrap())
+        };
+        assert_eq!(
+            parse(serde_json::json!({"main_class": "com.example.Main"})).unwrap().label(),
+            "com.example.Main"
+        );
+        assert_eq!(parse(serde_json::json!({"jar": "app.jar"})).unwrap().label(), "app.jar");
+
+        let both = parse(serde_json::json!({"main_class": "M", "jar": "a.jar"})).unwrap_err();
+        assert!(both.contains("not both") && both.contains('M') && both.contains("a.jar"), "{both}");
+        let neither = parse(serde_json::json!({})).unwrap_err();
+        assert!(neither.contains("main_class") && neither.contains("jar"), "{neither}");
+
+        // Whitespace is not a value: `{"jar": "  "}` must read as absent, not as a jar named two spaces.
+        assert!(parse(serde_json::json!({"main_class": "M", "jar": "   "})).is_ok());
+    }
+
+    // A named java_home that is not usable is an ERROR, never a silent fallback to some other JVM — the
+    // TEST-18 lesson (quietly testing a different JDK than the one asked for) applied to the launch path.
+    #[test]
+    fn an_unusable_java_home_is_refused_by_name_rather_than_replaced() {
+        let err = resolve_java_binary(Some("/definitely/not/a/jdk")).unwrap_err();
+        assert!(err.contains("/definitely/not/a/jdk"), "names what was asked for: {err}");
+        assert!(err.contains("bin/java"), "and says what was expected there: {err}");
+
+        // Absent means "decide for me", which is allowed to fall through to PATH.
+        assert!(resolve_java_binary(None).is_ok());
+        assert!(resolve_java_binary(Some("  ")).is_ok(), "blank is absent, not a directory named two spaces");
+    }
+
+    // LAUNCH-1: three facts are true of a launched JVM and of nothing else here, and none can be discovered
+    // by asking later — so the reply has to carry all three.
+    #[test]
+    fn the_launch_reply_states_the_suspension_the_ownership_and_the_lifetime() {
+        let args = |v: serde_json::Value| serde_json::from_value::<crate::args::LaunchArgs>(v).unwrap();
+        let target = LaunchTarget::MainClass("com.example.Main".to_string());
+
+        let suspended = render_launch_reply(
+            &args(serde_json::json!({"main_class": "com.example.Main"})),
+            &target,
+            &LaunchReply { session_id: "session_1", port: 5005, pid: Some(4242), read_only: false },
+        );
+        assert!(suspended.contains("SUSPENDED BEFORE ITS FIRST INSTRUCTION"), "{suspended}");
+        assert!(
+            suspended.contains("has NOT resolved your main class yet"),
+            "a launch is not a run: {suspended}"
+        );
+        assert!(
+            suspended.contains("This JVM IS YOURS"),
+            "the ownership that changes every other tool's advice"
+        );
+        assert!(suspended.contains("TERMINATES it"), "the default lifetime: {suspended}");
+        assert!(suspended.contains("4242"), "the pid, for the orphan case we cannot clean up: {suspended}");
+        assert!(suspended.contains("SIGKILLed"), "{suspended}");
+
+        // suspend:false must not claim a suspension, and must warn that the moment may be gone.
+        let running = render_launch_reply(
+            &args(serde_json::json!({"main_class": "com.example.Main", "suspend": false})),
+            &target,
+            &LaunchReply { session_id: "session_1", port: 5005, pid: None, read_only: false },
+        );
+        assert!(!running.contains("SUSPENDED"), "{running}");
+        assert!(running.contains("may already be past the code you wanted"), "{running}");
+
+        // Detached inverts the lifetime, and says who owns it now.
+        let detached = render_launch_reply(
+            &args(serde_json::json!({"main_class": "M", "detach_on_disconnect": true})),
+            &target,
+            &LaunchReply { session_id: "session_1", port: 5005, pid: Some(7), read_only: true },
+        );
+        assert!(detached.contains("KEEP RUNNING"), "{detached}");
+        assert!(detached.contains("lifetime is yours"), "{detached}");
+        assert!(!detached.contains("TERMINATES it"), "must not say both: {detached}");
+        assert!(detached.contains("Read-only"), "{detached}");
+    }
+
+    // FILT-3: a star is the only thing that makes an arming argument a pattern. `class_matches` treats a
+    // bare word as a substring for `list_classes`, and arming must NOT inherit that — `Order` promoted to
+    // "every class containing Order" would arm stop points on a shared JVM nobody asked for.
+    #[test]
+    fn only_a_star_makes_an_arming_argument_a_pattern() {
+        assert!(is_wildcard("com.example.*"));
+        assert!(is_wildcard("*.OrderService"));
+        assert!(is_wildcard("*Order*"));
+        assert!(!is_wildcard("com.example.Order"));
+        assert!(!is_wildcard("Order"), "a bare word stays exact, unlike in debug.list_classes");
+        assert!(!is_wildcard("Lcom/example/Order;"));
+    }
+
+    // FILT-3: the class-prepare watch must be a SUPERSET of the pattern, never a subset — a subset would
+    // silently miss classes the caller was promised, which is worse than a watch that sees too much and
+    // filters. Widening is reported, so the cost is the caller's to see.
+    #[test]
+    fn a_class_prepare_watch_is_the_tightest_legal_superset() {
+        assert_eq!(jdwp_class_match_for("com.example.*"), ("com.example.*".to_string(), false));
+        assert_eq!(jdwp_class_match_for("*.OrderService"), ("*.OrderService".to_string(), false));
+        assert_eq!(jdwp_class_match_for("*"), ("*".to_string(), false));
+        // JDWP understands one leading OR trailing star and nothing else, so these widen to `*` and are
+        // filtered our side rather than being sent as a pattern the JVM would match against literally.
+        assert_eq!(jdwp_class_match_for("*Order*"), ("*".to_string(), true));
+        assert_eq!(jdwp_class_match_for("a*b*c"), ("*".to_string(), true));
+
+        // The widened watch must still be a superset in practice: everything the real pattern matches has
+        // to survive our own filter under it.
+        for fqn in ["com.example.OrderRepo", "OrderService", "x.y.MyOrderThing"] {
+            assert!(class_matches(fqn, "*Order*"), "{fqn} should match the real pattern");
+        }
+    }
+
+    #[test]
+    fn a_dotted_name_becomes_a_jni_signature_and_a_signature_is_left_alone() {
+        assert_eq!(signature_for_dotted("com.example.Order"), "Lcom/example/Order;");
+        assert_eq!(signature_for_dotted("Order"), "LOrder;");
+        assert_eq!(signature_for_dotted("Lcom/example/Order;"), "Lcom/example/Order;");
+    }
+
+    // #74 asked what the reply says when 3 of 40 armed classes are stale. Not 40 paragraphs, and not
+    // silence: one class prints its whole caveat, several print a roll-call naming them.
+    #[test]
+    fn stale_bytecode_across_many_classes_is_a_roll_call_not_forty_paragraphs() {
+        let mut one = String::new();
+        render_stale_summary(&mut one, &[("com.example.A", "\n   ⚠️  STALE: line table differs")]);
+        assert!(one.contains("STALE: line table differs"), "one armed class keeps the full caveat: {one}");
+
+        let mut many = String::new();
+        render_stale_summary(
+            &mut many,
+            &[
+                ("com.example.A", "\n   ⚠️  STALE: line table differs"),
+                ("com.example.B", "\n   ⚠️  STALE: line table differs"),
+                ("com.example.C", "\n   ⚠️  STALE: line table differs"),
+            ],
+        );
+        assert!(many.contains("3 of the classes"), "the count is stated: {many}");
+        for c in ["com.example.A", "com.example.B", "com.example.C"] {
+            assert!(many.contains(c), "{c} must be named so it can be checked: {many}");
+        }
+        assert!(many.contains("debug.check_stale"), "and points at the tool that gives the detail");
+        assert_eq!(many.matches("STALE").count(), 1, "one warning, not one per class");
+
+        // Nothing stale says nothing at all — silence here is the absence of a proof, not a claim.
+        let mut none = String::new();
+        render_stale_summary(&mut none, &[]);
+        assert!(none.is_empty());
+    }
+
+    // FILT-4: a batch's normal outcome is partial, so the reply has to hold successes and failures at once.
+    // An error would have thrown away the two that armed.
+    #[test]
+    fn a_batch_reply_reports_every_pattern_including_the_ones_that_failed() {
+        let batches = vec![
+            BatchRows {
+                pattern: "java.lang.IllegalStateException".to_string(),
+                matched: None,
+                rows: vec![BatchRow::Armed("exc_1".to_string())],
+                skipped_at_cap: 0,
+            },
+            BatchRows {
+                pattern: "*.TimeoutException".to_string(),
+                matched: Some(2),
+                rows: vec![
+                    BatchRow::Armed("exc_2  com.example.TimeoutException".to_string()),
+                    BatchRow::Armed("exc_3  org.foo.TimeoutException".to_string()),
+                ],
+                skipped_at_cap: 3,
+            },
+            BatchRows {
+                pattern: "com.example.Nope".to_string(),
+                matched: None,
+                rows: vec![BatchRow::Failed("not loaded yet".to_string())],
+                skipped_at_cap: 0,
+            },
+        ];
+        let out = render_batch_arming("exception stop(s)", &batches, 2, "\n   Mode: trace");
+
+        assert!(out.contains("3 pattern(s) → 3 exception stop(s) armed, 1 refused"), "totals: {out}");
+        for id in ["exc_1", "exc_2", "exc_3"] {
+            assert!(out.contains(id), "{id} must be addressable from the reply: {out}");
+        }
+        assert!(out.contains("not loaded yet"), "the failure is reported, not thrown: {out}");
+        assert!(out.contains("2 loaded class(es) matched"), "a wildcard says what it matched: {out}");
+        assert!(out.contains("3 more matching class(es) were NOT armed"), "the cap says what it dropped");
+        assert!(out.contains("max_classes: 2"), "and names the number to raise: {out}");
+        assert!(out.contains("Mode: trace"), "shared settings are stated once");
+    }
+
+    // A pattern that matched nothing must say so as an ANSWER — this stop-point kind cannot be deferred,
+    // so "no rows" would otherwise read as "armed, waiting".
+    #[test]
+    fn a_pattern_that_matched_no_loaded_class_says_so() {
+        let batches = vec![BatchRows {
+            pattern: "com.absent.*".to_string(),
+            matched: Some(0),
+            rows: Vec::new(),
+            skipped_at_cap: 0,
+        }];
+        let out = render_batch_arming("watchpoint(s)", &batches, 20, "");
+        assert!(out.contains("0 watchpoint(s) armed"), "the total is honest: {out}");
+        assert!(out.contains("No loaded class matches this pattern"), "{out}");
+        assert!(out.contains("debug.list_classes"), "and says how to find out what IS loaded: {out}");
+    }
+
+    // FILT-3: the listing is the only place a caller learns what a wildcard BECAME — it grew after the
+    // reply they read, and it has stopped growing because it is full. Both are invisible from the members.
+    #[test]
+    fn a_family_listing_reports_growth_and_a_full_cap() {
+        let mut set = crate::session::PatternStopSet {
+            id: "bpset_1".to_string(),
+            class_pattern: "com.example.*".to_string(),
+            class_prepare_request_id: Some(9),
+            enabled: true,
+            members: vec!["bp_2".to_string(), "bp_3".to_string()],
+            armed_later: vec!["com.example.Late".to_string()],
+            armed_later_total: 1,
+            method: Some("handle".to_string()),
+            hit_count: None,
+            thread_filter: None,
+            condition: None,
+            trace: true,
+            trace_expr: None,
+            trace_budget: Some(200),
+            trace_frames: 3,
+            max_classes: 2,
+            skipped_at_cap: 4,
+            no_method: 6,
+        };
+        let mut out = String::new();
+        render_pattern_set_line(&mut out, &set, &std::collections::BTreeSet::new());
+        assert!(out.contains("[bpset_1]"), "addressable: {out}");
+        assert!(out.contains("family of 2 breakpoint(s)"), "{out}");
+        assert!(out.contains("Members: bp_2, bp_3"), "the members can be cleared individually: {out}");
+        assert!(out.contains("watching for matching classes that load later"), "{out}");
+        assert!(out.contains("+1 class(es) armed since"), "growth after the reply is reported: {out}");
+        assert!(out.contains("com.example.Late"), "and names it: {out}");
+        assert!(out.contains("FULL at max_classes: 2"), "a full family says it is full: {out}");
+        assert!(out.contains("4 matching class(es) were not armed"), "{out}");
+        assert!(out.contains("6 matching class(es) have no method 'handle'"), "counted, not an error: {out}");
+
+        // Disabled: the watch is gone too, and the listing must not imply it is still catching classes.
+        set.enabled = false;
+        set.class_prepare_request_id = None;
+        let mut off = String::new();
+        render_pattern_set_line(&mut off, &set, &std::collections::BTreeSet::new());
+        assert!(off.contains("not watching (disabled)"), "{off}");
+        assert!(off.contains("DISABLED"), "{off}");
+
+        // Enabled but with no watch is a THIRD state and must not read like either of the others: the
+        // family is live, and nothing will arm the next matching class.
+        set.enabled = true;
+        let mut broken = String::new();
+        render_pattern_set_line(&mut broken, &set, &std::collections::BTreeSet::new());
+        assert!(broken.contains("NOT watching for new classes"), "{broken}");
     }
 
     // TEST-8: the per-dump line-table cache is keyed by (class, method) and the LINE is resolved per frame

@@ -77,6 +77,135 @@ pub fn parse<T: serde::de::DeserializeOwned>(args: &serde_json::Value) -> Result
     serde_json::from_value(v).map_err(|e| format!("Invalid arguments: {e}"))
 }
 
+/// Arguments for `debug.launch` (LAUNCH-1).
+///
+/// **What this tool is for, and what it is not.** Every other tool here assumes the JVM belongs to someone
+/// else — that is where the watchdog, `debug.panic`, trace mode, `JDWP_READONLY` and SAFE-1's
+/// resume-on-disconnect all come from. This one starts a JVM that is *yours*: nobody else's requests are on
+/// it, suspending it costs nobody anything, and `suspend=y` becomes reachable, which is the only way to
+/// break on code that runs during initialisation. It is not a way to manage an app server — a long-running
+/// deployment should be started by whatever normally starts it, and attached to.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LaunchArgs {
+    /// Main class to run, e.g. `com.example.Main`. Give this **or** `jar`, not both. Needs `classpath`
+    /// unless the class is on the default one.
+    #[serde(default)]
+    pub main_class: Option<String>,
+    /// Executable jar to run (`java -jar <jar>`). Give this **or** `main_class`.
+    #[serde(default)]
+    pub jar: Option<String>,
+    /// Classpath entries, e.g. `["target/classes", "libs/dep.jar"]` — joined with the platform separator.
+    /// Relative paths resolve against `working_dir`.
+    #[serde(default)]
+    pub classpath: Option<Vec<String>>,
+    /// Extra JVM arguments, e.g. `["-Xmx512m", "-Dspring.profiles.active=dev"]`. Passed through verbatim,
+    /// before the main class. The `-agentlib:jdwp=…` argument is added for you and must not be given here.
+    #[serde(default)]
+    pub jvm_args: Option<Vec<String>>,
+    /// Arguments for the program's own `main(String[])`.
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    /// Working directory for the JVM. Defaults to this server's own.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// Suspend the JVM at startup, before a single line of the program runs — **default true**, and the
+    /// main reason this tool exists.
+    ///
+    /// `suspend=y` is unreachable when you attach to a JVM someone else started: by the time you can
+    /// connect, static initialisers, framework bootstrapping and anything else that runs once have already
+    /// run. With this you arm the stop points first and then `debug.continue`. Pass false for a JVM you
+    /// only want running and attached.
+    #[serde(default = "default_true")]
+    pub suspend: bool,
+    /// JDWP port. `0` (the default) picks a free one, which is usually right — the port only matters if
+    /// something else needs to reach it too.
+    #[serde(default)]
+    pub port: u16,
+    /// Which JDK to run: a home directory whose `bin/java` is used. Defaults to `JAVA_HOME`, then to `java`
+    /// on `PATH`. The reply always names the binary it actually ran, because "which JDK" is exactly the
+    /// question a version-dependent bug turns on.
+    #[serde(default)]
+    pub java_home: Option<String>,
+    /// Leave the JVM RUNNING when the session disconnects, instead of terminating it.
+    ///
+    /// The default is to terminate: this server started the process, so it owns it, and a JVM left behind
+    /// with an open JDWP port that no session knows about is worse than one that stops when you are done
+    /// with it. Set this when the point of the run is the program rather than the debugging — but then its
+    /// lifetime is yours, and nothing here will clean it up.
+    #[serde(default)]
+    pub detach_on_disconnect: bool,
+    /// Open the session read-only, exactly as `debug.attach` does. Rarely what you want on a JVM you
+    /// started yourself, but `JDWP_READONLY` still applies deployment-wide and cannot be relaxed here
+    /// (SAFE-3).
+    #[serde(default)]
+    pub read_only: bool,
+    /// Directories `debug.source` searches for `.java` files — see `debug.attach`.
+    #[serde(default)]
+    pub source_roots: Option<Vec<String>>,
+    /// Directories holding freshly compiled classes for `debug.reload_class` / `debug.check_stale` — see
+    /// `debug.attach`.
+    #[serde(default)]
+    pub class_roots: Option<Vec<String>>,
+}
+
+/// A class argument that takes **one** pattern or **several** (FILT-4).
+///
+/// Deserialises from either a JSON string or an array of strings, so `"com.example.Order"` and
+/// `["com.example.Order", "com.example.*Repo"]` are both valid and nothing written before FILT-4 has to
+/// change. The reply shape follows the same rule in reverse: a call that can only produce ONE stop point
+/// still gets exactly the single-stop-point reply it always got, and only a call that can produce several
+/// gets the per-target breakdown. That is deliberate — a batch must not make the ordinary arming harder
+/// to read, and partial success (2 armed, 1 deferred, 1 refused) is the *normal* outcome of a batch, so
+/// it needs a shape of its own rather than an error that discards the two that worked.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ClassPatterns {
+    /// One pattern — how every caller before FILT-4 spelled it.
+    One(String),
+    /// Several patterns, resolved and armed independently of one another.
+    Many(Vec<String>),
+}
+
+impl ClassPatterns {
+    /// The patterns: trimmed, blanks dropped, duplicates removed, original order kept.
+    ///
+    /// Deduped because the same pattern twice would arm two stop points on one location — never what a
+    /// caller means, and otherwise only discoverable by spending the JDWP requests to do it.
+    pub fn list(&self) -> Vec<String> {
+        let raw: &[String] = match self {
+            Self::One(s) => std::slice::from_ref(s),
+            Self::Many(v) => v.as_slice(),
+        };
+        let mut out: Vec<String> = Vec::with_capacity(raw.len());
+        for p in raw {
+            let t = p.trim();
+            if !t.is_empty() && !out.iter().any(|q| q == t) {
+                out.push(t.to_string());
+            }
+        }
+        out
+    }
+}
+
+/// Default ceiling on how many loaded classes ONE wildcard pattern may arm (FILT-3).
+///
+/// A wildcard is N arming operations whose N the caller cannot see before making the call — `com.*` on a
+/// real app server is thousands of line-table lookups and thousands of live stop points. So the expansion
+/// is bounded by default and says what it left out, rather than being fast to type and slow to regret.
+/// Raise it with `max_classes` when you mean it; it is clamped at [`MAX_CLASSES_CEILING`].
+pub const DEFAULT_MAX_CLASSES: usize = 20;
+
+/// Hard ceiling on `max_classes`, however large a number is passed.
+///
+/// Not a taste judgement: every armed location is a live JDWP event request on a JVM that is usually
+/// shared, and a caller who asks for 5000 has almost certainly mistyped a pattern rather than decided
+/// something. The reply says when it clamped.
+pub const MAX_CLASSES_CEILING: usize = 200;
+
+const fn default_max_classes() -> usize {
+    DEFAULT_MAX_CLASSES
+}
+
 /// Arguments for debug.attach.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AttachArgs {
@@ -113,9 +242,30 @@ pub struct AttachArgs {
 /// Arguments for `debug.set_line_stop`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetBreakpointArgs {
-    /// Class name pattern (e.g. "com.example.MyClass").
-    pub class_pattern: String,
-    /// Line number (optional if `method` is given).
+    /// Where to break: an EXACT class name (`com.example.MyClass`), a WILDCARD matching many loaded
+    /// classes (`com.example.*`, `*.OrderService`, `*Order*` — FILT-3), or a LIST of either
+    /// (`["com.example.Order", "com.example.*Repo"]` — FILT-4).
+    ///
+    /// The three behave differently, and the difference is worth knowing before you type one:
+    ///
+    /// - **Exact** arms one breakpoint. If the class is not loaded yet the breakpoint is *deferred* on a
+    ///   `CLASS_PREPARE` watch and arms itself when the class loads.
+    /// - **Wildcard** needs `method` and refuses `line` — a line number means a different thing in every
+    ///   class, so it is not portable across a pattern. It arms ONE STOP POINT PER MATCHING LOADED CLASS,
+    ///   each with its own `bp_…` id, and additionally keeps watching: a class matching the pattern that
+    ///   loads later (a generated proxy, a lazily-initialised implementation) is armed too. The whole
+    ///   family is addressable as one `bpset_…` id, so `debug.clear_stop_point`/`debug.toggle_stop_point`
+    ///   can drop or silence it — including the watch for future classes — in one call. Bounded by
+    ///   `max_classes`, and the reply states how many classes it armed, since that count is the one thing
+    ///   a wildcard hides from the caller.
+    /// - **List** resolves each entry independently by the two rules above. Nothing is aborted by one
+    ///   entry failing: the reply reports every pattern's outcome, because 2-armed-1-deferred-1-refused is
+    ///   the normal result of a batch.
+    ///
+    /// A JNI signature (`Lcom/example/MyClass;`) is accepted for an exact class, and dots or slashes work
+    /// as the separator either way.
+    pub class_pattern: ClassPatterns,
+    /// Line number (optional if `method` is given). Refused with a wildcard `class_pattern` — see there.
     #[serde(default)]
     pub line: Option<i32>,
     /// Method name (optional). If given without `line`, breaks at the method's first line.
@@ -175,6 +325,15 @@ pub struct SetBreakpointArgs {
     /// what the depth you chose is costing on *your* JVM once hits have landed.
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
+    /// Most loaded classes ONE wildcard pattern may arm (default 20, clamped at 200 — FILT-3).
+    ///
+    /// Only wildcards spend this; an exact class name arms one breakpoint and ignores it. When a pattern
+    /// matches more classes than this, the reply says how many it left out and how to see them
+    /// (`debug.list_classes {filter}` with the same pattern), rather than truncating quietly. The cap also
+    /// applies to classes that load *later*: the family stops arming new ones once it is full, and
+    /// `debug.list_stop_points` reports that it is.
+    #[serde(default = "default_max_classes")]
+    pub max_classes: usize,
     // NOTE: `session_id` is a cross-cutting argument handled uniformly by `resolve_session`
     // (from the raw arguments) for every tool, so it is intentionally not a typed field here.
 }
@@ -570,8 +729,15 @@ pub struct SetExceptionBreakpointArgs {
     /// "br.com.infotravel.ErrorException"); its subclasses match too. Omit to break on ALL
     /// exceptions — noisy, since the JVM throws/catches internally constantly. The class must
     /// already be loaded (trigger it once if unsure).
+    ///
+    /// Takes a WILDCARD (`*.ValidationException`, `br.com.infotravel.*` — FILT-3) or a LIST
+    /// (`["java.lang.IllegalStateException", "*.TimeoutException"]` — FILT-4). Both arm one `exc_…` per
+    /// resolved class, because a JDWP exception request needs a concrete reference type — there is no
+    /// `ClassMatch` for this event kind, which is also why none of them can be deferred. So a wildcard
+    /// here matches only what is LOADED NOW: an exception class the JVM has not needed yet is invisible
+    /// to it, and unlike a line breakpoint nothing will arm it later. `max_classes` bounds the expansion.
     #[serde(default)]
-    pub class_pattern: Option<String>,
+    pub class_pattern: Option<ClassPatterns>,
     /// Break on exceptions that ARE caught somewhere up the stack (default true).
     #[serde(default = "default_true")]
     pub caught: bool,
@@ -624,6 +790,11 @@ pub struct SetExceptionBreakpointArgs {
     /// from `debug.list_threads {name_filter}` first, then arm, then trigger (FILT-1).
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// Most loaded classes ONE wildcard pattern may arm (default 20, clamped at 200 — FILT-3). Ignored
+    /// for an exact class name. The reply says what a full expansion left out rather than truncating
+    /// quietly.
+    #[serde(default = "default_max_classes")]
+    pub max_classes: usize,
 }
 
 /// Arguments for `debug.set_field_stop`.
@@ -632,7 +803,13 @@ pub struct SetWatchpointArgs {
     /// Class declaring the field (e.g. `ConfigDefaultUtils` or a fully-qualified
     /// `br.com.infotravel.util.ConfigDefaultUtils`). Must already be loaded — a watchpoint needs a
     /// concrete field id, so it can't be deferred like a line breakpoint.
-    pub class_name: String,
+    ///
+    /// Takes a WILDCARD (`com.example.*` — FILT-3) or a LIST (FILT-4), arming one watch per matching
+    /// loaded class that actually HAS the field: a class that matches the pattern but declares no such
+    /// field is counted and reported, not treated as an error, since that is the expected majority for a
+    /// broad pattern. `max_classes` bounds the expansion, and a watched field cannot be JIT-optimised —
+    /// so a wildcard here de-optimises every class it matched, which is the reason to keep it narrow.
+    pub class_name: ClassPatterns,
     /// Field to watch (e.g. `dsInfra`, `empresaId`). Inherited fields are found by walking
     /// superclasses; the watch is registered on the class that actually declares it.
     pub field_name: String,
@@ -687,6 +864,11 @@ pub struct SetWatchpointArgs {
     /// `debug.list_threads {name_filter}` first, then arm, then trigger (FILT-1).
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// Most loaded classes ONE wildcard pattern may arm (default 20, clamped at 200 — FILT-3). Ignored
+    /// for an exact class name. Watches de-optimise every class they are armed on, so this cap is doing
+    /// more work here than for a line breakpoint.
+    #[serde(default = "default_max_classes")]
+    pub max_classes: usize,
 }
 
 /// Arguments for `debug.set_method_exit_stop` (METH-1).
@@ -695,7 +877,12 @@ pub struct SetMethodBreakpointArgs {
     /// Class whose method returns you want to see (e.g. `br.com.infotravel.IntegraSrv`), optionally
     /// with a leading/trailing `*`. This is a JDWP `ClassMatch`, so it fires for **every method** of
     /// every matching class — give `method` as well unless you really want all of them.
-    pub class_pattern: String,
+    ///
+    /// Also takes a LIST (`["*.OrderService", "*.PaymentService"]` — FILT-4), arming one `mexit_…` per
+    /// pattern. Unlike the other stop points a wildcard costs nothing extra here and needs no expansion:
+    /// the JVM does the matching, so one request covers every class the pattern matches, including classes
+    /// that load later. That is why this tool had pattern support from the start and the others did not.
+    pub class_pattern: ClassPatterns,
     /// Only report returns from this method name. Filtered on our side, because JDWP has no
     /// method-name modifier — the JVM still reports every method of the class and non-matching exits
     /// are dropped here. Overloads all match, since the name is all JDWP gives us to compare.
@@ -849,10 +1036,87 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(SetMethodBreakpointArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(ReloadClassArgs)).unwrap(),
             serde_json::to_value(schemars::schema_for!(PopFrameArgs)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(LaunchArgs)).unwrap(),
         ];
         for s in schemas {
             assert_eq!(s.get("type").and_then(|t| t.as_str()), Some("object"));
         }
+    }
+
+    // LAUNCH-1: the two defaults that decide what this tool is FOR. `suspend` is the whole reason it exists
+    // (breaking before the program's first instruction), and terminating on disconnect is the lifetime policy
+    // the tool description promises — both are quoted there, so a silent flip would make the docs lie.
+    #[test]
+    fn launch_defaults_to_suspended_and_to_owning_the_process() {
+        let a: LaunchArgs = serde_json::from_value(serde_json::json!({"main_class": "M"})).unwrap();
+        assert!(a.suspend, "suspend=y is the point of launching rather than attaching");
+        assert!(!a.detach_on_disconnect, "the JVM we started dies with the session unless asked otherwise");
+        assert_eq!(a.port, 0, "0 means pick a free port");
+        assert!(!a.read_only);
+    }
+
+    // FILT-4: the four arming tools must accept a class argument written either way, because the whole
+    // point is that nothing written before it has to change.
+    #[test]
+    fn a_class_argument_deserialises_from_a_string_or_a_list() {
+        let one: SetBreakpointArgs =
+            serde_json::from_value(serde_json::json!({"class_pattern": "com.example.Order", "line": 1}))
+                .unwrap();
+        assert_eq!(one.class_pattern.list(), vec!["com.example.Order".to_string()]);
+
+        let many: SetBreakpointArgs = serde_json::from_value(serde_json::json!({
+            "class_pattern": ["com.example.Order", "com.example.*Repo"],
+            "method": "handle"
+        }))
+        .unwrap();
+        assert_eq!(
+            many.class_pattern.list(),
+            vec!["com.example.Order".to_string(), "com.example.*Repo".to_string()]
+        );
+
+        // Every arming tool, including the one whose argument is called `class_name`.
+        let exc: SetExceptionBreakpointArgs =
+            serde_json::from_value(serde_json::json!({"class_pattern": ["A", "B"]})).unwrap();
+        assert_eq!(exc.class_pattern.unwrap().list().len(), 2);
+        let watch: SetWatchpointArgs =
+            serde_json::from_value(serde_json::json!({"class_name": ["A", "B"], "field_name": "f"})).unwrap();
+        assert_eq!(watch.class_name.list().len(), 2);
+        let mexit: SetMethodBreakpointArgs =
+            serde_json::from_value(serde_json::json!({"class_pattern": ["*.A", "*.B"]})).unwrap();
+        assert_eq!(mexit.class_pattern.list().len(), 2);
+    }
+
+    // Blanks and repeats are dropped rather than armed: a repeated pattern would put two stop points on
+    // one location, which is never meant and otherwise costs JDWP requests to discover.
+    #[test]
+    fn a_class_list_is_trimmed_and_deduped_in_order() {
+        let a: SetBreakpointArgs = serde_json::from_value(serde_json::json!({
+            "class_pattern": ["  com.example.B  ", "com.example.A", "", "com.example.B", "   "],
+            "method": "handle"
+        }))
+        .unwrap();
+        assert_eq!(
+            a.class_pattern.list(),
+            vec!["com.example.B".to_string(), "com.example.A".to_string()],
+            "order is the caller's, duplicates and blanks are gone"
+        );
+    }
+
+    // FILT-3: the expansion cap is what stops one mistyped wildcard arming thousands of stop points on a
+    // shared JVM, and the tool descriptions quote both numbers.
+    #[test]
+    fn max_classes_defaults_to_twenty_and_is_documented() {
+        let bp: SetBreakpointArgs =
+            serde_json::from_value(serde_json::json!({"class_pattern": "C", "line": 1})).unwrap();
+        assert_eq!(bp.max_classes, DEFAULT_MAX_CLASSES);
+        assert_eq!(DEFAULT_MAX_CLASSES, 20);
+        assert_eq!(MAX_CLASSES_CEILING, 200);
+
+        let asked: SetBreakpointArgs = serde_json::from_value(
+            serde_json::json!({"class_pattern": "C*", "method": "m", "max_classes": 5}),
+        )
+        .unwrap();
+        assert_eq!(asked.max_classes, 5);
     }
 
     // The deep-expansion knobs default to off/2/16 — the tool descriptions state those numbers, and

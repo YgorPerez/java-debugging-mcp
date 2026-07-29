@@ -380,6 +380,370 @@ fn deferred_breakpoint_arms_when_its_class_loads() {
     server.panic_reset();
 }
 
+/// FILT-3/FILT-4: one wildcard pattern must arm a breakpoint on every matching LOADED class, keep arming
+/// matching classes that load later, and be droppable — all of it — with the one `bpset_` id it returned.
+///
+/// The three properties are one test on purpose, because they are one promise: a wildcard is only usable if
+/// the caller can see what it armed, trust that it keeps up with class loading, and take it all back. Any
+/// one of them alone is a stop point you cannot reason about on a shared JVM.
+///
+/// `trace:true` throughout, for two reasons: the probe keeps calling these methods in a loop, so a
+/// suspending family would freeze on the first hit and the rest of the test would be about resuming; and
+/// snapshots are what let the test prove each member actually FIRES rather than merely appearing in a reply.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_wildcard_family_arms_every_match_grows_with_class_loading_and_clears_as_one() {
+    let Some(jdk) =
+        jdk_or_skip("a_wildcard_family_arms_every_match_grows_with_class_loading_and_clears_as_one")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "FamilyProbe").expect("launch FamilyProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    // FamilyAlpha/Beta/NoMethod are constructed before this line is printed, so they are genuinely loaded
+    // when we arm — and FamilyGamma genuinely is not.
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("ready")).expect("probe never printed ready");
+
+    // A line number is refused rather than armed on four classes with four unrelated meanings.
+    assert_contains_all(
+        "a wildcard refuses a line number",
+        &server.call(
+            "debug.set_line_stop",
+            serde_json::json!({"class_pattern": "Family*", "line": 42, "method": "handle"}),
+        ),
+        &["wildcard", "line 42"],
+    );
+
+    let set = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "Family*", "method": "handle", "trace": true}),
+    );
+    assert_contains_all(
+        "one call arms every matching loaded class, under one family id",
+        &set,
+        &["bpset_", "FamilyAlpha", "FamilyBeta"],
+    );
+    assert!(
+        !set.contains("FamilyGamma"),
+        "FamilyGamma is not loaded yet, so nothing can be armed on it — the watch is what must catch it \
+         later.\n  arm reply: {set}"
+    );
+    // FamilyProbe and FamilyNoMethod match `Family*` and declare no `handle`. That is the majority case for
+    // a broad pattern and must be counted rather than reported as failures.
+    assert_contains_all(
+        "classes that are not targets are counted, not failed",
+        &set,
+        &["no method 'handle'"],
+    );
+    let bpset = find_id(&set, "bpset_").unwrap_or_else(|| panic!("no bpset_ id in the reply: {set}"));
+
+    // Both armed members must actually fire, or "armed" was a claim about our own bookkeeping.
+    let traces = server
+        .wait_for_traces("FamilyAlpha", EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("no snapshot from FamilyAlpha.\n  probe output: {:?}", probe.output()));
+    assert!(
+        traces.contains("FamilyAlpha") && server.wait_for_traces("FamilyBeta", EVENT_TIMEOUT).is_some(),
+        "both members of the family must fire, not just the first one armed.\n  traces: {traces}"
+    );
+
+    // The part no arming reply could have reported: a class that loads minutes later.
+    probe.send_line("load").expect("cue the probe to load FamilyGamma");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("gamma loaded"))
+        .expect("probe never loaded FamilyGamma");
+    let late = server.wait_for_traces("FamilyGamma", EVENT_TIMEOUT).unwrap_or_else(|| {
+        panic!(
+            "the family never armed FamilyGamma after it loaded — its class-prepare watch is what should \
+             have done it.\n  probe output: {:?}\n  stop points: {}",
+            probe.output(),
+            server.call("debug.list_stop_points", serde_json::json!({}))
+        )
+    });
+    assert!(late.contains("FamilyGamma"), "traces: {late}");
+
+    let list = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert_contains_all(
+        "the listing reports the family and that it grew after the arming reply",
+        &list,
+        &[&bpset, "armed since"],
+    );
+
+    // One id takes all of it: three breakpoints and the watch. A watch left behind would keep arming
+    // classes for a family the caller believes is gone.
+    let cleared = server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": bpset}));
+    assert_contains_all("one call drops the whole family", &cleared, &["family cleared", "watch"]);
+    assert_contains_all(
+        "nothing is left armed",
+        &server.call("debug.list_stop_points", serde_json::json!({})),
+        &["No breakpoints set"],
+    );
+
+    // FILT-4: several patterns in one call, whose normal outcome is PARTIAL — two armed, one deferred —
+    // and which must report all three rather than failing on the entry that could not arm now.
+    let batch = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": ["FamilyAlpha", "FamilyBeta", "NoSuchClassAtAll"],
+            "method": "handle",
+            "trace": true
+        }),
+    );
+    assert_contains_all(
+        "a batch reports every entry's outcome",
+        &batch,
+        &["3 pattern(s)", "2 trace breakpoint(s) armed", "1 deferred", "FamilyAlpha", "NoSuchClassAtAll"],
+    );
+
+    server.panic_reset();
+}
+
+/// FILT-3/FILT-4 on the other three arming tools: a list and a wildcard must work there too, and each kind
+/// must report the thing that is specific to it.
+///
+/// The three differ in how a pattern can even be honoured, which is the point of testing them together:
+/// exception and field stops must EXPAND a wildcard over loaded classes, because those event kinds need a
+/// concrete reference type; method-exit passes the pattern to the JVM and expands nothing. A field wildcard
+/// also has to distinguish "matched but has no such field" (expected, a note) from a failure.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn batched_and_wildcard_arming_works_for_exception_field_and_method_exit_stops() {
+    let Some(jdk) =
+        jdk_or_skip("batched_and_wildcard_arming_works_for_exception_field_and_method_exit_stops")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "FamilyProbe").expect("launch FamilyProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("ready")).expect("probe never printed ready");
+
+    // Exception stops, as a list of two classes the JVM has certainly loaded.
+    let excs = server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({"class_pattern": ["java.lang.RuntimeException", "java.lang.Exception"], "trace": true}),
+    );
+    assert_contains_all(
+        "one exc_ per class, and the caveat that only loaded classes can match",
+        &excs,
+        &["2 pattern(s)", "2 exception stop(s) armed", "exc_", "LOADED NOW"],
+    );
+
+    // A wildcard here expands over LOADED exception classes rather than being handed to the JVM.
+    let wild_exc = server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({"class_pattern": ["java.lang.*Exception"], "trace": true, "max_classes": 3}),
+    );
+    assert_contains_all(
+        "a wildcard expands, states how many classes it matched, and stops at the cap",
+        &wild_exc,
+        &["loaded class(es) matched", "exception stop(s) armed"],
+    );
+
+    // Field stops: `Family*` matches four classes and only FamilyProbe declares `gamma`. The other three
+    // must be reported as not-targets, not as errors.
+    let fields = server.call(
+        "debug.set_field_stop",
+        serde_json::json!({"class_name": "Family*", "field_name": "gamma", "trace": true}),
+    );
+    assert_contains_all(
+        "the one class with the field is armed; the rest are notes",
+        &fields,
+        &["1 watchpoint(s) armed", "FamilyProbe.gamma", "has no field 'gamma'"],
+    );
+    assert!(!fields.contains("❌"), "a class without the field is not a failure: {fields}");
+
+    // Method exits: a list of two patterns, one request each, no expansion — the JVM does the matching.
+    let mexits = server.call(
+        "debug.set_method_exit_stop",
+        serde_json::json!({"class_pattern": ["FamilyAlpha", "FamilyBeta"], "method": "handle"}),
+    );
+    assert_contains_all(
+        "one mexit_ per pattern",
+        &mexits,
+        &["2 pattern(s)", "2 method-exit request(s) armed", "mexit_"],
+    );
+    assert!(
+        !mexits.contains("loaded class(es) matched"),
+        "method-exit does not expand, so it must not claim to have counted matches: {mexits}"
+    );
+
+    // All of it is listed, and the traced ones actually fire.
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert_contains_all("every kind is listed", &listed, &["exception", "watchpoint(s)", "method-exit"]);
+    assert!(
+        server.wait_for_traces("FamilyAlpha", EVENT_TIMEOUT).is_some(),
+        "a batched method-exit request must actually report returns.\n  stop points: {listed}"
+    );
+
+    server.panic_reset();
+}
+
+/// LAUNCH-1: `debug.launch` must start a JVM that is suspended BEFORE its first instruction, be identifiable
+/// as ours, and be terminated by `debug.disconnect`.
+///
+/// The suspend claim is tested the only way that actually proves it: a breakpoint inside a **static
+/// initialiser**. Attaching can never hit one — by the time a connection is possible the class has long since
+/// initialised — so if this fires, the debugger genuinely got there first. It also demonstrates the state
+/// itself: at the moment of launch the main class is not even LOADED, so the breakpoint has to defer.
+///
+/// Termination is proven against the OS rather than against our own reply text, because a reply saying
+/// "terminated" is exactly what a leaked JVM would also say.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn launch_suspends_before_the_first_instruction_and_disconnect_terminates_it() {
+    let Some(jdk) = jdk_or_skip("launch_suspends_before_the_first_instruction_and_disconnect_terminates_it")
+    else {
+        return;
+    };
+    let out = tempfile::tempdir().expect("tempdir for the compiled probe");
+    jdk.compile_probe("StartupProbe", out.path()).expect("compile StartupProbe");
+    let mut server = Server::start().expect("start server");
+
+    // java_home is passed explicitly: the server must run the SAME JDK that compiled the class, or the
+    // failure would be a class-file version mismatch rather than anything this test is about.
+    let launched = server.call(
+        "debug.launch",
+        serde_json::json!({
+            "main_class": "StartupProbe",
+            "classpath": [out.path().to_string_lossy()],
+            "java_home": jdk.home().to_string_lossy(),
+        }),
+    );
+    assert_contains_all(
+        "the launch reply states what it started and the three things only a launched JVM has",
+        &launched,
+        &["Launched StartupProbe", "SUSPENDED BEFORE ITS FIRST INSTRUCTION", "TERMINATES", "pid "],
+    );
+    let pid: u32 = launched
+        .split("pid ")
+        .nth(1)
+        .and_then(|rest| rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok())
+        .unwrap_or_else(|| panic!("no pid in the launch reply: {launched}"));
+
+    assert_contains_all(
+        "the session says whose JVM this is, and what it was started with",
+        &server.call("debug.list_sessions", serde_json::json!({})),
+        &["LAUNCHED by us", "dies with this session", "Launched with:", "StartupProbe"],
+    );
+
+    // Nothing has run, so the main class is not loaded yet — the breakpoint must defer rather than resolve.
+    let line = probe_line(&probe_source("StartupProbe"), "// BP_CLINIT");
+    let set = server
+        .call("debug.set_line_stop", serde_json::json!({"class_pattern": "StartupProbe", "line": line}));
+    assert!(
+        set.contains("Deferred") || set.contains("not loaded"),
+        "at suspend=y the main class cannot be loaded yet, so this must defer: {set}"
+    );
+
+    // Releasing the VM is what runs the static initialiser, and the deferred breakpoint has to arm in time
+    // to catch it.
+    server.call("debug.continue", serde_json::json!({}));
+    let hit = server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).unwrap_or_else(|| {
+        panic!(
+            "the breakpoint inside the static initialiser never fired — suspend=y did not hold the JVM \
+             before class initialisation.\n  launch reply: {launched}\n  stop points: {}",
+            server.call("debug.list_stop_points", serde_json::json!({}))
+        )
+    });
+    assert_contains_all(
+        "the hit is inside <clinit>, which attaching could never have reached",
+        &hit,
+        &["\"method\":\"<clinit>\"", "StartupProbe"],
+    );
+
+    let bye = server.call("debug.disconnect", serde_json::json!({}));
+    assert_contains_all(
+        "disconnect says it ended the JVM it started",
+        &bye,
+        &["TERMINATED", &pid.to_string()],
+    );
+
+    // The claim, checked against the OS. `/proc/<pid>` is Linux-only, which is where this suite runs; on
+    // anything else the directory is absent and this passes without proving anything, so the assertion is
+    // deliberately about the process being GONE rather than about the reply.
+    let proc_entry = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while proc_entry.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        !proc_entry.exists(),
+        "the JVM this server launched (pid {pid}) is still alive after debug.disconnect said it terminated \
+         it — a launched JVM that outlives its session is the leak LAUNCH-1's triage was worried about"
+    );
+}
+
+/// LAUNCH-1: a JVM that dies during startup must come back as the JVM's OWN words, not as a timeout.
+///
+/// This is the failure the launch path is most careful about, because a JVM that died and a JVM that is
+/// merely slow are the same observation from the socket's side — a connect that has not succeeded yet — and
+/// reporting "could not connect" after 30s would throw away the one thing that explains it.
+///
+/// **An unrecognised VM option, not a missing main class**, and the difference is worth recording: with
+/// `suspend=y` the JVM is held *before* it resolves the main class, so a bogus `main_class` LAUNCHES FINE and
+/// only dies on the first `debug.continue`. That surprised this test into existence, and it is why the launch
+/// reply now says a successful launch is not evidence the program can run, and why `debug.list_sessions`
+/// carries a dead launched JVM's last output. A bad VM option is rejected before the agent ever listens, which
+/// is what makes it the deterministic case for the startup path.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_launch_that_dies_at_startup_reports_the_jvms_own_words() {
+    let Some(jdk) = jdk_or_skip("a_launch_that_dies_at_startup_reports_the_jvms_own_words") else { return };
+    let mut server = Server::start().expect("start server");
+
+    let started = std::time::Instant::now();
+    let failed = server.call(
+        "debug.launch",
+        serde_json::json!({
+            "main_class": "Whatever",
+            "jvm_args": ["-XX:+DefinitelyNotARealVmOption"],
+            "java_home": jdk.home().to_string_lossy(),
+        }),
+    );
+    assert_contains_all(
+        "the reply is the JVM's own diagnosis, plus the command that produced it",
+        &failed,
+        &["exited before the debugger could attach", "DefinitelyNotARealVmOption", "Command:"],
+    );
+    // And it must not have waited out the connect timeout to say so: the child was polled alongside the port.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "a dead child should be noticed as soon as it exits, not after the 30s connect timeout (took {:?})",
+        started.elapsed()
+    );
+
+    // A failed launch must leave no session behind — there is nothing to talk to.
+    assert_contains_all(
+        "no session was opened",
+        &server.call("debug.list_sessions", serde_json::json!({})),
+        &["No debug sessions"],
+    );
+
+    // Nor a usable java_home: naming one that is not a JDK is an error, never a silent fallback to another
+    // JVM (the TEST-18 lesson, applied to the launch path).
+    assert_contains_all(
+        "an unusable java_home is refused by name",
+        &server.call(
+            "debug.launch",
+            serde_json::json!({"main_class": "Whatever", "java_home": "/definitely/not/a/jdk"}),
+        ),
+        &["/definitely/not/a/jdk", "bin/java"],
+    );
+}
+
+/// The first `prefix<digits>` id in a tool reply — enough to follow one up with `clear`/`toggle` without
+/// pulling a regex crate into the test suite.
+fn find_id(reply: &str, prefix: &str) -> Option<String> {
+    let at = reply.find(prefix)?;
+    let rest = &reply[at + prefix.len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some(format!("{prefix}{digits}"))
+}
+
 /// TEST-1: `force_return` must change what the CALLER receives, not merely report success. Proven by
 /// reading the probe's own stdout.
 ///
