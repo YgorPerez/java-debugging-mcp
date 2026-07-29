@@ -891,6 +891,10 @@ fn traced_exception_breakpoints_record_throws_without_suspending() {
             "exception=ExcProbe$SwallowedException",
             "caught=true",
             "caught_at=ExcProbe.integrate",
+            // EXC-2 (#67): the message travels with the type. Read off `Throwable.detailMessage` as a
+            // field, which is the only mechanism available here — trace mode resumes the hit thread
+            // immediately, so `getMessage()` could never have been called.
+            "message=integration failed on ",
         ],
     );
     // Locals and the trace expression are captured in the throwing frame, exactly as for a logpoint.
@@ -908,6 +912,221 @@ fn traced_exception_breakpoints_record_throws_without_suspending() {
         "listed as traced",
         &server.call("debug.list_stop_points", serde_json::json!({})),
         &["exception ExcProbe$SwallowedException", "(trace)"],
+    );
+
+    server.panic_reset();
+}
+
+/// EXC-2 (#67): an exception snapshot carries the message the JVM already computed, and says nothing
+/// when there is none.
+///
+/// The two halves are one test on purpose, because each is what makes the other readable. A `message=`
+/// that appeared unconditionally could be an empty string dressed up as an answer; an absent one proves
+/// only that nothing was read unless a sibling throw in the same run shows a message arriving.
+///
+/// **The NPE half is deliberately version-gated rather than version-locked.** JEP 358's helpful message
+/// is on by default from JDK 15, so on CI's JDK 11 leg the very same throw carries no message at all —
+/// which is the JVM behaving correctly, not the flake it would otherwise be diagnosed as (#36).
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_exception_snapshot_carries_the_jvms_own_message() {
+    let Some(jdk) = jdk_or_skip("an_exception_snapshot_carries_the_jvms_own_message") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "ExcMsgProbe").expect("launch ExcMsgProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // An exception request needs a concrete ref type, so both throwing paths must have run once.
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    // Traced, not suspending: reading the message off a field is the *only* mechanism available on this
+    // path, so proving it here proves the constraint #67 was filed under.
+    for pattern in ["java.lang.NullPointerException", "ExcMsgProbe$Bare"] {
+        let set = server
+            .call("debug.set_exception_stop", serde_json::json!({"class_pattern": pattern, "trace": true}));
+        assert_contains_all(&format!("{pattern} traced"), &set, &["exc_", "trace (non-suspending)"]);
+    }
+
+    // Both throws are caught, so the probe must keep ticking — the usual proof nothing is frozen.
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
+        "probe stopped ticking after two traced exception stops\n  output: {:?}",
+        probe.output(),
+    );
+
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+
+    // The messageless throw: `exception=` present, `message=` absent. Asserted on the Bare line rather
+    // than on the whole reply, because the NPE line in the same reply may legitimately carry one.
+    let bare_line = traces
+        .lines()
+        .find(|l| l.contains("exception=ExcMsgProbe$Bare"))
+        .unwrap_or_else(|| panic!("no snapshot for the messageless throw\n  got: {traces}"));
+    assert!(
+        !bare_line.contains("message="),
+        "an exception with no message must omit the key rather than report an empty one — a caller \
+         cannot tell those apart, and one of them is a lie: {bare_line}"
+    );
+
+    let npe_line = traces
+        .lines()
+        .find(|l| l.contains("exception=java.lang.NullPointerException"))
+        .unwrap_or_else(|| panic!("no snapshot for the NPE\n  got: {traces}"));
+    match jdk.feature_version() {
+        Some(v) if v >= 15 => assert_contains_all(
+            "a JDK 15+ helpful NPE names the failing subexpression, which is the diagnosis itself",
+            npe_line,
+            &["message=", "getCount()", "is null"],
+        ),
+        // Pre-15 the JVM computes nothing, so the correct snapshot is the same one the Bare throw gets.
+        Some(_) => assert!(
+            !npe_line.contains("message="),
+            "before JDK 15 the JVM computes no NPE message, so reporting one means it came from \
+             somewhere else: {npe_line}"
+        ),
+        // An unparseable version gates nothing: the type and catch site are version-independent.
+        None => assert_contains_all("NPE snapshot", npe_line, &["caught=true", "ExcMsgProbe.helpfulNpe"]),
+    }
+
+    server.panic_reset();
+}
+
+/// EXC-3 (#68): a rethrown instance keeps both ends of its chain, collapses the middle, and does not
+/// spend the trace budget on the plumbing.
+///
+/// `trace_max_hits: 3` is the whole experiment. `RethrowProbe` throws once and rethrows three times per
+/// iteration, so before the fix a budget of 3 was gone inside the *first* iteration — spent on
+/// `origin`, `pooled`, `tx`, disarming before the exception even escaped. Every assertion below is a
+/// different way of saying the budget now counts failures rather than layers.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_rethrow_chain_collapses_instead_of_spending_the_trace_budget() {
+    let Some(jdk) = jdk_or_skip("a_rethrow_chain_collapses_instead_of_spending_the_trace_budget") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "RethrowProbe").expect("launch RethrowProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // The exception request needs a concrete ref type, so one full throw/rethrow cycle must have run.
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    let set = server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({
+            "class_pattern": "RethrowProbe$LayerException", "trace": true, "trace_max_hits": 3,
+        }),
+    );
+    assert_contains_all("armed with a budget of 3", &set, &["exc_", "trace (non-suspending)"]);
+
+    // Wait for the budget to run out. Three charged hits means three *iterations*, so the probe has to
+    // get that far — and it can only tick if nothing was left suspended.
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 4)).is_some(),
+        "probe stopped ticking during a traced rethrow chain\n  output: {:?}",
+        probe.output(),
+    );
+
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    // Count by the snapshot's own HIT location — `#3 [exc_1] Class.method:line …` — never by a substring
+    // of the whole line. `trace_frames` puts `← RethrowProbe.pooled:40` in every origin record's caller
+    // chain, so a `contains` here would count the collapsed layers it is supposed to prove absent.
+    let at = |m: &str| {
+        let want = format!("RethrowProbe.{m}:");
+        traces
+            .lines()
+            .filter(|l| l.starts_with('#'))
+            .filter_map(|l| l.split_whitespace().nth(2))
+            .filter(|hit| hit.starts_with(&want))
+            .count()
+    };
+
+    // The budget bound, so this test is not passing merely because nothing ran out.
+    assert!(
+        traces.contains("trace-hit budget"),
+        "the stop point never hit its budget, so this proves nothing about what the budget was spent \
+         on:\n{traces}"
+    );
+
+    // THE assertion: three charged hits bought three distinct failures, not one failure's four layers.
+    assert_eq!(
+        at("origin"),
+        3,
+        "a budget of 3 should capture 3 separate throws; before EXC-3 the first instance's rethrows ate \
+         it and only one `origin` was ever recorded:\n{traces}"
+    );
+
+    // Both ends survive: the original throw above, and the point where it escaped.
+    assert!(
+        at("security") > 0,
+        "the escaping end of the chain is missing — that is the record saying where the exception left, \
+         and a chain trimmed to its start would never show it:\n{traces}"
+    );
+
+    // The middle is a count, not a pile of records. `pooled` and `tx` are pure plumbing here.
+    assert_eq!(
+        (at("pooled"), at("tx")),
+        (0, 0),
+        "the middle of the chain was kept as records instead of being collapsed:\n{traces}"
+    );
+    assert_contains_all(
+        "a collapsed chain says how much it folded, and points at the original throw",
+        &traces,
+        &["↻ rethrow of #", "more rethrow(s) collapsed"],
+    );
+
+    server.panic_reset();
+}
+
+/// TRACE-8 (#72): a traced stop point that disarms on its budget must not freeze the VM with the hits it
+/// already generated.
+///
+/// Found while implementing EXC-3 (#68), and it is the worst failure shape this crate has: trace mode's
+/// single promise is that it never suspends anything, and this broke it *at the moment the budget ran
+/// out* — the point where a caller has stopped watching. `try_record_trace` recognises a traced hit by
+/// looking its request id up among the enabled requests, so a disarm made every in-flight hit
+/// unrecognisable, and each one fell through to the suspending path and stayed there.
+///
+/// It takes a **rethrow** to see, which is why it went unnoticed: with `trace_max_hits: 1` a fresh-throw
+/// probe disarms and the next throw is a whole iteration away, by which time the request is simply gone.
+/// `RethrowProbe` has three more throws of the same instance already unwinding.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_traced_stop_point_that_disarms_mid_chain_leaves_nothing_suspended() {
+    let Some(jdk) = jdk_or_skip("a_traced_stop_point_that_disarms_mid_chain_leaves_nothing_suspended") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "RethrowProbe").expect("launch RethrowProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    // A budget of 1 disarms on the very first throw, with three rethrows of that instance still to come.
+    server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({
+            "class_pattern": "RethrowProbe$LayerException", "trace": true, "trace_max_hits": 1,
+        }),
+    );
+
+    // The debuggee's own output is the only thing that can prove this: the debugger reports success
+    // whether or not it left a thread frozen.
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 3)).is_some(),
+        "the probe stopped ticking after a traced exception stop disarmed itself mid-chain — an in-flight \
+         traced hit was surfaced as a suspending event and the thread was never resumed\n  output: {:?}",
+        probe.output(),
+    );
+
+    // The other half of the same bug: a traced hit must never become an event, disarmed or not.
+    let ev = server.last_event();
+    assert!(
+        !ev.contains("\"event\":\"exception\""),
+        "an in-flight traced throw was surfaced as a suspending event after the disarm: {ev}"
     );
 
     server.panic_reset();
@@ -2861,6 +3080,78 @@ fn watchdog_auto_resumes_and_disarms_the_offending_breakpoint() {
     assert!(
         server.last_event().contains("[watchdog]"),
         "get_last_event should carry the watchdog note so a returning caller sees the VM was rescued"
+    );
+
+    server.panic_reset();
+}
+
+/// SAFE-10 (#69): a watchdog note belongs to the suspension it rescued, so a *newer* hit must not be
+/// rendered underneath it.
+///
+/// The bug this pins down produced a `get_last_event` whose two lines were each correct and jointly
+/// false — `[suspended] true` for a live breakpoint hit, over a `[watchdog] auto-resumed the VM` about a
+/// suspension that had already ended — which reads as "the hit you are looking at is stale".
+///
+/// **Asserted on the note's *identity*, not its presence, and that is what keeps it off the flake list.**
+/// `JDWP_WATCHDOG_SECS=1` means the second freeze will be rescued too, a second or two later, and its
+/// own note is then legitimate. So racing to read before that happens would be the flaky version of this
+/// test. Instead: whatever `get_last_event` says after the second hit, it must not be about the *first*
+/// breakpoint — which is precisely what the old code replayed forever, and is true no matter which side
+/// of the second rescue the read lands on.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_watchdog_note_is_not_replayed_next_to_a_newer_hit() {
+    let Some(jdk) = jdk_or_skip("a_watchdog_note_is_not_replayed_next_to_a_newer_hit") else { return };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "1")]).expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    let src = probe_source("WatchProbe");
+    // Two different methods, each reached every iteration, so the second breakpoint is certain to fire.
+    let (line_a, line_b) =
+        (probe_line(&src, "counter = counter + 1;"), probe_line(&src, "holder.label = (i % 2 == 0)"));
+    assert_ne!(line_a, line_b, "the two freezes must be distinguishable stop points");
+
+    // First freeze, then its rescue — the state SAFE-2 exists to report, and the note is correct here.
+    let set_a = server
+        .call("debug.set_line_stop", serde_json::json!({"class_pattern": "WatchProbe", "line": line_a}));
+    let id_a = grab_token(&set_a, "bp_").expect("no bp id in the first arm reply");
+    server
+        .wait_for_event(&format!("\"line\":{line_a}"), EVENT_TIMEOUT)
+        .expect("first breakpoint never fired");
+    let frozen_at = highest_tick(&probe).expect("no tick before the first suspension");
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 3)).is_some(),
+        "the watchdog never rescued the first freeze\n  output: {:?}",
+        probe.output(),
+    );
+    let rescued = server.last_event();
+    let note = rescued
+        .lines()
+        .find(|l| l.starts_with("[watchdog]"))
+        .unwrap_or_else(|| panic!("SAFE-2's own case regressed — no note after a rescue:\n{rescued}"));
+    assert!(
+        note.contains(&id_a),
+        "the note should name the stop point it disarmed ({id_a}), or the assertion below proves nothing: {note}"
+    );
+
+    // A fresh hit on a DIFFERENT stop point. The first breakpoint was disabled by the rescue, so this
+    // event can only be the second one.
+    let set_b = server
+        .call("debug.set_line_stop", serde_json::json!({"class_pattern": "WatchProbe", "line": line_b}));
+    let id_b = grab_token(&set_b, "bp_").expect("no bp id in the second arm reply");
+    assert_ne!(id_a, id_b, "the second arm reused the first id, so the two notes are indistinguishable");
+    server
+        .wait_for_event(&format!("\"line\":{line_b}"), EVENT_TIMEOUT)
+        .expect("second breakpoint never fired");
+
+    let now = server.last_event();
+    let replayed = now.lines().any(|l| l.starts_with("[watchdog]") && l.contains(&id_a));
+    assert!(
+        !replayed,
+        "a rescue of {id_a} was replayed next to a newer hit on {id_b}, so a live suspension reads as \
+         one that is already over:\n{now}"
     );
 
     server.panic_reset();
@@ -7215,4 +7506,72 @@ fn a_severed_connection_is_reported_as_one_while_the_debuggee_lives_on() {
         probe.output().iter().any(|l| l.contains("Listening for transport")),
         "the probe should still be alive and its log intact"
     );
+}
+
+/// EVAL-6 (#70): `debug.evaluate_chain` walks a chain and names the link that went null, in one call.
+///
+/// Three shapes, because they fail differently and only the first is easy:
+///
+/// 1. **Null at the end.** Every link resolves; the last one is null. A plain `debug.evaluate` already
+///    answers this — the value is `null` — so what is added is the table showing the links that were fine.
+/// 2. **Null in the middle.** The links after it cannot be evaluated at all, and `debug.evaluate` reports
+///    a null receiver: the question restated, not answered. This must be a *report*, not an error, and it
+///    must say how many links it never reached rather than leaving their absence to read as "fine".
+/// 3. **Nothing null.** The tool must say so plainly instead of leaving a reader to scan for a `✘` that
+///    is not there — an empty collection and a null are the two answers being told apart.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn evaluate_chain_names_the_link_that_went_null() {
+    let Some(jdk) = jdk_or_skip("evaluate_chain_names_the_link_that_went_null") else { return };
+    let probe = Probe::launch(&jdk, "ChainProbe").expect("launch ChainProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let line = probe_line(&probe_source("ChainProbe"), "// BP_CHAIN");
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "ChainProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in ChainProbe.inspect never fired");
+
+    // 1. The issue's own chain: null at the far end, after a collection subscript.
+    let tail = server.call(
+        "debug.evaluate_chain",
+        serde_json::json!({
+            "expression": "reserva.getCircuitoParametro().getConfig().getConfigUhList()[0].getSqQuarto()",
+        }),
+    );
+    assert_contains_all(
+        "a null at the end is named, with the links that resolved shown above it",
+        &tail,
+        &["✘", "getSqQuarto()", "null at link 5 of 5", "✔", "getConfigUhList()[0]"],
+    );
+
+    // 2. Null in the middle — the case a plain evaluate cannot answer. It must not error, and it must
+    //    account for the links it never reached.
+    let middle = server.call(
+        "debug.evaluate_chain",
+        serde_json::json!({"expression": "reserva.getMissing().getConfig().getConfigUhList()"}),
+    );
+    assert_contains_all(
+        "a mid-chain null is a report, not an error, and says what was never evaluated",
+        &middle,
+        &["null at link 2 of 4", "getMissing()", "2 link(s) after it were never evaluated"],
+    );
+    // Checked against the table ROWS, not the whole reply — the header echoes the expression the caller
+    // passed, so every link name is in there by construction.
+    let rows: Vec<&str> = middle.lines().filter(|l| l.contains('✔') || l.contains('✘')).collect();
+    assert!(
+        !rows.iter().any(|l| l.contains("getConfigUhList") || l.contains("getConfig()")),
+        "links after the null must not appear as walked steps — nothing evaluated them: {rows:?}"
+    );
+
+    // 3. A chain with nothing null says so, rather than leaving a reader to hunt for a ✘.
+    let fine = server.call(
+        "debug.evaluate_chain",
+        serde_json::json!({"expression": "reserva.getCircuitoParametro().getConfig()"}),
+    );
+    assert_contains_all("a clean chain is stated as clean", &fine, &["✅", "no link in this chain is null"]);
+    assert!(!fine.contains('✘'), "nothing in this chain is null, so no link may be marked: {fine}");
+
+    server.panic_reset();
 }

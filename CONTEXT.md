@@ -156,6 +156,25 @@ _Avoid_: stack, backtrace (both imply the whole stack, with locals)
 How many hits a traced stop point will record before disarming itself. Bounds work done in the debuggee,
 not memory.
 
+**Rethrow chain**:
+The run of hits produced by **one exception instance** being thrown and then rethrown as it unwinds — an
+EJB interceptor chain or a Spring proxy produces one per failure. Identified by instance, since a type, a
+message and even a line repeat across unrelated failures. It is one *failure*, so it costs the trace budget
+once (EXC-3).
+_Avoid_: duplicate throws (they are not duplicates — each is a real throw at a real site)
+
+**Fold**:
+What a rethrow chain is recorded as: the first capture, the latest sighting, and a count of the sightings
+replaced in between. Both ends are kept because they answer different questions — where the failure started
+(the application frame and the cause) and where it left (which wrapper let it out) — and only the plumbing
+between them is collapsed. The latest sighting is *rolling*: nothing can know which rethrow is the last, so
+each supersedes the one before and whichever turns out to be final is the one left standing.
+
+**Link**:
+One step of a chained expression — `.getConfigUhList()`, `[0]`, `.getSqQuarto()`. The unit
+`debug.evaluate_chain` reports in, and the thing named when a chain goes null.
+_Avoid_: segment (the parser's word for the same thing; a caller never sees it)
+
 **Capture**:
 The work one traced hit costs: reading the hit frame's snapshot and the caller chain, between the JVM
 reporting the hit and the thread being resumed. The unit the reported trace cost is measured in — deliberately

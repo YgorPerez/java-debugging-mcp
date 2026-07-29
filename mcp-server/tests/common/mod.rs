@@ -193,6 +193,18 @@ impl Jdk {
             .unwrap_or_else(|| format!("an unidentified javac ({})", self.javac.display()))
     }
 
+    /// The JDK's feature version — 11, 17, 21 — parsed out of [`version`](Self::version).
+    ///
+    /// Exists so a test whose *subject* is version-dependent can say so in one line instead of being
+    /// version-locked by accident, which is the failure mode CI's three legs keep finding (#36): a test
+    /// that passes on 21 and fails on 11 because the JVM legitimately behaves differently there is not a
+    /// flake, and it should not be diagnosed as one. `None` when the line cannot be parsed, which callers
+    /// should read as "do not gate" rather than "old JDK" — guessing low would silently skip coverage.
+    pub fn feature_version(&self) -> Option<u32> {
+        // "javac 21.0.1" / "javac 11.0.29" — the feature version is the first dot-separated number.
+        self.version().split_whitespace().nth(1)?.split('.').next()?.parse().ok()
+    }
+
     /// Where the JVM says it lives — asked of the JVM rather than inferred from the path it was invoked
     /// through.
     ///

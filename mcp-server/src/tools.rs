@@ -5,10 +5,11 @@
 // empty object schema.
 
 use crate::args::{
-    AttachArgs, CheckStaleArgs, ClearBreakpointArgs, EvaluateArgs, ForceReturnArgs, GetLastEventArgs,
-    GetStackArgs, GetTracesArgs, ListClassesArgs, ListFieldsArgs, ListMethodsArgs, ListThreadsArgs,
-    PopFrameArgs, ReloadClassArgs, SetBreakpointArgs, SetExceptionBreakpointArgs, SetMethodBreakpointArgs,
-    SetValueArgs, SetWatchpointArgs, SourceArgs, StepArgs, ThreadDumpArgs, ToggleBreakpointArgs,
+    AttachArgs, CheckStaleArgs, ClearBreakpointArgs, EvaluateArgs, EvaluateChainArgs, ForceReturnArgs,
+    GetLastEventArgs, GetStackArgs, GetTracesArgs, ListClassesArgs, ListFieldsArgs, ListMethodsArgs,
+    ListThreadsArgs, PopFrameArgs, ReloadClassArgs, SetBreakpointArgs, SetExceptionBreakpointArgs,
+    SetMethodBreakpointArgs, SetValueArgs, SetWatchpointArgs, SourceArgs, StepArgs, ThreadDumpArgs,
+    ToggleBreakpointArgs,
 };
 use crate::protocol::Tool;
 use serde_json::json;
@@ -67,7 +68,7 @@ fn stop_point_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.set_exception_stop".to_string(),
-            description: "Break when an exception is thrown. Give class_pattern (e.g. java.lang.NullPointerException or a custom ErrorException) to target one type + its subclasses — ideal for silent-catch bugs where a swallowed exception hides the failure. Omit class_pattern to catch ALL exceptions (noisy). caught/uncaught select which throws to report. The hit is reported via debug.get_last_event with the exception type + throw/catch location. Pass trace:true to collect throws WITHOUT suspending — required on a shared instance, where the default freezes every thread on each throw; read them with debug.get_traces. Not suspending is not the same as not costing anything: capture is serialised at ~720 hits/s (~1160 with trace_frames:0), so a throw site firing thousands of times a second gets throttled, and trace_max_hits:0 makes that sustained rather than a blip. A traced throw also records the calling chain (trace_frames, default 3), which is usually the actual question for a swallowed exception: which request path reached the catch. debug.list_stop_points reports the cost this request is actually incurring once throws have landed.".to_string(),
+            description: "Break when an exception is thrown. Give class_pattern (e.g. java.lang.NullPointerException or a custom ErrorException) to target one type + its subclasses — ideal for silent-catch bugs where a swallowed exception hides the failure. Omit class_pattern to catch ALL exceptions (noisy). caught/uncaught select which throws to report. The hit is reported via debug.get_last_event with the exception type, its message, and the throw/catch location. The message is often the whole answer: on JDK 15+ a NullPointerException says which subexpression was null (\"because the return value of X.getY() is null\"), which is what you would otherwise bisect by hand with debug.evaluate. Reported in trace mode too — normally read straight off the exception with no invocation, and for a plain java.lang.NullPointerException (whose message the JVM computes on demand and never stores) by one bounded getMessage() call, which is the JDK's own native computation and runs no application code. Pass trace:true to collect throws WITHOUT suspending — required on a shared instance, where the default freezes every thread on each throw; read them with debug.get_traces. Not suspending is not the same as not costing anything: capture is serialised at ~720 hits/s (~1160 with trace_frames:0), so a throw site firing thousands of times a second gets throttled, and trace_max_hits:0 makes that sustained rather than a blip. A traced throw also records the calling chain (trace_frames, default 3), which is usually the actual question for a swallowed exception: which request path reached the catch. On a framework that rethrows — an EJB interceptor chain, a Spring proxy — one exception instance throws many times, so those sightings are FOLDED: the original throw and the point where it escapes are both kept, the layers between become a `↻ rethrow of #<seq> (+N collapsed)` note on the escaping record, and a collapsed rethrow does not spend trace_max_hits. Without that a budget of 30 was gone on one instance walking WildFly's interceptors, and the only informative record was the 9th. debug.list_stop_points reports the cost this request is actually incurring once throws have landed.".to_string(),
             input_schema: to_val(schemars::schema_for!(SetExceptionBreakpointArgs)),
         },
         Tool {
@@ -159,7 +160,7 @@ fn inspection_tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "debug.get_last_event".to_string(),
-            description: "Get the last breakpoint/event received. Includes a machine-readable [event] line with thread id and source location (class.method:line); for an exception hit the type and catch location, and for a watchpoint hit the field with its old → new value. Events are buffered, so a burst of hits isn't lost: the reply says how many older ones are pending — pass limit to read them (oldest first), drain:true to discard what you've read.".to_string(),
+            description: "Get the last breakpoint/event received. Includes a machine-readable [event] line with thread id and source location (class.method:line); for an exception hit the type, its message and the catch location, and for a watchpoint hit the field with its old → new value. On JDK 15+ an NPE's message names the failing subexpression itself (\"because the return value of X.getY() is null\"), so it is usually the diagnosis rather than a restatement of the type. Absent when the exception carries no message — the key is omitted rather than reported empty. Events are buffered, so a burst of hits isn't lost: the reply says how many older ones are pending — pass limit to read them (oldest first), drain:true to discard what you've read.".to_string(),
             input_schema: to_val(schemars::schema_for!(GetLastEventArgs)),
         },
         Tool {
@@ -171,6 +172,11 @@ fn inspection_tools() -> Vec<Tool> {
             name: "debug.evaluate".to_string(),
             description: "Evaluate a Java expression in frame context. Heads: a local, this, or a class name; then chain .field and .method(args), including static fields and static methods (ConfigDefaultUtils.getUrl()). Arguments may be literals or expressions passed by reference (svc.matches(reserva), foo.handle(this)). Method calls need a suspended thread; a plain static-field read does not. Subscripts work on arrays/List/Map: lines[0] (index, keeps chaining), counts[\"key\"] (map lookup), lines[2..5] (half-open slice), lines[?qty > 3] (filter, whose left side resolves against each element; filtering a Map tests its values and keeps the keys as key → value). Pass expand_objects:true to get a recursive field tree instead of one line — it walks nested objects, arrays, and List/Set/Map/Optional contents to max_depth, detects cycles, and unboxes Integer/Long/etc. NOTE: the DEFAULT rendering calls the value's toString() in the debuggee, and on some framework objects that cannot complete (it may need a lock held by another suspended thread) — it is bounded to 2s and the expiry is reported in the value. expand_objects:true reads FIELDS and invokes nothing, so on those objects it is both faster and more informative than the default.".to_string(),
             input_schema: to_val(schemars::schema_for!(EvaluateArgs)),
+        },
+        Tool {
+            name: "debug.evaluate_chain".to_string(),
+            description: "Answer \"WHICH LINK of this chain went null?\" in one call. Takes the same chained expression debug.evaluate takes (a.getB().getC()[0].getD()) and walks it left to right, printing every link with its value and naming the first one that is null — plus how many links after it were never evaluated. Use it when a chain yields null or an empty collection and you want to know how far down the value survived; that otherwise costs one debug.evaluate per link, bisecting by hand. Each method in the chain runs EXACTLY ONCE (links resolve against the previous link's value, not by re-evaluating longer and longer prefixes), and no toString() is invoked. NOTE: if the chain THROWS rather than returning null, you usually don't need this — on JDK 15+ the NullPointerException's own message names the failing subexpression, and debug.set_exception_stop reports it.".to_string(),
+            input_schema: to_val(schemars::schema_for!(EvaluateChainArgs)),
         },
         Tool {
             name: "debug.list_threads".to_string(),
@@ -209,7 +215,7 @@ fn inspection_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.get_traces".to_string(),
-            description: "Return snapshots captured by non-suspending trace mode — debug.set_line_stop, debug.set_exception_stop or debug.set_field_stop with trace:true. Each shows where it fired, its calling chain as `← class.method:line` entries (nearest caller first, locations only), the thread, in-scope locals/args, any trace_expr result, plus the exception type/catch site or the field's old → new value. Bounded ring buffer (most recent kept). Narrow with bp_id (one stop point), class_filter (substring), or since (only records newer than a #seq you already saw, for polling). Pass clear:true to empty the buffer after reading.".to_string(),
+            description: "Return snapshots captured by non-suspending trace mode — debug.set_line_stop, debug.set_exception_stop or debug.set_field_stop with trace:true. Each shows where it fired, its calling chain as `← class.method:line` entries (nearest caller first, locations only), the thread, in-scope locals/args, any trace_expr result, plus the exception type/message/catch site or the field's old → new value. A record marked `↻ rethrow of #<seq>` is the escaping end of a rethrow chain; `#<seq>` is the original throw, which is the one with the application frame and the cause. Bounded ring buffer (most recent kept). Narrow with bp_id (one stop point), class_filter (substring), or since (only records newer than a #seq you already saw, for polling). Pass clear:true to empty the buffer after reading.".to_string(),
             input_schema: to_val(schemars::schema_for!(GetTracesArgs)),
         },
     ]
@@ -250,6 +256,7 @@ mod tests {
             "debug.get_last_event",
             "debug.get_stack",
             "debug.evaluate",
+            "debug.evaluate_chain",
             "debug.list_threads",
             "debug.list_classes",
             "debug.list_methods",

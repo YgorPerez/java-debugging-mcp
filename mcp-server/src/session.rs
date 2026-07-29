@@ -45,6 +45,46 @@ pub struct DebugSession {
     /// What the watchdog last did, if anything — surfaced in `list_stop_points` and `get_last_event`
     /// so a caller who was away learns the VM was auto-resumed and which stop point was disarmed (SAFE-2).
     pub last_watchdog_note: Option<String>,
+    /// [`event_seq`](Self::event_seq) at the moment [`last_watchdog_note`](Self::last_watchdog_note)
+    /// was written — the watermark that stops an old rescue from being replayed next to a new hit
+    /// (SAFE-10).
+    ///
+    /// The note is not durable state, it is an account of **one** suspension ending, and without this it
+    /// was rendered against every later event forever. That produced a `get_last_event` whose two lines
+    /// were each correct and jointly false: `[suspended] true` for a genuinely live breakpoint hit, over a
+    /// `[watchdog] auto-resumed the VM` about a suspension that had ended long before it — which reads as
+    /// "the hit you are looking at is stale" about a hit that was fine, and cost a detour to re-verify.
+    ///
+    /// An event newer than the watermark means the suspension the note describes is not the one being
+    /// rendered, so the note is that event's history rather than its state. SAFE-2's case is the other
+    /// one and is untouched: a caller who walked away has no newer event, the watermark still matches,
+    /// and they are told.
+    pub last_watchdog_seq: Option<u64>,
+    /// JDWP request ids of **traced** stop points disarmed while events they generated were still in
+    /// flight (TRACE-8, #72 — found while implementing EXC-3).
+    ///
+    /// **What goes wrong without it, and it is the worst failure this crate has.** `try_record_trace`
+    /// recognises a traced hit by looking its request id up among the *enabled* requests. A budget disarm
+    /// clears `request_id`, so a hit that the JVM had already generated stops being recognisable the
+    /// instant the budget runs out — and the event falls through to the suspending path, which buffers it
+    /// and leaves the thread suspended. Trace mode's entire promise is that it never freezes anything.
+    ///
+    /// It needs a rethrow to see, which is why it survived until #68: an exception stop that disarms on
+    /// its budget mid-chain has three more throws of the same instance already coming. Measured on
+    /// `RethrowProbe` — the probe stopped printing at the exact tick the budget ran out, and stayed
+    /// stopped until a `debug.panic`.
+    ///
+    /// Bounded (`MAX_DISARMED_TRACED`), and nothing removes an entry — so membership alone must never be
+    /// the whole test. [`was_traced_and_disarmed`](Self::was_traced_and_disarmed) carries the reason and
+    /// the second clause; the short version is that a reused request id matching on membership would turn a
+    /// **suspending** breakpoint into one that silently never suspends.
+    pub disarmed_traced_requests: VecDeque<i32>,
+    /// Rethrow chains in flight, keyed by `(request id, thread, exception object id)` (EXC-3).
+    ///
+    /// **The thread is in the key on purpose.** A rethrow unwinds on the thread that threw, so including
+    /// it costs nothing and removes the one way this could misfire: JDWP object ids are reusable, so a
+    /// later, unrelated exception handed the same id would otherwise be folded into a dead chain.
+    pub rethrow_chains: HashMap<(i32, u64, u64), RethrowChain>,
     /// Traced stop points that disarmed themselves on reaching their hit budget (TRACE-3), as
     /// `(note, times)` keyed by note text. Surfaced by `get_traces` so silence is never mistaken for
     /// "no more hits"; cleared with `clear`.
@@ -217,6 +257,119 @@ impl DebugSession {
         self.suspended_cause = None;
     }
 
+    /// Record what the watchdog just did, stamped with the event it happened after (SAFE-10).
+    ///
+    /// One method rather than two assignments at each of the watchdog's four outcomes, because a note
+    /// written without its watermark is precisely the bug: it would be replayed against every later
+    /// event, which is what #69 reported.
+    pub fn note_watchdog(&mut self, note: String) {
+        self.last_watchdog_note = Some(note);
+        self.last_watchdog_seq = Some(self.event_seq);
+    }
+
+    /// Remember that a traced stop point's JDWP request was just disarmed, so hits it had already
+    /// generated are still resumed rather than surfaced as suspending events (TRACE-8, #72).
+    pub fn note_disarmed_traced(&mut self, req_id: i32) {
+        remember_bounded(&mut self.disarmed_traced_requests, req_id, MAX_DISARMED_TRACED);
+    }
+
+    /// Whether `req_id` belonged to a traced stop point that was disarmed with events in flight
+    /// (TRACE-8, #72).
+    ///
+    /// **Membership in the list is not sufficient, and getting that wrong would be worse than the bug this
+    /// fixes.** Nothing removes an id from the list, and JDWP request ids are allocated by the *debuggee* —
+    /// `HotSpot` happens to hand them out monotonically, but the spec promises nothing, and this crate talks
+    /// to whatever is on the port. If a reused id matched on membership alone, the hit it named would be
+    /// resumed and dropped: a **suspending** breakpoint that silently never suspends, with no error
+    /// anywhere and nothing in the reply to explain it. That is the same class of failure as the one being
+    /// fixed, pointing the other way.
+    ///
+    /// So the id must also not currently belong to a live stop point. The caller has already established
+    /// that it is not an *enabled traced* request (`find_traced_request` missed); this rules out its having
+    /// been reused for an enabled **suspending** one, which is the case that matters. A stale entry then
+    /// simply goes inert rather than needing to be purged.
+    pub fn was_traced_and_disarmed(&self, req_id: i32) -> bool {
+        self.disarmed_traced_requests.contains(&req_id) && !self.owns_live_request(req_id)
+    }
+
+    /// Whether any tracked stop point currently holds `req_id` as its live JDWP request.
+    fn owns_live_request(&self, req_id: i32) -> bool {
+        let id = Some(req_id);
+        self.breakpoints.values().any(|b| b.request_id == id)
+            || self.exception_requests.values().any(|e| e.request_id == id)
+            || self.watchpoints.values().any(|w| w.request_id == id)
+            || self.method_exits.values().any(|m| m.request_id == id)
+            // A deferred breakpoint's CLASS_PREPARE is a live request too, and arming the real breakpoint
+            // when it fires is not something to skip.
+            || self.pending_breakpoints.iter().any(|p| p.class_prepare_request_id == req_id)
+    }
+
+    /// Classify a traced exception hit as a first throw or a rethrow of an instance already captured,
+    /// and advance that instance's chain (EXC-3, #68).
+    ///
+    /// **Why this exists.** An exception stop armed on an application type with `trace_max_hits: 30`
+    /// captured 38 snapshots of which 30 were *one* instance walking `WildFly`'s EJB interceptor chain —
+    /// `InterceptorContext.proceed` rethrowing at every layer. Two things went wrong and they compound:
+    /// the stop point disarmed itself mid-request on a budget spent entirely on plumbing, and the one
+    /// informative record — the original throw, with the application frame and the cause — was the 9th,
+    /// reachable only by paging past the noise.
+    ///
+    /// **What is kept, and why not less.** Blanket dedupe by instance would be wrong: a rethrow at a
+    /// *different site* can be the interesting one, and a wrapper that drops the cause is the exact
+    /// failure this repo's swallowed-exception playbook exists for. So both ends survive — the first
+    /// capture, and the latest sighting, which converges on the escape point as the chain unwinds — and
+    /// only the middle is replaced by a count. The latest is a *rolling* record rather than a prediction:
+    /// nothing here can know which rethrow is the last one, so each supersedes the previous, and whichever
+    /// turns out to be final is the one left standing.
+    ///
+    /// Charging the budget is the caller's job, and [`ThrowKind::Rethrow`] means don't — that is the half
+    /// that stops framework plumbing from spending a request's whole allowance.
+    pub fn classify_throw(
+        &mut self,
+        req_id: i32,
+        thread: u64,
+        exception: Option<u64>,
+        next_seq: u64,
+    ) -> ThrowKind {
+        let Some(exc) = exception else {
+            return ThrowKind::First;
+        };
+        let key = (req_id, thread, exc);
+        if let Some(chain) = self.rethrow_chains.get_mut(&key) {
+            chain.collapsed = chain.collapsed.saturating_add(1);
+            let supersedes = chain.rolling_seq.replace(next_seq);
+            // The first rethrow is not a fold of anything yet — it becomes the rolling record, and only
+            // the ones after it collapse into a count.
+            return ThrowKind::Rethrow {
+                fold: RethrowFold { collapsed: chain.collapsed - 1, first_seq: chain.first_seq },
+                supersedes,
+            };
+        }
+        // Evict the oldest chain rather than growing without bound. An exception whose chain is this stale
+        // has been handled long ago, so the only thing lost is folding that will never be asked for.
+        if self.rethrow_chains.len() >= MAX_RETHROW_CHAINS {
+            if let Some(oldest) = self.rethrow_chains.iter().min_by_key(|(_, c)| c.first_seq).map(|(k, _)| *k)
+            {
+                self.rethrow_chains.remove(&oldest);
+            }
+        }
+        self.rethrow_chains
+            .insert(key, RethrowChain { first_seq: next_seq, rolling_seq: None, collapsed: 0 });
+        ThrowKind::First
+    }
+
+    /// The watchdog note, but only when it is about the suspension a caller is *currently* looking at
+    /// (SAFE-10) — `newest_seq` is the sequence of the newest event being rendered.
+    ///
+    /// `None` for a note that a later event has superseded. Also `None` when there is no event to render
+    /// at all: with nothing on screen for the note to be misread as describing, `get_last_event` has its
+    /// own answer for an empty buffer, and SAFE-2's caller-walked-away case always has the event that
+    /// caused the suspension still in the buffer.
+    pub fn watchdog_note_for(&self, newest_seq: Option<u64>) -> Option<&str> {
+        let (note, at) = (self.last_watchdog_note.as_deref()?, self.last_watchdog_seq?);
+        (newest_seq? <= at).then_some(note)
+    }
+
     /// Record that a traced stop point disarmed itself (SAFE-8). Repeats of the same note increment a
     /// count instead of adding an entry, and once `MAX_TRACE_DISARMS` distinct notes are held a new one
     /// is dropped and counted rather than growing the map without bound.
@@ -338,7 +491,72 @@ pub struct TraceRecord {
     /// Kept as ordered key/value pairs rather than a formatted string so the renderer, not the
     /// capture, decides how a trace line reads.
     pub detail: Vec<(String, String)>,
+    /// Set when this snapshot is the *latest* sighting of an exception instance already captured
+    /// earlier — the escaping end of a rethrow chain (EXC-3). `None` for every other snapshot.
+    pub rethrow: Option<RethrowFold>,
 }
+
+/// A rethrow chain folded into one snapshot (EXC-3, #68).
+#[derive(Debug, Clone, Copy)]
+pub struct RethrowFold {
+    /// How many rethrows of this instance were folded away to get here.
+    pub collapsed: u32,
+    /// `seq` of the first capture of this instance, so the original throw — the one with the
+    /// application frame and the cause — can be found without paging.
+    pub first_seq: u64,
+}
+
+/// What a traced exception hit is, with respect to chains already being tracked (EXC-3).
+#[derive(Debug, Clone, Copy)]
+pub enum ThrowKind {
+    /// Not an exception hit at all, or an instance never seen before: record and charge it as usual.
+    First,
+    /// This instance was captured before, so this is a rethrow. `supersedes` is the seq of the rolling
+    /// record to drop, if one is still in the buffer.
+    Rethrow { fold: RethrowFold, supersedes: Option<u64> },
+}
+
+/// One exception instance's rethrow chain, while it unwinds (EXC-3).
+#[derive(Debug, Clone, Copy)]
+pub struct RethrowChain {
+    /// `seq` of the first capture — never dropped, so the original throw survives.
+    pub first_seq: u64,
+    /// `seq` of the rolling "latest sighting" record, which each further rethrow replaces.
+    pub rolling_seq: Option<u64>,
+    pub collapsed: u32,
+}
+
+/// Push `req_id` onto a bounded, duplicate-free FIFO, evicting the oldest entry at `cap` (TRACE-8).
+///
+/// A free function rather than a method body so the bounding is testable without a live JDWP connection to
+/// build a whole [`DebugSession`] around — the same reason `note_trace_disarm`'s logic is mirrored in this
+/// module's tests, except that this one has no copy to drift from.
+fn remember_bounded(queue: &mut std::collections::VecDeque<i32>, req_id: i32, cap: usize) {
+    if queue.contains(&req_id) {
+        return;
+    }
+    // A cap of 0 would otherwise push after failing to evict, growing the queue it is meant to bound.
+    if cap == 0 {
+        return;
+    }
+    if queue.len() >= cap {
+        queue.pop_front();
+    }
+    queue.push_back(req_id);
+}
+
+/// How many disarmed traced request ids a session remembers (TRACE-8, #72).
+///
+/// Only in-flight events matter, and they arrive within microseconds of the disarm, so this is generous
+/// rather than tuned — it exists to keep the queue from growing over a long session.
+pub const MAX_DISARMED_TRACED: usize = 32;
+
+/// How many rethrow chains a session tracks at once (EXC-3).
+///
+/// A chain lives only while one exception unwinds, so this is not a working-set size — it is a bound on
+/// how far wrong the bookkeeping can go if entries are somehow never revisited. Evicting the oldest
+/// chain loses only the folding of an exception that has long since been handled.
+pub const MAX_RETHROW_CHAINS: usize = 64;
 
 /// An active exception breakpoint: an EXCEPTION event request that fires when a matching
 /// exception is thrown. Tracked so it shows in `list_stop_points` and is cleared by
@@ -572,6 +790,9 @@ impl SessionManager {
             suspended_cause: None,
             watchdog_task: None,
             last_watchdog_note: None,
+            last_watchdog_seq: None,
+            disarmed_traced_requests: VecDeque::new(),
+            rethrow_chains: HashMap::new(),
             trace_disarms: std::collections::BTreeMap::new(),
             trace_disarms_dropped: 0,
             read_only,
@@ -727,6 +948,35 @@ mod tests {
         }
         assert_eq!(notes.len(), MAX_TRACE_DISARMS, "distinct notes must be capped");
         assert!(dropped > 0, "overflow must be counted so a full buffer never reads as a quiet one");
+    }
+
+    // TRACE-8 (#72): the disarmed-traced list is what stops a budget disarm from freezing the VM with the
+    // hits it had already generated, so its bounding is load-bearing — an unbounded one would grow for the
+    // life of a session, and a broken eviction would forget the id that is about to be needed.
+    #[test]
+    fn disarmed_traced_ids_are_deduplicated_and_bounded() {
+        let mut q = std::collections::VecDeque::new();
+
+        // The same request disarmed repeatedly is one entry: `disarm_request` is reached from the budget
+        // path, the watchdog and a manual clear, and a re-armed stop point can disarm again and again.
+        for _ in 0..500 {
+            remember_bounded(&mut q, 7, MAX_DISARMED_TRACED);
+        }
+        assert_eq!(q.len(), 1, "repeats must not accumulate");
+
+        // Oldest out, newest in — the newest is the one whose hits are still in flight.
+        for i in 0..i32::try_from(MAX_DISARMED_TRACED).unwrap_or(i32::MAX) + 5 {
+            remember_bounded(&mut q, 1000 + i, MAX_DISARMED_TRACED);
+        }
+        assert_eq!(q.len(), MAX_DISARMED_TRACED, "the list must stay bounded");
+        assert!(!q.contains(&7), "the oldest entry must be the one evicted");
+        let newest = 1000 + i32::try_from(MAX_DISARMED_TRACED).unwrap_or(i32::MAX) + 4;
+        assert!(q.contains(&newest), "the newest disarm is the one most likely to have a hit in flight");
+
+        // A zero cap must not grow the queue it is meant to bound.
+        let mut zero = std::collections::VecDeque::new();
+        remember_bounded(&mut zero, 1, 0);
+        assert!(zero.is_empty(), "cap 0 must store nothing rather than push after not evicting");
     }
 
     // TRACE-7: a traced stop point that has captured nothing must be distinguishable from one that

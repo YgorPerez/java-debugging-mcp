@@ -25,6 +25,7 @@ these lazily, when decisions actually get resolved; that point arrived.
 | [0014](0014-a-cassette-is-keyed-by-the-request-and-a-miss-is-loud.md) | A recorded JDWP cassette is keyed by the request, and a miss is loud |
 | [0015](0015-a-second-tool-not-a-flag-that-changes-the-subject.md) | A field listing is a second tool, because a flag may not change what the question was |
 | [0016](0016-a-class-root-is-not-a-source-root-and-a-pop-is-not-a-flag.md) | Compiled output gets its own `class_roots`, and `pop_frame` is its own tool rather than a flag on a reload |
+| [0017](0017-an-exception-message-is-read-as-a-field-except-the-one-the-jvm-never-stores.md) | An exception's message is read as a field, with one narrowly-gated invocation for the helpful NPE the JVM never stores |
 
 The downstream consumer's contract is [`docs/toolkit-contract.md`](../toolkit-contract.md) — what shipping
 a change here costs the toolkit that packages it.

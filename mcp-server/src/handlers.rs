@@ -224,6 +224,7 @@ impl RequestHandler {
         Some(match name {
             "debug.get_stack" => self.handle_get_stack(args).await,
             "debug.evaluate" => self.handle_evaluate(args).await,
+            "debug.evaluate_chain" => self.handle_evaluate_chain(args).await,
             "debug.list_threads" => self.handle_list_threads(args).await,
             "debug.thread_dump" => self.handle_thread_dump(args).await,
             "debug.get_last_event" => self.handle_get_last_event(args).await,
@@ -899,6 +900,43 @@ impl RequestHandler {
         Ok(format!("{ro_note}{} = {}", expression.trim(), rendered))
     }
 
+    /// `debug.evaluate_chain` (EVAL-6, #70): walk a chained expression link by link and name the first
+    /// one that went null.
+    ///
+    /// A separate tool rather than a mode on `debug.evaluate`, per ADR-0015: a flag may change how an
+    /// answer is bounded, filtered or rendered, not what the question was — and "where did this become
+    /// null" is a different question from "what is this value". The name is also the discovery mechanism,
+    /// and it sits next to `debug.evaluate` in an alphabetical tool list, which is where a caller looking
+    /// for it will be.
+    async fn handle_evaluate_chain(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::EvaluateChainArgs = crate::args::parse(&args)?;
+        let expression = a.expression.trim();
+
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+        let thread_id = crate::args::parse_thread_id(a.thread_id.as_deref()).or(session.last_thread);
+        let conn = &mut session.connection;
+
+        // Same frame selection as `debug.evaluate`, including its fallback to the top frame, so the two
+        // tools never disagree about which frame an expression was read in.
+        let frame = match thread_id {
+            Some(tid) => match conn.get_frames(tid, 0, -1).await {
+                Ok(frames) if !frames.is_empty() => {
+                    frames.get(a.frame_index).cloned().or_else(|| frames.first().cloned())
+                }
+                _ => None,
+            },
+            None => None,
+        };
+
+        let walk = walk_expression_chain(conn, thread_id, frame.as_ref(), expression, a.max_result_length)
+            .await
+            .map_err(explain_readonly)?;
+        drop(session);
+        Ok(render_expression_chain(expression, &walk))
+    }
+
     async fn handle_list_threads(&self, args: serde_json::Value) -> Result<String, String> {
         let session_guard =
             self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
@@ -1533,14 +1571,21 @@ impl RequestHandler {
         if a.drain {
             session.events.clear();
         }
-        let watchdog_note = session.last_watchdog_note.clone();
+        // SAFE-10: scoped to the newest event being rendered, so a rescue that has since been overtaken
+        // by a fresh hit is not replayed as though it were about that hit.
+        let watchdog_note = session.watchdog_note_for(shown.last().map(|r| r.seq)).map(ToString::to_string);
         drop(session);
 
         lines.push(format!("[suspended] {suspended}"));
         // If the watchdog auto-resumed while the caller was away, they'd otherwise read a stale
         // "suspended" state — tell them the VM was rescued and which stop point was disarmed (SAFE-2).
+        //
+        // `[suspended]` above comes from the event's suspend POLICY, not from a live read of the VM, so
+        // it still says what the hit did. Naming the rescued suspension as this event's own is the half
+        // that was missing: unqualified, the pair read as a contradiction that only a caller who knew
+        // where `[suspended]` came from could resolve (SAFE-10).
         if let Some(n) = watchdog_note {
-            lines.push(format!("[watchdog] {n}"));
+            lines.push(format!("[watchdog] this suspension has since ended — {n}"));
         }
         // Only when there is something to catch up on: silence means "you have seen everything".
         if unshown > 0 {
@@ -2169,7 +2214,7 @@ impl RequestHandler {
             let args_s = format_trace_args(rec);
             let expr_s = format_trace_expr(rec);
             lines.push(format!(
-                "#{} [{}] {}.{}:{}{} thread=0x{:x}{}{}{}",
+                "#{} [{}] {}.{}:{}{} thread=0x{:x}{}{}{}{}",
                 rec.seq,
                 rec.bp_id,
                 rec.class,
@@ -2179,7 +2224,8 @@ impl RequestHandler {
                 rec.thread,
                 detail_s,
                 args_s,
-                expr_s
+                expr_s,
+                format_trace_rethrow(rec),
             ));
         }
         // A stop point that hit its budget disarmed itself (TRACE-3) — say so, so a caller doesn't
@@ -3006,28 +3052,192 @@ async fn describe_event_into(
     }
 }
 
-/// Add an exception hit's details: the thrown type, whether it is caught, and where it is caught.
+/// Add an exception hit's details: the thrown type, its message, whether it is caught, and where it
+/// is caught.
 ///
 /// `caught` comes from the presence of a catch location, which is how JDWP reports it — an exception
 /// with no catch location propagates out of the thread.
+///
+/// `message` is the field that turns a location into a diagnosis (EXC-2). On JDK 15+ a
+/// `NullPointerException`'s message names the failing subexpression outright — *"because the return
+/// value of `WSReservaCircuitoUh.getSqQuarto()` is null"* — which is the answer a caller would
+/// otherwise reach by bisecting the expression with a handful of `debug.evaluate` calls.
 async fn describe_exception_event(
     conn: &mut jdwp_client::JdwpConnection,
     details: &EventKind,
     obj: &mut serde_json::Map<String, serde_json::Value>,
 ) {
-    let EventKind::Exception { exception, catch_location, .. } = details else {
+    let EventKind::Exception { thread, exception, catch_location, .. } = details else {
         return;
     };
-    let exc_type = match conn.get_object_reference_type(*exception).await {
-        Ok(t) => decode_signature(&conn.get_signature(t).await.unwrap_or_default()),
-        Err(_) => "unknown".to_string(),
+    let ref_type = conn.get_object_reference_type(*exception).await.ok();
+    let exc_type = match ref_type {
+        Some(t) => decode_signature(&conn.get_signature(t).await.unwrap_or_default()),
+        None => "unknown".to_string(),
     };
     obj.insert("exception".to_string(), json!(exc_type));
+    match exception_message(conn, *exception, ref_type, &exc_type, *thread).await {
+        ExceptionMessage::Text(msg) => {
+            obj.insert("message".to_string(), json!(truncate(&msg, EXCEPTION_MESSAGE_LEN)));
+        }
+        // A freeze the caller has to know about: JDWP cannot cancel an invocation, so the hit thread is
+        // still running it. Reported in the `message` slot because that is the field whose absence would
+        // otherwise be read as "this exception carries no message".
+        ExceptionMessage::TimedOut(ms) => {
+            obj.insert(
+                "message".to_string(),
+                json!(format!(
+                    "<not read — getMessage() did not return within {ms}ms; that thread is still executing it>"
+                )),
+            );
+        }
+        ExceptionMessage::None => {}
+    }
     obj.insert("caught".to_string(), json!(catch_location.is_some()));
     if let Some(cl) = catch_location {
         let (cls, method, line) = describe_location(conn, cl).await;
         obj.insert("caught_at".to_string(), json!(format!("{}.{}:{}", cls, method, line.unwrap_or(-1))));
     }
+}
+
+/// How much of an exception message a snapshot keeps (EXC-2).
+///
+/// Larger than the 200 other describers use, because a helpful-NPE message spends most of its length
+/// on the fully-qualified names that *are* the diagnosis: `Cannot invoke "…" because the return value
+/// of "br.com.infotera.common.WSReservaCircuitoUh.getSqQuarto()" is null` is already 140 characters
+/// with short package names. Truncating mid-chain would cut the half a caller came for.
+const EXCEPTION_MESSAGE_LEN: usize = 1000;
+
+/// The thrown object's id, for an exception event; `None` for every other kind (EXC-3).
+///
+/// The identity of the *instance* is the only thing that distinguishes a rethrow from a second, similar
+/// failure — same type, same message and even the same line do not, since a loop throwing on every
+/// iteration is not a chain.
+const fn exception_instance(details: &EventKind) -> Option<u64> {
+    if let EventKind::Exception { exception, .. } = details {
+        Some(*exception)
+    } else {
+        None
+    }
+}
+
+/// What reading a thrown exception's message produced (EXC-2).
+enum ExceptionMessage {
+    Text(String),
+    /// The bounded `getMessage()` invocation expired. The hit thread is still executing it.
+    TimedOut(u64),
+    /// The exception carries no message, or nothing could be read.
+    None,
+}
+
+/// The message of a thrown exception: read as a **field** where the JVM stored one, and computed by
+/// the JVM where it did not (EXC-2).
+///
+/// **The field read is the mechanism, and it covers every exception built with a message.**
+/// `Throwable.detailMessage` is a plain `String`, so this is what a watchpoint does to read its
+/// old/new values — no invocation, and therefore available in trace mode too, which is the discipline
+/// [`describe_method_exit_event`] records. The field is declared on `Throwable` rather than on the
+/// thrown subclass, so the type chain is walked to find it.
+///
+/// **A helpful NPE is the one case the field cannot answer, and it is the case #67 was filed about.**
+/// JEP 358's message is *not* stored: `NullPointerException.getMessage()` computes it on demand via a
+/// private native method and caches nothing, so `detailMessage` reads null before and after — measured
+/// on JDK 21, where `getMessage()` returns the full sentence and the field stays null either way. A
+/// field read alone would therefore have delivered every exception except the motivating one.
+///
+/// So exactly one invocation is allowed, under three gates that between them remove the reasons the
+/// house rule exists:
+///
+/// 1. **Only when the field is null**, so an exception that already carries a message costs nothing.
+/// 2. **Only when the type is exactly `java.lang.NullPointerException`** — not a subclass. That makes
+///    `getMessage()` the JDK's own implementation, whose entire body is the native computation: no
+///    application code runs, and nothing takes a Java-level monitor. The deadlock this rule guards
+///    against is a `toString()` blocking on a lock another suspended thread holds, and there is no
+///    lock here to block on.
+/// 3. **Bounded by the existing invocation budget**, and an expiry is *reported* rather than dropped
+///    (the same reasoning as EVAL-5): a caller must be able to tell a freeze from an absent message.
+///
+/// The thread is suspended at this point on both paths — a traced hit is armed `EventThread` and
+/// resumed only after the snapshot is built — so the invocation has a thread to run on either way.
+/// Its cost lands inside TRACE-7's measured capture window, which is where a caller should see it.
+async fn exception_message(
+    conn: &mut jdwp_client::JdwpConnection,
+    exception: u64,
+    ref_type: Option<u64>,
+    exc_type: &str,
+    thread: u64,
+) -> ExceptionMessage {
+    if let Some(s) = detail_message_field(conn, exception, ref_type).await {
+        return ExceptionMessage::Text(s);
+    }
+    if exc_type != "java.lang.NullPointerException" {
+        return ExceptionMessage::None;
+    }
+    let Some(type_id) = ref_type else {
+        return ExceptionMessage::None;
+    };
+    computed_npe_message(conn, exception, type_id, thread).await
+}
+
+/// `Throwable.detailMessage` off a thrown exception, without invoking anything.
+///
+/// `None` covers all three of "no message", "no such field" (a JVM whose `Throwable` is shaped
+/// differently) and "the read failed" — deliberately not distinguished, because none of them is a
+/// message and reporting an empty one would be a lie a caller cannot see through.
+async fn detail_message_field(
+    conn: &mut jdwp_client::JdwpConnection,
+    exception: u64,
+    ref_type: Option<u64>,
+) -> Option<String> {
+    let mut current = ref_type;
+    let mut guard = 0;
+    while let Some(tid) = current {
+        guard += 1;
+        // Same bound the other superclass walks use: a chain this deep is a broken VM, not a hierarchy.
+        if guard > 50 {
+            break;
+        }
+        if let Ok(fields) = conn.get_fields(tid).await {
+            if let Some(f) = fields.into_iter().find(|f| f.name == "detailMessage") {
+                let v = conn.get_object_values(exception, vec![f.field_id]).await.ok()?.into_iter().next()?;
+                let jdwp_client::types::ValueData::Object(id) = v.data else {
+                    return None;
+                };
+                return string_value_of(conn, id).await;
+            }
+        }
+        current = conn.get_superclass(tid).await.unwrap_or(None);
+    }
+    None
+}
+
+/// The JEP 358 message for a `java.lang.NullPointerException`, by the one invocation
+/// [`exception_message`] permits. Its three gates are checked by the caller.
+async fn computed_npe_message(
+    conn: &mut jdwp_client::JdwpConnection,
+    exception: u64,
+    type_id: u64,
+    thread: u64,
+) -> ExceptionMessage {
+    let Ok(Some((decl, m))) = find_method_arity(conn, type_id, "getMessage", 0).await else {
+        return ExceptionMessage::None;
+    };
+    if m.signature != "()Ljava/lang/String;" {
+        return ExceptionMessage::None;
+    }
+    let (ret, exc) = match conn.invoke_method(exception, thread, decl, m.method_id, vec![]).await {
+        Ok(pair) => pair,
+        Err(jdwp_client::JdwpError::InvokeTimeout(ms)) => return ExceptionMessage::TimedOut(ms),
+        Err(_) => return ExceptionMessage::None,
+    };
+    // A `getMessage()` that threw tells us nothing about the exception we were asked about.
+    if exc != 0 {
+        return ExceptionMessage::None;
+    }
+    let jdwp_client::types::ValueData::Object(sid) = ret.data else {
+        return ExceptionMessage::None;
+    };
+    string_value_of(conn, sid).await.map_or(ExceptionMessage::None, ExceptionMessage::Text)
 }
 
 /// Add a method-exit hit's returned value to a `get_last_event` / trace entry (METH-1).
@@ -5907,6 +6117,13 @@ async fn method_name_matches(
 /// silently destroy a condition or `trace_expr` the user typed by hand — the very setup SAFE-2's design
 /// note said not to throw away. Disabling keeps it recoverable in one call (BP-2).
 async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32) -> Option<String> {
+    // TRACE-8 (#72): note it BEFORE clearing, while the stop point still says it was traced. Hits this request
+    // already generated are in flight and must still be resumed rather than surfaced as suspending
+    // events — see `disarmed_traced_requests`. Done here rather than at the budget path so it also covers
+    // the watchdog and a manual `clear_stop_point`, which have the same in-flight window.
+    if find_traced_request(session, req_id).is_some() {
+        session.note_disarmed_traced(req_id);
+    }
     if let Some((id, bp)) = session
         .breakpoints
         .iter()
@@ -6304,6 +6521,14 @@ async fn try_record_trace(
         return false;
     };
     let Some(req) = find_traced_request(session, req_id) else {
+        // TRACE-8 (#72): the request is gone, but the JVM had already generated this hit and suspended the
+        // thread for it. Falling through here would surface a *traced* hit as a suspending event and
+        // leave the thread frozen — trace mode's one promise, broken exactly when a budget disarm makes
+        // it hardest to notice. Resume and drop it: the budget said stop recording, not stop the VM.
+        if session.was_traced_and_disarmed(req_id) {
+            let _ = session.connection.resume_thread(thread).await;
+            return true;
+        }
         return false;
     };
     // Two reasons to drop a hit without recording it, and neither charges the trace budget — so
@@ -6344,9 +6569,23 @@ async fn try_record_trace(
     if recorded {
         record_trace_cost(session, req_id, started, took);
     }
+    // EXC-3: decide whether this hit is a fresh throw or the chain of one already captured, BEFORE the
+    // record is filed — the answer picks its seq, whether an earlier rolling record is dropped, and (the
+    // load-bearing half) whether the budget is charged at all.
+    let mut kind = crate::session::ThrowKind::First;
     if let Some(mut rec) = record {
         session.trace_seq += 1;
         rec.seq = session.trace_seq;
+        kind = session.classify_throw(req_id, thread, exception_instance(&details), rec.seq);
+        if let crate::session::ThrowKind::Rethrow { fold, supersedes } = kind {
+            rec.rethrow = Some(fold);
+            // The previous latest-sighting of this instance is what this record replaces, so it goes.
+            // Absent when the buffer already evicted it, which needs no repair — the fold's own
+            // `first_seq` still points at the original throw.
+            if let Some(old) = supersedes {
+                session.traces.retain(|r| r.seq != old);
+            }
+        }
         if session.traces.len() >= crate::session::MAX_TRACES {
             session.traces.pop_front();
         }
@@ -6356,6 +6595,11 @@ async fn try_record_trace(
     // TRACE-3: charge the hit against this stop point's budget and disarm it once it runs out, so a
     // hot throw/field can't keep flooding the debuggee. Only a recorded hit is charged, so the
     // "exactly N traces, then it stops" contract holds even when a condition skips some.
+    //
+    // EXC-3: a collapsed rethrow is explicitly NOT charged. Otherwise the mechanism that makes tracing
+    // safe and the mechanism that makes it useful are in direct conflict on any EJB or Spring app: the
+    // framework spends the whole budget rethrowing before the application gets a look in.
+    let recorded = recorded && matches!(kind, crate::session::ThrowKind::First);
     if recorded {
         if let Some(label) = charge_trace_budget(session, req_id).await {
             session.note_trace_disarm(label);
@@ -6641,7 +6885,7 @@ fn spawn_watchdog(
                             s.mark_resumed();
                             let note = format!("watchdog auto-resumed the VM after {secs}s {disarmed}");
                             info!("{note}");
-                            s.last_watchdog_note = Some(note);
+                            s.note_watchdog(note);
                             "warning"
                         }
                         Ok(Some(detail)) if detail.starts_with("cleared") => {
@@ -6649,7 +6893,7 @@ fn spawn_watchdog(
                             let note =
                                 format!("watchdog auto-resumed the VM after {secs}s {disarmed} ({detail})");
                             info!("{note}");
-                            s.last_watchdog_note = Some(note);
+                            s.note_watchdog(note);
                             "warning"
                         }
                         Ok(Some(problem)) => {
@@ -6659,7 +6903,7 @@ fn spawn_watchdog(
                                 "⚠️ watchdog tried to resume the VM after {secs}s {disarmed}, but {problem}"
                             );
                             warn!("{note}");
-                            s.last_watchdog_note = Some(note);
+                            s.note_watchdog(note);
                             // A still-frozen VM is an `error`: nothing the caller does next will work
                             // until it runs, which is a different thing from "we rescued it for you".
                             "error"
@@ -6667,7 +6911,7 @@ fn spawn_watchdog(
                         Err(e) => {
                             let note = format!("⚠️ watchdog could not resume the VM after {secs}s: {e}");
                             warn!("{note}");
-                            s.last_watchdog_note = Some(note);
+                            s.note_watchdog(note);
                             "error"
                         }
                     };
@@ -8120,6 +8364,199 @@ async fn resolve_expression_multi(
         }
     }
     Ok(Resolved::One(current))
+}
+
+/// A walked expression chain (EVAL-6).
+struct ChainWalk {
+    steps: Vec<ChainStep>,
+    /// How many links the caller *wrote*, which is not `steps.len()` once a null cuts the walk short.
+    /// Kept so the report can say how many were never evaluated rather than leaving their absence to be
+    /// read as "these were fine".
+    total_links: usize,
+}
+
+/// One link of a walked expression chain (EVAL-6).
+struct ChainStep {
+    /// The link as the caller wrote it — `.getConfigUhList()`, `[0]`, `Config.URL`.
+    label: String,
+    /// The link's value, rendered the way `debug.evaluate` renders one.
+    rendered: String,
+    /// Whether the link resolved to `null`, which is what ends a walk.
+    is_null: bool,
+}
+
+/// Walk an expression left to right, recording what each link resolved to, and stop at the first
+/// `null` (EVAL-6, #70).
+///
+/// **The one-call answer to "which link went null".** Finding that out took three `debug.evaluate` calls
+/// bisecting by hand during the investigation behind #67, and #67 only removes that cost for chains that
+/// *throw* — a JDK 15+ helpful NPE names the failing subexpression itself. This is for the case where
+/// nothing throws: a field that is legitimately null, or a collection that came back empty, where the
+/// question is how far down the chain the value survived.
+///
+/// **Walked once, not re-evaluated per prefix.** The obvious implementation — resolve `a`, then `a.b()`,
+/// then `a.b().c()` — invokes `b()` once per remaining link, and a debugger that silently calls a method
+/// three times is not one you can trust against a live JVM. Each link here is resolved against the
+/// previous link's value, so every method in the chain runs exactly once, as `debug.evaluate` would.
+///
+/// The head's two resolution paths and every primitive are shared with [`resolve_expression_multi`]; what
+/// is duplicated is the orchestration, which ADR-0015 weighed and accepted for exactly this shape.
+async fn walk_expression_chain(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
+    expr: &str,
+    max_len: usize,
+) -> Result<ChainWalk, String> {
+    let segs = parse_expr(expr)?;
+    let Some(head_seg) = segs.first() else {
+        return Err("Empty expression".to_string());
+    };
+    let head_result = match (thread_id, frame) {
+        (Some(tid), Some(fr)) => Some(resolve_head(conn, tid, fr, head_seg).await),
+        _ => None,
+    };
+    let (mut current, start) = if let Some(Ok(v)) = head_result {
+        (v, 1usize)
+    } else {
+        resolve_static_head(conn, thread_id, frame, &segs).await.map_err(|static_err| match &head_result {
+            Some(Err(head_err)) => {
+                format!("{head_err} (also not a resolvable static member: {static_err})")
+            }
+            _ => format!(
+                "No suspended frame to read locals from, and not a resolvable static member: {static_err}"
+            ),
+        })?
+    };
+
+    // A static head folds a dotted class prefix and its member into ONE link, so the count the caller
+    // recognises is not `segs.len()`.
+    let total_links = segs.len() + 1 - start;
+    let mut steps = Vec::with_capacity(total_links);
+    // A static head consumed a dotted class prefix as well as the member, so the label is all of it.
+    let head_label =
+        segs.get(..start).map_or_else(String::new, |s| s.iter().map(seg_label).collect::<Vec<_>>().join("."));
+    let head_owner = segs
+        .get(start.saturating_sub(1))
+        .ok_or_else(|| "Internal error: head resolution consumed no segments".to_string())?;
+    match apply_subscripts(conn, thread_id, frame, current, &head_owner.subs, &head_owner.name).await? {
+        Resolved::One(v) => {
+            steps.push(chain_step(conn, head_label, &v, max_len).await);
+            current = v;
+        }
+        // A slice or filter yields several values, so it is necessarily the end of the walk.
+        Resolved::Many { .. } => {
+            steps.push(ChainStep {
+                label: head_label,
+                rendered: "(several values — a slice or filter ends the chain)".to_string(),
+                is_null: false,
+            });
+            return Ok(ChainWalk { steps, total_links });
+        }
+    }
+
+    for seg in segs.iter().skip(start) {
+        // **This is the answer, not an error.** `current` is null and the caller wrote another link, so
+        // resolving it would fail with a message about a null receiver — which is the question restated,
+        // not answered. The walk stops here and the steps already recorded say where it survived to.
+        if steps.last().is_some_and(|s| s.is_null) {
+            break;
+        }
+        let member = resolve_member(conn, thread_id, frame, &current, seg).await?;
+        match apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name).await? {
+            Resolved::One(v) => {
+                steps.push(chain_step(conn, seg_label(seg), &v, max_len).await);
+                current = v;
+            }
+            Resolved::Many { .. } => {
+                steps.push(ChainStep {
+                    label: seg_label(seg),
+                    rendered: "(several values — a slice or filter ends the chain)".to_string(),
+                    is_null: false,
+                });
+                return Ok(ChainWalk { steps, total_links });
+            }
+        }
+    }
+    Ok(ChainWalk { steps, total_links })
+}
+
+/// Render one resolved link into a [`ChainStep`].
+///
+/// `thread: None`, so no `toString()` runs: a walk exists to be read link by link, and a chain of
+/// invocations whose only purpose is prettier text is the wrong trade when one of them can block on a
+/// monitor another suspended thread holds (the same reasoning as the event describers).
+async fn chain_step(
+    conn: &mut jdwp_client::JdwpConnection,
+    label: String,
+    v: &jdwp_client::types::Value,
+    max_len: usize,
+) -> ChainStep {
+    let is_null = matches!(v.data, jdwp_client::types::ValueData::Object(0));
+    ChainStep { label, rendered: render_value(conn, v, None, max_len).await, is_null }
+}
+
+/// One segment as the caller wrote it: `getConfigUhList()`, `sqQuarto`, `lines[0]`.
+fn seg_label(seg: &Seg) -> String {
+    let mut out = seg.name.clone();
+    if let Some(args) = &seg.args {
+        let inner = args.iter().map(render_arglit).collect::<Vec<_>>().join(", ");
+        let _ = write!(out, "({inner})");
+    }
+    for s in &seg.subs {
+        let _ = match s {
+            Subscript::Index(a) => write!(out, "[{}]", render_arglit(a)),
+            Subscript::Range(a, b) => write!(out, "[{a}..{b}]"),
+            Subscript::Filter(p) => write!(out, "[?{p}]"),
+        };
+    }
+    out
+}
+
+/// Render a walked chain: one line per link, and a verdict naming the first `null` (EVAL-6).
+///
+/// The verdict is spelled out rather than left for the reader to spot, because "which link went null" is
+/// the question the tool was called with — a table that happens to contain the answer is what
+/// `debug.evaluate` already gave.
+fn render_expression_chain(expr: &str, walk: &ChainWalk) -> String {
+    let steps = &walk.steps;
+    let mut out = format!("🔗 {expr}\n\n");
+    let width = steps.iter().map(|s| s.label.chars().count()).max().unwrap_or(0);
+    for s in steps {
+        let _ = writeln!(
+            out,
+            "  {} {:<width$}  {}",
+            if s.is_null { "✘" } else { "✔" },
+            s.label,
+            s.rendered,
+            width = width
+        );
+    }
+    let _ = writeln!(out);
+    match steps.iter().position(|s| s.is_null) {
+        Some(at) => {
+            let step = steps.get(at).map_or("?", |s| s.label.as_str());
+            let _ = write!(out, "⛔ null at link {} of {}: {step}", at + 1, walk.total_links);
+            // The links the caller wrote but the walk never reached. Said explicitly, because their
+            // absence from the table above otherwise reads as "they were fine".
+            let unreached = walk.total_links.saturating_sub(steps.len());
+            if unreached > 0 {
+                let _ = write!(
+                    out,
+                    " — the {unreached} link(s) after it were never evaluated, so nothing here says \
+                     whether they would have worked"
+                );
+            }
+        }
+        None => {
+            let _ = write!(
+                out,
+                "✅ no link in this chain is null. If you expected one to be, the value you are after is \
+                 the last line above — an empty collection or a zero counts as present here."
+            );
+        }
+    }
+    out
 }
 
 fn multi_then_chain_error(name: &str) -> String {
@@ -10383,6 +10820,8 @@ async fn capture_trace(
         callers,
         expr,
         detail,
+        // Filled in by the caller, which is what owns the chain bookkeeping (EXC-3).
+        rethrow: None,
     }
 }
 
@@ -10428,6 +10867,19 @@ fn format_trace_detail(rec: &crate::session::TraceRecord) -> String {
     rec.detail.iter().fold(String::new(), |mut acc, (k, v)| {
         let _ = write!(acc, " {k}={v}");
         acc
+    })
+}
+
+/// Format a rethrow fold as ` ↻ rethrow of #N` (+ how many sightings were collapsed), or nothing at all
+/// for the ordinary case of a snapshot that is its own throw (EXC-3).
+///
+/// It names the first capture's `#seq` rather than just counting, because that record is the one worth
+/// reading: the original throw, with the application frame and the cause. The count is the part that says
+/// this line is the far end of a chain and not a second failure.
+fn format_trace_rethrow(rec: &crate::session::TraceRecord) -> String {
+    rec.rethrow.map_or_else(String::new, |f| match f.collapsed {
+        0 => format!(" ↻ rethrow of #{}", f.first_seq),
+        n => format!(" ↻ rethrow of #{} (+{n} more rethrow(s) collapsed)", f.first_seq),
     })
 }
 
@@ -10991,6 +11443,7 @@ mod tests {
             callers: Vec::new(),
             expr: None,
             detail: Vec::new(),
+            rethrow: None,
         };
         assert_eq!(format_trace_callers(&rec), "");
 

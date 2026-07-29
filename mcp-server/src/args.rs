@@ -311,6 +311,26 @@ pub struct EvaluateArgs {
     pub max_children: usize,
 }
 
+/// Arguments for `debug.evaluate_chain` (EVAL-6).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EvaluateChainArgs {
+    /// The chained Java expression to walk, in exactly the form `debug.evaluate` accepts —
+    /// `wsReservaCircuito.getCircuitoParametro().getConfigUhList()[0].getSqQuarto()`.
+    ///
+    /// A single-link expression is accepted but answers nothing this tool is for: with one link there is
+    /// no "which one" to find.
+    pub expression: String,
+    /// Thread ID (optional; defaults to the last thread that hit a breakpoint).
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Stack frame index (0 = current frame).
+    #[serde(default)]
+    pub frame_index: usize,
+    /// Maximum length of each link's rendered value.
+    #[serde(default = "default_max_result_length")]
+    pub max_result_length: usize,
+}
+
 /// Arguments for `debug.list_threads`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListThreadsArgs {
