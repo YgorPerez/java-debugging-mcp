@@ -23,6 +23,16 @@ CI never even ran the pass. `rust-doctor.toml` now ignores the rule and explains
 why the `Warning: unknown rule(s) in ignore config` the tool prints on every run is **false** — the entry
 works, and was measured working. Our own `unsafe` is a different rule and still fails the gate.
 
+**GitHub's security tab shows only what the gate fails on**, via `scripts/sarif-for-code-scanning.py`, and an
+empty tab there is now meaningful rather than reassuring. It used to publish rust-doctor's raw SARIF, which
+grew to **115 open alerts against a green gate**: 109 `excessive-clone` notes (one identical sentence, on
+`Arc` handle clones), 6 `skipped-pass` notes (a tool wasn't installed — not a finding about the code), and
+every one of them anchored to a path that does not exist in this tree, because rust-doctor writes
+crate-relative URIs (`src/handlers.rs`) under a `%SRCROOT%` base id it never declares and this is a
+workspace. The script resolves the paths, publishes `warning`/`error` only, and prints what it withheld into
+the job summary — so nothing is silently dropped. Notes still reach you two other ways: the full SARIF is
+the `rust-doctor-sarif` artifact, and `--findings` prints locally.
+
 **Run the suite on more than one JDK.** `scripts/integration-test.sh` covers the `#[ignore]`d
 JVM tests; plain `cargo test` covers the unit and cassette tests, and you need both to see all of
 `mcp_integration.rs`. CI runs JDK 11/17/21 and has caught version-locked tests that passed on one JDK

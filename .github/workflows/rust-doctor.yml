@@ -125,11 +125,24 @@ jobs:
           PY
           cat "$GITHUB_STEP_SUMMARY"
 
+      # The raw SARIF is not uploadable as-is, and the security tab is where that went unnoticed: it had
+      # accumulated 115 open alerts against a green gate, every one of them pointing at a path that is not
+      # in this tree (`src/handlers.rs` — rust-doctor writes crate-relative URIs under a `%SRCROOT%` base
+      # id it never declares, and this is a workspace) and none of them at a level that fails anything.
+      # The script resolves the paths and publishes only what the gate acts on; its stdout accounts for
+      # every result it withheld, so a quiet tab is not the same as an unexamined one.
+      - name: Prepare the SARIF for code scanning
+        if: always()
+        shell: bash
+        run: |
+          scripts/sarif-for-code-scanning.py rust-doctor.sarif rust-doctor-published.sarif \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Upload SARIF to code scanning
         if: always()
         uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: rust-doctor.sarif
+          sarif_file: rust-doctor-published.sarif
           category: rust-doctor
 
       - name: Upload SARIF as an artifact
