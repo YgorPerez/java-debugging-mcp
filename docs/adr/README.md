@@ -26,6 +26,7 @@ these lazily, when decisions actually get resolved; that point arrived.
 | [0015](0015-a-second-tool-not-a-flag-that-changes-the-subject.md) | A field listing is a second tool, because a flag may not change what the question was |
 | [0016](0016-a-class-root-is-not-a-source-root-and-a-pop-is-not-a-flag.md) | Compiled output gets its own `class_roots`, and `pop_frame` is its own tool rather than a flag on a reload |
 | [0017](0017-an-exception-message-is-read-as-a-field-except-the-one-the-jvm-never-stores.md) | An exception's message is read as a field, with one narrowly-gated invocation for the helpful NPE the JVM never stores |
+| [0018](0018-the-socket-read-half-is-owned-by-its-own-task.md) | The socket's read half is owned by its own task, because `select!` cancels `read_exact` and JDWP cannot resynchronise |
 
 The downstream consumer's contract is [`docs/toolkit-contract.md`](../toolkit-contract.md) — what shipping
 a change here costs the toolkit that packages it.

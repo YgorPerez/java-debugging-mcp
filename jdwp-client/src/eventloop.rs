@@ -133,9 +133,54 @@ struct PendingReply {
     sent_at: tokio::time::Instant,
 }
 
+/// How many whole packets the reader may run ahead of the loop (TEST-24, #65).
+///
+/// Small on purpose. Its job is to move the *read* out of `select!`, not to buffer traffic, and a packet
+/// may be up to `MAX_PACKET_SIZE` — so a generous channel is a generous memory bound for nothing. When it
+/// fills, the reader waits, which is the same serialisation the single-task version had and is not a
+/// deadlock: the loop returns to `select!` after every branch and keeps draining.
+const PACKET_CHANNEL_DEPTH: usize = 8;
+
+/// Own the socket's read half in a task of its own, forwarding whole packets over a channel.
+///
+/// **This exists because `read_exact` is not cancel safe, and the event loop is a `select!`.** tokio
+/// documents it: *"if the method is used as a branch in `tokio::select!` and another branch completes
+/// first, then some data may already have been read into buf"* — and that data is then gone. Reading a
+/// packet takes two `read_exact` calls, so any command sent, or any cleanup tick, while a packet was
+/// partly read **discarded the bytes already consumed**. JDWP has no frame delimiter, so the stream never
+/// recovers: the next read starts mid-payload and interprets whatever it finds as a header.
+///
+/// That is the whole of TEST-24 (#65). Its fingerprint was a length field of `1701737519`, which is the
+/// ASCII text `ent/` — a fragment of a package name, read from inside a class signature in the middle of
+/// an `AllClasses` reply. Those replies are the biggest this client ever receives, which is why
+/// `list_classes` is where it kept surfacing, and why it needed a busy session to reproduce: the payload
+/// read spans many polls, so the cancellation window is at its widest exactly there.
+///
+/// A dedicated task cannot be cancelled by another branch, and `Receiver::recv` — which replaces it in the
+/// `select!` — **is** cancel safe.
+fn spawn_packet_reader(mut reader: OwnedReadHalf) -> mpsc::Receiver<JdwpResult<(bool, u32, Vec<u8>)>> {
+    let (tx, rx) = mpsc::channel(PACKET_CHANNEL_DEPTH);
+    tokio::spawn(async move {
+        loop {
+            let result = read_packet(&mut reader).await;
+            let fatal = result.is_err();
+            // A closed channel means the loop is gone; there is nobody to read for.
+            if tx.send(result).await.is_err() {
+                break;
+            }
+            // One error ends the stream: alignment is lost or the socket is dead, and reading on would
+            // manufacture more garbage from the same broken stream.
+            if fatal {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 /// Main event loop task
 async fn event_loop_task(
-    mut reader: OwnedReadHalf,
+    reader: OwnedReadHalf,
     mut writer: OwnedWriteHalf,
     mut command_rx: mpsc::Receiver<CommandRequest>,
     event_tx: mpsc::Sender<EventSet>,
@@ -145,6 +190,8 @@ async fn event_loop_task(
 
     let mut pending_replies: HashMap<u32, PendingReply> = HashMap::new();
     let mut cleanup_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+    // Reading happens in its own task so `select!` can never cancel it mid-packet (#65).
+    let mut packets = spawn_packet_reader(reader);
 
     let cause = loop {
         tokio::select! {
@@ -158,10 +205,17 @@ async fn event_loop_task(
                 cleanup_pending_replies(&mut pending_replies);
             }
 
-            // Handle incoming packets
-            result = read_packet(&mut reader) => {
-                if let Some(cause) = handle_incoming_packet(&mut pending_replies, &event_tx, result) {
-                    break cause;
+            // Handle incoming packets. `recv()` is cancel safe, which is the point of the reader task.
+            received = packets.recv() => {
+                match received {
+                    Some(result) => {
+                        if let Some(cause) = handle_incoming_packet(&mut pending_replies, &event_tx, result) {
+                            break cause;
+                        }
+                    }
+                    // The reader task ended without sending a final error, which it is written not to do.
+                    // Reported as the anomaly it would be rather than as a plausible-looking default.
+                    None => break "the packet reader stopped without reporting a reason".to_string(),
                 }
             }
         }
@@ -332,6 +386,66 @@ fn handle_event_packet(event_tx: &mpsc::Sender<EventSet>, data: &[u8]) -> Option
     }
 }
 
+/// How many bytes of a non-JDWP stream to quote in the error (TEST-24, #65).
+///
+/// Four bytes cannot identify a speaker — `ent/` is a fragment of a package name, an HTTP header and a
+/// filesystem path alike — and the first sighting of this failure spent an entire investigation on exactly
+/// that ambiguity. Sixty-four is enough for an HTTP request line, a TLS `ClientHello` record header, or a
+/// recognisable run of a Java class signature, and still short enough to read in one line of log.
+const FOREIGN_BYTES_QUOTED: usize = 64;
+
+/// How long to spend collecting those bytes.
+///
+/// Deliberately short and deliberately best-effort. The connection is already unusable, so this is buying
+/// evidence, not function — and a peer that sent four bytes and stopped must not turn a clear error into a
+/// hang. Whatever has arrived by the deadline is what gets quoted, and the reply says how much that was.
+const FOREIGN_BYTES_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Build the payload for [`JdwpError::NotJdwpFramed`]: what was wrong, and what was actually on the wire.
+///
+/// Reads a little further on purpose. The stream is finished either way — nothing downstream can resynchronise
+/// a JDWP connection once alignment is lost — so the only remaining value in the socket is the identity of
+/// whatever is talking, and that is worth 250ms to capture.
+async fn describe_foreign_bytes(reader: &mut OwnedReadHalf, header: &[u8], why: &str) -> String {
+    let mut seen = header.to_vec();
+    // Plain `read` rather than `read_exact`, and `read` is also the cancel-safe one — a short stream is
+    // the expected case here, not an error. Appending straight onto `seen` keeps every slice in bounds.
+    while seen.len() < FOREIGN_BYTES_QUOTED {
+        let mut chunk = [0u8; 32];
+        let want = (FOREIGN_BYTES_QUOTED - seen.len()).min(chunk.len());
+        let Some(into) = chunk.get_mut(..want) else { break };
+        match tokio::time::timeout(FOREIGN_BYTES_DEADLINE, reader.read(into)).await {
+            // Nothing more is coming, or nothing more arrived in time: quote what we have.
+            Ok(Ok(0) | Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => seen.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+        }
+    }
+
+    let hex = seen.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+    let text: String =
+        seen.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
+
+    // The decoded length field, when it is printable — the detail that turns "1701737519 bytes" into
+    // "the four bytes are the text `ent/`", which is what says foreign traffic rather than a huge reply.
+    let len_bytes = header.get(..4).unwrap_or_default();
+    let as_text = if len_bytes.iter().all(|&b| (0x20..0x7f).contains(&b)) {
+        format!(
+            " The length field's four bytes are the printable text {:?}, so this is text, not a size.",
+            String::from_utf8_lossy(len_bytes)
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "{why}.{as_text} {} byte(s) read at the header position: hex [{hex}] text \"{text}\". \
+         The connection cannot be resynchronised — JDWP has no frame delimiter to seek to — so the session \
+         ends here. If the text names a protocol or a path, something other than this JVM's JDWP agent is \
+         on that socket.",
+        seen.len()
+    )
+}
+
 /// Read a packet from the socket and determine if it's a reply or event
 async fn read_packet(reader: &mut OwnedReadHalf) -> JdwpResult<(bool, u32, Vec<u8>)> {
     // Read header into a fixed-size buffer (constant-index access, no bounds risk).
@@ -344,14 +458,23 @@ async fn read_packet(reader: &mut OwnedReadHalf) -> JdwpResult<(bool, u32, Vec<u
     let packet_id = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
     let flags = header[8];
 
-    if length < HEADER_SIZE {
-        return Err(JdwpError::Protocol(format!("Invalid packet length: {length}")));
-    }
-
-    if length > MAX_PACKET_SIZE {
-        return Err(JdwpError::Protocol(format!(
-            "Packet too large: {length} bytes (max: {MAX_PACKET_SIZE} bytes)"
-        )));
+    // Validate the header on three INDEPENDENT grounds before trusting `length` (TEST-24, #65).
+    //
+    // The flags check is the one that was missing, and it is the cheapest of the three: JDWP defines
+    // exactly two values, `0` for a command and `0x80` for a reply. Any other byte means this is not a
+    // header, and it catches foreign traffic whose length field happens to land inside the 11..10MiB
+    // window — which the size checks alone never would.
+    let flags_are_jdwp = flags == 0 || flags == REPLY_FLAG;
+    let length_is_sane = (HEADER_SIZE..=MAX_PACKET_SIZE).contains(&length);
+    if !flags_are_jdwp || !length_is_sane {
+        let why = if !flags_are_jdwp {
+            format!("flags byte is {flags:#04x}, and JDWP defines only 0x00 (command) and 0x80 (reply)")
+        } else if length < HEADER_SIZE {
+            format!("length field is {length}, below the {HEADER_SIZE}-byte header it must include")
+        } else {
+            format!("length field is {length}, above the {MAX_PACKET_SIZE}-byte cap")
+        };
+        return Err(JdwpError::NotJdwpFramed(describe_foreign_bytes(reader, &header, &why).await));
     }
 
     // Read rest of packet
@@ -442,6 +565,175 @@ mod tests {
             cause.contains("reading from the debuggee failed"),
             "the cause must name what happened to the connection, not just that it ended: {cause}"
         );
+    }
+
+    /// A peer that sends `bytes` and then stays connected — foreign traffic on a JDWP socket.
+    ///
+    /// Stays connected on purpose: hanging up would make EOF the explanation and hide the framing failure
+    /// behind a plausible one, which is the substitution this whole class of bug keeps making.
+    async fn garbage_peer(bytes: &'static [u8]) -> EventLoopHandle {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a loopback port");
+        let addr = listener.local_addr().expect("read back the bound address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept the event loop's connection");
+            let _ = socket.write_all(bytes).await;
+            let _ = socket.flush().await;
+            // Hold the socket open so the failure cannot be read as a hang-up.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect to the peer");
+        let (reader, writer) = stream.into_split();
+        spawn_event_loop(reader, writer)
+    }
+
+    /// TEST-24 (#65): the exact CI fingerprint — a length field that is really ASCII text — must be
+    /// reported as text on the wire, not as an enormous packet.
+    ///
+    /// The bytes are the ones the release gate actually produced: `0x656e742f`, announced at the time as
+    /// `Packet too large: 1701737519 bytes`. That sentence sent the reader looking for a 1.7GB reply. The
+    /// four bytes are `ent/` — a fragment of a package name, an HTTP path, or a header — and *that* is the
+    /// fact worth printing.
+    #[tokio::test]
+    async fn a_length_field_that_is_really_text_says_so_instead_of_claiming_a_huge_packet() {
+        let handle = garbage_peer(b"ent/management/RuntimeMXBean;junk padding to fill the quote").await;
+        let err = handle
+            .send_command(CommandPacket::new(1, 1, 1))
+            .await
+            .expect_err("a stream that is not JDWP-framed cannot answer a command");
+        let JdwpError::ConnectionClosed(cause) = &err else {
+            panic!("expected ConnectionClosed carrying the reason, got {err:?}");
+        };
+        assert!(
+            cause.contains("not JDWP-framed"),
+            "the failure must name the framing, which is what is actually wrong: {cause}"
+        );
+        assert!(
+            cause.contains("printable text") && cause.contains("ent/"),
+            "the decoded length field is the whole insight — 1701737519 tells nobody anything: {cause}"
+        );
+        assert!(
+            !cause.contains("Packet too large"),
+            "reporting this as a large packet is the misdiagnosis being fixed: {cause}"
+        );
+        // The bytes themselves, so the *speaker* can be identified rather than guessed at.
+        assert!(cause.contains("hex ["), "the raw bytes must be quoted: {cause}");
+        assert!(
+            cause.contains("management/"),
+            "quoting only 4 bytes is what made the first sighting ambiguous; the run has to be long \
+             enough to recognise: {cause}"
+        );
+    }
+
+    /// TEST-24 (#65): the check that did not exist — a flags byte JDWP never uses.
+    ///
+    /// This is the case the two size checks can never catch: a length field that lands inside
+    /// `11..=10MiB` looks perfectly plausible, so foreign traffic passes both and is then parsed as a
+    /// packet. JDWP defines exactly two flag values, which makes this the cheapest possible detector.
+    #[tokio::test]
+    async fn a_flags_byte_jdwp_never_uses_is_caught_even_when_the_length_looks_plausible() {
+        // length = 32 (plausible), id = 1, flags = 'A' — neither 0x00 nor 0x80.
+        let bytes: &'static [u8] = b"\x00\x00\x00\x20\x00\x00\x00\x01AGET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let handle = garbage_peer(bytes).await;
+        let err = handle
+            .send_command(CommandPacket::new(1, 1, 1))
+            .await
+            .expect_err("a stream whose flags byte is not JDWP cannot answer a command");
+        let JdwpError::ConnectionClosed(cause) = &err else {
+            panic!("expected ConnectionClosed carrying the reason, got {err:?}");
+        };
+        assert!(
+            cause.contains("flags byte is 0x41"),
+            "the flags value is the finding here, and it must be named: {cause}"
+        );
+        assert!(
+            cause.contains("0x00 (command)") && cause.contains("0x80 (reply)"),
+            "say what JDWP does allow, so the reader can tell foreign traffic from a version skew: {cause}"
+        );
+    }
+
+    // Probe: same peer, but give the loop time to read BEFORE any command is sent.
+    /// A peer that answers one command with a reply delivered in **two chunks**, so the payload read is
+    /// provably in flight during the gap.
+    ///
+    /// The gap is the experiment: it is when a second command gets sent, and under the old single-task
+    /// `select!` that command cancelled the half-finished `read_exact` and threw away everything already
+    /// consumed.
+    async fn chunked_reply_peer(payload: Vec<u8>) -> (EventLoopHandle, oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a loopback port");
+        let addr = listener.local_addr().expect("read back the bound address");
+        let (finish, finish_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept the event loop's connection");
+            let mut cmd = [0u8; HEADER_SIZE];
+            socket.read_exact(&mut cmd).await.expect("read the first command's header");
+            let id = u32::from_be_bytes([cmd[4], cmd[5], cmd[6], cmd[7]]);
+
+            // Reply header + error code, then only the first byte of the payload.
+            // The 2-byte error code lives INSIDE JDWP's 11-byte header, so it must not be counted twice.
+            let total = u32::try_from(HEADER_SIZE + payload.len()).expect("reply fits in u32");
+            let mut head = Vec::new();
+            head.extend_from_slice(&total.to_be_bytes());
+            head.extend_from_slice(&id.to_be_bytes());
+            head.push(REPLY_FLAG);
+            head.extend_from_slice(&0u16.to_be_bytes());
+            head.extend_from_slice(&payload[..1]);
+            socket.write_all(&head).await.expect("write the first chunk");
+            socket.flush().await.expect("flush the first chunk");
+
+            // Hold the rest back until the test has sent the second command.
+            let _ = finish_rx.await;
+            socket.write_all(&payload[1..]).await.expect("write the second chunk");
+            socket.flush().await.expect("flush the second chunk");
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect to the peer");
+        let (reader, writer) = stream.into_split();
+        (spawn_event_loop(reader, writer), finish)
+    }
+
+    /// TEST-24 (#65), the root cause: a command sent while a packet is half-read must not eat the bytes
+    /// already consumed.
+    ///
+    /// `read_exact` is **not cancel safe** — tokio says so — and `read_packet` calls it twice. While it was
+    /// a `select!` branch, any command or cleanup tick arriving mid-packet dropped the future and discarded
+    /// everything it had read. JDWP has no frame delimiter, so the stream never realigns: the next read
+    /// starts inside the old payload and reads whatever it finds there as a header. That is where #65's
+    /// `1701737519` came from — ASCII `ent/`, a fragment of a package name inside an `AllClasses` reply,
+    /// which is both the largest reply this client receives and the one that kept failing.
+    ///
+    /// The payload is padded well past one read so the cancellation window is real rather than notional.
+    #[tokio::test]
+    async fn a_command_sent_mid_packet_does_not_desynchronise_the_stream() {
+        let payload: Vec<u8> = (0..8192u32).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+        let (handle, finish) = chunked_reply_peer(payload.clone()).await;
+
+        let first = tokio::spawn({
+            let h = handle.clone();
+            async move { h.send_command(CommandPacket::new(1, 1, 1)).await }
+        });
+
+        // Let the first command go out and its reply start arriving, so the read is genuinely in flight.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // THE cancellation trigger. Under the old code this dropped the in-flight `read_exact`.
+        let second = tokio::spawn({
+            let h = handle.clone();
+            async move { h.send_command(CommandPacket::new(2, 1, 1)).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        finish.send(()).expect("the peer should still be waiting to send the rest");
+
+        let reply = first
+            .await
+            .expect("the first command's task should not panic")
+            .expect("the first reply must arrive intact — a cancelled read would have desynchronised here");
+        assert_eq!(
+            reply.data(),
+            &payload[..],
+            "the reply payload must be byte-identical; a short or shifted payload is the desync this test exists for"
+        );
+
+        second.abort();
     }
 
     /// The second half: the reason has to outlive the loop that discovered it.

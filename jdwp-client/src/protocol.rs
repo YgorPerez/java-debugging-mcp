@@ -35,6 +35,22 @@ pub enum JdwpError {
     #[error("connection to the debuggee closed: {0}")]
     ConnectionClosed(String),
 
+    /// The bytes where a JDWP packet header should be are not a JDWP packet header (TEST-24, #65).
+    ///
+    /// **Its own variant because the remedy is different from every other protocol failure.** A
+    /// [`Protocol`](Self::Protocol) error means we mis-read something the debuggee legitimately sent; this
+    /// means the stream itself is not ours to parse — a peer that is not a JDWP agent, a socket carrying
+    /// someone else's traffic, or a stream that has lost packet alignment. Nothing in the *command* is
+    /// wrong, so retrying the command is pointless, and the session cannot be salvaged by reading on.
+    ///
+    /// It exists because the honest version of this was being reported as its own opposite. A header whose
+    /// length field reads `1701737519` was announced as `Packet too large: 1701737519 bytes` — a sentence
+    /// that sends the reader looking for an enormous reply, when those four bytes are the ASCII text
+    /// `ent/` and no large packet was ever involved. The payload carries the bytes so the *speaker* can be
+    /// identified rather than guessed at.
+    #[error("the debuggee's stream is not JDWP-framed at this point: {0}")]
+    NotJdwpFramed(String),
+
     /// A command was sent, the connection stayed up, and no reply arrived within the budget.
     ///
     /// Distinct from [`ConnectionClosed`](Self::ConnectionClosed) because the remedy differs: the socket
