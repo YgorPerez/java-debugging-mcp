@@ -1786,7 +1786,8 @@ fn a_production_shaped_dump_costs_a_bounded_number_of_packets_per_thread() {
     );
     let (read, total) = dump_thread_counts(&deep).expect("no thread count in the dump header");
     assert!(read >= 300, "expected the whole pool, got {read}/{total}:\n{}", head_of(&deep));
-    let packets = dump_packet_cost(&deep).expect("no packet cost in the dump");
+    let packets = dump_packet_cost(&deep)
+        .unwrap_or_else(|| panic!("no packet cost in the dump — the reply was:\n{}", head_of(&deep)));
     let per_thread = packets / read;
     assert!(
         per_thread <= 20,
@@ -1801,7 +1802,9 @@ fn a_production_shaped_dump_costs_a_bounded_number_of_packets_per_thread() {
         "debug.thread_dump",
         serde_json::json!({"suspend": true, "limit": 400, "monitors_only": true, "max_suspend_ms": 120_000}),
     );
-    let m_packets = dump_packet_cost(&monitors).expect("no packet cost in the monitors-only dump");
+    let m_packets = dump_packet_cost(&monitors).unwrap_or_else(|| {
+        panic!("no packet cost in the monitors-only dump — the reply was:\n{}", head_of(&monitors))
+    });
     let (m_read, _) = dump_thread_counts(&monitors).expect("no thread count");
     assert!(
         m_packets / m_read <= 6,
@@ -1856,7 +1859,8 @@ fn a_heterogeneous_pool_pays_only_for_its_distinct_frames() {
     );
     let (read, total) = dump_thread_counts(&deep).expect("no thread count in the dump header");
     assert!(read >= 300, "expected the whole pool, got {read}/{total}:\n{}", head_of(&deep));
-    let packets = dump_packet_cost(&deep).expect("no packet cost in the dump");
+    let packets = dump_packet_cost(&deep)
+        .unwrap_or_else(|| panic!("no packet cost in the dump — the reply was:\n{}", head_of(&deep)));
 
     // The same per-thread bound the uniform pool has to meet. Heterogeneity must not quietly restore the
     // per-frame-per-thread cost the cache exists to remove.
@@ -1983,11 +1987,17 @@ fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
     let mut sample = |delay: std::time::Duration| -> (u64, f64) {
         relay.set_rtt(delay);
         let dump = server.call("debug.thread_dump", workload.clone());
-        let packets = dump_packet_cost(&dump).expect("no packet cost");
+        let packets = dump_packet_cost(&dump).unwrap_or_else(|| {
+            // TEST-25 (#71): a missing cost line and a reply that is not a dump at all produce the same
+            // words, and the second is what a contended runner actually yields. Print the reply.
+            panic!("no packet cost — the reply was:\n{}", head_of(&dump))
+        });
         // The figure the dump reports about ITSELF, which is what a caller on a real instance reads
         // instead of doing this arithmetic (TEST-8). Asserting on the reported number rather than a
         // recomputed one is the point: it is the reading #24 wanted from the 8180.
-        let reported = dump_per_packet_ms(&dump).expect("the dump must report its own per-packet cost");
+        let reported = dump_per_packet_ms(&dump).unwrap_or_else(|| {
+            panic!("the dump must report its own per-packet cost — the reply was:\n{}", head_of(&dump))
+        });
         (packets, reported)
     };
 
