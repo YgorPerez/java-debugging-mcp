@@ -78,6 +78,18 @@ See `docs/agents/triage-labels.md`.
 
 Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
+## Releasing
+
+**Use `/release [X.Y.Z]`** (`.claude/commands/release.md`). `scripts/release.sh` is the half that bumps,
+gates, commits and tags — deliberately stopping before the push — and the command is everything around it:
+which bump, the release body (which *is* the release notes, so the toolkit can read it), the tag push, the
+downstream pin and skill audit, and the issue closes.
+
+It leads with the four traps that have actually cost time, so read them rather than rediscovering them. The
+worst is that a non-interactive `release.sh` writes only the commit **subject**, and repairing that means
+**re-tagging** — an annotated tag names one commit, and amending leaves the tag pointing at an object no
+longer on the branch.
+
 ## Downstream consumer
 
 `infotravel-dev-toolkit` installs this server from a **pinned release** and documents its tools in Claude
