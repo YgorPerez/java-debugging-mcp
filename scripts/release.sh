@@ -142,16 +142,24 @@ if [ -z "$by_rule" ]; then
   fi
   echo "    doctor: clean"
 else
-  # Everything except the known baseline. `unsafe-dependency ×NN` is removed by name; whatever is left is
-  # a rule nobody has signed off on.
+  # Everything except `unsafe-dependency`, which is removed by name; whatever is left is a rule nobody has
+  # signed off on. Not "the baseline" — there is no baseline any more (see above), and the messages below
+  # must not send anyone looking for a documented count that no longer exists.
   beyond="$(printf '%s' "$by_rule" |
     sed -E 's/^\s*by rule:\s*//; s/unsafe-dependency[^,]*,?\s*//g; s/,\s*$//')"
   if [ -n "$beyond" ]; then
     printf '%s\n' "$doctor_out" | grep -E '^- \*\*(warning|error)\*\*' | grep -v 'unsafe-dependency' || true
-    die "doctor found $beyond — beyond the documented baseline, so it is yours and it will fail CI.
-       Fix it, or say why it is acceptable, before cutting a release."
+    die "doctor found $beyond — a clean tree prints 'would pass', so every one of those is yours and it
+       will fail CI. Fix it, or say why it is acceptable, before cutting a release."
   fi
-  echo "    doctor: ${by_rule#*by rule: } — the documented baseline only, nothing new"
+  # Reached only when `unsafe-dependency` was the *only* thing found, which on a correctly configured tree
+  # does not happen at all: `rust-doctor.toml` ignores the rule. So this says what it actually means — the
+  # gate is not blocked, and the findings are a local configuration quirk rather than anything this release
+  # introduced. The old wording called them "the documented baseline", which was a pointer to a count this
+  # repo deleted.
+  echo "    doctor: ${by_rule#*by rule: } — all of it third-party \`unsafe-dependency\`, which
+    \`rust-doctor.toml\` ignores and CI never runs, so none of it is yours. Seeing it here means
+    cargo-geiger is installed on this machine and the ignore is not matching."
 fi
 
 # The JVM tests are NOT run here and the script says so rather than implying a full verification. They
