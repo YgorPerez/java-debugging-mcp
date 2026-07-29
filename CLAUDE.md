@@ -24,6 +24,37 @@ which of `JAVA_HOME` / `PATH` / the snap JBR it came from — read it, and quote
 intent when you report a result. Setting `JAVA_HOME` is a *request*: if it is not a usable JDK the run
 now fails instead of quietly testing another one, which it used to do (TEST-18, #52).
 
+**Getting the JDKs CI has.** "More than one" was aspirational for a while because this workspace had only
+JDK 11 and a snap JBR, so every result ended in "17 and 21 are CI's to confirm" — which is a slow way to
+learn that a test is version-locked. Adoptium tarballs need no root and no package manager:
+
+```bash
+mkdir -p ~/.jdks && cd ~/.jdks
+for v in 17 21; do
+  curl -fsSL "https://api.adoptium.net/v3/binary/latest/$v/ga/linux/x64/jdk/hotspot/normal/eclipse" \
+    | tar xz
+done
+JAVA_HOME=~/.jdks/jdk-17.0.20+8 scripts/integration-test.sh   # and quote the `JDK in use:` line
+```
+
+**A single test on an idle 16-core box is a *gentler* environment than CI, not a harsher one.** Worth
+saying because two separate flake investigations here got it backwards and spent thousands of cycles
+proving very little. CI runs all ~89 `#[ignore]`d tests at once on a 4-vCPU runner, so the contention that
+produces these failures comes from dozens of probe JVMs competing, not from CPU scarcity alone. To
+reproduce that, pin the whole suite instead of adding load:
+
+```bash
+taskset -c 0-3 cargo test --test mcp_integration -- --ignored --nocapture
+```
+
+Pass **no** `--test-threads`: libtest derives it from `available_parallelism()`, which honours CPU affinity
+on Linux, so four cores make it choose four the way CI does. And prefer this to CPU hogs — a hog-based arm
+leaked 32 processes twice, because `trap … EXIT` does not fire on SIGKILL.
+
+**Run a soak against a copied binary, never the working tree.** `cp $(cargo test --no-run …) /tmp/arm.bin`
+first. An arm that rebuilds while you edit reports *your compile errors* as failures: that produced a
+confident "8 failures in 40" that were nothing of the kind.
+
 ## Agent skills
 
 ### Issue tracker

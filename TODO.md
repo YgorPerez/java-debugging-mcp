@@ -1022,6 +1022,22 @@ nothing enabled and then discarded. Chasing a rate is expensive and often fails 
 nothing. Making the failure name its own cause is cheap, always works, and is what closed #57 and what
 `e0db036` did for #65. **Prefer it to a soak.**
 
+**The arms were measuring the wrong thing, and that is the most reusable finding here.** Every sighting in
+this family happened during a full ~89-test suite on a **4-vCPU** runner, where dozens of probe JVMs
+compete. Every investigation reached instead for *one test at a time on 16 idle cores* — which is a
+**gentler** environment than CI, not a harsher one — and then read the clean result as evidence. #45 spent
+3,573 cycles that way and #64 another 205 across JDK 17 and 21, all of it proving less than it appeared to.
+The CPU-hog escalation was the same error wearing a costume: it starved cores without reproducing the
+*shape* of CI's contention, and leaked 32 processes twice while doing it, because `trap … EXIT` does not
+fire on SIGKILL.
+
+Pin the suite instead of loading the box: `taskset -c 0-3 cargo test --test mcp_integration -- --ignored`,
+with **no** `--test-threads` — libtest derives it from `available_parallelism()`, which honours CPU affinity,
+so four cores make it choose four the way CI does. And run soaks against a *copied* binary
+(`cp $(cargo test --no-run …) /tmp/arm.bin`): an arm that rebuilds from a tree you are editing reports your
+own compile errors as failures, which is exactly how one produced a confident "8 failures in 40" that were
+nothing of the kind. `CLAUDE.md` carries both, plus how to install the JDKs CI has.
+
 **Where the sightings now come from.** Two of the seven were found by reading CI's own history rather than
 by running an arm locally, and that is the cheapest instrument available: the matrix runs three JDK legs per
 push, so ~3 integration legs accumulate per commit at no cost, on hardware and under parallelism no
