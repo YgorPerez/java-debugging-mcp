@@ -498,6 +498,84 @@ fn a_wildcard_family_arms_every_match_grows_with_class_loading_and_clears_as_one
     server.panic_reset();
 }
 
+/// FILT-5: a family that is FULL must stop watching for classes it cannot arm, and start again when a slot
+/// frees.
+///
+/// The cost this proves is gone cannot be observed from outside — a `CLASS_PREPARE` event, a suspension of the
+/// loading thread and a resume, on every class load — so the test asserts on the two places the state is
+/// reported and then on the BEHAVIOUR that state implies: after unparking, a class loading later is armed
+/// again. That last step is what separates a real fix from a listing that merely claims one, and it is why
+/// this uses `FamilyGamma`, which loads only on a cue, long after the arming reply was written.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_full_family_parks_its_class_load_watch_and_takes_it_back_when_a_member_is_cleared() {
+    let Some(jdk) =
+        jdk_or_skip("a_full_family_parks_its_class_load_watch_and_takes_it_back_when_a_member_is_cleared")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "FamilyProbe").expect("launch FamilyProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("ready")).expect("probe never printed ready");
+
+    // `max_classes: 1` against a pattern with two loaded targets: the family fills up as it arms, so it is
+    // full before the reply is even written.
+    let set = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "Family*", "method": "handle", "trace": true, "max_classes": 1}),
+    );
+    assert_contains_all(
+        "a family that filled up says it armed one, refused the rest, and is NOT watching for more",
+        &set,
+        &["bpset_", "max_classes: 1", "NOT watching for classes that load later"],
+    );
+    let bpset = find_id(&set, "bpset_").unwrap_or_else(|| panic!("no bpset_ id in the reply: {set}"));
+    let member = find_id(&set, "bp_").unwrap_or_else(|| panic!("no member bp_ id in the reply: {set}"));
+
+    // The listing has to distinguish "parked because full" from the two other ways a family can be not
+    // watching — a caller reading "not watching" alone cannot tell whether clearing a member would help.
+    assert_contains_all(
+        "the listing says the watch is parked, not that it failed or that the family is off",
+        &server.call("debug.list_stop_points", serde_json::json!({})),
+        &[&bpset, "FULL at max_classes: 1", "watch is parked"],
+    );
+
+    // Clearing the member frees the slot, so the family can grow again and must therefore be listening
+    // again — and the reply says so, because it changes what happens to the next class the JVM loads.
+    let cleared = server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": member}));
+    assert_contains_all(
+        "clearing a member reports that the family it belonged to is watching again",
+        &cleared,
+        &["freed a slot", &bpset, "watching again"],
+    );
+
+    // The proof: a class that loads NOW is armed, which only an unparked watch can do.
+    probe.send_line("load").expect("cue the probe to load FamilyGamma");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("gamma loaded"))
+        .expect("probe never loaded FamilyGamma");
+    let late = server.wait_for_traces("FamilyGamma", EVENT_TIMEOUT).unwrap_or_else(|| {
+        panic!(
+            "the family never armed FamilyGamma, so its watch did not come back when the slot freed — a \
+             parked watch that never unparks is worse than one that was never parked.\n  probe output: \
+             {:?}\n  stop points: {}",
+            probe.output(),
+            server.call("debug.list_stop_points", serde_json::json!({}))
+        )
+    });
+    assert!(late.contains("FamilyGamma"), "traces: {late}");
+
+    // And arming it filled the family again, so the watch is parked again — the cycle, not a one-off.
+    assert_contains_all(
+        "a family that fills up a second time parks its watch a second time",
+        &server.call("debug.list_stop_points", serde_json::json!({})),
+        &["FULL at max_classes: 1", "watch is parked"],
+    );
+
+    server.panic_reset();
+}
+
 /// FILT-3/FILT-4 on the other three arming tools: a list and a wildcard must work there too, and each kind
 /// must report the thing that is specific to it.
 ///

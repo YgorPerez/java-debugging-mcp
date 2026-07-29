@@ -728,14 +728,14 @@ pub struct PatternStopSet {
     pub id: String,
     /// The dotted wildcard pattern as the caller wrote it (`com.example.*`).
     pub class_pattern: String,
-    /// The `CLASS_PREPARE` request that arms classes loading from now on; `None` while disabled.
+    /// The watch that arms classes loading from now on, and why it is not running when it isn't.
     ///
     /// The same primitive a deferred breakpoint uses, with one difference that matters: a deferred
-    /// breakpoint clears its watch the moment its one class loads, and this one never does. A wildcard is
-    /// *permanently* deferred — every future matching class is new work — so the watch is the family's,
-    /// not one breakpoint's, and disabling the family has to clear it or the family would keep growing
-    /// while reporting itself silenced.
-    pub class_prepare_request_id: Option<i32>,
+    /// breakpoint clears its watch the moment its one class loads, and this one keeps it for as long as it
+    /// can still use it. Every future matching class is new work, so the watch is the family's, not one
+    /// breakpoint's, and disabling the family has to clear it or the family would keep growing while
+    /// reporting itself silenced.
+    pub watch: ClassLoadWatch,
     pub enabled: bool,
     /// `bp_` ids this family has armed, in arming order.
     pub members: Vec<String>,
@@ -816,6 +816,49 @@ impl LaunchedJvm {
             return Vec::new();
         };
         buf.iter().skip(buf.len().saturating_sub(n)).cloned().collect()
+    }
+}
+
+/// A wildcard family's **class-load watch**, and why it is not running when it isn't (FILT-5).
+///
+/// This was an `Option<i32>` — a request id or nothing — until "nothing" turned out to mean three
+/// different things that a caller has to be able to tell apart, and that the code has to act on
+/// differently. The one that made it an enum is [`Parked`](Self::Parked): a family at `max_classes` used to
+/// keep its watch, so every class the JVM loaded still cost an event, a suspension of the loading thread
+/// and a resume — to be told there is no room. `max_classes` bounded what a wildcard may *arm* and left
+/// what it *costs* unbounded, which made a full family read as "done paying" when it meant "paying the same
+/// and buying nothing".
+///
+/// The three not-watching states are not interchangeable in the listing either: a parked watch comes back on
+/// its own the moment a slot frees, a disabled one comes back when the caller re-arms the family, and a
+/// failed one never comes back at all. Rendering them the same way would tell a caller their family will grow
+/// when it won't, or that it is broken when it is merely full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassLoadWatch {
+    /// Registered under this JDWP request id: matching classes that load from now on are armed.
+    Watching(i32),
+    /// Deliberately not registered, because the family is FULL at `max_classes` and a watch could only
+    /// cost. The family keeps its definition and starts watching again the moment a member is cleared.
+    Parked,
+    /// Cleared because the family is disabled (BP-1). Re-arming re-registers it — unless it is still full.
+    Disabled,
+    /// The JVM refused to register it, so this family will never grow. Its members are unaffected, which
+    /// is why this does not fail the arming call.
+    Failed,
+}
+
+impl ClassLoadWatch {
+    /// The live JDWP request id, when there is one to clear.
+    pub const fn request_id(&self) -> Option<i32> {
+        match self {
+            Self::Watching(req) => Some(*req),
+            Self::Parked | Self::Disabled | Self::Failed => None,
+        }
+    }
+
+    /// Is this family currently being told about classes as they load?
+    pub const fn is_watching(&self) -> bool {
+        matches!(self, Self::Watching(_))
     }
 }
 

@@ -306,6 +306,18 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   reply. Validated by `a_wildcard_family_arms_every_match_grows_with_class_loading_and_clears_as_one`, which
   proves all three promises against a live JVM: two loaded classes armed from one call, a third armed only
   because the watch caught its load, and the whole family dropped by its `bpset_` id.
+- **A full family stops paying for its watch (FILT-5/#77)** — `max_classes` bounded what a wildcard *arms*
+  and left what it *costs* unbounded: a family at its cap kept its `CLASS_PREPARE` request, so every class
+  the JVM loaded still bought an event, an `EventThread` suspension of the loading thread and a resume, only
+  to be told there is no room — and worse for a pattern JDWP cannot express, where the watch is widened to
+  `*` and every load reaches us. A full family now **parks** its watch and takes it back the moment a
+  cleared member frees a slot, so the cap bounds the cost as well as the count. `Option<i32>` became a
+  four-state `ClassLoadWatch`, because "not watching" turned out to mean parked (comes back by itself),
+  disabled (comes back when you re-arm the family) or refused-by-the-JVM (never comes back), and
+  `list_stop_points` has to answer "will this catch the class my next deployment generates?" differently for
+  each. Found by a domain-modeling pass rather than by hitting it, and proven by
+  `a_full_family_parks_its_class_load_watch_and_takes_it_back_when_a_member_is_cleared`, whose last step is
+  the one that matters: after unparking, a class loading later is armed again.
 - **Launch mode (LAUNCH-1/#76)** — `debug.launch` starts a JVM under the debugger instead of attaching to
   one. It exists for the thing attaching can never do: `suspend` defaults to **true**, so the VM is held
   before its first instruction and a breakpoint inside a *static initialiser* can actually fire — proven that

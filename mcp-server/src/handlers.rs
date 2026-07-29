@@ -665,19 +665,15 @@ impl RequestHandler {
 
         // Remove from session
         session.breakpoints.remove(bp_id);
-        // If it belonged to a wildcard family, the family's member list must stop claiming it (FILT-3).
-        // That also frees a slot under `max_classes`, which is correct: the location is genuinely gone.
-        for set in session.pattern_sets.values_mut() {
-            set.members.retain(|m| m != bp_id);
-        }
+        let family_note = release_family_slot(&mut session, bp_id).await;
         drop(session);
 
         Ok(format!(
-            "✅ Breakpoint cleared: {} at {}:{}\n   JDWP Request ID: {}",
+            "✅ Breakpoint cleared: {} at {}:{}\n   JDWP Request ID: {}{family_note}",
             bp_id,
             bp_info.class_pattern,
             bp_info.line,
-            bp_info.request_id.map_or_else(|| "(disabled)".to_string(), |r| r.to_string())
+            bp_info.request_id.map_or_else(|| "(disabled)".to_string(), |r| r.to_string()),
         ))
     }
 
@@ -843,8 +839,7 @@ impl RequestHandler {
         // A wildcard family's members are BREAKPOINT requests, so `ClearAllBreakpoints` above already took
         // them — but its class-prepare watch is a different event kind and would survive, re-arming new
         // classes on a VM the caller just asked to be left alone (FILT-3).
-        let sets: Vec<i32> =
-            session.pattern_sets.drain().filter_map(|(_, s)| s.class_prepare_request_id).collect();
+        let sets: Vec<i32> = session.pattern_sets.drain().filter_map(|(_, s)| s.watch.request_id()).collect();
         for req in sets {
             let _ = session.connection.clear_class_prepare(req).await;
         }
@@ -3570,11 +3565,17 @@ fn render_pending_line(
 /// This line is the only place a caller can learn what a wildcard has become since they armed it: how many
 /// classes it holds now, how many arrived after the reply they read, and whether it has stopped taking new
 /// ones because it is full. All three are invisible from the members alone.
+///
+/// The watch gets four wordings rather than two because not-watching has three causes and they lead
+/// somewhere different (FILT-5): parked comes back on its own when a member is cleared, disabled comes back
+/// when the family is re-armed, failed never comes back. One shared "not watching" would answer "will this
+/// catch the class my next deployment generates?" wrongly in two of the three cases.
 fn render_pattern_set_line(
     output: &mut String,
     set: &crate::session::PatternStopSet,
     dead: &std::collections::BTreeSet<u64>,
 ) {
+    use crate::session::ClassLoadWatch;
     let _ = writeln!(
         output,
         "  {} [{}] {} — family of {} breakpoint(s){}{}{}",
@@ -3583,12 +3584,11 @@ fn render_pattern_set_line(
         set.class_pattern,
         set.members.len(),
         if set.trace { " (trace)" } else { "" },
-        if set.class_prepare_request_id.is_some() {
-            ", watching for matching classes that load later"
-        } else if set.enabled {
-            ", NOT watching for new classes (its watch could not be registered)"
-        } else {
-            ", not watching (disabled)"
+        match &set.watch {
+            ClassLoadWatch::Watching(_) => ", watching for matching classes that load later",
+            ClassLoadWatch::Parked => ", not watching while it is full (see below)",
+            ClassLoadWatch::Disabled => ", not watching (disabled)",
+            ClassLoadWatch::Failed => ", NOT watching for new classes (its watch could not be registered)",
         },
         if set.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
     );
@@ -3631,12 +3631,25 @@ fn render_pattern_set_line(
             set.method.as_deref().unwrap_or("?")
         );
     }
-    if set.skipped_at_cap > 0 {
+    // Gated on fullness rather than on the skip count: a family that filled up exactly, having refused
+    // nothing, is still full and still not watching, and used to say neither.
+    if !set.has_room() {
+        let refused = if set.skipped_at_cap > 0 {
+            format!(" — {} matching class(es) were not armed", set.skipped_at_cap)
+        } else {
+            String::new()
+        };
+        let watch_state = if set.watch == ClassLoadWatch::Parked {
+            " Its class-load watch is parked while it is full, so a class loading now costs nothing and \
+             arms nothing; clear a member and it starts watching again by itself."
+        } else {
+            ""
+        };
         let _ = writeln!(
             output,
-            "     ⚠️  FULL at max_classes: {} — {} matching class(es) were not armed, and new matches are \
-             being skipped. Clear members you don't need, or re-arm with a higher max_classes.",
-            set.max_classes, set.skipped_at_cap
+            "     ⚠️  FULL at max_classes: {}{refused}.{watch_state} Clear members you don't need, or \
+             re-arm with a higher max_classes.",
+            set.max_classes
         );
     }
 }
@@ -6728,9 +6741,15 @@ async fn arm_pattern_set_members(
                 continue;
             };
             if !set.has_room() {
-                if let Some(s) = session.pattern_sets.get_mut(&set_id) {
-                    s.skipped_at_cap += 1;
+                // Only a family that was still WATCHING counts the skip. Once its watch is parked it is no
+                // longer looking, and a count fed by some other family's watch would be a number whose
+                // meaning depended on what else happened to be armed (FILT-5).
+                if set.watch.is_watching() {
+                    if let Some(s) = session.pattern_sets.get_mut(&set_id) {
+                        s.skipped_at_cap += 1;
+                    }
                 }
+                park_family_watch_if_full(session, &set_id).await;
                 continue;
             }
             spec_from_pattern_set(set, &fqn, signature)
@@ -6743,6 +6762,9 @@ async fn arm_pattern_set_members(
                     s.members.push(armed.bp_id);
                     s.note_armed_later(&fqn);
                 }
+                // That may have taken the last slot, and a family with no room must stop paying for a
+                // watch it can no longer use (FILT-5).
+                park_family_watch_if_full(session, &set_id).await;
             }
             // The pattern matched a class that is not a target — the common case for a broad pattern, and
             // not a failure. Counted so the listing can say how much of the pattern's reach is irrelevant.
@@ -6756,6 +6778,119 @@ async fn arm_pattern_set_members(
             }
         }
     }
+}
+
+/// A family that is FULL stops watching for classes it could not arm anyway (FILT-5).
+///
+/// `max_classes` bounded what a wildcard may *arm* and left what it *costs* unbounded. A full family kept
+/// its `CLASS_PREPARE` request, so every class the JVM loaded still bought an event, an `EventThread`
+/// suspension of the thread doing the loading, a `resume_thread` round trip and our own pattern matching —
+/// all of it to conclude there is no room. Mid-deployment that is thousands of class loads, each briefly
+/// holding the loading thread, and it is worse for a pattern JDWP cannot express: `jdwp_class_match_for`
+/// widens `*Order*` to `*`, so a full family with that pattern pays on *every* load, forever.
+///
+/// It parks the watch rather than failing it, and the distinction is the whole reason
+/// [`ClassLoadWatch`](crate::session::ClassLoadWatch) is an enum: a slot frees the moment a member is
+/// cleared, and [`unpark_family_watch`] puts the watch straight back.
+///
+/// Does nothing unless the family is full and its watch is live, so it is safe to call after any arming
+/// attempt. A watch that could NOT be cleared stays recorded as live, because the request may well still
+/// exist in the JVM and pretending otherwise would leak it.
+async fn park_family_watch_if_full(session: &mut crate::session::DebugSession, set_id: &str) {
+    let Some(set) = session.pattern_sets.get(set_id) else {
+        return;
+    };
+    if set.has_room() {
+        return;
+    }
+    let Some(req) = set.watch.request_id() else {
+        return;
+    };
+    if let Err(e) = session.connection.clear_class_prepare(req).await {
+        warn!("Family {set_id}: full at max_classes, but its class-load watch could not be cleared: {e}");
+        return;
+    }
+    if let Some(s) = session.pattern_sets.get_mut(set_id) {
+        s.watch = crate::session::ClassLoadWatch::Parked;
+    }
+    info!("Family {set_id}: full at max_classes — class-load watch parked until a slot frees");
+}
+
+/// A slot freed in a family that had parked its watch: start watching again (FILT-5).
+///
+/// The counterpart to [`park_family_watch_if_full`], and the half that makes parking safe to do
+/// automatically. A member is cleared by its own `bp_` id — which `clear_stop_point` deliberately
+/// `retain`s out of the family, so the cap counts *live* members — and the family can grow again, so it
+/// has to be listening again. Anything else would make clearing one member quietly cost the family its
+/// future.
+///
+/// Only a PARKED watch is unparked: a disabled family is silenced on purpose and a failed one is not
+/// something to retry behind the caller's back. A registration that fails here is recorded as
+/// [`Failed`](crate::session::ClassLoadWatch::Failed), because a family that is no longer full and no
+/// longer watching must not keep reading as "full".
+async fn unpark_family_watch(session: &mut crate::session::DebugSession, set_id: &str) -> bool {
+    let Some(set) = session.pattern_sets.get(set_id) else {
+        return false;
+    };
+    if set.watch != crate::session::ClassLoadWatch::Parked || !set.enabled || !set.has_room() {
+        return false;
+    }
+    let (jdwp_pattern, _) = jdwp_class_match_for(&set.class_pattern);
+    let watch =
+        session.connection.set_class_prepare(&jdwp_pattern, jdwp_client::SuspendPolicy::EventThread).await;
+    let state = match watch {
+        Ok(req) => {
+            info!("Family {set_id}: a slot freed — class-load watch registered again");
+            crate::session::ClassLoadWatch::Watching(req)
+        }
+        Err(e) => {
+            warn!("Family {set_id}: a slot freed but its class-load watch could not be re-registered: {e}");
+            crate::session::ClassLoadWatch::Failed
+        }
+    };
+    let watching = state.is_watching();
+    if let Some(s) = session.pattern_sets.get_mut(set_id) {
+        s.watch = state;
+    }
+    watching
+}
+
+/// A breakpoint was cleared by its own `bp_` id: tell any family that owned it, and let that family start
+/// watching again if the freed slot was the thing stopping it (FILT-3/FILT-5).
+///
+/// Two effects that used to sit inline in `clear_stop_point`, extracted together because the second only
+/// makes sense as a consequence of the first: the family's member list must stop claiming a breakpoint that
+/// no longer exists, and that shrinks the count `max_classes` is measured against — so a family that had
+/// parked its class-load watch has room again and must be listening again.
+///
+/// Returns the sentence to append to the reply, empty when nothing changed. It is worth saying: the caller
+/// asked to clear one breakpoint and also changed what a DIFFERENT stop point will do with the next class
+/// the JVM loads, which is not something they could infer from the id they passed.
+async fn release_family_slot(session: &mut crate::session::DebugSession, bp_id: &str) -> String {
+    let freed: Vec<String> = session
+        .pattern_sets
+        .values_mut()
+        .filter_map(|set| {
+            let before = set.members.len();
+            set.members.retain(|m| m != bp_id);
+            (set.members.len() < before).then(|| set.id.clone())
+        })
+        .collect();
+
+    let mut watching_again = Vec::new();
+    for set_id in freed {
+        if unpark_family_watch(session, &set_id).await {
+            watching_again.push(set_id);
+        }
+    }
+    if watching_again.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n   ℹ️  That freed a slot in {}, which was full and had stopped watching for new classes — it is \
+         watching again, so a matching class loading now WILL be armed.",
+        watching_again.join(", ")
+    )
 }
 
 /// A family's stored definition, pointed at one newly-loaded class (FILT-3).
@@ -7187,32 +7322,46 @@ async fn toggle_pattern_family(
         }
     }
 
+    let full = session.pattern_sets.get(set_id).is_some_and(|s| !s.has_room());
     let watch_note = if want {
-        let (jdwp_pattern, _) = jdwp_class_match_for(&pattern);
-        match session
-            .connection
-            .set_class_prepare(&jdwp_pattern, jdwp_client::SuspendPolicy::EventThread)
-            .await
-        {
-            Ok(req) => {
-                if let Some(s) = session.pattern_sets.get_mut(set_id) {
-                    s.class_prepare_request_id = Some(req);
-                }
-                " and is watching for matching classes again"
+        // Re-arming a family that is still full must not put its watch back (FILT-5) — the members are
+        // live again, but there is no room for another one, so a watch could only cost.
+        if full {
+            if let Some(s) = session.pattern_sets.get_mut(set_id) {
+                s.watch = crate::session::ClassLoadWatch::Parked;
             }
-            Err(e) => {
-                warn!("Family {set_id}: class-prepare watch not re-registered: {e}");
-                " — but its watch for classes loading later could NOT be re-registered, so only the \
-                 breakpoints above are live"
+            " and is NOT watching for new classes, because it is still full at max_classes — clear a member \
+             and it starts watching again"
+        } else {
+            let (jdwp_pattern, _) = jdwp_class_match_for(&pattern);
+            match session
+                .connection
+                .set_class_prepare(&jdwp_pattern, jdwp_client::SuspendPolicy::EventThread)
+                .await
+            {
+                Ok(req) => {
+                    if let Some(s) = session.pattern_sets.get_mut(set_id) {
+                        s.watch = crate::session::ClassLoadWatch::Watching(req);
+                    }
+                    " and is watching for matching classes again"
+                }
+                Err(e) => {
+                    warn!("Family {set_id}: class-prepare watch not re-registered: {e}");
+                    if let Some(s) = session.pattern_sets.get_mut(set_id) {
+                        s.watch = crate::session::ClassLoadWatch::Failed;
+                    }
+                    " — but its watch for classes loading later could NOT be re-registered, so only the \
+                     breakpoints above are live"
+                }
             }
         }
     } else {
-        let req = session.pattern_sets.get(set_id).and_then(|s| s.class_prepare_request_id);
+        let req = session.pattern_sets.get(set_id).and_then(|s| s.watch.request_id());
         if let Some(req) = req {
             let _ = session.connection.clear_class_prepare(req).await;
         }
         if let Some(s) = session.pattern_sets.get_mut(set_id) {
-            s.class_prepare_request_id = None;
+            s.watch = crate::session::ClassLoadWatch::Disabled;
         }
         " and stopped watching for new classes"
     };
@@ -7248,7 +7397,7 @@ async fn clear_pattern_family(
     set_id: &str,
     set: &crate::session::PatternStopSet,
 ) -> String {
-    if let Some(req) = set.class_prepare_request_id {
+    if let Some(req) = set.watch.request_id() {
         let _ = session.connection.clear_class_prepare(req).await;
     }
     let mut cleared = 0usize;
@@ -8486,6 +8635,9 @@ struct FamilyOutcome {
     broadened_watch: bool,
     /// The family is armed but not watching for future classes, because the watch itself failed.
     watch_error: Option<String>,
+    /// The family filled up as it armed, so no watch was registered at all (FILT-5) — a different thing
+    /// from a watch that failed, and it comes back on its own when a member is cleared.
+    watch_parked: bool,
 }
 
 /// Arm one wildcard pattern: a breakpoint per matching loaded class, plus a `CLASS_PREPARE` watch that
@@ -8531,20 +8683,32 @@ async fn arm_pattern_family(
         }
     }
 
-    let (jdwp_pattern, broadened_watch) = jdwp_class_match_for(&spec.class_pattern);
-    let watch =
-        session.connection.set_class_prepare(&jdwp_pattern, jdwp_client::SuspendPolicy::EventThread).await;
-    let (class_prepare_request_id, watch_error) = match watch {
-        Ok(req) => (Some(req), None),
-        Err(e) => (None, Some(format!("{e}"))),
+    // A family that is already full must not register a watch at all (FILT-5): the pattern that matched 200
+    // classes with a cap of 20 is the common shape of this call, and registering a watch it can only refuse
+    // from would buy an event on every class load for nothing. It comes back when a slot frees.
+    let (jdwp_pattern, broadened) = jdwp_class_match_for(&spec.class_pattern);
+    let (watch, watch_error) = if members.len() >= max_classes {
+        (crate::session::ClassLoadWatch::Parked, None)
+    } else {
+        match session
+            .connection
+            .set_class_prepare(&jdwp_pattern, jdwp_client::SuspendPolicy::EventThread)
+            .await
+        {
+            Ok(req) => (crate::session::ClassLoadWatch::Watching(req), None),
+            Err(e) => (crate::session::ClassLoadWatch::Failed, Some(format!("{e}"))),
+        }
     };
+    let watch_parked = watch == crate::session::ClassLoadWatch::Parked;
+    // Only a watch that is actually running has a breadth worth warning about.
+    let broadened_watch = broadened && watch.is_watching();
 
     session.pattern_sets.insert(
         set_id.clone(),
         crate::session::PatternStopSet {
             id: set_id.clone(),
             class_pattern: spec.class_pattern.clone(),
-            class_prepare_request_id,
+            watch,
             enabled: true,
             members: members.iter().map(|m| m.armed.bp_id.clone()).collect(),
             armed_later: Vec::new(),
@@ -8563,7 +8727,17 @@ async fn arm_pattern_family(
         },
     );
 
-    FamilyOutcome { set_id, members, matched, skipped, no_method, failures, broadened_watch, watch_error }
+    FamilyOutcome {
+        set_id,
+        members,
+        matched,
+        skipped,
+        no_method,
+        failures,
+        broadened_watch,
+        watch_error,
+        watch_parked,
+    }
 }
 
 /// What one entry of a `class_pattern` produced (FILT-3/FILT-4).
@@ -8790,7 +8964,7 @@ fn render_family_block(out: &mut String, pattern: &str, f: &FamilyOutcome, max_c
         f.set_id,
         f.members.len(),
         f.matched,
-        if f.watch_error.is_none() { ", and watching for more" } else { "" }
+        if f.watch_error.is_none() && !f.watch_parked { ", and watching for more" } else { "" }
     );
     for m in &f.members {
         let _ =
@@ -8818,8 +8992,18 @@ fn render_family_block(out: &mut String, pattern: &str, f: &FamilyOutcome, max_c
             out,
             "      ⚠️  {} more matched but were NOT armed — the family is full at max_classes: {max_classes}. \
              Raise max_classes if you mean it, or narrow the pattern; `debug.list_classes \
-             {{filter:\"{pattern}\"}}` shows all of them. The cap also applies to classes that load later.",
+             {{filter:\"{pattern}\"}}` shows all of them.",
             f.skipped
+        );
+    }
+    // A full family holds no class-load watch, and that is worth one line: a caller who read "watching for
+    // more" on their last wildcard would otherwise assume this one is too (FILT-5).
+    if f.watch_parked {
+        let _ = writeln!(
+            out,
+            "      ℹ️  Because it is full it is NOT watching for classes that load later, so a class loading \
+             now costs nothing and arms nothing. Clear a member (or the family) and it starts watching \
+             again by itself; re-arm with a higher max_classes to cover more."
         );
     }
     for msg in &f.failures {
@@ -13424,12 +13608,17 @@ mod tests {
 
     // FILT-3: the listing is the only place a caller learns what a wildcard BECAME — it grew after the
     // reply they read, and it has stopped growing because it is full. Both are invisible from the members.
+    //
+    // FILT-5 added the fourth watch state and the reason all four have to read differently: "will this catch
+    // the class my next deployment generates?" is answered yes / not yet / no-until-you-re-arm / never, and
+    // one shared "not watching" got two of those wrong.
     #[test]
     fn a_family_listing_reports_growth_and_a_full_cap() {
+        use crate::session::ClassLoadWatch;
         let mut set = crate::session::PatternStopSet {
             id: "bpset_1".to_string(),
             class_pattern: "com.example.*".to_string(),
-            class_prepare_request_id: Some(9),
+            watch: ClassLoadWatch::Watching(9),
             enabled: true,
             members: vec!["bp_2".to_string(), "bp_3".to_string()],
             armed_later: vec!["com.example.Late".to_string()],
@@ -13442,8 +13631,8 @@ mod tests {
             trace_expr: None,
             trace_budget: Some(200),
             trace_frames: 3,
-            max_classes: 2,
-            skipped_at_cap: 4,
+            max_classes: 3,
+            skipped_at_cap: 0,
             no_method: 6,
         };
         let mut out = String::new();
@@ -13454,24 +13643,52 @@ mod tests {
         assert!(out.contains("watching for matching classes that load later"), "{out}");
         assert!(out.contains("+1 class(es) armed since"), "growth after the reply is reported: {out}");
         assert!(out.contains("com.example.Late"), "and names it: {out}");
-        assert!(out.contains("FULL at max_classes: 2"), "a full family says it is full: {out}");
-        assert!(out.contains("4 matching class(es) were not armed"), "{out}");
         assert!(out.contains("6 matching class(es) have no method 'handle'"), "counted, not an error: {out}");
+        assert!(!out.contains("FULL at max_classes"), "a family with room is not full: {out}");
+
+        // Full, and therefore parked — the state a family reaches by growing into its cap (FILT-5). Both
+        // halves have to be said: that it stopped arming, and that it also stopped WATCHING, which is the
+        // difference between a cap that bounds the cost and one that only bounds the count.
+        set.max_classes = 2;
+        set.skipped_at_cap = 4;
+        set.watch = ClassLoadWatch::Parked;
+        let mut full = String::new();
+        render_pattern_set_line(&mut full, &set, &std::collections::BTreeSet::new());
+        assert!(full.contains("FULL at max_classes: 2"), "a full family says it is full: {full}");
+        assert!(full.contains("4 matching class(es) were not armed"), "{full}");
+        assert!(full.contains("not watching while it is full"), "the header points at the reason: {full}");
+        assert!(full.contains("watch is parked"), "and the cost is stated as gone, not paid: {full}");
+        assert!(full.contains("clear a member"), "with the way out of it: {full}");
+
+        // A family that filled up exactly, refusing nothing, is still full and still parked — this used to
+        // say neither, because the whole block hung off the skip count.
+        set.skipped_at_cap = 0;
+        let mut exact = String::new();
+        render_pattern_set_line(&mut exact, &set, &std::collections::BTreeSet::new());
+        assert!(exact.contains("FULL at max_classes: 2"), "{exact}");
+        assert!(!exact.contains("class(es) were not armed"), "nothing was refused, so say nothing: {exact}");
+        assert!(exact.contains("watch is parked"), "{exact}");
 
         // Disabled: the watch is gone too, and the listing must not imply it is still catching classes.
         set.enabled = false;
-        set.class_prepare_request_id = None;
+        set.watch = ClassLoadWatch::Disabled;
         let mut off = String::new();
         render_pattern_set_line(&mut off, &set, &std::collections::BTreeSet::new());
         assert!(off.contains("not watching (disabled)"), "{off}");
         assert!(off.contains("DISABLED"), "{off}");
+        assert!(!off.contains("watch is parked"), "disabled is not parked — it will not unpark: {off}");
 
-        // Enabled but with no watch is a THIRD state and must not read like either of the others: the
-        // family is live, and nothing will arm the next matching class.
+        // A watch the JVM refused is the one state that never comes back, and must not read like either of
+        // the two that do.
         set.enabled = true;
+        set.watch = ClassLoadWatch::Failed;
         let mut broken = String::new();
         render_pattern_set_line(&mut broken, &set, &std::collections::BTreeSet::new());
         assert!(broken.contains("NOT watching for new classes"), "{broken}");
+        assert!(
+            broken.contains("could not be registered"),
+            "and says why, since nothing will fix it: {broken}"
+        );
     }
 
     // TEST-8: the per-dump line-table cache is keyed by (class, method) and the LINE is resolved per frame

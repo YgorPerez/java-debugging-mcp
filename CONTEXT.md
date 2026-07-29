@@ -173,6 +173,20 @@ the id is caller-facing and already shipped (v0.7.0, pinned downstream), so rena
 something and buys nothing the concept name has not already delivered. The window that entry describes —
 "taken while nothing scripted against them yet" — closed on this prefix the day it shipped.
 
+**Parked watch**:
+A class-load watch a **wildcard family** deliberately does not hold while it is full. A full family cannot arm
+the next matching class, so watching for one could only cost — an event, a suspension of the thread doing the
+loading, a resume — and `max_classes` would bound what a wildcard *arms* while leaving what it *costs*
+unbounded (FILT-5).
+
+Parking is reversible by definition, and that is what makes it a distinct word: clearing a member frees a slot
+and the watch comes back by itself. A **disabled** family's watch also comes back, but only when the caller
+re-arms it; a watch the JVM *refused* never comes back at all. All three are "not watching", and a caller
+asking "will this catch the class my next deployment generates?" needs a different answer for each — which is
+why the listing gives four wordings rather than two.
+_Avoid_: dormant, suspended, paused (paused especially: `debug.pause` is a whole-VM suspension and has nothing
+to do with this)
+
 **Batch**:
 Several class patterns given to one arming call, each resolved independently. Distinct from a **wildcard
 family**: a batch is many patterns and produces no shared handle, a family is one pattern and does. Its
@@ -188,7 +202,7 @@ line-table lookups and thousands of live event requests. A reply that expanded s
 The cap counts a family's **live members**, not the classes it has ever matched — so clearing one member
 frees a slot and the next matching class to load takes it. That is deliberate: the ceiling is about how many
 event requests are armed on someone else's JVM at once, which is a fact about now, not a quota spent for
-good.
+good. It bounds the family's **class-load watch** as well as its members — see **Parked watch**.
 
 **Only the kinds that need a concrete target expand**, and the exception is the useful half of the term. A
 line breakpoint needs a resolved location per class; an exception stop needs a reference type; a watchpoint
