@@ -18,13 +18,18 @@ The `WildFly` instance several people use at once. Not an environment name — t
 every safety default, because freezing it stalls other people's requests.
 
 **Attached** / **launched**:
-Whose JVM it is, which is the fact every safety default here is derived from. An **attached** debuggee was
-started by somebody else and is presumed shared: suspending it is somebody else's stalled request, which is why
-suspensions are bounded, announced and rescued. A **launched** debuggee (LAUNCH-1) is one `debug.launch` started
-for this session — nobody else is on it, so suspending it costs nothing, `suspend=y` becomes reachable, and its
-lifetime is this process's problem instead of nobody's. `debug.list_sessions` states which a session is, because
-no other fact changes the advice on so many tools.
+Whose JVM it is — the fact every safety default here is derived from. An **attached** debuggee was started by
+somebody else and is *presumed* shared, so suspending it may be stalling a request nobody told you about,
+which is why suspensions are bounded, announced and rescued. A **launched** debuggee (LAUNCH-1) is one
+`debug.launch` started for this session: nobody else is on it, so suspending it costs nobody *else* anything
+and `suspend=y` — breaking before the program's first instruction — becomes reachable at all.
 _Avoid_: spawned, forked (the JVM is a child process, but the word that matters to a caller is who owns it)
+
+The asymmetry to keep straight is **who owns the lifetime**. An attached JVM's outlives the session by
+definition; a launched one is bound *to the session*, so disconnecting it, dropping it, or exiting cleanly
+all end the JVM, and `detach_on_disconnect` is the one way to ask for the attached shape instead. The single
+gap is a `SIGKILL`ed server, which orphans it — that is why the launch reply names the pid rather than
+implying a guarantee it cannot make.
 
 **Loaded**:
 Present in the debuggee, as opposed to present in a source tree. A class loads on first use, so an
@@ -122,8 +127,8 @@ anyway. Renaming an argument breaks callers for no gain the tool name has not al
 The *concepts* below keep their own names: a line breakpoint is still a breakpoint.
 
 **Line breakpoint**:
-A stop point at one source location. The only kind that can carry a condition, and the only kind that can
-be deferred.
+A stop point at one source location. The only kind that can carry a condition, the only kind that can be
+deferred, and the only kind that forms a **wildcard family**.
 
 **Exception breakpoint**:
 A stop point on a thrown exception of a given class and its subclasses, reporting the throw site and the
@@ -137,24 +142,60 @@ pair.
 A stop point on returns from a matching method, reporting which `return` was taken and the value it
 produced.
 
+**Class-load watch**:
+A request the debugger holds *instead of* a stop point, so a class it cannot arm yet can be armed the moment
+the JVM loads one. What makes a **deferred breakpoint** and a **wildcard family** possible, and the only
+reason either can reach past what is already **loaded**.
+_Avoid_: class-prepare watch (`CLASS_PREPARE` is the JDWP event kind and the right name in code — a caller
+is thinking about a class loading, not about an event kind)
+
 **Deferred breakpoint**:
 A line breakpoint whose class is not loaded yet. It holds a class-load watch instead of a real request, and
 arms itself when the class appears.
 _Avoid_: pending (used for the internal bookkeeping, not the concept)
 
 **Wildcard family**:
-The N line breakpoints one wildcard `class_pattern` arms — one per matching class — plus the class-load watch
-that arms matching classes as they load (FILT-3). Every member is an ordinary line breakpoint with its own
-`bp_` id; the family adds a second, coarser handle (`bpset_`) that clears or toggles all of them and the watch
-together. A family is *permanently* deferred: unlike a deferred breakpoint, which drops its watch once its one
-class appears, a family's watch never goes away while the family is enabled, because every future matching
-class is new work.
-_Avoid_: group, set (`set` is the field name, not the concept — the caller-facing word is family)
+The line breakpoints one wildcard `class_pattern` arms — one per matching class — together with the
+class-load watch that keeps arming matches as they load (FILT-3). Every member is an ordinary line breakpoint
+under its own `bp_` id; the family is a coarser handle over all of them *and* the watch.
+_Avoid_: group; batch (a batch is several patterns in one call — a different thing, see **Batch**)
+
+**A family is not deferred**, and that is a distinction the tooling makes rather than a shade of meaning:
+`list_stop_points` counts families separately from its "N deferred" figure, which only ever counts
+breakpoints waiting for one named class. A deferred breakpoint drops its watch the moment its class appears;
+a family's watch outlives every class it arms, because the next match is more work rather than the end of a
+wait. So a family is never "done" the way a deferred breakpoint is — the only things that end it are
+`clear_stop_point`, `toggle_stop_point` and `panic`.
+
+**The id prefix is `bpset_`, which says *set* where this glossary says *family*.** That is the same kind of
+mismatch the **Stop point** entry records for `bp_`/`breakpoint_id`, and it is accepted for the same reason:
+the id is caller-facing and already shipped (v0.7.0, pinned downstream), so renaming it costs callers
+something and buys nothing the concept name has not already delivered. The window that entry describes —
+"taken while nothing scripted against them yet" — closed on this prefix the day it shipped.
+
+**Batch**:
+Several class patterns given to one arming call, each resolved independently. Distinct from a **wildcard
+family**: a batch is many patterns and produces no shared handle, a family is one pattern and does. Its
+defining property is that **partial success is the normal outcome**, so a batch reply is per-pattern rather
+than one verdict.
+_Avoid_: bulk, multi (and note a batch is not a thing that exists after the call — only its stop points are)
 
 **Expansion**:
-Turning one wildcard into the concrete classes it arms. Bounded by `max_classes`, because the count is
-invisible to the caller before the call: `com.*` on an app server is thousands of line-table lookups and
-thousands of live requests. A reply that expanded says what it left out.
+Turning one wildcard into the concrete classes it arms, one stop point each. Bounded by `max_classes`,
+because the number is invisible to the caller before the call: `com.*` on an app server is thousands of
+line-table lookups and thousands of live event requests. A reply that expanded says what it left out.
+
+The cap counts a family's **live members**, not the classes it has ever matched — so clearing one member
+frees a slot and the next matching class to load takes it. That is deliberate: the ceiling is about how many
+event requests are armed on someone else's JVM at once, which is a fact about now, not a quota spent for
+good.
+
+**Only the kinds that need a concrete target expand**, and the exception is the useful half of the term. A
+line breakpoint needs a resolved location per class; an exception stop needs a reference type; a watchpoint
+needs a field id — so all three expand, and all three therefore see only what is **loaded** at the moment of
+the call. A **method-exit request** does not expand at all: JDWP's own `ClassMatch` does the matching, so one
+request covers every class the pattern matches *including ones that load later*. That is why it alone has no
+`max_classes`, and why it accepted patterns long before the other three did.
 
 ### Hits, and where they go
 

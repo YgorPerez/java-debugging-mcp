@@ -8051,7 +8051,7 @@ async fn defer_breakpoint(
         .connection
         .set_class_prepare(&spec.class_pattern, jdwp_client::SuspendPolicy::EventThread)
         .await
-        .map_err(|e| format!("Failed to register class-prepare watch: {e}"))?;
+        .map_err(|e| format!("Failed to register the class-load watch: {e}"))?;
 
     let recheck = session.connection.classes_by_signature(&spec.signature).await.unwrap_or_default();
     if let Some(c) = recheck.first() {
@@ -8828,7 +8828,7 @@ fn render_family_block(out: &mut String, pattern: &str, f: &FamilyOutcome, max_c
     if let Some(e) = &f.watch_error {
         let _ = writeln!(
             out,
-            "      ⚠️  The class-prepare watch could not be registered ({e}), so classes matching this \
+            "      ⚠️  The class-load watch could not be registered ({e}), so classes matching this \
              pattern that load LATER will not be armed. The breakpoints above are unaffected."
         );
     } else if f.broadened_watch {
