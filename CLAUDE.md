@@ -36,9 +36,14 @@ the `rust-doctor-sarif` artifact, and `--findings` prints locally.
 **CI now installs `cargo-deny` and `cargo-machete`** (prebuilt, seconds), so those two passes are part of the
 gate — machete's first run found `anyhow` and `serde_json` declared and unused by `jdwp-client`. Three passes
 stay off deliberately and `rust-doctor.yml` says why at each one: `cargo-geiger` feeds the
-`unsafe-dependency` rule this repo ignores, `cargo-semver-checks` would compare against **bonk-dev's**
-unrelated `jdwp-client` on crates.io (ours are unpublished) and answer confidently from the wrong package,
-and coverage belongs to `coverage.yml`. `--findings` works this out **per tool** from the workflow's install
+`unsafe-dependency` rule this repo ignores, `cargo-semver-checks` through *that* pass would compare against
+**bonk-dev's** unrelated `jdwp-client` on crates.io (ours are unpublished) and answer confidently from the
+wrong package — so the check lives in the `semver` job instead, via `scripts/semver-check.sh`, which uses the
+last release **tag** as the baseline: 196 checks run that way against 0 through the pass. It gates, and
+`release.yml` calls this workflow, so a broken public API blocks a tag. Read its verdict rather than the tick:
+on a release commit every check skips, because a bump that permits breaking changes leaves nothing to
+violate, and the script prints "0 checks ran, so this verified nothing" instead of passing quietly. Coverage
+belongs to `coverage.yml`. `--findings` works this out **per tool** from the workflow's install
 list, so "ran here, but not in the gate" stays true as that list changes — it used to be a yes/no grep for
 `cargo install` anywhere in the file, which a *comment* containing those words silently flipped.
 

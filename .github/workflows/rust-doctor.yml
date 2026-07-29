@@ -120,8 +120,9 @@ jobs:
       #     bonk-dev/jdwp-client, an unrelated project that happens to hold the name. Ours are unpublished
       #     (distribution is the release binaries), so the pass compares against a stranger's crate and
       #     reports "no semver update required" — a confident answer built on the wrong package, which is
-      #     worse than a skip. `cargo semver-checks --baseline-rev <last tag>` is the version that would
-      #     mean something, and rust-doctor's pass has no way to ask for it.
+      #     worse than a skip. rust-doctor's pass cannot be told to use a different baseline, so the check
+      #     it would have done is the `semver` job at the bottom of this file instead, against the last
+      #     release TAG: 196 checks run that way, against 0 through this pass.
       #   - coverage — `coverage.yml` owns it, produces `target/coverage/lcov.info`, and knows about the
       #     atexit-handler trap TEST-5 found. Generating coverage again here would double the test run to
       #     tell doctor something another workflow already publishes.
@@ -182,3 +183,45 @@ jobs:
           name: rust-doctor-sarif
           path: rust-doctor.sarif
           if-no-files-found: warn
+
+  # Its own job, not a step in the scan above, for one reason: it needs the FULL history and every tag, and
+  # the health scan does not. A shallow checkout would leave it with no baseline — which it reports rather
+  # than passing quietly, but a check whose default state is "could not run" is not a check.
+  #
+  # It runs `cargo semver-checks --baseline-rev <last tag>` and NOT the bare `cargo semver-checks` that
+  # rust-doctor's own semver pass would: the default baseline is the crate's latest crates.io release, and
+  # `jdwp-client` there belongs to bonk-dev/jdwp-client, an unrelated project holding the name. See
+  # scripts/semver-check.sh for the whole argument, and for what this covers (jdwp-client's lib API —
+  # jdwp-mcp is a [[bin]] and contributes nothing) versus what it cannot (the MCP tool surface, which is
+  # what callers actually pin, and which only docs/toolkit-contract.md covers).
+  #
+  # It gates. release.yml calls this workflow, so a violation blocks a tag — which is the point: the version
+  # number is what the downstream toolkit pins, and it should not be able to claim compatibility the API
+  # does not have. On a release commit every check skips (a major bump permits breaking changes) and the
+  # script says so, so the pass is announced as vacuous instead of counted as verification.
+  semver:
+    name: Public API vs the last tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags and history: the baseline is a tag, not a registry
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1" # the pin the health scan uses, for the same reason
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+
+      - name: Compare the public API against the last release tag
+        shell: bash
+        run: |
+          # `shell: bash` already runs with -eo pipefail, so the script's exit status survives the pipe into
+          # the summary. Set explicitly and said out loud because it nearly did not: a local negative test
+          # printed "exit=0" while the check had in fact failed, because `$?` after a pipeline is `tee`'s.
+          set -o pipefail
+          scripts/semver-check.sh | tee -a "$GITHUB_STEP_SUMMARY"
