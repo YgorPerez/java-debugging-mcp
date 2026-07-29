@@ -117,15 +117,18 @@ cargo test --workspace --quiet || die "tests failed. Nothing has been bumped."
 echo "    unit and cassette tests pass"
 
 step "Gate: scripts/doctor.sh --findings"
-# Doctor is the gate, not clippy, and it fails on *warnings* (ADR-0007). Its exit code alone cannot be the
-# verdict here, and finding that out is why this script has a dry-run mode: locally it reports 21
-# `unsafe-dependency` findings from a cargo-geiger that CI does not install, so a bare `if ! doctor` refuses
-# every release on a developer machine while CI is green.
+# Doctor is the gate, not clippy, and it fails on *warnings* (ADR-0007). This reads the `by rule:` line
+# rather than the score, which is not the verdict — the repo has sat at 100/100 on top of 21 warnings.
 #
-# So the rule CLAUDE.md already states is applied instead of re-derived by eye: the baseline is
-# `unsafe-dependency` and nothing else. Any finding from another rule is ours and blocks. This reads the
-# `by rule:` line rather than the score, which is not the verdict — the repo has sat at 100/100 on top of
-# all 21 of them.
+# **The `unsafe-dependency` baseline this used to subtract is gone**, so on a current tree the clean branch
+# below is the one that runs. `rust-doctor.toml` ignores the rule: every finding was about a third-party
+# crate, none of them ever ran in CI, and naming a count here and in CLAUDE.md made the local verdict
+# something you decoded against a number that drifts with `Cargo.lock`.
+#
+# The subtraction is kept anyway, and deliberately. It costs one `sed` and it is what stops this script from
+# refusing every release on a machine where someone has installed `cargo-geiger` *and* the ignore has been
+# removed or has stopped matching — which is a configuration this repo has already lived in for months. A
+# gate that fails closed on a dependency's internals is not a gate anyone keeps.
 doctor_out="$(./scripts/doctor.sh --findings 2>&1)" && doctor_rc=0 || doctor_rc=$?
 by_rule="$(printf '%s' "$doctor_out" | grep -oE '^\s*by rule:.*' | head -1 || true)"
 
