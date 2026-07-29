@@ -13,10 +13,18 @@ different repo, the part that is this machine, and the traps below, every one of
 
 ## The traps, up front
 
-1. **A non-interactive `release.sh` writes only the commit *subject*.** The body is the release notes
-   (`gh release create --generate-notes` builds them from commits), so a subject-only release commit ships
-   a release nobody can read. Fixing it means **re-tagging**, because amending rewrites the commit the
-   annotated tag names. Step 4.
+1. **A non-interactive `release.sh` writes only the commit *subject*.** The release commit's body **is** the
+   lead of the release notes — `scripts/release-notes.py` reads it out of the tagged commit and the workflow
+   publishes it with `--notes-file` — so a subject-only release commit ships a release whose body is a bare
+   changelog and says nothing about tools, arguments or replies. Fixing it means **re-tagging**, because
+   amending rewrites the commit the annotated tag names. Step 4.
+
+   Until v0.8.0 this trap was worse than it read: the workflow published with `--generate-notes`, which
+   lists merged **pull requests** and never looked at a commit body at all. So the amend-and-re-tag ritual
+   was writing prose into git history that the releases page never showed, and every release from v0.2.1 to
+   v0.8.0 published one line — the compare link. If you are looking at an old release and wondering where
+   its notes went, they are in `git log` on the release commit, and `scripts/release-notes.py v0.7.0` will
+   print what that release *should* have said.
 2. **Verify CI on the commit you are about to tag, not after.** The tag push starts a workflow that
    *re-runs* the gates; finding out there is the expensive moment.
 3. **The release gate can fail on a known flake.** Check it against the open issues before re-running, and
@@ -114,6 +122,21 @@ silent, so this is the whole mitigation):
 Group under `## New tool` / `## Changed replies` / `## Fixed` / `## Internal`. `v0.6.0` is the shape to
 copy.
 
+**What you do *not* have to write** is the per-commit list. `scripts/release-notes.py` appends a categorized
+changelog under `## What's Changed` — the emoji headings `~/html/b2c-next` uses, derived from the
+conventional-commit subjects since the previous tag — plus the compare link. Read the whole body before you
+push, because this is exactly what the releases page will show:
+
+```bash
+python3 scripts/release-notes.py v<version>
+```
+
+Two things to look for. A commit whose subject is not conventional (`feat+docs:`, or no prefix) lands under
+**Other Changes** with its subject intact — fine, but if that is a *caller-visible* change it belongs in your
+prose above as well. And a `!` in the type or a `BREAKING CHANGE:` footer promotes the entry to
+**⚠️ Breaking Changes** at the top; if something breaks callers and nothing appears there, the subject did
+not say so.
+
 ## 5. Publish
 
 ```bash
@@ -151,6 +174,17 @@ gh release view v<version> --json tagName,isDraft,isPrerelease,assets \
 
 Four platform binaries plus `SHA256SUMS`, not a draft. The asset **names** are the interface
 (`docs/toolkit-contract.md`), not a workflow detail.
+
+Then check the **body**, because that is the other half of the interface and it failed silently for six
+releases:
+
+```bash
+gh release view v<version> --json body --jq '.body' | head -40
+```
+
+Your narrative first, then `## What's Changed`, then the compare link. A body that is *only* the compare
+link means the notes step published nothing — the old `--generate-notes` failure mode — and the toolkit
+audit in step 7 has nothing to read.
 
 ## 7. Propagate to infotravel-dev-toolkit
 

@@ -114,6 +114,17 @@ worst is that a non-interactive `release.sh` writes only the commit **subject**,
 **re-tagging** — an annotated tag names one commit, and amending leaves the tag pointing at an object no
 longer on the branch.
 
+**The release body reaches the releases page through `scripts/release-notes.py`**, and it did not until
+v0.9.0. The workflow published with `--generate-notes`, which lists merged **pull requests** — so a release
+of direct pushes to main generated an empty "What's Changed", and the commit body it never read is where all
+the caller-visible detail lives. Every release from v0.2.1 to v0.8.0 published one line: the compare link.
+The script now leads with that commit body verbatim and appends a changelog categorized from the
+conventional-commit subjects since the previous tag, under the same emoji headings `~/html/b2c-next` uses.
+Preview it with `python3 scripts/release-notes.py v<version>`; it is byte-for-byte what will be published,
+and it also lands in the run's job summary. There is deliberately **no `.github/release.yml`** — that is
+b2c-next's mechanism and it categorizes by PR *label*, which here would categorize almost nothing and look
+load-bearing while deciding nothing.
+
 ## Downstream consumer
 
 `infotravel-dev-toolkit` installs this server from a **pinned release** and documents its tools in Claude

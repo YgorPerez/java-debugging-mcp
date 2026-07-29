@@ -177,6 +177,18 @@ jobs:
     permissions:
       contents: write # create the release and upload its assets; nothing else is needed
     steps:
+      # Checked out for ONE reason — `scripts/release-notes.py` builds the release body out of git history
+      # — and it goes FIRST because `actions/checkout` clears its target directory. Put it after the
+      # download and it deletes `dist/`, taking every binary this run built with it.
+      #
+      # fetch-depth: 0 is not caution. The notes need the previous tag (`git describe --tags` on the tagged
+      # commit's parent) and every commit between it and here; the default depth-1 fetch has neither, and
+      # would produce a changelog of one commit against no baseline rather than an error.
+      - name: Check out the tagged commit and its history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       # `pattern` is the whole point: without it download-artifact takes EVERY artifact the run produced,
       # and this run produces more than binaries — gate-lint calls rust-doctor.yml, which uploads its
       # SARIF. That is not hypothetical. v0.2.1 shipped `rust-doctor.sarif` as a sixth downloadable asset
@@ -219,6 +231,31 @@ jobs:
           sha256sum jdwp-mcp-* > SHA256SUMS
           cat SHA256SUMS
 
+      # The release body, built here rather than by `--generate-notes`, which this step used to pass.
+      #
+      # `--generate-notes` lists **merged pull requests**, and a release whose commits were all direct
+      # pushes to main generates an empty "What's Changed" — so every release from v0.2.1 to v0.8.0
+      # published one line, the compare link, and nothing else. Worse, it never read the release commit's
+      # body, which is where `/release` step 4 puts the part that matters: new tools by name, renames with
+      # both names, behaviour changes behind an unchanged name. `docs/toolkit-contract.md` points the
+      # downstream toolkit at these notes as the one mitigation for five silent failure modes, and the
+      # notes did not contain any of it.
+      #
+      # The script leads with that body verbatim, then categorizes the commits since the previous tag under
+      # the same emoji headings b2c-next uses. It is written not to fail a release: a missing narrative or
+      # an unreachable baseline drops a section rather than exiting non-zero.
+      - name: Build the release notes
+        shell: bash
+        run: |
+          python3 scripts/release-notes.py "$GITHUB_REF_NAME" > release-notes.md
+          # Into the job summary as well, so the published body is reviewable from the run that published
+          # it — the releases page is the only other copy, and by then it is public.
+          {
+            echo "## Release notes published for \`$GITHUB_REF_NAME\`"
+            echo
+            cat release-notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # The upload globs `jdwp-mcp-*` plus SHA256SUMS by name — the same discipline the checksum step
       # above uses — rather than `dist/*`. The two cannot disagree that way: what gets listed is what gets
       # published. `dist/*` is how a file nobody checksummed ended up on the downloads page (#41).
@@ -231,12 +268,12 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          # This job deliberately does not check out the repo — it only needs the built artifacts. That
-          # leaves `gh` with no git remote to infer the target from, so name it explicitly; without this
-          # the publish step fails at the very end of an otherwise successful release.
+          # Kept explicit even though this job now checks out the repo, so the publish does not depend on
+          # `gh` inferring a target from a remote. It cost a whole green release to learn that failing here
+          # is the most expensive place to fail.
           GH_REPO: ${{ github.repository }}
         run: |
-          flags=(--verify-tag --generate-notes --title "$GITHUB_REF_NAME")
+          flags=(--verify-tag --notes-file release-notes.md --title "$GITHUB_REF_NAME")
           case "$GITHUB_REF_NAME" in
             *-*) flags+=(--prerelease) ;;
           esac

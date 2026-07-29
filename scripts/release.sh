@@ -224,6 +224,11 @@ git add Cargo.toml Cargo.lock
 # the precedent), but it is prose about what shipped and this script has no way to know that — so it
 # writes the one line it can be sure of and hands the body over below.
 #
+# That body is not just for `git log`: `scripts/release-notes.py` reads it out of the tagged commit and
+# `release.yml` publishes it as the lead of the release notes, above the changelog it generates from the
+# commits. A subject-only release commit therefore ships a release that documents nothing a caller could
+# have noticed — which is the one thing `docs/toolkit-contract.md` asks a release to do.
+#
 # `-e` opens an editor when there is one, which is the common interactive case. Under a non-interactive
 # shell (`GIT_EDITOR=true`, CI, an agent) that is a no-op and the subject stands, so the script never
 # hangs waiting for input that will not come.
@@ -263,6 +268,11 @@ cat <<EOF
     To undo before pushing:
 
         git tag -d $TAG && git reset --hard HEAD~1
+
+    Read the body the release will actually publish first — this commit's message body leads it, and
+    scripts/release-notes.py appends the categorized changelog and the compare link:
+
+        python3 scripts/release-notes.py $TAG
 
     To reword the release notes before pushing, RE-TAG afterwards — an annotated tag names one commit,
     and amending rewrites it, leaving $TAG pointing at an object no longer on the branch:
