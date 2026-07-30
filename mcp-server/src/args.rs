@@ -512,11 +512,18 @@ pub struct GetStackArgs {
 /// Arguments for debug.evaluate.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvaluateArgs {
-    /// Java expression. Heads: a local, `this`, or a class (`ConfigDefaultUtils`, or fully
-    /// qualified). Then chain `.field` and `.method(args)` freely, including static members
+    /// Java expression. Heads: a local, `this`, a class (`ConfigDefaultUtils`, or fully
+    /// qualified), or an **object handle** — `@0x1f4c`, the spelling every reply prints beside an
+    /// object. Then chain `.field` and `.method(args)` freely, including static members
     /// (`ConfigDefaultUtils.getUrl()`). Arguments may be literals (int, `123L`, true/false, null,
     /// `"string"`) or expressions passed by reference — a local, `this.field`, or a nested call
     /// (`svc.matches(reserva)`, `foo.handle(this, cfg.getId())`).
+    ///
+    /// A handle reaches an object with **no frame and no root to reach it from**, which is what makes a
+    /// trace snapshot drillable after the fact (TRACE-10). It may only be the first segment. The id is a
+    /// **weak** reference, so a handle can stop working: the reply says `Vanished: @0x…` and which of
+    /// the two readings it is, rather than reporting a JDWP error code. Nothing pins objects to keep
+    /// handles alive — ADR-0022 records why.
     ///
     /// Subscripts work on arrays, `List` and `Map`:
     /// `lines[0]` (index — keeps chaining, so `lines[0].sku` works), `counts["key"]` (map lookup),
@@ -565,7 +572,8 @@ pub struct EvaluateArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvaluateChainArgs {
     /// The chained Java expression to walk, in exactly the form `debug.evaluate` accepts —
-    /// `wsReservaCircuito.getCircuitoParametro().getConfigUhList()[0].getSqQuarto()`.
+    /// `wsReservaCircuito.getCircuitoParametro().getConfigUhList()[0].getSqQuarto()`, including an
+    /// `@0x…` object handle as the head.
     ///
     /// A single-link expression is accepted but answers nothing this tool is for: with one link there is
     /// no "which one" to find.
@@ -664,6 +672,45 @@ pub struct ListFieldsArgs {
     /// Max fields to return; the rest are reported as a hidden count.
     #[serde(default = "default_limit")]
     pub limit: usize,
+}
+
+/// How many handles `debug.list_instances` returns per type when the caller does not say.
+///
+/// Small on purpose, and not because the walk gets cheaper: the walk costs the same whether it returns
+/// 7 handles or 7000 (the price tracks the live heap, not the answer). What a low default bounds is the
+/// **rendering** afterwards — a couple of round trips per handle — and the size of the reply. The true
+/// live count is reported regardless, from `InstanceCounts`, so a clamped listing still says how many
+/// there are.
+const fn default_max_instances() -> i32 {
+    10
+}
+
+/// Arguments for `debug.list_instances` (DISC-10).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListInstancesArgs {
+    /// Fully-qualified class names whose live instances to find, e.g.
+    /// `["br.com.infotravel.service.ApplicationSrv"]`. Each must already be **loaded** — find it with
+    /// `debug.list_classes`.
+    ///
+    /// **Several is nearly free and one is not**: the JVM walks the live heap once for the whole batch
+    /// (three types measured at 604 ms against 522 ms for one), so ask about everything you want in a
+    /// single call rather than making several.
+    ///
+    /// **Exact type, not subtype-inclusive.** An interface or a base class answers about objects whose
+    /// runtime class is *exactly* that name, which for a CDI bean is usually its `…_$$_WeldClientProxy`
+    /// rather than the interface you reached for. Naming both costs nothing extra.
+    pub class_names: Vec<String>,
+    /// Handles to return per type. `0` means all of them; a negative value is refused. The **count** is
+    /// reported in full either way, so clamping hides objects, never their number.
+    #[serde(default = "default_max_instances")]
+    pub max_instances: i32,
+    /// Report only how many instances each type has, and return no handles.
+    ///
+    /// One heap walk for the whole batch instead of one per type, so this is the cheap shape of the
+    /// question when "does this cache have anything in it" is all you need. It costs the same pause per
+    /// walk — nothing here is free.
+    #[serde(default)]
+    pub counts_only: bool,
 }
 
 /// Arguments for `debug.source` (DISC-3).

@@ -125,6 +125,43 @@ So `canGetInstanceInfo` (16) and `canUseInstanceFilters` (12) are both available
 Note positions 9 and 10 being false is what makes `HotSpot`'s "method bodies only" restriction on hot
 reload visible *before* a refusal, which is the rule `vm.rs` already states.
 
+## What shipped from this, and what did not (DISC-10, #84)
+
+Two of the four commands are now implemented and gated by `debug.list_instances`: `Instances` and
+`InstanceCounts`, together, because they share the capability bit and the walk and batching types is
+nearly free. `canGetInstanceInfo` (16) is decoded in `vm.rs` **in the same change that consults it** —
+positions 12-15 are still read past rather than named, for the reason that file gives.
+
+`ObjectReference.ReferringObjects` did **not** ship here; "who is holding this?" is a different question.
+`Method.IsObsolete` did not either. The `ClassExclude` / `InstanceOnly` unknown below is untouched.
+
+The ad-hoc harness that produced the table above (`probe_heap_queries.rs`) is not in the tree: it existed
+to *discover* the wire shapes, and now that they are implemented and covered by an integration test the
+findings live here rather than in a script that would have to be kept compiling. The shaped heap did
+survive, as `examples/probes/HeapProbe.java`, and the integration test asserts the exact-type result
+(7, not 9) and the pause **against the probe's own tick gaps** — a debugger's report of its own cost is
+not evidence on its own.
+
+Reproduced on a smaller heap on other hardware, and this time on **three** JDKs. `HeapProbe` at 600,000
+live objects, one `InstanceCounts` walk over three types, with the debugger's own reported figure beside
+the probe's worst tick gap. Several runs each, on a box that was also running other suites:
+
+| JDK | debugger's reported held duration | probe's worst tick gap (quiet ≈50-57 ms) |
+| --- | --- | --- |
+| Microsoft 11.0.28 | 65-125 ms | 88-290 ms |
+| Temurin 17.0.20 | 87-92 ms | 98-146 ms |
+| Temurin 21.0.12 | 97-291 ms | 136-435 ms |
+
+**The ranges are the finding, not a defect in it.** Three things read off them. The two columns move
+together, which is what makes the debugger's self-reported cost trustworthy rather than merely present.
+The pause is there on every JDK, so it is a property of the command rather than of one JVM generation.
+And the *same* command, on the *same* heap, on the *same* box varied by 3× between runs — so a fixed
+figure in a tool description would be a fiction whichever number it picked, which is most of why
+ADR-0023 has the tool report what it measured instead of quoting this table.
+
+Note this is `InstanceCounts` over 600,000 objects against the 630 ms the 2M row measures: the same
+direction as the original table, not a linear scaling of it.
+
 ## Not yet measured
 
 - **JDK 11 and 21.** Only 17.0.20 is covered above. The `capabilities` vector in particular is per-JVM and

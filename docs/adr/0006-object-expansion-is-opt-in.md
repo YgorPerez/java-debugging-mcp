@@ -8,7 +8,8 @@ The original variable-inspection plan assumed objects would auto-expand to `max_
 
 Expansion is **opt-in** (`expand_objects:true`).
 
-`debug.get_stack`'s default renders an object as `Type (id=0x…)` with **no invocation at all** — it passes no
+`debug.get_stack`'s default renders an object as `Type @0x…` (it was `Type (id=0x…)` until ADR-0022 made
+the printed id a usable expression head) with **no invocation at all** — it passes no
 thread, so nothing can run in the debuggee. `debug.evaluate`'s default **does** invoke: it calls `toString()`
 to render the value, because "show me this value" is the whole request. Those are different defaults, and this
 ADR originally described only the first as though it covered both.

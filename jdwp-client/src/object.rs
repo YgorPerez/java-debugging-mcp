@@ -48,6 +48,37 @@ impl JdwpConnection {
         Ok(reference_type_id)
     }
 
+    /// Whether the object behind an id has been garbage collected
+    /// (`ObjectReference.IsCollected`, set 9 command 9).
+    ///
+    /// **The one command that answers "vanished" as a fact rather than as a failure.** A JDWP object id
+    /// is a weak reference — the JVM is free to collect the object while the debugger still holds the
+    /// number — and every other command answers [`ERR_INVALID_OBJECT`](crate::protocol::ERR_INVALID_OBJECT)
+    /// once that happens, which is the same code a *typo* produces. This one separates the two while the
+    /// JVM still remembers the id: `Ok(true)` is "it was here and it is gone", where an
+    /// `INVALID_OBJECT` **error** from this command means the JVM has no record of the id at all —
+    /// collected long enough ago that the mapping itself was dropped, or never valid.
+    ///
+    /// Deliberately not paired with `DisableCollection` / `EnableCollection` (commands 7 and 8): pinning
+    /// an object so its id stays readable makes the debugger the reason a live heap cannot be collected.
+    /// See ADR-0022.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed. In particular
+    /// `INVALID_OBJECT` (20) for an id this JVM has no record of.
+    pub async fn is_collected(&mut self, object_id: ObjectId) -> JdwpResult<bool> {
+        let id = self.next_id();
+        let mut packet =
+            CommandPacket::new(id, command_sets::OBJECT_REFERENCE, object_reference_commands::IS_COLLECTED);
+        packet.data.put_u64(object_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        Ok(read_u8(&mut data)? != 0)
+    }
+
     /// Get field values from an object (ObjectReference.GetValues command)
     ///
     /// # Arguments

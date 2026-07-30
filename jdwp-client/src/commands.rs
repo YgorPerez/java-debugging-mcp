@@ -44,6 +44,9 @@ pub mod vm_commands {
     pub const RELEASE_EVENTS: u8 = 16;
     pub const CAPABILITIES_NEW: u8 = 17;
     pub const REDEFINE_CLASSES: u8 = 18;
+    /// How many live instances each of several types has — one heap walk for the whole batch, which is
+    /// why the tool takes a list (DISC-10).
+    pub const INSTANCE_COUNTS: u8 = 21;
 }
 
 // ReferenceType commands (set 2)
@@ -63,6 +66,8 @@ pub mod reference_type_commands {
     pub const SIGNATURE_WITH_GENERIC: u8 = 13;
     pub const FIELDS_WITH_GENERIC: u8 = 14;
     pub const METHODS_WITH_GENERIC: u8 = 15;
+    /// The live instances of ONE type — **exact type, not subtype-inclusive** (DISC-10).
+    pub const INSTANCES: u8 = 16;
 }
 
 // Method commands (set 6)

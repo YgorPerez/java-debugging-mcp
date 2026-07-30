@@ -4871,8 +4871,8 @@ fn read_only_blocks_every_invocation_path() {
     //    render from the type name and id instead — no invocation.
     let obj = server.evaluate("order");
     assert!(
-        obj.contains("(id=0x"),
-        "a read-only object render must fall back to Type (id=0x…) rather than invoking toString(): {obj}"
+        obj.contains("@0x"),
+        "a read-only object render must fall back to Type @0x… rather than invoking toString(): {obj}"
     );
 
     // 2. A List subscript used to invoke `List.get(int)` — also parenthesis-free, also previously
@@ -9810,6 +9810,321 @@ fn a_trace_expr_decodes_a_byte_array_and_reads_its_length_without_suspending() {
         &length,
         &["req.length => (int) 9"],
     );
+
+    server.panic_reset();
+}
+
+/// The `<n>` of `HeapProbe`'s `tick … gap=<n>ms` line — the probe's own measurement of how long it was
+/// held. A tick is the only evidence an application thread is running, so the pause a stop-the-world
+/// heap walk imposes shows up here and nowhere else; the debugger reports success either way.
+fn tick_gap_ms(line: &str) -> Option<i64> {
+    let at = line.find("gap=")? + "gap=".len();
+    line.get(at..)?.strip_suffix("ms")?.parse().ok()
+}
+
+/// The largest gap the probe has printed since `from` lines of output.
+fn worst_gap_since(probe: &Probe, from: usize) -> i64 {
+    probe.output().iter().skip(from).filter_map(|l| tick_gap_ms(l)).max().unwrap_or(0)
+}
+
+/// DISC-10: the heap query ships, and it reports what it cost — measured on both sides.
+///
+/// Four things are being pinned here, and the third and fourth are the ones the maintainer's decision
+/// on #84 turns on. That `Instances` is **exact type** — `Widget` answers 7 with two live `SubWidget`s
+/// in the heap, which is `CONTEXT.md`'s `Loaded` trap in a new costume and would otherwise be
+/// discovered. That the handles it returns are **usable**, which is the whole reason #84 was blocked on
+/// #85. That the reply states its own **held duration** rather than refusing or demanding an
+/// acknowledgement (ADR-0010's precedent, ADR-0023's decision). And that the duration is real: the
+/// probe's own tick gaps have to widen while the walks run, because the debugger reports success either
+/// way and its own number would otherwise be unfalsifiable.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+#[allow(clippy::too_many_lines)] // one linear script against one shaped heap; splitting it would mean
+                                 // allocating the ballast twice for halves that only mean anything together
+fn a_heap_query_answers_by_exact_type_and_reports_the_pause_it_imposed() {
+    let Some(jdk) = jdk_or_skip("a_heap_query_answers_by_exact_type_and_reports_the_pause_it_imposed") else {
+        return;
+    };
+    // `launch_running`: the ballast takes a moment to allocate and nothing is asked about a class that
+    // has not been instantiated yet.
+    let probe = Probe::launch_running(&jdk, "HeapProbe", |l| l.starts_with("ready")).expect("launch");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // A quiet stretch first, so the pause below is measured against this probe on this box rather than
+    // against the 50ms the probe intends to sleep for.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let quiet_from = probe.output().len();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let quiet_worst = worst_gap_since(&probe, quiet_from);
+    let busy_from = probe.output().len();
+
+    let types = serde_json::json!(["HeapProbe$Widget", "HeapProbe$SubWidget", "HeapProbe$Nothing"]);
+
+    // 1. Exact-type counts, in one call, over one batch.
+    let listed =
+        server.call("debug.list_instances", serde_json::json!({"class_names": types, "max_instances": 3}));
+    assert_contains_all(
+        "exact-type counts, with the semantic stated rather than left to be discovered",
+        &listed,
+        &[
+            "HeapProbe$Widget — 7 live instance(s)",
+            "HeapProbe$SubWidget — 2 live instance(s)",
+            "HeapProbe$Nothing — 0 live instance(s)",
+            "EXACT TYPE, NOT SUBTYPE-INCLUSIVE",
+            "HELD APPLICATION THREADS FOR ~",
+        ],
+    );
+    // 7, not 9: the two SubWidgets are live and are NOT counted as Widgets. And not 10 either — the
+    // three unreachable Widgets are never reported.
+    assert!(!listed.contains("Widget — 9 live"), "Instances is exact-type, not subtype-inclusive: {listed}");
+    // The clamp bounds the handles and not the count, so a clamped listing still says how many exist.
+    assert_contains_all(
+        "max_instances clamps what is shown, never what is reported",
+        &listed,
+        &["showing 3", "… +4 more"],
+    );
+
+    // 2. The handles work. This is the whole reason #84 was blocked on #85 — without it the tool
+    //    returns identifiers nothing can dereference.
+    let handle = listed
+        .lines()
+        .filter(|l| l.starts_with("  ") && l.contains("HeapProbe$Widget"))
+        .find_map(|l| l.split_whitespace().find(|w| w.starts_with("@0x")))
+        .unwrap_or_else(|| panic!("no @0x… handle in:\n{listed}"))
+        .to_string();
+    let payload = server.evaluate(&format!("{handle}.payload"));
+    assert!(
+        payload.contains("widget-"),
+        "a handle from list_instances must be an expression head that reaches that object: {payload}"
+    );
+
+    // 3. counts_only is one walk for the whole batch and returns no handles.
+    let counted =
+        server.call("debug.list_instances", serde_json::json!({"class_names": types, "counts_only": true}));
+    assert_contains_all(
+        "counts_only answers the cheap half in a single walk",
+        &counted,
+        &["1 live-heap walk(s)", "HeapProbe$Widget — 7 live instance(s)"],
+    );
+    assert!(!counted.contains("@0x"), "counts_only returns no handles: {counted}");
+
+    // 4. A negative clamp is refused without spending a walk to learn it.
+    let bad = server.call(
+        "debug.list_instances",
+        serde_json::json!({"class_names": ["HeapProbe$Widget"], "max_instances": -1}),
+    );
+    assert_contains_all("a negative max_instances is refused here, not by the JVM", &bad, &["max_instances"]);
+    assert!(!bad.contains("live-heap walk"), "nothing should have been walked: {bad}");
+
+    // A name that does not resolve is reported beside the answers rather than failing the call — the
+    // same partial-success rule a batch of class patterns follows.
+    let mixed = server.call(
+        "debug.list_instances",
+        serde_json::json!({"class_names": ["HeapProbe$Widget", "no.such.Type"], "counts_only": true}),
+    );
+    assert_contains_all(
+        "an unresolvable name costs nothing and does not lose the others",
+        &mixed,
+        &["HeapProbe$Widget — 7 live instance(s)", "no.such.Type — not resolved"],
+    );
+
+    // 5. THE MEASUREMENT, from the debuggee. Nothing was suspended by the debugger, and the reply says
+    //    it was still held — so the probe's ticks must show it. This is the only unfalsifiable half.
+    let busy_worst = worst_gap_since(&probe, busy_from);
+    // Printed rather than only asserted: the two numbers ARE the finding, and a run log that names them
+    // is what lets someone reproduce this on another box and another heap size.
+    println!("HeapProbe tick gaps: worst quiet={quiet_worst}ms, worst during the heap walks={busy_worst}ms");
+    println!("debugger's own figure for one walk: {}", counted.lines().next().unwrap_or("(missing)"));
+    assert!(
+        busy_worst > quiet_worst,
+        "a stop-the-world walk must show up as a widened tick gap — quiet {quiet_worst}ms vs busy \
+         {busy_worst}ms\n  output: {:?}",
+        probe.output(),
+    );
+    // And the probe is still running: the walk holds threads, it does not leave them suspended.
+    let after = probe.output().len();
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_gap_ms(l).is_some()).is_some() || after > busy_from,
+        "the probe must still be ticking after the walks\n  output: {:?}",
+        probe.output(),
+    );
+
+    server.panic_reset();
+}
+
+/// Pull the `@0x…` handle that follows `<name>=` on one `debug.get_traces` line (TRACE-10).
+///
+/// Reads the handle the reply printed rather than reconstructing one, which is the point of the two
+/// tests below: a handle is only useful if the exact text a snapshot shows can be pasted back in.
+fn traced_handle(line: &str, name: &str) -> Option<String> {
+    let after = line.split_once(&format!("{name}="))?.1;
+    let at = after.find("@0x")?;
+    let rest = &after[at..];
+    let end = rest[3..].find(|c: char| !c.is_ascii_hexdigit()).map_or(rest.len(), |i| i + 3);
+    Some(rest[..end].to_string())
+}
+
+/// TRACE-10 half two: a snapshot inside an ANONYMOUS class shows the enclosing method's captures.
+///
+/// The captures are synthetic `val$…` fields plus `this$0`, and none of them are in `call()`'s local
+/// variable table — so before this the whole causal chain across the thread boundary was invisible and
+/// the snapshot showed a single `this`. `plain()` is traced in the same run as the control, because "no
+/// captured section here" has to be measured against a live ordinary site rather than against silence.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_snapshot_inside_an_anonymous_class_shows_the_enclosing_captures() {
+    let Some(jdk) = jdk_or_skip("a_snapshot_inside_an_anonymous_class_shows_the_enclosing_captures") else {
+        return;
+    };
+    // `launch_running`, not `launch`: the anonymous class does not exist until the warmup task has run
+    // it, and arming before that would legitimately DEFER and prove nothing (TEST-17, #49).
+    let probe = Probe::launch_running(&jdk, "CapturedProbe", |l| l.starts_with("ready")).expect("launch");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let base = highest_tick(&probe).unwrap_or(-1);
+    let src = probe_source("CapturedProbe");
+
+    let anon = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "CapturedProbe$1", "line": probe_line(&src, "// BP1"), "trace": true,
+        }),
+    );
+    assert!(anon.contains("bp_"), "the anonymous class's call() must arm: {anon}");
+    let plain = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "CapturedProbe", "line": probe_line(&src, "// BP2"), "trace": true,
+        }),
+    );
+    assert!(plain.contains("bp_"), "the control site must arm: {plain}");
+
+    // Reading four extra fields per hit must still leave nothing suspended, and only the probe's own
+    // output can say so.
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
+        "probe stopped ticking after the captured-field read — a hit left it suspended\n  output: {:?}",
+        probe.output(),
+    );
+
+    let traces = server
+        .wait_for_traces("supplier-A", EVENT_TIMEOUT)
+        .expect("no traced hit inside the anonymous class");
+    let hit = traces
+        .lines()
+        .find(|l| l.contains("supplier-A"))
+        .unwrap_or_else(|| panic!("no supplier-A trace line in:\n{traces}"));
+
+    // Both captured locals BY NAME, plus the enclosing instance — the acceptance criterion.
+    assert_contains_all(
+        "the enclosing method's captures are on the snapshot, by name",
+        hit,
+        &[" captured{", "val$supplier=\"supplier-A\"", "val$attempt=(int) ", "val$request=", "this$0="],
+    );
+
+    // The control. `plain()` is an ordinary static method on an ordinary class, hit in the same run.
+    let plain_hit =
+        server.wait_for_traces("CapturedProbe.plain:", EVENT_TIMEOUT).expect("the control site never fired");
+    for line in plain_hit.lines().filter(|l| l.contains("CapturedProbe.plain:")) {
+        assert!(!line.contains("captured{"), "an ordinary class has no captures to show: {line}");
+    }
+
+    // Side-effect free, measured rather than asserted: `Request.toString()` counts its own calls, and
+    // rendering four fields (one of them a Request) must not have run a line of debuggee code.
+    let calls = server.evaluate("CapturedProbe.toStringCalls");
+    assert!(
+        calls.contains("(int) 0"),
+        "capturing the enclosing values must invoke nothing in the debuggee: {calls}"
+    );
+
+    server.panic_reset();
+}
+
+/// TRACE-10 half one: a handle a snapshot kept dereferences later, and says **vanished** when it cannot.
+///
+/// Three readings, all from the same run: a handle whose object is pinned in a `static final` reads a
+/// field long after the hit; an id this JVM never issued is refused as vanished rather than as a raw
+/// JDWP error; and an object deliberately dropped and collected mid-session becomes the same reading —
+/// which is the one that matters, because on a pool that retires workers it is the ordinary case.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_object_handle_outlives_its_snapshot_and_reports_when_it_has_not() {
+    let Some(jdk) = jdk_or_skip("an_object_handle_outlives_its_snapshot_and_reports_when_it_has_not") else {
+        return;
+    };
+    let mut probe = Probe::launch_running(&jdk, "CapturedProbe", |l| l.starts_with("ready")).expect("launch");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let src = probe_source("CapturedProbe");
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "CapturedProbe$1", "line": probe_line(&src, "// BP1"), "trace": true,
+        }),
+    );
+
+    // ONE wait, for the LATER of the two hits. `wait_for_traces` returns on the first matching record,
+    // so waiting separately for each would read the buffer between them; the probe submits supplier-A
+    // before supplier-B in every iteration, so a buffer containing B already contains an A.
+    let traces =
+        server.wait_for_traces("supplier-B", EVENT_TIMEOUT).expect("the doomed request was never traced");
+    let pinned_line = traces
+        .lines()
+        .find(|l| l.contains("supplier-A"))
+        .unwrap_or_else(|| panic!("no supplier-A line in:\n{traces}"));
+    let doomed_line = traces
+        .lines()
+        .find(|l| l.contains("supplier-B"))
+        .unwrap_or_else(|| panic!("no supplier-B line in:\n{traces}"));
+
+    let pinned = traced_handle(pinned_line, "val$request")
+        .unwrap_or_else(|| panic!("no handle beside val$request in: {pinned_line}"));
+    let doomed = traced_handle(doomed_line, "val$request")
+        .unwrap_or_else(|| panic!("no handle beside val$request in: {doomed_line}"));
+    assert_ne!(pinned, doomed, "the two requests are different objects: {traces}");
+
+    // 1. The handle reads a field of the same object, with nothing suspended and long after the hit.
+    let read = server.evaluate(&format!("{pinned}.id"));
+    assert!(read.contains("pinned-req"), "a retained handle must still read its object's field: {read}");
+    let doomed_read = server.evaluate(&format!("{doomed}.id"));
+    assert!(doomed_read.contains("doomed-req"), "the second handle names the other object: {doomed_read}");
+
+    // 2. An id this JVM never issued. Deterministic, and it exercises the same reading the collected
+    //    case reaches by the other route — the JVM answering INVALID_OBJECT rather than IsCollected.
+    let never = server.evaluate("@0xdeadbeefdeadbeef.id");
+    assert_contains_all(
+        "an id the JVM has no record of is a vanished reading, not a raw JDWP error",
+        &never,
+        &["Vanished", "WEAK reference"],
+    );
+
+    // 3. Forced collection: the acceptance criterion says to test this deliberately rather than to wait
+    //    for a pool to do it. The probe drops its last strong reference and runs two collections.
+    probe.send_line("drop").expect("send drop cue");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("dropped"))
+        .unwrap_or_else(|| panic!("the probe never dropped the request\n  output: {:?}", probe.output()));
+
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+    let mut last;
+    loop {
+        last = server.evaluate(&format!("{doomed}.id"));
+        if last.contains("Vanished") || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert_contains_all(
+        "a collected object's handle reads as vanished, in the debugger's own words",
+        &last,
+        &["Vanished", &doomed],
+    );
+    // The pinned one is unaffected: this is a fact about one object, not the handle mechanism failing.
+    let still = server.evaluate(&format!("{pinned}.id"));
+    assert!(still.contains("pinned-req"), "a live object's handle must survive the other's death: {still}");
 
     server.panic_reset();
 }

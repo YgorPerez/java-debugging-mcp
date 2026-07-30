@@ -163,6 +163,15 @@ pub fn read_u64(buf: &mut &[u8]) -> JdwpResult<u64> {
     Ok(buf.get_u64())
 }
 
+/// Read an i64
+///
+/// # Errors
+/// Returns a [`JdwpError`] if the buffer does not contain enough bytes or is malformed.
+pub fn read_i64(buf: &mut &[u8]) -> JdwpResult<i64> {
+    ensure(buf, 8, "i64")?;
+    Ok(buf.get_i64())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

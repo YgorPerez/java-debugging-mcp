@@ -545,6 +545,26 @@ impl TraceCost {
     }
 }
 
+/// One value a snapshot captured: what it was called, how it rendered, and — for a reference — the
+/// handle that reaches the same object again afterwards (TRACE-10, #85).
+///
+/// The id is carried **beside** the text rather than left inside it, because for most values it is not
+/// in the text at all: a String renders as its contents, an array as its elements, a boxed primitive as
+/// the number it holds, and an expanded object as a field block. Only the plain shallow render spells
+/// an id out, and a snapshot that kept only the rendering was therefore a dead end for exactly the
+/// values worth following up.
+///
+/// **The id is a weak reference and stays one.** Nothing pins it, so a handle may have *vanished* by
+/// the time it is used — `CONTEXT.md` defines the term, and ADR-0022 records why pinning was rejected.
+#[derive(Debug, Clone)]
+pub struct TracedValue {
+    pub name: String,
+    /// The value as the snapshot rendered it — no `toString()` was invoked to produce it.
+    pub rendered: String,
+    /// The JDWP object id, for a non-null reference. `None` for a primitive and for `null`.
+    pub object_id: Option<u64>,
+}
+
 /// One captured hit of a trace/logpoint breakpoint: where it fired, on which thread, the in-scope
 /// locals/args at that point, and an optional evaluated expression. Recorded without leaving the
 /// thread suspended.
@@ -556,8 +576,16 @@ pub struct TraceRecord {
     pub class: String,
     pub method: String,
     pub line: Option<i32>,
-    /// (name, rendered value) for each in-scope local/argument at the hit.
-    pub args: Vec<(String, String)>,
+    /// Each in-scope local/argument at the hit.
+    pub args: Vec<TracedValue>,
+    /// The enclosing method's captured locals, when the hit class is an **anonymous** inner class
+    /// (TRACE-10, #85). Empty for every other class.
+    ///
+    /// `javac` compiles an anonymous class's captures to synthetic `val$…` fields plus a `this$0` back
+    /// reference, and none of them are in `call()`'s local variable table — so a snapshot inside a
+    /// fan-out worker showed one `this` and nothing about the request that queued it. These are read as
+    /// **fields**, invoking nothing, so the capture stays side-effect free in trace mode.
+    pub captured: Vec<TracedValue>,
     /// The calling chain above the hit frame, nearest caller first, each as `class.method:line`
     /// (TRACE-5). Empty when `trace_frames` was 0, or when the hit is already the outermost frame.
     ///

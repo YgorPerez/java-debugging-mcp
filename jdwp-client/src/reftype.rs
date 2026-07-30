@@ -290,4 +290,60 @@ impl JdwpConnection {
         self.types().put_fields(ref_type_id, &fields);
         Ok(fields)
     }
+
+    /// The live instances of one type (`ReferenceType.Instances`, command 16).
+    ///
+    /// **This stops the world, and JDWP never says so.** No suspend is required and this client issues
+    /// none, yet the JVM holds every application thread for a full live-heap walk. Measured against
+    /// Temurin 17.0.20: **522 ms of held application threads on a 2,000,000-object heap** to answer with
+    /// 7 objects, against 54 ms on a 20,000-object heap for **the same 7 objects**. The cost tracks the
+    /// live heap, not the result. Full method and wire notes in `docs/heap-query-measurements.md`.
+    ///
+    /// **Exact type, not subtype-inclusive.** `Widget` answers 7 with two live `SubWidget`s in the heap,
+    /// not 9. On a CDI or EJB codebase the name a caller reaches for is usually the interface or the
+    /// base class, so this is the semantic most likely to produce a confident `0` about a type with
+    /// hundreds of live objects — the `Loaded` trap from `CONTEXT.md` in a new costume. Anything built
+    /// on this has to say so rather than let it be discovered.
+    ///
+    /// Only **strongly reachable** objects are reported. `max_instances` `0` means all, a positive value
+    /// clamps, and a negative one is `ILLEGAL_ARGUMENT` (103) — rejected here before the round trip,
+    /// since a wire error is a poor way to report an argument this crate can see is wrong.
+    ///
+    /// Each returned [`Value`] carries the JVM's own tag, so a String, an array, a thread and a class
+    /// object are distinguishable without a follow-up round trip.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed. `NOT_IMPLEMENTED`
+    /// (99) when the JVM lacks `canGetInstanceInfo`, and `INVALID_OBJECT` (20) for a bogus type id — ask
+    /// [`capabilities_new`](JdwpConnection::capabilities_new) first, so a refusal reads as "this JVM
+    /// cannot answer that".
+    pub async fn instances(
+        &mut self,
+        ref_type_id: ReferenceTypeId,
+        max_instances: i32,
+    ) -> JdwpResult<Vec<crate::types::Value>> {
+        if max_instances < 0 {
+            return Err(crate::protocol::JdwpError::Protocol(format!(
+                "max_instances must be 0 (all) or positive, got {max_instances}"
+            )));
+        }
+        let id = self.next_id();
+        let mut packet =
+            CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::INSTANCES);
+        packet.data.put_u64(ref_type_id);
+        packet.data.put_i32(max_instances);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let count = read_i32(&mut data)?;
+        let mut out = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        for _ in 0..count {
+            let tag = crate::reader::read_u8(&mut data)?;
+            let value_data = crate::reader::read_value_by_tag(tag, &mut data)?;
+            out.push(crate::types::Value { tag, data: value_data });
+        }
+        Ok(out)
+    }
 }
