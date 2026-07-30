@@ -1182,6 +1182,262 @@ fn collection_subscripts_index_slice_and_filter() {
     );
 }
 
+/// EVAL-10 (#92) — the reply's marker for a collection read by walking its own fields.
+const WALKED: &str = "📐 read structurally";
+/// EVAL-10 (#92) — the reply's marker for a collection read by invoking in the debuggee.
+const INVOKED: &str = "⚙️ read by invoking";
+
+/// The ANSWER half of a `debug.evaluate` reply — what the two read paths must agree on.
+///
+/// Deliberately not the whole reply. The EVAL-10 path note is exactly what has to differ, and the
+/// header in front of a slice or filter names the runtime type, which differs by construction: one
+/// side is a `java.util.HashMap`, the other the wrapper holding it.
+fn answer(reply: &str) -> String {
+    let body = reply.split_once(" = ").map_or(reply, |(_, v)| v);
+    // A multi-value reply is `<type>[…] → N of M unit {`, one line per element, then `}`.
+    if let Some((head, rest)) = body.split_once('{') {
+        let selection = head.split_once('→').map_or("", |(_, s)| s).trim();
+        let elements: Vec<&str> =
+            rest.lines().map(str::trim).take_while(|l| *l != "}").filter(|l| !l.is_empty()).collect();
+        return format!("{selection}\n{}", elements.join("\n"));
+    }
+    body.lines().next().unwrap_or_default().trim().to_string()
+}
+
+/// Assert the structural and the invoking path returned the same answer over the same objects, and
+/// that each reply said which path it took.
+///
+/// The comparison is against the OTHER PATH, never against a hardcoded expectation — that is what
+/// keeps the two from drifting apart as either changes.
+fn assert_paths_agree(label: &str, walked: &str, invoked: &str) {
+    assert!(walked.contains(WALKED), "{label}: expected a structural read, got:\n{walked}");
+    assert!(invoked.contains(INVOKED), "{label}: expected an invoking read, got:\n{invoked}");
+    assert_eq!(
+        answer(walked),
+        answer(invoked),
+        "{label}: the two paths disagree\n--- structural ---\n{walked}\n--- invoking ---\n{invoked}"
+    );
+}
+
+/// The sixteen equal-hash keys `CollectionProbe` builds, rebuilt here rather than copied, so the test
+/// and the probe cannot drift apart on which keys collide.
+fn colliding_keys() -> Vec<String> {
+    let two = ["Aa", "BB"];
+    let mut out = Vec::new();
+    for a in two {
+        for b in two {
+            for c in two {
+                for d in two {
+                    out.push(format!("{a}{b}{c}{d}"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// EVAL-10 (#92): a subscript, a slice and a filter over the standard collections **with nothing
+/// suspended** — which is the whole point, since invoking `get()` needs a suspended thread and the
+/// shared 8180 is exactly the instance you cannot afford to suspend.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+// One probe, one premise ("nothing is suspended"), and every assertion below only means anything
+// while that premise holds — so this cannot be split without each half re-establishing it.
+#[allow(clippy::too_many_lines)]
+fn collection_reads_walk_the_layout_with_no_suspended_thread() {
+    let Some(jdk) = jdk_or_skip("collection_reads_walk_the_layout_with_no_suspended_thread") else {
+        return;
+    };
+    // The first question here is about static fields, and a static field of a class that has not
+    // initialised yet answers "not loaded" *correctly* — so wait for the probe to be RUNNING rather
+    // than merely listening (TEST-17).
+    let probe = Probe::launch_running(&jdk, "CollectionProbe", |l| l.starts_with("inspect "))
+        .expect("launch CollectionProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // The premise, asserted rather than assumed: no stop point was armed and nothing is suspended.
+    let before = server.call("debug.list_threads", serde_json::json!({"only_suspended": true, "limit": 200}));
+    assert!(before.trim_start().starts_with("0/"), "something was already suspended:\n{before}");
+
+    // --- a subscript on each recognised layout, with no thread to invoke on ---
+    let hash = server.evaluate("CollectionProbe.HASH[\"b\"].sku");
+    assert_contains_all("HashMap key with no suspended thread", &hash, &["\"bb\"", WALKED]);
+    // The note is not decoration: it states the two things the value itself cannot say.
+    assert_contains_all(
+        "the walk states what it did and did not do",
+        &hash,
+        &["no thread had to be suspended", "SAMPLE of a live collection"],
+    );
+    assert_contains_all(
+        "LinkedHashMap key",
+        &server.evaluate("CollectionProbe.LINKED[\"d\"].qty"),
+        &["(int) 9", WALKED],
+    );
+    assert_contains_all(
+        "ConcurrentHashMap key",
+        &server.evaluate("CollectionProbe.CONCURRENT[\"e\"].sku"),
+        &["\"ee\"", WALKED],
+    );
+    assert_contains_all(
+        "ArrayList index",
+        &server.evaluate("CollectionProbe.LIST[2].sku"),
+        &["\"cc\"", WALKED],
+    );
+    // An int key is boxed to Integer before `get(Object)` sees it, so the walk compares against an
+    // Integer key too — `Integer.equals(Long)` is false and both paths have to say so.
+    assert_contains_all(
+        "Integer-keyed map",
+        &server.evaluate("CollectionProbe.BY_ID[3].sku"),
+        &["\"dd\"", WALKED],
+    );
+    // A key that is not there is `null`, which is an answer rather than an error — the same one
+    // `get()` gives.
+    assert_contains_all("absent key", &server.evaluate("CollectionProbe.HASH[\"zz\"]"), &["null", WALKED]);
+
+    // --- the treeified bin ---
+    // Proven treeified rather than assumed: the table is read the same way the walk reads it, and a
+    // bin that treeified holds `HashMap$TreeNode` where an ordinary one holds `HashMap$Node`.
+    let table = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "CollectionProbe.TREEIFIED.table[0..64]", "max_children": 64}),
+    );
+    assert!(
+        table.contains("TreeNode"),
+        "the colliding keys did not treeify a bin, so the treeified case went untested:\n{table}"
+    );
+    assert_contains_all(
+        "first colliding key",
+        &server.evaluate("CollectionProbe.TREEIFIED[\"AaAaAaAa\"].sku"),
+        &["\"t0\"", WALKED],
+    );
+    assert_contains_all(
+        "last colliding key",
+        &server.evaluate("CollectionProbe.TREEIFIED[\"BBBBBBBB\"].sku"),
+        &["\"t15\"", WALKED],
+    );
+
+    // --- a slice: the backing array is 64 long, the list is 5, and the spare slots are null ---
+    let sliced = server.evaluate("CollectionProbe.LIST[0..64]");
+    assert_contains_all("an over-long slice clamps to size, not capacity", &sliced, &["5 of 5", WALKED]);
+    assert!(!sliced.contains("null"), "elementData's trailing nulls leaked into the list:\n{sliced}");
+
+    // --- a filter whose predicate reads a FIELD of each element, so it invokes nothing either ---
+    assert_contains_all(
+        "filter a HashMap by its values, keeping the keys",
+        &server.evaluate("CollectionProbe.HASH[?qty > 3]"),
+        &["3 of 5 entr(ies)", "\"b\" →", "\"d\" →", "\"e\" →", WALKED],
+    );
+
+    // --- an unrecognised implementation refuses instead of guessing at its internals ---
+    assert_contains_all(
+        "a synchronizedMap wrapper says what it needs and why",
+        &server.evaluate("CollectionProbe.HASH_WRAPPED[\"b\"]"),
+        &["needs a suspended thread", "java.util.Collections$SynchronizedMap", "structural reads cover"],
+    );
+    // A HashMap SUBCLASS has a HashMap's internals and is still not walked: recognition is by exact
+    // signature, because the next subclass along may keep its entries somewhere else entirely.
+    assert_contains_all(
+        "a HashMap subclass is not walked",
+        &server.evaluate("CollectionProbe.SUBCLASS[\"b\"]"),
+        &["needs a suspended thread"],
+    );
+
+    // Nothing above suspended anything, which is the claim being made — so it is asserted, not
+    // inferred from the reads having succeeded.
+    let after = server.call("debug.list_threads", serde_json::json!({"only_suspended": true, "limit": 200}));
+    assert!(after.trim_start().starts_with("0/"), "a collection read suspended a thread:\n{after}");
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("inspect ")).is_some(),
+        "the probe stopped running while its collections were read"
+    );
+}
+
+/// EVAL-10 (#92): the walked answer and the invoked answer, over the same objects.
+///
+/// Every pair below reads one collection twice — once through the field walk, once through a wrapper
+/// of the same object that is not a recognised layout and therefore goes through `get()` /
+/// `entrySet()` / `toArray()`. Asserting them equal to each other rather than to a written-down
+/// expectation is what keeps the two implementations from drifting.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+#[allow(clippy::too_many_lines)]
+fn structural_and_invoking_collection_reads_agree() {
+    let Some(jdk) = jdk_or_skip("structural_and_invoking_collection_reads_agree") else { return };
+    let probe = Probe::launch(&jdk, "CollectionProbe").expect("launch CollectionProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // A suspended thread, so that the INVOKING half of every comparison is reachable at all.
+    let line = probe_line(&probe_source("CollectionProbe"), "// BP1");
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "CollectionProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in CollectionProbe.inspect never fired");
+
+    for (label, walked, invoked) in [
+        ("HashMap key", "CollectionProbe.HASH[\"b\"]", "CollectionProbe.HASH_WRAPPED[\"b\"]"),
+        ("HashMap absent key", "CollectionProbe.HASH[\"zz\"]", "CollectionProbe.HASH_WRAPPED[\"zz\"]"),
+        ("LinkedHashMap key", "CollectionProbe.LINKED[\"c\"]", "CollectionProbe.LINKED_WRAPPED[\"c\"]"),
+        (
+            "ConcurrentHashMap key",
+            "CollectionProbe.CONCURRENT[\"e\"]",
+            "CollectionProbe.CONCURRENT_WRAPPED[\"e\"]",
+        ),
+        ("Integer key", "CollectionProbe.BY_ID[3]", "CollectionProbe.BY_ID_WRAPPED[3]"),
+        ("ArrayList index", "CollectionProbe.LIST[4]", "CollectionProbe.LIST_WRAPPED[4]"),
+        // Same five entries, one map walked and one map's subclass invoked.
+        ("HashMap subclass", "CollectionProbe.HASH[\"a\"]", "CollectionProbe.SUBCLASS[\"a\"]"),
+        ("ArrayList slice", "CollectionProbe.LIST[1..4]", "CollectionProbe.LIST_WRAPPED[1..4]"),
+        (
+            "ArrayList slice past its size",
+            "CollectionProbe.LIST[0..64]",
+            "CollectionProbe.LIST_WRAPPED[0..64]",
+        ),
+        ("HashMap filter", "CollectionProbe.HASH[?qty > 3]", "CollectionProbe.HASH_WRAPPED[?qty > 3]"),
+        // ORDER, not just membership: LINKED was built backwards, so its iteration order and its table
+        // order differ, and a walk of the wrong half would return the right entries in the wrong order.
+        (
+            "LinkedHashMap filter keeps insertion order",
+            "CollectionProbe.LINKED[?qty > 0]",
+            "CollectionProbe.LINKED_WRAPPED[?qty > 0]",
+        ),
+        (
+            "ConcurrentHashMap filter",
+            "CollectionProbe.CONCURRENT[?qty > 3]",
+            "CollectionProbe.CONCURRENT_WRAPPED[?qty > 3]",
+        ),
+        (
+            "Integer-keyed filter",
+            "CollectionProbe.BY_ID[?qty > 3]",
+            "CollectionProbe.BY_ID_WRAPPED[?qty > 3]",
+        ),
+        (
+            "treeified filter",
+            "CollectionProbe.TREEIFIED[?qty > 12]",
+            "CollectionProbe.TREEIFIED_WRAPPED[?qty > 12]",
+        ),
+    ] {
+        let a = server.evaluate(walked);
+        let b = server.evaluate(invoked);
+        assert_paths_agree(label, &a, &b);
+    }
+
+    // Every one of the sixteen colliding keys, because a treeified bin is exactly where a walk that
+    // followed the red-black tree instead of the `next` chain would quietly lose entries.
+    for key in colliding_keys() {
+        let a = server.evaluate(&format!("CollectionProbe.TREEIFIED[\"{key}\"]"));
+        let b = server.evaluate(&format!("CollectionProbe.TREEIFIED_WRAPPED[\"{key}\"]"));
+        assert_paths_agree(&format!("treeified key {key}"), &a, &b);
+    }
+
+    server.panic_reset();
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("inspect ")).is_some(),
+        "probe stopped running after the comparison"
+    );
+}
+
 /// The original roadmap's success criteria (`docs/VARIABLE_INSPECTION_PLAN.md`, appendix items 10/14),
 /// checked one by one against a stand-in for Spring Boot + Micrometer.
 ///
@@ -4283,9 +4539,20 @@ fn read_only_blocks_every_invocation_path() {
         "a read-only object render must fall back to Type (id=0x…) rather than invoking toString(): {obj}"
     );
 
-    // 2. A List subscript invokes List.get(int) — also parenthesis-free, also previously missed.
+    // 2. A List subscript used to invoke `List.get(int)` — also parenthesis-free, also previously
+    //    missed by the text guard. Since EVAL-10 (#92) it invokes nothing: an `ArrayList` is read by
+    //    walking `elementData`, so read-only ALLOWS it and the reply says which path it took. ADR-0001
+    //    is unchanged — reads needing no invocation were always untouched; what moved is which reads
+    //    those are.
     let sub = server.evaluate("order.lines[0]");
-    assert_contains_all("a List subscript is refused", &sub, &["Read-only"]);
+    assert_contains_all("a List subscript is a field walk now, and says so", &sub, &["Line", WALKED]);
+    // A `Map` that is NOT a recognised layout still reaches its entry through `get()`, so the wire
+    // guard still refuses it — the property this case was added for is intact.
+    assert_contains_all(
+        "a subscript that must still invoke is still refused",
+        &server.evaluate("order.wrappedCounts[\"a\"]"),
+        &["Read-only"],
+    );
 
     // 3. An explicit call is still refused (it always was).
     assert_contains_all(
