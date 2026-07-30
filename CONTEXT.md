@@ -76,6 +76,20 @@ _Avoid_: hidden class (the `/` suffix and the absent name are the JVM's doing; t
 can type), proxy (true of `_ClientProxy` and wrong for `_Subclass`, which is an inheritance relationship and is
 the one you will actually be standing in)
 
+**Erased type**:
+A type shown without its parameters because the debuggee had no generic signature to give — **not** a claim that
+the declaration was raw.
+The two readings arrive identically, which is why this needs a word. A generic signature is an *optional*
+class-file attribute — absent from code compiled without it, from some synthetic members, and from arrays of type
+variables — and JDWP answers with an **empty string** rather than an error. But `List` declared raw and
+`List<ReservaHotel>` whose signature was stripped are different facts about the code, and the caller's next move
+differs: in the first there is nothing more to know, in the second the element type exists and has to be reached
+another way, by reading an element and asking its runtime type.
+It only reads as ambiguous where the class *declares* parameters. `java.lang.String` has nothing missing and
+saying so would be noise; a bare `java.util.List` is the case that owes the caller a word.
+_Avoid_: raw type (a real thing in Java — a declaration that named no parameters — and precisely the reading
+this term exists in order *not* to assert)
+
 **Source drift**:
 The checkout in front of you not being the build that is running. A finding, not an error — the debuggee
 reports which file a class was compiled from, and a mismatch is the answer to a question rather than a
@@ -372,6 +386,21 @@ _Avoid_: stopped, frozen, paused (all read as application state)
 Stopped by the application's own logic — waiting on a monitor, sleeping, parked. Independent of suspension,
 and a thread can be both: a wedged thread is blocked but not suspended, so its stack stays unreadable until
 the debugger suspends it as well.
+
+**Monitor event**:
+One of the four transitions the debuggee reports around a lock: a thread beginning to wait for a monitor
+another thread holds, that thread acquiring it, a thread entering `Object.wait()`, and that wait ending.
+Their value is what they are *not*. **Blocked** is a state, and reading it means suspending the thread and
+asking — which makes "requests are hanging on a lock" the one wedged-server question that forces a suspension
+of a shared instance. These are that state's **edges**, reported as the debuggee runs, so the same question
+becomes a stream to watch instead of a freeze to impose.
+**They come in pairs, and only the second of each pair carries a duration** — the beginning of a wait cannot
+know how long it will last. Not a detail: a "report only waits longer than N ms" filter is expressible on the
+two *end* events and meaningless on the two *start* events, so offering it on all four would silently do
+nothing on half of them.
+_Avoid_: contention event (true of one pair, wrong for the other — `Object.wait()` is a thread waiting to be
+*notified*, not competing for a lock), deadlock (a cycle in who waits for whom; these are evidence for one and
+never a statement of one)
 
 **Finished**:
 Run to completion. JDWP still answers `ZOMBIE` for it while the debugger holds the `Thread` object, so it
