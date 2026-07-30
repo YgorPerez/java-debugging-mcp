@@ -300,7 +300,7 @@ impl DebugSession {
     /// Whether any tracked stop point currently holds `req_id` as its live JDWP request.
     fn owns_live_request(&self, req_id: i32) -> bool {
         let id = Some(req_id);
-        self.breakpoints.values().any(|b| b.request_id == id)
+        self.breakpoints.values().any(|b| b.owns_request(req_id))
             || self.exception_requests.values().any(|e| e.request_id == id)
             || self.watchpoints.values().any(|w| w.request_id == id)
             || self.method_exits.values().any(|m| m.request_id == id)
@@ -882,9 +882,22 @@ impl PatternStopSet {
 
 #[derive(Debug, Clone)]
 pub struct BreakpointInfo {
-    /// The live JDWP request id, or `None` when the breakpoint is disabled — its definition is kept
-    /// so it can be re-armed, but no request is set in the JVM (BP-1).
-    pub request_id: Option<i32>,
+    /// The live JDWP request ids — **one per armed bytecode location** — or empty when the breakpoint
+    /// is disabled, in which case its definition is kept so it can be re-armed but no request is set in
+    /// the JVM (BP-1).
+    ///
+    /// A set rather than a single id because one source line can map to several bytecode locations:
+    /// `javac` inlines a `finally` body once per exit path, so the line is in the table twice and a
+    /// breakpoint that armed only the first copy fired on normal completion and never on the throw
+    /// (BP-4, #78). The stop point stays **one** thing to the caller — ADR-0005's one-id-per-stop-point
+    /// rule is untouched — and this is the internal multiplicity underneath it.
+    ///
+    /// A `Vec` rather than a primary-plus-extras pair specifically because this field is *looked up by*
+    /// (a hit arrives carrying a request id, and something has to find the stop point it belongs to).
+    /// Any lookup that checked only a primary would silently miss hits on the exception-path copy, which
+    /// is the bug being fixed wearing a different hat. Go through [`Self::owns_request`] rather than
+    /// matching on an element.
+    pub request_ids: Vec<i32>,
     pub class_pattern: String,
     pub line: u32,
     pub method: Option<String>,
@@ -918,6 +931,22 @@ pub struct BreakpointInfo {
     pub arm: BreakpointArm,
 }
 
+impl BreakpointInfo {
+    /// Whether `req` is one of this breakpoint's armed requests.
+    ///
+    /// The only supported way to ask. See [`Self::request_ids`] for why a lookup must not match on one
+    /// element: a breakpoint on a `finally` line owns two requests, and the second is the one that
+    /// fires when the code being debugged failed.
+    pub fn owns_request(&self, req: i32) -> bool {
+        self.request_ids.contains(&req)
+    }
+
+    /// Whether this breakpoint currently has any live request in the JVM.
+    pub fn is_armed(&self) -> bool {
+        !self.request_ids.is_empty()
+    }
+}
+
 /// The resolved JDWP location and modifiers for a breakpoint, kept so a disabled breakpoint can be
 /// re-armed at exactly the same place with the same behaviour (BP-1).
 #[derive(Debug, Clone)]
@@ -925,6 +954,15 @@ pub struct BreakpointArm {
     pub class_id: u64,
     pub method_id: u64,
     pub bytecode_index: u64,
+    /// The *other* bytecode indices this line resolved to, when `javac` emitted the line more than once
+    /// (BP-4, #78). Empty for the ordinary single-location breakpoint.
+    ///
+    /// Deliberately a primary plus extras rather than the `Vec` [`BreakpointInfo::request_ids`] uses,
+    /// and the asymmetry is the point: these are only ever *read together* at the arming site, so
+    /// keeping the first out of the collection makes "there is at least one location" true by
+    /// construction. Request ids are *searched*, where the same shape would invite a lookup that
+    /// checks only the primary.
+    pub extra_bytecode_indices: Vec<u64>,
     pub suspend_policy: jdwp_client::SuspendPolicy,
     pub hit_count: Option<i32>,
     pub thread_filter: Option<u64>,

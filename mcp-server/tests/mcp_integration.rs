@@ -8017,3 +8017,135 @@ fn evaluate_chain_names_the_link_that_went_null() {
 
     server.panic_reset();
 }
+
+/// BP-4 (#78): one source line, several bytecode copies — arm all of them.
+///
+/// `javac` inlines a `finally` body once per exit path, so the line is in the line table twice. The
+/// resolver used to take the first match, which is the normal-completion copy in ascending code-index
+/// order, and the stop point then reported the calls that SUCCEEDED and stayed silent on the throw.
+/// Silence that is indistinguishable from "the code never ran", on the one site — request and response
+/// both still in scope on both paths — that makes a `finally` the idiomatic logpoint.
+///
+/// Both halves are asserted on purpose. Checking only that the exception-path copy fires would also pass
+/// on a resolver that armed the *last* location instead of the first, which is the same bug rotated.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_finally_line_arms_every_copy_javac_emitted() {
+    let Some(jdk) = jdk_or_skip("a_finally_line_arms_every_copy_javac_emitted") else { return };
+    let probe = Probe::launch(&jdk, "FinallyProbe").expect("launch FinallyProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let src = probe_source("FinallyProbe");
+    let line = probe_line(&src, "// BP1");
+
+    // Trace mode, so the probe keeps driving both paths while this watches. `rs` is what separates the
+    // copies: "OK" on normal completion, still null when the throw carried us into the same line.
+    let set = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "FinallyProbe", "line": line, "trace": true, "trace_expr": "rs",
+        }),
+    );
+    assert_contains_all(
+        "a finally line reports that it armed more than one location",
+        &set,
+        &["bp_", "Armed at 2 locations", "finally"],
+    );
+
+    // The probe's own stdout first: without this the trace assertions below could pass vacuously on a
+    // run where the throwing call never happened. The debugger reports success either way.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("finally ") && l.contains("rs=OK"))
+        .expect("probe never completed call() normally");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("finally ") && l.contains("rs=null"))
+        .expect("probe never drove call() down the throwing path");
+
+    // And now the debugger has to have seen BOTH. Pre-fix, only the normal-completion copy is armed, so
+    // every record reads rs="OK" and this is the assertion that fails.
+    server.wait_for_traces("FinallyProbe.call", EVENT_TIMEOUT);
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    let rows: Vec<&str> = traces.lines().filter(|l| l.contains("FinallyProbe.call")).collect();
+    assert!(
+        rows.iter().any(|l| l.contains("\"OK\"")),
+        "no traced hit from the normal-completion copy of the finally line: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("rs=null")),
+        "no traced hit from the exception-path copy of the finally line — this is BP-4: the stop point \
+         armed the path that worked and went silent on the one being debugged: {rows:?}"
+    );
+
+    // ADR-0005 survives the change: one caller-facing id over two armed requests, so the stop point is
+    // listed once and cleared once.
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert_eq!(
+        listed.matches("bp_1").count(),
+        1,
+        "a two-location stop point must be listed once, not per armed request: {listed}"
+    );
+    assert!(
+        listed.contains("Armed at 2 locations"),
+        "the listing must say the stop point covers more than one location: {listed}"
+    );
+
+    let cleared = server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": "bp_1"}));
+    assert_contains_all("one clear removes every armed location", &cleared, &["✅", "bp_1"]);
+    let after = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(after.contains("No breakpoints set"), "clear left something armed: {after}");
+
+    server.panic_reset();
+}
+
+/// BP-4 (#78), the half that is easy to get wrong in the other direction: a stop point that owns two
+/// armed requests must charge its trace budget **once per hit**, not once per armed location.
+///
+/// Charging per location would halve the budget's meaning silently — the caller asks for 6 hits, the
+/// buffer holds 3, and nothing anywhere says why. Asserted through the auto-disarm rather than by
+/// reading a counter, because the disarm is the observable the caller actually has: it is what stops
+/// the recording.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_multi_location_stop_point_charges_its_budget_once_per_hit() {
+    let Some(jdk) = jdk_or_skip("a_multi_location_stop_point_charges_its_budget_once_per_hit") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "FinallyProbe").expect("launch FinallyProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let src = probe_source("FinallyProbe");
+    let line = probe_line(&src, "// BP1");
+
+    // 6 rather than 2: the probe drives both copies once per tick, so a per-location charge would
+    // disarm after three ticks with three records, and a per-hit charge after six hits.
+    let set = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "FinallyProbe", "line": line, "trace": true, "trace_expr": "rs",
+            "trace_max_hits": 6,
+        }),
+    );
+    assert_contains_all(
+        "armed with a small budget",
+        &set,
+        &["bp_1", "Armed at 2 locations", "Auto-disarms after 6"],
+    );
+
+    // Let the probe run well past the budget before reading, so the count cannot still be moving under
+    // the assertion. Six hits arrive within three ticks either way this is charged; ten ticks is slack.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > 9))
+        .expect("probe stopped ticking");
+
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    let rows = traces.lines().filter(|l| l.contains("FinallyProbe.call")).count();
+    assert_eq!(
+        rows, 6,
+        "a budget of 6 must buy 6 recorded hits across both armed locations, not 3 — per-location \
+         charging halves the budget with nothing in any reply to explain it:\n{traces}"
+    );
+
+    server.panic_reset();
+}

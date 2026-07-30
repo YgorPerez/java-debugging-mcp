@@ -655,10 +655,12 @@ impl RequestHandler {
 
         // Clear the breakpoint in the JVM — a disabled breakpoint has no live request, so there is
         // nothing to clear there, only the stored definition to drop (BP-1).
-        if let Some(req) = bp_info.request_id {
+        // Every one of them: a `finally` line owns a request per inlined copy (BP-4, #78), and clearing
+        // one would leave the others firing under an id the caller has already been told is gone.
+        for req in &bp_info.request_ids {
             session
                 .connection
-                .clear_breakpoint(req)
+                .clear_breakpoint(*req)
                 .await
                 .map_err(|e| format!("Failed to clear breakpoint: {e}"))?;
         }
@@ -673,7 +675,11 @@ impl RequestHandler {
             bp_id,
             bp_info.class_pattern,
             bp_info.line,
-            bp_info.request_id.map_or_else(|| "(disabled)".to_string(), |r| r.to_string()),
+            if bp_info.request_ids.is_empty() {
+                "(disabled)".to_string()
+            } else {
+                bp_info.request_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            },
         ))
     }
 
@@ -3518,6 +3524,19 @@ fn render_breakpoint_line(
     }
     if let Some(method) = &bp.method {
         let _ = writeln!(output, "     Method: {method}");
+    }
+    // BP-4 (#78): one caller-facing stop point over several armed JDWP requests. Printed only when there
+    // is more than one, so an ordinary listing stays byte-identical — and printed at all because the
+    // count is the only place a *re-armed* duplicated line can report that a copy was refused, the event
+    // pump and `toggle_stop_point` having no reply to carry it.
+    if bp.is_armed() && bp.request_ids.len() > 1 {
+        let _ = writeln!(
+            output,
+            "     Armed at {} locations (JDWP requests {}) — one source line, several bytecode copies, \
+             which is what `javac` emits for a `finally` body",
+            bp.request_ids.len(),
+            bp.request_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        );
     }
     if let Some(t) = bp.arm.thread_filter {
         let _ = writeln!(output, "     Thread filter: 0x{t:x}");
@@ -6642,7 +6661,7 @@ async fn try_arm_deferred_breakpoints(
             Ok(loc) => {
                 // Destructured rather than cloned: `method` is needed three times below and `lines`
                 // once, and taking both by value costs nothing per iteration.
-                let ResolvedLocation { method, code_index: index, line, lines } = loc;
+                let ResolvedLocation { method, code_index: index, extra_code_indices, line, lines } = loc;
                 let sp = suspend_policy_for(pend.trace);
                 match session
                     .connection
@@ -6657,6 +6676,22 @@ async fn try_arm_deferred_breakpoints(
                     .await
                 {
                     Ok(req_id) => {
+                        // The other copies of a duplicated line (BP-4, #78). A refused copy shows only
+                        // as a smaller count in `list_stop_points`, this being the event pump — there is
+                        // no reply here to carry the reason.
+                        let mut arm = crate::session::BreakpointArm {
+                            class_id: cp_ref,
+                            method_id: method.method_id,
+                            bytecode_index: index,
+                            extra_bytecode_indices: extra_code_indices,
+                            suspend_policy: sp,
+                            hit_count: pend.hit_count,
+                            thread_filter: pend.thread_filter,
+                        };
+                        let extra_copies = arm_extra_line_copies(session, &arm).await;
+                        arm.extra_bytecode_indices = extra_copies.armed;
+                        let mut request_ids = vec![req_id];
+                        request_ids.extend(extra_copies.request_ids);
                         // Do the bookkeeping that only borrows `pend` first, so its owned fields can
                         // be moved (not cloned) into the stored BreakpointInfo below.
                         let _ = session.connection.clear_class_prepare(pend.class_prepare_request_id).await;
@@ -6673,7 +6708,7 @@ async fn try_arm_deferred_breakpoints(
                         session.breakpoints.insert(
                             pend.bp_id,
                             crate::session::BreakpointInfo {
-                                request_id: Some(req_id),
+                                request_ids,
                                 class_pattern: pend.class_pattern,
                                 line: u32::try_from(line).unwrap_or(0),
                                 method: Some(method.name),
@@ -6686,14 +6721,7 @@ async fn try_arm_deferred_breakpoints(
                                 trace_budget: pend.trace_budget,
                                 trace_frames: pend.trace_frames,
                                 trace_cost: crate::session::TraceCost::default(),
-                                arm: crate::session::BreakpointArm {
-                                    class_id: cp_ref,
-                                    method_id: method.method_id,
-                                    bytecode_index: index,
-                                    suspend_policy: sp,
-                                    hit_count: pend.hit_count,
-                                    thread_filter: pend.thread_filter,
-                                },
+                                arm,
                             },
                         );
                     }
@@ -6935,7 +6963,7 @@ struct TracedRequest {
 /// its bookkeeping (and its `clear`/`panic` handling), so a parallel index would be a second source of
 /// truth that could outlive an entry it points at. The maps are small enough that scanning is free.
 fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> Option<TracedRequest> {
-    if let Some((id, b)) = session.breakpoints.iter().find(|(_, b)| b.request_id == Some(req_id) && b.trace) {
+    if let Some((id, b)) = session.breakpoints.iter().find(|(_, b)| b.owns_request(req_id) && b.trace) {
         return Some(TracedRequest {
             id: id.clone(),
             condition: b.condition.clone(),
@@ -7096,15 +7124,16 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
     if find_traced_request(session, req_id).is_some() {
         session.note_disarmed_traced(req_id);
     }
-    if let Some((id, bp)) = session
-        .breakpoints
-        .iter()
-        .find(|(_, b)| b.request_id == Some(req_id))
-        .map(|(k, v)| (k.clone(), v.clone()))
+    if let Some((id, bp)) =
+        session.breakpoints.iter().find(|(_, b)| b.owns_request(req_id)).map(|(k, v)| (k.clone(), v.clone()))
     {
-        let _ = session.connection.clear_breakpoint(req_id).await;
+        // Not just the id that fired: a stop point disarmed on one of its copies while the others stay
+        // armed is a stop point the caller has been told is off and which still freezes their VM.
+        for req in &bp.request_ids {
+            let _ = session.connection.clear_breakpoint(*req).await;
+        }
         if let Some(b) = session.breakpoints.get_mut(&id) {
-            b.request_id = None;
+            b.request_ids.clear();
             b.enabled = false;
         }
         return Some(format!("breakpoint {id} at {}:{}", bp.class_pattern, bp.line));
@@ -7183,15 +7212,15 @@ async fn disable_line_breakpoint(
     id: &str,
     bp: &crate::session::BreakpointInfo,
 ) -> Result<String, String> {
-    if let Some(req) = bp.request_id {
+    for req in &bp.request_ids {
         session
             .connection
-            .clear_breakpoint(req)
+            .clear_breakpoint(*req)
             .await
             .map_err(|e| format!("Failed to clear breakpoint request: {e}"))?;
     }
     if let Some(b) = session.breakpoints.get_mut(id) {
-        b.request_id = None;
+        b.request_ids.clear();
         b.enabled = false;
     }
     Ok(format!("{}:{}", bp.class_pattern, bp.line))
@@ -7403,8 +7432,8 @@ async fn clear_pattern_family(
     let mut cleared = 0usize;
     for member in &set.members {
         if let Some(info) = session.breakpoints.remove(member) {
-            if let Some(req) = info.request_id {
-                let _ = session.connection.clear_breakpoint(req).await;
+            for req in &info.request_ids {
+                let _ = session.connection.clear_breakpoint(*req).await;
             }
             cleared += 1;
         }
@@ -7491,8 +7520,15 @@ async fn rearm_line_breakpoint(
         )
         .await
         .map_err(|e| format!("Failed to re-arm breakpoint: {e}"))?;
+    // The rest of a duplicated line (BP-4, #78). Re-resolved by name just above, so a redeploy that
+    // moved or merged the copies is reflected here rather than replayed from stale indices.
+    let mut arm = arm;
+    let extra_copies = arm_extra_line_copies(session, &arm).await;
+    arm.extra_bytecode_indices = extra_copies.armed;
+    let mut request_ids = vec![req];
+    request_ids.extend(extra_copies.request_ids);
     if let Some(b) = session.breakpoints.get_mut(id) {
-        b.request_id = Some(req);
+        b.request_ids = request_ids;
         b.enabled = true;
         b.arm = arm;
         b.trace_budget = refreshed_budget(b.trace_budget);
@@ -7607,6 +7643,7 @@ async fn rearm_breakpoint_location(
             class_id: class.type_id,
             method_id: loc.method.method_id,
             bytecode_index: loc.code_index,
+            extra_bytecode_indices: loc.extra_code_indices,
             ..bp.arm.clone()
         }),
         // The class is loaded but the location didn't resolve; the old ids are the best guess left, and
@@ -7743,7 +7780,7 @@ fn record_trace_cost(
     started: std::time::Instant,
     took: std::time::Duration,
 ) {
-    if let Some(b) = session.breakpoints.values_mut().find(|b| b.request_id == Some(req_id)) {
+    if let Some(b) = session.breakpoints.values_mut().find(|b| b.owns_request(req_id)) {
         b.trace_cost.record(started, took);
     } else if let Some(e) = session.exception_requests.values_mut().find(|e| e.request_id == Some(req_id)) {
         e.trace_cost.record(started, took);
@@ -7757,7 +7794,9 @@ fn record_trace_cost(
 /// Decrement the matching stop point's trace budget in place, returning the count left afterwards, or
 /// `None` when the request has no budget (unbounded) or isn't found.
 fn decrement_trace_budget(session: &mut crate::session::DebugSession, req_id: i32) -> Option<u32> {
-    if let Some(b) = session.breakpoints.values_mut().find(|b| b.request_id == Some(req_id)) {
+    // Charged once per *hit*, not once per armed location: an execution passes through exactly one of a
+    // duplicated line's copies, so the single event it produces decrements once here (BP-4, #78).
+    if let Some(b) = session.breakpoints.values_mut().find(|b| b.owns_request(req_id)) {
         let n = b.trace_budget?.saturating_sub(1);
         b.trace_budget = Some(n);
         return Some(n);
@@ -7805,11 +7844,8 @@ async fn store_reportable_event(
             let _ = session.connection.resume_all().await;
             skip = true;
         }
-        let cond = session
-            .breakpoints
-            .values()
-            .find(|b| b.request_id == Some(req_id))
-            .and_then(|b| b.condition.clone());
+        let cond =
+            session.breakpoints.values().find(|b| b.owns_request(req_id)).and_then(|b| b.condition.clone());
         if !skip {
             if let Some(cond) = cond {
                 if !evaluate_condition_on_thread(&mut session.connection, thread, &cond).await {
@@ -7883,7 +7919,7 @@ fn stop_point_id(session: &crate::session::DebugSession, req: i32) -> Option<Str
     session
         .breakpoints
         .iter()
-        .find(|(_, b)| b.request_id == hit)
+        .find(|(_, b)| b.owns_request(req))
         .map(|(k, _)| k.clone())
         .or_else(|| {
             session.exception_requests.iter().find(|(_, e)| e.request_id == hit).map(|(k, _)| k.clone())
@@ -8086,10 +8122,94 @@ struct ArmedBreakpoint {
     /// The line actually resolved, which is not always the line asked for.
     line: i32,
     method_name: String,
-    request_id: i32,
+    /// One per armed bytecode location, ascending — usually one (BP-4, #78).
+    request_ids: Vec<i32>,
+    /// Locations this line resolved to that the JVM refused, already worded. Empty on the ordinary
+    /// path; never silently dropped, because a stop point covering fewer paths than the caller thinks
+    /// is the failure this change exists to remove.
+    partial: Vec<String>,
     /// DISC-8: the stale-bytecode caveat, when there is a proof of drift. `None` the rest of the time,
     /// including every case where the answer is merely unknown.
     drift: Option<String>,
+}
+
+impl ArmedBreakpoint {
+    /// How the reply names the JDWP request(s) behind this stop point.
+    ///
+    /// A single location renders exactly as it always has — a bare id — because `docs/toolkit-contract.md`
+    /// pins these replies downstream and the overwhelmingly common breakpoint must not move. Several
+    /// render as a list plus the count and the reason, since a caller who is told "armed" deserves to
+    /// know it covers two paths through the same source line.
+    fn describe_requests(&self) -> String {
+        let mut s = self.request_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+        if self.request_ids.len() > 1 {
+            let _ = write!(
+                s,
+                "\n   Armed at {} locations — this source line is in the line table more than once, \
+                 which is what `javac` does to a `finally` body (it is inlined once per exit path). \
+                 Arming only the first would fire on normal completion and stay silent on the throw.",
+                self.request_ids.len()
+            );
+        }
+        for p in &self.partial {
+            let _ = write!(
+                s,
+                "\n   ⚠️ One copy of the line could not be armed ({p}) — this stop point \
+                               covers the others, so a path through the missing copy will not report."
+            );
+        }
+        s
+    }
+}
+
+/// What arming the *other* copies of a duplicated line produced (BP-4, #78).
+struct ExtraLineCopies {
+    /// One JDWP request per copy that armed.
+    request_ids: Vec<i32>,
+    /// The bytecode indices those requests are on — what gets stored for a later re-arm, so a location
+    /// the JVM already refused is not retried on every toggle.
+    armed: Vec<u64>,
+    /// Copies the JVM refused, already worded for a caller.
+    refused: Vec<String>,
+}
+
+/// Arm every bytecode copy of a line beyond the first, for a line the line table holds more than once.
+///
+/// Shared by all three arming paths — immediate, deferred (in the event pump) and re-arm — because they
+/// were about to grow the same loop three times, and a stop point whose copies are armed differently
+/// depending on which path armed it is a bug waiting for a `toggle_stop_point`.
+///
+/// **The first location is not this function's business.** It is armed by the caller and its failure is
+/// fatal there: it is the location the caller asked for. A *later* copy failing is not fatal — refusing
+/// the whole stop point would leave the caller with nothing where they could have had the normal path —
+/// so it is dropped from `armed` and reported in `refused`. Silence is the one option not available: a
+/// stop point that quietly covers fewer paths than it claims is precisely the bug BP-4 is.
+async fn arm_extra_line_copies(
+    session: &mut crate::session::DebugSession,
+    arm: &crate::session::BreakpointArm,
+) -> ExtraLineCopies {
+    let mut out = ExtraLineCopies { request_ids: Vec::new(), armed: Vec::new(), refused: Vec::new() };
+    for idx in &arm.extra_bytecode_indices {
+        match session
+            .connection
+            .set_breakpoint_ex(
+                arm.class_id,
+                arm.method_id,
+                *idx,
+                arm.suspend_policy,
+                arm.hit_count,
+                arm.thread_filter,
+            )
+            .await
+        {
+            Ok(req) => {
+                out.request_ids.push(req);
+                out.armed.push(*idx);
+            }
+            Err(e) => out.refused.push(format!("bytecode index {idx}: {e}")),
+        }
+    }
+    out
 }
 
 /// Resolve the location on a loaded class, set the JDWP breakpoint, and record it in the session under
@@ -8108,7 +8228,8 @@ async fn arm_and_insert(
     )
     .await
     .map_err(|e| ArmError::from_location(&e, &spec.class_pattern))?;
-    let (method, index, line, jvm_lines) = (loc.method, loc.code_index, loc.line, loc.lines);
+    let (method, index, extra, line, jvm_lines) =
+        (loc.method, loc.code_index, loc.extra_code_indices, loc.line, loc.lines);
     let request_id = session
         .connection
         .set_breakpoint_ex(
@@ -8121,12 +8242,26 @@ async fn arm_and_insert(
         )
         .await
         .map_err(|e| ArmError::Other(format!("Failed to set breakpoint: {e}")))?;
+    let mut arm = crate::session::BreakpointArm {
+        class_id: class_type_id,
+        method_id: method.method_id,
+        bytecode_index: index,
+        extra_bytecode_indices: extra,
+        suspend_policy: spec.suspend_policy,
+        hit_count: spec.hit_count,
+        thread_filter: spec.thread_filter,
+    };
+    let extra_copies = arm_extra_line_copies(session, &arm).await;
+    arm.extra_bytecode_indices = extra_copies.armed;
+    let mut request_ids = vec![request_id];
+    request_ids.extend(extra_copies.request_ids);
+    let partial = extra_copies.refused;
     // Computed before the insert so the stop point carries it too, not only this reply (DISC-8).
     let drift = drift_caveat_for_armed_method(session, &spec.class_pattern, &method, jvm_lines).await;
     session.breakpoints.insert(
         bp_id.clone(),
         crate::session::BreakpointInfo {
-            request_id: Some(request_id),
+            request_ids: request_ids.clone(),
             class_pattern: spec.class_pattern.clone(),
             line: u32::try_from(line).unwrap_or(0),
             method: Some(method.name.clone()),
@@ -8139,20 +8274,13 @@ async fn arm_and_insert(
             trace_budget: spec.trace_budget,
             trace_frames: spec.trace_frames,
             trace_cost: crate::session::TraceCost::default(),
-            arm: crate::session::BreakpointArm {
-                class_id: class_type_id,
-                method_id: method.method_id,
-                bytecode_index: index,
-                suspend_policy: spec.suspend_policy,
-                hit_count: spec.hit_count,
-                thread_filter: spec.thread_filter,
-            },
+            arm,
         },
     );
     // After arming, not before: the breakpoint is the thing the caller asked for, and a drift check that
     // could fail must never be able to prevent it. Everything this call does is fallible-but-ignorable by
     // construction, and it returns `None` rather than an error for the same reason.
-    Ok(ArmedBreakpoint { bp_id, line, method_name: method.name, request_id, drift })
+    Ok(ArmedBreakpoint { bp_id, line, method_name: method.name, request_ids, partial, drift })
 }
 
 /// The target class isn't loaded yet: register a `CLASS_PREPARE` watch (`EventThread` suspend, so the
@@ -8831,8 +8959,8 @@ async fn arm_single_named(
     let class_type_id = first_class.type_id;
 
     let armed = arm_and_insert(session, class_type_id, spec, bp_id).await.map_err(ArmError::into_message)?;
-    let (bp_id, line, method_name, request_id) =
-        (armed.bp_id, armed.line, armed.method_name, armed.request_id);
+    let request_id = armed.describe_requests();
+    let (bp_id, line, method_name) = (&armed.bp_id, armed.line, &armed.method_name);
 
     let mut extra = describe_trace_mode(spec, frames_note);
     if let Some(c) = spec.hit_count {
@@ -8908,7 +9036,10 @@ fn render_one_pattern_outcome<'a>(
             let _ = writeln!(
                 out,
                 "{pattern}\n   ✅ {} at {pattern}:{} ({}) — JDWP request {}",
-                a.bp_id, a.line, a.method_name, a.request_id
+                a.bp_id,
+                a.line,
+                a.method_name,
+                a.describe_requests()
             );
             if let Some(d) = &a.drift {
                 stale.push((pattern, d));
@@ -9079,6 +9210,15 @@ fn render_stale_summary(out: &mut String, stale: &[(&str, &str)]) {
 struct ResolvedLocation {
     method: jdwp_client::reftype::MethodInfo,
     code_index: u64,
+    /// The *other* bytecode indices in the same method that the line table maps this line to, in
+    /// ascending code-index order. Empty for almost every line (BP-4, #78).
+    ///
+    /// Non-empty when `javac` emitted the source line more than once, which it does for a `finally`
+    /// body: it is inlined once per exit path, so the line appears at the normal-completion copy *and*
+    /// at the exception-path copy. Measured on Temurin 11 and 17 — `line 9: 24` and `line 9: 39` for a
+    /// four-line probe. Arming only `code_index` means the stop point fires on the calls that worked and
+    /// stays silent on the one that failed, which is indistinguishable from the code never running.
+    extra_code_indices: Vec<u64>,
     /// The line actually resolved, which is not always the line asked for.
     line: i32,
     /// The chosen method's line table as `(bytecode index, line)`, normalised to the shape the staleness
@@ -9092,8 +9232,56 @@ struct ResolvedLocation {
 /// keeps the winning method cloned once *after* the loop instead of once per iteration — while the inline
 /// type is complex enough that `clippy::type_complexity` is right to object to it. Both lints are
 /// satisfied by naming the thing rather than by giving up one for the other.
-type BpCandidate<'a> = (&'a jdwp_client::reftype::MethodInfo, u64, i32, Vec<(u64, i32)>);
+type BpCandidate<'a> = (&'a jdwp_client::reftype::MethodInfo, u64, Vec<u64>, i32, Vec<(u64, i32)>);
 
+/// Where one method's line table puts the requested line: the first bytecode index, every *other*
+/// index the same line maps to, and the line actually resolved.
+///
+/// `None` when this method is not the target, which is what makes the caller move on to the next one.
+///
+/// Split out of the resolution loop rather than written inline so the vectors are not allocated inside
+/// a `for` — `unnecessary-allocation`, and the gate fails on warnings (ADR-0007).
+fn locations_in_method(
+    line_table: &jdwp_client::method::LineTable,
+    line_opt: Option<i32>,
+    method_hint: Option<&str>,
+) -> Option<(u64, Vec<u64>, i32)> {
+    let Some(want) = line_opt else {
+        // No line asked for: the method's first executable location, as before.
+        let e = line_table.lines.iter().min_by_key(|e| e.line_code_index)?;
+        return Some((e.line_code_index, Vec::new(), e.line_number));
+    };
+    // Every copy of the line, not the first (BP-4, #78). Sorted so the primary is the lowest bytecode
+    // index — which for a duplicated `finally` is the normal-completion copy, i.e. exactly the location
+    // this resolved to before. A single-location line therefore resolves byte-identically, and a
+    // duplicated one only *gains* the copies it was silently dropping.
+    let mut hits: Vec<u64> =
+        line_table.lines.iter().filter(|e| e.line_number == want).map(|e| e.line_code_index).collect();
+    hits.sort_unstable();
+    if let Some(first) = hits.first().copied() {
+        hits.remove(0);
+        return Some((first, hits, want));
+    }
+    // The caller named a method but the line is not in it: fall back to the method's first location, as
+    // before, so `method` + a line that has drifted still arms somewhere useful.
+    if method_hint.is_some() {
+        let e = line_table.lines.iter().min_by_key(|e| e.line_code_index)?;
+        return Some((e.line_code_index, Vec::new(), e.line_number));
+    }
+    None
+}
+
+/// Find where in a class's bytecode a requested line lives.
+///
+/// **Every copy of the line within the winning method**, not the first one (BP-4, #78) — see
+/// [`ResolvedLocation::extra_code_indices`] for why one line can have several.
+///
+/// Scope worth stating because it is a choice rather than an oversight: the search still stops at the
+/// **first method** whose line table contains the line, exactly as before. A source line can also appear
+/// in a *second* method — a lambda body compiles to a synthetic method that keeps the enclosing source
+/// line — and arming those too would change what a caller gets for an ordinary line, on a question
+/// (should a stop point on a line containing a lambda fire once per element?) that has nothing to do
+/// with the `finally` bug. Unchanged from today rather than silently widened.
 async fn resolve_bp_location(
     conn: &mut jdwp_client::JdwpConnection,
     class_type_id: u64,
@@ -9120,19 +9308,8 @@ async fn resolve_bp_location(
         // without this function knowing anything about drift.
         let lines: Vec<(u64, i32)> =
             line_table.lines.iter().map(|e| (e.line_code_index, e.line_number)).collect();
-        if let Some(want) = line_opt {
-            if let Some(e) = line_table.lines.iter().find(|e| e.line_number == want) {
-                chosen = Some((method, e.line_code_index, want, lines));
-                break;
-            }
-            if method_hint.is_some() {
-                if let Some(e) = line_table.lines.iter().min_by_key(|e| e.line_code_index) {
-                    chosen = Some((method, e.line_code_index, e.line_number, lines));
-                    break;
-                }
-            }
-        } else if let Some(e) = line_table.lines.iter().min_by_key(|e| e.line_code_index) {
-            chosen = Some((method, e.line_code_index, e.line_number, lines));
+        if let Some((first, extra, line)) = locations_in_method(&line_table, line_opt, method_hint) {
+            chosen = Some((method, first, extra, line, lines));
             break;
         }
     }
@@ -9140,8 +9317,8 @@ async fn resolve_bp_location(
         // The single clone, outside the loop: `excessive-clone` is about repeated allocation, and this
         // runs once per call. Destructured rather than `map_or_else` because the Err arm below already
         // uses one and nesting two reads worse than the match.
-        Some((method, code_index, line, lines)) => {
-            Ok(ResolvedLocation { method: method.clone(), code_index, line, lines })
+        Some((method, code_index, extra_code_indices, line, lines)) => {
+            Ok(ResolvedLocation { method: method.clone(), code_index, extra_code_indices, line, lines })
         }
         None => Err(line_opt.map_or_else(
             || BpLocationError::NoSuchMethod(method_hint.unwrap_or("").to_string()),

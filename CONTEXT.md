@@ -370,6 +370,16 @@ breakpoint armed by name.
 The debuggee's own identifier for an armed request. An internal detail that changes when a stop point is
 re-armed, and deliberately not the stop point's identity.
 
+**One stop point can own several**, which is newer than the rest of this entry and is the thing most
+likely to be assumed away. A line breakpoint holds one request *per bytecode location the line resolves
+to*, and a source line inside a `finally` resolves to more than one because `javac` inlines the block
+once per exit path (BP-4, #78). The stop point is still one thing to the caller — one `bp_` id, listed
+once, cleared once, and its trace budget charged once per **hit** rather than once per armed location —
+so ADR-0005's one-id-per-stop-point rule is untouched. What changes is that a lookup *by* request id has
+to ask whether the stop point owns the id, not whether it equals the stop point's id.
+_Avoid_: "the breakpoint's request id" (there may be two, and the one that matters is usually the second
+— it is the copy that fires when the code being debugged failed)
+
 **Allocated by the debuggee, so a value may recur.** JDWP promises nothing about reuse — `HotSpot` happens
 to hand them out monotonically, and this server talks to whatever is on the port. So a request id is only
 meaningful *while* its request is live: remembering one and matching on it later can silently name a
