@@ -44,12 +44,35 @@ pretending it cannot happen: a test with no recorded duration is charged the med
 which lands in the CI log; a recorded duration for a test that no longer exists is named too. Coverage is never
 affected by drift — the plan partitions whatever `--list` returns.
 
+## What it actually bought, on CI
+
+Run `30575514717` against the v0.9.0 baseline `30565005289`:
+
+| | before (3 legs) | after (6 legs) |
+|---|---|---|
+| workflow wall clock | 223 s | **147 s — −34%** |
+| slowest leg | 220 s | 138 s |
+| `Integration tests` step | 188/188/189 s | 111/107/107 s (shard 1), 90/88/88 s (shard 2) |
+| runner-seconds | 648 s | **747 s — +15%** |
+
+**The runner bill is +15%, not the ~6% projected from local numbers.** Two shards run ~197 s of test step
+between them against 188 s unsharded — roughly 5% of duplicated per-process warmup — and each extra leg pays
+its own 28 s of fixed cost. Recorded because the trade is wall clock *for* runner-seconds, and only one of the
+two was projected accurately.
+
 ## Why two shards and not three
 
-The slowest single test is **70 s** (`resume_thread_is_honest_from_every_suspended_state`) and a test cannot be
-split, so it is a floor. Shard 1 measures 79 s of wall clock with that 70 s test inside it — already within 9 s
-of the floor. A third shard divides test time that the floor already dominates: the projection is ~106 s per
-leg against ~115 s for two shards, for three more runners per push.
+Two reasons, and the second is the stronger one and was only visible after measuring on CI.
+
+**The floor.** The slowest single test is **70 s** (`resume_thread_is_honest_from_every_suspended_state`) and a
+test cannot be split, so no shard is ever shorter than that.
+
+**Concurrency falls as shards get smaller, which is the constraint that actually binds.** A 60-test shard
+reaches only **~2.6x concurrent** on 4 vCPU — 283 s of test time in a 107 s test step — against 3.7x for the
+full 118. There is less overlap available at the tail of a smaller shard, so halving a shard's test time does
+*not* halve its wall clock. The local projection of ~115 s per leg came in at 131–138 s for exactly this
+reason. A third shard would divide test time against a concurrency factor that falls again, for three more
+runners per push.
 
 So two shards is not a cautious first step towards more. It is where this stops being worth anything.
 

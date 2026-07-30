@@ -73,8 +73,10 @@ nightly-only features in silently. Arguments still go straight to libtest and th
 **CI runs six legs now: three JDKs x two shards** (TEST-29, #106; ADR-0025). A shard is half the suite split by
 *measured* duration — `scripts/shard-plan.py` reading `mcp-server/tests/timings.tsv` — because a split by name
 had a 1-in-8 chance of piling the four resume-honesty tests into one shard and making it the whole wall clock.
-Two shards and not three: the slowest single test is **70 s** and cannot be split, so it is a floor a third
-shard cannot get under.
+Measured on CI: **workflow wall clock 223 s → 147 s (−34%), runner-seconds 648 → 747 (+15%)**. Two shards and
+not three for two reasons — the slowest single test is **70 s** and cannot be split, and a 60-test shard only
+reaches ~2.6x concurrent on 4 vCPU against 3.7x for the full 118, so halving a shard's test time does *not*
+halve its wall clock.
 
 **Run the unsharded suite when you are working a flake.** `scripts/integration-test.sh` with no `--shard` still
 runs all 118 tests in one process, which is the contention CI used to have. Sharding *reduces* how many probe
