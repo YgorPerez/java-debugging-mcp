@@ -70,6 +70,19 @@ fingerprint, so setting it on a `cargo test` recompiles the workspace and compil
 nightly-only features in silently. Arguments still go straight to libtest and the script still supplies the
 `--`.
 
+**CI runs six legs now: three JDKs x two shards** (TEST-29, #106; ADR-0025). A shard is half the suite split by
+*measured* duration — `scripts/shard-plan.py` reading `mcp-server/tests/timings.tsv` — because a split by name
+had a 1-in-8 chance of piling the four resume-honesty tests into one shard and making it the whole wall clock.
+Two shards and not three: the slowest single test is **70 s** and cannot be split, so it is a floor a third
+shard cannot get under.
+
+**Run the unsharded suite when you are working a flake.** `scripts/integration-test.sh` with no `--shard` still
+runs all 118 tests in one process, which is the contention CI used to have. Sharding *reduces* how many probe
+JVMs compete, so **a flake that stops reproducing under CI's new shape is not fixed** — #45, #56, #64 and #71
+were open when this landed and the trade was accepted with that stated. Refresh the timings file with
+`scripts/test-timings.py --emit-timings <log> > mcp-server/tests/timings.tsv`; it is generated, never hand-edited,
+and drift is reported rather than fatal.
+
 **Getting the JDKs CI has.** "More than one" was aspirational for a while because this workspace had only
 JDK 11 and a snap JBR, so every result ended in "17 and 21 are CI's to confirm" — which is a slow way to
 learn that a test is version-locked. Adoptium tarballs need no root and no package manager:

@@ -220,6 +220,28 @@ def render_markdown(report, top, label):
     return "\n".join(out) + "\n"
 
 
+def render_timings(report, _top, _label):
+    """`seconds<TAB>name`, sorted slowest first — the input `scripts/shard-plan.py` assigns shards from.
+
+    A flat file rather than JSON because its whole job is to be read in a diff: when a shard's projected cost
+    moves, the reviewable question is which test's duration changed, and one line per test answers it.
+
+    Failed tests are excluded. A failure's duration is when it gave up — frequently a timeout, which is the
+    largest number in the run and the least representative of what the work costs. Recording one would make a
+    shard plan chase a value that disappears the moment the test is fixed.
+    """
+    out = [
+        "# Per-test durations, seconds<TAB>name. Generated — do not hand-edit:",
+        "#     scripts/test-timings.py --emit-timings <log> > mcp-server/tests/timings.tsv",
+        "# Read by scripts/shard-plan.py. Drift is reported, not fatal: a test with no line here is charged",
+        "# the median and named on stderr. Refresh it when the ranking changes materially, not every run.",
+    ]
+    for secs, name, verdict in sorted(report.timed, reverse=True):
+        if verdict == "ok":
+            out.append(f"{secs:.2f}\t{name}")
+    return "\n".join(out) + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Rank the slowest tests in a libtest log.",
@@ -228,6 +250,11 @@ def main():
     ap.add_argument("log", nargs="?", default="-", help="libtest output; `-` or omitted for stdin")
     ap.add_argument("--top", type=int, default=15, help="how many to rank (default 15)")
     ap.add_argument("--markdown", action="store_true", help="emit markdown for a CI job summary")
+    ap.add_argument(
+        "--emit-timings",
+        action="store_true",
+        help="emit `seconds<TAB>name` for scripts/shard-plan.py instead of a ranking",
+    )
     ap.add_argument("--label", default="", help="what this run was, e.g. 'Integration (JDK 17)'")
     # For the caller that already knows: `scripts/integration-test.sh` retries without the timing flags when
     # libtest refuses them, and the retried log no longer contains the refusal, so the report would
@@ -246,7 +273,12 @@ def main():
             lines = handle.read().splitlines()
 
     report = parse(lines, refused=args.refused)
-    render = render_markdown if args.markdown else render_text
+    if args.emit_timings:
+        render = render_timings
+    elif args.markdown:
+        render = render_markdown
+    else:
+        render = render_text
     sys.stdout.write(render(report, args.top, args.label))
     return 0
 

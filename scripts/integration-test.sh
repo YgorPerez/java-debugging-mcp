@@ -22,8 +22,11 @@
 #   scripts/integration-test.sh                     # all of them
 #   scripts/integration-test.sh force_return        # only tests whose name contains this
 #   scripts/integration-test.sh --test-threads=1    # serial, easier to read when debugging
+#   scripts/integration-test.sh --shard 1/2         # half the suite, split by MEASURED duration
 #
-# Arguments go straight to libtest — this script already supplies the `--`, so do NOT pass another one.
+# Arguments go straight to libtest — this script already supplies the `--`, so do NOT pass another one. The
+# single exception is `--shard N/M` (TEST-29, #106), which this script interprets and libtest has never heard
+# of; it is refused alongside a name filter rather than silently intersected with one.
 # `… -- --test-threads=1` makes libtest read the bare `--` as a test-name FILTER, which matches nothing:
 # "0 passed; 47 filtered out", exit 0, and a run that looks fine having executed nothing. The usage line
 # above said exactly that until it was caught doing it.
@@ -62,6 +65,33 @@ cd "$(dirname "$0")/.."
 LOG="$(mktemp)"
 trap 'rm -f "$LOG"' EXIT
 
+# `--shard N/M` is the ONE argument this script interprets rather than forwarding (TEST-29, #106). Everything
+# else still goes straight to libtest, which is the contract the usage note above depends on — so it is pulled
+# out of "$@" here and the remainder is passed on untouched.
+SHARD=""
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --shard)
+      [ $# -ge 2 ] || {
+        echo "error: --shard wants N/M, e.g. --shard 1/2" >&2
+        exit 1
+      }
+      SHARD="$2"
+      shift 2
+      ;;
+    --shard=*)
+      SHARD="${1#--shard=}"
+      shift
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
 # Build with a clean environment — see the note above on RUSTC_BOOTSTRAP and the fingerprint. Build output
 # goes to the terminal, not into $LOG: the guards below grep for test results, and a `Compiling` line has
 # never been one.
@@ -84,6 +114,36 @@ fi
 # failing the gate. Timings are an instrument; the three guards further down are the gate.
 TIMING=(-Z unstable-options --report-time)
 
+# Sharding (TEST-29, #106). libtest has no shard flag, so a shard is expressed as the thing libtest does have:
+# an explicit list of names under `--exact`. `scripts/shard-plan.py` picks the names by **measured** duration
+# from `mcp-server/tests/timings.tsv`, which matters rather than being a nicety — the four resume-honesty
+# tests are 29% of the suite's test time and the slowest single test is 70 s, so a split by name has a real
+# chance of putting the heavy ones together and making one shard the whole wall clock.
+#
+# The plan's report goes to stderr and is deliberately not suppressed: it names any test with no recorded
+# duration, which is the one way this can quietly go wrong — a new slow test charged the median, landing in a
+# shard, and making one leg longer for a reason nobody can see.
+SELECTION=()
+if [ -n "$SHARD" ]; then
+  if [ "$#" -gt 0 ]; then
+    echo "error: --shard and a test-name filter together would silently intersect: the shard plan covers" >&2
+    echo "       every test, and filtering it afterwards leaves a shard that is neither the whole shard" >&2
+    echo "       nor the whole filter. Pick one." >&2
+    exit 1
+  fi
+  LIST="$(mktemp)"
+  trap 'rm -f "$LOG" "$LIST"' EXIT
+  "$BIN" --ignored --list >"$LIST"
+  mapfile -t SELECTION < <(scripts/shard-plan.py --shard "$SHARD" --tests "$LIST")
+  if [ "${#SELECTION[@]}" -eq 0 ]; then
+    echo "" >&2
+    echo "error: shard $SHARD selected no tests, so this run would be a green run of nothing." >&2
+    exit 1
+  fi
+  echo "shard $SHARD: ${#SELECTION[@]} tests selected by measured duration"
+  SELECTION=(--exact "${SELECTION[@]}")
+fi
+
 # `2>&1` into the tee, which it did not used to be, and the omission hid the very thing the retry below
 # looks for: libtest writes its argument refusals to STDERR, so a log built from stdout alone could never
 # contain one and the fallback could never fire. Found by defeating it on purpose rather than by a toolchain
@@ -92,7 +152,8 @@ TIMING=(-Z unstable-options --report-time)
 run_suite() {
   set +e
   # pipefail is set, so ${PIPESTATUS[0]} is read before anything can overwrite it.
-  RUSTC_BOOTSTRAP=1 "$BIN" --ignored --nocapture "${TIMING[@]}" "$@" 2>&1 | tee "$LOG"
+  RUSTC_BOOTSTRAP=1 "$BIN" --ignored --nocapture "${TIMING[@]}" \
+    ${SELECTION[@]+"${SELECTION[@]}"} "$@" 2>&1 | tee "$LOG"
   status=${PIPESTATUS[0]}
   set -e
 }
@@ -152,7 +213,9 @@ fi
 # truncated it — and without being told, the report would guess "a run that did not pass --report-time",
 # which is the wrong diagnosis for the wrong reason.
 if command -v python3 >/dev/null 2>&1; then
-  timing_args=(--label "$(sed -n 's/^JDK in use: \(javac [^ ]*\).*/\1/p' "$LOG" | head -1)")
+  label="$(sed -n 's/^JDK in use: \(javac [^ ]*\).*/\1/p' "$LOG" | head -1)"
+  [ -n "$SHARD" ] && label="$label shard $SHARD"
+  timing_args=(--label "$label")
   [ "$refused" -eq 1 ] && timing_args+=(--refused)
   scripts/test-timings.py "${timing_args[@]}" "$LOG" || true
 else

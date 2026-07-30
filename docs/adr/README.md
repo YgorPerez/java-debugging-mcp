@@ -33,6 +33,7 @@ these lazily, when decisions actually get resolved; that point arrived.
 | [0022](0022-an-object-handle-is-printed-weak-and-never-pinned.md) | An object handle is the `@0x…` every reply prints, and it stays a weak reference — nothing is pinned |
 | [0023](0023-a-heap-query-ships-and-reports-the-pause-it-imposed.md) | The heap query ships and reports the pause it imposed, rather than refusing or asking permission |
 | [0024](0024-per-test-timings-come-from-libtest.md) | Per-test timings come from libtest's `--report-time` — so the runner builds and runs in two steps — and not from cargo-nextest, whose process-per-test scheduling is the one variable that must not move while the flakes are open |
+| [0025](0025-the-suite-is-sharded-two-ways-by-measured-duration.md) | The suite is sharded two ways per JDK, split by *measured* duration rather than by name — and stops at two, because the 70 s slowest test is a floor a third shard cannot get under |
 
 The downstream consumer's contract is [`docs/toolkit-contract.md`](../toolkit-contract.md) — what shipping
 a change here costs the toolkit that packages it.
