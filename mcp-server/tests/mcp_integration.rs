@@ -5244,6 +5244,14 @@ enum Freeze {
     /// a rescue that re-derived the depth from the tools it had seen called would be wrong here and right
     /// there, which is exactly the shape of every bug this matrix has caught.
     ConditionEscalated,
+    /// ONE thread frozen by `debug.suspend_thread` (SAFE-11), the whole VM still running. The probe's
+    /// ticking thread is the one held, so the same tick witness answers the same question — and this is a
+    /// genuinely new way to leave the debuggee stopped: no `suspended_since`, no `SuspendCause`, so
+    /// nothing the VM-wide rescue paths look at is set.
+    ThreadSuspend,
+    /// The same thread frozen TWICE, so it carries a per-thread suspend depth of 2. SAFE-7's shape
+    /// arriving through the new door: one decrement leaves it stopped, and the reply must say so.
+    ThreadSuspendTwice,
 }
 
 /// A way we claim to un-freeze it.
@@ -5254,16 +5262,25 @@ enum Resume {
     Watchdog,
     /// `debug.disconnect` — the SAFE-1 case, and the one whose name most implies it is safe.
     Disconnect,
+    /// `debug.resume_thread` (SAFE-11) — the per-thread door. Run against the VM-wide freezes too, on
+    /// purpose: it is a resume path, and a resume path that quietly fails to un-freeze the *thread the
+    /// caller named* is the same bug as one that quietly fails to un-freeze the VM.
+    ///
+    /// Named for what it resumes rather than for the tool, because `ResumeThread` inside an enum called
+    /// `Resume` is the stutter `clippy::enum_variant_names` exists to catch.
+    OneThread,
 }
 
 impl Freeze {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::Breakpoint,
         Self::Pause,
         Self::BreakpointThenPause,
         Self::BreakpointDrained,
         Self::Step,
         Self::ConditionEscalated,
+        Self::ThreadSuspend,
+        Self::ThreadSuspendTwice,
     ];
 }
 
@@ -5280,6 +5297,11 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
     // the probe said and whether anything holds the port; `server.attach` cannot.
     probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    // WatchProbe ticks from `main`, so `main` is BOTH the thread the per-thread cases freeze and the
+    // witness every case is judged by. Resolved once, before anything is suspended, because
+    // `debug.list_threads` on a frozen VM is a different question.
+    let ticking = thread_id_named(&mut server, "main");
 
     let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
     // `hit_count: 1` on purpose: the breakpoint expires after one hit, so it cannot re-freeze the VM
@@ -5339,6 +5361,17 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
                  test: {hit}"
             );
         }
+        Freeze::ThreadSuspend | Freeze::ThreadSuspendTwice => {
+            let times = if matches!(freeze, Freeze::ThreadSuspendTwice) { 2 } else { 1 };
+            for _ in 0..times {
+                let said = server.call("debug.suspend_thread", serde_json::json!({"thread_id": &ticking}));
+                assert!(
+                    said.contains("Suspended thread"),
+                    "{freeze:?}: could not suspend the ticking thread, so the state under test was never \
+                     reached: {said}"
+                );
+            }
+        }
     }
 
     // The debuggee's own output is the only witness that matters — every tool reports success either
@@ -5350,6 +5383,7 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
         Resume::Continue => server.call("debug.continue", serde_json::json!({})),
         Resume::Panic => server.call("debug.panic", serde_json::json!({})),
         Resume::Disconnect => server.call("debug.disconnect", serde_json::json!({})),
+        Resume::OneThread => server.call("debug.resume_thread", serde_json::json!({"thread_id": &ticking})),
         // Nothing to call: the watchdog's whole point is that it acts without being asked.
         Resume::Watchdog => String::new(),
     };
@@ -5517,6 +5551,458 @@ fn disconnect_is_honest_from_every_suspended_state() {
     for freeze in Freeze::ALL {
         assert_resume_is_honest(&jdk, freeze, Resume::Disconnect);
     }
+}
+
+/// Invariant: `debug.resume_thread` either gives the named thread back or says it didn't (SAFE-11).
+///
+/// The per-thread door is new, so every state it can be asked from is new too — including the ones it
+/// cannot fix. `Freeze::ThreadSuspendTwice` is the interesting cell: one call decrements one suspend, so
+/// the thread stays stopped, and the whole question is whether the reply admits it. `Freeze::Step` is the
+/// other: a step armed on the thread would re-stop it on the very next line, at `SuspendPolicy::All`, so
+/// releasing one worker would have frozen the entire VM.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn resume_thread_is_honest_from_every_suspended_state() {
+    let Some(jdk) = jdk_or_skip("resume_thread_is_honest_from_every_suspended_state") else { return };
+    for freeze in Freeze::ALL {
+        assert_resume_is_honest(&jdk, freeze, Resume::OneThread);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// SAFE-11 — a per-thread suspend, asserted against the probe's OWN per-thread ticks
+//
+// `SuspendProbe` prints a SEPARATE counter per worker, which is the only thing that can tell "we froze
+// one thread" apart from "we froze the JVM". Every tool here reports success either way.
+// ---------------------------------------------------------------------------------------------
+
+/// The `<n>` of a `SuspendProbe` worker's own `<who> tick <n> <layout>` line.
+fn worker_tick(line: &str, who: &str) -> Option<i64> {
+    line.strip_prefix(who)?.trim_start().strip_prefix("tick ")?.split_whitespace().next()?.parse().ok()
+}
+
+/// The highest tick one named worker has printed so far.
+fn highest_worker_tick(probe: &Probe, who: &str) -> Option<i64> {
+    probe.output().iter().filter_map(|l| worker_tick(l, who)).max()
+}
+
+/// The id of the single thread named exactly `name`, read from `debug.list_threads`' own output.
+///
+/// Exact rather than substring: `name_filter` is a `contains`, and picking the first match would happily
+/// return `main` for a filter of `ai` on a JVM with a `Common-Cleaner`. Asserting there is exactly one
+/// keeps a probe rename from silently pointing a test at another thread.
+fn thread_id_named(server: &mut Server, name: &str) -> String {
+    let listed = server.call("debug.list_threads", serde_json::json!({"name_filter": name, "limit": 200}));
+    let mut found: Vec<String> = Vec::new();
+    for line in listed.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(id), Some(got)) = (parts.next(), parts.next()) else { continue };
+        if id.starts_with("0x") && got == name {
+            found.push(id.to_string());
+        }
+    }
+    assert_eq!(found.len(), 1, "expected exactly one thread named {name}, got {found:?} from:\n{listed}");
+    found.remove(0)
+}
+
+/// Settle time before reading a probe's tick high-water mark after a suspend.
+///
+/// JDWP's Suspend reply means the thread is stopped, but a line it printed a moment earlier may still be
+/// in the pipe — and reading the mark too early would credit the freeze with a tick it never prevented.
+const PIPE_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// SAFE-11's headline claim, and the only assertion that can prove it: suspending ONE thread stops ITS
+/// ticks while the others keep printing.
+///
+/// A tick is the only evidence a thread is running (`CONTEXT.md`), and `debug.suspend_thread` reports
+/// success whether it froze one thread, all of them, or none — so the probe's stdout is the witness and
+/// the reply is not.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn suspending_one_thread_stops_its_ticks_while_the_others_keep_running() {
+    let Some(jdk) = jdk_or_skip("suspending_one_thread_stops_its_ticks_while_the_others_keep_running") else {
+        return;
+    };
+    // The watchdog off, or it would release the thread underneath the assertion and the test would be
+    // measuring the rescue rather than the suspend.
+    let mut probe = Probe::launch(&jdk, "SuspendProbe").expect("launch SuspendProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    probe.attach(&mut server);
+    for who in ["worker-a", "worker-b", "worker-c"] {
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| worker_tick(l, who).is_some())
+            .unwrap_or_else(|| panic!("{who} never ticked, so there was nothing to freeze"));
+    }
+
+    let tid = thread_id_named(&mut server, "worker-b");
+    let said = server.call("debug.suspend_thread", serde_json::json!({"thread_id": &tid}));
+    assert_contains_all(
+        "suspend_thread reply",
+        &said,
+        &["Suspended thread", "ONLY this thread", "Suspend depth 1", "debug.resume_thread"],
+    );
+
+    std::thread::sleep(PIPE_SETTLE);
+    let frozen_b = highest_worker_tick(&probe, "worker-b").unwrap_or(-1);
+    let base_a = highest_worker_tick(&probe, "worker-a").unwrap_or(-1);
+    let base_c = highest_worker_tick(&probe, "worker-c").unwrap_or(-1);
+
+    // Half one: the OTHERS keep running. Without this the test would pass on a whole-VM freeze.
+    for (who, base) in [("worker-a", base_a), ("worker-c", base_c)] {
+        assert!(
+            probe
+                .wait_for_line(EVENT_TIMEOUT, |l| worker_tick(l, who).is_some_and(|n| n > base + 2))
+                .is_some(),
+            "{who} stopped ticking after worker-b was suspended — a per-thread suspend froze more than \
+             one thread.\n  probe output: {:?}",
+            probe.output()
+        );
+    }
+
+    // Half two: the SUSPENDED one did not. Read after the others have advanced three ticks, so a
+    // still-running worker-b has had ample opportunity to print.
+    let now_b = highest_worker_tick(&probe, "worker-b").unwrap_or(-1);
+    assert_eq!(
+        now_b,
+        frozen_b,
+        "worker-b kept ticking ({frozen_b} → {now_b}) while debug.suspend_thread reported it \
+         suspended.\n  said: {said}\n  probe output: {:?}",
+        probe.output()
+    );
+
+    // And the suspension is VISIBLE while it lasts — an invisible one is the kind that gets forgotten.
+    let threads =
+        server.call("debug.list_threads", serde_json::json!({"name_filter": "worker", "limit": 50}));
+    assert_contains_all("list_threads marks the held thread", &threads, &["worker-b", "SUSPENDED BY YOU"]);
+    assert!(
+        !threads.lines().any(|l| l.contains("worker-a") && l.contains("SUSPENDED BY YOU")),
+        "only the held thread may be marked:\n{threads}"
+    );
+    let sessions = server.call("debug.list_sessions", serde_json::json!({}));
+    assert_contains_all(
+        "list_sessions shows the held thread",
+        &sessions,
+        &["1 thread(s) suspended by you", "worker-b"],
+    );
+    assert!(
+        !sessions.contains("SUSPENDED"),
+        "the VM is running — only the worker is held, and calling the session SUSPENDED would send a \
+         caller looking for a freeze that is not there:\n{sessions}"
+    );
+
+    // Resuming brings it back, which is the other half of the claim.
+    let back = server.call("debug.resume_thread", serde_json::json!({"thread_id": tid}));
+    assert_contains_all("resume_thread reply", &back, &["Resumed thread", "running again"]);
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| worker_tick(l, "worker-b").is_some_and(|n| n > frozen_b))
+            .is_some(),
+        "worker-b never ticked again after debug.resume_thread said it was running.\n  said: {back}\n  \
+         probe output: {:?}",
+        probe.output()
+    );
+}
+
+/// The payoff, and the limit — measured rather than assumed (SAFE-11, issue #90).
+///
+/// The issue asked for "`evaluate` with a method invocation works against a per-thread-suspended frame"
+/// and called it the payoff. **It does not, on `HotSpot`,** and this test is what establishes that rather
+/// than a reading of the spec: the same thread id that answers `ThreadReference.Frames` with a full
+/// stack of readable locals answers `INVALID_THREAD` to `ClassType.InvokeMethod`. JDWP permits an
+/// invocation only on a thread suspended **by an event**, and `debug.pause` does not qualify either —
+/// which means the expensive remedy the old refusals named ("pause one or hit a breakpoint first") was
+/// half wrong before this issue existed.
+///
+/// So the payoff is real but narrower than the issue supposed, and this asserts both halves, because a
+/// test that only proved the good half would let the tool go on advertising an invocation it cannot do:
+///
+/// - **reads work** — the whole stack with locals, a local by name, and `expand_objects`, which walks a
+///   `LinkedHashMap`'s own fields and reaches the entries without invoking anything;
+/// - **a write works**, proved against the probe's own stdout rather than the reply;
+/// - **an invoke is refused, and the refusal explains itself** instead of passing `INVALID_THREAD` out.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_per_thread_suspended_frame_reads_and_writes_but_cannot_invoke() {
+    let Some(jdk) = jdk_or_skip("a_per_thread_suspended_frame_reads_and_writes_but_cannot_invoke") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "SuspendProbe").expect("launch SuspendProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    probe.attach(&mut server);
+    // The map is touched on every pass, so a worker that has ticked has loaded and populated it —
+    // evaluating before that would answer a different question (TEST-17).
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| worker_tick(l, "worker-a").is_some())
+        .expect("worker-a never ticked");
+
+    let tid = thread_id_named(&mut server, "worker-a");
+    let said = server.call("debug.suspend_thread", serde_json::json!({"thread_id": &tid}));
+    assert!(said.contains("Suspended thread"), "could not suspend worker-a: {said}");
+    // The reply must not promise the invoke it cannot deliver — that is the failure this whole file
+    // exists to prevent, and it would be a NEW one rather than an inherited one.
+    assert_contains_all(
+        "the suspend reply states the invocation limit",
+        &said,
+        &["NOT UNLOCKED", "INVALID_THREAD", "suspended by an EVENT"],
+    );
+
+    // --- reads ---
+    let stack = server.call("debug.get_stack", serde_json::json!({"thread_id": &tid, "max_frames": 6}));
+    assert_contains_all(
+        "a per-thread-suspended thread's stack is readable, locals and all",
+        &stack,
+        &["SuspendProbe.runWorker", "who = \"worker-a\"", "layout = \"layout-adturismo\""],
+    );
+
+    // A local by name. `frame_index` matters and is not incidental: the thread is parked in
+    // Thread.sleep, so frame 0 is native and has no variable table at all. The index is READ OFF THE
+    // STACK rather than written down, because it is version-locked — JDK 21 splits the sleep into
+    // `Thread.sleep` over a native `Thread.sleep0`, so the Java frame is #2 there and #1 on JDK 17, and
+    // a hardcoded 2 passed on 21 and failed on 17.
+    let frame = stack
+        .lines()
+        .find(|l| l.contains("SuspendProbe.runWorker"))
+        .and_then(|l| l.trim().strip_prefix('#'))
+        .and_then(|l| l.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("no SuspendProbe.runWorker frame in:\n{stack}"));
+    let local = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "who", "thread_id": &tid, "frame_index": frame}),
+    );
+    assert!(local.contains("worker-a"), "a local was not readable off the suspended frame: {local}");
+
+    // expand_objects reaches the map's CONTENTS by walking fields — no invocation anywhere.
+    let expanded = server.call(
+        "debug.evaluate",
+        serde_json::json!({
+            "expression": "SuspendProbe.layoutLoginMap",
+            "thread_id": &tid,
+            "expand_objects": true,
+            "max_depth": 3,
+        }),
+    );
+    assert_contains_all(
+        "expand_objects reads fields, so it works where an invoke does not",
+        &expanded,
+        &["layout-adturismo", "ADTURISMO"],
+    );
+
+    // --- a Map subscript, which EVAL-10 (#92) turned from an invoke into a field walk ---
+    //
+    // This assertion is inverted from the one SAFE-11 originally shipped, and the inversion is the
+    // point. That version asserted the subscript could NOT be read here, because `map["k"]` invoked
+    // `get()` and JDWP refuses an invoke on a thread suspended this way — and it said in its own words
+    // that "if this ever starts working the refusal below is now a lie and both must be revisited".
+    // #92 landed in a parallel branch and made exactly that happen: the subscript now walks
+    // `LinkedHashMap`'s own fields and invokes nothing, so it works on a per-thread-suspended frame.
+    // Both branches were right about their own tree; only the merge can see that together they close
+    // the gap the refusal was describing.
+    let sub = server.call(
+        "debug.evaluate",
+        serde_json::json!({
+            "expression": "SuspendProbe.layoutLoginMap[\"ADTURISMO\"]",
+            "thread_id": &tid,
+        }),
+    );
+    assert_contains_all(
+        "a structural subscript needs no invocation, so a per-thread-suspended frame can read it",
+        &sub,
+        &["layout-adturismo", "read structurally"],
+    );
+
+    // --- something that genuinely INVOKES, and its refusal ---
+    //
+    // A method call is the case that has no structural route, so it is what still proves the JDWP rule:
+    // invocation is granted only to a thread suspended BY AN EVENT.
+    let called = server.call(
+        "debug.evaluate",
+        serde_json::json!({
+            "expression": "SuspendProbe.layoutLoginMap.size()",
+            "thread_id": &tid,
+        }),
+    );
+    assert_contains_all(
+        "the refusal explains itself rather than passing INVALID_THREAD out",
+        &called,
+        &["INVALID_THREAD", "suspended BY AN EVENT", "debug.pause"],
+    );
+
+    // --- a write, proved by the probe rather than by the reply ---
+    let wrote = server.call(
+        "debug.set_value",
+        serde_json::json!({"target": "n", "value": "4242", "thread_id": &tid, "frame_index": frame}),
+    );
+    assert!(wrote.contains("Set local n"), "writing a local off a suspended frame failed: {wrote}");
+    server.call("debug.resume_thread", serde_json::json!({"thread_id": tid}));
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| worker_tick(l, "worker-a").is_some_and(|n| n == 4243))
+            .is_some(),
+        "the write reported success but the worker never printed the value it should have produced — \
+         which is exactly the shape of failure this repo keeps finding.\n  probe output: {:?}",
+        probe.output()
+    );
+}
+
+/// Suspends are counted, so two suspends need two resumes — and the reply must say so rather than
+/// report a success it did not achieve (ADR-0003, arriving at the per-thread door).
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn suspending_twice_then_resuming_once_says_the_thread_is_still_suspended() {
+    let Some(jdk) = jdk_or_skip("suspending_twice_then_resuming_once_says_the_thread_is_still_suspended")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "SuspendProbe").expect("launch SuspendProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    probe.attach(&mut server);
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| worker_tick(l, "worker-c").is_some())
+        .expect("worker-c never ticked");
+
+    let tid = thread_id_named(&mut server, "worker-c");
+    server.call("debug.suspend_thread", serde_json::json!({"thread_id": &tid}));
+    let twice = server.call("debug.suspend_thread", serde_json::json!({"thread_id": &tid}));
+    assert_contains_all(
+        "a second suspend reports the depth it built",
+        &twice,
+        &["Suspend depth 2", "2 resumes"],
+    );
+
+    std::thread::sleep(PIPE_SETTLE);
+    let frozen = highest_worker_tick(&probe, "worker-c").unwrap_or(-1);
+
+    let once = server.call("debug.resume_thread", serde_json::json!({"thread_id": &tid}));
+    assert!(
+        once.contains("STILL suspended"),
+        "one resume against a depth of 2 leaves the thread stopped, and claiming success is the SAFE-7 \
+         bug through a new door: {once}"
+    );
+
+    // The probe agrees with the reply, which is the point — a tool that admits it failed is only useful
+    // if the admission is true.
+    let mut others_moved = false;
+    for who in ["worker-a", "worker-b"] {
+        let base = highest_worker_tick(&probe, who).unwrap_or(-1);
+        others_moved |= probe
+            .wait_for_line(EVENT_TIMEOUT, |l| worker_tick(l, who).is_some_and(|n| n > base + 1))
+            .is_some();
+    }
+    assert!(others_moved, "the other workers stopped too, so this froze more than one thread");
+    assert_eq!(
+        highest_worker_tick(&probe, "worker-c").unwrap_or(-1),
+        frozen,
+        "worker-c ran after one resume of a depth of 2, so the honest-looking reply was wrong"
+    );
+
+    // The second resume is the one that frees it.
+    let second = server.call("debug.resume_thread", serde_json::json!({"thread_id": tid}));
+    assert_contains_all("the second resume frees it", &second, &["Resumed thread", "running again"]);
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| worker_tick(l, "worker-c").is_some_and(|n| n > frozen))
+            .is_some(),
+        "worker-c never ran again after both suspends were cleared.\n  probe output: {:?}",
+        probe.output()
+    );
+}
+
+/// **Finished** and **vanished** are different findings (`CONTEXT.md`), and DUMP-4 (#47) is what happened
+/// when a reply confused them. Neither may come back as a bare JDWP error.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_finished_thread_and_a_vanished_thread_get_different_readings() {
+    let Some(jdk) = jdk_or_skip("a_finished_thread_and_a_vanished_thread_get_different_readings") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "SuspendProbe").expect("launch SuspendProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    probe.attach(&mut server);
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("ephemeral-worker ready"))
+        .expect("the ephemeral worker never announced itself");
+
+    // Its id must be taken while it is alive — that is what makes it FINISHED rather than VANISHED
+    // afterwards, and `main` holding a reference is what keeps the Thread object from being collected.
+    let doomed = thread_id_named(&mut server, "ephemeral-worker");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("ephemeral-worker done"))
+        .expect("the ephemeral worker never ended");
+    // The line is printed by the thread's last statement, so give the JVM a moment to actually retire it.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let finished = server.call("debug.suspend_thread", serde_json::json!({"thread_id": doomed}));
+    assert_contains_all(
+        "a finished thread is refused as finished",
+        &finished,
+        &["FINISHED", "ZOMBIE", "never suspended"],
+    );
+    assert!(
+        !finished.contains("VANISHED"),
+        "a finished thread is still a row the debugger can read — calling it vanished is DUMP-4's \
+         confusion: {finished}"
+    );
+
+    // An id the JVM never handed out is the vanished shape: valid syntax, no object behind it.
+    let vanished =
+        server.call("debug.suspend_thread", serde_json::json!({"thread_id": "0xdeadbeefdeadbee0"}));
+    assert_contains_all(
+        "an unknown id reads as vanished",
+        &vanished,
+        &["VANISHED", "weak reference", "debug.list_threads"],
+    );
+    assert!(
+        !vanished.contains("FINISHED"),
+        "a vanished thread has no identity left to describe, so it is not the finished reading: \
+         {vanished}"
+    );
+
+    // And an id that is not an id at all is a third answer again, not either of those.
+    let nonsense = server.call("debug.suspend_thread", serde_json::json!({"thread_id": "worker-a"}));
+    assert_contains_all("a non-id says so", &nonsense, &["not a thread id", "debug.list_threads"]);
+}
+
+/// `debug.panic` is the escape hatch, so it must release per-thread suspends too — and SAY it did. A
+/// VM-wide resume stops as soon as the thread it probes reaches zero, so a held worker can survive a
+/// panic that reported "resumed all threads".
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn panic_releases_a_per_thread_suspend_and_names_it() {
+    let Some(jdk) = jdk_or_skip("panic_releases_a_per_thread_suspend_and_names_it") else { return };
+    let mut probe = Probe::launch(&jdk, "SuspendProbe").expect("launch SuspendProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    probe.attach(&mut server);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| worker_tick(l, "worker-a").is_some()).expect("no tick");
+
+    let tid = thread_id_named(&mut server, "worker-a");
+    // Twice, so a single VM-wide resume could not have cleared it by accident.
+    server.call("debug.suspend_thread", serde_json::json!({"thread_id": &tid}));
+    server.call("debug.suspend_thread", serde_json::json!({"thread_id": tid}));
+    std::thread::sleep(PIPE_SETTLE);
+    let frozen = highest_worker_tick(&probe, "worker-a").unwrap_or(-1);
+
+    let said = server.call("debug.panic", serde_json::json!({}));
+    assert_contains_all(
+        "panic names what it released",
+        &said,
+        &["Also released", "worker-a", "debug.suspend_thread"],
+    );
+    assert!(
+        probe
+            .wait_for_line(EVENT_TIMEOUT, |l| worker_tick(l, "worker-a").is_some_and(|n| n > frozen))
+            .is_some(),
+        "worker-a never ticked again after debug.panic said it had released it — a rescue that reports \
+         success it did not achieve is the exact shape of every safety bug here.\n  said: {said}\n  \
+         probe output: {:?}",
+        probe.output()
+    );
+    // And the claim expires: nothing is held any more, so nothing is advertised as held.
+    let sessions = server.call("debug.list_sessions", serde_json::json!({}));
+    assert!(
+        !sessions.contains("suspended by you"),
+        "panic released the thread, so the listing must stop saying it holds one:\n{sessions}"
+    );
 }
 
 /// TEST-6 / BP-4, approximated locally: re-arming after the target class has been **reloaded through a new

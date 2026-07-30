@@ -29,6 +29,7 @@ these lazily, when decisions actually get resolved; that point arrived.
 | [0018](0018-the-socket-read-half-is-owned-by-its-own-task.md) | The socket's read half is owned by its own task, because `select!` cancels `read_exact` and JDWP cannot resynchronise |
 | [0019](0019-arming-covers-every-classloader-reading-picks-one-and-says-so.md) | Arming covers every classloader's copy of a class; a read picks one, says so, and can be pinned |
 | [0020](0020-a-conditional-stop-point-decides-on-one-thread-and-escalates.md) | A conditional stop point decides on one thread, and escalates to a VM-wide suspend only when the condition holds |
+| [0021](0021-one-thread-is-suspended-by-its-own-tool-and-invocation-is-not-what-it-unlocks.md) | A per-thread suspend is its own pair of tools, and what it unlocks is every read of a frame — but not method invocation, which JDWP reserves for an event-suspended thread |
 
 The downstream consumer's contract is [`docs/toolkit-contract.md`](../toolkit-contract.md) — what shipping
 a change here costs the toolkit that packages it.

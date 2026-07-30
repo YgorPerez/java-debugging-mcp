@@ -296,10 +296,51 @@ impl JdwpConnection {
         Ok((issued, left))
     }
 
+    /// Suspend **one** thread (`ThreadReference.Suspend`, set 11 command 2) — the counterpart to
+    /// [`resume_thread`](Self::resume_thread), and the cheap alternative to
+    /// [`suspend_all`](Self::suspend_all) on a debuggee other people are using.
+    ///
+    /// This is the only way to obtain an evaluable frame without freezing every in-flight request:
+    /// `VirtualMachine.Suspend` and a `SuspendPolicy::All` stop point both hold the whole VM, and on a
+    /// shared application server that is a cost nobody agreed to pay.
+    ///
+    /// **Counted, exactly like every other suspend here.** This increments *this* thread's suspend count
+    /// by one and nothing else's; a thread already held by a `VirtualMachine.Suspend`, or parked at an
+    /// `EventThread`-policy event, ends up at 2 and needs two decrements before it runs. So a caller
+    /// must read [`suspend_count`](Self::suspend_count) afterwards rather than assume a depth of 1 —
+    /// which is ADR-0003's rule arriving at the per-thread door.
+    ///
+    /// **What the JVM answers for a thread that is not running.** A **finished** thread (`ZOMBIE`) can
+    /// still be named and described while the debugger holds its `Thread` object, but it cannot be
+    /// suspended: `HotSpot` answers `INVALID_THREAD` (10) — which reads as "you passed a bad id" and is
+    /// not what happened. A **vanished** thread, whose id the JVM has already collected, answers
+    /// `INVALID_OBJECT` (20). The two are different findings and callers must not collapse them
+    /// (DUMP-4), so this returns the raw error rather than a sentence.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn suspend_thread(&mut self, thread_id: ThreadId) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::SUSPEND);
+        packet.data.put_u64(thread_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        Ok(())
+    }
+
     /// Resume a single thread (ThreadReference.Resume) — decrements just that thread's suspend
     /// count, leaving other suspended threads alone. Used after arming a deferred breakpoint on the
     /// thread that a `ClassPrepare` event suspended, so class init proceeds without disturbing any
     /// thread parked at a real breakpoint.
+    ///
+    /// **One decrement, not "make this thread run".** The distinction is the same one
+    /// [`resume_all`](Self::resume_all) draws against [`resume_all_fully`](Self::resume_all_fully): the
+    /// JVM acknowledges this command whether or not the thread is left suspended underneath, so a caller
+    /// whose intent is that the thread proceeds must verify with
+    /// [`suspend_count`](Self::suspend_count). `debug.resume_thread` does exactly that, and says so when
+    /// the count did not reach zero.
     ///
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
