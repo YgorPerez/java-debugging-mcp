@@ -231,7 +231,8 @@ still answers.
 Enforced on the connection itself rather than by inspecting expressions, so the indirect paths are
 covered too — `toString()` rendering, `List`/`Map` subscripts, and breakpoint `condition`/`trace_expr`
 (refused when you arm them, not silently on each hit). The honest cost is shallower output: objects
-render as `Type (id=0x…)`, because pretty-printing one means invoking it. Reads that need no
+render as `Type @0x…`, because pretty-printing one means invoking it — and that `@0x…` is a handle
+`debug.evaluate` accepts as an expression head, so a shallow render is still somewhere to go. Reads that need no
 invocation are unaffected — locals, fields, statics, array indexing, `get_stack`, and
 watchpoint/exception reporting. A guard against accidentally mutating a production JVM, **not** a
 security boundary: anyone who can reach the JDWP port can open their own connection without it.

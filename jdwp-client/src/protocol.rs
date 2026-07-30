@@ -145,6 +145,14 @@ pub const ERR_ABSENT_INFORMATION: u16 = 101;
 /// same reason as [`ERR_ABSENT_INFORMATION`]: for an optional command it is an answer, not a fault.
 pub const ERR_NOT_IMPLEMENTED: u16 = 99;
 
+/// `INVALID_OBJECT` — the object id is not one this JVM currently knows.
+///
+/// Public for the same reason as the two above, and it is the sharpest example of the rule: a JDWP
+/// object id is a **weak** reference, so this is what a perfectly valid id becomes once the object it
+/// named is collected. `CONTEXT.md` calls that **Vanished**, and reporting it as a transport failure
+/// would blame the debugger for the garbage collector doing its job (TRACE-10, #85).
+pub const ERR_INVALID_OBJECT: u16 = 20;
+
 /// JDWP error-code to human-readable name mapping.
 const ERROR_MESSAGES: &[(u16, &str)] = &[
     (0, "NONE"),

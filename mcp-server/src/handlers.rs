@@ -2291,9 +2291,10 @@ impl RequestHandler {
             let callers_s = format_trace_callers(rec);
             let detail_s = format_trace_detail(rec);
             let args_s = format_trace_args(rec);
+            let captured_s = format_trace_captured(rec);
             let expr_s = format_trace_expr(rec);
             lines.push(format!(
-                "#{} [{}] {}.{}:{}{} thread=0x{:x}{}{}{}{}",
+                "#{} [{}] {}.{}:{}{} thread=0x{:x}{}{}{}{}{}",
                 rec.seq,
                 rec.bp_id,
                 rec.class,
@@ -2303,6 +2304,7 @@ impl RequestHandler {
                 rec.thread,
                 detail_s,
                 args_s,
+                captured_s,
                 expr_s,
                 format_trace_rethrow(rec),
             ));
@@ -4613,6 +4615,19 @@ fn parse_args(inside: &str) -> Result<Vec<ArgLit>, String> {
 fn parse_seg(raw: &str) -> Result<Seg, String> {
     let (head, sub_groups) = split_subscripts(raw)?;
     let subs = sub_groups.iter().map(|g| parse_subscript(g)).collect::<Result<Vec<_>, _>>()?;
+
+    // An object handle (TRACE-10). Kept out of `is_ident` rather than folded into it: `@` starts no
+    // Java identifier, so a token beginning with one is *meant* to be a handle and a malformed one
+    // deserves to be told so instead of falling through to "Unsupported token".
+    if head.starts_with('@') {
+        if parse_object_handle(&head).is_none() {
+            return Err(format!(
+                "Bad object handle '{head}' — the form is @0x<hex>, exactly as a trace snapshot, an \
+                 expanded object or debug.list_instances prints it."
+            ));
+        }
+        return Ok(Seg { name: head, args: None, subs });
+    }
 
     if let Some(open) = head.find('(') {
         if !head.ends_with(')') {
@@ -9598,6 +9613,100 @@ async fn arglit_to_value(
     })
 }
 
+// ----- the object-handle expression head: TRACE-10 -----
+
+/// Read `@0x1f4c` as an object id, or `None` if the token is not that shape.
+///
+/// **The spelling is the one every reply already prints** — `render_object` renders a plain object as
+/// `com.example.Order @0x1f4c`, a trace snapshot repeats the handle beside any object-valued entry, and
+/// `debug.list_instances` returns nothing else. That is `CONTEXT.md`'s rule under **Loaded** applied to
+/// values instead of class names: a name this tool shows is a name it accepts, so a handle read off a
+/// snapshot can be pasted straight back in.
+///
+/// Hex only, and the `@` is required. Both halves are deliberate: a bare `0x1f4c` would be a plausible
+/// *number* in an argument position, and decimal ids would make a handle unrecognisable next to the
+/// rendered form it was copied from.
+fn parse_object_handle(token: &str) -> Option<u64> {
+    let hex = token.strip_prefix("@0x").or_else(|| token.strip_prefix("@0X"))?;
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// What the debugger says about a handle whose object the debuggee no longer has.
+///
+/// **Vanished, in `CONTEXT.md`'s sense, not an error.** A JDWP object id is a weak reference, so this is
+/// the ordinary outcome for a handle retained across a pool's worker turnover — the same reason a thread
+/// dump reports vanished threads as a count rather than a fault. `why` distinguishes the two readings the
+/// JVM can give, because only one of them is certain.
+fn vanished_handle_message(id: u64, why: &str) -> String {
+    format!(
+        "Vanished: @0x{id:x} — {why}. A JDWP object id is a WEAK reference: a handle a snapshot retained \
+         works only while the debuggee still holds the object strongly, and on a pool that retires \
+         workers losing one is the ordinary case rather than the exotic one. This is not a wrong id and \
+         not a debugger fault, and nothing here pins objects to keep handles alive — pinning would make \
+         the debugger the reason a live heap could not be collected (ADR-0021). Take a fresh handle from \
+         a newer snapshot, or re-trace the site."
+    )
+}
+
+/// Turn a parsed `@0x…` handle into a value, or explain that the object has vanished.
+///
+/// Liveness is asked **before** the read rather than inferred from a failed one, because every other
+/// JDWP command answers `INVALID_OBJECT` for a collected object and `INVALID_OBJECT` for a typo, and a
+/// caller who cannot tell those apart learns nothing. `IsCollected` separates them while the JVM still
+/// remembers the id.
+///
+/// The value's tag is read from the object's own type rather than assumed to be `L`. It decides whether
+/// a following `[…]` can index the object without invoking anything and whether a String renders as its
+/// contents, so guessing here would make `@0x…[0]` behave differently from the same array reached
+/// through a local.
+async fn resolve_object_handle(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+) -> Result<jdwp_client::types::Value, String> {
+    use jdwp_client::types::{Value, ValueData};
+    if id == 0 {
+        return Err("@0x0 is null — there is no object behind it.".to_string());
+    }
+    match conn.is_collected(id).await {
+        Ok(true) => {
+            return Err(vanished_handle_message(id, "the debuggee says it has been garbage collected"))
+        }
+        Ok(false) => {}
+        Err(jdwp_client::JdwpError::JdwpErrorCode(jdwp_client::protocol::ERR_INVALID_OBJECT, _)) => {
+            return Err(vanished_handle_message(
+                id,
+                "the debuggee has no record of this id, which means it was collected long enough ago \
+                 that the mapping went too — or that the handle was never one this JVM issued",
+            ))
+        }
+        Err(e) => return Err(format!("Could not ask whether @0x{id:x} is still live: {e}")),
+    }
+    let tag = match conn.get_object_reference_type(id).await {
+        Ok(type_id) => {
+            let sig = conn.get_signature(type_id).await.unwrap_or_default();
+            if sig.starts_with('[') {
+                TAG_ARRAY
+            } else if sig == "Ljava/lang/String;" {
+                TAG_STRING
+            } else {
+                TAG_OBJECT
+            }
+        }
+        // Live a moment ago and unreadable now is possible on a racing GC; `L` is the safe reading and
+        // the next round trip will report the vanishing properly.
+        Err(_) => TAG_OBJECT,
+    };
+    Ok(Value { tag, data: ValueData::Object(id) })
+}
+
+/// JDWP value tags for the three reference shapes this server distinguishes when rendering.
+const TAG_OBJECT: u8 = 76; // 'L'
+const TAG_ARRAY: u8 = 91; // '['
+const TAG_STRING: u8 = 115; // 's'
+
 async fn resolve_head(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: u64,
@@ -9885,7 +9994,7 @@ async fn scan_elements(
 /// Keys ARE rendered with `toString()`. Normally this code avoids that (see `describe_field_event`), but
 /// a key exists to identify its entry, and a real key is often an object: measured against Micrometer,
 /// `meterMap` is keyed by `Meter.Id`, which without `toString()` renders as
-/// `Meter$Id (id=0xaf)` — true, and useless. The filter is already invoking a predicate against every
+/// `Meter$Id @0xaf` — true, and useless. The filter is already invoking a predicate against every
 /// value, so one more call per surviving entry changes nothing about the side effects.
 async fn scan_map_entries(
     conn: &mut jdwp_client::JdwpConnection,
@@ -10197,6 +10306,15 @@ async fn resolve_member(
     seg: &Seg,
 ) -> Result<jdwp_client::types::Value, String> {
     use jdwp_client::types::ValueData;
+    // A handle addresses an object outright, so it is a head and only a head. Saying so here beats the
+    // alternative, which is "No field '@0x1f4c' found on the object" — accurate and useless.
+    if parse_object_handle(&seg.name).is_some() {
+        return Err(format!(
+            "'{}' is an object handle, which can only be the FIRST segment of an expression — write \
+             {}.field, not something.{}",
+            seg.name, seg.name, seg.name
+        ));
+    }
     let obj_id = match &current.data {
         ValueData::Object(0) => return Err(format!("Cannot access '.{}' on null", seg.name)),
         ValueData::Object(id) => *id,
@@ -10352,6 +10470,44 @@ async fn resolve_expression(
     resolve_expression_multi(conn, thread_id, frame, expr).await?.single("This")
 }
 
+/// Resolve an expression's head, whichever of the three shapes it is, and say how many segments it ate.
+///
+/// One function because both `resolve_expression_multi` and `walk_expression_chain` need exactly this and
+/// used to spell it out twice — ADR-0015 accepted duplicated *orchestration* between those two, not a
+/// duplicated resolution order that could drift into answering differently.
+///
+/// **An `@0x…` object handle short-circuits the other two paths.** It needs no suspended frame, and its
+/// failure mode — the object vanished — is an ANSWER, so folding it into "also not a resolvable static
+/// member" would bury the one thing the caller needs to read (TRACE-10). Otherwise, with a suspended
+/// frame, the head is tried as a local variable or `this` (the common case at a breakpoint); failing
+/// that, as a static field on a class named by the leading dotted prefix
+/// (`br.com.infotravel.util.ConfigDefaultUtils.dsUrlMotor`), which needs no suspended thread at all and
+/// is why a static head can consume more than one segment.
+async fn resolve_any_head(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
+    segs: &[Seg],
+    head_seg: &Seg,
+) -> Result<(jdwp_client::types::Value, usize), String> {
+    if let Some(id) = parse_object_handle(&head_seg.name) {
+        return Ok((resolve_object_handle(conn, id).await?, 1));
+    }
+    let head_result = match (thread_id, frame) {
+        (Some(tid), Some(fr)) => Some(resolve_head(conn, tid, fr, head_seg).await),
+        _ => None,
+    };
+    if let Some(Ok(v)) = head_result {
+        return Ok((v, 1));
+    }
+    resolve_static_head(conn, thread_id, frame, segs).await.map_err(|static_err| match &head_result {
+        Some(Err(head_err)) => format!("{head_err} (also not a resolvable static member: {static_err})"),
+        _ => format!(
+            "No suspended frame to read locals from, and not a resolvable static member: {static_err}"
+        ),
+    })
+}
+
 async fn resolve_expression_multi(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: Option<u64>,
@@ -10363,31 +10519,7 @@ async fn resolve_expression_multi(
         return Err("Empty expression".to_string());
     };
 
-    // Head resolution has two paths. With a suspended frame we first try the head segment as a
-    // local variable or `this` (the common case at a breakpoint). If there is no frame, or the
-    // head isn't a local, we fall back to reading a static field off a class named by the leading
-    // dotted prefix (e.g. `br.com.infotravel.util.ConfigDefaultUtils.dsUrlMotor`). Static reads
-    // don't need a suspended thread at all.
-    let head_result = match (thread_id, frame) {
-        (Some(tid), Some(fr)) => Some(resolve_head(conn, tid, fr, head_seg).await),
-        _ => None,
-    };
-
-    let (mut current, start) = if let Some(Ok(v)) = head_result {
-        (v, 1usize)
-    } else {
-        let (v, consumed) = resolve_static_head(conn, thread_id, frame, &segs).await.map_err(
-            |static_err| match &head_result {
-                Some(Err(head_err)) => {
-                    format!("{head_err} (also not a resolvable static member: {static_err})")
-                }
-                _ => format!(
-                    "No suspended frame to read locals from, and not a resolvable static member: {static_err}"
-                ),
-            },
-        )?;
-        (v, consumed)
-    };
+    let (mut current, start) = resolve_any_head(conn, thread_id, frame, &segs, head_seg).await?;
 
     // The head's own subscripts still have to be applied — `orders[0]` is a single segment. For a
     // static head, `start` counts the class-name prefix too, so the member is the last consumed one.
@@ -10461,22 +10593,7 @@ async fn walk_expression_chain(
     let Some(head_seg) = segs.first() else {
         return Err("Empty expression".to_string());
     };
-    let head_result = match (thread_id, frame) {
-        (Some(tid), Some(fr)) => Some(resolve_head(conn, tid, fr, head_seg).await),
-        _ => None,
-    };
-    let (mut current, start) = if let Some(Ok(v)) = head_result {
-        (v, 1usize)
-    } else {
-        resolve_static_head(conn, thread_id, frame, &segs).await.map_err(|static_err| match &head_result {
-            Some(Err(head_err)) => {
-                format!("{head_err} (also not a resolvable static member: {static_err})")
-            }
-            _ => format!(
-                "No suspended frame to read locals from, and not a resolvable static member: {static_err}"
-            ),
-        })?
-    };
+    let (mut current, start) = resolve_any_head(conn, thread_id, frame, &segs, head_seg).await?;
 
     // A static head folds a dotted class prefix and its member into ONE link, so the count the caller
     // recognises is not `segs.len()`.
@@ -10789,11 +10906,11 @@ async fn render_element(conn: &mut jdwp_client::JdwpConnection, value: &jdwp_cli
             }
             match conn.get_object_reference_type(*id).await {
                 Ok(t) => format!(
-                    "{} (id=0x{:x})",
+                    "{} @0x{:x}",
                     decode_signature(&conn.get_signature(t).await.unwrap_or_default()),
                     id
                 ),
-                Err(_) => format!("(object) @{id:x}"),
+                Err(_) => format!("(object) @0x{id:x}"),
             }
         }
         _ => value.format(),
@@ -10946,7 +11063,7 @@ async fn render_node(
     // A cycle: this exact object is already an ancestor of itself.
     if state.path.contains(&id) {
         let name = type_name_of(conn, id).await;
-        return format!("↩ {name} (id=0x{id:x}, cycle)");
+        return format!("↩ {name} @0x{id:x} (cycle)");
     }
 
     // A boxed primitive is a leaf, whatever the depth: expanding it would turn a `List<Integer>`
@@ -10968,7 +11085,7 @@ async fn render_node(
         }
     }
     let Ok(type_id) = conn.get_object_reference_type(id).await else {
-        return format!("(object) @{id:x}");
+        return format!("(object) @0x{id:x}");
     };
     let name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
     if name == "java.lang.String" {
@@ -11029,11 +11146,11 @@ async fn render_fields_deep(
     let shown = fields.len().min(opts.child_limit);
     let ids: Vec<u64> = fields.iter().take(shown).map(|f| f.field_id).collect();
     let Ok(values) = conn.get_object_values(id, ids).await else {
-        return format!("{name} (id=0x{id:x}, fields unreadable)");
+        return format!("{name} @0x{id:x} (fields unreadable)");
     };
 
     let pad = indent(depth + 1);
-    let mut out = format!("{name} (id=0x{id:x}) {{");
+    let mut out = format!("{name} @0x{id:x} {{");
     for (f, v) in fields.iter().take(shown).zip(&values) {
         let rendered = render_node_boxed(conn, v, thread_id, opts, state, depth + 1).await;
         let _ = write!(out, "\n{pad}{} = {rendered}", f.name);
@@ -11056,12 +11173,12 @@ async fn render_array_deep(
     depth: usize,
 ) -> String {
     let Ok(len) = conn.get_array_length(id).await else {
-        return format!("{name} (id=0x{id:x}, length unreadable)");
+        return format!("{name} @0x{id:x} (length unreadable)");
     };
     let base = name.strip_suffix("[]").unwrap_or(name);
     render_indexed_block(conn, &format!("{base}[{len}]"), id, len, thread_id, opts, state, depth)
         .await
-        .unwrap_or_else(|| format!("{name} (id=0x{id:x}, elements unreadable)"))
+        .unwrap_or_else(|| format!("{name} @0x{id:x} (elements unreadable)"))
 }
 
 /// Indentation for a node at `depth`. Children are drawn at `indent(depth + 1)` and the closing
@@ -11367,7 +11484,7 @@ async fn render_object(
         }
     }
     let Ok(type_id) = conn.get_object_reference_type(id).await else {
-        return format!("(object) @{id:x}");
+        return format!("(object) @0x{id:x}");
     };
     let name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
     if name == "java.lang.String" {
@@ -11395,13 +11512,13 @@ async fn render_object(
             // caller had no way to know the VM had just been frozen for the whole budget (EVAL-5).
             ToStringOutcome::TimedOut(ms) => {
                 return format!(
-                    "{name} (id=0x{id:x}) ⚠️ toString() did not return within {ms}ms — value not rendered.                      JDWP cannot cancel an invocation, so that thread is STILL executing it and its frames                      are unreadable until it finishes or you debug.continue. Use expand_objects:true                      instead, which reads fields and invokes nothing."
+                    "{name} @0x{id:x} ⚠️ toString() did not return within {ms}ms — value not rendered.                      JDWP cannot cancel an invocation, so that thread is STILL executing it and its frames                      are unreadable until it finishes or you debug.continue. Use expand_objects:true                      instead, which reads fields and invokes nothing."
                 );
             }
             ToStringOutcome::Unavailable => {}
         }
     }
-    format!("{name} (id=0x{id:x})")
+    format!("{name} @0x{id:x}")
 }
 
 /// Render up to 16 elements of an array object; `None` if its length/values can't be read.
@@ -12790,7 +12907,8 @@ async fn capture_trace(
     details: &EventKind,
 ) -> crate::session::TraceRecord {
     let (class, method, line) = describe_location(conn, loc).await;
-    let mut args: Vec<(String, String)> = Vec::new();
+    let mut args: Vec<crate::session::TracedValue> = Vec::new();
+    let mut captured: Vec<crate::session::TracedValue> = Vec::new();
     let mut callers: Vec<String> = Vec::new();
     let mut expr: Option<(String, String)> = None;
 
@@ -12835,10 +12953,20 @@ async fn capture_trace(
                     if let Ok(vals) = conn.get_frame_values(thread, frame.frame_id, slots).await {
                         for ((name, _), val) in in_scope.into_iter().zip(vals.iter()) {
                             let rendered = render_value(conn, val, None, 100).await;
-                            args.push((name, rendered));
+                            args.push(crate::session::TracedValue {
+                                name,
+                                rendered,
+                                object_id: as_object_id(val),
+                            });
                         }
                     }
                 }
+            }
+            // TRACE-10: an anonymous inner class's `call()` or `run()` has almost nothing in its
+            // variable table — the enclosing method's captured locals are synthetic FIELDS on `this`.
+            // Guarded on the JVM's own name shape, so an ordinary class pays no round trips for it.
+            if is_anonymous_class(&class) {
+                captured = capture_enclosing_locals(conn, thread, frame.frame_id).await;
             }
             if let Some(e) = trace_expr {
                 let rendered = match resolve_expression(conn, Some(thread), Some(&frame), e).await {
@@ -12866,12 +12994,67 @@ async fn capture_trace(
         method,
         line,
         args,
+        captured,
         callers,
         expr,
         detail,
         // Filled in by the caller, which is what owns the chain bookkeeping (EXC-3).
         rethrow: None,
     }
+}
+
+/// Whether a JVM class name names an **anonymous** inner class — `DispHotelSrv$2`, not `Order$Line`.
+///
+/// The test is the name the JVM reports, not a guess about the source, which is the distinction
+/// `CONTEXT.md` draws under **Hidden class**: `javac` numbers anonymous classes and gives every other
+/// nested class an identifier, so a trailing `$<digits>` is decisive rather than heuristic. A lambda
+/// needs nothing here — its body is desugared onto the *enclosing* class as `lambda$…`, so its captures
+/// arrive as ordinary parameters already.
+fn is_anonymous_class(jvm_name: &str) -> bool {
+    jvm_name
+        .rsplit_once('$')
+        .is_some_and(|(_, tail)| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Read an anonymous inner class's captured enclosing-method values off `this` (TRACE-10, #85).
+///
+/// `javac` stores each captured local in a synthetic `val$<name>` field and the enclosing instance in
+/// `this$0`, so the whole causal chain across the thread boundary — which request, which session, which
+/// supplier — is sitting in fields the tool can already read. Reading them costs four round trips and
+/// **invokes nothing**, which is what keeps it usable in trace mode and under `read_only`.
+///
+/// Every failure path returns an empty section rather than an error: this is supplementary context on a
+/// snapshot, and a hit that lost its captures is still worth more than no hit. Best-effort throughout,
+/// exactly like the caller chain beside it.
+async fn capture_enclosing_locals(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread: u64,
+    frame_id: u64,
+) -> Vec<crate::session::TracedValue> {
+    let Ok(this_id) = conn.get_this_object(thread, frame_id).await else { return Vec::new() };
+    if this_id == 0 {
+        return Vec::new();
+    }
+    let Ok(type_id) = conn.get_object_reference_type(this_id).await else { return Vec::new() };
+    let Ok(fields) = conn.get_fields(type_id).await else { return Vec::new() };
+    // Declared fields only, which is what `get_fields` answers — a capture belongs to the class that
+    // captured it, and walking superclasses would drag in state that has nothing to do with the
+    // enclosing method.
+    let wanted: Vec<jdwp_client::reftype::FieldInfo> =
+        fields.into_iter().filter(|f| f.name.starts_with("val$") || f.name.starts_with("this$")).collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let ids: Vec<u64> = wanted.iter().map(|f| f.field_id).collect();
+    let Ok(values) = conn.get_object_values(this_id, ids).await else { return Vec::new() };
+    let mut out = Vec::with_capacity(values.len());
+    for (f, v) in wanted.into_iter().zip(values.iter()) {
+        // `None` for the thread, like the locals above: rendering must not invoke `toString()` in a
+        // debuggee nobody agreed to run code in.
+        let rendered = render_value(conn, v, None, 100).await;
+        out.push(crate::session::TracedValue { name: f.name, rendered, object_id: as_object_id(v) });
+    }
+    out
 }
 
 /// Render a run of caller frames as `class.method:line`, nearest caller first (TRACE-5).
@@ -12944,13 +13127,54 @@ fn format_trace_callers(rec: &crate::session::TraceRecord) -> String {
     })
 }
 
+/// Render one captured value as `name=value`, appending the object handle when the rendering does not
+/// already carry it (TRACE-10).
+///
+/// The condition is a check rather than a rule about which shapes carry an id, because the renderings
+/// disagree: a plain object prints `Order @0x1f4c` and needs nothing added, while a String prints its
+/// contents, an array its elements and a boxed primitive its number — none of which say which object
+/// they came from. Testing the rendered text keeps the two in step without either side knowing about
+/// the other.
+fn format_traced_value(v: &crate::session::TracedValue) -> String {
+    v.object_id.map_or_else(
+        || format!("{}={}", v.name, v.rendered),
+        |id| {
+            let handle = format!("@0x{id:x}");
+            if v.rendered.contains(&handle) {
+                format!("{}={}", v.name, v.rendered)
+            } else {
+                format!("{}={} {handle}", v.name, v.rendered)
+            }
+        },
+    )
+}
+
 /// Format a trace record's captured args as ` {n=v, …}` (empty string when there are none).
 fn format_trace_args(rec: &crate::session::TraceRecord) -> String {
     if rec.args.is_empty() {
         String::new()
     } else {
-        let parts: Vec<String> = rec.args.iter().map(|(n, v)| format!("{n}={v}")).collect();
+        let parts: Vec<String> = rec.args.iter().map(format_traced_value).collect();
         format!(" {{{}}}", parts.join(", "))
+    }
+}
+
+/// Format an anonymous class's captured enclosing-method values as ` captured{…}` (TRACE-10, #85).
+///
+/// Its own group rather than merged into the locals, because it answers a different question. `{…}` is
+/// what the variable table says is in scope *here*; `captured{…}` is what the frame that queued this
+/// work was holding — usually on another thread, possibly minutes earlier. Folding them together would
+/// present the submitter's context as the worker's own.
+///
+/// The names are the JVM's (`val$sessao`, `this$0`) and not prettified, on the rule `CONTEXT.md` records
+/// under **Loaded**: a name this tool shows is a name it accepts, and `this.val$sessao` is exactly what
+/// `debug.evaluate` takes.
+fn format_trace_captured(rec: &crate::session::TraceRecord) -> String {
+    if rec.captured.is_empty() {
+        String::new()
+    } else {
+        let parts: Vec<String> = rec.captured.iter().map(format_traced_value).collect();
+        format!(" captured{{{}}}", parts.join(", "))
     }
 }
 
@@ -13781,6 +14005,7 @@ mod tests {
             method: "save".to_string(),
             line: Some(10),
             args: Vec::new(),
+            captured: Vec::new(),
             callers: Vec::new(),
             expr: None,
             detail: Vec::new(),
@@ -13790,6 +14015,55 @@ mod tests {
 
         rec.callers = vec!["Ctl.post:40".to_string(), "Http.run:12".to_string()];
         assert_eq!(format_trace_callers(&rec), " ← Ctl.post:40 ← Http.run:12");
+    }
+
+    /// TRACE-10: a handle is added to a rendering that does not already carry one, and never twice.
+    ///
+    /// The three rows are the three renderings that exist. The middle one is why this is a check on the
+    /// text rather than a rule about tags: the plain object form already ends in the handle, so a rule
+    /// like "objects get one appended" would print it twice for the commonest case of all.
+    #[test]
+    fn a_traced_value_carries_its_handle_exactly_once() {
+        let v = |name: &str, rendered: &str, id: Option<u64>| crate::session::TracedValue {
+            name: name.to_string(),
+            rendered: rendered.to_string(),
+            object_id: id,
+        };
+        // A primitive has no object behind it, so nothing is added.
+        assert_eq!(format_traced_value(&v("n", "(int) 3", None)), "n=(int) 3");
+        // A plain object already renders as its own handle.
+        assert_eq!(format_traced_value(&v("o", "Order @0x1f4c", Some(0x1f4c))), "o=Order @0x1f4c");
+        // A String renders as its contents, so the handle is nowhere in the text and has to be added —
+        // which is the whole reason the id is carried beside the rendering rather than inside it.
+        assert_eq!(format_traced_value(&v("s", "\"ABC\"", Some(0x2a))), "s=\"ABC\" @0x2a");
+    }
+
+    /// TRACE-10: the captured section is anonymous-classes-only, and the test is the JVM's name shape.
+    ///
+    /// `Order$Line` is the case that matters — a nested class is not anonymous, and paying four round
+    /// trips per hit to discover it has no `val$` fields would be a cost on every ordinary trace.
+    #[test]
+    fn only_a_numbered_inner_class_reads_as_anonymous() {
+        for anon in ["DispHotelSrv$2", "a.b.Outer$1", "Outer$1$3"] {
+            assert!(is_anonymous_class(anon), "{anon} is an anonymous inner class");
+        }
+        for named in ["Order", "com.example.Order", "Order$Line", "Outer$1Local", "Trailing$"] {
+            assert!(!is_anonymous_class(named), "{named} is not an anonymous inner class");
+        }
+    }
+
+    /// TRACE-10: `@0x…` is read as a handle, and nothing else is.
+    ///
+    /// The rejected rows are the point. A bare `0x2a` would be indistinguishable from a hex *number* in
+    /// an argument, and a decimal id would not match the form every reply prints — so both are refused
+    /// rather than accepted as a convenience that makes the printed spelling optional.
+    #[test]
+    fn an_object_handle_is_at_and_hex_and_nothing_else() {
+        assert_eq!(parse_object_handle("@0x1f4c"), Some(0x1f4c));
+        assert_eq!(parse_object_handle("@0X1F4C"), Some(0x1f4c));
+        for not_a_handle in ["@", "@0x", "@1f4c", "0x1f4c", "@0xzz", "order", "@0x1f4cg"] {
+            assert_eq!(parse_object_handle(not_a_handle), None, "{not_a_handle} is not a handle");
+        }
     }
 
     /// A `DumpRow` with everything empty, for the render tests to fill in selectively.

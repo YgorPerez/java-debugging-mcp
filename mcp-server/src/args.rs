@@ -431,11 +431,18 @@ pub struct GetStackArgs {
 /// Arguments for debug.evaluate.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvaluateArgs {
-    /// Java expression. Heads: a local, `this`, or a class (`ConfigDefaultUtils`, or fully
-    /// qualified). Then chain `.field` and `.method(args)` freely, including static members
+    /// Java expression. Heads: a local, `this`, a class (`ConfigDefaultUtils`, or fully
+    /// qualified), or an **object handle** — `@0x1f4c`, the spelling every reply prints beside an
+    /// object. Then chain `.field` and `.method(args)` freely, including static members
     /// (`ConfigDefaultUtils.getUrl()`). Arguments may be literals (int, `123L`, true/false, null,
     /// `"string"`) or expressions passed by reference — a local, `this.field`, or a nested call
     /// (`svc.matches(reserva)`, `foo.handle(this, cfg.getId())`).
+    ///
+    /// A handle reaches an object with **no frame and no root to reach it from**, which is what makes a
+    /// trace snapshot drillable after the fact (TRACE-10). It may only be the first segment. The id is a
+    /// **weak** reference, so a handle can stop working: the reply says `Vanished: @0x…` and which of
+    /// the two readings it is, rather than reporting a JDWP error code. Nothing pins objects to keep
+    /// handles alive — ADR-0021 records why.
     ///
     /// Subscripts work on arrays, `List` and `Map`:
     /// `lines[0]` (index — keeps chaining, so `lines[0].sku` works), `counts["key"]` (map lookup),
@@ -474,7 +481,8 @@ pub struct EvaluateArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EvaluateChainArgs {
     /// The chained Java expression to walk, in exactly the form `debug.evaluate` accepts —
-    /// `wsReservaCircuito.getCircuitoParametro().getConfigUhList()[0].getSqQuarto()`.
+    /// `wsReservaCircuito.getCircuitoParametro().getConfigUhList()[0].getSqQuarto()`, including an
+    /// `@0x…` object handle as the head.
     ///
     /// A single-link expression is accepted but answers nothing this tool is for: with one link there is
     /// no "which one" to find.
