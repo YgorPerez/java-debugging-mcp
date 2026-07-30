@@ -47,6 +47,24 @@ belongs to `coverage.yml`. `--findings` works this out **per tool** from the wor
 list, so "ran here, but not in the gate" stays true as that list changes — it used to be a yes/no grep for
 `cargo install` anywhere in the file, which a *comment* containing those words silently flipped.
 
+**There is deliberately no AI code-review workflow, and re-adding one by reflex would undo a decision.**
+`/install-github-app` had scaffolded `claude-code-review.yml` and `claude.yml` — untouched template, commented-out
+`paths:` filter and all. The auth step was never finished: the repo has **no secrets at all**, so
+`CLAUDE_CODE_OAUTH_TOKEN` was always empty. The review workflow ran five times, **failed five times, and never
+posted a comment**; the `@claude` one skipped twenty times and would have failed the same way if anyone had tried
+it. Both are removed.
+
+They were removed rather than wired up because a red check that verified nothing is the inversion of the rule the
+rest of this section is built on. `--findings` names the passes that did not run, `sarif-for-code-scanning.py`
+prints what it withheld, and `semver-check.sh` says "0 checks ran, so this verified nothing" instead of passing
+quietly — all so a green tick cannot mean less than it looks like. A permanent red that tested nothing costs more
+than that: it teaches you to ignore red on PRs. Review depth already comes from doctor (the gate, ADR-0007),
+rust-doctor, the semver job, coverage, six integration legs, GitGuardian, and the `/code-review` skill locally —
+which reads this file, `CONTEXT.md` and the ADRs rather than a generic five-bullet prompt. If an AI review is
+wanted, it needs `CLAUDE_CODE_OAUTH_TOKEN` set as a repository secret **first**, and a prompt that names this
+repo's actual risks (suspension honesty, resume verification, caller-visible replies) instead of "performance
+considerations".
+
 **Run the suite on more than one JDK.** `scripts/integration-test.sh` covers the `#[ignore]`d
 JVM tests; plain `cargo test` covers the unit and cassette tests, and you need both to see all of
 `mcp_integration.rs`. CI runs JDK 11/17/21 and has caught version-locked tests that passed on one JDK
