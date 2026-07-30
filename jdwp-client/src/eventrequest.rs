@@ -167,8 +167,21 @@ impl JdwpConnection {
 
     /// As [`set_exception_request`](Self::set_exception_request), plus optional `ThreadOnly` (report
     /// only throws on one thread — the single biggest noise reduction on a busy app server, FILT-1)
-    /// and `Count` (report at most every Nth throw, and — because `Count` auto-expires *inside the
-    /// JVM* — a self-disarming hit budget for trace mode so a hot throw site can't flood, TRACE-3).
+    /// and `Count`.
+    ///
+    /// `Count` reports **only the Nth throw** and then the JVM deletes the request — it is not a
+    /// sampler, so `count: 5` gives you throw #5 and nothing before or after it.
+    ///
+    /// **It is not what bounds trace mode**, and no caller in this workspace passes it: every call site
+    /// gives `None`. The trace-hit budget is counted *server-side* by `decrement_trace_budget`, because
+    /// the requirement is "record the first N hits, then stop" and `Count` cannot express that — it
+    /// would silently record one trace instead of N. See ADR-0002, which rejected `Count` for exactly
+    /// this and notes the JVM-side expiry is attractive enough that it was nearly re-proposed after
+    /// being turned down once. This doc comment previously claimed the opposite; a maintainer who
+    /// believed it might remove the server-side counter as redundant.
+    ///
+    /// `Count` *is* the right tool for `hit_count` ("stop on the Nth hit"), which is what it means, and
+    /// that is where [`set_breakpoint_ex`](Self::set_breakpoint_ex) uses it.
     ///
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
@@ -246,8 +259,10 @@ impl JdwpConnection {
     }
 
     /// As [`set_field_watch`](Self::set_field_watch), plus optional `ThreadOnly` (report only touches
-    /// from one thread, FILT-1) and `Count` (report at most every Nth touch — used as a self-disarming
-    /// hit budget for trace mode, since `Count` expires inside the JVM and stops sending, TRACE-3).
+    /// from one thread, FILT-1) and `Count` — which reports **only the Nth touch** before the JVM
+    /// deletes the request, and which no caller here passes. See
+    /// [`set_exception_request_ex`](Self::set_exception_request_ex) for why the trace budget is counted
+    /// server-side instead (ADR-0002).
     ///
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed. A JVM

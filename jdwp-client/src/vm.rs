@@ -31,6 +31,17 @@ pub struct VmVersion {
 /// Worth asking before a feature that depends on one: a JVM without the capability answers
 /// `NOT_IMPLEMENTED` (99) to the actual command, and "this JVM can't tell us" is a far more useful
 /// report than a bare error code.
+///
+/// **Two features deliberately don't ask, and it is worth knowing which**, so the sentence above is not
+/// read as a guarantee it does not make: [`force_early_return`](JdwpConnection::force_early_return)
+/// (`canForceEarlyReturn`) and
+/// [`get_source_debug_extension`](JdwpConnection::get_source_debug_extension)
+/// (`canGetSourceDebugExtension`) both issue their command without checking first, and neither bit is
+/// decoded — [`VmCapabilitiesNew`] stops at `canPopFrames`. Both then surface the raw
+/// `NOT_IMPLEMENTED` (99), which is precisely the bare error code this rule exists to improve on.
+/// Accepted for now rather than overlooked: adding a bit nothing consults is the mistake `IDSizes` was
+/// deleted for (CLEAN-1, #27), so the bits arrive with the check, not before it. Measured values for the
+/// whole `CapabilitiesNew` vector on Temurin 17.0.20 are in `docs/heap-query-measurements.md`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 // Seven bools because the JDWP reply is seven bools, in this order. This is a decoded wire structure,
 // not a parameter bag that wants splitting up — grouping them differently would only make the reader
