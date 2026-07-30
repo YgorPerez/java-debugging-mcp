@@ -8018,6 +8018,145 @@ fn evaluate_chain_names_the_link_that_went_null() {
     server.panic_reset();
 }
 
+/// The `<n>` of `HeapProbe`'s `tick … gap=<n>ms` line — the probe's own measurement of how long it was
+/// held. A tick is the only evidence an application thread is running, so the pause a stop-the-world
+/// heap walk imposes shows up here and nowhere else; the debugger reports success either way.
+fn tick_gap_ms(line: &str) -> Option<i64> {
+    let at = line.find("gap=")? + "gap=".len();
+    line.get(at..)?.strip_suffix("ms")?.parse().ok()
+}
+
+/// The largest gap the probe has printed since `from` lines of output.
+fn worst_gap_since(probe: &Probe, from: usize) -> i64 {
+    probe.output().iter().skip(from).filter_map(|l| tick_gap_ms(l)).max().unwrap_or(0)
+}
+
+/// DISC-10: the heap query ships, and it reports what it cost — measured on both sides.
+///
+/// Four things are being pinned here, and the third and fourth are the ones the maintainer's decision
+/// on #84 turns on. That `Instances` is **exact type** — `Widget` answers 7 with two live `SubWidget`s
+/// in the heap, which is `CONTEXT.md`'s `Loaded` trap in a new costume and would otherwise be
+/// discovered. That the handles it returns are **usable**, which is the whole reason #84 was blocked on
+/// #85. That the reply states its own **held duration** rather than refusing or demanding an
+/// acknowledgement (ADR-0010's precedent, ADR-0022's decision). And that the duration is real: the
+/// probe's own tick gaps have to widen while the walks run, because the debugger reports success either
+/// way and its own number would otherwise be unfalsifiable.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+#[allow(clippy::too_many_lines)] // one linear script against one shaped heap; splitting it would mean
+                                 // allocating the ballast twice for halves that only mean anything together
+fn a_heap_query_answers_by_exact_type_and_reports_the_pause_it_imposed() {
+    let Some(jdk) = jdk_or_skip("a_heap_query_answers_by_exact_type_and_reports_the_pause_it_imposed") else {
+        return;
+    };
+    // `launch_running`: the ballast takes a moment to allocate and nothing is asked about a class that
+    // has not been instantiated yet.
+    let probe = Probe::launch_running(&jdk, "HeapProbe", |l| l.starts_with("ready")).expect("launch");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // A quiet stretch first, so the pause below is measured against this probe on this box rather than
+    // against the 50ms the probe intends to sleep for.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let quiet_from = probe.output().len();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let quiet_worst = worst_gap_since(&probe, quiet_from);
+    let busy_from = probe.output().len();
+
+    let types = serde_json::json!(["HeapProbe$Widget", "HeapProbe$SubWidget", "HeapProbe$Nothing"]);
+
+    // 1. Exact-type counts, in one call, over one batch.
+    let listed =
+        server.call("debug.list_instances", serde_json::json!({"class_names": types, "max_instances": 3}));
+    assert_contains_all(
+        "exact-type counts, with the semantic stated rather than left to be discovered",
+        &listed,
+        &[
+            "HeapProbe$Widget — 7 live instance(s)",
+            "HeapProbe$SubWidget — 2 live instance(s)",
+            "HeapProbe$Nothing — 0 live instance(s)",
+            "EXACT TYPE, NOT SUBTYPE-INCLUSIVE",
+            "HELD APPLICATION THREADS FOR ~",
+        ],
+    );
+    // 7, not 9: the two SubWidgets are live and are NOT counted as Widgets. And not 10 either — the
+    // three unreachable Widgets are never reported.
+    assert!(!listed.contains("Widget — 9 live"), "Instances is exact-type, not subtype-inclusive: {listed}");
+    // The clamp bounds the handles and not the count, so a clamped listing still says how many exist.
+    assert_contains_all(
+        "max_instances clamps what is shown, never what is reported",
+        &listed,
+        &["showing 3", "… +4 more"],
+    );
+
+    // 2. The handles work. This is the whole reason #84 was blocked on #85 — without it the tool
+    //    returns identifiers nothing can dereference.
+    let handle = listed
+        .lines()
+        .filter(|l| l.starts_with("  ") && l.contains("HeapProbe$Widget"))
+        .find_map(|l| l.split_whitespace().find(|w| w.starts_with("@0x")))
+        .unwrap_or_else(|| panic!("no @0x… handle in:\n{listed}"))
+        .to_string();
+    let payload = server.evaluate(&format!("{handle}.payload"));
+    assert!(
+        payload.contains("widget-"),
+        "a handle from list_instances must be an expression head that reaches that object: {payload}"
+    );
+
+    // 3. counts_only is one walk for the whole batch and returns no handles.
+    let counted =
+        server.call("debug.list_instances", serde_json::json!({"class_names": types, "counts_only": true}));
+    assert_contains_all(
+        "counts_only answers the cheap half in a single walk",
+        &counted,
+        &["1 live-heap walk(s)", "HeapProbe$Widget — 7 live instance(s)"],
+    );
+    assert!(!counted.contains("@0x"), "counts_only returns no handles: {counted}");
+
+    // 4. A negative clamp is refused without spending a walk to learn it.
+    let bad = server.call(
+        "debug.list_instances",
+        serde_json::json!({"class_names": ["HeapProbe$Widget"], "max_instances": -1}),
+    );
+    assert_contains_all("a negative max_instances is refused here, not by the JVM", &bad, &["max_instances"]);
+    assert!(!bad.contains("live-heap walk"), "nothing should have been walked: {bad}");
+
+    // A name that does not resolve is reported beside the answers rather than failing the call — the
+    // same partial-success rule a batch of class patterns follows.
+    let mixed = server.call(
+        "debug.list_instances",
+        serde_json::json!({"class_names": ["HeapProbe$Widget", "no.such.Type"], "counts_only": true}),
+    );
+    assert_contains_all(
+        "an unresolvable name costs nothing and does not lose the others",
+        &mixed,
+        &["HeapProbe$Widget — 7 live instance(s)", "no.such.Type — not resolved"],
+    );
+
+    // 5. THE MEASUREMENT, from the debuggee. Nothing was suspended by the debugger, and the reply says
+    //    it was still held — so the probe's ticks must show it. This is the only unfalsifiable half.
+    let busy_worst = worst_gap_since(&probe, busy_from);
+    // Printed rather than only asserted: the two numbers ARE the finding, and a run log that names them
+    // is what lets someone reproduce this on another box and another heap size.
+    println!("HeapProbe tick gaps: worst quiet={quiet_worst}ms, worst during the heap walks={busy_worst}ms");
+    println!("debugger's own figure for one walk: {}", counted.lines().next().unwrap_or("(missing)"));
+    assert!(
+        busy_worst > quiet_worst,
+        "a stop-the-world walk must show up as a widened tick gap — quiet {quiet_worst}ms vs busy \
+         {busy_worst}ms\n  output: {:?}",
+        probe.output(),
+    );
+    // And the probe is still running: the walk holds threads, it does not leave them suspended.
+    let after = probe.output().len();
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_gap_ms(l).is_some()).is_some() || after > busy_from,
+        "the probe must still be ticking after the walks\n  output: {:?}",
+        probe.output(),
+    );
+
+    server.panic_reset();
+}
+
 /// Pull the `@0x…` handle that follows `<name>=` on one `debug.get_traces` line (TRACE-10).
 ///
 /// Reads the handle the reply printed rather than reconstructing one, which is the point of the two

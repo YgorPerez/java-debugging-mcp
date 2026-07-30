@@ -7,7 +7,7 @@
 use crate::args::{
     AttachArgs, CheckStaleArgs, ClearBreakpointArgs, EvaluateArgs, EvaluateChainArgs, ForceReturnArgs,
     GetLastEventArgs, GetStackArgs, GetTracesArgs, LaunchArgs, ListClassesArgs, ListFieldsArgs,
-    ListMethodsArgs, ListThreadsArgs, PopFrameArgs, ReloadClassArgs, SetBreakpointArgs,
+    ListInstancesArgs, ListMethodsArgs, ListThreadsArgs, PopFrameArgs, ReloadClassArgs, SetBreakpointArgs,
     SetExceptionBreakpointArgs, SetMethodBreakpointArgs, SetValueArgs, SetWatchpointArgs, SourceArgs,
     StepArgs, ThreadDumpArgs, ToggleBreakpointArgs,
 };
@@ -204,6 +204,11 @@ fn inspection_tools() -> Vec<Tool> {
             input_schema: to_val(schemars::schema_for!(ListFieldsArgs)),
         },
         Tool {
+            name: "debug.list_instances".to_string(),
+            description: "Find the LIVE OBJECTS of one or more loaded classes, returned as @0x… handles that debug.evaluate accepts as expression heads — the only way to reach an object that no local, `this` and no static field can name. That is the container case: an @ApplicationScoped bean's caches, a producer-injected component, anything whose only reference is a Weld proxy held by the container. Also reports how many instances each type has, which is the cheap half (counts_only:true).\nTHIS IS NOT FREE, AND IT LOOKS FREE. JDWP requires no suspend for these commands and none is issued — yet the JVM STOPS THE WORLD for a full live-heap walk on every call: measured at 522 ms of held application threads on a 2,000,000-object heap to answer with 7 objects, against 54 ms on a 20,000-object heap for THE SAME 7 OBJECTS. The cost tracks the LIVE HEAP, not the answer, so on a multi-GB app server a single call can stall every in-flight request for seconds. The reply reports the duration it actually held them, and how many walks it took. Nothing here refuses on heap size; you are being told the price, not protected from it.\nASK ABOUT SEVERAL TYPES AT ONCE. The count for a whole batch is one walk (three types measured at 604 ms, about the price of one), so class_names is a list and using it is nearly free; calling this once per type is not.\nEXACT TYPE, NOT SUBTYPE-INCLUSIVE — the thing most likely to mislead you. Instances of a base class or an interface are NOT included: Widget answers 7 with two live SubWidgets in the heap, not 9. On a CDI/EJB codebase the name you reach for is usually the interface or the bean class while the live objects are …_$$_WeldClientProxy, so this can answer a confident 0 about a type with hundreds of live instances. Name the subclasses and the proxy explicitly — they ride the same walk.\nOnly strongly-reachable objects are reported. max_instances clamps the handles (0 = all) but never the reported count, so a clamped listing still tells you how many there are. Handles are WEAK references and nothing pins them, so one can report Vanished later.".to_string(),
+            input_schema: to_val(schemars::schema_for!(ListInstancesArgs)),
+        },
+        Tool {
             name: "debug.source".to_string(),
             description: "What file a loaded class was COMPILED FROM, and — when source roots are configured — the source lines around a given line. Two independent halves. The JVM half needs no local files at all and is the one that settles whether your checkout is the code that is actually running: a class reporting Order.java in a tree where that file was renamed months ago is the answer, and reading local source would never have shown it. A JSR-45 source debug extension (JSP, Kotlin, Groovy) is reported when the class carries one, meaning the .java name is only an intermediate. The disk half turns a stack frame's class.method:line into text: pass line to get a bounded window around it with line numbers (context, default 20 either side) — that is the intended use, since a caller chasing one frame should not pull a 2000-line file into context. whole_file:true returns everything, still capped by max_lines (default 400), and the reply always states which lines of how many it is showing. Roots come from debug.attach {source_roots:[...]} or the JDWP_SOURCE_ROOTS environment variable, and source_roots on the call overrides both ([] reads no file). A root is where the PACKAGE TREE starts: the file is looked up at <root>/<package as directories>/<the name the JVM reported>, which is why an inner class (com.example.Order$Line) correctly resolves to its enclosing Order.java. Plain directories only — sources inside JARs are not read. The failure modes stay distinct: class not loaded, loaded but compiled with no SourceFile attribute (javac -g:none, or a synthetic class), no configured root holds the file, and found-but-unreadable each say something different about what to fix.".to_string(),
             input_schema: to_val(schemars::schema_for!(SourceArgs)),
@@ -267,6 +272,7 @@ mod tests {
             "debug.list_classes",
             "debug.list_methods",
             "debug.list_fields",
+            "debug.list_instances",
             "debug.source",
             "debug.check_stale",
             "debug.thread_dump",

@@ -151,6 +151,8 @@ impl RequestHandler {
         let args = call_params.arguments;
         let result = if let Some(r) = self.dispatch_control(name, args.clone()).await {
             r
+        } else if let Some(r) = self.dispatch_stop_points(name, args.clone()).await {
+            r
         } else if let Some(r) = self.dispatch_discovery(name, args.clone()).await {
             r
         } else if let Some(r) = self.dispatch_inspect(name, args).await {
@@ -181,10 +183,6 @@ impl RequestHandler {
         Some(match name {
             "debug.attach" => self.handle_attach(args).await,
             "debug.launch" => self.handle_launch(args).await,
-            "debug.set_line_stop" => self.handle_set_line_stop(args).await,
-            "debug.list_stop_points" => self.handle_list_stop_points(args).await,
-            "debug.clear_stop_point" => self.handle_clear_stop_point(args).await,
-            "debug.toggle_stop_point" => self.handle_toggle_stop_point(args).await,
             "debug.continue" => self.handle_continue(args).await,
             "debug.step_over" => self.handle_step_over(args).await,
             "debug.step_into" => self.handle_step_into(args).await,
@@ -193,6 +191,30 @@ impl RequestHandler {
             "debug.list_sessions" => self.handle_list_sessions().await,
             "debug.disconnect" => self.handle_disconnect(args).await,
             "debug.panic" => self.handle_panic(args).await,
+            _ => return None,
+        })
+    }
+
+    /// Arming, listing and disarming **stop points** — all four kinds, plus the three tools that work
+    /// across them. Returns `None` if `name` isn't one of these.
+    ///
+    /// Its own group as of DISC-10 (#84), when a fifteenth arm pushed `dispatch_inspect` past the
+    /// complexity budget and the four `set_*_stop` tools were sitting in it while `set_line_stop` sat in
+    /// `dispatch_control`. The line is a real one and it is the one `CONTEXT.md` and `tools.rs` already
+    /// draw: everything here creates or removes a request in the debuggee, and nothing here reads state.
+    async fn dispatch_stop_points(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Option<Result<String, String>> {
+        Some(match name {
+            "debug.set_line_stop" => self.handle_set_line_stop(args).await,
+            "debug.set_exception_stop" => self.handle_set_exception_stop(args).await,
+            "debug.set_field_stop" => self.handle_set_field_stop(args).await,
+            "debug.set_method_exit_stop" => self.handle_set_method_exit_stop(args).await,
+            "debug.list_stop_points" => self.handle_list_stop_points(args).await,
+            "debug.clear_stop_point" => self.handle_clear_stop_point(args).await,
+            "debug.toggle_stop_point" => self.handle_toggle_stop_point(args).await,
             _ => return None,
         })
     }
@@ -233,10 +255,11 @@ impl RequestHandler {
             "debug.force_return" => self.handle_force_return(args).await,
             "debug.reload_class" => self.handle_reload_class(args).await,
             "debug.pop_frame" => self.handle_pop_frame(args).await,
-            "debug.set_exception_stop" => self.handle_set_exception_stop(args).await,
-            "debug.set_field_stop" => self.handle_set_field_stop(args).await,
-            "debug.set_method_exit_stop" => self.handle_set_method_exit_stop(args).await,
             "debug.get_traces" => self.handle_get_traces(args).await,
+            // Not in `dispatch_discovery` despite taking class names: that group answers what a class
+            // DECLARES, with no suspended thread and no cost to anyone else. This one asks what is
+            // ALIVE, and stops the world to find out.
+            "debug.list_instances" => self.handle_list_instances(args).await,
             _ => return None,
         })
     }
@@ -1315,6 +1338,91 @@ impl RequestHandler {
         }
 
         Ok(output)
+    }
+
+    /// DISC-10: which objects of these types are alive right now, as handles an expression can start
+    /// from — the only route to a container-held bean that no local, `this` or static field can name.
+    ///
+    /// **This is a diagnostic that looks free and is not, and saying so is half the feature.** JDWP
+    /// requires no suspend for `ReferenceType.Instances` or `VirtualMachine.InstanceCounts` and this
+    /// server issues none, yet the JVM holds every application thread for a full live-heap walk:
+    /// **522 ms on a 2,000,000-object heap to answer with 7 objects**, 54 ms on a 20,000-object heap for
+    /// the same 7. The cost tracks the live heap, not the result, so on a multi-GB `WildFly` a single
+    /// call can stall every in-flight request for seconds.
+    ///
+    /// Nothing refuses on heap size and there is no acknowledgement argument. Both were considered and
+    /// rejected in #84's decision comment: they make the tool guess on the caller's behalf about a cost
+    /// the caller is explicitly accepting, and a heap-size pre-check is itself a heap walk. What the
+    /// tool owes instead is **its own measured cost**, on the ADR-0010 precedent that a traced stop
+    /// point reports what it actually spent rather than a documented estimate. ADR-0022 records it.
+    ///
+    /// The timer wraps the heap-walking commands and nothing else — not name resolution, not the
+    /// capability check, not the rendering afterwards — for exactly ADR-0010's reason: charging our own
+    /// work to "what the walk cost" would report the debugger's overhead as the debuggee's price.
+    async fn handle_list_instances(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::ListInstancesArgs = crate::args::parse(&args)?;
+        if a.max_instances < 0 {
+            return Err(format!(
+                "max_instances must be 0 (all) or positive, got {}. JDWP answers ILLEGAL_ARGUMENT to a \
+                 negative one, and there is no reason to spend a heap walk finding that out.",
+                a.max_instances
+            ));
+        }
+        let names: Vec<String> =
+            a.class_names.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if names.is_empty() {
+            return Err("class_names is required — one or more loaded, fully-qualified class names \
+                        (e.g. [\"br.com.infotravel.service.ApplicationSrv\"]). Several cost about one \
+                        heap walk between them; one at a time costs one each."
+                .to_string());
+        }
+
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+        let conn = &mut session.connection;
+
+        // Asked before the command rather than after a refusal, per the rule `VmCapabilities` states.
+        // `canGetInstanceInfo` is bit 16 and is decoded in this same change, because a decoded bit
+        // nothing reads is the mistake `IDSizes` was deleted for (CLEAN-1, #27).
+        let caps = conn
+            .capabilities_new()
+            .await
+            .map_err(|e| format!("Failed to ask the JVM what it supports (CapabilitiesNew): {e}"))?;
+        if !caps.can_get_instance_info {
+            return Err("This JVM cannot answer heap queries: it reports canGetInstanceInfo=false, so \
+                        ReferenceType.Instances and VirtualMachine.InstanceCounts would both answer \
+                        NOT_IMPLEMENTED. Nothing was sent and no heap was walked."
+                .to_string());
+        }
+
+        // Resolve every name first, and outside the timed window. Partial success is the normal outcome
+        // for a list of names, exactly as it is for a batch of class patterns, so an unresolvable name
+        // is reported beside the answers rather than failing the call.
+        let mut resolved: Vec<(String, u64)> = Vec::new();
+        let mut unresolved: Vec<(String, String)> = Vec::new();
+        for name in names {
+            match resolve_loaded_class(conn, &name).await {
+                Ok(id) => resolved.push((name, id)),
+                Err(e) => unresolved.push((name, e)),
+            }
+        }
+        if resolved.is_empty() {
+            let mut out = String::from(
+                "No heap was walked: none of the names resolved to a loaded class, and a heap query on \
+                 nothing would still have cost a full walk.\n",
+            );
+            for (name, why) in &unresolved {
+                let _ = writeln!(out, "  {name}: {why}");
+            }
+            return Err(out);
+        }
+
+        let ids: Vec<u64> = resolved.iter().map(|(_, id)| *id).collect();
+        let walk = walk_the_heap(conn, &ids, a.max_instances, a.counts_only).await?;
+        let report = render_instance_report(conn, &resolved, &unresolved, &walk, &a).await;
+        drop(session);
+        Ok(report)
     }
 
     /// DISC-3: what file a loaded class was compiled from, and — when source roots are configured —
@@ -4962,6 +5070,172 @@ fn explain_no_fields(filtered: bool, inherited: bool) -> String {
         note.push_str(" Pass inherited:true to walk the superclass chain.\n");
     }
     note
+}
+
+// ----- the heap query: DISC-10 -----
+
+/// What one `debug.list_instances` call actually did, and what it cost (DISC-10, #84).
+struct HeapWalk {
+    /// True live counts per resolved type, from `InstanceCounts` — **one** walk for the whole batch.
+    ///
+    /// Always asked, even when handles are wanted too, because it is what keeps a clamped listing
+    /// honest: `max_instances: 10` against 4000 live objects has to say 4000, not 10.
+    counts: Vec<i64>,
+    /// Handles per type, parallel to `counts`. Empty in `counts_only` mode, and empty for a type whose
+    /// count is 0 — there is nothing to fetch and a whole walk is saved by not asking.
+    handles: Vec<Vec<jdwp_client::types::Value>>,
+    /// A per-type failure, parallel again. One type refusing must not lose the others' answers; the
+    /// walk they cost has already been paid for.
+    errors: Vec<Option<String>>,
+    /// How many full live-heap walks this call cost. The number that explains the duration below.
+    walks: usize,
+    /// Wall clock across the walking commands and **nothing else** — the held duration this reports.
+    held: std::time::Duration,
+}
+
+/// Issue the heap-walking commands, timing them and nothing else (ADR-0010's discipline, ADR-0022).
+///
+/// `InstanceCounts` first and always, for the whole batch at once: it is one walk regardless of how
+/// many types are named (three measured at 604 ms, about the price of one), and it is the only source
+/// of a *true* count when the handle listing is clamped. Then one `Instances` per type that has any —
+/// each of those is another full walk, which is why the reply reports the number of them rather than
+/// leaving a caller to infer it.
+async fn walk_the_heap(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &[u64],
+    max_instances: i32,
+    counts_only: bool,
+) -> Result<HeapWalk, String> {
+    let started = std::time::Instant::now();
+    let counts = conn.instance_counts(ids).await.map_err(|e| {
+        format!(
+            "VirtualMachine.InstanceCounts failed: {e}. The heap walk it started may still have cost \
+             the debuggee a pause."
+        )
+    })?;
+    let mut walks = 1usize;
+    let mut handles = Vec::with_capacity(ids.len());
+    let mut errors = Vec::with_capacity(ids.len());
+    if !counts_only {
+        for (i, id) in ids.iter().enumerate() {
+            // A count of 0 means there is nothing to fetch, so the second walk is skipped outright —
+            // which is most of why `InstanceCounts` is asked for the whole batch first.
+            if counts.get(i).copied().unwrap_or(0) == 0 {
+                handles.push(no_instances());
+                errors.push(None);
+                continue;
+            }
+            walks += 1;
+            match conn.instances(*id, max_instances).await {
+                Ok(vs) => {
+                    handles.push(vs);
+                    errors.push(None);
+                }
+                Err(e) => {
+                    handles.push(no_instances());
+                    errors.push(Some(format!("ReferenceType.Instances failed: {e}")));
+                }
+            }
+        }
+    }
+    Ok(HeapWalk { counts, handles, errors, walks, held: started.elapsed() })
+}
+
+/// The empty handle list for a type that was not asked about, or whose ask failed.
+///
+/// A named function rather than `Vec::new()` at the two call sites: both are inside the walk loop, and
+/// an empty `Vec` there reads to a linter — reasonably — as an allocation that should have been hoisted.
+/// It cannot be, since each slot is moved into the result, so the intent is stated instead.
+const fn no_instances() -> Vec<jdwp_client::types::Value> {
+    Vec::new()
+}
+
+/// Render one live instance as `@0x…  <value>`, adding the handle when the rendering lacks it.
+///
+/// Nothing is invoked (`thread_id` is `None`), so a `String` instance shows its contents and an array
+/// its elements without running a line of debuggee code — and this happens **after** the timed window,
+/// because it is the debugger's own cost rather than the walk's.
+async fn render_instance(conn: &mut jdwp_client::JdwpConnection, v: &jdwp_client::types::Value) -> String {
+    let rendered = render_value(conn, v, None, 120).await;
+    let Some(id) = as_object_id(v) else { return rendered };
+    let handle = format!("@0x{id:x}");
+    if rendered.contains(&handle) {
+        rendered
+    } else {
+        format!("{handle}  {rendered}")
+    }
+}
+
+/// Turn a completed [`HeapWalk`] into the reply.
+///
+/// The measured cost leads rather than trails, because it is the thing a caller has to see before
+/// deciding whether to run this again — the same reason ADR-0010 puts a traced stop point's cost beside
+/// its budget in the listing rather than behind a second call.
+async fn render_instance_report(
+    conn: &mut jdwp_client::JdwpConnection,
+    resolved: &[(String, u64)],
+    unresolved: &[(String, String)],
+    walk: &HeapWalk,
+    a: &crate::args::ListInstancesArgs,
+) -> String {
+    let mut out = format!(
+        "🧭 {} type(s) over {} live-heap walk(s) — HELD APPLICATION THREADS FOR ~{}ms.\n\
+         That is this call's own measurement, not an estimate: the debuggee stops the world for each \
+         walk even though JDWP required no suspend and none was issued.\n\n",
+        resolved.len(),
+        walk.walks,
+        walk.held.as_millis()
+    );
+
+    for (i, (name, _)) in resolved.iter().enumerate() {
+        let count = walk.counts.get(i).copied().unwrap_or(0);
+        if let Some(Some(err)) = walk.errors.get(i) {
+            let _ = writeln!(out, "{name} — {count} live instance(s), but no handles: {err}");
+            continue;
+        }
+        let shown = walk.handles.get(i).map_or(0, Vec::len);
+        // A count of 0 is an ANSWER, and "showing 0:" over an empty block reads like a listing that
+        // failed. It is also the reading most likely to be wrong for the caller's actual question — see
+        // the exact-type note below — so it gets the plainest wording available.
+        if a.counts_only || count == 0 {
+            let _ = writeln!(out, "{name} — {count} live instance(s)");
+            continue;
+        }
+        let _ = writeln!(out, "{name} — {count} live instance(s), showing {shown}:");
+        if let Some(vs) = walk.handles.get(i) {
+            for v in vs {
+                let _ = writeln!(out, "  {}", render_instance(conn, v).await);
+            }
+        }
+        let shown_i64 = i64::try_from(shown).unwrap_or(i64::MAX);
+        if count > shown_i64 {
+            let _ = writeln!(
+                out,
+                "  … +{} more (raise max_instances — but the next call is another full walk)",
+                count - shown_i64
+            );
+        }
+    }
+
+    for (name, why) in unresolved {
+        let _ = writeln!(out, "{name} — not resolved, so it was not asked about: {why}");
+    }
+
+    out.push_str(
+        "\n⚠️  EXACT TYPE, NOT SUBTYPE-INCLUSIVE. A count of 0 here means no object's RUNTIME class is \
+         exactly this name — it does NOT mean there are no instances of it in the wider sense. \
+         Widget answers 7 with two live SubWidgets in the heap, not 9; on a CDI codebase the useful \
+         name is usually the …_$$_WeldClientProxy rather than the interface or the bean class you \
+         reached for. Ask about the subclasses and the proxy by name too: they ride the same walk.\n",
+    );
+    if !a.counts_only {
+        out.push_str(
+            "Each @0x… is an expression head: debug.evaluate \"@0x1f4c.someField\" reads that object \
+             with nothing suspended. The id is a WEAK reference and nothing pins it, so a handle can \
+             report Vanished later (ADR-0021).\n",
+        );
+    }
+    out
 }
 
 /// One method as Java source would spell it: `static boolean matches(java.lang.String, int)`.

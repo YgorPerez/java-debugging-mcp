@@ -348,8 +348,20 @@ actually running rather than assume one resume was enough.
 _Avoid_: suspend count (JDWP's own word for the reading; depth is the accumulated state)
 
 **Held duration**:
-How long this debugger kept the debuggee suspended for an operation of its own. The cost a diagnostic
-imposed on everyone else using a shared instance, as opposed to how long the operation took to answer.
+How long this debugger stopped the debuggee's application threads for an operation of its own. The cost a
+diagnostic imposed on everyone else using a shared instance, as opposed to how long the operation took to
+answer.
+
+**Held is not the same as suspended**, and DISC-10 (#84) is why that had to be said. The word used to
+read "kept the debuggee **suspended**", which covered `thread_dump` and the watchdog and nothing else,
+because a suspension was the only way this server could stop anyone. `debug.list_instances` issues no
+suspend at all — JDWP requires none for a heap query — and the JVM still stops the world for a full
+live-heap walk: 522 ms of held application threads on a 2M-object heap to answer with 7 objects. Nothing
+is **suspended** during that, in the counted sense this glossary defines; everything is **held**. A term
+that only covered suspensions would have made the most expensive diagnostic here the one with no cost to
+report.
+_Avoid_: pause on its own (`debug.pause` is a specific tool), latency (that is how long the answer took,
+which is the thing this is deliberately not)
 
 **Watchdog**:
 The timer that resumes a debuggee left suspended too long and disarms whatever froze it, so a forgotten

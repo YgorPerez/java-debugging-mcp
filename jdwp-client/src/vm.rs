@@ -72,6 +72,15 @@ pub struct VmCapabilitiesNew {
     /// Whether [`pop_frames`](JdwpConnection::pop_frames) will work — the other half of a useful swap,
     /// since a frame already on the stack keeps running the code it entered with.
     pub can_pop_frames: bool,
+    /// Whether [`instances`](JdwpConnection::instances) and
+    /// [`instance_counts`](JdwpConnection::instance_counts) will work — position **16**, four bits past
+    /// where this decoder used to stop.
+    ///
+    /// Decoded in the same change that consults it (DISC-10, #84). Positions 12-15
+    /// (`canUseInstanceFilters`, `canGetSourceDebugExtension`, `canRequestVMDeathEvent`,
+    /// `canSetDefaultStratum`) are read past rather than named, for the reason this struct's
+    /// documentation gives: a bit nothing reads is the mistake `IDSizes` was deleted for.
+    pub can_get_instance_info: bool,
 }
 
 /// Class information from `ClassesBySignature`
@@ -145,7 +154,8 @@ impl JdwpConnection {
     /// The reply repeats [`capabilities`](Self::capabilities)' seven booleans before the ones that are
     /// only here, so the first seven bytes are read past rather than decoded twice — the two commands
     /// answer about the same JVM and disagreeing about the overlap is not a state worth representing.
-    /// Everything from the twelfth bit on is skipped for the reason [`VmCapabilitiesNew`] gives.
+    /// Everything past the sixteenth bit is skipped for the reason [`VmCapabilitiesNew`] gives, and so
+    /// are 12-15, which sit between two bits that *are* consulted.
     ///
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
@@ -162,12 +172,61 @@ impl JdwpConnection {
         for _ in 0..7 {
             flag()?;
         }
+        let can_redefine_classes = flag()?;
+        let can_add_method = flag()?;
+        let can_unrestrictedly_redefine_classes = flag()?;
+        let can_pop_frames = flag()?;
+        // 12-15: canUseInstanceFilters, canGetSourceDebugExtension, canRequestVMDeathEvent,
+        // canSetDefaultStratum. Read past, not named — nothing here consults them yet.
+        for _ in 0..4 {
+            flag()?;
+        }
         Ok(VmCapabilitiesNew {
-            can_redefine_classes: flag()?,
-            can_add_method: flag()?,
-            can_unrestrictedly_redefine_classes: flag()?,
-            can_pop_frames: flag()?,
+            can_redefine_classes,
+            can_add_method,
+            can_unrestrictedly_redefine_classes,
+            can_pop_frames,
+            can_get_instance_info: flag()?,
         })
+    }
+
+    /// How many live instances each of `ref_types` has (`VirtualMachine.InstanceCounts`, command 21).
+    ///
+    /// **This stops the world, and JDWP never says so.** It requires no suspend and this client issues
+    /// none, yet the JVM holds every application thread for a full live-heap walk: measured at **630 ms
+    /// over a 2,000,000-object heap, with a matching 522 ms pause**, against 54 ms on a 20,000-object
+    /// heap. The cost tracks the **live heap**, not the answer. See `docs/heap-query-measurements.md`.
+    ///
+    /// **One walk covers the whole batch** — three types measured at 604 ms, about the price of one — so
+    /// this takes a slice rather than being called in a loop, and asking about more types is close to
+    /// free.
+    ///
+    /// Counts are **exact-type**, matching [`instances`](Self::instances): a base class does not count
+    /// its subclasses. A `ref_types` entry the JVM does not recognise answers `0` rather than erroring,
+    /// which makes a typo look like an absence — the caller has to resolve names first.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed. `NOT_IMPLEMENTED`
+    /// (99) when the JVM lacks `canGetInstanceInfo` — ask [`capabilities_new`](Self::capabilities_new)
+    /// first, so a refusal can be reported as "this JVM cannot answer that" rather than as an error code.
+    pub async fn instance_counts(&mut self, ref_types: &[ReferenceTypeId]) -> JdwpResult<Vec<i64>> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::INSTANCE_COUNTS);
+        packet.data.put_i32(i32::try_from(ref_types.len()).unwrap_or(i32::MAX));
+        for t in ref_types {
+            packet.data.put_u64(*t);
+        }
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let n = read_i32(&mut data)?;
+        let mut counts = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
+        for _ in 0..n {
+            counts.push(crate::reader::read_i64(&mut data)?);
+        }
+        Ok(counts)
     }
 
     /// Install new bytecode for already-loaded classes (VirtualMachine.RedefineClasses, command 18) —
