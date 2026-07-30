@@ -64,6 +64,17 @@ jobs:
       # including mcp-server/tests/stdio_protocol.rs, which drives the real binary's front door with
       # malformed input and needs no JDK precisely so it is not hidden behind the ignore flag that exists
       # for tests that do (TEST-9, #25).
+      # Deliberately NOT given the per-test timing report that the integration legs now publish (TEST-26,
+      # #103), and the reason is that the report would be empty rather than short. Timings come from
+      # libtest's nightly-gated `--report-time`, which needs `RUSTC_BOOTSTRAP=1` on the test binary and must
+      # never reach `cargo` — it is hashed into the build fingerprint, so setting it on a `cargo test`
+      # invocation recompiles the workspace (measured: 14 s locally) and compiles it under a flag that makes
+      # nightly-only features build silently. Getting timings here would mean enumerating and running every
+      # unit and cassette binary by hand, to rank a layer that finishes in seconds.
+      #
+      # So this stays one number, and the honest version of that is saying so here rather than publishing a
+      # summary section that always reads "no per-test timings in this log". If this layer ever grows a slow
+      # test, split build from run the way scripts/integration-test.sh does.
       - name: Unit tests
         run: cargo test
 
@@ -150,6 +161,15 @@ jobs:
               ;;
           esac
 
+      # Split out of the step below so the per-leg **build** cost is a measured number instead of one
+      # inferred by subtracting a local timing from a CI step. TEST-27 (#104) proposes hoisting this build
+      # into a single shared job, and that proposal is only worth landing if this number is bigger than a
+      # whole extra job's fixed cost plus an artifact round trip — which cannot be judged while the build
+      # hides inside a 184 s step. `integration-test.sh` builds too, so this step does the work and the
+      # script's own build becomes a no-op; nothing about what runs changes.
+      - name: Build the integration test binary
+        run: cargo test --test mcp_integration --no-run
+
       # Scoped to --test mcp_integration on purpose: a bare `cargo test -- --ignored` also un-ignores
       # jdwp-client's illustrative ```ignore doctests, which were never meant to compile.
       #
@@ -173,3 +193,19 @@ jobs:
             grep 'SKIP .*no JDK found' integration.log
             exit 1
           fi
+
+      # Per-test durations into the job summary (TEST-26, #103), so the ranking is readable without
+      # downloading a log. Published for ALL THREE legs rather than the one the issue asked for: the marginal
+      # cost is a second, and three rankings side by side answer a question one cannot — whether a slow test
+      # is slow everywhere or slow on one JVM generation. That is the same reasoning the matrix itself exists
+      # for.
+      #
+      # `if: always()` because a failing leg is when the ranking is most worth having: a test that failed on
+      # a timeout is exactly the one you want to see at the top. It cannot rescue a red leg — it publishes a
+      # summary and does not touch the step's status, and `integration.log` exists by then either way.
+      - name: Publish per-test timings for JDK ${{ matrix.java }}
+        if: always()
+        shell: bash
+        run: |
+          scripts/test-timings.py --markdown --label 'Integration (JDK ${{ matrix.java }})' \
+            integration.log >> "$GITHUB_STEP_SUMMARY"

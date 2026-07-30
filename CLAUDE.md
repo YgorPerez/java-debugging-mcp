@@ -55,6 +55,21 @@ which of `JAVA_HOME` / `PATH` / the snap JBR it came from — read it, and quote
 intent when you report a result. Setting `JAVA_HOME` is a *request*: if it is not a usable JDK the run
 now fails instead of quietly testing another one, which it used to do (TEST-18, #52).
 
+**Every run ends with a ranked slowest-tests list, so quote it instead of estimating.** `scripts/test-timings.py`
+prints it (TEST-26, #103; ADR-0024), and the three CI legs publish it into their job summaries. Two numbers,
+easy to swap: **test time** is the sum of every test's own duration — occupancy, 647.4 s — and **wall clock**
+is what you wait for, 177.3 s under `taskset -c 0-3`. Neither includes the build, the JDK install or the
+cache restore. It exists because a triage estimate of the largest available saving was **4x too high**; the
+same section warning you about the two backwards flake investigations applies to speed claims. As of v0.9.0
+the four `*_is_honest_from_every_suspended_state` tests are **29% of the suite's test time** between them,
+and the slowest single test is 74 s — which is the floor for anything that splits the suite up.
+
+Because the timing flag is nightly-gated, `integration-test.sh` now **builds with `cargo test --no-run` and
+runs the test binary directly**, keeping `RUSTC_BOOTSTRAP=1` off `cargo` — it is hashed into the build
+fingerprint, so setting it on a `cargo test` recompiles the workspace and compiles it under a flag that lets
+nightly-only features in silently. Arguments still go straight to libtest and the script still supplies the
+`--`.
+
 **Getting the JDKs CI has.** "More than one" was aspirational for a while because this workspace had only
 JDK 11 and a snap JBR, so every result ended in "17 and 21 are CI's to confirm" — which is a slow way to
 learn that a test is version-locked. Adoptium tarballs need no root and no package manager:
@@ -70,7 +85,7 @@ JAVA_HOME=~/.jdks/jdk-17.0.20+8 scripts/integration-test.sh   # and quote the `J
 
 **A single test on an idle 16-core box is a *gentler* environment than CI, not a harsher one.** Worth
 saying because two separate flake investigations here got it backwards and spent thousands of cycles
-proving very little. CI runs all ~89 `#[ignore]`d tests at once on a 4-vCPU runner, so the contention that
+proving very little. CI runs all 117 `#[ignore]`d tests at once on a 4-vCPU runner, so the contention that
 produces these failures comes from dozens of probe JVMs competing, not from CPU scarcity alone. To
 reproduce that, pin the whole suite instead of adding load:
 
