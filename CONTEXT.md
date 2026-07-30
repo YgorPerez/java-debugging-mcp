@@ -253,12 +253,23 @@ many hits and no events means the condition never held, while one showing none m
 those send a reader somewhere completely different.
 
 **Hit tally**:
-How many times a stop point has been hit. An observed count, growing as the debuggee runs.
+How many times a stop point has been hit. An observed count, growing as the debuggee runs, reported by
+`list_stop_points` as `Hits: N` on every kind — **including `Hits: 0`**, printed rather than omitted, because
+an absent line cannot be told apart from a build that does not count.
+
+It counts what the *JVM reported for this stop point*, which is deliberately not what the caller was told
+about. A hit whose **condition** was false counts: the line ran, and "400 hits, none matched" is a different
+diagnosis from "never ran". A folded **rethrow** counts although it does not spend the trace budget, so on a
+traced stop point the tally and the capture count answer different questions instead of repeating one. An exit
+from a method other than the one asked for does *not* count — that is JDWP delivering traffic the request
+could not filter, not the stop point firing. Charged once per hit, never once per armed location.
+
 _Avoid_: hit count. That name belongs to the **`hit_count` argument**, which is the opposite kind of thing — a
 *requested* selector saying which single occurrence to stop on (JDWP's `Count`), after which the stop point is
 **spent**. One counts what happened; the other chooses what will. The collision is not hypothetical: the two
 were both called `hit_count` in the code, and the tally sat dead and always zero behind a listing that could
-never report it (FILT-10, #110).
+never report it. Fixed in FILT-10 (#110) by renaming the tally to `hits` and leaving `hit_count` to mean the
+argument alone.
 
 **Event**:
 A hit that suspended the debuggee and is reported to the caller, who is expected to resume it. Reported

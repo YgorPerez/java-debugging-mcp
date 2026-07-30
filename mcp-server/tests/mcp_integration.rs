@@ -9533,6 +9533,194 @@ fn a_multi_location_stop_point_charges_its_budget_once_per_hit() {
     server.panic_reset();
 }
 
+/// FILT-10 (#110): `list_stop_points` reports how many times each stop point has actually fired.
+///
+/// The field existed and was never written. Both construction sites set it to `0`, nothing anywhere
+/// incremented it, and the render was behind `if hit_count > 0` — so the `Hits:` line had never once
+/// printed, and a stop point that had fired four hundred times listed **identically** to one that had
+/// never fired. That is the failure `debug.check_stale`'s description, DISC-8's drift warning and BP-4's
+/// `Armed at N locations` note all exist to prevent, with the counter simply absent: silence reading as
+/// an answer.
+///
+/// Three things are asserted here and each would pass without the other two:
+///
+///  - **A fired stop point reports its count, once per hit and not once per armed location.** The
+///    `finally` line owns two JDWP requests (BP-4), so a per-location tally would report 12 where 6 is
+///    right — the same rotation of the same bug the trace budget was fixed for. Anchored on the
+///    auto-disarm rather than a tick count, for the reason the budget test gives: capture is serialised,
+///    so an exact count read while the buffer is still filling is a race in the test.
+///  - **A different kind counts too**, on a number chosen not to collide with the first, since both are
+///    read out of one listing.
+///  - **An armed stop point that has never fired reports `Hits: 0`, printed rather than omitted.** This
+///    is the half that makes the other two mean anything. If zero were suppressed, a caller could not
+///    tell "this build counts and the answer is none" from "this build does not count" — which is
+///    exactly the reading the old code left them with, and no assertion on a non-zero count can catch
+///    it.
+///
+/// The probe's own stdout is checked first in each case. The debugger reports a plausible tally either
+/// way, and only the probe knows how many times its code really ran.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_listing_says_how_many_times_each_stop_point_has_fired() {
+    let Some(jdk) = jdk_or_skip("a_listing_says_how_many_times_each_stop_point_has_fired") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "FinallyProbe").expect("launch FinallyProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // The class must already be LOADED, or the arm legitimately defers and returns a different reply.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("finally rq="))
+        .expect("probe never reached the finally block, so its class never loaded");
+
+    let src = probe_source("FinallyProbe");
+    let line = probe_line(&src, "// BP1");
+
+    // 6, on a line javac emitted twice. A per-location tally reports 12.
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "FinallyProbe", "line": line, "trace": true, "trace_expr": "rs",
+            "trace_max_hits": 6,
+        }),
+    );
+    // 4, and deliberately not 6: both tallies land in one listing, so equal numbers would let a
+    // rendering that printed the same stop point twice pass.
+    server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({
+            "class_pattern": "FinallyProbe$GatewayException", "trace": true, "trace_max_hits": 4,
+        }),
+    );
+    // Never thrown by this probe, so this one is the never-fired case. `java.lang.ArithmeticException`
+    // is loaded in every JVM, so the arm resolves and is real rather than deferred.
+    let never = server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({"class_pattern": "java.lang.ArithmeticException", "trace": true}),
+    );
+    assert!(never.contains("exc_"), "the never-fired exception stop did not arm: {never}");
+
+    // The probe's own account first: without it every assertion below could pass vacuously on a run
+    // where the probe never got going.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 3"))
+        .expect("probe never reached its fourth tick, so the finally line ran fewer than 8 times");
+
+    // Both budgets have to be spent before the listing is read, or a tally is caught mid-fill.
+    server
+        .wait_for_traces("reached its trace-hit budget", EVENT_TIMEOUT)
+        .expect("no traced stop point ran its budget out");
+
+    // Both stop points, not just the one that tripped the notice above: the two disarm independently and
+    // `wait_for_traces` returns on the first match, so reading the listing straight after it catches
+    // whichever budget was still filling.
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+    let mut listed = String::new();
+    while std::time::Instant::now() < deadline {
+        listed = server.call("debug.list_stop_points", serde_json::json!({}));
+        if hits_for(&listed, "bp_1") == Some(6) && hits_for(&listed, "exc_2").is_some_and(|n| n >= 4) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+
+    assert_eq!(
+        hits_for(&listed, "bp_1"),
+        Some(6),
+        "a stop point armed at 2 locations and hit 6 times must report 6, not 12 — a per-location tally \
+         is BP-4's bug rotated, and nothing in any reply would explain the doubling:\n{listed}"
+    );
+    // Deliberately not an exact number, and the reason is the point rather than a weakened assertion.
+    // EXC-3 folds a rethrow of an instance already captured: it is NOT charged to the trace budget, but
+    // it IS a throw the JVM reported for this request, so the tally counts it and the two numbers
+    // legitimately differ. How many times one `GatewayException` is re-reported as it leaves a `finally`
+    // is the JVM's business and moves between JDKs. What must hold is that the tally is at least the
+    // budget the stop point spent — a tally that merely tracked captures would be an alias for a number
+    // already on the line above it.
+    let exc_hits = hits_for(&listed, "exc_2")
+        .unwrap_or_else(|| panic!("the exception stop point reported no tally at all:\n{listed}"));
+    assert!(
+        exc_hits >= 4,
+        "an exception stop point that spent a budget of 4 must have been hit at least 4 times, got \
+         {exc_hits}:\n{listed}"
+    );
+    assert_eq!(
+        hits_for(&listed, "exc_3"),
+        Some(0),
+        "an armed stop point that has never fired must report `Hits: 0` rather than nothing — a missing \
+         line cannot be told apart from a build that does not count, which is the whole of FILT-10:\
+         \n{listed}"
+    );
+
+    server.panic_reset();
+}
+
+/// The `Hits:` tally `debug.list_stop_points` printed for one stop-point id, or `None` if that stop
+/// point had no tally line at all.
+///
+/// Reads *within* the stop point's own block rather than grepping the whole listing, because several
+/// stop points in one listing can legitimately share a number and a bare `contains("Hits: 6")` would
+/// then pass on a renderer that printed one stop point's tally against another's id.
+fn hits_for(listing: &str, id: &str) -> Option<u32> {
+    let marker = format!("[{id}]");
+    listing
+        .lines()
+        .skip_while(|l| !l.contains(&marker))
+        .skip(1)
+        .take_while(|l| !l.contains(" ["))
+        .find_map(|l| l.trim().strip_prefix("Hits: ").and_then(|n| n.trim().parse().ok()))
+}
+
+/// FILT-10 (#110), the half the obvious implementation gets wrong: a method-exit stop point counts exits
+/// of the method the caller **asked for**, not every exit the JDWP request received.
+///
+/// JDWP has no method-name modifier. A `mexit_` request narrowed to `classify` is registered as a
+/// `ClassMatch` and the JVM reports every method of `ReturnProbe` returning — `other()`, and `classify`
+/// on both of its two `return` statements. METH-1 already drops the wrong ones downstream, so the reply
+/// a caller reads is correctly filtered; a tally charged in the event pump *before* that filter would
+/// nonetheless report several times the real number, on a stop point whose own reply said otherwise.
+///
+/// Asserted by the exact number rather than by an inequality: the probe calls `other()` once per tick and
+/// `classify` twice, so an unfiltered tally would already be past 6 by the time the sixth `classify` exit
+/// lands, and "greater than zero" would pass on the bug.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_method_exit_tally_counts_the_asked_for_method_only() {
+    let Some(jdk) = jdk_or_skip("a_method_exit_tally_counts_the_asked_for_method_only") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // Loaded before arming, and the probe's own `calls=` counter is the witness that `classify` really
+    // ran more than six times by the end.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 0 "))
+        .expect("probe never printed its first tick, so ReturnProbe never loaded");
+
+    server.call(
+        "debug.set_method_exit_stop",
+        serde_json::json!({
+            "class_pattern": "ReturnProbe", "method": "classify", "trace": true, "trace_max_hits": 6,
+        }),
+    );
+    server
+        .wait_for_traces("reached its trace-hit budget", EVENT_TIMEOUT)
+        .expect("the traced method-exit stop point never ran its budget out");
+
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(
+        listed.contains("Hits: 6"),
+        "a method-exit stop point filtered to `classify` must count 6 exits of `classify`, not every \
+         method of the class that returned while it was armed — `other()` returns once per tick and \
+         `main` returns too:\n{listed}"
+    );
+
+    server.panic_reset();
+}
+
 /// EVAL-7 (#81): a `byte[]` reads as text under the charset the caller names, and `array.length`
 /// resolves.
 ///

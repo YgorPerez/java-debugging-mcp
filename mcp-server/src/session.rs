@@ -685,6 +685,9 @@ pub struct ExceptionRequestInfo {
     pub request_id: Option<i32>,
     /// Whether this request is currently armed in the JVM.
     pub enabled: bool,
+    /// How many throws the JVM has reported on this request (FILT-10). See [`BreakpointInfo::hits`] for
+    /// what the number counts and why it is not called `hit_count`.
+    pub hits: u32,
     /// The resolved exception ref type, kept so a disabled request can be re-armed (BP-2). `None` means
     /// "all exceptions", which is how it was registered.
     pub ref_type: Option<u64>,
@@ -721,6 +724,9 @@ pub struct WatchpointInfo {
     pub request_id: Option<i32>,
     /// Whether this watch is currently armed in the JVM.
     pub enabled: bool,
+    /// How many accesses or modifications the JVM has reported on this watch (FILT-10). See
+    /// [`BreakpointInfo::hits`] for what the number counts and why it is not called `hit_count`.
+    pub hits: u32,
     /// The declaring type and field id, kept **only** so a disabled watch can be re-armed (BP-2).
     ///
     /// Reporting a hit deliberately does not use these — a hit carries its own declaring type and field,
@@ -771,6 +777,16 @@ pub struct MethodExitRequestInfo {
     /// The live JDWP request id, or `None` while disabled (BP-2).
     pub request_id: Option<i32>,
     pub enabled: bool,
+    /// How many exits of the *asked-for* method the JVM has reported (FILT-10). See
+    /// [`BreakpointInfo::hits`] for what the number counts and why it is not called `hit_count`.
+    ///
+    /// "Asked-for" is load-bearing here and nowhere else: JDWP has no method-name modifier, so this
+    /// request receives every method of a matching class and [`method_name_matches`] drops the rest.
+    /// The tally is charged *after* that filter — counting before it would report thousands of hits on a
+    /// stop point that reported three, which is a worse answer than the missing one this replaced.
+    ///
+    /// [`method_name_matches`]: crate::handlers::method_name_matches
+    pub hits: u32,
     /// Dotted class pattern the caller gave, kept so a disabled request can be re-armed.
     pub class_pattern: String,
     /// Method name to report on, filtered on OUR side: JDWP has no method-name modifier, so the request
@@ -1031,7 +1047,18 @@ pub struct BreakpointInfo {
     /// Whether the breakpoint is currently armed in the JVM. A disabled breakpoint stays listed (so
     /// its `condition`/`trace_expr` aren't lost) but has no JDWP request and never fires (BP-1).
     pub enabled: bool,
-    pub hit_count: u32,
+    /// How many times the JVM has reported a hit on this stop point (FILT-10).
+    ///
+    /// Named `hits` and not `hit_count` on purpose. `hit_count` is the *requested* `Count` modifier
+    /// ([`BreakpointArm::hit_count`], and the caller-facing `hit_count` argument), which asks the JVM to
+    /// report only the Nth occurrence. This is the *observed* tally, and the two are opposite ends of
+    /// the same word: one is an instruction, one is a measurement. They shared a name until FILT-10, and
+    /// the collision is how this field stayed dead — constructed `0`, never incremented, so
+    /// `list_stop_points`' `Hits:` line had never once printed.
+    ///
+    /// **Cumulative across a disable and re-arm**, following BP-1's rule that a toggled stop point keeps
+    /// its definition: it is the same caller-facing stop point, so its tally is its lifetime tally.
+    pub hits: u32,
     /// Optional server-side condition: on hit, evaluate it and auto-resume if it is not true.
     pub condition: Option<String>,
     /// Non-suspending trace/logpoint: on hit, snapshot into the ring buffer and resume the thread.

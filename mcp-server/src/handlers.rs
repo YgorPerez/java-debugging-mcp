@@ -3303,6 +3303,7 @@ async fn arm_one_field_watch(
         crate::session::WatchpointInfo {
             request_id: Some(request_id),
             enabled: true,
+            hits: 0,
             arm: spec.arm,
             kind,
             class_name: spec.class_name.clone(),
@@ -3563,6 +3564,7 @@ async fn arm_one_method_exit(
             id: mexit_id.clone(),
             request_id: Some(request_id),
             enabled: true,
+            hits: 0,
             class_pattern: class_pattern.to_string(),
             method: method.cloned(),
             with_return_value: arm.with_return_value,
@@ -3823,6 +3825,7 @@ async fn arm_one_exception(
             id: exc_id.clone(),
             request_id: Some(request_id),
             enabled: true,
+            hits: 0,
             ref_type,
             class_pattern: class_pattern.to_string(),
             caught: a.caught,
@@ -4181,9 +4184,7 @@ fn render_breakpoint_line(
     if let Some(d) = &bp.drift {
         let _ = writeln!(output, "    {}", d.trim_start_matches('\n').trim_end());
     }
-    if bp.hit_count > 0 {
-        let _ = writeln!(output, "     Hits: {}", bp.hit_count);
-    }
+    render_hits(output, bp.hits);
     render_trace_cost(output, bp.trace, &bp.trace_cost);
 }
 
@@ -4359,6 +4360,7 @@ fn render_exception_line(
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
+    render_hits(output, er.hits);
     render_trace_cost(output, er.trace, &er.trace_cost);
 }
 
@@ -4389,6 +4391,31 @@ fn trace_budget_tag(trace: bool, budget: Option<u32>) -> String {
 ///
 /// Nothing at all for a suspending stop point: it does no capture, so it has no capture cost. Its price
 /// is the freeze, which the watchdog and `thread_dump` report.
+/// The observed hit tally for one stop point (FILT-10), on every kind and **always printed, including
+/// zero**.
+///
+/// Printing `Hits: 0` rather than nothing is the whole repair, and it is worth being explicit about why
+/// the obvious `if n > 0` is wrong here. Before FILT-10 the field was never incremented, so a listing
+/// printed no tally whether the stop point had fired four hundred times or never — and "armed, no `Hits:`
+/// line" reads as *this code never ran*, which is the "indistinguishable from a wrong hypothesis" failure
+/// DISC-8's drift warning and BP-4's `Armed at N locations` note both exist to prevent. Suppressing zero
+/// would leave that reading intact for the one case it matters most: a caller cannot tell "this build
+/// counts and the answer is none" from "this build does not count". A number that is always there never
+/// has to be interpreted.
+///
+/// What it counts is every hit the JVM reported **for this stop point**, which is deliberately not the
+/// same as every hit the caller was *told* about:
+///  - a hit whose `condition` was false counts — the line ran, and "armed, 400 hits, condition never
+///    matched" and "armed, 0 hits" are different diagnoses that used to look identical;
+///  - a rethrow of an exception already captured (EXC-3) counts, though it is not charged to the trace
+///    budget — so on a traced stop point `Hits` and the capture count are visibly different questions
+///    rather than two spellings of one number;
+///  - an exit from a method other than the one asked for does **not** count. See
+///    [`MethodExitRequestInfo::hits`](crate::session::MethodExitRequestInfo::hits).
+fn render_hits(output: &mut String, hits: u32) {
+    let _ = writeln!(output, "     Hits: {hits}");
+}
+
 fn render_trace_cost(output: &mut String, trace: bool, cost: &crate::session::TraceCost) {
     if !trace {
         return;
@@ -4795,6 +4822,7 @@ fn render_watchpoint_line(
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
+    render_hits(output, wp.hits);
     render_trace_cost(output, wp.trace, &wp.trace_cost);
 }
 
@@ -4831,6 +4859,7 @@ fn render_method_exit_line(
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
+    render_hits(output, me.hits);
     render_trace_cost(output, me.trace, &me.trace_cost);
 }
 
@@ -7614,7 +7643,7 @@ async fn try_arm_deferred_breakpoints(
                                 method: Some(method.name),
                                 drift,
                                 enabled: true,
-                                hit_count: 0,
+                                hits: 0,
                                 condition: pend.condition,
                                 trace: pend.trace,
                                 trace_expr: pend.trace_expr,
@@ -8604,6 +8633,13 @@ async fn try_record_trace(
     //    common case, since JDWP's ClassMatch reports every method of the class.
     let wrong_method =
         !method_name_matches(&mut session.connection, req.method_filter.as_deref(), &loc).await;
+    // FILT-10: the hit is this stop point's as soon as the method filter has cleared it. Counted here
+    // rather than after the condition, because a false condition means the line RAN and the caller's
+    // filter rejected it — "400 hits, none matched" and "0 hits" are different diagnoses that read
+    // identically when only matches are counted.
+    if !wrong_method {
+        record_stop_point_hit(session, req_id);
+    }
     let skip = wrong_method
         || match &req.condition {
             Some(cond) => !evaluate_condition_on_thread(&mut session.connection, thread, cond).await,
@@ -8700,6 +8736,45 @@ fn record_trace_cost(
     }
 }
 
+/// Charge one observed hit to whichever stop point owns `req_id` (FILT-10).
+///
+/// Four maps in the same order as [`decrement_trace_budget`], and for the same reason: each kind owns its
+/// own bookkeeping, and a parallel index keyed by request id would be a second source of truth that could
+/// outlive the entry it points at. Safe against JDWP's recurring request ids for the same reason the
+/// budget is — [`disarm_request`] clears `request_ids` / sets `request_id` to `None`, so a disarmed stop
+/// point cannot be matched by an id the JVM has since handed to something else (`CONTEXT.md` §
+/// **Request id**).
+///
+/// **Counted once per hit, not once per armed location.** A `finally` line is in the line table twice and
+/// carries two JDWP requests, but an execution passes through exactly one of them, so the single event it
+/// produces is charged here exactly once — the same rule `trace_max_hits` is charged by (BP-4, #78).
+///
+/// **Where this is called from is the design decision.** The obvious site is the event pump itself, before
+/// it splits three ways — one place, every event. It is wrong for method exits: JDWP has no method-name
+/// modifier, so a `mexit_` request narrowed to `save` receives *every* method of the class and the pump
+/// filters the rest out downstream (METH-1). Counting before that filter would report thousands of hits on
+/// a stop point that reported three, which is a worse answer than the missing one this replaces. So it is
+/// called from the two places that have already decided the hit belongs to this stop point, and each is
+/// past its own `method_name_matches` — costing no extra JDWP round trip, since that call has happened by
+/// then either way.
+fn record_stop_point_hit(session: &mut crate::session::DebugSession, req_id: i32) {
+    if let Some(b) = session.breakpoints.values_mut().find(|b| b.owns_request(req_id)) {
+        b.hits = b.hits.saturating_add(1);
+        return;
+    }
+    if let Some(e) = session.exception_requests.values_mut().find(|e| e.request_id == Some(req_id)) {
+        e.hits = e.hits.saturating_add(1);
+        return;
+    }
+    if let Some(w) = session.watchpoints.values_mut().find(|w| w.request_id == Some(req_id)) {
+        w.hits = w.hits.saturating_add(1);
+        return;
+    }
+    if let Some(m) = session.method_exits.values_mut().find(|m| m.request_id == Some(req_id)) {
+        m.hits = m.hits.saturating_add(1);
+    }
+}
+
 /// Decrement the matching stop point's trace budget in place, returning the count left afterwards, or
 /// `None` when the request has no budget (unbounded) or isn't found.
 fn decrement_trace_budget(session: &mut crate::session::DebugSession, req_id: i32) -> Option<u32> {
@@ -8769,6 +8844,13 @@ async fn store_reportable_event(
         {
             release_dropped_hit(session, thread, held_thread_only).await;
             skip = true;
+        }
+        // FILT-10: past the method filter, so this hit is this stop point's — counted before the
+        // condition for the same reason the traced path counts before its condition. See
+        // [`record_stop_point_hit`]. An event that belongs to no stop point (a step, a manual pause, a
+        // VM event) matches none of the four maps and is not counted.
+        if !skip {
+            record_stop_point_hit(session, req_id);
         }
         let cond =
             session.breakpoints.values().find(|b| b.owns_request(req_id)).and_then(|b| b.condition.clone());
@@ -9917,7 +9999,7 @@ async fn arm_and_insert(
             method: Some(method.name.clone()),
             drift: drift.clone(),
             enabled: true,
-            hit_count: 0,
+            hits: 0,
             condition: spec.condition.clone(),
             trace: spec.trace,
             trace_expr: spec.trace_expr.clone(),
