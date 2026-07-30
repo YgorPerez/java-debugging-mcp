@@ -1773,6 +1773,148 @@ fn trace_frames_zero_keeps_the_one_frame_snapshot_and_the_cap_is_reported() {
     server.panic_reset();
 }
 
+/// How many characters a rendered value kept before the debugger's `… (N chars total)` suffix.
+///
+/// Panics if the value was not truncated at all — which is the point: "did it truncate, and at exactly
+/// what length" is one question here, and a helper that answered `0` for "not truncated" would let the
+/// default arm pass on a capture that was never capped.
+fn kept_chars(line: &str, after: &str) -> usize {
+    let at = line.find(after).unwrap_or_else(|| panic!("no `{after}` in trace line: {line}"));
+    let rest = &line[at + after.len()..];
+    let end = rest
+        .find("… (")
+        .unwrap_or_else(|| panic!("`{after}` was not truncated at all in trace line: {line}"));
+    rest[..end].trim_start_matches('"').chars().count()
+}
+
+/// TRACE-9 (#80): the per-value capture cap is the caller's to raise, and raising it is the only way to
+/// see a payload — truncation happens at CAPTURE time, so `debug.get_traces` can never recover the rest.
+///
+/// Both halves are asserted, and the default half is the one that carries the test. Asserting only that
+/// a raised cap reaches the end of the payload would pass identically if `trace_max_length` were parsed
+/// and thrown away, because a 2048-character body fits under any cap that was never applied. So the
+/// default arm pins the two documented numbers exactly — 100 for an in-scope local, 200 for the
+/// `trace_expr` result — and the raised arm proves the marker that lives ONLY in the payload's last
+/// field arrives.
+///
+/// The payload's length and its tail marker are read from the probe's OWN stdout, not from the
+/// debugger's reply: the debugger would report a capture happily either way, and a test that took its
+/// word for what the JVM was holding would be checking the debugger against itself.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_raised_trace_max_length_captures_a_payload_the_default_cuts() {
+    let Some(jdk) = jdk_or_skip("a_raised_trace_max_length_captures_a_payload_the_default_cuts") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "PayloadProbe").expect("launch PayloadProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // The probe's own account of what it is holding. Everything below is asserted against these.
+    let announced = probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("payload length="))
+        .expect("probe never announced its payload");
+    assert!(
+        announced.contains("payload length=2048") && announced.contains("tail=TAILMARK"),
+        "the probe must hold a 2048-char payload ending in the tail marker: {announced}"
+    );
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    let src = probe_source("PayloadProbe");
+    let line = probe_line(&src, "// BP1");
+
+    // ---- the default: byte-for-byte what this tool captured before trace_max_length existed ----
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "PayloadProbe", "line": line, "trace": true,
+            "trace_expr": "response.getBody()",
+        }),
+    );
+    assert!(armed.contains("bp_"), "the traced logpoint must arm: {armed}");
+    assert!(
+        !armed.contains("trace_max_length"),
+        "an unset trace_max_length must add nothing to the reply: {armed}"
+    );
+    let default_bp = stop_id(&armed, "bp_").expect("no bp_ id in the arm reply");
+
+    let traces = server
+        .wait_for_traces("PayloadProbe.handle:", EVENT_TIMEOUT)
+        .expect("the traced logpoint never recorded a hit");
+    let hit = traces
+        .lines()
+        .find(|l| l.contains("PayloadProbe.handle:"))
+        .unwrap_or_else(|| panic!("no hit line in:\n{traces}"));
+
+    assert_eq!(kept_chars(hit, "body="), 100, "an in-scope local is captured at 100 chars: {hit}");
+    assert_eq!(
+        kept_chars(hit, "response.getBody() => "),
+        200,
+        "the trace_expr result is captured at 200 — twice the locals', because it is the value the \
+         caller named: {hit}"
+    );
+    assert!(hit.contains("(2048 chars total)"), "a truncated capture must say how much it cut: {hit}");
+    assert!(
+        !hit.contains("TAILMARK"),
+        "the end of the payload cannot be reachable at the default caps: {hit}"
+    );
+
+    // TRACE-2's discipline, which no reply can evidence: reading a 2048-char local must still resume the
+    // hit thread. Only the probe's own ticks prove it.
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
+        "probe stopped ticking under a traced logpoint — a hit left it suspended\n  output: {:?}",
+        probe.output(),
+    );
+
+    // ---- raised: the same line, the same expression, and now the whole payload ----
+    server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": default_bp}));
+    let raised = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "PayloadProbe", "line": line, "trace": true,
+            "trace_expr": "response.getBody()", "trace_max_length": 2500,
+        }),
+    );
+    assert!(raised.contains("bp_"), "the raised logpoint must arm: {raised}");
+    assert!(!raised.contains("clamped"), "2500 is under the ceiling and must not be clamped: {raised}");
+
+    // `TAILMARK` exists nowhere but the payload's last field, so a record containing it can only have
+    // come from the raised stop point — no filtering by id needed to tell the two arms apart.
+    let full = server
+        .wait_for_traces("TAILMARK", EVENT_TIMEOUT)
+        .expect("a raised trace_max_length never reached the end of the payload");
+    let full_hit = full
+        .lines()
+        .find(|l| l.contains("TAILMARK"))
+        .unwrap_or_else(|| panic!("no hit line carrying the tail marker in:\n{full}"));
+    assert!(
+        !full_hit.contains("chars total"),
+        "at 2500 a 2048-char payload is not truncated at all: {full_hit}"
+    );
+    assert_eq!(
+        full_hit.matches("TAILMARK").count(),
+        2,
+        "BOTH the local and the trace_expr result must reach the end — one knob raises both: {full_hit}"
+    );
+
+    // ---- above the ceiling: clamped, and said out loud ----
+    let over = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "PayloadProbe", "line": line, "trace": true, "trace_max_length": 99999,
+        }),
+    );
+    assert_contains_all(
+        "a request above the ceiling is clamped and the clamp is reported",
+        &over,
+        &["clamped to 4000", "trace_max_length 99999"],
+    );
+
+    server.panic_reset();
+}
+
 /// TRACE-7: a traced stop point reports what it has ACTUALLY cost, not what #22 measured elsewhere.
 ///
 /// The figures are asserted against the probe's known firing rate rather than merely checked for
@@ -8036,6 +8178,14 @@ fn a_finally_line_arms_every_copy_javac_emitted() {
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
 
+    // The class must already be LOADED, or the arm legitimately defers and returns a different reply.
+    // A class loads on first use, so one `finally` line means `call()` has run and `FinallyProbe` is in
+    // the JVM. Without this the test passes on an idle box and fails roughly one run in eight under the
+    // full suite, where the probe is slower to get going than the server is to arm.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("finally rq="))
+        .expect("probe never reached the finally block, so its class never loaded");
+
     let src = probe_source("FinallyProbe");
     let line = probe_line(&src, "// BP1");
 
@@ -8123,6 +8273,14 @@ fn a_multi_location_stop_point_charges_its_budget_once_per_hit() {
     let probe = Probe::launch(&jdk, "FinallyProbe").expect("launch FinallyProbe");
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
+
+    // The class must already be LOADED, or the arm legitimately defers and returns a different reply.
+    // A class loads on first use, so one `finally` line means `call()` has run and `FinallyProbe` is in
+    // the JVM. Without this the test passes on an idle box and fails roughly one run in eight under the
+    // full suite, where the probe is slower to get going than the server is to arm.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("finally rq="))
+        .expect("probe never reached the finally block, so its class never loaded");
 
     let src = probe_source("FinallyProbe");
     let line = probe_line(&src, "// BP1");

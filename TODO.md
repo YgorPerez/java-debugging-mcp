@@ -620,6 +620,32 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
   for the originating stack, and `TECHNIQUES.md`'s "walk up the call chain one frame at a time" is gone.
   It is explicit there that caller frames carry **locations only** — the chain replaces the search for the
   next frame, not the reading of its value, which is the one way that advice could be misread.
+- **A capture's length cap is the caller's to raise (TRACE-9, #80)** — `capture_trace` rendered in-scope
+  locals at a hard-coded **100** characters and the `trace_expr` result at **200**, and the same 200 capped
+  a method exit's `returned` value and a watchpoint's old → new pair. None of it was reachable from any
+  argument, and the truncation happens at **capture** time — the cut string is what `TraceRecord` stores,
+  so `get_traces` could never recover the remainder. That landed squarely on the one mode that is safe on
+  the shared 8180: every payload worth observing there — a gateway's JSON, a SOAP envelope, a `+=`-built
+  SQL string — is longer than 200 characters, so the observation mode you are *allowed* to use could not
+  see the thing it was armed for, and the workaround (suspend, then `evaluate` with a big
+  `max_result_length`) is precisely what must not happen on a shared instance.
+  `trace_max_length` on all four arming tools raises it, ceiling **4000**. **One knob, not two**: a caller
+  raising the cap wants the payload and should not have to work out which of two numbers governs the value
+  in front of them, so `Some(n)` is `n` everywhere. The two defaults still differ, and `trace_lengths`
+  is the one place that says why — the locals are context, captured whether you asked for them or not,
+  while `trace_expr` is the payload you named, and both stay frugal because a trace may fire hundreds of
+  times into a bounded buffer. Unset stays `None` all the way down rather than being normalised into a
+  number, which is what keeps an unset call **byte-identical**: a default that was a single scalar would
+  silently rewrite whichever of the two caps it did not match. Clamped and **reported**, exactly as
+  `trace_frames` is; `0` is read as the ceiling and said out loud, because it means *no limit* on the
+  `trace_max_hits` sitting next to it and cannot mean that for a value held in a bounded buffer.
+  The ceiling's arithmetic is written where the constant is: a captured value is stored, so buffer memory
+  is roughly the cap × the hits recorded, and `DEFAULT_TRACE_BUDGET` is 200.
+  Validated by `a_raised_trace_max_length_captures_a_payload_the_default_cuts` (+
+  `examples/probes/PayloadProbe.java`, a 2048-character gateway body whose tail marker appears **only** in
+  its last field). Both arms are asserted, and the **default** arm is the one carrying the test: a 2048-char
+  payload fits under any cap that was never applied, so asserting only the raised case would pass on an
+  argument that was parsed and thrown away — proven by defeating `trace_lengths` and watching it fail.
 - **Method-exit reporting, and `MethodEntry` deleted (METH-1)** — the receiving half of method events was
   built and unreachable: `EventKind::MethodEntry`/`MethodExit` existed and `handlers.rs` named both in
   `event_type_name` / `event_location` / `event_suspends`, but no tool could arm one — and the wire

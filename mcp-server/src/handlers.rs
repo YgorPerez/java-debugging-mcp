@@ -472,7 +472,9 @@ impl RequestHandler {
         }
 
         let suspend_policy = suspend_policy_for(a.trace);
-        let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
+        let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
+        let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
+        let frames_note = merge_clamp_notes(depth_note, length_note);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
         // One definition, pointed at each pattern in turn below.
         let base = BreakpointSpec {
@@ -487,6 +489,7 @@ impl RequestHandler {
             trace_expr: a.trace_expr.clone(),
             trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
             trace_frames,
+            trace_max_length,
             suspend_policy,
         };
 
@@ -2086,7 +2089,9 @@ impl RequestHandler {
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
         check_thread_filter(&mut session.connection, thread_filter).await?;
-        let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
+        let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
+        let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
+        let frames_note = merge_clamp_notes(depth_note, length_note);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
 
         // The catch-all and the one named class keep exactly the reply they have always had.
@@ -2099,9 +2104,16 @@ impl RequestHandler {
                 None => None,
             };
             let class_pattern = pattern.unwrap_or("*").to_string();
-            let exc_id =
-                arm_one_exception(&mut session, &a, ref_type, &class_pattern, thread_filter, trace_frames)
-                    .await?;
+            let exc_id = arm_one_exception(
+                &mut session,
+                &a,
+                ref_type,
+                &class_pattern,
+                thread_filter,
+                trace_frames,
+                trace_max_length,
+            )
+            .await?;
             drop(session);
             return Ok(render_exception_stop_reply(
                 &a,
@@ -2130,7 +2142,7 @@ impl RequestHandler {
                     &a,
                     p,
                     &index,
-                    &BatchLimits { max_classes, thread_filter, trace_frames },
+                    &BatchLimits { max_classes, thread_filter, trace_frames, trace_max_length },
                 )
                 .await,
             );
@@ -2162,9 +2174,12 @@ impl RequestHandler {
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
         check_thread_filter(&mut session.connection, thread_filter).await?;
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
-        let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
+        let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
+        let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
+        let frames_note = merge_clamp_notes(depth_note, length_note);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
-        let arm = FieldArm { field_name: &field_name, kinds: &kinds, trace_budget, trace_frames };
+        let arm =
+            FieldArm { field_name: &field_name, kinds: &kinds, trace_budget, trace_frames, trace_max_length };
 
         // One named class keeps exactly the reply it has always had.
         if let (1, Some(only)) = (classes.len(), classes.first().filter(|c| !is_wildcard(c))) {
@@ -2181,7 +2196,7 @@ impl RequestHandler {
         } else {
             Vec::new()
         };
-        let limits = BatchLimits { max_classes, thread_filter, trace_frames };
+        let limits = BatchLimits { max_classes, thread_filter, trace_frames, trace_max_length };
         let mut batches = Vec::with_capacity(classes.len());
         for pattern in &classes {
             batches.push(field_rows_for_pattern(&mut session, &a, pattern, &index, &arm, &limits).await);
@@ -2221,9 +2236,12 @@ impl RequestHandler {
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
         check_thread_filter(&mut session.connection, thread_filter).await?;
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
-        let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
+        let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
+        let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
+        let frames_note = merge_clamp_notes(depth_note, length_note);
 
-        let mexit = MethodExitArm { with_return_value, thread_filter, trace_budget, trace_frames };
+        let mexit =
+            MethodExitArm { with_return_value, thread_filter, trace_budget, trace_frames, trace_max_length };
         let (extra, mode) = describe_method_exit_arm(&a, method.as_ref(), &mexit, frames_note.as_deref());
 
         // One pattern keeps exactly the reply it has always had — including a WILDCARD one, which has
@@ -2662,6 +2680,98 @@ fn clamp_trace_frames(trace: bool, requested: usize) -> (usize, Option<String>) 
     (requested, None)
 }
 
+/// Per-value length cap for an in-scope LOCAL on a trace capture, when the caller named none (TRACE-9).
+///
+/// Frugal on purpose, and the frugality is the point rather than an oversight: a trace may fire hundreds
+/// of times into a bounded buffer, and every local in scope is captured whether the caller wanted it or
+/// not. 100 characters identifies a value — enough to see which order, which status, which id — without
+/// paying for a payload nobody asked for on every hit.
+const DEFAULT_TRACE_LOCAL_LENGTH: usize = 100;
+
+/// Per-value length cap for the `trace_expr` result — and for the kind-specific detail that goes through
+/// the same describers, the method-exit `returned` value and a watchpoint's old → new pair (TRACE-9).
+///
+/// Twice `DEFAULT_TRACE_LOCAL_LENGTH` because this is the value the caller NAMED. The locals are context;
+/// this is the payload, so it gets the larger of the two frugal numbers. Both are still frugal, and
+/// TRACE-9 exists because on a real app server every payload worth tracing — a gateway's JSON, a SOAP
+/// envelope, a built SQL string — is longer than either.
+const DEFAULT_TRACE_EXPR_LENGTH: usize = 200;
+
+/// Hard ceiling on `trace_max_length`, whatever the caller asks for.
+///
+/// The arithmetic it comes from: a captured value is stored, not streamed, so buffer memory is roughly
+/// this cap × the hits recorded. `DEFAULT_TRACE_BUDGET` is 200 hits and `MAX_TRACES` bounds the whole
+/// session's buffer at 500 records, each holding every in-scope local — so 4000 is ~800KB per captured
+/// value on one stop point at its default budget, and a few MB for a frame with a handful of locals.
+/// That is a cost worth paying to see a 2000-character payload whole, which is what this ceiling is
+/// sized for (twice `debug.evaluate`'s default `max_result_length`); an order of magnitude more is not.
+/// A clamp is reported, never silent.
+const MAX_TRACE_LENGTH: usize = 4000;
+
+/// Clamp a requested per-value capture length to `MAX_TRACE_LENGTH`, returning `(cap, note)` where `note`
+/// is a sentence for the arm reply when the request was changed — mirroring `clamp_trace_frames`, because
+/// a silently narrowed cap is worse here than there: the caller would read a truncated payload and have
+/// no way to tell it apart from the JVM's own value.
+fn clamp_trace_max_length(trace: bool, requested: Option<usize>) -> (Option<usize>, Option<String>) {
+    if !trace {
+        // Nothing is captured for a suspending stop point, so there is no value to bound. `debug.get_stack`
+        // and `debug.evaluate` have their own `max_result_length` for the live frame.
+        return (None, None);
+    }
+    match requested {
+        None => (None, None),
+        // `0` means "no limit" on `trace_max_hits`, which is the argument sitting next to this one, so a
+        // caller WILL try it — and here it cannot mean that: a capture is stored in a bounded buffer, and
+        // an unbounded one would be the very thing ADR-0002's neighbourhood refuses. Rendering 0 characters
+        // of every value would be the literal reading and is useless, so it is read as the maximum and said
+        // out loud rather than obeyed or ignored.
+        Some(0) => (
+            Some(MAX_TRACE_LENGTH),
+            Some(format!(
+                "trace_max_length 0 does NOT mean \"no limit\" the way trace_max_hits 0 does — a capture \
+                 is stored in a bounded buffer, so it was read as the maximum, {MAX_TRACE_LENGTH}."
+            )),
+        ),
+        Some(n) if n > MAX_TRACE_LENGTH => (
+            Some(MAX_TRACE_LENGTH),
+            Some(format!(
+                "trace_max_length {n} exceeds the {MAX_TRACE_LENGTH}-character cap and was clamped to \
+                 {MAX_TRACE_LENGTH} — a captured value is held in the trace buffer, so the cap times the \
+                 hit budget is memory this server keeps; read a bigger value from a suspended frame with \
+                 debug.evaluate {{max_result_length}} instead."
+            )),
+        ),
+        Some(n) => (Some(n), None),
+    }
+}
+
+/// The two capture-time caps a stop point renders with: `(locals, trace_expr)`.
+///
+/// ONE argument decides both (TRACE-9). A caller raising the cap wants the payload and should not have to
+/// work out which of two numbers governs the value in front of them — so `Some(n)` is `n` for each, and
+/// `None` is the pair of deliberately-different defaults, which is what keeps an unset call's output
+/// byte-identical to what it produced before this argument existed.
+const fn trace_lengths(trace_max_length: Option<usize>) -> (usize, usize) {
+    match trace_max_length {
+        Some(n) => (n, n),
+        None => (DEFAULT_TRACE_LOCAL_LENGTH, DEFAULT_TRACE_EXPR_LENGTH),
+    }
+}
+
+/// Fold the arming-time clamp notices into the single `note` slot every arm reply already renders.
+///
+/// Two things can now be clamped on one call (`trace_frames` and `trace_max_length`), and both have to be
+/// said: a reply that reported one clamp and swallowed the other would be exactly the silent narrowing
+/// each clamp exists to prevent. Joined with the separator `describe_trace_frames` puts in front of a
+/// note, so two read as two warnings rather than one run-on sentence.
+fn merge_clamp_notes(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a}\n   ⚠️  {b}")),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
 /// The trace-hit budget a stop point should arm with: the caller's `trace_max_hits` when tracing
 /// (default `DEFAULT_TRACE_BUDGET`), where `0` means unbounded; `None` for a non-trace stop point,
 /// which is unbounded because it suspends and so can't flood.
@@ -2691,6 +2801,8 @@ struct WatchSpec<'a> {
     trace_expr: Option<&'a str>,
     trace_budget: Option<u32>,
     trace_frames: usize,
+    /// Per-value capture length (TRACE-9), already clamped to `MAX_TRACE_LENGTH`; `None` for the defaults.
+    trace_max_length: Option<usize>,
     thread_filter: Option<u64>,
 }
 
@@ -2740,6 +2852,7 @@ async fn arm_one_field_watch(
             trace_expr: spec.trace_expr.map(str::to_string),
             trace_budget: spec.trace_budget,
             trace_frames: spec.trace_frames,
+            trace_max_length: spec.trace_max_length,
             trace_cost: crate::session::TraceCost::default(),
             thread_filter: spec.thread_filter,
         },
@@ -2753,6 +2866,7 @@ struct FieldArm<'a> {
     kinds: &'a [jdwp_client::WatchKind],
     trace_budget: Option<u32>,
     trace_frames: usize,
+    trace_max_length: Option<usize>,
 }
 
 /// The one-named-class path, with the reply and the two error messages `debug.set_field_stop` has always used.
@@ -2785,6 +2899,7 @@ async fn arm_field_on_named_class(
         trace_expr: a.trace_expr.as_deref(),
         trace_budget: arm.trace_budget,
         trace_frames: arm.trace_frames,
+        trace_max_length: arm.trace_max_length,
         thread_filter,
     };
     let mut ids = Vec::with_capacity(arm.kinds.len());
@@ -2881,6 +2996,7 @@ async fn arm_field_on_one_class(
         trace_expr: a.trace_expr.as_deref(),
         trace_budget: arm.trace_budget,
         trace_frames: arm.trace_frames,
+        trace_max_length: arm.trace_max_length,
         thread_filter,
     };
     let mut ids = Vec::with_capacity(arm.kinds.len());
@@ -2956,6 +3072,7 @@ struct MethodExitArm {
     thread_filter: Option<u64>,
     trace_budget: Option<u32>,
     trace_frames: usize,
+    trace_max_length: Option<usize>,
 }
 
 /// Arm one `METHOD_EXIT` request on one class pattern and register it, returning its `mexit_` id and the
@@ -2993,6 +3110,7 @@ async fn arm_one_method_exit(
             trace_expr: a.trace_expr.clone(),
             trace_budget: arm.trace_budget,
             trace_frames: arm.trace_frames,
+            trace_max_length: arm.trace_max_length,
             trace_cost: crate::session::TraceCost::default(),
             thread_filter: arm.thread_filter,
         },
@@ -3223,6 +3341,7 @@ async fn arm_one_exception(
     class_pattern: &str,
     thread_filter: Option<u64>,
     trace_frames: usize,
+    trace_max_length: Option<usize>,
 ) -> Result<String, String> {
     let request_id = session
         .connection
@@ -3252,6 +3371,7 @@ async fn arm_one_exception(
             trace_expr: a.trace_expr.clone(),
             trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
             trace_frames,
+            trace_max_length,
             trace_cost: crate::session::TraceCost::default(),
             thread_filter,
         },
@@ -3264,6 +3384,7 @@ struct BatchLimits {
     max_classes: usize,
     thread_filter: Option<u64>,
     trace_frames: usize,
+    trace_max_length: Option<usize>,
 }
 
 /// Arm one exception pattern — one `exc_` per resolved class — and describe what happened to each.
@@ -3300,7 +3421,16 @@ async fn exception_rows_for_pattern(
             skipped_at_cap += 1;
             continue;
         }
-        match arm_one_exception(session, a, Some(tid), &fqn, limits.thread_filter, limits.trace_frames).await
+        match arm_one_exception(
+            session,
+            a,
+            Some(tid),
+            &fqn,
+            limits.thread_filter,
+            limits.trace_frames,
+            limits.trace_max_length,
+        )
+        .await
         {
             Ok(id) => {
                 armed += 1;
@@ -3840,8 +3970,12 @@ async fn describe_event_into(
         obj.insert("method".to_string(), json!(method));
         obj.insert("line".to_string(), json!(line));
         describe_exception_event(conn, details, obj).await;
-        describe_field_event(conn, details, obj).await;
-        describe_method_exit_event(conn, details, obj).await;
+        // A SUSPENDING hit, so `trace_max_length` cannot apply: it is an argument of a traced stop point,
+        // and this path has a live frozen thread the caller can read with `debug.evaluate` at whatever
+        // `max_result_length` they like. The default stands, which is what keeps `get_last_event`
+        // byte-identical to what it printed before TRACE-9.
+        describe_field_event(conn, details, obj, DEFAULT_TRACE_EXPR_LENGTH).await;
+        describe_method_exit_event(conn, details, obj, DEFAULT_TRACE_EXPR_LENGTH).await;
         return;
     }
     // Events with no location still name their thread, and a class-prepare names its class.
@@ -4061,13 +4195,14 @@ async fn describe_method_exit_event(
     conn: &mut jdwp_client::JdwpConnection,
     details: &EventKind,
     obj: &mut serde_json::Map<String, serde_json::Value>,
+    max_len: usize,
 ) {
     let EventKind::MethodExit { return_value, .. } = details else {
         return;
     };
     match return_value {
         Some(v) => {
-            obj.insert("returned".to_string(), json!(render_value(conn, v, None, 200).await));
+            obj.insert("returned".to_string(), json!(render_value(conn, v, None, max_len).await));
         }
         None => {
             obj.insert("returned".to_string(), json!("<not reported — this JVM speaks JDWP < 1.6>"));
@@ -4090,6 +4225,7 @@ async fn describe_field_event(
     conn: &mut jdwp_client::JdwpConnection,
     details: &EventKind,
     obj: &mut serde_json::Map<String, serde_json::Value>,
+    max_len: usize,
 ) {
     use jdwp_client::events::EventKind as K;
     let (f, new_value) = match details {
@@ -4126,14 +4262,14 @@ async fn describe_field_event(
     match new_value {
         Some(nv) => {
             if let Some(old) = current {
-                obj.insert("old".to_string(), json!(render_value(conn, &old, None, 200).await));
+                obj.insert("old".to_string(), json!(render_value(conn, &old, None, max_len).await));
             }
-            obj.insert("new".to_string(), json!(render_value(conn, nv, None, 200).await));
+            obj.insert("new".to_string(), json!(render_value(conn, nv, None, max_len).await));
         }
         // A read doesn't change anything, so there is one value to report, not a pair.
         None => {
             if let Some(v) = current {
-                obj.insert("value".to_string(), json!(render_value(conn, &v, None, 200).await));
+                obj.insert("value".to_string(), json!(render_value(conn, &v, None, max_len).await));
             }
         }
     }
@@ -6813,6 +6949,7 @@ async fn try_arm_deferred_breakpoints(
                                 trace_expr: pend.trace_expr,
                                 trace_budget: pend.trace_budget,
                                 trace_frames: pend.trace_frames,
+                                trace_max_length: pend.trace_max_length,
                                 trace_cost: crate::session::TraceCost::default(),
                                 // A CLASS_PREPARE names exactly one reference type, so a deferred arm
                                 // has no multiplicity to report — a second classloader loading the same
@@ -7035,6 +7172,7 @@ fn spec_from_pattern_set(set: &crate::session::PatternStopSet, fqn: &str, signat
         trace_expr: set.trace_expr.clone(),
         trace_budget: set.trace_budget,
         trace_frames: set.trace_frames,
+        trace_max_length: set.trace_max_length,
         suspend_policy: suspend_policy_for(set.trace),
     }
 }
@@ -7048,6 +7186,8 @@ struct TracedRequest {
     trace_expr: Option<String>,
     /// How many caller frames to record above the hit (TRACE-5).
     trace_frames: usize,
+    /// Per-value length cap for this capture (TRACE-9); `None` renders at the defaults.
+    trace_max_length: Option<usize>,
     /// Only a method-exit request has one (METH-1): the method name the caller asked for, which has to
     /// be filtered on OUR side because JDWP's `ClassMatch` fires for every method of the class. A hit on
     /// a different method is dropped without recording it and without charging the budget.
@@ -7066,6 +7206,7 @@ fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> O
             condition: b.condition.clone(),
             trace_expr: b.trace_expr.clone(),
             trace_frames: b.trace_frames,
+            trace_max_length: b.trace_max_length,
             method_filter: None,
         });
     }
@@ -7077,6 +7218,7 @@ fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> O
             condition: None,
             trace_expr: e.trace_expr.clone(),
             trace_frames: e.trace_frames,
+            trace_max_length: e.trace_max_length,
             method_filter: None,
         });
     }
@@ -7086,6 +7228,7 @@ fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> O
             condition: None,
             trace_expr: w.trace_expr.clone(),
             trace_frames: w.trace_frames,
+            trace_max_length: w.trace_max_length,
             method_filter: None,
         });
     }
@@ -7096,6 +7239,7 @@ fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> O
             condition: None,
             trace_expr: m.trace_expr.clone(),
             trace_frames: m.trace_frames,
+            trace_max_length: m.trace_max_length,
             method_filter: m.method.clone(),
         });
     }
@@ -7802,18 +7946,7 @@ async fn try_record_trace(
     let record = if skip {
         None
     } else {
-        Some(
-            capture_trace(
-                &mut session.connection,
-                &req.id,
-                req.trace_expr.as_deref(),
-                req.trace_frames,
-                thread,
-                &loc,
-                &details,
-            )
-            .await,
-        )
+        Some(capture_trace(&mut session.connection, &req, thread, &loc, &details).await)
     };
     let took = started.elapsed();
     let recorded = record.is_some();
@@ -8193,6 +8326,8 @@ struct BreakpointSpec {
     trace_budget: Option<u32>,
     /// Caller-frame depth for traced hits (TRACE-5), already clamped to `MAX_TRACE_FRAMES`.
     trace_frames: usize,
+    /// Per-value capture length (TRACE-9), already clamped to `MAX_TRACE_LENGTH`; `None` for the defaults.
+    trace_max_length: Option<usize>,
     suspend_policy: jdwp_client::SuspendPolicy,
 }
 
@@ -8213,6 +8348,7 @@ impl BreakpointSpec {
             trace_expr: self.trace_expr.clone(),
             trace_budget: self.trace_budget,
             trace_frames: self.trace_frames,
+            trace_max_length: self.trace_max_length,
             suspend_policy: self.suspend_policy,
         }
     }
@@ -8385,6 +8521,48 @@ async fn arm_extra_line_copies(
 ///
 /// The first entry is the primary and its failure is fatal; the others go through the same
 /// `extra_locations` mechanism BP-4 built for a duplicated `finally` line.
+/// Resolve the requested line in every *other* classloader's copy of the class, appending each to
+/// `locations` (BP-5, #79). Returns the copies that did not resolve, already worded.
+///
+/// Split out of `arm_and_insert` to keep it under the length the gate allows, and it is the right seam
+/// anyway: everything here is about the second and later copies, which the primary path knows nothing
+/// about.
+async fn resolve_other_classloader_copies(
+    session: &mut crate::session::DebugSession,
+    other_copies: &[u64],
+    spec: &BreakpointSpec,
+    locations: &mut Vec<crate::session::ArmedLocation>,
+) -> Vec<String> {
+    // Then the same line in every *other* classloader's copy of the class (BP-5). Resolved per copy
+    // rather than reusing the primary's method and index: two deployments can carry different builds of
+    // the same library, so the method id and the bytecode offsets are not interchangeable. A copy that
+    // does not resolve is reported rather than dropped — "this deployment has a different build" is a
+    // finding, not noise.
+    let mut unresolved: Vec<String> = Vec::new();
+    for &other in other_copies {
+        match resolve_bp_location(&mut session.connection, other, spec.line_opt, spec.method_hint.as_deref())
+            .await
+        {
+            Ok(o) => {
+                locations.push(crate::session::ArmedLocation {
+                    class_id: other,
+                    method_id: o.method.method_id,
+                    bytecode_index: o.code_index,
+                });
+                locations.extend(o.extra_code_indices.into_iter().map(|bytecode_index| {
+                    crate::session::ArmedLocation {
+                        class_id: other,
+                        method_id: o.method.method_id,
+                        bytecode_index,
+                    }
+                }));
+            }
+            Err(e) => unresolved.push(format!("another classloader's copy (class 0x{other:x}): {e}")),
+        }
+    }
+    unresolved
+}
+
 async fn arm_and_insert(
     session: &mut crate::session::DebugSession,
     class_type_ids: &[u64],
@@ -8425,33 +8603,7 @@ async fn arm_and_insert(
             bytecode_index,
         })
         .collect();
-    // Then the same line in every *other* classloader's copy of the class (BP-5). Resolved per copy
-    // rather than reusing the primary's method and index: two deployments can carry different builds of
-    // the same library, so the method id and the bytecode offsets are not interchangeable. A copy that
-    // does not resolve is reported rather than dropped — "this deployment has a different build" is a
-    // finding, not noise.
-    let mut unresolved: Vec<String> = Vec::new();
-    for &other in other_copies {
-        match resolve_bp_location(&mut session.connection, other, spec.line_opt, spec.method_hint.as_deref())
-            .await
-        {
-            Ok(o) => {
-                locations.push(crate::session::ArmedLocation {
-                    class_id: other,
-                    method_id: o.method.method_id,
-                    bytecode_index: o.code_index,
-                });
-                locations.extend(o.extra_code_indices.into_iter().map(|bytecode_index| {
-                    crate::session::ArmedLocation {
-                        class_id: other,
-                        method_id: o.method.method_id,
-                        bytecode_index,
-                    }
-                }));
-            }
-            Err(e) => unresolved.push(format!("another classloader's copy (class 0x{other:x}): {e}")),
-        }
-    }
+    let unresolved = resolve_other_classloader_copies(session, other_copies, spec, &mut locations).await;
     let mut arm = crate::session::BreakpointArm {
         class_id: class_type_id,
         method_id: method.method_id,
@@ -8492,6 +8644,7 @@ async fn arm_and_insert(
             trace_expr: spec.trace_expr.clone(),
             trace_budget: spec.trace_budget,
             trace_frames: spec.trace_frames,
+            trace_max_length: spec.trace_max_length,
             trace_cost: crate::session::TraceCost::default(),
             loaders,
             arm,
@@ -8573,6 +8726,7 @@ async fn defer_breakpoint(
         trace_expr: spec.trace_expr.clone(),
         trace_budget: spec.trace_budget,
         trace_frames: spec.trace_frames,
+        trace_max_length: spec.trace_max_length,
     });
     Ok(DeferResult::Deferred { bp_id })
 }
@@ -9070,6 +9224,7 @@ async fn arm_pattern_family(
             trace_expr: spec.trace_expr.clone(),
             trace_budget: spec.trace_budget,
             trace_frames: spec.trace_frames,
+            trace_max_length: spec.trace_max_length,
             max_classes,
             skipped_at_cap: skipped,
             no_method,
@@ -13203,15 +13358,21 @@ async fn describe_location(
 /// The watchpoint detail must be captured HERE rather than at read time for the same reason
 /// `get_last_event` reports it inline: the old value is only readable while the pending store has not
 /// committed, which is exactly this window.
+///
+/// Takes the whole [`TracedRequest`] rather than its fields one by one: TRACE-9 added the fourth thing a
+/// capture reads off the stop point that armed it, and the list had already reached the point where a
+/// caller has to count positions to be sure `trace_frames` and `trace_max_length` are the right way round.
 async fn capture_trace(
     conn: &mut jdwp_client::JdwpConnection,
-    bp_id: &str,
-    trace_expr: Option<&str>,
-    trace_frames: usize,
+    req: &TracedRequest,
     thread: u64,
     loc: &Location,
     details: &EventKind,
 ) -> crate::session::TraceRecord {
+    let (bp_id, trace_expr, trace_frames) = (&req.id, req.trace_expr.as_deref(), req.trace_frames);
+    // TRACE-9: ONE caller argument, two caps — see `trace_lengths` for why they differ when it is unset,
+    // and why an unset call still renders byte-for-byte what it rendered before the argument existed.
+    let (local_len, expr_len) = trace_lengths(req.trace_max_length);
     let (class, method, line) = describe_location(conn, loc).await;
     let mut args: Vec<(String, String)> = Vec::new();
     let mut callers: Vec<String> = Vec::new();
@@ -13257,7 +13418,7 @@ async fn capture_trace(
                 if !slots.is_empty() {
                     if let Ok(vals) = conn.get_frame_values(thread, frame.frame_id, slots).await {
                         for ((name, _), val) in in_scope.into_iter().zip(vals.iter()) {
-                            let rendered = render_value(conn, val, None, 100).await;
+                            let rendered = render_value(conn, val, None, local_len).await;
                             args.push((name, rendered));
                         }
                     }
@@ -13265,7 +13426,7 @@ async fn capture_trace(
             }
             if let Some(e) = trace_expr {
                 let rendered = match resolve_expression(conn, Some(thread), Some(&frame), e).await {
-                    Ok(v) => render_value(conn, &v, Some(thread), 200).await,
+                    Ok(v) => render_value(conn, &v, Some(thread), expr_len).await,
                     Err(err) => format!("<error: {err}>"),
                 };
                 expr = Some((e.to_string(), rendered));
@@ -13277,13 +13438,17 @@ async fn capture_trace(
     // what a suspending one would; the pairs are flattened for the one-line trace rendering.
     let mut obj = serde_json::Map::new();
     describe_exception_event(conn, details, &mut obj).await;
-    describe_field_event(conn, details, &mut obj).await;
-    describe_method_exit_event(conn, details, &mut obj).await;
+    // TRACE-9: the kind-specific detail is the PAYLOAD of a watchpoint or method-exit trace — the old →
+    // new pair, or what the method returned — so it is capped with the same number as `trace_expr`, not
+    // with the locals'. A `trace_max_length` that reached the context and stopped short of the answer
+    // would be an argument that looks like it worked.
+    describe_field_event(conn, details, &mut obj, expr_len).await;
+    describe_method_exit_event(conn, details, &mut obj, expr_len).await;
     let detail = obj.into_iter().map(|(k, v)| (k, json_scalar_to_string(&v))).collect();
 
     crate::session::TraceRecord {
         seq: 0,
-        bp_id: bp_id.to_string(),
+        bp_id: bp_id.clone(),
         thread,
         class,
         method,
@@ -13813,6 +13978,72 @@ mod tests {
         assert_eq!(clamp_trace_frames(false, 5), (0, None), "depth is meaningless without trace mode");
     }
 
+    // TRACE-9: the same discipline for the per-value capture length — clamped, and the clamp SAID. The
+    // extra thing this has to prove that `trace_frames` does not is that "unset" survives as unset all
+    // the way to `trace_lengths`: the two caps it stands for are different numbers, so a clamp that
+    // normalised `None` into one of them would silently rewrite the other for every existing caller.
+    #[test]
+    fn trace_max_length_is_clamped_and_the_clamp_is_reported() {
+        assert_eq!(clamp_trace_max_length(true, None), (None, None), "unset must stay unset");
+        assert_eq!(clamp_trace_max_length(true, Some(3000)), (Some(3000), None), "within the cap, verbatim");
+        assert_eq!(
+            clamp_trace_max_length(true, Some(MAX_TRACE_LENGTH)),
+            (Some(MAX_TRACE_LENGTH), None),
+            "the cap itself is reachable, not one short of it"
+        );
+
+        let (cap, note) = clamp_trace_max_length(true, Some(MAX_TRACE_LENGTH + 1));
+        assert_eq!(cap, Some(MAX_TRACE_LENGTH));
+        let note = note.expect("exceeding the cap must produce a note, not silence");
+        assert!(note.contains("clamped"), "the note must say what happened: {note}");
+
+        // `0` is "no limit" on `trace_max_hits` next door, and cannot be here. Read as the maximum and
+        // said out loud, rather than obeyed into a capture that renders nothing.
+        let (cap, note) = clamp_trace_max_length(true, Some(0));
+        assert_eq!(cap, Some(MAX_TRACE_LENGTH));
+        assert!(
+            note.is_some_and(|n| n.contains("no limit")),
+            "0 must be explained against the neighbouring argument that does mean no limit"
+        );
+
+        // Nothing is captured for a suspending stop point, so there is no value to bound.
+        assert_eq!(clamp_trace_max_length(false, Some(3000)), (None, None));
+    }
+
+    // TRACE-9: one argument, two caps — and unset is byte-identical to the pre-TRACE-9 literals. This is
+    // the assertion that would fail if either default were "tidied" into a single number.
+    #[test]
+    fn trace_lengths_keeps_two_different_defaults_and_raises_both_together() {
+        assert_eq!(
+            trace_lengths(None),
+            (100, 200),
+            "unset must render exactly what the hard-coded literals rendered: locals 100, trace_expr 200"
+        );
+        assert_eq!(trace_lengths(None), (DEFAULT_TRACE_LOCAL_LENGTH, DEFAULT_TRACE_EXPR_LENGTH));
+        assert_eq!(
+            trace_lengths(Some(3000)),
+            (3000, 3000),
+            "a caller raising the cap wants the payload, whichever of the two slots it landed in"
+        );
+    }
+
+    // TRACE-9: two clamps can happen on one call, and a reply that reported one and swallowed the other
+    // would be the silent narrowing both clamps exist to prevent.
+    #[test]
+    fn both_clamp_notices_survive_into_one_arm_reply() {
+        assert_eq!(merge_clamp_notes(None, None), None);
+        assert_eq!(merge_clamp_notes(Some("a".to_string()), None), Some("a".to_string()));
+        assert_eq!(merge_clamp_notes(None, Some("b".to_string()),), Some("b".to_string()));
+
+        let both = merge_clamp_notes(Some("a".to_string()), Some("b".to_string())).unwrap();
+        assert!(both.contains('a') && both.contains('b'), "neither notice may be dropped: {both}");
+        // Rendered through the same slot `describe_trace_frames` prefixes with a warning sign, so the
+        // second has to carry its own.
+        assert_eq!(both.matches("⚠️").count(), 1, "the first warning sign is added by the renderer: {both}");
+        let rendered = describe_trace_frames(true, 20, Some(&both), "hit frame only");
+        assert_eq!(rendered.matches("⚠️").count(), 2, "two clamps read as two warnings: {rendered}");
+    }
+
     // TRACE-5: the depth is visible in `list_stop_points` (so a slowed debuggee is explainable), and
     // absent when there is nothing to report.
     #[test]
@@ -14054,6 +14285,7 @@ mod tests {
             trace_expr: None,
             trace_budget: Some(200),
             trace_frames: 3,
+            trace_max_length: None,
             max_classes: 3,
             skipped_at_cap: 0,
             no_method: 6,
