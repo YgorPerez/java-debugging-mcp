@@ -9672,6 +9672,80 @@ fn hits_for(listing: &str, id: &str) -> Option<u32> {
         .find_map(|l| l.trim().strip_prefix("Hits: ").and_then(|n| n.trim().parse().ok()))
 }
 
+/// EVAL-11 (#98): an enum constant or a `public static final` field works in ARGUMENT position, as a
+/// `Map` subscript, and is scored on its runtime type when overloads compete.
+///
+/// **This is a regression test for a capability that already worked, not a test for new code**, and that
+/// is worth stating rather than leaving for someone to infer from a thin diff. #98 was filed on the
+/// premise that "a dotted static path in argument position does not resolve". Measured against a live
+/// JVM before writing anything, every one of its acceptance criteria already passed — because an
+/// argument that is not a literal is parsed as a full expression and resolved through the *same* head
+/// resolver `debug.evaluate` uses, which has handled static paths since DISC-1. The brief's own advice
+/// ("reuse it rather than writing a second resolver") had already been followed by the shape of the
+/// code.
+///
+/// What was genuinely missing is this test. Nothing in the suite passed a static reference as an
+/// argument, so the capability held by accident of a shared resolver and could have stopped holding the
+/// same way — silently, in the one place a caller would read as "the debugger cannot express this".
+///
+/// The overload pair is the part that could regress without any error appearing. `describe` exists for
+/// `SupplierKey` and for `Object`; a resolver that handed the invoke a reference without its runtime
+/// type would pick `describe(Object)` and return a plausible string. The two return different prefixes
+/// so the assertion can tell which method actually ran.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_enum_constant_and_a_static_field_work_as_call_arguments() {
+    let Some(jdk) = jdk_or_skip("an_enum_constant_and_a_static_field_work_as_call_arguments") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "EnumArgProbe").expect("launch EnumArgProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // A suspended frame, because invoking anything needs a thread suspended BY AN EVENT.
+    let line = probe_line(&probe_source("EnumArgProbe"), "// BP1");
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "EnumArgProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in EnumArgProbe.main never fired");
+
+    let eval = |server: &mut Server, expr: &str| {
+        server.call("debug.evaluate", serde_json::json!({"expression": expr}))
+    };
+
+    // A SIMPLE-name enum constant as an argument, and the overload scored on its runtime type.
+    let simple = eval(&mut server, "EnumArgProbe.describe(SupplierKey.OMNIBEES)");
+    assert!(
+        simple.contains("\"enum:OMNIBEES\""),
+        "a simple-name enum constant must resolve in argument position AND be scored as its own type — \
+         `object:` here means it landed on the describe(Object) overload, which looks like success:\
+         \n{simple}"
+    );
+
+    // Fully qualified, which is what a caller writes when the simple name is ambiguous.
+    let fq = eval(&mut server, "EnumArgProbe.describe(EnumArgProbe.MARKER)");
+    assert!(
+        fq.contains("\"object:static-marker\""),
+        "a `public static final` field must resolve in argument position; a String has no more specific \
+         overload here, so describe(Object) is the correct answer:\n{fq}"
+    );
+
+    // An enum constant as a Map subscript — the two-level session-pool read #98 names.
+    let sub = eval(&mut server, "EnumArgProbe.pool[SupplierKey.OMNIBEES]");
+    assert!(sub.contains("\"omnibees-pool\""), "an enum constant must work as a Map subscript:\n{sub}");
+
+    // A wrong constant names the missing CONSTANT rather than failing to parse. The likely case on an
+    // enum with hundreds of values, which is why #98 called it out.
+    let wrong = eval(&mut server, "EnumArgProbe.describe(SupplierKey.NOPE)");
+    assert!(
+        wrong.contains("has no static field 'NOPE'"),
+        "a typo'd constant must say which field is missing from which class, not report a parse error:\
+         \n{wrong}"
+    );
+
+    server.panic_reset();
+}
+
 /// STEP-1 (#94): `debug.step_into` skips framework and JDK frames by default, and the old behaviour is
 /// one argument away.
 ///
