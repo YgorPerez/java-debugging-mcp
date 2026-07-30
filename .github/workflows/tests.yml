@@ -64,11 +64,22 @@ jobs:
       # including mcp-server/tests/stdio_protocol.rs, which drives the real binary's front door with
       # malformed input and needs no JDK precisely so it is not hidden behind the ignore flag that exists
       # for tests that do (TEST-9, #25).
+      # Deliberately NOT given the per-test timing report that the integration legs now publish (TEST-26,
+      # #103), and the reason is that the report would be empty rather than short. Timings come from
+      # libtest's nightly-gated `--report-time`, which needs `RUSTC_BOOTSTRAP=1` on the test binary and must
+      # never reach `cargo` — it is hashed into the build fingerprint, so setting it on a `cargo test`
+      # invocation recompiles the workspace (measured: 14 s locally) and compiles it under a flag that makes
+      # nightly-only features build silently. Getting timings here would mean enumerating and running every
+      # unit and cassette binary by hand, to rank a layer that finishes in seconds.
+      #
+      # So this stays one number, and the honest version of that is saying so here rather than publishing a
+      # summary section that always reads "no per-test timings in this log". If this layer ever grows a slow
+      # test, split build from run the way scripts/integration-test.sh does.
       - name: Unit tests
         run: cargo test
 
   integration:
-    name: Integration (JDK ${{ matrix.java }})
+    name: Integration (JDK ${{ matrix.java }}, shard ${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     strategy:
       # One JDK failing must not hide whether the others would have passed: with a version matrix the
@@ -95,10 +106,35 @@ jobs:
         # path. JDWP's version tracks the JDK, so even 8 would speak 1.8. That path needs `FaultRelay`
         # (7db6318) rewriting the `Version` reply, or a recorded cassette (#37).
         #
-        # The finding as of TEST-11: 11, 17 and 21 are all green with the same 56 tests, so no test needs a
-        # version-gated skip and none has one. If that changes, skip it explicitly with the reason rather
-        # than narrowing the matrix — a leg quietly removed is indistinguishable from a leg that passes.
+        # The finding as of TEST-11 and still true at 118 tests: 11, 17 and 21 are all green with the same
+        # set, so no test needs a version-gated skip and none has one. If that changes, skip it explicitly
+        # with the reason rather than narrowing the matrix — a leg quietly removed is indistinguishable from
+        # a leg that passes.
         java: ['11', '17', '21']
+
+        # Two shards per JDK (TEST-29, #106), so six legs. Landed on measurement rather than on the guess in
+        # the issue, which expected the answer to be no:
+        #
+        #   - **Execution is 87% of a leg** — 188 s of tests against 28 s of everything else. #106 said it
+        #     would close `wontfix` if setup dominated. It does not.
+        #   - Splitting by MEASURED duration gives 283 s / 284 s of test time, so neither shard is the tail.
+        #     `scripts/shard-plan.py` does that from `mcp-server/tests/timings.tsv`; a split by *name* had a
+        #     1-in-8 chance of piling the four resume-honesty tests — 29% of the suite between them — into one
+        #     shard, which would have made one leg the whole wall clock and looked fine on the run someone
+        #     checked.
+        #   - The JDK install measures **0 s** on these runners and the cargo cache restore 4–6 s, so the
+        #     "nine installs and nine cache restores" cost #106 worried about is not what bites.
+        #
+        # **Why 2 and not 3.** The slowest single test is 70 s and cannot be split, so it is a floor: shard 1
+        # measures 79 s of wall clock against a 70 s test inside it. A third shard divides test time the floor
+        # already dominates — it buys almost nothing and costs three more runners.
+        #
+        # **The known risk, accepted deliberately.** Fewer tests per shard means fewer probe JVMs contending
+        # at once, and #106 warns that contention is the variable this repo has misread twice. #45, #56, #64
+        # and #71 are open, and this change could plausibly stop some of them reproducing without fixing
+        # them. That was the maintainer's call, made with the trade stated. If a flake investigation needs the
+        # old contention, `scripts/integration-test.sh` with no `--shard` still runs all 118 in one process.
+        shard: ['1', '2']
     steps:
       - uses: actions/checkout@v4
 
@@ -150,6 +186,15 @@ jobs:
               ;;
           esac
 
+      # Split out of the step below so the per-leg **build** cost is a measured number instead of one
+      # inferred by subtracting a local timing from a CI step. TEST-27 (#104) proposes hoisting this build
+      # into a single shared job, and that proposal is only worth landing if this number is bigger than a
+      # whole extra job's fixed cost plus an artifact round trip — which cannot be judged while the build
+      # hides inside a 184 s step. `integration-test.sh` builds too, so this step does the work and the
+      # script's own build becomes a no-op; nothing about what runs changes.
+      - name: Build the integration test binary
+        run: cargo test --test mcp_integration --no-run
+
       # Scoped to --test mcp_integration on purpose: a bare `cargo test -- --ignored` also un-ignores
       # jdwp-client's illustrative ```ignore doctests, which were never meant to compile.
       #
@@ -158,9 +203,12 @@ jobs:
       # — and a failing test suite exited 1 into a tee that exited 0, leaving this step green. The SKIP grep
       # below would not have caught it either: that looks for skips, not failures. Naming the shell turns on
       # pipefail.
+      # `--shard` is the one argument this script interprets rather than forwarding to libtest, and the shard
+      # plan's report goes into the log — including the name of any test with no recorded duration, which is
+      # the one way sharding goes quietly wrong.
       - name: Integration tests
         shell: bash
-        run: scripts/integration-test.sh 2>&1 | tee integration.log
+        run: scripts/integration-test.sh --shard ${{ matrix.shard }}/2 2>&1 | tee integration.log
 
       # Runs per leg, which is the point: a leg whose JDK failed to install must go red, never
       # green-with-zero-tests. The message names the JDK so the failure is attributable to a version rather
@@ -173,3 +221,41 @@ jobs:
             grep 'SKIP .*no JDK found' integration.log
             exit 1
           fi
+
+      # Fourth member of the green-run-of-nothing family, and it exists because sharding created the gap.
+      # `scripts/shard-plan.py` refuses a plan that is not a partition, so a test cannot fall between the two
+      # shards — but that check runs INSIDE a leg, and it cannot see whether the other leg ran at all. What
+      # this step asserts is the half a single leg can know: that this leg ran the number of tests its own
+      # plan said it would. A shard that selected 60 and ran 40 is a leg reporting green over 20 tests nobody
+      # executed, and every other guard here would pass it.
+      - name: Confirm this shard ran the tests it selected
+        shell: bash
+        run: |
+          selected="$(sed -n 's/^shard [0-9]*\/[0-9]*: \([0-9]*\) tests selected.*/\1/p' integration.log | head -1)"
+          ran="$(sed -n 's/^test result: \w*\. \([0-9]*\) passed.*/\1/p' integration.log | head -1)"
+          if [ -z "$selected" ] || [ -z "$ran" ]; then
+            echo "::error::Could not read the selected/ran counts out of the log, so this leg's coverage is unattributable."
+            exit 1
+          fi
+          if [ "$selected" != "$ran" ]; then
+            echo "::error::Shard ${{ matrix.shard }}/2 on JDK ${{ matrix.java }} selected $selected tests but ran $ran — the difference was never executed."
+            exit 1
+          fi
+          echo "shard ${{ matrix.shard }}/2 selected $selected tests and ran $selected"
+
+      # Per-test durations into the job summary (TEST-26, #103), so the ranking is readable without
+      # downloading a log. Published for ALL THREE legs rather than the one the issue asked for: the marginal
+      # cost is a second, and three rankings side by side answer a question one cannot — whether a slow test
+      # is slow everywhere or slow on one JVM generation. That is the same reasoning the matrix itself exists
+      # for.
+      #
+      # `if: always()` because a failing leg is when the ranking is most worth having: a test that failed on
+      # a timeout is exactly the one you want to see at the top. It cannot rescue a red leg — it publishes a
+      # summary and does not touch the step's status, and `integration.log` exists by then either way.
+      - name: Publish per-test timings for JDK ${{ matrix.java }} shard ${{ matrix.shard }}
+        if: always()
+        shell: bash
+        run: |
+          scripts/test-timings.py --markdown \
+            --label 'Integration (JDK ${{ matrix.java }}, shard ${{ matrix.shard }}/2)' \
+            integration.log >> "$GITHUB_STEP_SUMMARY"

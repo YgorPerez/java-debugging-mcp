@@ -6797,6 +6797,71 @@ fn source_reports_the_compiled_from_file_and_reads_a_window_from_a_root() {
     assert_contains_all("stale line number", &stale, &["past the end", "does not match the running build"]);
 }
 
+/// TEST-28 (#105): the probe-compile cache must key on the **debug-info flavour**, and this is what says so.
+///
+/// The cache compiles each `(javac, flag, source)` once per run. Its most dangerous possible bug is serving a
+/// `-g` build to a caller that asked for `-g:none`, because the one test that cares about the difference —
+/// [`source_says_when_a_loaded_class_carries_no_source_file_attribute`] below — would then assert the
+/// *absence* of a line table against a class file that has one, and **pass**.
+///
+/// This test exists because that hazard turned out to be undefended. Removing `debug_info` from the cache key
+/// on purpose left the whole suite green: `StrippedProbe` is the only source ever compiled `-g:none`, and the
+/// one place it is *also* compiled `-g` (`a_class_with_no_debug_info_cannot_be_checked_and_says_so`) hands the
+/// result to `debug.check_stale`, whose answer does not depend on what is in it. So the property was correct
+/// and argued rather than enforced, and an argument does not fail a build.
+///
+/// Asserted on the class files directly rather than through a JVM, because the claim is about javac's output
+/// and nothing else: two compilations of one source differ, the `-g` one carries `LineNumberTable`, and the
+/// `-g:none` one does not.
+#[test]
+#[ignore = "needs a JDK; run with --ignored"]
+fn the_probe_compile_cache_keeps_stripped_and_debug_builds_apart() {
+    let Some(jdk) = jdk_or_skip("the_probe_compile_cache_keeps_stripped_and_debug_builds_apart") else {
+        return;
+    };
+    let with_debug = tempfile::tempdir().expect("tempdir");
+    let stripped = tempfile::tempdir().expect("tempdir");
+
+    // Order matters: stripped FIRST, so a cache that ignored the flavour would have the `-g:none` entry
+    // already warm and would serve it to the `-g` request below. That is the failing direction, and asking
+    // for them the other way round would let the bug hide.
+    jdk.compile_probe_stripped("StrippedProbe", stripped.path()).expect("compile -g:none");
+    jdk.compile_probe("StrippedProbe", with_debug.path()).expect("compile -g");
+
+    let stripped_bytes = std::fs::read(stripped.path().join("StrippedProbe.class")).expect("read stripped");
+    let debug_bytes = std::fs::read(with_debug.path().join("StrippedProbe.class")).expect("read -g");
+
+    // `LineNumberTable` is a constant-pool UTF-8 entry, so it is findable in the raw bytes without decoding
+    // the class file — and its presence/absence is exactly what `-g:none` is being asked for here.
+    //
+    // Asserted BEFORE the byte comparison on purpose: when the flavour is missing from the cache key all
+    // three assertions here fail, and the one that fires first should name the cause rather than a symptom.
+    // With stripped compiled first, the failing direction is the `-g` request being served the stripped
+    // entry — verified by removing `debug_info` from the key and reading which assertion fires.
+    //
+    // `assert!` rather than `assert_ne!` for the byte check: `assert_ne!` on two `Vec<u8>` prints both of
+    // them, which is 1.4 kB of decimal noise in place of a sentence.
+    let names_line_table = |bytes: &[u8]| bytes.windows(15).any(|w| w == b"LineNumberTable");
+    assert!(
+        names_line_table(&debug_bytes),
+        "the `-g` build of StrippedProbe has no LineNumberTable. Since `-g:none` was compiled first, the \
+         likely cause is the compile cache serving the stripped entry to a `-g` request — i.e. the \
+         debug-info flavour is not part of its key"
+    );
+    assert!(
+        !names_line_table(&stripped_bytes),
+        "the `-g:none` build carries a LineNumberTable, so it is not stripped — either javac ignored the flag \
+         or the cache served a `-g` build for it, and the absent-line-table path TEST-14 (#39) exists for is \
+         unreachable again"
+    );
+    assert!(
+        stripped_bytes != debug_bytes,
+        "`-g:none` and `-g` of the same source came out byte-identical ({} bytes each), so the cache served \
+         one build for both flavours",
+        stripped_bytes.len()
+    );
+}
+
 /// TEST-14 (#39): the fourth `debug.source` answer — loaded, and compiled with no `SourceFile` at all.
 ///
 /// The realistic shape of this is a vendored jar, a shaded dependency, or an app server's own internals,

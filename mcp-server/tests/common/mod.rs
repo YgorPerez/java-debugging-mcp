@@ -34,9 +34,11 @@
 /// any of it — which was the whole condition #37 attached to building it.
 pub mod cassette;
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -63,6 +65,169 @@ pub struct Jdk {
     /// distinction TEST-18 (#52) turned on, so a banner that omitted it would leave the interesting half
     /// unsaid.
     origin: &'static str,
+}
+
+/// What one `javac` run produced: every class file it wrote, as `(path relative to the output dir, bytes)`.
+///
+/// Held in memory rather than as a shared directory on disk, and that is the design rather than an
+/// implementation detail — see [`javac_once`].
+type CompiledClasses = Arc<Vec<(PathBuf, Vec<u8>)>>;
+
+/// The compile-once cache (TEST-28, #105): `(javac, debug-info flag, the source text)` → what came out.
+///
+/// ## The three properties the key has to have, and how the key has them
+///
+/// **Debug-info flavour is part of the identity.** `StrippedProbe` is deliberately compiled with `-g:none`
+/// to reach `debug.source`'s `ABSENT_INFORMATION` branch (TEST-14, #39). A cache keyed on the probe's name
+/// would hand that test a `-g` build, and it would **pass** — asserting the absence of a line table against
+/// a class file that has one. So the flag is in the key.
+///
+/// **A generated or modified variant is not the probe of the same name.** The hot-reload tests compile an
+/// edited copy of a checked-in probe (SWAP-1, #58) and the delayed-launch tests generate a wrapper class.
+/// Keying on the **source text itself** rather than on a name makes that structural instead of a rule
+/// someone has to remember: an edited `X.java` cannot collide with the checked-in `X.java`, because the
+/// thing being compared is what javac would actually read. Two tests that happen to make the *same* edit do
+/// share, correctly.
+///
+/// **The `javac` binary is part of the identity**, so a run that switches `JAVA_HOME` mid-process cannot
+/// serve a JDK 11 class file to a JDK 21 test. Nothing does that today; it costs one tuple field to make it
+/// impossible rather than merely unusual.
+///
+/// ## Why in-memory bytes and not a shared output directory
+///
+/// A shared directory would be the obvious cache and it is the wrong shape here, for two reasons that both
+/// matter. `install_source_debug_extension` **rewrites the class file in place** to bolt on an `SMAP`, and
+/// tests are concurrent — with a shared directory, one test's rewrite is another test's corrupted input. And
+/// a directory has to be cleaned up, which a test binary has no reliable hook for; a static's `Drop` never
+/// runs. Bytes handed out by value give every launch its own pristine class root, exactly as before, and
+/// there is nothing to reap. The whole cache is 38 probe sources' worth of class files — tens of kilobytes.
+///
+/// ## Why concurrent launches of one probe cannot race
+///
+/// The global mutex is held only long enough to look up or insert the per-key slot; the compile happens
+/// inside that slot's [`OnceLock::get_or_init`], which blocks other threads asking for the **same** key
+/// until it finishes and lets different keys proceed in parallel. So a probe is compiled once even if ten
+/// tests ask at once, and no test can observe a half-written result — the failure mode #105 warns about,
+/// since a truncated `.class` seen intermittently would look exactly like the flakes already open against
+/// this suite (#45, #56, #64, #71).
+///
+/// Deliberately **per-process**, not per-machine: #105 puts cross-run caching out of scope because a stale
+/// probe surviving a source edit would break tests that locate breakpoints by `// BP<n>` markers in that
+/// source. Keying on the source text would in fact make that safe, but the scope call is the maintainer's
+/// and nothing here needs it.
+#[allow(clippy::type_complexity)]
+static PROBE_CLASSES: OnceLock<
+    Mutex<HashMap<(PathBuf, String, String), Arc<OnceLock<Result<CompiledClasses, String>>>>>,
+> = OnceLock::new();
+
+/// How many times `javac` actually ran, and how many times something asked for a compile.
+///
+/// Both, because the interesting number is the ratio and reporting one of them would invite the reader to
+/// assume the other. Printed per request when `JDWP_TEST_TRACE_JAVAC` is set, which is how the before/after
+/// in #105 was measured — and it stays in the tree so the next person can re-measure instead of trusting a
+/// figure in a commit message. This repo has already paid for one speed estimate that was 4x off.
+static JAVAC_RUNS: AtomicUsize = AtomicUsize::new(0);
+static COMPILE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Compile `src` with `javac` at most once per `(javac, debug_info, source text)`, and hand back the bytes.
+///
+/// `src` is passed to `javac` as-is rather than copied somewhere neutral, so the invocation is byte-for-byte
+/// what it was before this cache existed: same working directory, same source path, same implicit
+/// `-sourcepath`. Only the *number* of invocations changes.
+fn javac_once(javac: &Path, debug_info: &str, src: &Path) -> Result<CompiledClasses, String> {
+    let source = std::fs::read_to_string(src)
+        .map_err(|e| format!("cannot read {} to compile it: {e}", src.display()))?;
+    let key = (javac.to_path_buf(), debug_info.to_string(), source);
+
+    let slot = {
+        let mut cache = PROBE_CLASSES
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|e| format!("the probe compile cache was poisoned by another test: {e}"))?;
+        Arc::clone(cache.entry(key).or_default())
+    };
+
+    let requests = COMPILE_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let result = slot.get_or_init(|| javac_into_memory(javac, debug_info, src));
+    if std::env::var_os("JDWP_TEST_TRACE_JAVAC").is_some() {
+        println!(
+            "probe-compile request #{requests} -> javac run #{} ({} {})",
+            JAVAC_RUNS.load(Ordering::Relaxed),
+            debug_info,
+            src.file_name().unwrap_or(src.as_os_str()).to_string_lossy()
+        );
+    }
+    result.clone()
+}
+
+/// Run `javac` into a throwaway directory and read the class files back out of it.
+///
+/// The staging directory is a `TempDir` that is dropped before this returns, so nothing on disk outlives the
+/// call — the cache is the returned bytes.
+fn javac_into_memory(javac: &Path, debug_info: &str, src: &Path) -> Result<CompiledClasses, String> {
+    JAVAC_RUNS.fetch_add(1, Ordering::Relaxed);
+    let staging = tempfile::tempdir()
+        .map_err(|e| format!("cannot make a staging directory to compile {}: {e}", src.display()))?;
+
+    let out = Command::new(javac)
+        .arg(debug_info)
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-d")
+        .arg(staging.path())
+        .arg(src)
+        .output()
+        .map_err(|e| format!("failed to run javac: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("javac {} failed: {}", src.display(), String::from_utf8_lossy(&out.stderr)));
+    }
+
+    let mut classes = Vec::new();
+    collect_class_files(staging.path(), staging.path(), &mut classes)?;
+    if classes.is_empty() {
+        // javac exiting 0 having written nothing is not a state anyone has seen, and if it ever happens the
+        // caching layer must not be the thing that makes it look like a working compile: an empty entry
+        // would be served forever, and the test would fail on a missing class with no mention of javac.
+        return Err(format!("javac {} exited 0 but wrote no class files", src.display()));
+    }
+    Ok(Arc::new(classes))
+}
+
+/// Walk `dir` and collect every `.class` file as `(path relative to `root`, bytes)`.
+///
+/// Recursive because a probe can compile to more than one class file — nested and anonymous classes land
+/// beside the outer one, and a packaged probe lands in a subdirectory. A flat read of `*.class` in the top
+/// directory would silently drop the anonymous `Callable`s that TRACE-10 (#85) is about.
+fn collect_class_files(root: &Path, dir: &Path, into: &mut Vec<(PathBuf, Vec<u8>)>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read an entry of {}: {e}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_class_files(root, &path, into)?;
+        } else if path.extension().is_some_and(|e| e == "class") {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| format!("{} is not under {}: {e}", path.display(), root.display()))?
+                .to_path_buf();
+            let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            into.push((relative, bytes));
+        }
+    }
+    into.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(())
+}
+
+/// Materialise cached class files into `out_dir`, which becomes a class root exactly as `javac -d` left it.
+fn write_class_files(classes: &CompiledClasses, out_dir: &Path) -> Result<(), String> {
+    for (relative, bytes) in classes.iter() {
+        let dest = out_dir.join(relative);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&dest, bytes).map_err(|e| format!("write {}: {e}", dest.display()))?;
+    }
+    Ok(())
 }
 
 impl Jdk {
@@ -289,42 +454,28 @@ impl Jdk {
         let src = src_dir.join(format!("{name}.java"));
         std::fs::write(&src, modified).map_err(|e| format!("write {}: {e}", src.display()))?;
 
-        let out = Command::new(&self.javac)
-            .arg("-g")
-            .arg("-encoding")
-            .arg("UTF-8")
-            .arg("-d")
-            .arg(out_dir)
-            .arg(&src)
-            .output()
-            .map_err(|e| format!("failed to run javac: {e}"))?;
-        if !out.status.success() {
-            return Err(format!("javac {} failed: {}", src.display(), String::from_utf8_lossy(&out.stderr)));
-        }
+        // Cached like any other compile (TEST-28, #105), and safely so: [`javac_once`] keys on the **source
+        // text**, and the assertion above guarantees this text differs from the checked-in probe's. So a
+        // variant can never be served the unmodified build — which would make a swap that changed nothing
+        // look like a swap that worked, the exact failure the assertion exists to prevent.
+        let classes = javac_once(&self.javac, "-g", &src)?;
+        write_class_files(&classes, out_dir)?;
         Ok(out_dir.join(format!("{name}.class")))
     }
 
+    /// Compile a checked-in probe into `out_dir`.
+    ///
+    /// Goes through [`javac_once`], so a probe used by ten tests is compiled once per run rather than ten
+    /// times (TEST-28, #105). The cache sits behind this one private method precisely so it cannot be
+    /// bypassed by a new call site — both public entry points above route through here.
     fn compile_probe_with_debug_info(
         &self,
         debug_info: &str,
         name: &str,
         out_dir: &Path,
     ) -> Result<(), String> {
-        let src = probe_source_path(name);
-        let out = Command::new(&self.javac)
-            .arg(debug_info)
-            .arg("-encoding")
-            .arg("UTF-8")
-            .arg("-d")
-            .arg(out_dir)
-            .arg(&src)
-            .output()
-            .map_err(|e| format!("failed to run javac: {e}"))?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(format!("javac {} failed: {}", src.display(), String::from_utf8_lossy(&out.stderr)))
-        }
+        let classes = javac_once(&self.javac, debug_info, &probe_source_path(name))?;
+        write_class_files(&classes, out_dir)
     }
 }
 
@@ -1583,16 +1734,13 @@ fn compile_slow_start(jdk: &Jdk, dir: &Path) -> Result<(), String> {
         ),
     )
     .map_err(|e| format!("cannot write {}: {e}", src.display()))?;
-    let out = Command::new(&jdk.javac)
-        .args(["-g", "-encoding", "UTF-8", "-d"])
-        .arg(dir)
-        .arg(&src)
-        .output()
-        .map_err(|e| format!("failed to run javac for {SLOW_START}: {e}"))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    Err(format!("javac failed for {SLOW_START}: {}", String::from_utf8_lossy(&out.stderr)))
+
+    // The generated source is a constant, so every delayed-launch test writes the same text and this compiles
+    // once for the whole run (TEST-28, #105). The `.java` is still written per launch: it costs nothing and
+    // it is what someone reads when a delayed launch does something surprising.
+    let classes =
+        javac_once(&jdk.javac, "-g", &src).map_err(|e| format!("javac failed for {SLOW_START}: {e}"))?;
+    write_class_files(&classes, dir)
 }
 
 /// Drain one of the probe's output streams into `sink`, notifying `tx` per line.
