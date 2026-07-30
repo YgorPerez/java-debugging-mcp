@@ -232,6 +232,20 @@ request covers every class the pattern matches *including ones that load later*.
 One occurrence of a stop point being reached. What happens next depends on whether it suspends — a hit
 becomes either an event or a snapshot, never both.
 
+**A hit is counted whether or not it is reported.** A stop point with a false **condition** hits, is dropped, and
+lets the thread go; a narrowed method-exit request hits on every method of the class and drops the ones that do
+not match. Those are hits. The distinction is the whole diagnostic value of counting them: a stop point showing
+many hits and no events means the condition never held, while one showing none means the code never ran, and
+those send a reader somewhere completely different.
+
+**Hit tally**:
+How many times a stop point has been hit. An observed count, growing as the debuggee runs.
+_Avoid_: hit count. That name belongs to the **`hit_count` argument**, which is the opposite kind of thing — a
+*requested* selector saying which single occurrence to stop on (JDWP's `Count`), after which the stop point is
+**spent**. One counts what happened; the other chooses what will. The collision is not hypothetical: the two
+were both called `hit_count` in the code, and the tally sat dead and always zero behind a listing that could
+never report it (FILT-10, #110).
+
 **Event**:
 A hit that suspended the debuggee and is reported to the caller, who is expected to resume it. Reported
 **two** ways, and both always happen: recorded in a bounded buffer the caller polls, and pushed as an
@@ -325,6 +339,23 @@ To remove the stop point and its definition entirely. Unlike disable, nothing su
 **Disarm**:
 To disable a stop point *automatically* — by the watchdog, or on a trace budget running out. Named
 separately from disable because it is never the caller's instruction.
+
+**Spent**:
+A stop point the **debuggee** removed on its own, without telling anyone. Only `hit_count` produces this: JDWP's
+`Count` modifier reports the Nth occurrence and then deletes the request inside the JVM, so the stop point fires
+exactly once and is gone.
+Its own word, and the fifth in this cluster rather than a variety of the fourth, because of the one property the
+other four do not have: **a disarm is something this debugger does, so its own records are right by
+construction; a spent stop point is something the debuggee did, so its records are a stale belief.** There is no
+event, no reply and no acknowledgement — the request id we hold is one the JVM has forgotten. Two consequences
+follow from that and from nothing else, which is why the distinction earns a term: such a stop point must not be
+listed as armed, and clearing it must not send a clear for a **request id** the debuggee may have since reissued
+to someone else.
+_Avoid_: disarmed (this cluster's word for the automatic case, and the conflation that hides the staleness —
+the watchdog and a trace budget disarm are ours and known, this is neither), expired (suggests time),
+consumed, retired (both already spoken for — an entity read, and a pool worker)
+_Also avoid_ using **spent** for a **trace budget** running out. That is a disarm: we count it, we do it, and we
+know when it happened.
 
 **Disarming stops future hits, not hits that already exist.** A stop point can be armed and gone while hits
 it caused are still unhandled — see **in-flight hit**. Treating "disarmed" as "silent" is what froze a

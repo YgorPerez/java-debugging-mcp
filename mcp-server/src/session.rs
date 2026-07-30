@@ -394,7 +394,7 @@ impl DebugSession {
     /// **Why this exists.** An exception stop armed on an application type with `trace_max_hits: 30`
     /// captured 38 snapshots of which 30 were *one* instance walking `WildFly`'s EJB interceptor chain —
     /// `InterceptorContext.proceed` rethrowing at every layer. Two things went wrong and they compound:
-    /// the stop point disarmed itself mid-request on a budget spent entirely on plumbing, and the one
+    /// the stop point disarmed itself mid-request on a budget exhausted entirely on plumbing, and the one
     /// informative record — the original throw, with the application frame and the cause — was the 9th,
     /// reachable only by paging past the noise.
     ///
