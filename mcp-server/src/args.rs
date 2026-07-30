@@ -58,6 +58,18 @@ const fn default_max_children() -> usize {
 const fn default_trace_frames() -> usize {
     crate::handlers::DEFAULT_TRACE_FRAMES
 }
+// `trace_max_length` unset. Deliberately NOT a number: the two capture-time caps it raises are
+// different from each other (100 for a local, 200 for the `trace_expr` result), so there is no single
+// scalar that could stand for "leave them alone", and inventing one would change the default output of
+// whichever of the two it did not match. `None` means exactly what it says — the caller expressed no
+// preference — and `trace_lengths` in `handlers` is the one place that turns it into the pair.
+//
+// Written as a shared fn beside `default_trace_frames` for the reason that one is: four arming tools
+// read this argument, and a per-struct `#[serde(default)]` is four places for the meaning of "unset" to
+// drift apart in.
+const fn default_trace_max_length() -> Option<usize> {
+    None
+}
 const fn default_dump_frames() -> usize {
     8
 }
@@ -325,6 +337,29 @@ pub struct SetBreakpointArgs {
     /// what the depth you chose is costing on *your* JVM once hits have landed.
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
+    /// Only with `trace:true` — raise the per-value length cap on each capture, for a payload that does
+    /// not fit the frugal defaults: a JSON body, a SOAP envelope, a `+=`-built SQL string. Unset keeps
+    /// them exactly as they were — **100** characters for each in-scope local, **200** for the
+    /// `trace_expr` result, the method-exit `returned` value and a watchpoint's old → new pair. Ceiling
+    /// 4000; a larger request is clamped and the reply says so, and `0` is read as the ceiling rather
+    /// than as "no limit" (which is what it means on `trace_max_hits`, and cannot mean here).
+    ///
+    /// **Truncation happens at CAPTURE time**, which is why this is an arming argument rather than a
+    /// `debug.get_traces` one: the cut string is what the snapshot stores, so the remainder is gone and
+    /// no later read can recover it. On a shared instance the workaround — suspend, then `debug.evaluate`
+    /// with a large `max_result_length` — is precisely the thing trace mode exists to avoid.
+    ///
+    /// **The two defaults differ deliberately, and ONE argument raises both.** The locals are context,
+    /// captured whether you asked for them or not, while `trace_expr` is the payload you named, so it
+    /// already gets twice the room; both are frugal because a trace may fire hundreds of times into a
+    /// bounded buffer. One knob rather than two because a caller raising the cap wants the payload and
+    /// should not have to work out which of two numbers governs the value in front of them.
+    ///
+    /// It is still a bound. Buffer memory is roughly this cap × the hits recorded, and `trace_max_hits`
+    /// defaults to 200 — so 4000 is ~800KB per captured value on one stop point at its default budget,
+    /// which is where the ceiling comes from.
+    #[serde(default = "default_trace_max_length")]
+    pub trace_max_length: Option<usize>,
     /// Most loaded classes ONE wildcard pattern may arm (default 20, clamped at 200 — FILT-3).
     ///
     /// Only wildcards spend this; an exact class name arms one breakpoint and ignores it. When a pattern
@@ -785,6 +820,29 @@ pub struct SetExceptionBreakpointArgs {
     /// what the depth you chose is costing on *your* JVM once hits have landed.
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
+    /// Only with `trace:true` — raise the per-value length cap on each capture, for a payload that does
+    /// not fit the frugal defaults: a JSON body, a SOAP envelope, a `+=`-built SQL string. Unset keeps
+    /// them exactly as they were — **100** characters for each in-scope local, **200** for the
+    /// `trace_expr` result, the method-exit `returned` value and a watchpoint's old → new pair. Ceiling
+    /// 4000; a larger request is clamped and the reply says so, and `0` is read as the ceiling rather
+    /// than as "no limit" (which is what it means on `trace_max_hits`, and cannot mean here).
+    ///
+    /// **Truncation happens at CAPTURE time**, which is why this is an arming argument rather than a
+    /// `debug.get_traces` one: the cut string is what the snapshot stores, so the remainder is gone and
+    /// no later read can recover it. On a shared instance the workaround — suspend, then `debug.evaluate`
+    /// with a large `max_result_length` — is precisely the thing trace mode exists to avoid.
+    ///
+    /// **The two defaults differ deliberately, and ONE argument raises both.** The locals are context,
+    /// captured whether you asked for them or not, while `trace_expr` is the payload you named, so it
+    /// already gets twice the room; both are frugal because a trace may fire hundreds of times into a
+    /// bounded buffer. One knob rather than two because a caller raising the cap wants the payload and
+    /// should not have to work out which of two numbers governs the value in front of them.
+    ///
+    /// It is still a bound. Buffer memory is roughly this cap × the hits recorded, and `trace_max_hits`
+    /// defaults to 200 — so 4000 is ~800KB per captured value on one stop point at its default budget,
+    /// which is where the ceiling comes from.
+    #[serde(default = "default_trace_max_length")]
+    pub trace_max_length: Option<usize>,
     /// Only report throws on this thread (hex id, e.g. `0x2a`). On a busy app server with hundreds of
     /// threads, restricting to your request thread is the single biggest noise reduction — get the id
     /// from `debug.list_threads {name_filter}` first, then arm, then trigger (FILT-1).
@@ -859,6 +917,29 @@ pub struct SetWatchpointArgs {
     /// what the depth you chose is costing on *your* JVM once hits have landed.
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
+    /// Only with `trace:true` — raise the per-value length cap on each capture, for a payload that does
+    /// not fit the frugal defaults: a JSON body, a SOAP envelope, a `+=`-built SQL string. Unset keeps
+    /// them exactly as they were — **100** characters for each in-scope local, **200** for the
+    /// `trace_expr` result, the method-exit `returned` value and a watchpoint's old → new pair. Ceiling
+    /// 4000; a larger request is clamped and the reply says so, and `0` is read as the ceiling rather
+    /// than as "no limit" (which is what it means on `trace_max_hits`, and cannot mean here).
+    ///
+    /// **Truncation happens at CAPTURE time**, which is why this is an arming argument rather than a
+    /// `debug.get_traces` one: the cut string is what the snapshot stores, so the remainder is gone and
+    /// no later read can recover it. On a shared instance the workaround — suspend, then `debug.evaluate`
+    /// with a large `max_result_length` — is precisely the thing trace mode exists to avoid.
+    ///
+    /// **The two defaults differ deliberately, and ONE argument raises both.** The locals are context,
+    /// captured whether you asked for them or not, while `trace_expr` is the payload you named, so it
+    /// already gets twice the room; both are frugal because a trace may fire hundreds of times into a
+    /// bounded buffer. One knob rather than two because a caller raising the cap wants the payload and
+    /// should not have to work out which of two numbers governs the value in front of them.
+    ///
+    /// It is still a bound. Buffer memory is roughly this cap × the hits recorded, and `trace_max_hits`
+    /// defaults to 200 — so 4000 is ~800KB per captured value on one stop point at its default budget,
+    /// which is where the ceiling comes from.
+    #[serde(default = "default_trace_max_length")]
+    pub trace_max_length: Option<usize>,
     /// Only report touches from this thread (hex id, e.g. `0x2a`). On a busy app server, restricting
     /// to your request thread is the single biggest noise reduction — get the id from
     /// `debug.list_threads {name_filter}` first, then arm, then trigger (FILT-1).
@@ -926,6 +1007,29 @@ pub struct SetMethodBreakpointArgs {
     /// what the depth you chose is costing on *your* JVM once hits have landed.
     #[serde(default = "default_trace_frames")]
     pub trace_frames: usize,
+    /// Only with `trace:true` — raise the per-value length cap on each capture, for a payload that does
+    /// not fit the frugal defaults: a JSON body, a SOAP envelope, a `+=`-built SQL string. Unset keeps
+    /// them exactly as they were — **100** characters for each in-scope local, **200** for the
+    /// `trace_expr` result, the method-exit `returned` value and a watchpoint's old → new pair. Ceiling
+    /// 4000; a larger request is clamped and the reply says so, and `0` is read as the ceiling rather
+    /// than as "no limit" (which is what it means on `trace_max_hits`, and cannot mean here).
+    ///
+    /// **Truncation happens at CAPTURE time**, which is why this is an arming argument rather than a
+    /// `debug.get_traces` one: the cut string is what the snapshot stores, so the remainder is gone and
+    /// no later read can recover it. On a shared instance the workaround — suspend, then `debug.evaluate`
+    /// with a large `max_result_length` — is precisely the thing trace mode exists to avoid.
+    ///
+    /// **The two defaults differ deliberately, and ONE argument raises both.** The locals are context,
+    /// captured whether you asked for them or not, while `trace_expr` is the payload you named, so it
+    /// already gets twice the room; both are frugal because a trace may fire hundreds of times into a
+    /// bounded buffer. One knob rather than two because a caller raising the cap wants the payload and
+    /// should not have to work out which of two numbers governs the value in front of them.
+    ///
+    /// It is still a bound. Buffer memory is roughly this cap × the hits recorded, and `trace_max_hits`
+    /// defaults to 200 — so 4000 is ~800KB per captured value on one stop point at its default budget,
+    /// which is where the ceiling comes from.
+    #[serde(default = "default_trace_max_length")]
+    pub trace_max_length: Option<usize>,
     /// Only report returns on this thread (hex id, e.g. `0x2a`). On a busy app server this is the
     /// single biggest noise reduction for this event kind — get the id from `debug.list_threads`
     /// or `debug.thread_dump` first.
@@ -1155,6 +1259,42 @@ mod tests {
             serde_json::from_value(serde_json::json!({"class_pattern": "C", "line": 1, "trace_frames": 0}))
                 .unwrap();
         assert_eq!(off.trace_frames, 0);
+    }
+
+    // TRACE-9: the same shape for `trace_max_length`, and one thing more that `trace_frames` does not
+    // have to prove — that UNSET is distinguishable from any number. The two caps it raises differ
+    // (100 for a local, 200 for the trace_expr result), so a default that was a number would silently
+    // change one of them for every caller who never asked; `None` is what keeps today's output
+    // byte-identical, and this test is what stops it becoming `0` or `100` in a later tidy-up.
+    #[test]
+    fn trace_max_length_defaults_to_unset_on_all_four_arming_tools() {
+        let bp: SetBreakpointArgs =
+            serde_json::from_value(serde_json::json!({"class_pattern": "C", "line": 1})).unwrap();
+        let exc: SetExceptionBreakpointArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        let watch: SetWatchpointArgs =
+            serde_json::from_value(serde_json::json!({"class_name": "C", "field_name": "f"})).unwrap();
+        let mexit: SetMethodBreakpointArgs =
+            serde_json::from_value(serde_json::json!({"class_pattern": "C"})).unwrap();
+
+        assert_eq!(bp.trace_max_length, None, "unset must not be a number");
+        assert_eq!(exc.trace_max_length, bp.trace_max_length);
+        assert_eq!(watch.trace_max_length, bp.trace_max_length);
+        assert_eq!(mexit.trace_max_length, bp.trace_max_length);
+
+        // A value the caller did give survives deserialization as itself, on all four.
+        let raised: SetBreakpointArgs = serde_json::from_value(
+            serde_json::json!({"class_pattern": "C", "line": 1, "trace_max_length": 3000}),
+        )
+        .unwrap();
+        assert_eq!(raised.trace_max_length, Some(3000));
+
+        // And `0` reaches the handler as `Some(0)` rather than collapsing into "unset" — the clamp is
+        // what decides its meaning, and it cannot decide anything it was never told.
+        let zero: SetBreakpointArgs = serde_json::from_value(
+            serde_json::json!({"class_pattern": "C", "line": 1, "trace_max_length": 0}),
+        )
+        .unwrap();
+        assert_eq!(zero.trace_max_length, Some(0));
     }
 
     // `get_last_event` gained a buffer (EVT-1) but must stay backward compatible: a bare call still

@@ -595,6 +595,10 @@ pub struct ExceptionRequestInfo {
     pub trace_budget: Option<u32>,
     /// How many caller frames each traced throw records above the throwing frame (TRACE-5).
     pub trace_frames: usize,
+    /// Per-value length cap for this stop point's captures (TRACE-9), or `None` for the defaults (100
+    /// for a local, 200 for the `trace_expr` result). Kept beside `trace_frames` and for the same
+    /// reason: a disable and re-arm must not quietly hand back a narrower capture than the one armed.
+    pub trace_max_length: Option<usize>,
     /// Observed capture cost, reported by `list_stop_points` (TRACE-7).
     pub trace_cost: TraceCost,
     /// Thread this request is filtered to (`ThreadOnly`), if any — for the `list_stop_points` line (FILT-1).
@@ -636,6 +640,10 @@ pub struct WatchpointInfo {
     pub trace_budget: Option<u32>,
     /// How many caller frames each traced hit records above the mutating frame (TRACE-5).
     pub trace_frames: usize,
+    /// Per-value length cap for this stop point's captures (TRACE-9), or `None` for the defaults (100
+    /// for a local, 200 for the `trace_expr` result). Kept beside `trace_frames` and for the same
+    /// reason: a disable and re-arm must not quietly hand back a narrower capture than the one armed.
+    pub trace_max_length: Option<usize>,
     /// Observed capture cost, reported by `list_stop_points` (TRACE-7).
     pub trace_cost: TraceCost,
     /// Thread this watch is filtered to (`ThreadOnly`), if any — for the `list_stop_points` line (FILT-1).
@@ -671,6 +679,10 @@ pub struct MethodExitRequestInfo {
     pub trace_budget: Option<u32>,
     /// Caller-frame depth for traced hits (TRACE-5).
     pub trace_frames: usize,
+    /// Per-value length cap for this stop point's captures (TRACE-9), or `None` for the defaults (100
+    /// for a local, 200 for the `trace_expr` result). Kept beside `trace_frames` and for the same
+    /// reason: a disable and re-arm must not quietly hand back a narrower capture than the one armed.
+    pub trace_max_length: Option<usize>,
     /// Observed capture cost, reported by `list_stop_points` (TRACE-7).
     pub trace_cost: TraceCost,
     pub thread_filter: Option<u64>,
@@ -702,6 +714,10 @@ pub struct PendingBreakpoint {
     pub trace_budget: Option<u32>,
     /// Caller-frame depth carried through to the real breakpoint once the class loads (TRACE-5).
     pub trace_frames: usize,
+    /// Per-value length cap for this stop point's captures (TRACE-9), or `None` for the defaults (100
+    /// for a local, 200 for the `trace_expr` result). Kept beside `trace_frames` and for the same
+    /// reason: a disable and re-arm must not quietly hand back a narrower capture than the one armed.
+    pub trace_max_length: Option<usize>,
 }
 
 /// A **family** of line breakpoints armed from one wildcard class pattern (FILT-3).
@@ -757,6 +773,10 @@ pub struct PatternStopSet {
     pub trace_expr: Option<String>,
     pub trace_budget: Option<u32>,
     pub trace_frames: usize,
+    /// Per-value length cap for this stop point's captures (TRACE-9), or `None` for the defaults (100
+    /// for a local, 200 for the `trace_expr` result). Kept beside `trace_frames` and for the same
+    /// reason: a disable and re-arm must not quietly hand back a narrower capture than the one armed.
+    pub trace_max_length: Option<usize>,
     /// Ceiling on live members, from `max_classes`.
     pub max_classes: usize,
     /// Matching classes NOT armed because the family was already full — reported, never silent.
@@ -903,6 +923,10 @@ pub struct BreakpointInfo {
     /// How many caller frames each traced hit records above the hit frame (TRACE-5). 0 restores the
     /// original one-frame snapshot.
     pub trace_frames: usize,
+    /// Per-value length cap for this stop point's captures (TRACE-9), or `None` for the defaults (100
+    /// for a local, 200 for the `trace_expr` result). Kept beside `trace_frames` and for the same
+    /// reason: a disable and re-arm must not quietly hand back a narrower capture than the one armed.
+    pub trace_max_length: Option<usize>,
     /// Observed capture cost, reported by `list_stop_points` (TRACE-7).
     pub trace_cost: TraceCost,
     /// DISC-8: the stale-bytecode caveat found when this stop point was armed, if there was a proof.
