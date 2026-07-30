@@ -574,7 +574,13 @@ for the 3rd exit of ANY method of the class — almost certainly a getter — wh
 method, leaving a stop point that reported nothing and that the JVM has already deleted. There is no way to
 make it mean what it reads like, so it is refused with that explanation. WITHOUT method it means exactly what
 it says: the Nth return out of the class, whichever method produced it, after which the request is gone and
-debug.list_stop_points reports it SPENT.
+debug.list_stop_points reports it SPENT. PASS exclude_classes TO STOP THE EVENTS BEING GENERATED AT ALL, which
+is what makes a WILDCARD class_pattern usable here: the JVM does the ClassMatch, so a broad pattern sweeps in
+every proxy and interceptor the container generates and each unwanted exit costs a real event before the
+method-name filter on this side can discard it. A ClassExclude is applied by the JVM instead. There is
+deliberately NO default set here, unlike the stepping tools — a method-exit class_pattern is something you
+wrote, and silently subtracting from it would answer a different question from the one you asked. Measured: a
+request accepts at least 5000 exclusion patterns, so the list is not a resource to ration.
 
 ## debug.set_value
 Write a value to a local variable, a static field (e.g. ConfigDefaultUtils.dsInfra — flip tenant/infra on a
@@ -626,7 +632,15 @@ session is a chain of full-VM freezes with your thinking time inside each one �
 other request is stopped while you read the reply. Each freeze ends only with debug.continue, debug.panic, or
 the watchdog (JDWP_WATCHDOG_SECS, default 120), which will resume the VM out from under you mid-step. Only one
 step request is live at a time — a new step clears the previous one. THE REPLY DOES NOT SAY WHERE IT STOPPED:
-call debug.get_last_event for the new location.
+call debug.get_last_event for the new location. CLASS FILTERING IS ON BY DEFAULT, WHICH IS A BEHAVIOUR CHANGE
+AND IS DELIBERATE: this steps OVER java.*, javax.*, jakarta.*, sun.*, com.sun.*, jdk.*, org.jboss.*,
+io.undertow.*, org.wildfly.* and org.hibernate.*, so it lands on the next line of YOUR code instead of inside
+the JDK or a container proxy. On a JAX-RS request through WildFly that is the difference between one step and
+a dozen — nearly every call crosses a Weld client proxy or an EJB interceptor chain first. Nothing in the
+default set can match an application package, which is why it is safe to have on. Pass exclude_classes:[] for
+the old behaviour (step into everything), your own list to replace the default, or
+only_classes:["br.com.example.*"] for the inverse — keep stepping until we are back in my package. The reply
+always says which filtering was in force, so a step that lands somewhere surprising is explicable.
 
 ## debug.step_out
 Run the current method to its return and stop at the CALL SITE in the caller's frame — the way out of a method
@@ -639,7 +653,15 @@ full-VM freezes with your thinking time inside each one — on a shared instance
 while you read the reply. Each freeze ends only with debug.continue, debug.panic, or the watchdog
 (JDWP_WATCHDOG_SECS, default 120), which will resume the VM out from under you mid-step. Only one step request
 is live at a time — a new step clears the previous one. THE REPLY DOES NOT SAY WHERE IT STOPPED: call
-debug.get_last_event for the new location.
+debug.get_last_event for the new location. CLASS FILTERING IS ON BY DEFAULT, WHICH IS A BEHAVIOUR CHANGE AND
+IS DELIBERATE: this steps OVER java.*, javax.*, jakarta.*, sun.*, com.sun.*, jdk.*, org.jboss.*,
+io.undertow.*, org.wildfly.* and org.hibernate.*, so it lands on the next line of YOUR code instead of inside
+the JDK or a container proxy. On a JAX-RS request through WildFly that is the difference between one step and
+a dozen — nearly every call crosses a Weld client proxy or an EJB interceptor chain first. Nothing in the
+default set can match an application package, which is why it is safe to have on. Pass exclude_classes:[] for
+the old behaviour (step into everything), your own list to replace the default, or
+only_classes:["br.com.example.*"] for the inverse — keep stepping until we are back in my package. The reply
+always says which filtering was in force, so a step that lands somewhere surprising is explicable.
 
 ## debug.step_over
 Run the current line to completion and stop on the next line of the SAME frame — anything that line calls runs
@@ -653,7 +675,15 @@ default 120), which will resume the VM out from under you mid-step. Stepping is 
 cannot replace, so it is worth reserving for that: if you only need to know which path reached a line and what
 state it saw, a trace:true stop point records exactly that plus its caller chain and never suspends anything.
 Only one step request is live at a time — a new step clears the previous one, and debug.continue drops it. THE
-REPLY DOES NOT SAY WHERE IT STOPPED: call debug.get_last_event for the new location.
+REPLY DOES NOT SAY WHERE IT STOPPED: call debug.get_last_event for the new location. CLASS FILTERING IS ON BY
+DEFAULT, WHICH IS A BEHAVIOUR CHANGE AND IS DELIBERATE: this steps OVER java.*, javax.*, jakarta.*, sun.*,
+com.sun.*, jdk.*, org.jboss.*, io.undertow.*, org.wildfly.* and org.hibernate.*, so it lands on the next line
+of YOUR code instead of inside the JDK or a container proxy. On a JAX-RS request through WildFly that is the
+difference between one step and a dozen — nearly every call crosses a Weld client proxy or an EJB interceptor
+chain first. Nothing in the default set can match an application package, which is why it is safe to have on.
+Pass exclude_classes:[] for the old behaviour (step into everything), your own list to replace the default, or
+only_classes:["br.com.example.*"] for the inverse — keep stepping until we are back in my package. The reply
+always says which filtering was in force, so a step that lands somewhere surprising is explicable.
 
 ## debug.suspend_thread
 Suspend ONE NAMED THREAD and leave every other thread in the JVM running and serving requests. THIS IS THE

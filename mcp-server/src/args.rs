@@ -456,6 +456,21 @@ pub struct StepArgs {
     /// Thread ID to step (optional; defaults to the last thread that hit a breakpoint).
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// Class patterns to step **over** rather than into (STEP-1). **A default set is applied when this
+    /// is omitted** — see `debug.step_into`'s description for the list and why it is on.
+    ///
+    /// Each is JDWP's own pattern form: an exact dotted class name, or one with a single leading or
+    /// trailing `*` (`java.*`, `*.OrderService`). Pass `[]` to step into everything, which is the
+    /// behaviour before this argument existed.
+    #[serde(default)]
+    pub exclude_classes: Option<Vec<String>>,
+    /// Class patterns to step **only** within — the inverse of `exclude_classes`, for "keep going until
+    /// we are back in my package" (`br.com.infotravel.*`).
+    ///
+    /// Composes with `exclude_classes`: the JVM applies every modifier, so a class must match one of
+    /// these AND none of the exclusions. Omitted or empty, nothing is restricted.
+    #[serde(default)]
+    pub only_classes: Option<Vec<String>>,
 }
 
 /// Arguments for `debug.suspend_thread` (SAFE-11).
@@ -1128,6 +1143,17 @@ pub struct SetMethodBreakpointArgs {
     /// class regardless of which method produced it.
     #[serde(default)]
     pub hit_count: Option<i32>,
+    /// Class patterns this request must NOT fire for (STEP-1), as JDWP `ClassExclude` modifiers.
+    ///
+    /// What makes a *wildcard* `class_pattern` usable on a framework-heavy JVM. The match is done by the
+    /// JVM, so a broad pattern sweeps in every proxy and interceptor the container generates, and each
+    /// unwanted exit costs a real event before this side can discard it by method name. An exclusion
+    /// stops the event being generated at all.
+    ///
+    /// **No default here, unlike the stepping tools.** A method-exit `class_pattern` is something the
+    /// caller wrote; silently subtracting from it would answer a different question from the one asked.
+    #[serde(default)]
+    pub exclude_classes: Option<Vec<String>>,
     /// Logpoint mode: snapshot each return (location, thread, in-scope locals, the returned value) and
     /// resume immediately WITHOUT suspending. **Defaults to true, unlike every other stop point** — a
     /// suspending method exit on a hot method is the fastest way to freeze a shared JVM this tool

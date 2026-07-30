@@ -13,7 +13,12 @@ natural language.
 - **Breakpoint Management**: Set/list/clear by class+line — with optional **hit-count** (stop on the
   Nth hit) and **thread filters**, or set by **method name** (first line)
 - **Stack Inspection**: Stack frames with typed local variables and resolved **source lines**
-- **Execution Control**: **Step over/into/out**, continue, pause
+- **Execution Control**: **Step over/into/out**, continue, pause. Stepping **skips the JDK and the
+  container by default** — `java.*`, `javax.*`, `jakarta.*`, `sun.*`, `com.sun.*`, `jdk.*`,
+  `org.jboss.*`, `io.undertow.*`, `org.wildfly.*`, `org.hibernate.*` — so `step_into` lands on the next
+  line of *your* code rather than inside a Weld proxy or an EJB interceptor chain. `exclude_classes:[]`
+  restores the unfiltered behaviour, `only_classes` is the inverse ("keep going until we are back in my
+  package"), and every step reply says which was in force
 - **Expression Evaluation**: `localVar`/`this`/`Class` heads with `.field` and `.method(args)` chains
   — including **static fields and static methods** (`ConfigDefaultUtils.getUrl()`) — resolving
   overloads by the arguments' **runtime types**, including interfaces they implement (walked
@@ -195,8 +200,8 @@ Adjust the path to match where you saved the downloaded binary (or `target/relea
 | `debug.clear_stop_point` | Remove a stop point (line, deferred, exception, watchpoint, method-exit) — or a whole wildcard family by its `bpset_…` id, which also drops its watch for classes that load later |
 | `debug.toggle_stop_point` | Silence or re-arm any stop point (`bp_…` / `exc_…` / `watch_…` / `mexit_…` / `bpset_…`) without losing its `condition`/`trace_expr`; the id stays the same across the round trip |
 | `debug.continue` | Resume execution |
-| `debug.step_over` | Step over current line (defaults to last-hit thread) |
-| `debug.step_into` | Step into a method call |
+| `debug.step_over` | Step over current line (defaults to last-hit thread). Optional `exclude_classes` / `only_classes` (JDWP `ClassExclude` / `ClassOnly`) — a **default exclusion set** applies unless you pass your own or an empty list |
+| `debug.step_into` | Step into a method call — **skips framework and JDK frames by default**, so it lands on your next line instead of several steps deep in the container; `exclude_classes:[]` steps into everything |
 | `debug.step_out` | Step out of the current method |
 | `debug.get_stack` | Stack frames, compact `#i class.method:line` with typed locals indented |
 | `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods, object arguments, `[i]`/`["k"]`/`[a..b]`/`[?pred]` subscripts (predicates support `&&`/`||`), `arr.length` on any array, a `byte[]`/`char[]` rendered as decoded text with a `#<charset>` selector, and `expand_objects` for a deep field tree |

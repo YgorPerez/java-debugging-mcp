@@ -25,6 +25,9 @@ mod mod_kinds {
     pub const COUNT: u8 = 1;
     pub const THREAD_ONLY: u8 = 3;
     pub const CLASS_MATCH: u8 = 5;
+    /// `ClassExclude` (6): drop events from classes matching a pattern. One modifier per pattern —
+    /// JDWP carries a single string each, so N exclusions occupy N of the request's modifier slots.
+    pub const CLASS_EXCLUDE: u8 = 6;
     pub const LOCATION_ONLY: u8 = 7;
     pub const EXCEPTION_ONLY: u8 = 8;
     pub const FIELD_ONLY: u8 = 9;
@@ -329,20 +332,57 @@ impl JdwpConnection {
         count: Option<i32>,
         thread: Option<ThreadId>,
     ) -> JdwpResult<i32> {
+        self.set_method_exit_request_ex(class_pattern, with_return_value, suspend_policy, count, thread, &[])
+            .await
+    }
+
+    /// [`set_method_exit_request`](Self::set_method_exit_request) with `ClassExclude` patterns (STEP-1).
+    ///
+    /// The exclusions are what make a *wildcard* `ClassMatch` usable on a framework-heavy JVM: the match
+    /// itself is done by the JVM, so a broad pattern sweeps in every proxy and interceptor the container
+    /// generates, and each unwanted exit costs a real event before this side can discard it. An exclusion
+    /// stops the event being generated at all.
+    ///
+    /// **One modifier per pattern**, so the count written into the packet has to include all of them.
+    /// A wrong count is not diagnosed as such: the JVM reads the following bytes as another modifier and
+    /// answers `INTERNAL` (113), which says nothing about the cause.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn set_method_exit_request_ex(
+        &mut self,
+        class_pattern: &str,
+        with_return_value: bool,
+        suspend_policy: SuspendPolicy,
+        count: Option<i32>,
+        thread: Option<ThreadId>,
+        exclude: &[String],
+    ) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
 
         packet.data.put_u8(method_exit_kind(with_return_value));
         packet.data.put_u8(suspend_policy as u8);
 
-        // ClassMatch is always present; ThreadOnly and Count are added when asked for.
-        let n_mods = 1 + i32::from(count.is_some()) + i32::from(thread.is_some());
+        // ClassMatch is always present; ThreadOnly, Count and one ClassExclude per pattern are added
+        // when asked for.
+        let n_mods = 1
+            + i32::from(count.is_some())
+            + i32::from(thread.is_some())
+            + i32::try_from(exclude.len()).unwrap_or(0);
         packet.data.put_i32(n_mods);
 
         packet.data.put_u8(mod_kinds::CLASS_MATCH);
         let pat = class_pattern.as_bytes();
         packet.data.put_u32(u32::try_from(pat.len()).unwrap_or(u32::MAX));
         packet.data.extend_from_slice(pat);
+
+        for p in exclude {
+            packet.data.put_u8(mod_kinds::CLASS_EXCLUDE);
+            let b = p.as_bytes();
+            packet.data.put_u32(u32::try_from(b.len()).unwrap_or(u32::MAX));
+            packet.data.extend_from_slice(b);
+        }
 
         write_count_thread(&mut packet, count, thread);
 

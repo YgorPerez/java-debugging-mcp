@@ -818,6 +818,9 @@ pub struct MethodExitRequestInfo {
     pub hits: u32,
     /// Dotted class pattern the caller gave, kept so a disabled request can be re-armed.
     pub class_pattern: String,
+    /// `ClassExclude` patterns this request was armed with (STEP-1), kept so a re-arm reproduces them —
+    /// a re-arm that quietly dropped them would hand back a far noisier stop point under the same id.
+    pub exclude_classes: Vec<String>,
     /// Method name to report on, filtered on OUR side: JDWP has no method-name modifier, so the request
     /// fires for every method of a matching class and non-matching exits are dropped by the event pump.
     /// `None` means every method — only allowed in trace mode.

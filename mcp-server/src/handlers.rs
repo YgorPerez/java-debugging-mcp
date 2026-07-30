@@ -867,9 +867,11 @@ impl RequestHandler {
         if let Some((req, _)) = session.pending_step.take() {
             let _ = session.connection.clear_step(req).await;
         }
+        let exclude = step_exclusions(a.exclude_classes.as_deref());
+        let only = a.only_classes.unwrap_or_default();
         let req = session
             .connection
-            .set_step(thread_id, depth)
+            .set_step_ex(thread_id, depth, &exclude, &only)
             .await
             .map_err(|e| format!("Failed to set step: {e}"))?;
         session.pending_step = Some((req, thread_id));
@@ -878,7 +880,9 @@ impl RequestHandler {
         drop(session);
 
         Ok(format!(
-            "👣 Stepping {label} on thread 0x{thread_id:x}. Call debug.get_last_event to see where it stopped."
+            "👣 Stepping {label} on thread 0x{thread_id:x}. Call debug.get_last_event to see where it \
+             stopped.{}",
+            describe_step_filter(&exclude, &only, a.exclude_classes.is_none())
         ))
     }
 
@@ -2862,6 +2866,72 @@ async fn set_field_by_path(
     ))
 }
 
+/// The class patterns stepping skips unless the caller says otherwise (STEP-1).
+///
+/// **On by default, which is a behaviour change, and it was chosen deliberately.** Without it
+/// `debug.step_into` on the target stack is close to unusable: a `JAX-RS` request on `WildFly` arrives
+/// through dozens of framework frames, and with 515 `@Stateless` beans, 2052 `@TransactionAttribute`
+/// uses and 3479 `@Inject` sites in one codebase, nearly every call crosses a Weld client proxy or an EJB
+/// interceptor chain before reaching application code. The old behaviour — step into all of it, then
+/// spend several more steps escaping — is what the tool's own description already apologised for.
+///
+/// The default is the frameworks and the JDK, not a guess about the caller's own code:
+///  - `java.*`, `javax.*`, `jakarta.*`, `sun.*`, `com.sun.*`, `jdk.*` — the JDK and the EE APIs;
+///  - `org.jboss.*`, `io.undertow.*`, `org.wildfly.*` — the container;
+///  - `org.hibernate.*` — the persistence layer, whose proxies are the other common landing spot.
+///
+/// Nothing here can match an application package, which is the property that makes it safe to default
+/// on. A caller who *wants* to step into the JDK passes `exclude_classes: []` and gets exactly the old
+/// behaviour; the reply says which of the two is in force either way, so a step that lands somewhere
+/// surprising is explicable rather than mysterious.
+const DEFAULT_STEP_EXCLUSIONS: [&str; 10] = [
+    "java.*",
+    "javax.*",
+    "jakarta.*",
+    "sun.*",
+    "com.sun.*",
+    "jdk.*",
+    "org.jboss.*",
+    "io.undertow.*",
+    "org.wildfly.*",
+    "org.hibernate.*",
+];
+
+/// Resolve the exclusion list for one step: the caller's if they gave one (including an explicit empty
+/// list, which means "step into everything"), otherwise [`DEFAULT_STEP_EXCLUSIONS`].
+fn step_exclusions(from_caller: Option<&[String]>) -> Vec<String> {
+    from_caller.map_or_else(
+        || DEFAULT_STEP_EXCLUSIONS.iter().map(|s| (*s).to_string()).collect(),
+        <[String]>::to_vec,
+    )
+}
+
+/// The line a step reply appends about what filtering was in force (STEP-1).
+///
+/// Printed on every step rather than only when it is unusual, because the default is ON: a caller who
+/// does not know that reads a step landing two frames further along as the debugger misbehaving. Saying
+/// it costs one line and turns a surprise into a fact with an argument attached to it.
+fn describe_step_filter(exclude: &[String], only: &[String], defaulted: bool) -> String {
+    let mut out = String::new();
+    if exclude.is_empty() && only.is_empty() {
+        out.push_str("\n   No class filter: this steps into framework and JDK code as well as yours.");
+        return out;
+    }
+    if !exclude.is_empty() {
+        let _ = write!(
+            out,
+            "\n   Stepping OVER {} ({}){}",
+            exclude.join(", "),
+            if defaulted { "the default set" } else { "your exclude_classes" },
+            if defaulted { " — pass exclude_classes:[] to step into everything" } else { "" }
+        );
+    }
+    if !only.is_empty() {
+        let _ = write!(out, "\n   Stepping ONLY within {}", only.join(", "));
+    }
+    out
+}
+
 /// Refuse `hit_count` together with `method` on a method-exit stop point (FILT-8), because the two
 /// cannot mean what the pair reads like and the failure is silent.
 ///
@@ -3599,12 +3669,13 @@ async fn arm_one_method_exit(
 ) -> Result<(String, i32), String> {
     let request_id = session
         .connection
-        .set_method_exit_request(
+        .set_method_exit_request_ex(
             class_pattern,
             arm.with_return_value,
             suspend_policy_for(a.trace),
             a.hit_count,
             arm.thread_filter,
+            a.exclude_classes.as_deref().unwrap_or(&[]),
         )
         .await
         .map_err(|e| format!("Failed to set method-exit request on '{class_pattern}': {e}"))?;
@@ -3620,6 +3691,7 @@ async fn arm_one_method_exit(
             hit_count: a.hit_count,
             hits: 0,
             class_pattern: class_pattern.to_string(),
+            exclude_classes: a.exclude_classes.clone().unwrap_or_default(),
             method: method.cloned(),
             with_return_value: arm.with_return_value,
             trace: a.trace,
@@ -8563,12 +8635,13 @@ async fn rearm_method_exit(
 ) -> Result<String, String> {
     let req = session
         .connection
-        .set_method_exit_request(
+        .set_method_exit_request_ex(
             &me.class_pattern,
             me.with_return_value,
             suspend_policy_for(me.trace),
             me.hit_count,
             me.thread_filter,
+            &me.exclude_classes,
         )
         .await
         .map_err(|e| format!("Failed to re-arm method-exit request: {e}"))?;

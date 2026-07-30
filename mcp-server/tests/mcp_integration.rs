@@ -9672,6 +9672,86 @@ fn hits_for(listing: &str, id: &str) -> Option<u32> {
         .find_map(|l| l.trim().strip_prefix("Hits: ").and_then(|n| n.trim().parse().ok()))
 }
 
+/// STEP-1 (#94): `debug.step_into` skips framework and JDK frames by default, and the old behaviour is
+/// one argument away.
+///
+/// Before this, a step request carried a `Step` modifier and **nothing else** — no `ClassExclude`, no
+/// `ClassOnly`. On the target stack that made `step_into` close to unusable: a `JAX-RS` request on `WildFly`
+/// arrives through dozens of framework frames, and the tool's own description conceded that a mis-step
+/// "can cost several more steps to escape".
+///
+/// `StepFilterProbe` is built for exactly this and nothing else. Its marked line calls
+/// `List.sort(...)` — real JDK code with real line numbers — and the comparator is a method of the probe
+/// itself, so execution goes *ours → java.util → ours*. That shape is what makes the two arms below
+/// distinguishable, and it is also what stops a blunter implementation passing: something that merely
+/// stepped OUT to the caller would skip the callback into application code as well.
+///
+/// Both arms run against the same probe in one test on purpose. Asserting only the filtered arm would
+/// pass on a JVM that never steps into `java.util` at all, which would make the whole feature untested
+/// while looking green.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn step_into_skips_the_jdk_by_default_and_steps_into_it_when_asked() {
+    let Some(jdk) = jdk_or_skip("step_into_skips_the_jdk_by_default_and_steps_into_it_when_asked") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "StepFilterProbe").expect("launch StepFilterProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 1 "))
+        .expect("probe never reached its second tick, so StepFilterProbe never loaded");
+
+    let src = probe_source("StepFilterProbe");
+    let sort_line = probe_line(&src, "// BP1");
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "StepFilterProbe", "line": sort_line}),
+    );
+
+    // ARM 1 — no filter at all, which is what every step did before STEP-1. The step from the `sort`
+    // call has to land inside the JDK, or the second arm below proves nothing.
+    server
+        .wait_for_event(&format!("\"line\":{sort_line}"), EVENT_TIMEOUT)
+        .expect("breakpoint on the sort line never fired");
+    let unfiltered_reply = server.call("debug.step_into", serde_json::json!({"exclude_classes": []}));
+    assert!(
+        unfiltered_reply.contains("No class filter"),
+        "an explicitly empty exclusion list must say it is stepping into everything: {unfiltered_reply}"
+    );
+    server.wait_for_event("\"event\":\"step\"", EVENT_TIMEOUT).expect("unfiltered step never reported");
+    let unfiltered = server.last_event();
+    assert!(
+        unfiltered.contains("java."),
+        "with no exclusion a step_into at a `List.sort` call must land in the JDK — if it does not, this \
+         probe is not exercising the thing STEP-1 changed and the filtered arm below is vacuous:\
+         \n{unfiltered}"
+    );
+
+    // ARM 2 — the default. Same line, same call, and it must land back in the probe's own code.
+    server.call("debug.continue", serde_json::json!({}));
+    server
+        .wait_for_event(&format!("\"line\":{sort_line}"), EVENT_TIMEOUT)
+        .expect("breakpoint on the sort line never fired a second time");
+    let filtered_reply = server.call("debug.step_into", serde_json::json!({}));
+    assert_contains_all(
+        "the default filter is stated in the reply, with the way to turn it off",
+        &filtered_reply,
+        &["Stepping OVER", "java.*", "the default set", "exclude_classes:[]"],
+    );
+    server.wait_for_event("\"event\":\"step\"", EVENT_TIMEOUT).expect("filtered step never reported");
+    let filtered = server.last_event();
+    assert!(
+        filtered.contains("StepFilterProbe"),
+        "with the default exclusions a step_into at a `List.sort` call must land in the probe's own \
+         code — either the comparator the JDK calls back into, or the next line — and not inside \
+         java.util:\n{filtered}"
+    );
+
+    server.panic_reset();
+}
+
 /// FILT-8 (#99): a `hit_count` stop point fires on the Nth occurrence, ONCE, and is then **spent** —
 /// deleted by the JVM, not by us — and everything downstream has to say so.
 ///

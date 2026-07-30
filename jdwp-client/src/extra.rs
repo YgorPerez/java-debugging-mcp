@@ -13,12 +13,24 @@ use bytes::BufMut;
 // JDWP modifier kinds
 const MOD_COUNT: u8 = 1;
 const MOD_THREAD_ONLY: u8 = 3;
+/// `ClassOnly` (4): restrict the request to classes matching a pattern.
+const MOD_CLASS_ONLY: u8 = 4;
+/// `ClassExclude` (6): drop events from classes matching a pattern. One modifier per pattern —
+/// JDWP takes a single string each, so N exclusions are N modifiers on one request.
+const MOD_CLASS_EXCLUDE: u8 = 6;
 const MOD_LOCATION_ONLY: u8 = 7;
 const MOD_STEP: u8 = 10;
 // ArrayReference command set (13)
 const ARRAY_LENGTH: u8 = 1;
 const ARRAY_GET_VALUES: u8 = 2;
 const ARRAY_SET_VALUES: u8 = 3;
+
+/// Write a JDWP string: a big-endian `u32` byte length, then the UTF-8 bytes.
+fn write_jdwp_string(packet: &mut CommandPacket, s: &str) {
+    let b = s.as_bytes();
+    packet.data.put_u32(u32::try_from(b.len()).unwrap_or(u32::MAX));
+    packet.data.extend_from_slice(b);
+}
 
 /// Step depth selector for `set_step`.
 #[derive(Debug, Clone, Copy)]
@@ -78,11 +90,45 @@ impl JdwpConnection {
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_step(&mut self, thread: ThreadId, depth: StepDepth) -> JdwpResult<i32> {
+        self.set_step_ex(thread, depth, &[], &[]).await
+    }
+
+    /// Set a single-step request with `ClassExclude` / `ClassOnly` filtering (STEP-1).
+    ///
+    /// `exclude` drops events from classes matching each pattern; `only` restricts the request to
+    /// classes matching each pattern. Patterns are JDWP's own form — an exact class name, or one with a
+    /// single leading or trailing `*` (`java.*`, `*.OrderService`) — and the JVM matches them against
+    /// the **dotted** class name.
+    ///
+    /// **One modifier per pattern.** JDWP's `ClassExclude` carries a single string, so N exclusions
+    /// occupy N of the request's modifier slots and the count written into the packet has to include
+    /// all of them. Getting that count wrong does not produce a complaint about the modifier: the JVM
+    /// reads the next bytes as another modifier and answers `INTERNAL` (113), which says nothing about
+    /// the cause — the same failure the `Count`/`ThreadOnly` pair already carries a warning about.
+    ///
+    /// **How many the JVM tolerates, measured rather than assumed** (Temurin 17, HotSpot): a step
+    /// request with **5000** `ClassExclude` modifiers was accepted without complaint, as were 255, 256
+    /// and 1000 — so there is no practical cap to defend against and no error path to translate. The
+    /// count field is an `i32` and the packet is length-prefixed; nothing here bounds it before that.
+    /// Worth measuring because the byte-level failure mode above gives no signal, so a cap discovered in
+    /// production would have looked like a bug in this function rather than a limit.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn set_step_ex(
+        &mut self,
+        thread: ThreadId,
+        depth: StepDepth,
+        exclude: &[String],
+        only: &[String],
+    ) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
         packet.data.put_u8(event_kinds::SINGLE_STEP);
         packet.data.put_u8(SuspendPolicy::All as u8);
-        packet.data.put_i32(1); // one modifier: Step
+        // Step, plus one modifier per pattern.
+        let n_mods = 1 + exclude.len() + only.len();
+        packet.data.put_i32(i32::try_from(n_mods).unwrap_or(i32::MAX));
         packet.data.put_u8(MOD_STEP);
         packet.data.put_u64(thread);
         packet.data.put_i32(step_sizes::LINE);
@@ -91,6 +137,14 @@ impl JdwpConnection {
             StepDepth::Over => step_depths::OVER,
             StepDepth::Out => step_depths::OUT,
         });
+        for pat in only {
+            packet.data.put_u8(MOD_CLASS_ONLY);
+            write_jdwp_string(&mut packet, pat);
+        }
+        for pat in exclude {
+            packet.data.put_u8(MOD_CLASS_EXCLUDE);
+            write_jdwp_string(&mut packet, pat);
+        }
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
         let mut data = reply.data();
