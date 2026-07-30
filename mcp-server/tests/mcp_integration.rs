@@ -7572,15 +7572,18 @@ fn every_primitive_and_its_array_renders_the_same_as_local_field_and_element() {
     ];
     // And the arrays, which are the only route to `Value::format`. Every element carries its own type
     // prefix, so a `short[]` read as an `int[]` would be visible here rather than plausible.
+    //
+    // `byte[]` and `char[]` are the two that no longer render as elements: EVAL-7 (#81) made them decode
+    // to text, because a bag of signed integers is what made `WSIntegradorLog.dsRequest` unreadable. They
+    // stay in this table because the property under test is unchanged — the same value read three ways
+    // must render the same way — and because the marking survived the move: `1`/`-2`/`127` are a NUL-ish
+    // control, an octet that is not valid UTF-8, and DEL, and all three are shown as the octets they are
+    // rather than as replacement characters. `PrimitiveProbe.sBytes#raw` is the way back to the element
+    // list, and is asserted below.
     let arrays = [
-        ("bs", "sBytes", "bs", "byte[3]{(byte) 1, (byte) -2, (byte) 127}"),
+        ("bs", "sBytes", "bs", "byte[3] UTF-8 \"\\x01\\xfe\\x7f\""),
         ("ss", "sShorts", "ss", "short[3]{(short) -300, (short) 0, (short) 300}"),
-        (
-            "cs",
-            "sChars",
-            "cs",
-            "char[3]{(char) 'a', (char) 'Z', (char) '\\uD800' (unpaired surrogate, not a character)}",
-        ),
+        ("cs", "sChars", "cs", "char[3] UTF-16 \"aZ\\uD800\""),
         ("is", "sInts", "is", "int[3]{(int) 0, (int) -1, (int) 2147483647}"),
         ("js", "sLongs", "js", "long[2]{(long) -9000000000, (long) 9000000000}"),
         ("fs", "sFloats", "fs", "float[2]{(float) 0.5, (float) -1.25}"),
@@ -7616,14 +7619,30 @@ fn every_primitive_and_its_array_renders_the_same_as_local_field_and_element() {
     // to tell the two apart. The array above pins the new rendering; this pins the property that made it
     // a finding — that it can be told apart from a genuine `'?'` rather than merely rendered as
     // *something*.
+    //
+    // The `char[]` now renders as text (EVAL-7, #81), so the property is asserted in the form the text
+    // render takes — `\uD800`, not `?` — and then again on the element itself, which is the route that
+    // still reaches `format_char` directly and is where the wording lives.
     assert!(
-        !stack.contains("(char) 'Z', (char) '?'"),
+        !stack.contains("\"aZ?\""),
         "a lone surrogate must not render as a literal '?', which is a value the debuggee could really \
          hold:\n{stack}"
     );
     assert!(
-        stack.contains("(char) '\\uD800' (unpaired surrogate"),
-        "it renders as the code unit it is, and says what that is:\n{stack}"
+        stack.contains("char[3] UTF-16 \"aZ\\uD800\""),
+        "it renders as the code unit it is, escaped rather than replaced:\n{stack}"
+    );
+    assert_eq!(
+        evaluated(&server.evaluate("PrimitiveProbe.sChars[2]")),
+        "(char) '\\uD800' (unpaired surrogate, not a character)",
+        "read one element at a time it still says what a lone surrogate IS, which the text render has no \
+         room for"
+    );
+    // The way back to the octets, for the byte[] that is genuinely not text (EVAL-7).
+    assert_eq!(
+        evaluated(&server.evaluate("PrimitiveProbe.sBytes#raw")),
+        "byte[3]{(byte) 1, (byte) -2, (byte) 127}",
+        "`#raw` renders the elements, because a byte[] really can be a hash or a serialised object"
     );
     let real_question_mark = server.evaluate("PrimitiveProbe.sChars[1]");
     assert_eq!(
@@ -8963,6 +8982,168 @@ fn a_multi_location_stop_point_charges_its_budget_once_per_hit() {
     server.panic_reset();
 }
 
+/// EVAL-7 (#81): a `byte[]` reads as text under the charset the caller names, and `array.length`
+/// resolves.
+///
+/// Two gaps that combined into one blocked investigation. Every supplier round trip on this stack is
+/// recorded as `WSIntegradorLog.dsRequest` / `dsResponse`, both `byte[]`, so reaching either meant
+/// reading a bag of signed integers — with no `new String(bytes)` to express (no constructors, no casts)
+/// and no `.length`, because that read routed through the field lookup and a JDWP array type has no
+/// field table.
+///
+/// **The charset is the half most likely to be got wrong, so it is asserted in both directions.**
+/// `it-common`'s `Utils` pins the shared JAXB marshaller to `ISO-8859-1`, so Latin-1 payloads are
+/// genuinely in circulation; a UTF-8-only decode would corrupt `São Paulo` into something a reader
+/// would diagnose as a *supplier* bug. Both payloads are read under both charsets here: the right
+/// decode has to produce the text, and the wrong one has to be visibly wrong rather than plausible.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+// One probe, one arrangement, every route into the same renderer — static field, local, chained field,
+// array element, deep expansion. The comparison between them IS the test; split up, no half could claim
+// the other's setup.
+#[allow(clippy::too_many_lines)]
+fn byte_arrays_render_as_text_under_the_charset_the_caller_names() {
+    let Some(jdk) = jdk_or_skip("byte_arrays_render_as_text_under_the_charset_the_caller_names") else {
+        return;
+    };
+    // `launch_running`, not `launch`: a class loads on first use, so reading loaded state before the
+    // probe has executed anything gets a correct "not loaded" and asserts a wrong finding (TEST-17, #49).
+    let probe =
+        Probe::launch_running(&jdk, "BytesProbe", |l| l.starts_with("tick ")).expect("launch BytesProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // --- the charset, both ways round, on the two payloads actually in circulation ---
+    //
+    // `latin1City` is `São Paulo` as ISO-8859-1: nine octets, and the `ã` is a bare `0xE3`, which is not
+    // valid UTF-8 at all. That octet is what the issue is about.
+    assert_eq!(
+        evaluated(&server.evaluate("BytesProbe.latin1City")),
+        r#"byte[9] UTF-8 "S\xe3o Paulo""#,
+        "the default decode names UTF-8 and MARKS the octet it could not decode — a lossy decode would \
+         have put a U+FFFD there, indistinguishable from one the debuggee really held"
+    );
+    assert_eq!(
+        evaluated(&server.evaluate("BytesProbe.latin1City#ISO-8859-1")),
+        r#"byte[9] ISO-8859-1 "São Paulo""#,
+        "named the right charset, the same nine octets are the text they always were"
+    );
+    assert_eq!(
+        evaluated(&server.evaluate("BytesProbe.utf8City")),
+        r#"byte[10] UTF-8 "São Paulo""#,
+        "a UTF-8 payload under the default"
+    );
+    assert_eq!(
+        evaluated(&server.evaluate("BytesProbe.utf8City#latin1")),
+        r#"byte[10] ISO-8859-1 "SÃ£o Paulo""#,
+        "the wrong charset produces mojibake a reader can recognise, and the reply names the charset it \
+         used, so there is something to correct"
+    );
+
+    // --- a whole envelope, newlines and all ---
+    let envelope = evaluated(&server.evaluate("BytesProbe.log.dsRequest#ISO-8859-1")).to_string();
+    assert_contains_all(
+        "the WSIntegradorLog shape reads as the envelope it is",
+        &envelope,
+        &["byte[73] ISO-8859-1", "<?xml version=", "<cidade>São Paulo</cidade>"],
+    );
+    assert!(
+        !envelope.contains('\n'),
+        "a decoded payload must stay ONE line — a trace record is one line, and a raw newline would break \
+         the record apart: {envelope}"
+    );
+    assert!(
+        envelope.contains("\\n<Envelope>"),
+        "the newlines are escaped rather than dropped, so nothing is lost: {envelope}"
+    );
+
+    // --- a byte[] that is not text at all, and the way back to the octets ---
+    assert_eq!(
+        evaluated(&server.evaluate("BytesProbe.blob")),
+        r#"byte[4] UTF-8 "\x00\x01\xfe\x7f""#,
+        "a blob decodes to nothing but marked octets, which is itself the answer: this is not text"
+    );
+    assert_eq!(
+        evaluated(&server.evaluate("BytesProbe.blob#raw")),
+        "byte[4]{(byte) 0, (byte) 1, (byte) -2, (byte) 127}",
+        "`#raw` is the way back, because for a hash or a serialised object the octets ARE the answer"
+    );
+
+    // --- char[], which carries no charset question: a Java char is already a UTF-16 code unit ---
+    assert_eq!(
+        evaluated(&server.evaluate("BytesProbe.chars")),
+        r#"char[3] UTF-16 "ol\uD800""#,
+        "a lone surrogate is not a character, and is escaped rather than replaced (TYPE-1, #48)"
+    );
+
+    // --- array.length, on all three array kinds ---
+    assert_eq!(
+        evaluated(&server.evaluate("BytesProbe.latin1City.length")),
+        "(int) 9",
+        "a primitive byte[] — the case that used to fail with `No field 'length' found on the object`"
+    );
+    assert_eq!(evaluated(&server.evaluate("BytesProbe.words.length")), "(int) 3", "an object array");
+    assert_eq!(evaluated(&server.evaluate("BytesProbe.numbers.length")), "(int) 5", "a primitive int[]");
+
+    // Chaining still works after an INDEX, and `.length` is terminal because it is a number.
+    assert_eq!(
+        evaluated(&server.evaluate("BytesProbe.pages[0].length")),
+        "(int) 9",
+        "an index narrows to one value, so a `.length` still chains off it"
+    );
+    assert_eq!(
+        evaluated(&server.evaluate("BytesProbe.pages[1]")),
+        r#"byte[10] UTF-8 "São Paulo""#,
+        "an element of a byte[][] is a byte[], and reads as text for the same reason the outer one would"
+    );
+    assert_contains_all(
+        "a chain after `.length` says what it hit rather than inventing a member on an int",
+        &server.evaluate("BytesProbe.numbers.length.foo"),
+        &["primitive"],
+    );
+
+    // An unrecognised selector is an error, not a silent fall back to the default — a caller who typed a
+    // charset this tool does not have must not be handed a UTF-8 answer as though it were theirs.
+    assert_contains_all(
+        "an unknown `#…` selector is refused and names what is accepted",
+        &server.evaluate("BytesProbe.latin1City#utf9"),
+        &["not a render selector", "ISO-8859-1", "raw"],
+    );
+
+    // --- the same renderer reached through a suspended frame's locals ---
+    let source = probe_source("BytesProbe");
+    let line = probe_line(&source, "// BP1");
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "BytesProbe", "line": line}));
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("the breakpoint in BytesProbe.work never fired"));
+
+    assert_eq!(
+        evaluated(&server.evaluate("req#ISO-8859-1")),
+        r#"byte[9] ISO-8859-1 "São Paulo""#,
+        "a local resolves to the same array the static field did, and renders identically"
+    );
+    assert_eq!(evaluated(&server.evaluate("req.length")), "(int) 9", "`.length` on a local byte[]");
+    assert_contains_all(
+        "a byte[] reached through a field of a local object — the `integrador.getIntegradorLogList()` shape",
+        &server.evaluate("entry.dsResponse"),
+        &["byte[74] UTF-8", "<cidade>São Paulo</cidade>"],
+    );
+    // A deep expansion must treat a byte[] as a leaf too: expanded elementwise, one payload would be
+    // seventy numbered lines where a caller asked to read an envelope.
+    let expanded = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "entry#ISO-8859-1", "expand_objects": true}),
+    );
+    assert_contains_all(
+        "an expanded object shows its byte[] fields as text, not as a numbered element block",
+        &expanded,
+        &["dsRequest = byte[73] ISO-8859-1", "<cidade>São Paulo</cidade>"],
+    );
+
+    server.panic_reset();
+}
+
 /// BP-5 (#79): one class name, two classloaders — arm both copies.
 ///
 /// `classes_by_signature` returns one entry per classloader that has loaded a name, and the arming path
@@ -9078,6 +9259,71 @@ fn an_exact_class_name_arms_every_classloaders_copy() {
     assert_contains_all("one clear removes both copies", &cleared, &["✅", "bp_1"]);
     let after = server.call("debug.list_stop_points", serde_json::json!({}));
     assert!(after.contains("No breakpoints set"), "clear left something armed: {after}");
+
+    server.panic_reset();
+}
+
+/// EVAL-7 (#81), the half that decides whether any of it is usable on the shared 8180: a decoded
+/// `byte[]` and an `array.length` both have to be reachable from a `trace_expr`, which is the only way
+/// to read a value on an instance other people are using without freezing it.
+///
+/// Two stop points rather than two assertions on one, because a `trace_expr` is one expression per stop
+/// point — and each is waited for by its OWN needle, since `wait_for_traces` returns on the FIRST
+/// matching record and a single wait would read the buffer between the two.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_trace_expr_decodes_a_byte_array_and_reads_its_length_without_suspending() {
+    let Some(jdk) = jdk_or_skip("a_trace_expr_decodes_a_byte_array_and_reads_its_length_without_suspending")
+    else {
+        return;
+    };
+    let probe =
+        Probe::launch_running(&jdk, "BytesProbe", |l| l.starts_with("tick ")).expect("launch BytesProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    let source = probe_source("BytesProbe");
+    // One expression per stop point, so the two questions are two stop points — on two adjacent lines
+    // of the same method, which the probe carries markers for.
+    for (marker, expr) in [("// BP1", "entry.dsRequest#ISO-8859-1"), ("// BP2", "req.length")] {
+        let armed = server.call(
+            "debug.set_line_stop",
+            serde_json::json!({
+                "class_pattern": "BytesProbe",
+                "line": probe_line(&source, marker),
+                "trace": true,
+                "trace_expr": expr,
+            }),
+        );
+        assert_contains_all("armed as a trace", &armed, &["bp_", "trace (non-suspending)"]);
+    }
+
+    // The whole point of trace mode: the debuggee never stops. A suspending breakpoint here would hold
+    // the JVM on every call and the ticks would end.
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
+        "the probe stopped ticking, so a traced hit left it suspended\n  output: {:?}",
+        probe.output(),
+    );
+
+    let decoded = server
+        .wait_for_traces("entry.dsRequest#ISO-8859-1 =>", EVENT_TIMEOUT)
+        .expect("no trace record carried the decoded payload");
+    assert_contains_all(
+        "the trace record carries the decoded envelope, on one line",
+        &decoded,
+        &["entry.dsRequest#ISO-8859-1 => byte[73] ISO-8859-1", "<cidade>São Paulo</cidade>"],
+    );
+
+    let length = server
+        .wait_for_traces("req.length =>", EVENT_TIMEOUT)
+        .expect("no trace record carried the array length");
+    assert_contains_all(
+        "and `.length` answers inside a trace_expr, where there is no schema to extend",
+        &length,
+        &["req.length => (int) 9"],
+    );
 
     server.panic_reset();
 }

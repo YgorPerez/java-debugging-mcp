@@ -951,7 +951,16 @@ impl RequestHandler {
             hidden: 0,
             deep: expand_objects.then(|| {
                 (
-                    DeepOpts { depth_limit: a.max_depth, child_limit: a.max_children.max(1), text_len: 200 },
+                    DeepOpts {
+                        depth_limit: a.max_depth,
+                        child_limit: a.max_children.max(1),
+                        text_len: 200,
+                        // `get_stack` reads whatever locals a frame happens to hold rather than one
+                        // value a caller named, so there is no expression to carry a `#charset` on and
+                        // it renders every `byte[]` the default way. Ask about one with
+                        // `debug.evaluate buf#ISO-8859-1` when the default decode looks wrong.
+                        bytes: ByteRender::default(),
+                    },
                     DeepState::new(STACK_NODE_BUDGET),
                 )
             }),
@@ -976,7 +985,9 @@ impl RequestHandler {
 
     async fn handle_evaluate(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::EvaluateArgs = crate::args::parse(&args)?;
-        let expression = a.expression.as_str();
+        // A trailing `#<charset>` is a rendering selector, not part of the path to the value, so it is
+        // taken off before anything resolves (EVAL-7).
+        let (expression, bytes) = split_charset(a.expression.as_str())?;
         let frame_index = a.frame_index;
         let max_len = a.max_result_length;
 
@@ -1017,17 +1028,18 @@ impl RequestHandler {
             depth_limit: a.max_depth,
             child_limit: a.max_children.max(1),
             text_len: max_len,
+            bytes,
         });
 
         let rendered = match resolved {
-            Resolved::One(value) => render_one(conn, &value, thread_id, max_len, deep).await,
+            Resolved::One(value) => render_one(conn, &value, thread_id, max_len, deep, bytes).await,
             // A slice/filter result: the header carries how many of how many were selected, which is
             // as important as the values — "0 matched" and "0 scanned" mean very different things.
             Resolved::Many { header, values, keys } => {
                 let shown = values.len().min(a.max_children.max(1));
                 let mut out = format!("{header} {{");
                 for (i, v) in values.iter().take(shown).enumerate() {
-                    let r = render_one(conn, v, thread_id, max_len, deep).await;
+                    let r = render_one(conn, v, thread_id, max_len, deep, bytes).await;
                     // Map entries keep their keys; everything else is positional.
                     match keys.get(i) {
                         Some(k) => write!(out, "\n  {k} → {r}"),
@@ -1061,7 +1073,8 @@ impl RequestHandler {
     /// for it will be.
     async fn handle_evaluate_chain(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::EvaluateChainArgs = crate::args::parse(&args)?;
-        let expression = a.expression.trim();
+        // Same `#<charset>` selector `debug.evaluate` takes, stripped before resolution (EVAL-7).
+        let (expression, bytes) = split_charset(a.expression.trim())?;
 
         let session_guard =
             self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
@@ -1081,9 +1094,10 @@ impl RequestHandler {
             None => None,
         };
 
-        let walk = walk_expression_chain(conn, thread_id, frame.as_ref(), expression, a.max_result_length)
-            .await
-            .map_err(explain_readonly)?;
+        let walk =
+            walk_expression_chain(conn, thread_id, frame.as_ref(), expression, a.max_result_length, bytes)
+                .await
+                .map_err(explain_readonly)?;
         drop(session);
         Ok(render_expression_chain(expression, &walk))
     }
@@ -4244,7 +4258,10 @@ async fn describe_method_exit_event(
     };
     match return_value {
         Some(v) => {
-            obj.insert("returned".to_string(), json!(render_value(conn, v, None, max_len).await));
+            obj.insert(
+                "returned".to_string(),
+                json!(render_value(conn, v, None, max_len, ByteRender::default()).await),
+            );
         }
         None => {
             obj.insert("returned".to_string(), json!("<not reported — this JVM speaks JDWP < 1.6>"));
@@ -4304,14 +4321,23 @@ async fn describe_field_event(
     match new_value {
         Some(nv) => {
             if let Some(old) = current {
-                obj.insert("old".to_string(), json!(render_value(conn, &old, None, max_len).await));
+                obj.insert(
+                    "old".to_string(),
+                    json!(render_value(conn, &old, None, max_len, ByteRender::default()).await),
+                );
             }
-            obj.insert("new".to_string(), json!(render_value(conn, nv, None, max_len).await));
+            obj.insert(
+                "new".to_string(),
+                json!(render_value(conn, nv, None, max_len, ByteRender::default()).await),
+            );
         }
         // A read doesn't change anything, so there is one value to report, not a pair.
         None => {
             if let Some(v) = current {
-                obj.insert("value".to_string(), json!(render_value(conn, &v, None, max_len).await));
+                obj.insert(
+                    "value".to_string(),
+                    json!(render_value(conn, &v, None, max_len, ByteRender::default()).await),
+                );
             }
         }
     }
@@ -4497,7 +4523,7 @@ async fn render_frame_variables(
     for ((name, _), value) in active.iter().zip(values.iter()) {
         let formatted_value = match &mut deep {
             Some((opts, state)) => render_node(conn, value, Some(target_thread), *opts, state, 0).await,
-            None => render_value(conn, value, None, 200).await,
+            None => render_value(conn, value, None, 200, ByteRender::default()).await,
         };
         let _ = writeln!(output, "     {name} = {formatted_value}");
         if deep.as_ref().is_some_and(|(_, state)| state.exhausted()) {
@@ -10149,7 +10175,7 @@ async fn set_collection_element(
         .await
         .map_err(|e| format!("{}() on '{container_expr}' failed: {e}", m.name))?;
     let displaced = invoke_result(conn, &m.name, ret, exc).await?;
-    let old = render_value(conn, &displaced, Some(tid), 200).await;
+    let old = render_value(conn, &displaced, Some(tid), 200, ByteRender::default()).await;
     Ok(format!("✅ Set {container_expr}[{}] = {raw_value} (was {old}) via {}()", render_arglit(key), m.name))
 }
 
@@ -10198,7 +10224,7 @@ async fn set_array_element(
         .map_err(|e| format!("Failed to write '{container_expr}[{i}]': {e}"))?;
 
     let was = match old {
-        Some(v) => format!(" (was {})", render_value(conn, &v, None, 200).await),
+        Some(v) => format!(" (was {})", render_value(conn, &v, None, 200, ByteRender::default()).await),
         None => String::new(),
     };
     Ok(format!("✅ Set {container_expr}[{i}] = {raw_value}{was}"))
@@ -11341,7 +11367,10 @@ async fn structural_scan(
     let mut values = Vec::with_capacity(pairs.len());
     let mut keys = Vec::with_capacity(pairs.len());
     for (k, v) in pairs {
-        keys.push(render_value(conn, &k, thread_id, 120).await);
+        // A map KEY renders with the default byte reading (EVAL-7, #81). The `#<charset>` selector
+        // scopes to the value the caller named, and here that is the collection, not its keys — a
+        // key that is itself a `byte[]` is vanishingly rare and would read as text under UTF-8.
+        keys.push(render_value(conn, &k, thread_id, 120, ByteRender::default()).await);
         values.push(v);
     }
     Ok(Walked::Read(Scan { values, keys, len, name }))
@@ -11611,7 +11640,7 @@ async fn scan_map_entries(
         // An unreadable entry is skipped rather than failing the whole scan, matching how the deep
         // renderer treats one.
         if let Some((k, v)) = entry_pair(conn, e, tid).await {
-            keys.push(render_value(conn, &k, Some(tid), 120).await);
+            keys.push(render_value(conn, &k, Some(tid), 120, ByteRender::default()).await);
             values.push(v);
         }
     }
@@ -11975,6 +12004,22 @@ async fn read_segment_field(
     type_id: u64,
     seg: &Seg,
 ) -> Result<jdwp_client::types::Value, String> {
+    // `arr.length` is not a field read, and no amount of looking will make it one: a JDWP array type
+    // has no field table at all, so the lookup below answered "No field 'length' found on the object"
+    // about the one member every Java array has. `ArrayReference.Length` is the primitive that answers
+    // it, and it invokes nothing (EVAL-7). The signature is only fetched for a segment literally named
+    // `length`, so an ordinary field read costs the same round trips it always did — and a real field
+    // called `length` on a non-array still resolves the ordinary way.
+    if seg.name == "length" {
+        let sig = conn.get_signature(type_id).await.unwrap_or_default();
+        if sig.starts_with('[') {
+            let len = conn
+                .get_array_length(obj_id)
+                .await
+                .map_err(|e| format!("Failed to read the length of '{}': {e}", decode_signature(&sig)))?;
+            return Ok(value_int(len));
+        }
+    }
     let fid = find_field(conn, type_id, &seg.name)
         .await?
         .ok_or_else(|| format!("No field '{}' found on the object", seg.name))?;
@@ -12156,6 +12201,7 @@ async fn walk_expression_chain(
     frame: Option<&jdwp_client::thread::Frame>,
     expr: &str,
     max_len: usize,
+    how: ByteRender,
 ) -> Result<ChainWalk, String> {
     let segs = parse_expr(expr)?;
     let Some(head_seg) = segs.first() else {
@@ -12193,7 +12239,7 @@ async fn walk_expression_chain(
         .await?
     {
         Resolved::One(v) => {
-            steps.push(chain_step(conn, head_label, &v, max_len).await);
+            steps.push(chain_step(conn, head_label, &v, max_len, how).await);
             current = v;
         }
         // A slice or filter yields several values, so it is necessarily the end of the walk.
@@ -12217,7 +12263,7 @@ async fn walk_expression_chain(
         let member = resolve_member(conn, thread_id, frame, &current, seg).await?;
         match apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name, &mut path).await? {
             Resolved::One(v) => {
-                steps.push(chain_step(conn, seg_label(seg), &v, max_len).await);
+                steps.push(chain_step(conn, seg_label(seg), &v, max_len, how).await);
                 current = v;
             }
             Resolved::Many { .. } => {
@@ -12243,9 +12289,10 @@ async fn chain_step(
     label: String,
     v: &jdwp_client::types::Value,
     max_len: usize,
+    how: ByteRender,
 ) -> ChainStep {
     let is_null = matches!(v.data, jdwp_client::types::ValueData::Object(0));
-    ChainStep { label, rendered: render_value(conn, v, None, max_len).await, is_null }
+    ChainStep { label, rendered: render_value(conn, v, None, max_len, how).await, is_null }
 }
 
 /// One segment as the caller wrote it: `getConfigUhList()`, `sqQuarto`, `lines[0]`.
@@ -12502,8 +12549,335 @@ async fn find_static_field(
     Ok(None)
 }
 
+// ----- byte[] / char[] as text: EVAL-7 (#81) -----
+
+/// The charset a `byte[]` is decoded with.
+///
+/// Three, deliberately, rather than "whatever a charset crate supports. Two of them are the ones this
+/// debugger exists to read: `it-common`'s shared JAXB marshaller pins `JAXB_ENCODING` to `ISO-8859-1`,
+/// so a supplier envelope on the shared 8180 is genuinely Latin-1 while everything newer is UTF-8, and
+/// a UTF-8-only decode would corrupt the first kind into something that reads as a *supplier* bug.
+/// `US-ASCII` is the third because it is the only one that can prove a payload is plain ASCII instead
+/// of assuming it — under Latin-1 every octet decodes, so Latin-1 can never disagree with anything.
+///
+/// Anything wider would mean a dependency carrying a hundred legacy codecs to answer a question nobody
+/// on this stack asks, and the error from [`parse_byte_render`] names the three rather than pretending
+/// the list is open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Charset {
+    Utf8,
+    Latin1,
+    Ascii,
+}
+
+impl Charset {
+    /// The name that goes into the rendered value, so a reader knows what was **assumed** rather than
+    /// having to infer it from whether the text looks right.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Latin1 => "ISO-8859-1",
+            Self::Ascii => "US-ASCII",
+        }
+    }
+
+    /// Worst-case octets behind one rendered character, so the read can be bounded by what could
+    /// possibly be displayed.
+    const fn max_bytes_per_char(self) -> usize {
+        match self {
+            Self::Utf8 => 4,
+            Self::Latin1 | Self::Ascii => 1,
+        }
+    }
+}
+
+/// How a `byte[]` / `char[]` is rendered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ByteRender {
+    /// Decode to text. The default, because the alternative — a bag of signed integers — is what made
+    /// `WSIntegradorLog.dsRequest` unreadable in the first place.
+    Text(Charset),
+    /// The element list every other primitive array gets. Not a charset, and here because changing the
+    /// default has to leave a way back: a `byte[]` really can be a hash, a serialised object or an
+    /// image, and for those the octets ARE the answer.
+    Raw,
+}
+
+impl Default for ByteRender {
+    fn default() -> Self {
+        Self::Text(Charset::Utf8)
+    }
+}
+
+/// Parse a `#…` selector: a charset name, or `raw` for the element list.
+///
+/// Punctuation and case are ignored, so `ISO-8859-1`, `iso88591` and `Latin1` are one name — a caller
+/// typing a charset from memory should not have to remember which spelling this tool chose.
+fn parse_byte_render(name: &str) -> Option<ByteRender> {
+    let key: String =
+        name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect();
+    Some(match key.as_str() {
+        "utf8" => ByteRender::Text(Charset::Utf8),
+        "iso88591" | "latin1" | "l1" => ByteRender::Text(Charset::Latin1),
+        "usascii" | "ascii" => ByteRender::Text(Charset::Ascii),
+        "raw" | "bytes" => ByteRender::Raw,
+        _ => return None,
+    })
+}
+
+/// Split a trailing `#<charset>` selector off an expression — `log.dsRequest#ISO-8859-1`.
+///
+/// **Why a suffix on the expression and not an argument on the tool**, which is the other half of what
+/// EVAL-7 had to decide.
+///
+/// The charset is not a property of the value or of the path to it: it is a property of the *render*.
+/// So it cannot travel the way #79's `@0x…` classloader selector does, by narrowing resolution — that
+/// suffix changes which class you get, and a charset changes nothing about which bytes you get. But it
+/// cannot travel as a resolver result either: `resolve_expression` hands back a JDWP `Value`, decoded
+/// text is not one, and *making* it one would mean allocating a `String` in the debuggee — an
+/// invocation ADR-0001 refuses in a read-only session and a side effect on a JVM other people are
+/// using. So the suffix is stripped **before** resolution and consumed by the renderer, and the
+/// resolver never sees it.
+///
+/// Given that, a tool argument would have had to be added to seven tools and, for the four arming
+/// ones, stored in every stop-point record, carried through disable/re-arm, and reported by
+/// `list_stop_points` or it would be hidden state. The suffix costs none of that, composes with
+/// `trace_expr` where there is no schema to extend at all (the same reason #79 gave), and is scoped to
+/// **one value** rather than to a whole call — so a trace can decode its `dsRequest` as Latin-1 without
+/// also asserting that every other local in the capture is Latin-1.
+///
+/// A `#` at quote depth 0 is not valid Java, so any such `#` IS a selector attempt and an unrecognised
+/// one is an error rather than a silent fallback. A `#` inside a string literal (`map["a#b"]`) is left
+/// alone.
+fn split_charset(expr: &str) -> Result<(&str, ByteRender), String> {
+    let Some(at) = last_selector_hash(expr) else {
+        return Ok((expr, ByteRender::default()));
+    };
+    let (head, tail) = expr.split_at(at);
+    let name = tail.get(1..).unwrap_or_default().trim();
+    let how = parse_byte_render(name).ok_or_else(|| {
+        format!(
+            "'#{name}' is not a render selector. A trailing `#…` on an expression says how to render a \
+             byte[]/char[]: UTF-8 (the default), ISO-8859-1 (aliases: latin1), US-ASCII (ascii), or \
+             `raw` for the element list. A '#' inside a string literal is left alone."
+        )
+    })?;
+    Ok((head.trim_end(), how))
+}
+
+/// Byte offset of the last `#` outside a string literal, or `None` if there is none.
+fn last_selector_hash(expr: &str) -> Option<usize> {
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut found = None;
+    for (i, c) in expr.char_indices() {
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_str = true;
+        } else if c == '#' {
+            found = Some(i);
+        }
+    }
+    found
+}
+
+/// Octets read from a `byte[]` for a text render before the read is cut short.
+///
+/// Bounded by what could be **displayed** rather than by [`SUBSCRIPT_SCAN_CAP`], and the difference is
+/// the point: that cap counts elements a caller reads one at a time, and a decoded byte is not one of
+/// those — a thousand of them are a paragraph, not a thousand answers. Reading more octets than
+/// `max_len` can show is waste on a wire that belongs to somebody else, so the display length is the
+/// real bound and this constant is only the ceiling that stops a caller who set `max_result_length` to
+/// a million from turning one render into a megabyte read. A render that was cut short says so.
+const TEXT_SCAN_CAP: usize = 65_536;
+
+/// Render a `byte[]` or a `char[]` as text (EVAL-7). `None` when the array is neither of those, when
+/// the caller asked for `#raw`, or when the array cannot be read — every one of which falls back to
+/// the ordinary element rendering.
+async fn render_text_array(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    sig: &str,
+    max_len: usize,
+    how: ByteRender,
+) -> Option<String> {
+    let ByteRender::Text(charset) = how else {
+        return None;
+    };
+    // Keyed on the array's own signature, which is the only thing that says what these elements are.
+    // `[[B` is an array OF byte[]s and deliberately stays an element list — each of its elements
+    // renders as text on its own.
+    let is_bytes = sig == "[B";
+    if !is_bytes && sig != "[C" {
+        return None;
+    }
+    let len = conn.get_array_length(id).await.ok()?;
+    let per = if is_bytes { charset.max_bytes_per_char() } else { 1 };
+    let want = i32::try_from(max_len.saturating_mul(per).min(TEXT_SCAN_CAP)).unwrap_or(i32::MAX);
+    let take = len.min(want);
+    let values = if take <= 0 { Vec::new() } else { conn.get_array_values(id, 0, take).await.ok()? };
+
+    let (kind, unit, label, text) = if is_bytes {
+        let raw: Vec<u8> = values.iter().filter_map(byte_of).collect();
+        ("byte", "bytes", charset.label(), decode_bytes(&raw, charset))
+    } else {
+        let units: Vec<u16> = values.iter().filter_map(char_unit_of).collect();
+        // A Java `char` IS a UTF-16 code unit, so nothing is assumed here — but the encoding is named
+        // anyway, so a reader never has to work out which of the two array kinds they are looking at.
+        ("char", "chars", "UTF-16", decode_chars(&units))
+    };
+    let note = if take < len { format!(" (decoded {take} of {len} {unit})") } else { String::new() };
+    Some(format!("{kind}[{len}] {label} \"{}\"{note}", truncate(&text, max_len)))
+}
+
+/// The octet behind a JDWP `byte` element.
+///
+/// Java's `byte` is signed and the wire carries the bit pattern; reading it back as unsigned IS the
+/// decode, not a lossy cast — `0xE7`, the `ç` that makes a Latin-1 payload undecodable as UTF-8,
+/// arrives here as `-25`.
+#[allow(clippy::cast_sign_loss)]
+const fn byte_of(v: &jdwp_client::types::Value) -> Option<u8> {
+    match v.data {
+        jdwp_client::types::ValueData::Byte(b) => Some(b as u8),
+        _ => None,
+    }
+}
+
+/// The UTF-16 code unit behind a JDWP `char` element.
+const fn char_unit_of(v: &jdwp_client::types::Value) -> Option<u16> {
+    match v.data {
+        jdwp_client::types::ValueData::Char(c) => Some(c),
+        _ => None,
+    }
+}
+
+/// Decode octets to text under one charset, marking everything that is not readable text.
+fn decode_bytes(raw: &[u8], charset: Charset) -> String {
+    let mut out = String::with_capacity(raw.len());
+    match charset {
+        // Latin-1 maps all 256 octets to code points, so nothing is ever *undecodable* under it —
+        // which is exactly why the control marking in `push_text_char` matters here: it is the only
+        // thing that can tell a caller they asked for Latin-1 and got a blob rather than text.
+        Charset::Latin1 => {
+            for &b in raw {
+                push_text_char(&mut out, char::from(b));
+            }
+        }
+        Charset::Ascii => {
+            for &b in raw {
+                if b < 0x80 {
+                    push_text_char(&mut out, char::from(b));
+                } else {
+                    push_raw_byte(&mut out, b);
+                }
+            }
+        }
+        Charset::Utf8 => decode_utf8_marked(raw, &mut out),
+    }
+    out
+}
+
+/// UTF-8 decode that **marks** every octet it could not decode and carries on, instead of substituting
+/// U+FFFD.
+///
+/// `String::from_utf8_lossy` is the obvious call and the wrong one: a replacement character is
+/// indistinguishable from a replacement character the debuggee genuinely held, and the whole failure
+/// this issue is about is a wrong answer that looks like a supplier bug. `\xe7` says which octet was
+/// there, which is enough to recognise a Latin-1 payload on sight and re-read it with `#ISO-8859-1`.
+fn decode_utf8_marked(raw: &[u8], out: &mut String) {
+    let mut rest = raw;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                push_text(out, s);
+                return;
+            }
+            Err(e) => {
+                let good = e.valid_up_to();
+                if let Some(s) = rest.get(..good).and_then(|b| std::str::from_utf8(b).ok()) {
+                    push_text(out, s);
+                }
+                // `error_len() == None` means the input ended mid-sequence, which is what a read cut
+                // short by the scan cap looks like. Those octets are marked like any other undecodable
+                // run; the truncation note on the render says the read was the reason.
+                let bad = e.error_len().unwrap_or_else(|| rest.len().saturating_sub(good)).max(1);
+                let end = good.saturating_add(bad).min(rest.len());
+                for &b in rest.get(good..end).unwrap_or_default() {
+                    push_raw_byte(out, b);
+                }
+                match rest.get(end..) {
+                    Some(r) if !r.is_empty() => rest = r,
+                    _ => return,
+                }
+            }
+        }
+    }
+}
+
+/// Decode UTF-16 code units — a `char[]`, or a `String`'s backing array — to text.
+fn decode_chars(units: &[u16]) -> String {
+    let mut out = String::with_capacity(units.len());
+    for unit in char::decode_utf16(units.iter().copied()) {
+        match unit {
+            Ok(c) => push_text_char(&mut out, c),
+            // An unpaired surrogate is an ordinary thing to find in a `char[]` — a string sliced
+            // mid-pair leaves one behind — and it is not a character. Shown as the escape Java itself
+            // prints, for the reason TYPE-1 (#48) gave: replacing it would hide the very thing someone
+            // reached for a debugger to look at.
+            Err(e) => push_raw_unit(&mut out, e.unpaired_surrogate()),
+        }
+    }
+    out
+}
+
+fn push_text(out: &mut String, s: &str) {
+    for c in s.chars() {
+        push_text_char(out, c);
+    }
+}
+
+/// Append one decoded character, marking the ones that are not readable text.
+///
+/// A C0 control or DEL decodes fine and is still not something a reader can see — a binary blob read
+/// as Latin-1 is nothing but those — so it goes in as `\xNN` rather than raw into somebody's terminal.
+/// `\n`, `\r` and `\t` get their short escapes instead, because a trace record is **one line** and a
+/// decoded SOAP envelope is full of them: a raw newline there would break the record apart. `\` is
+/// doubled so a literal `\x41` in a payload can never be read as an octet this function marked.
+fn push_text_char(out: &mut String, c: char) {
+    match c {
+        '\\' => out.push_str("\\\\"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        _ if u32::from(c) < 0x20 || u32::from(c) == 0x7f => {
+            let _ = write!(out, "\\x{:02x}", u32::from(c));
+        }
+        _ => out.push(c),
+    }
+}
+
+/// An octet that did not decode, as `\xNN`.
+fn push_raw_byte(out: &mut String, b: u8) {
+    let _ = write!(out, "\\x{b:02x}");
+}
+
+/// A UTF-16 code unit that is not a character, as `\uNNNN`.
+fn push_raw_unit(out: &mut String, unit: u16) {
+    let _ = write!(out, "\\u{unit:04X}");
+}
+
 /// Shallow render of an array element (no recursion / method invocation).
-async fn render_element(conn: &mut jdwp_client::JdwpConnection, value: &jdwp_client::types::Value) -> String {
+async fn render_element(
+    conn: &mut jdwp_client::JdwpConnection,
+    value: &jdwp_client::types::Value,
+    how: ByteRender,
+) -> String {
     use jdwp_client::types::ValueData;
     match &value.data {
         ValueData::Object(0) => "null".to_string(),
@@ -12514,11 +12888,15 @@ async fn render_element(conn: &mut jdwp_client::JdwpConnection, value: &jdwp_cli
                 }
             }
             match conn.get_object_reference_type(*id).await {
-                Ok(t) => format!(
-                    "{} (id=0x{:x})",
-                    decode_signature(&conn.get_signature(t).await.unwrap_or_default()),
-                    id
-                ),
+                Ok(t) => {
+                    let sig = conn.get_signature(t).await.unwrap_or_default();
+                    // An element of a `byte[][]` is a `byte[]`, and reads as text for the same reason
+                    // the outer one would.
+                    if let Some(text) = render_text_array(conn, *id, &sig, 60, how).await {
+                        return text;
+                    }
+                    format!("{} (id=0x{:x})", decode_signature(&sig), id)
+                }
                 Err(_) => format!("(object) @{id:x}"),
             }
         }
@@ -12533,25 +12911,28 @@ async fn render_one(
     thread_id: Option<u64>,
     max_len: usize,
     deep: Option<DeepOpts>,
+    how: ByteRender,
 ) -> String {
     match deep {
         Some(opts) => render_value_deep(conn, value, thread_id, opts).await,
-        None => render_value(conn, value, thread_id, max_len).await,
+        None => render_value(conn, value, thread_id, max_len, how).await,
     }
 }
 
-/// Render a value for display. Strings show contents; arrays show their elements; objects
-/// show their type name (and, when `thread_id` is Some, a best-effort `toString()`).
+/// Render a value for display. Strings show contents; a `byte[]`/`char[]` shows decoded text (EVAL-7);
+/// other arrays show their elements; objects show their type name (and, when `thread_id` is Some, a
+/// best-effort `toString()`).
 async fn render_value(
     conn: &mut jdwp_client::JdwpConnection,
     value: &jdwp_client::types::Value,
     thread_id: Option<u64>,
     max_len: usize,
+    how: ByteRender,
 ) -> String {
     use jdwp_client::types::ValueData;
     match &value.data {
         ValueData::Object(0) => "null".to_string(),
-        ValueData::Object(id) => render_object(conn, *id, value.tag, thread_id, max_len).await,
+        ValueData::Object(id) => render_object(conn, *id, value.tag, thread_id, max_len, how).await,
         // `ValueData::format_primitive` declines only a reference, and both reference shapes are matched
         // above — so the fallback is unreachable rather than a rendering anyone should see.
         other => other.format_primitive().unwrap_or_else(|| "(?)".to_string()),
@@ -12574,6 +12955,9 @@ struct DeepOpts {
     child_limit: usize,
     /// Max length of a rendered string value.
     text_len: usize,
+    /// How a `byte[]`/`char[]` node is rendered (EVAL-7) — carried here so a deep walk decodes the
+    /// same way the shallow render of the same value would.
+    bytes: ByteRender,
 }
 
 /// Default total nodes one deep render may visit. Reached only by genuinely large graphs; the point
@@ -12684,7 +13068,7 @@ async fn render_node(
     // At the depth limit, stop expanding but still say as much as one line can — toString() is the
     // most informative summary available, so this is where it earns its keep.
     if depth >= opts.depth_limit {
-        return render_object(conn, id, value.tag, thread_id, opts.text_len).await;
+        return render_object(conn, id, value.tag, thread_id, opts.text_len, opts.bytes).await;
     }
 
     // Strings and arrays already have good shallow renderings; strings are terminal, arrays recurse.
@@ -12696,7 +13080,8 @@ async fn render_node(
     let Ok(type_id) = conn.get_object_reference_type(id).await else {
         return format!("(object) @{id:x}");
     };
-    let name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+    let sig = conn.get_signature(type_id).await.unwrap_or_default();
+    let name = decode_signature(&sig);
     if name == "java.lang.String" {
         if let Ok(s) = conn.get_string_value(id).await {
             return format!("\"{}\"", truncate(&s, opts.text_len));
@@ -12704,7 +13089,8 @@ async fn render_node(
     }
 
     state.path.push(id);
-    let rendered = expand_object(conn, id, type_id, &name, value.tag, thread_id, opts, state, depth).await;
+    let rendered =
+        expand_object(conn, id, type_id, &sig, &name, value.tag, thread_id, opts, state, depth).await;
     state.path.pop();
     rendered
 }
@@ -12715,6 +13101,7 @@ async fn expand_object(
     conn: &mut jdwp_client::JdwpConnection,
     id: u64,
     type_id: u64,
+    sig: &str,
     name: &str,
     tag: u8,
     thread_id: Option<u64>,
@@ -12723,6 +13110,11 @@ async fn expand_object(
     depth: usize,
 ) -> String {
     if tag == 91 {
+        // A `byte[]`/`char[]` is a leaf whatever the depth: expanding one would print a thousand
+        // numbered lines where a caller asked to read a payload (EVAL-7).
+        if let Some(text) = render_text_array(conn, id, sig, opts.text_len, opts.bytes).await {
+            return text;
+        }
         return render_array_deep(conn, id, name, thread_id, opts, state, depth).await;
     }
     // Collections need method invocation, so only attempt them with a suspended thread.
@@ -12750,7 +13142,7 @@ async fn render_fields_deep(
     let fields = collect_instance_fields(conn, type_id).await;
     if fields.is_empty() {
         // Nothing to expand — a one-liner beats an empty brace block.
-        return render_object(conn, id, 76, thread_id, opts.text_len).await;
+        return render_object(conn, id, 76, thread_id, opts.text_len, opts.bytes).await;
     }
     let shown = fields.len().min(opts.child_limit);
     let ids: Vec<u64> = fields.iter().take(shown).map(|f| f.field_id).collect();
@@ -13078,14 +13470,16 @@ async fn type_name_of(conn: &mut jdwp_client::JdwpConnection, id: u64) -> String
     }
 }
 
-/// Render an object value: strings show contents; arrays show their elements; other objects show
-/// their type name (and, when `thread_id` is Some, a best-effort `toString()`).
+/// Render an object value: strings show contents; a `byte[]`/`char[]` shows decoded text; other arrays
+/// show their elements; other objects show their type name (and, when `thread_id` is Some, a
+/// best-effort `toString()`).
 async fn render_object(
     conn: &mut jdwp_client::JdwpConnection,
     id: u64,
     tag: u8,
     thread_id: Option<u64>,
     max_len: usize,
+    how: ByteRender,
 ) -> String {
     if tag == 115 {
         if let Ok(s) = conn.get_string_value(id).await {
@@ -13095,15 +13489,20 @@ async fn render_object(
     let Ok(type_id) = conn.get_object_reference_type(id).await else {
         return format!("(object) @{id:x}");
     };
-    let name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+    let sig = conn.get_signature(type_id).await.unwrap_or_default();
+    let name = decode_signature(&sig);
     if name == "java.lang.String" {
         if let Ok(s) = conn.get_string_value(id).await {
             return format!("\"{}\"", truncate(&s, max_len));
         }
     }
-    // Array contents
+    // Array contents. A `byte[]`/`char[]` reads as text ahead of the generic case (EVAL-7): these are
+    // the arrays whose elements are not the answer.
     if tag == 91 {
-        if let Some(rendered) = render_array(conn, id, &name).await {
+        if let Some(rendered) = render_text_array(conn, id, &sig, max_len, how).await {
+            return rendered;
+        }
+        if let Some(rendered) = render_array(conn, id, &name, how).await {
             return rendered;
         }
     }
@@ -13131,13 +13530,18 @@ async fn render_object(
 }
 
 /// Render up to 16 elements of an array object; `None` if its length/values can't be read.
-async fn render_array(conn: &mut jdwp_client::JdwpConnection, id: u64, name: &str) -> Option<String> {
+async fn render_array(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    name: &str,
+    how: ByteRender,
+) -> Option<String> {
     let len = conn.get_array_length(id).await.ok()?;
     let take = len.min(16);
     let elems = conn.get_array_values(id, 0, take).await.ok()?;
     let mut parts = Vec::with_capacity(elems.len());
     for e in &elems {
-        parts.push(render_element(conn, e).await);
+        parts.push(render_element(conn, e, how).await);
     }
     let more = if len > take { format!(", … +{} more", len - take) } else { String::new() };
     let base = name.strip_suffix("[]").unwrap_or(name);
@@ -14566,15 +14970,30 @@ async fn capture_trace(
                 if !slots.is_empty() {
                     if let Ok(vals) = conn.get_frame_values(thread, frame.frame_id, slots).await {
                         for ((name, _), val) in in_scope.into_iter().zip(vals.iter()) {
-                            let rendered = render_value(conn, val, None, local_len).await;
+                            let rendered =
+                                render_value(conn, val, None, local_len, ByteRender::default()).await;
                             args.push((name, rendered));
                         }
                     }
                 }
             }
             if let Some(e) = trace_expr {
-                let rendered = match resolve_expression(conn, Some(thread), Some(&frame), e).await {
-                    Ok(v) => render_value(conn, &v, Some(thread), expr_len).await,
+                // The `#<charset>` selector reaches a trace this way, which is the whole reason it is a
+                // suffix on the expression: a stop point's arming call has a schema to extend but its
+                // `trace_expr` does not, and the decode is scoped to the value the caller named rather
+                // than to every local in the capture (EVAL-7). A bad selector is reported like any other
+                // expression error — on the record, not by failing the hit.
+                //
+                // `expr_len` rather than a literal 200: TRACE-9 (#80) made the cap caller-raisable, and a
+                // decoded SOAP envelope is worthless at 200 chars, so the two features are only useful
+                // together.
+                let rendered = match split_charset(e) {
+                    Ok((expr_text, bytes)) => {
+                        match resolve_expression(conn, Some(thread), Some(&frame), expr_text).await {
+                            Ok(v) => render_value(conn, &v, Some(thread), expr_len, bytes).await,
+                            Err(err) => format!("<error: {err}>"),
+                        }
+                    }
                     Err(err) => format!("<error: {err}>"),
                 };
                 expr = Some((e.to_string(), rendered));
@@ -17263,5 +17682,84 @@ mod tests {
         assert_eq!(hashmap_spread(0x1234_5678), 0x1234_5678 ^ 0x1234);
         assert!(chm_spread(-1) >= 0);
         assert!(chm_spread(i32::MIN) >= 0);
+    }
+
+    // ----- EVAL-7: the `#<charset>` selector and the decoders -----
+
+    #[test]
+    fn a_charset_selector_is_split_off_the_expression() {
+        assert_eq!(split_charset("log.dsRequest"), Ok(("log.dsRequest", ByteRender::default())));
+        assert_eq!(
+            split_charset("log.dsRequest#ISO-8859-1"),
+            Ok(("log.dsRequest", ByteRender::Text(Charset::Latin1)))
+        );
+        // Case and punctuation are not part of the name: a caller typing a charset from memory should not
+        // have to remember which spelling this tool picked.
+        for spelling in ["#iso88591", "#Latin1", "#latin-1", "#ISO_8859_1"] {
+            assert_eq!(
+                split_charset(&format!("buf{spelling}")),
+                Ok(("buf", ByteRender::Text(Charset::Latin1))),
+                "{spelling} names Latin-1"
+            );
+        }
+        assert_eq!(split_charset("buf#raw"), Ok(("buf", ByteRender::Raw)));
+        assert_eq!(split_charset("buf#us-ascii"), Ok(("buf", ByteRender::Text(Charset::Ascii))));
+    }
+
+    /// A `#` at quote depth 0 is not valid Java, so any such `#` IS a selector attempt: an unrecognised
+    /// one is refused rather than silently answered under the default, which would hand a caller who
+    /// typed a charset this tool does not have a UTF-8 reading as though it were theirs.
+    #[test]
+    fn an_unknown_selector_is_refused_and_a_hash_inside_a_string_is_left_alone() {
+        let err = split_charset("buf#utf9").expect_err("an unknown charset must not fall back");
+        assert!(err.contains("not a render selector"), "{err}");
+        assert!(err.contains("ISO-8859-1") && err.contains("raw"), "it names what is accepted: {err}");
+
+        // The split must not be able to eat an expression. A '#' can legitimately appear inside a string
+        // literal — a map key, a label — and there it is data.
+        assert_eq!(split_charset(r#"counts["a#b"]"#), Ok((r#"counts["a#b"]"#, ByteRender::default())));
+        assert_eq!(
+            split_charset(r#"counts["a#b"]#latin1"#),
+            Ok((r#"counts["a#b"]"#, ByteRender::Text(Charset::Latin1)))
+        );
+    }
+
+    /// Every octet that is not readable text is MARKED. `String::from_utf8_lossy` is the obvious call and
+    /// the wrong one: a U+FFFD is indistinguishable from a replacement character the debuggee held.
+    #[test]
+    fn an_undecodable_octet_is_marked_rather_than_replaced() {
+        // "São Paulo" as ISO-8859-1 — the shape `it-common`'s marshaller produces.
+        let latin1 = b"S\xe3o Paulo";
+        assert_eq!(decode_bytes(latin1, Charset::Utf8), r"S\xe3o Paulo");
+        assert_eq!(decode_bytes(latin1, Charset::Latin1), "São Paulo");
+        assert_eq!(decode_bytes(latin1, Charset::Ascii), r"S\xe3o Paulo");
+        // And the same text as UTF-8, read the other way round: mojibake a reader can recognise.
+        assert_eq!(decode_bytes("São Paulo".as_bytes(), Charset::Utf8), "São Paulo");
+        assert_eq!(decode_bytes("São Paulo".as_bytes(), Charset::Latin1), "SÃ£o Paulo");
+    }
+
+    /// Under Latin-1 nothing is ever *undecodable* — all 256 octets map to code points — so the control
+    /// marking is the only thing that can tell a caller they are looking at a blob rather than at text.
+    #[test]
+    fn control_octets_are_marked_and_a_line_break_stays_on_one_line() {
+        assert_eq!(decode_bytes(&[0x00, 0x01, 0xfe, 0x7f], Charset::Latin1), r"\x00\x01þ\x7f");
+        assert_eq!(decode_bytes(&[0x00, 0x01, 0xfe, 0x7f], Charset::Utf8), r"\x00\x01\xfe\x7f");
+        // A trace record is ONE line, and a decoded envelope is full of newlines.
+        let rendered = decode_bytes(b"<a>\r\n\t<b/>\n</a>", Charset::Utf8);
+        assert!(!rendered.contains('\n'), "{rendered}");
+        assert_eq!(rendered, r"<a>\r\n\t<b/>\n</a>");
+        // A backslash is doubled, so a literal `\x41` in a payload can never be read as a marked octet.
+        assert_eq!(decode_bytes(br"\x41", Charset::Utf8), r"\\x41");
+    }
+
+    /// A `char[]` is UTF-16 code units, and half a surrogate pair is an ordinary thing to find in one —
+    /// a string sliced mid-pair leaves one behind. It is not a character, and replacing it would hide the
+    /// very thing someone reached for a debugger to look at (TYPE-1, #48).
+    #[test]
+    fn a_lone_surrogate_in_a_char_array_is_escaped_not_replaced() {
+        assert_eq!(decode_chars(&[0x006f, 0x006c, 0xd800]), r"ol\uD800");
+        assert_eq!(decode_chars(&[0x0061, 0x00e1]), "aá");
+        // A well-formed pair is one character, not two escapes.
+        assert_eq!(decode_chars(&[0xd83d, 0xde00]), "😀");
     }
 }
