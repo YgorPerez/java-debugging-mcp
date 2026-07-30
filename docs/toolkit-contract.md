@@ -46,22 +46,45 @@ Ordered by how *quietly* it breaks, because that is what decides whether it need
 | Change what a **reply says** | Prose quoting the reply goes stale | **No** |
 | Add a **tool** | Nothing breaks; it simply goes undocumented and unused | **No** — nobody finds a tool the docs do not name |
 | Change **behaviour behind an existing name** | Docs describe the old behaviour | **No** — the worst case, since the docs still look right |
+| Corrupt or truncate a **tool description** | The description *is* the caller's documentation, and the toolkit's skills paraphrase it. Gibberish, or a capability silently deleted from it, propagates as advice | **No** — and it happened: DOC-7 (#108) |
 | Rename an **asset** or drop `SHA256SUMS` | Their install refuses | **Yes**, immediately |
 
-Five of six are silent. So the rule is not "avoid breaking them" — it is **say what changed, in the release
+Six of seven are silent. So the rule is not "avoid breaking them" — it is **say what changed, in the release
 notes, in caller-visible terms**.
+
+The description row is the one that arrived by accident rather than by decision, and it is worth reading twice
+for that reason. Two merges in the v0.9.0 range interleaved `debug.evaluate` and `debug.evaluate_chain`'s
+descriptions — each is a single ~4000-character string literal, so git had nothing to conflict *on* — and
+shipped `"Anees n thread at all."`, `"invokhing"`, and the `@0x…` object-handle capability **deleted from both
+head lists** with ungrammatical fragments about it stranded at the end. Nothing failed: the tests asserted on
+tool names and argument shapes, and no human reads a 4000-character line in a diff.
+
+So a description change is now gated two ways, and `mcp-server/tests/tool-descriptions.txt` is the important
+one: a word-wrapped snapshot of all 36 descriptions that a deliberate edit must regenerate. That regeneration
+step **is** the review moment this table asks for — the point at which somebody reads what a caller will read.
 
 ## What to do when cutting a release
 
 `scripts/release.sh` prints the reminder at the end for this reason. The release commit body is the artifact
-that matters: `gh release create --generate-notes` builds the notes from commits, so a caller-visible change
-described only in a diff reaches nobody.
+that matters, and **since v0.9.0 it is the artifact that actually gets published**: `scripts/release-notes.py`
+leads the release body with that commit's message body verbatim, then appends a changelog categorized from the
+conventional-commit subjects since the previous tag.
+
+That sentence used to read `gh release create --generate-notes` builds the notes from commits, and it was wrong
+in the way that cost the most: `--generate-notes` lists merged **pull requests**, not commits, and never reads
+a commit body at all. Plenty of work here lands as a direct push to `main`, so every release from v0.2.1 to
+v0.8.0 published exactly one line — the compare link — while this file was pointing the toolkit at release
+notes as the one mitigation for six silent failure modes. Preview what will actually be published with
+`python3 scripts/release-notes.py v<version>`; it is byte-for-byte the result.
 
 For each caller-visible change, the release body should name:
 
 - the **tool** affected, by its exact current name;
 - whether an **argument** was added, renamed or removed;
 - whether a **reply** changed shape or wording, if downstream prose is likely to quote it;
+- whether a **tool description** changed, and how — the description is what the toolkit's skills paraphrase, so
+  a corrected or expanded one is a caller-visible change even though no name, argument or reply moved. The diff
+  to read is `mcp-server/tests/tool-descriptions.txt`, which is why it is committed;
 - for a rename, **both** names — the toolkit's audit greps for old names, and that only works if the release
   says what the old name was.
 

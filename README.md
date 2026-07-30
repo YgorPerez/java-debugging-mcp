@@ -264,6 +264,33 @@ invocation are unaffected — locals, fields, statics, array indexing, `get_stac
 watchpoint/exception reporting. A guard against accidentally mutating a production JVM, **not** a
 security boundary: anyone who can reach the JDWP port can open their own connection without it.
 
+### Two things that look like reads and are not
+
+Neither is a defect in this tool, and neither is caught by `read_only` — which is why they are written down
+rather than guarded (DOC-6, #89).
+
+**A JAX-RS `Response` entity is single-pass, so reading it from the debugger corrupts the live request.**
+`response.readEntity(String.class)` **consumes** the entity; the application's own read afterwards gets an empty
+body. You break the thing you were inspecting by inspecting it. `read_only` lets it through, correctly — it
+invokes a method you asked for, writes no field and forces no return, and nothing here can know which of the
+debuggee's own methods tolerate being asked twice. What to do instead:
+
+- break at or **after** the assignment to a local, where the entity is a re-readable `String`;
+- or capture the returned value with `debug.set_method_exit_stop` on the method that reads it;
+- suspended *before* the read, only `getStatus()` and `getHeaders()` are safe to touch.
+
+The same applies to any one-shot stream — an `InputStream`, a `Scanner`, an `Iterator` — where reading it is
+what spends it.
+
+**A frame in `Foo_Subclass` is your `Foo`.** Build-time frameworks generate classes alongside yours: Quarkus
+emits `Foo_Bean`, `Foo_ClientProxy` and `Foo_Subclass`, and `_Subclass` **extends your own bean**, so any method
+reached through a CDI interceptor arrives through it. These have ordinary dotted names but no `SourceFile` and no
+useful line table — so a reader who has learned that source-less frames are framework internals will skip
+straight past their own code. `debug.list_classes` with a wildcard shows them already; set the stop point on
+`Foo`, where the line table is, and expect `Foo_Subclass` in the stack around it. `CONTEXT.md` calls this an
+**augmented class**, distinct from a JVM **hidden class** (a lambda or generated proxy, named with a `/`) and
+from a compiler-synthesised one (`Outer$1`, `lambda$…`, which have real source lines).
+
 ## Compared with the other Java debugging MCP servers
 
 Two other projects solve the same problem, and one of them is this repository's **parent**: this is a

@@ -185,12 +185,12 @@ fn inspection_tools() -> Vec<Tool> {
         },
         Tool {
             name: "debug.evaluate".to_string(),
-            description: "Evaluate a Java expression in frame context. Heads: a local, this, or a class name; then chain .field and .method(args), including static fields and static methods (ConfigDefaultUtils.getUrl()). Arguments may be literals or expressions passed by reference (svc.matches(reserva), foo.handle(this)). Method calls need a suspended thread; a plain static-field read does not. Subscripts work on arrays/List/Map: lines[0] (index, keeps chaining), counts[\"key\"] (map lookup), lines[2..5] (half-open slice), lines[?qty > 3] (filter, whose left side resolves against each element; filtering a Map tests its values and keeps the keys as key → value). A subscript, slice or filter on a java.util.HashMap, LinkedHashMap, ConcurrentHashMap or ArrayList needs NO SUSPENDED THREAD: those four are read by walking their own fields (table[] → Node.key/value/next, elementData[0..size]), which JDWP does without stopping anything — so a cache lookup on a shared instance is a plain read now, and it works under read_only too. Any other implementation (a Map subclass, a Collections.synchronizedMap wrapper) falls back to invoking get()/entrySet()/toArray() and still needs a suspended thread, because guessing at internals it does not recognise would be a confidently wrong answer. THE REPLY SAYS WHICH PATH IT TOOK, and a structural read also says it took no lock — a value read while another thread resizes the map is a sample, not a transaction. Pass expand_objects:true to get a recursive field tree instead of one line — it walks nested objects, arrays, and List/Set/Map/Optional contents to max_depth, detects cycles, and unboxes Integer/Long/etc. NOTE: the DEFAULT rendering calls the value's toString() in the debuggee, and on some framework objects that cannot complete (it may need a lock held by another suspended thread) — it is bounded to 2s and the expiry is reported in the value. expand_objects:true reads FIELDS and invokes nothing, so on those objects it is both faster and more informative than the default. A byte[] or char[] renders as DECODED TEXT with the encoding named (byte[73] ISO-8859-1 \"<?xml …\") instead of a list of numbers, and arr.length works on any array. A trailing #<charset> on the expression picks the encoding — UTF-8 (default), ISO-8859-1 (alias latin1), US-ASCII, or #raw for the element list when the array really is binary; octets that do not decode are marked \\xNN rather than replaced. ISO-8859-1 is the reading a marshalled supplier envelope usually needs. Anees n thread at all. Reading a LOCAL or a field chain needs a suspended thread, and debug.suspend_thread with a thread_id is the cheap way to get one — it freezes a single thread and leaves the rest of the JVM serving. INVOKING is stricter and the difference is measured, not assumed: a method call, a Map/List subscript, a slice or filter, and the default toString() rendering all need a thread suspended BY AN EVENT (a stop point hit or a step landing). Neither debug.suspend_thread nor debug.pause qualifies — both answer INVALID_THREAD — so an invoke needs a suspending stop point on the code you want to ask about. expand_objects:true is the way round it: it reads FIELDS and invokhing, so it works against a thread you suspended yourself, and on framework objects it is both faster and more informative than the default line , or an OBJECT HANDLE (@0x1f4c) —. A handle is the @0x… that every reply prints beside an object (a trace snapshot's locals and captures, an expanded field tree, debug.list_instances), and pasting one back in reaches THAT object with no suspended frame and no root to reach it from — which is how you drill into a snapshot after the fact. It must be the FIRST segment. A JDWP object id is a WEAK reference, so a handle can stop working: the reply then says `Vanished: @0x…` and explains which of the two readings it is (the debuggee says the object was collected, or it has no record of the id at all). Nothing pins objects to prevent that, deliberately — see ADR-0022".to_string(),
+            description: "Evaluate a Java expression in frame context. Heads: a local, this, a class name, or an OBJECT HANDLE (@0x1f4c); then chain .field and .method(args), including static fields and static methods (ConfigDefaultUtils.getUrl()). Arguments may be literals or expressions passed by reference (svc.matches(reserva), foo.handle(this)). Method calls need a suspended thread; a plain static-field read does not. Subscripts work on arrays/List/Map: lines[0] (index, keeps chaining), counts[\"key\"] (map lookup), lines[2..5] (half-open slice), lines[?qty > 3] (filter, whose left side resolves against each element; filtering a Map tests its values and keeps the keys as key → value). A subscript, slice or filter on a java.util.HashMap, LinkedHashMap, ConcurrentHashMap or ArrayList needs NO SUSPENDED THREAD: those four are read by walking their own fields (table[] → Node.key/value/next, elementData[0..size]), which JDWP does without stopping anything — so a cache lookup on a shared instance is a plain read now, and it works under read_only too. Any other implementation (a Map subclass, a Collections.synchronizedMap wrapper) falls back to invoking get()/entrySet()/toArray() and still needs a suspended thread, because guessing at internals it does not recognise would be a confidently wrong answer. THE REPLY SAYS WHICH PATH IT TOOK, and a structural read also says it took no lock — a value read while another thread resizes the map is a sample, not a transaction. Pass expand_objects:true to get a recursive field tree instead of one line — it walks nested objects, arrays, and List/Set/Map/Optional contents to max_depth, detects cycles, and unboxes Integer/Long/etc. NOTE: the DEFAULT rendering calls the value's toString() in the debuggee, and on some framework objects that cannot complete (it may need a lock held by another suspended thread) — it is bounded to 2s and the expiry is reported in the value. expand_objects:true reads FIELDS and invokes nothing, so on those objects it is both faster and more informative than the default. A byte[] or char[] renders as DECODED TEXT with the encoding named (byte[73] ISO-8859-1 \"<?xml …\") instead of a list of numbers, and arr.length works on any array. A trailing #<charset> on the expression picks the encoding — UTF-8 (default), ISO-8859-1 (alias latin1), US-ASCII, or #raw for the element list when the array really is binary; octets that do not decode are marked \\xNN rather than replaced. ISO-8859-1 is the reading a marshalled supplier envelope usually needs. Reading a LOCAL or a field chain needs a suspended thread, and debug.suspend_thread with a thread_id is the cheap way to get one — it freezes a single thread and leaves the rest of the JVM serving. INVOKING is stricter and the difference is measured, not assumed: a method call, a Map/List subscript, a slice or filter, and the default toString() rendering all need a thread suspended BY AN EVENT (a stop point hit or a step landing). Neither debug.suspend_thread nor debug.pause qualifies — both answer INVALID_THREAD — so an invoke needs a suspending stop point on the code you want to ask about. expand_objects:true is the way round it: it reads FIELDS and invokes nothing, so it works against a thread you suspended yourself, and on framework objects it is both faster and more informative than the default line. A handle is the @0x… that every reply prints beside an object (a trace snapshot's locals and captures, an expanded field tree, debug.list_instances), and pasting one back in reaches THAT object with no suspended frame and no root to reach it from — which is how you drill into a snapshot after the fact. It must be the FIRST segment. A JDWP object id is a WEAK reference, so a handle can stop working: the reply then says `Vanished: @0x…` and explains which of the two readings it is (the debuggee says the object was collected, or it has no record of the id at all). Nothing pins objects to prevent that, deliberately — see ADR-0022. ONE READ IS DESTRUCTIVE AND read_only DOES NOT STOP IT: a JAX-RS Response entity is SINGLE-PASS, so evaluating response.readEntity(String.class) CONSUMES it and the application's own read afterwards gets an empty body — you corrupt the live request by looking at it. read_only lets it through correctly (it invokes a method you asked for, writes no field, forces no return), and nothing here can know which of the debuggee's methods tolerate being asked twice. Read at or AFTER the assignment to a local, where the entity is a re-readable String, or capture the returned value with debug.set_method_exit_stop on the reading method. Suspended BEFORE the read, only getStatus() and getHeaders() are safe. The same caution applies to any one-shot stream — an InputStream, a Scanner, an Iterator — where reading it is what spends it.".to_string(),
             input_schema: to_val(schemars::schema_for!(EvaluateArgs)),
         },
         Tool {
             name: "debug.evaluate_chain".to_string(),
-            description: "Answer \"WHICH LINK of this chain went null?\" in one call. Takes the same chained expression debug.evaluate takes (a.getB().getC()[0].getD()) and walks it left to right, printing every link with its value and naming the first one that is null — plus how many links after it were never evaluated. Use it when a chain yields null or an empty collection and you want to know how far down the value survived; that otherwise costs one debug.evaluate per link, bisecting by hand. Each method in the chain runs EXACTLY ONCE (links resolve against the previous link's value, not by re-evaluating longer and longer prefixes), and no toString() is invoked. A [\"key\"] or [i] link on a HashMap/LinkedHashMap/ConcurrentHashMap/ArrayList is read by walking its fields instead of invoking, so such a chain can be walked with nothing suspended; the reply names the path each collection link took. NOTE: if the chain THROWS rather than returning null, you usually don't need this — on JDK 15+ the NullPointerException's own message names the failing subexpression, and debug.set_exception_stop reports it. Takes the same trailing #<charset> selector debug.evaluate does. , including an @0x… object handle as the head".to_string(),
+            description: "Answer \"WHICH LINK of this chain went null?\" in one call. Takes the same chained expression debug.evaluate takes (a.getB().getC()[0].getD(), including an @0x… object handle as the head) and walks it left to right, printing every link with its value and naming the first one that is null — plus how many links after it were never evaluated. Use it when a chain yields null or an empty collection and you want to know how far down the value survived; that otherwise costs one debug.evaluate per link, bisecting by hand. Each method in the chain runs EXACTLY ONCE (links resolve against the previous link's value, not by re-evaluating longer and longer prefixes), and no toString() is invoked. A [\"key\"] or [i] link on a HashMap/LinkedHashMap/ConcurrentHashMap/ArrayList is read by walking its fields instead of invoking, so such a chain can be walked with nothing suspended; the reply names the path each collection link took. NOTE: if the chain THROWS rather than returning null, you usually don't need this — on JDK 15+ the NullPointerException's own message names the failing subexpression, and debug.set_exception_stop reports it. Takes the same trailing #<charset> selector debug.evaluate does.".to_string(),
             input_schema: to_val(schemars::schema_for!(EvaluateChainArgs)),
         },
         Tool {
@@ -292,5 +292,208 @@ mod tests {
         ] {
             assert!(names.contains(expected), "missing tool: {expected}");
         }
+    }
+
+    /// Every tool description is one enormous single-line string literal, and this is what stops a merge
+    /// shredding one again (DOC-7, #108).
+    ///
+    /// Two merges in the v0.9.0 range did exactly that. `debug.evaluate` shipped reading "…usually needs.
+    /// **Anees n thread at all.** Reading a LOCAL…" and "it reads FIELDS and **invokhing**", with the `@0x…`
+    /// object handle deleted from its head list and an ungrammatical fragment about it stranded 3000
+    /// characters later; `debug.evaluate_chain` had the same clause moved out of the parenthesis it qualified
+    /// and left dangling past the final full stop. Git resolved both **without a conflict**, because on a
+    /// one-line string there is nothing to conflict on — the line is a single hunk and whichever side wins
+    /// takes its neighbour's words with it.
+    ///
+    /// Nothing caught it. The test above asserts on tool *names*, the schema snapshots on argument shapes, and
+    /// no human reads a 4000-character line in a diff. But these descriptions are the caller's only
+    /// documentation, and `docs/toolkit-contract.md` names them as the mitigation for five of the downstream
+    /// toolkit's six silent failure modes — so gibberish here is a caller-visible defect, and it shipped.
+    ///
+    /// The patterns are the *shapes* that kind of damage leaves rather than a spell-check: a stranded clause
+    /// starts with punctuation, a spliced sentence doubles a word or a space, a truncated one ends mid-token.
+    /// Measured across all 36 descriptions they produced 5 hits — the 4 real defects and 1 false positive —
+    /// which is why this gates rather than merely reports.
+    #[test]
+    fn no_tool_description_carries_the_marks_of_a_bad_merge() {
+        // The one legitimate hit: `VirtualMachine.Resume` is JDWP's own command name, and it trips the
+        // missing-space-after-period pattern for the same reason any qualified identifier would. Listed by
+        // exact substring rather than by suppressing the whole rule, so the rule still guards every other
+        // description — including the rest of this one.
+        let allowed = ["VirtualMachine.Resume"];
+
+        // Plain substring scanning rather than a regex crate: the shapes are trivial and a dev-dependency for
+        // five of them would be its own argument. One list, so there is nothing for a second list to disagree
+        // with — which is the failure mode this whole test is about.
+        //
+        //   " . " and " ,"  a clause stranded by a splice starts with the punctuation that joined it
+        //   ". ,"           a fragment appended after a completed sentence
+        //   "—."            a dash left dangling where its clause was taken away
+        //   "  "            two sides' whitespace both surviving the join
+        // Hoisted and cleared per tool rather than allocated inside the loop — `scripts/doctor.sh` fails on
+        // the latter and `cargo clippy` does not, which is ADR-0007 in one line.
+        let mut complaints: Vec<String> = Vec::new();
+
+        for tool in get_tools() {
+            let d = &tool.description;
+            complaints.clear();
+
+            for needle in [" . ", ". ,", "—.", "  ", " ,"] {
+                if let Some(at) = d.find(needle) {
+                    let from = at.saturating_sub(70);
+                    let to = (at + needle.len() + 70).min(d.len());
+                    let window = &d[char_boundary(d, from)..char_boundary(d, to)];
+                    if allowed.iter().any(|ok| window.contains(ok)) {
+                        continue;
+                    }
+                    complaints.push(format!("{needle:?} at {at}: …{window}…"));
+                }
+            }
+
+            // A description that ends without terminal punctuation is the other shape a splice leaves — the
+            // sentence carrying the full stop went to the other side of the merge.
+            if !d.trim_end().ends_with(['.', '!', '?', ')']) {
+                complaints.push(format!(
+                    "ends mid-sentence: …{}",
+                    &d[char_boundary(d, d.len().saturating_sub(80))..]
+                ));
+            }
+
+            // A doubled word of four letters or more. Short ones have legitimate repeats ("that that", "had
+            // had"); four-plus does not, and "the the" is caught by the double-space rule anyway.
+            let words: Vec<&str> = d.split_whitespace().collect();
+            for pair in words.windows(2) {
+                if pair[0].len() >= 4 && pair[0].eq_ignore_ascii_case(pair[1]) {
+                    complaints.push(format!("doubled word {:?}", pair[0]));
+                }
+            }
+
+            assert!(
+                complaints.is_empty(),
+                "{}'s description carries the marks of a bad merge — these are the shapes an interleaved \
+                 one-line string leaves, and DOC-7 (#108) shipped four of them:\n  {}",
+                tool.name,
+                complaints.join("\n  ")
+            );
+        }
+    }
+
+    /// `&str` slicing panics on a non-char-boundary index, and every description here is full of em dashes and
+    /// ellipses. Rounding down to the nearest boundary keeps the error *message* from becoming the failure.
+    fn char_boundary(s: &str, mut at: usize) -> usize {
+        while at > 0 && !s.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
+    /// The descriptions, word-wrapped, as a committed snapshot — and the reason this exists as well as the
+    /// pattern scan above (DOC-7, #108).
+    ///
+    /// The scan catches the *shapes* a splice leaves. Checked by restoring each of the four v0.9.0 defects, it
+    /// caught three: the stranded `—.`, the `. ,` fragment, and a description ending mid-sentence. It did not
+    /// catch the fourth. `"Anees n thread at all."` — the wreckage of "A plain static-field read needs no
+    /// thread at all." — has no punctuation artifact at all; it is shaped like a sentence and only a reader
+    /// knows it is not one. No cheap pattern finds that, and pretending otherwise would be the kind of
+    /// reassurance this repo keeps writing guards against.
+    ///
+    /// A snapshot does find it, because it does not have to understand the text — any change fails. What it
+    /// costs is that a deliberate edit must regenerate the file, and that cost *is* the feature: it forces the
+    /// review moment that was missing when a merge rewrote a 4000-character line and no human read it.
+    ///
+    /// Word-wrapped at 110 columns rather than split into sentences, because sentence-splitting on `". "` is
+    /// wrong in a file where `debug.evaluate` and `Klass.CONSTANT` are ordinary text. Wrapping needs no
+    /// heuristic and still makes a corrupted clause a two-line diff.
+    ///
+    /// Regenerate with `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp tool_descriptions`, then read the
+    /// diff — that is the whole point of it.
+    #[test]
+    fn tool_descriptions_match_the_committed_snapshot() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tool-descriptions.txt");
+        let current = render_description_snapshot();
+
+        if std::env::var_os("UPDATE_TOOL_DESCRIPTIONS").is_some() {
+            std::fs::write(&path, &current).expect("write the tool-description snapshot");
+            println!("rewrote {} — read the diff before committing it", path.display());
+            return;
+        }
+
+        // Read at runtime rather than `include_str!` so regenerating does not need a rebuild first.
+        let committed = std::fs::read_to_string(&path).unwrap_or_else(|why| {
+            panic!(
+                "cannot read the tool-description snapshot at {}: {why}. Create it with \
+                 UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp tool_descriptions",
+                path.display()
+            )
+        });
+
+        if committed != current {
+            let differing =
+                committed.lines().zip(current.lines()).enumerate().find(|(_, (was, now))| was != now);
+            let first = match differing {
+                Some((n, (was, now))) => {
+                    format!("line {}:\n  committed: {was}\n  current:   {now}", n + 1)
+                }
+                // Every shared line matches, so one side simply has more of them — a description was added,
+                // removed, or grew past a wrap boundary.
+                None => format!(
+                    "no differing line, so the length changed: {} committed vs {} current",
+                    committed.lines().count(),
+                    current.lines().count()
+                ),
+            };
+            panic!(
+                "a tool description changed without its snapshot being updated.\n\n{first}\n\nIf the change \
+                 was deliberate: UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp tool_descriptions, then \
+                 READ THE DIFF — a caller-visible change behind an unchanged tool name is what \
+                 docs/toolkit-contract.md is for. If it was not deliberate, a merge has shredded a \
+                 one-line string literal again (DOC-7, #108)."
+            );
+        }
+    }
+
+    fn render_description_snapshot() -> String {
+        let mut tools = get_tools();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut out = String::from(
+            "# Every debug.* tool description, word-wrapped at 110 columns. GENERATED — do not hand-edit:\n\
+             #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp tool_descriptions\n\
+             #\n\
+             # This file exists so that a change to a tool description has to be READ by somebody. Two merges\n\
+             # in the v0.9.0 range interleaved two of these single-line string literals and shipped the\n\
+             # gibberish; nothing failed, because the tests asserted on names and argument shapes and no human\n\
+             # reads a 4000-character line in a diff (DOC-7, #108).\n",
+        );
+        for tool in tools {
+            out.push_str("\n## ");
+            out.push_str(&tool.name);
+            out.push('\n');
+            for line in wrap(&tool.description, 110) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Greedy word wrap. Counts CHARACTERS, not bytes: these descriptions are full of em dashes and ellipses,
+    /// and wrapping by byte length would put the break in a different place depending on how much punctuation
+    /// a line happened to carry.
+    fn wrap(text: &str, width: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        for word in text.split_whitespace() {
+            let would_be = line.chars().count() + usize::from(!line.is_empty()) + word.chars().count();
+            if !line.is_empty() && would_be > width {
+                lines.push(std::mem::take(&mut line));
+            } else if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+        lines
     }
 }
