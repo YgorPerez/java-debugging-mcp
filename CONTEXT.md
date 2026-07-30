@@ -61,6 +61,21 @@ _Avoid_: synthetic class (the compiler's own inventions — a `lambda$…` body,
 classes and methods with real names and real source lines; one is actionable and the other is not, and
 a word covering both loses exactly that)
 
+**Augmented class**:
+A **third** kind of class-you-did-not-write, and neither of the two words above covers it (DOC-6, #89). A
+build-time framework — Quarkus is the case here — generates `Foo_Bean`, `Foo_ClientProxy` and `Foo_Subclass`
+alongside your `Foo`, and `Foo_Subclass` **extends your own class**. So it has an ordinary dotted name, no
+`SourceFile` and no useful line table, and it stands in for a class the caller wrote rather than for a lambda or
+a JVM-generated proxy.
+Why it needs its own word: **a frame in `Foo_Subclass` is your `Foo`**, and a reader who has learned that
+source-less frames are the JVM's inventions will skip past their own bean. Any method reached through a CDI
+interceptor is certain to arrive this way. `debug.list_classes` with a wildcard already shows these names, so
+nothing is missing but the sentence — set the stop point on `Foo` (your code, with a line table) and expect the
+stack to name `Foo_Subclass` above or below it.
+_Avoid_: hidden class (the `/` suffix and the absent name are the JVM's doing; this has a real name a caller
+can type), proxy (true of `_ClientProxy` and wrong for `_Subclass`, which is an inheritance relationship and is
+the one you will actually be standing in)
+
 **Source drift**:
 The checkout in front of you not being the build that is running. A finding, not an error — the debuggee
 reports which file a class was compiled from, and a mismatch is the answer to a question rather than a
@@ -437,9 +452,21 @@ A mode in which nothing changes the debuggee — no method invocation, no writes
 reload, and no popped frame. A guard against accident, **not** a security boundary: anyone who can reach the
 debug port can do anything.
 A `dry_run` reload is the deliberate exception, because it installs nothing.
-_Avoid_: "nothing executes code in the debuggee" (the wording before SWAP-1, #58 — a hot reload invokes
-nothing, writes no field and forces no return, yet replaces the running program, so it satisfied that
-phrasing while being the one change nothing can undo)
+**A read can still be destructive, and read-only does not stop it** (DOC-6, #89). A single-pass stream is the
+case: evaluating `response.readEntity(String.class)` on a JAX-RS `Response` **consumes the entity**, so the
+application's own read afterwards gets an empty body — the live request under inspection is corrupted by
+looking at it. That passes every check this mode makes, correctly: it invokes a method the caller asked for,
+writes no field and forces no return. The mode's promise is about *what the debugger does*, not about whether
+the debuggee's own API tolerates being asked twice, and nothing here can know which methods those are. Read at
+or after the assignment to a local (where the entity is a re-readable `String`), or capture the returned value
+with `debug.set_method_exit_stop` on the reading method. Before the read, only `getStatus()` and `getHeaders()`
+are safe.
+_Avoid_: "nothing changes the debuggee" unqualified, and "nothing executes code in the debuggee" (the wording
+before SWAP-1, #58 — a hot reload invokes nothing, writes no field and forces no return, yet replaces the
+running program, so it satisfied that phrasing while being the one change nothing can undo). The two
+exceptions are different in kind and both matter: hot reload is a change this tool makes and reports, while a
+destructive read is a change the *debuggee's own API* makes because it was asked a legal question, which no
+guard here can predict
 
 **Outstanding redefinition**:
 A class a session hot-reloaded and cannot restore. Its own term because every other mutation here ends when
