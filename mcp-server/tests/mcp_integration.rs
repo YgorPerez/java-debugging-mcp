@@ -8064,7 +8064,16 @@ fn a_finally_line_arms_every_copy_javac_emitted() {
 
     // And now the debugger has to have seen BOTH. Pre-fix, only the normal-completion copy is armed, so
     // every record reads rs="OK" and this is the assertion that fails.
-    server.wait_for_traces("FinallyProbe.call", EVENT_TIMEOUT);
+    // Wait for EACH copy's record, not for "a record". `wait_for_traces` returns on the first match, and
+    // the probe drives the two paths in sequence — so waiting once reads the buffer between the normal
+    // hit and the throwing one and fails on whichever has not landed yet. That is a race in the test,
+    // not a flake in the debugger, and it cost a full-suite run on JDK 21 to see.
+    server
+        .wait_for_traces("rs => \"OK\"", EVENT_TIMEOUT)
+        .expect("no traced hit from the normal-completion copy of the finally line");
+    server
+        .wait_for_traces("rs => null", EVENT_TIMEOUT)
+        .expect("no traced hit from the exception-path copy of the finally line — this is BP-4");
     let traces = server.call("debug.get_traces", serde_json::json!({}));
     let rows: Vec<&str> = traces.lines().filter(|l| l.contains("FinallyProbe.call")).collect();
     assert!(
@@ -8133,11 +8142,13 @@ fn a_multi_location_stop_point_charges_its_budget_once_per_hit() {
         &["bp_1", "Armed at 2 locations", "Auto-disarms after 6"],
     );
 
-    // Let the probe run well past the budget before reading, so the count cannot still be moving under
-    // the assertion. Six hits arrive within three ticks either way this is charged; ten ticks is slack.
-    probe
-        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > 9))
-        .expect("probe stopped ticking");
+    // Wait for the DISARM, not for a tick count. Capture is serialised, so under load the probe can be
+    // ten ticks in while the sixth hit is still being recorded, and an exact-count assertion then reads
+    // a buffer that is still filling. The disarm notice is the event that means "the budget is spent",
+    // which is the precondition this assertion actually needs.
+    server
+        .wait_for_traces("reached its trace-hit budget", EVENT_TIMEOUT)
+        .expect("the traced stop point never ran its budget out");
 
     let traces = server.call("debug.get_traces", serde_json::json!({}));
     let rows = traces.lines().filter(|l| l.contains("FinallyProbe.call")).count();
@@ -8146,6 +8157,125 @@ fn a_multi_location_stop_point_charges_its_budget_once_per_hit() {
         "a budget of 6 must buy 6 recorded hits across both armed locations, not 3 — per-location \
          charging halves the budget with nothing in any reply to explain it:\n{traces}"
     );
+
+    server.panic_reset();
+}
+
+/// BP-5 (#79): one class name, two classloaders — arm both copies.
+///
+/// `classes_by_signature` returns one entry per classloader that has loaded a name, and the arming path
+/// took `.first()`. So a stop point on a class that two deployments each pack into their own
+/// `WEB-INF/lib` reported "armed" and then watched the copy the request never runs through. Silence that
+/// is indistinguishable from a wrong hypothesis about the code path.
+///
+/// The probe defines the same class through two parent-less loaders, so the two copies are genuinely
+/// different reference types with their own statics — `calls` counts independently in each, which is the
+/// `Utils.tpAmbiente` shape that makes reading the wrong copy an actively wrong answer.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_exact_class_name_arms_every_classloaders_copy() {
+    let Some(jdk) = jdk_or_skip("an_exact_class_name_arms_every_classloaders_copy") else { return };
+    let probe = Probe::launch(&jdk, "TwinLoaderProbe").expect("launch TwinLoaderProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // The probe's own sanity line first. Without it a green test could mean the JVM collapsed the two
+    // loaders into one type, in which case there is no multiplicity to arm and nothing was proven.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("loaded twice=true"))
+        .expect("probe did not load the class twice — nothing for this test to assert about");
+    // Both copies must have RUN before arming: a class the JVM has not linked yet is not in
+    // classes_by_signature, so arming early would legitimately find one copy.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("ran beta:"))
+        .expect("probe never exercised the second copy");
+
+    let src = probe_source("TwinLoaderProbe");
+    let line = probe_line(&src, "// BP1");
+
+    let set = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "TwinLoaderProbe$Widget", "line": line,
+            "trace": true, "trace_expr": "this.owner",
+        }),
+    );
+    assert_contains_all(
+        "an exact class name reports that it armed on more than one classloader",
+        &set,
+        &["bp_", "Armed on 2 classloaders"],
+    );
+
+    // Both copies have to report. Pre-fix only one does, and which one is up to the JVM's ordering.
+    // One wait per copy, for the same reason the BP-4 test does: a single wait returns on whichever
+    // landed first and reads the buffer before the other one arrives.
+    server
+        .wait_for_traces("this.owner => \"alpha\"", EVENT_TIMEOUT)
+        .expect("no traced hit from the first classloader's copy");
+    server
+        .wait_for_traces("this.owner => \"beta\"", EVENT_TIMEOUT)
+        .expect("no traced hit from the second classloader's copy — this is BP-5");
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    let rows: Vec<&str> = traces.lines().filter(|l| l.contains("[bp_1]")).collect();
+    assert!(
+        rows.iter().any(|l| l.contains("\"alpha\"")),
+        "no traced hit from the first classloader's copy: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("\"beta\"")),
+        "no traced hit from the second classloader's copy — this is BP-5: the stop point armed one \
+         deployment's copy and reported armed: {rows:?}"
+    );
+
+    // Still one stop point, per ADR-0005, and the listing has to make the copies distinguishable —
+    // otherwise "armed on 2 classloaders" is a fact a caller can read and not act on.
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert_eq!(
+        listed.matches("bp_1").count(),
+        1,
+        "two classloaders' copies must be listed as one stop point: {listed}"
+    );
+    assert_contains_all(
+        "the listing names the loaders and how to select one",
+        &listed,
+        &["Armed on 2 classloaders", "#0 ", "#1 ", "TwinLoader"],
+    );
+
+    // A read that had to choose says so, and names the copies it did not read.
+    let fields =
+        server.call("debug.list_fields", serde_json::json!({"class_name": "TwinLoaderProbe$Widget"}));
+    assert_contains_all(
+        "a read path that had to choose between copies says so",
+        &fields,
+        &["calls", "is loaded by 2 classloaders", "Target a specific one with"],
+    );
+
+    // And the caller can pin it. The selector is the 0x… the note just printed.
+    let after = listed.split("#1 ").nth(1).expect("no second loader in the listing");
+    let at = after.find("@0x").expect("the listing must print the loader's objectID") + 1;
+    let hex_len = after[at + 2..].find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(after.len() - at - 2);
+    let loader = after[at..at + 2 + hex_len].to_string();
+    let pinned = server.call(
+        "debug.list_fields",
+        serde_json::json!({"class_name": format!("TwinLoaderProbe$Widget@{loader}")}),
+    );
+    assert!(
+        pinned.contains("calls") && !pinned.contains("is loaded by 2 classloaders"),
+        "pinning a read to one loader must resolve unambiguously and drop the caveat: {pinned}"
+    );
+
+    // A loader id that is not one of them is an error, never a quiet fall back to the first copy.
+    let wrong = server
+        .call("debug.list_fields", serde_json::json!({"class_name": "TwinLoaderProbe$Widget@0xdeadbeef"}));
+    assert!(
+        wrong.contains("none by classloader"),
+        "an unmatched loader selector must refuse rather than answer from another copy: {wrong}"
+    );
+
+    let cleared = server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": "bp_1"}));
+    assert_contains_all("one clear removes both copies", &cleared, &["✅", "bp_1"]);
+    let after = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(after.contains("No breakpoints set"), "clear left something armed: {after}");
 
     server.panic_reset();
 }

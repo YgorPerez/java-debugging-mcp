@@ -6,7 +6,7 @@ use crate::commands::{command_sets, reference_type_commands};
 use crate::connection::JdwpConnection;
 use crate::protocol::{CommandPacket, JdwpResult, ERR_ABSENT_INFORMATION, ERR_NOT_IMPLEMENTED};
 use crate::reader::{read_i32, read_string, read_u64};
-use crate::types::{FieldId, MethodId, ReferenceTypeId};
+use crate::types::{FieldId, MethodId, ObjectId, ReferenceTypeId};
 use bytes::BufMut;
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +66,41 @@ impl JdwpConnection {
 
         self.types().put_methods(ref_type_id, &methods);
         Ok(methods)
+    }
+
+    /// `ReferenceType.ClassLoader` — which classloader defined this type (BP-5, #79).
+    ///
+    /// The answer that makes "the class is loaded twice" a statement a caller can act on rather than a
+    /// warning they can only nod at. `classes_by_signature` returns one entry per classloader that has
+    /// loaded a name, and on an app server that is the ordinary case, not the exotic one: `WildFly` gives
+    /// every deployment its own module classloader, and a library packed into each war's `WEB-INF/lib`
+    /// is a genuinely different reference type per deployment — different `public static` state,
+    /// different endpoint URLs, different mute flags.
+    ///
+    /// **`Ok(None)` means the bootstrap classloader**, which is what JDWP's null `objectID` encodes and
+    /// is a real answer (`java.lang.String` has no loader object). It is not a failure, and rendering
+    /// it as one would make every JDK type look broken.
+    ///
+    /// Returns the loader's raw `objectID` and nothing else on purpose. Naming it means reading its own
+    /// type — [`Self::get_object_reference_type`](crate::JdwpConnection::get_object_reference_type)
+    /// plus a signature — which the caller can do when it has a caller to answer; calling `toString()`
+    /// on it would need a suspended thread and is exactly the implicit invocation ADR-0001's posture
+    /// rules out.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn get_class_loader(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<Option<ObjectId>> {
+        let id = self.next_id();
+        let mut packet =
+            CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::CLASS_LOADER);
+        packet.data.put_u64(ref_type_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let loader = read_u64(&mut data)?;
+        Ok((loader != 0).then_some(loader))
     }
 
     /// `ReferenceType.Interfaces` — the interfaces this type declares **directly**.

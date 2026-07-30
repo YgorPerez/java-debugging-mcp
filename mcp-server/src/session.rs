@@ -926,6 +926,14 @@ pub struct BreakpointInfo {
     /// most needs the warning (they armed against a class that was not loaded yet) is the one who never
     /// sees it. `debug.list_stop_points` renders it for both.
     pub drift: Option<String>,
+    /// One rendered label per classloader this stop point is armed on, in the order the JVM listed
+    /// them, when the class name resolved to more than one copy (BP-5, #79). Empty otherwise — which is
+    /// almost always, and is what keeps an ordinary listing byte-identical.
+    ///
+    /// Rendered at arm time rather than at list time because naming a loader costs JDWP round trips
+    /// (its `objectID`, then its own reference type, then that type's signature) and `list_stop_points`
+    /// is the tool a caller reaches for while deciding whether a trace is hurting a shared instance.
+    pub loaders: Vec<String>,
     /// Everything needed to re-arm this breakpoint at the same location after a `toggle_stop_point`
     /// disable (BP-1). Kept for every armed breakpoint so disable→enable round-trips exactly.
     pub arm: BreakpointArm,
@@ -954,18 +962,39 @@ pub struct BreakpointArm {
     pub class_id: u64,
     pub method_id: u64,
     pub bytecode_index: u64,
-    /// The *other* bytecode indices this line resolved to, when `javac` emitted the line more than once
-    /// (BP-4, #78). Empty for the ordinary single-location breakpoint.
+    /// Every *other* place this one stop point is armed. Empty for the ordinary breakpoint.
+    ///
+    /// Two different multiplicities land here, which is why it is a full location rather than a bare
+    /// bytecode index:
+    ///  - **one line, several bytecode copies in the same method** — `javac` inlines a `finally` body
+    ///    once per exit path (BP-4, #78), so `class_id` and `method_id` repeat and only the index moves;
+    ///  - **one class name, several loaded copies of it** — every classloader that has loaded the name
+    ///    defines its own reference type (BP-5, #79), so `class_id` differs too.
+    ///
+    /// They are the same mechanism deliberately. Both are "one caller-facing stop point over N armed
+    /// JDWP requests", and building the second as a parallel mechanism would have meant two disarm
+    /// paths, two budget rules and two ways to be wrong.
     ///
     /// Deliberately a primary plus extras rather than the `Vec` [`BreakpointInfo::request_ids`] uses,
     /// and the asymmetry is the point: these are only ever *read together* at the arming site, so
     /// keeping the first out of the collection makes "there is at least one location" true by
     /// construction. Request ids are *searched*, where the same shape would invite a lookup that
     /// checks only the primary.
-    pub extra_bytecode_indices: Vec<u64>,
+    pub extra_locations: Vec<ArmedLocation>,
     pub suspend_policy: jdwp_client::SuspendPolicy,
     pub hit_count: Option<i32>,
     pub thread_filter: Option<u64>,
+}
+
+/// One concrete place a stop point is armed: a bytecode index in a method of a reference type.
+///
+/// Carries `class_id` as well as the index because the second copy of a stop point is not always in the
+/// same class — see [`BreakpointArm::extra_locations`].
+#[derive(Debug, Clone, Copy)]
+pub struct ArmedLocation {
+    pub class_id: u64,
+    pub method_id: u64,
+    pub bytecode_index: u64,
 }
 
 #[derive(Clone)]

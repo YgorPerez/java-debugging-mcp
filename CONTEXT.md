@@ -371,9 +371,10 @@ The debuggee's own identifier for an armed request. An internal detail that chan
 re-armed, and deliberately not the stop point's identity.
 
 **One stop point can own several**, which is newer than the rest of this entry and is the thing most
-likely to be assumed away. A line breakpoint holds one request *per bytecode location the line resolves
-to*, and a source line inside a `finally` resolves to more than one because `javac` inlines the block
-once per exit path (BP-4, #78). The stop point is still one thing to the caller — one `bp_` id, listed
+likely to be assumed away. A line breakpoint holds one request *per armed location*, and there are two
+independent ways to have more than one: a source line inside a `finally` resolves to several bytecode
+copies, because `javac` inlines the block once per exit path (BP-4, #78); and a class name resolves to
+several **reference types**, one per classloader that loaded it (BP-5, #79). The stop point is still one thing to the caller — one `bp_` id, listed
 once, cleared once, and its trace budget charged once per **hit** rather than once per armed location —
 so ADR-0005's one-id-per-stop-point rule is untouched. What changes is that a lookup *by* request id has
 to ask whether the stop point owns the id, not whether it equals the stop point's id.

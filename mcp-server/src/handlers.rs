@@ -1218,7 +1218,8 @@ impl RequestHandler {
         let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
         let limit = a.limit.max(1);
 
-        let target_id = resolve_loaded_class(&mut session.connection, class_name).await?;
+        let (target_id, loader_note) =
+            resolve_loaded_class_for_read(&mut session.connection, class_name).await?;
 
         let mut rows =
             collect_method_rows(&mut session.connection, target_id, a.inherited, name_filter.as_deref())
@@ -1253,7 +1254,7 @@ impl RequestHandler {
             output.push_str("No method name matched. Drop name_filter to see the whole class.\n");
         }
 
-        Ok(output)
+        Ok(output + loader_note.as_deref().unwrap_or(""))
     }
 
     /// DISC-5: the fields of one loaded class — the other half of the question `list_methods` answers.
@@ -1281,7 +1282,8 @@ impl RequestHandler {
         let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
         let limit = a.limit.max(1);
 
-        let target_id = resolve_loaded_class(&mut session.connection, class_name).await?;
+        let (target_id, loader_note) =
+            resolve_loaded_class_for_read(&mut session.connection, class_name).await?;
 
         let mut rows =
             collect_field_rows(&mut session.connection, target_id, a.inherited, name_filter.as_deref())
@@ -1320,7 +1322,7 @@ impl RequestHandler {
             output.push_str(&explain_no_fields(name_filter.is_some(), a.inherited));
         }
 
-        Ok(output)
+        Ok(output + loader_note.as_deref().unwrap_or(""))
     }
 
     /// DISC-3: what file a loaded class was compiled from, and — when source roots are configured —
@@ -1348,7 +1350,8 @@ impl RequestHandler {
             return Err("class_name is required (e.g. com.example.OrderService)".to_string());
         }
 
-        let type_id = resolve_loaded_class(&mut session.connection, &class_name).await?;
+        let (type_id, loader_note) =
+            resolve_loaded_class_for_read(&mut session.connection, &class_name).await?;
         let file_name = match session.connection.get_source_file(type_id).await {
             Ok(f) => f,
             Err(jdwp_client::JdwpError::JdwpErrorCode(code, _))
@@ -1387,7 +1390,7 @@ impl RequestHandler {
             );
         }
         output.push_str(&local_source_section(&class_name, &file_name, &roots, &a));
-        Ok(output)
+        Ok(output + loader_note.as_deref().unwrap_or(""))
     }
 
     /// DISC-7: is this JVM running the build on your disk, or last week's bytecode?
@@ -1420,7 +1423,8 @@ impl RequestHandler {
             self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
-        let type_id = resolve_loaded_class(&mut session.connection, &class_name).await?;
+        let (type_id, loader_note) =
+            resolve_loaded_class_for_read(&mut session.connection, &class_name).await?;
         let roots: Vec<std::path::PathBuf> = a.class_roots.as_ref().map_or_else(
             || session.class_roots.clone(),
             |v| v.iter().map(std::path::PathBuf::from).collect(),
@@ -1450,7 +1454,8 @@ impl RequestHandler {
         }
         let packets = session.connection.packets_sent().saturating_sub(before);
         drop(session);
-        Ok(render_stale_report(&class_name, &path, &report, a.limit, packets))
+        Ok(render_stale_report(&class_name, &path, &report, a.limit, packets)
+            + loader_note.as_deref().unwrap_or(""))
     }
 
     /// DUMP-1: every thread's stack in one call, plus which monitors each thread holds and which one it
@@ -1898,7 +1903,8 @@ impl RequestHandler {
             ));
         }
 
-        let type_id = resolve_loaded_class(&mut session.connection, &class_name).await?;
+        let (type_id, loader_note) =
+            resolve_loaded_class_for_read(&mut session.connection, &class_name).await?;
         let caps = session
             .connection
             .capabilities_new()
@@ -1960,7 +1966,7 @@ impl RequestHandler {
         );
         out.push_str(&describe_live_frames(&class_name, thread, live.as_deref()));
         out.push_str(&describe_armed_stop_points(&armed));
-        Ok(out)
+        Ok(out + loader_note.as_deref().unwrap_or(""))
     }
 
     /// SWAP-1's other half: pop a frame off a suspended thread so the method is re-entered — with the
@@ -3538,6 +3544,19 @@ fn render_breakpoint_line(
             bp.request_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
         );
     }
+    // BP-5 (#79): the class name is loaded more than once, so the copies have to be distinguishable —
+    // otherwise "armed on 2 classloaders" is a fact the caller can read and not act on. Each `@0x…` is
+    // usable as a selector on the read tools (debug.evaluate, list_fields, source, check_stale).
+    if bp.loaders.len() > 1 {
+        let _ = writeln!(
+            output,
+            "     Armed on {} classloaders — {}. Each copy has its own statics; pin a read to one with \
+             {}@<the 0x… above>",
+            bp.loaders.len(),
+            bp.loaders.join("; "),
+            bp.class_pattern
+        );
+    }
     if let Some(t) = bp.arm.thread_filter {
         let _ = writeln!(output, "     Thread filter: 0x{t:x}");
     }
@@ -4744,18 +4763,85 @@ fn explain_no_match(names: &[(String, bool)], filter: Option<&str>) -> String {
 /// It asks for each of `descriptor_candidates`' spellings in turn rather than building one descriptor,
 /// because a hidden class is spelled differently on JDK 11 and on 15+ (DISC-4, #50) — a normal class
 /// still costs exactly one lookup.
-async fn resolve_loaded_class(
+/// Split `com.example.Utils@0x7f3a1c` into the class name and the classloader the caller pinned it to.
+///
+/// The selector exists because a class name is not a unique thing to read from (BP-5, #79): each
+/// classloader that loaded the name defines its own type, with its own `public static` state, and on
+/// this stack that is the norm rather than the exception. "Which copy did you read?" has to be
+/// answerable, and had no answer at all before.
+///
+/// A **suffix rather than a tool argument**, deliberately. Five read tools resolve a class name
+/// (`evaluate`, `list_fields`, `list_methods`, `source`, `check_stale`) and a sixth would want it next
+/// week; putting it in the name means it composes with all of them at once, travels through
+/// `trace_expr` where there is no schema to extend, and is copy-pasteable straight out of the
+/// `#0 …@0x…` list that `list_stop_points` and the ambiguity note both print.
+///
+/// Split on the **last** `@`, since a JVM-generated name can contain one (`Foo$$Lambda@0x…`), and only
+/// when what follows parses as a loader id — so an ordinary name carrying an `@` is untouched.
+fn split_loader_selector(dotted: &str) -> (&str, Option<u64>) {
+    let Some((name, sel)) = dotted.rsplit_once('@') else { return (dotted, None) };
+    let Some(hex) = sel.strip_prefix("0x") else { return (dotted, None) };
+    u64::from_str_radix(hex, 16).map_or((dotted, None), |id| (name, Some(id)))
+}
+
+/// Which of a class name's loaded copies to read, and whether choosing was ambiguous (BP-5, #79).
+///
+/// Returns the reference type plus a note that is `Some` **only** when the name resolved to more than
+/// one copy and the caller did not pin one. That note is not decoration: a static field read is the
+/// best-fitting capability this tool has for these libraries, and answering it confidently from
+/// whichever copy sorted first is a wrong answer, not one of two honest readings — the rule `CONTEXT.md`
+/// records under **Loaded** for SIG-1 (#46), which is the same failure family.
+///
+/// Today's choice (`.first()`) is kept when there is no selector, so nothing that worked stops working.
+/// What changes is that the reply says the choice was made.
+async fn resolve_loaded_class_for_read(
     conn: &mut jdwp_client::JdwpConnection,
     class_name: &str,
-) -> Result<u64, String> {
+) -> Result<(u64, Option<String>), String> {
+    let (class_name, want_loader) = split_loader_selector(class_name);
     for signature in descriptor_candidates(class_name) {
         let found = conn
             .classes_by_signature(&signature)
             .await
             .map_err(|e| format!("Failed to resolve {class_name}: {e}"))?;
-        if let Some(class) = found.first() {
-            return Ok(class.type_id);
+        if found.is_empty() {
+            continue;
         }
+        let ids: Vec<u64> = found.iter().map(|c| c.type_id).collect();
+        if let Some(want) = want_loader {
+            let labels = describe_class_loaders(conn, &ids).await;
+            // Matched on the label, which is where the id the caller copied was printed. A miss is an
+            // error rather than a silent fallback to the first copy — pinning a read and being given a
+            // different one is the bug this argument exists to prevent.
+            let needle = format!("0x{want:x}");
+            if let Some((&id, _)) = ids.iter().zip(&labels).find(|(_, l)| l.contains(&needle)) {
+                return Ok((id, None));
+            }
+            return Err(format!(
+                "{class_name} is loaded {} time(s), but none by classloader 0x{want:x}. Loaded by: {}. \
+                 Loader ids are weak references and change across a redeploy — re-read the list.",
+                ids.len(),
+                labels.join("; ")
+            ));
+        }
+        let Some((&first_id, rest_ids)) = ids.split_first() else { continue };
+        if !rest_ids.is_empty() {
+            let labels = describe_class_loaders(conn, &ids).await;
+            return Ok((
+                first_id,
+                Some(format!(
+                    "\n⚠️  {class_name} is loaded by {} classloaders and this call used the first \
+                     ({}). Each copy is a different type with its own statics — on WildFly a library \
+                     packed into more than one deployment's WEB-INF/lib genuinely holds different \
+                     values per war, so this may not be the copy you meant. Loaded by: {}. Target a \
+                     specific one with {class_name}@<the 0x… you want>.",
+                    ids.len(),
+                    labels.first().map_or("#0", String::as_str),
+                    labels.join("; ")
+                )),
+            ));
+        }
+        return Ok((first_id, None));
     }
     let simple = class_name.rsplit('.').next().unwrap_or(class_name);
     Err(format!(
@@ -6683,13 +6769,20 @@ async fn try_arm_deferred_breakpoints(
                             class_id: cp_ref,
                             method_id: method.method_id,
                             bytecode_index: index,
-                            extra_bytecode_indices: extra_code_indices,
+                            extra_locations: extra_code_indices
+                                .into_iter()
+                                .map(|bytecode_index| crate::session::ArmedLocation {
+                                    class_id: cp_ref,
+                                    method_id: method.method_id,
+                                    bytecode_index,
+                                })
+                                .collect(),
                             suspend_policy: sp,
                             hit_count: pend.hit_count,
                             thread_filter: pend.thread_filter,
                         };
                         let extra_copies = arm_extra_line_copies(session, &arm).await;
-                        arm.extra_bytecode_indices = extra_copies.armed;
+                        arm.extra_locations = extra_copies.armed;
                         let mut request_ids = vec![req_id];
                         request_ids.extend(extra_copies.request_ids);
                         // Do the bookkeeping that only borrows `pend` first, so its owned fields can
@@ -6721,6 +6814,10 @@ async fn try_arm_deferred_breakpoints(
                                 trace_budget: pend.trace_budget,
                                 trace_frames: pend.trace_frames,
                                 trace_cost: crate::session::TraceCost::default(),
+                                // A CLASS_PREPARE names exactly one reference type, so a deferred arm
+                                // has no multiplicity to report — a second classloader loading the same
+                                // name fires its own event and is a separate concern.
+                                loaders: Vec::default(),
                                 arm,
                             },
                         );
@@ -6783,7 +6880,7 @@ async fn arm_pattern_set_members(
             spec_from_pattern_set(set, &fqn, signature)
         };
         let bp_id = session.next_stop_id("bp_");
-        match arm_and_insert(session, class_ref, &spec, bp_id).await {
+        match arm_and_insert(session, &[class_ref], &spec, bp_id).await {
             Ok(armed) => {
                 info!("Armed {} on newly loaded {} for family {}", armed.bp_id, fqn, set_id);
                 if let Some(s) = session.pattern_sets.get_mut(&set_id) {
@@ -7524,7 +7621,7 @@ async fn rearm_line_breakpoint(
     // moved or merged the copies is reflected here rather than replayed from stale indices.
     let mut arm = arm;
     let extra_copies = arm_extra_line_copies(session, &arm).await;
-    arm.extra_bytecode_indices = extra_copies.armed;
+    arm.extra_locations = extra_copies.armed;
     let mut request_ids = vec![req];
     request_ids.extend(extra_copies.request_ids);
     if let Some(b) = session.breakpoints.get_mut(id) {
@@ -7643,7 +7740,15 @@ async fn rearm_breakpoint_location(
             class_id: class.type_id,
             method_id: loc.method.method_id,
             bytecode_index: loc.code_index,
-            extra_bytecode_indices: loc.extra_code_indices,
+            extra_locations: loc
+                .extra_code_indices
+                .into_iter()
+                .map(|bytecode_index| crate::session::ArmedLocation {
+                    class_id: class.type_id,
+                    method_id: loc.method.method_id,
+                    bytecode_index,
+                })
+                .collect(),
             ..bp.arm.clone()
         }),
         // The class is loaded but the location didn't resolve; the old ids are the best guess left, and
@@ -8122,8 +8227,12 @@ struct ArmedBreakpoint {
     /// The line actually resolved, which is not always the line asked for.
     line: i32,
     method_name: String,
-    /// One per armed bytecode location, ascending — usually one (BP-4, #78).
+    /// One per armed location — usually one (BP-4 #78, BP-5 #79).
     request_ids: Vec<i32>,
+    /// How many classloaders had loaded this class name. 1 for almost every class; more on an app
+    /// server, where a library packed into each deployment is a genuinely different reference type per
+    /// war (BP-5, #79).
+    loader_count: usize,
     /// Locations this line resolved to that the JVM refused, already worded. Empty on the ordinary
     /// path; never silently dropped, because a stop point covering fewer paths than the caller thinks
     /// is the failure this change exists to remove.
@@ -8151,6 +8260,16 @@ impl ArmedBreakpoint {
                 self.request_ids.len()
             );
         }
+        if self.loader_count > 1 {
+            let _ = write!(
+                s,
+                "\n   Armed on {} classloaders — this class name is loaded {} times in this JVM, and \
+                 each copy is a different type with its own statics. On WildFly that is a library \
+                 packed into more than one deployment's WEB-INF/lib; arming one copy is how a stop \
+                 point reports \"armed\" and then never fires. debug.list_stop_points names the loaders.",
+                self.loader_count, self.loader_count
+            );
+        }
         for p in &self.partial {
             let _ = write!(
                 s,
@@ -8163,39 +8282,77 @@ impl ArmedBreakpoint {
 }
 
 /// What arming the *other* copies of a duplicated line produced (BP-4, #78).
+/// Name the classloader that defined each of `class_ids`, in order, as something a caller can act on.
+///
+/// The shape is `#<n> <loader type>@0x<objectID>`, or `#<n> bootstrap` for the null loader JDWP reports
+/// for a JDK type. The hex `objectID` is the part that matters: it is what a caller pastes back as
+/// `com.example.Utils@0x7f3a…` to pin a read to one deployment's copy (see [`split_loader_selector`]).
+/// An index alone would not do — `classes_by_signature` promises no order across calls.
+///
+/// **Nothing is invoked.** Reading the loader's own type and signature is two ordinary JDWP commands;
+/// calling `toString()` on it would need a suspended thread, which is exactly the implicit invocation
+/// this tool's posture rules out (ADR-0001) — and is why a `WildFly` `ModuleClassLoader` is named by its
+/// type rather than by the module name it would have printed.
+///
+/// A loader whose type will not read degrades to the bare id rather than dropping the entry: the count
+/// has to stay right, since it is what tells the caller their class is loaded more than once.
+async fn describe_class_loaders(conn: &mut jdwp_client::JdwpConnection, class_ids: &[u64]) -> Vec<String> {
+    let mut out = Vec::with_capacity(class_ids.len());
+    for (i, &cid) in class_ids.iter().enumerate() {
+        let label = match conn.get_class_loader(cid).await {
+            Ok(None) => "bootstrap".to_string(),
+            Ok(Some(loader)) => {
+                let named = match conn.get_object_reference_type(loader).await {
+                    Ok(lt) => conn.get_signature(lt).await.ok().map(|s| decode_internal_name(&s)),
+                    Err(_) => None,
+                };
+                named.map_or_else(|| format!("0x{loader:x}"), |n| format!("{n}@0x{loader:x}"))
+            }
+            Err(e) => format!("(loader unreadable: {e})"),
+        };
+        out.push(format!("#{i} {label}"));
+    }
+    out
+}
+
 struct ExtraLineCopies {
     /// One JDWP request per copy that armed.
     request_ids: Vec<i32>,
-    /// The bytecode indices those requests are on — what gets stored for a later re-arm, so a location
-    /// the JVM already refused is not retried on every toggle.
-    armed: Vec<u64>,
-    /// Copies the JVM refused, already worded for a caller.
+    /// The locations those requests are on — what gets stored for a later re-arm, so a location the JVM
+    /// already refused is not retried on every toggle.
+    armed: Vec<crate::session::ArmedLocation>,
+    /// Locations the JVM refused, already worded for a caller.
     refused: Vec<String>,
 }
 
-/// Arm every bytecode copy of a line beyond the first, for a line the line table holds more than once.
+/// Arm every location of a stop point beyond the first.
 ///
 /// Shared by all three arming paths — immediate, deferred (in the event pump) and re-arm — because they
 /// were about to grow the same loop three times, and a stop point whose copies are armed differently
 /// depending on which path armed it is a bug waiting for a `toggle_stop_point`.
 ///
+/// One mechanism for the two multiplicities in [`crate::session::BreakpointArm::extra_locations`]: the
+/// same source line copied per `finally` exit path (BP-4, #78), and the same class name loaded by
+/// several classloaders (BP-5, #79). Each entry carries its own `class_id`, so the second needs nothing
+/// extra here — which is the whole reason the first was built this way.
+///
 /// **The first location is not this function's business.** It is armed by the caller and its failure is
-/// fatal there: it is the location the caller asked for. A *later* copy failing is not fatal — refusing
-/// the whole stop point would leave the caller with nothing where they could have had the normal path —
-/// so it is dropped from `armed` and reported in `refused`. Silence is the one option not available: a
-/// stop point that quietly covers fewer paths than it claims is precisely the bug BP-4 is.
+/// fatal there: it is the location the caller asked for. A *later* one failing is not fatal — refusing
+/// the whole stop point would leave the caller with nothing where they could have had one copy — so it
+/// is dropped from `armed` and reported in `refused`. Silence is the one option not available: a stop
+/// point that quietly covers less than it claims is precisely the bug both issues are.
 async fn arm_extra_line_copies(
     session: &mut crate::session::DebugSession,
     arm: &crate::session::BreakpointArm,
 ) -> ExtraLineCopies {
     let mut out = ExtraLineCopies { request_ids: Vec::new(), armed: Vec::new(), refused: Vec::new() };
-    for idx in &arm.extra_bytecode_indices {
+    for loc in &arm.extra_locations {
         match session
             .connection
             .set_breakpoint_ex(
-                arm.class_id,
-                arm.method_id,
-                *idx,
+                loc.class_id,
+                loc.method_id,
+                loc.bytecode_index,
                 arm.suspend_policy,
                 arm.hit_count,
                 arm.thread_filter,
@@ -8204,22 +8361,39 @@ async fn arm_extra_line_copies(
         {
             Ok(req) => {
                 out.request_ids.push(req);
-                out.armed.push(*idx);
+                out.armed.push(*loc);
             }
-            Err(e) => out.refused.push(format!("bytecode index {idx}: {e}")),
+            Err(e) => out
+                .refused
+                .push(format!("class 0x{:x} bytecode index {}: {e}", loc.class_id, loc.bytecode_index)),
         }
     }
     out
 }
 
-/// Resolve the location on a loaded class, set the JDWP breakpoint, and record it in the session under
-/// the caller-facing `bp_id` (allocated by the caller so it survives a later disable/re-arm — BP-3).
+/// Resolve the location on each loaded copy of a class, set the JDWP breakpoints, and record them in
+/// the session under the caller-facing `bp_id` (allocated by the caller so it survives a later
+/// disable/re-arm — BP-3).
+///
+/// **`class_type_ids` is every reference type the name resolved to**, not one (BP-5, #79). A class name
+/// is not unique in a JVM: each classloader that loads it defines its own type, and on `WildFly` —
+/// where
+/// a library packed into each war's `WEB-INF/lib` is loaded once per deployment — that is the ordinary
+/// case. Arming only the first meant the reply said "armed" and the stop point never fired, because it
+/// was watching the other deployment's copy. Indistinguishable from a wrong hypothesis about the code
+/// path, which is what makes it worse than a missing feature.
+///
+/// The first entry is the primary and its failure is fatal; the others go through the same
+/// `extra_locations` mechanism BP-4 built for a duplicated `finally` line.
 async fn arm_and_insert(
     session: &mut crate::session::DebugSession,
-    class_type_id: u64,
+    class_type_ids: &[u64],
     spec: &BreakpointSpec,
     bp_id: String,
 ) -> Result<ArmedBreakpoint, ArmError> {
+    let Some((&class_type_id, other_copies)) = class_type_ids.split_first() else {
+        return Err(ArmError::Other(format!("{} is not loaded", spec.class_pattern)));
+    };
     let loc = resolve_bp_location(
         &mut session.connection,
         class_type_id,
@@ -8242,20 +8416,65 @@ async fn arm_and_insert(
         )
         .await
         .map_err(|e| ArmError::Other(format!("Failed to set breakpoint: {e}")))?;
+    // The rest of this line inside the primary copy — a `finally` inlined per exit path (BP-4).
+    let mut locations: Vec<crate::session::ArmedLocation> = extra
+        .into_iter()
+        .map(|bytecode_index| crate::session::ArmedLocation {
+            class_id: class_type_id,
+            method_id: method.method_id,
+            bytecode_index,
+        })
+        .collect();
+    // Then the same line in every *other* classloader's copy of the class (BP-5). Resolved per copy
+    // rather than reusing the primary's method and index: two deployments can carry different builds of
+    // the same library, so the method id and the bytecode offsets are not interchangeable. A copy that
+    // does not resolve is reported rather than dropped — "this deployment has a different build" is a
+    // finding, not noise.
+    let mut unresolved: Vec<String> = Vec::new();
+    for &other in other_copies {
+        match resolve_bp_location(&mut session.connection, other, spec.line_opt, spec.method_hint.as_deref())
+            .await
+        {
+            Ok(o) => {
+                locations.push(crate::session::ArmedLocation {
+                    class_id: other,
+                    method_id: o.method.method_id,
+                    bytecode_index: o.code_index,
+                });
+                locations.extend(o.extra_code_indices.into_iter().map(|bytecode_index| {
+                    crate::session::ArmedLocation {
+                        class_id: other,
+                        method_id: o.method.method_id,
+                        bytecode_index,
+                    }
+                }));
+            }
+            Err(e) => unresolved.push(format!("another classloader's copy (class 0x{other:x}): {e}")),
+        }
+    }
     let mut arm = crate::session::BreakpointArm {
         class_id: class_type_id,
         method_id: method.method_id,
         bytecode_index: index,
-        extra_bytecode_indices: extra,
+        extra_locations: locations,
         suspend_policy: spec.suspend_policy,
         hit_count: spec.hit_count,
         thread_filter: spec.thread_filter,
     };
     let extra_copies = arm_extra_line_copies(session, &arm).await;
-    arm.extra_bytecode_indices = extra_copies.armed;
+    arm.extra_locations = extra_copies.armed;
     let mut request_ids = vec![request_id];
     request_ids.extend(extra_copies.request_ids);
-    let partial = extra_copies.refused;
+    let mut partial = extra_copies.refused;
+    partial.extend(unresolved);
+    let loader_count = class_type_ids.len();
+    // Only when there is an ambiguity to report: naming a loader costs three round trips per copy, and
+    // the single-copy case is nearly every class.
+    let loaders = if loader_count > 1 {
+        describe_class_loaders(&mut session.connection, class_type_ids).await
+    } else {
+        Vec::new()
+    };
     // Computed before the insert so the stop point carries it too, not only this reply (DISC-8).
     let drift = drift_caveat_for_armed_method(session, &spec.class_pattern, &method, jvm_lines).await;
     session.breakpoints.insert(
@@ -8274,13 +8493,14 @@ async fn arm_and_insert(
             trace_budget: spec.trace_budget,
             trace_frames: spec.trace_frames,
             trace_cost: crate::session::TraceCost::default(),
+            loaders,
             arm,
         },
     );
     // After arming, not before: the breakpoint is the thing the caller asked for, and a drift check that
     // could fail must never be able to prevent it. Everything this call does is fallible-but-ignorable by
     // construction, and it returns `None` rather than an error for the same reason.
-    Ok(ArmedBreakpoint { bp_id, line, method_name: method.name, request_ids, partial, drift })
+    Ok(ArmedBreakpoint { bp_id, line, method_name: method.name, request_ids, loader_count, partial, drift })
 }
 
 /// The target class isn't loaded yet: register a `CLASS_PREPARE` watch (`EventThread` suspend, so the
@@ -8331,10 +8551,11 @@ async fn defer_breakpoint(
         .map_err(|e| format!("Failed to register the class-load watch: {e}"))?;
 
     let recheck = session.connection.classes_by_signature(&spec.signature).await.unwrap_or_default();
-    if let Some(c) = recheck.first() {
-        let ctid = c.type_id;
+    if !recheck.is_empty() {
+        // Every copy, not the first: the race can close on a name several classloaders hold (BP-5, #79).
+        let ctids: Vec<u64> = recheck.iter().map(|c| c.type_id).collect();
         let _ = session.connection.clear_class_prepare(cp_req).await;
-        let armed = arm_and_insert(session, ctid, spec, bp_id).await.map_err(ArmError::into_message)?;
+        let armed = arm_and_insert(session, &ctids, spec, bp_id).await.map_err(ArmError::into_message)?;
         return Ok(DeferResult::ArmedOnRecheck(armed));
     }
 
@@ -8802,7 +9023,7 @@ async fn arm_pattern_family(
         }
         let per_class = spec.for_pattern(&fqn);
         let bp_id = session.next_stop_id("bp_");
-        match arm_and_insert(session, type_id, &per_class, bp_id).await {
+        match arm_and_insert(session, &[type_id], &per_class, bp_id).await {
             Ok(armed) => members.push(FamilyMember { class: fqn, armed }),
             // Not a failure: the pattern matched a class that is not a target. Counted, never listed —
             // a broad pattern would otherwise bury the real failures under dozens of these.
@@ -8917,19 +9138,18 @@ async fn arm_one_pattern(
         Ok(c) => c,
         Err(e) => return PatternOutcome::Failed(format!("Failed to find class: {e}")),
     };
-    match classes.first() {
-        Some(c) => {
-            let type_id = c.type_id;
-            match arm_and_insert(session, type_id, spec, bp_id).await {
-                Ok(armed) => PatternOutcome::Armed(armed),
-                Err(e) => PatternOutcome::Failed(e.into_message()),
-            }
-        }
-        None => match defer_breakpoint(session, spec, bp_id).await {
+    if classes.is_empty() {
+        return match defer_breakpoint(session, spec, bp_id).await {
             Ok(DeferResult::ArmedOnRecheck(armed)) => PatternOutcome::Armed(armed),
             Ok(DeferResult::Deferred { bp_id }) => PatternOutcome::Deferred { bp_id },
             Err(e) => PatternOutcome::Failed(e),
-        },
+        };
+    }
+    // Every classloader's copy (BP-5, #79), same as the single-named path.
+    let type_ids: Vec<u64> = classes.iter().map(|c| c.type_id).collect();
+    match arm_and_insert(session, &type_ids, spec, bp_id).await {
+        Ok(armed) => PatternOutcome::Armed(armed),
+        Err(e) => PatternOutcome::Failed(e.into_message()),
     }
 }
 
@@ -8953,12 +9173,16 @@ async fn arm_single_named(
         .classes_by_signature(&spec.signature)
         .await
         .map_err(|e| format!("Failed to find class: {e}"))?;
-    let Some(first_class) = classes.first() else {
+    if classes.is_empty() {
         return register_deferred_breakpoint(session, spec, bp_id).await;
-    };
-    let class_type_id = first_class.type_id;
+    }
+    // Every reference type the name resolved to (BP-5, #79). One entry per classloader that has loaded
+    // it — `.first()` here is how a stop point on a shared library reported "armed" and then watched the
+    // other deployment's copy.
+    let class_type_ids: Vec<u64> = classes.iter().map(|c| c.type_id).collect();
 
-    let armed = arm_and_insert(session, class_type_id, spec, bp_id).await.map_err(ArmError::into_message)?;
+    let armed =
+        arm_and_insert(session, &class_type_ids, spec, bp_id).await.map_err(ArmError::into_message)?;
     let request_id = armed.describe_requests();
     let (bp_id, line, method_name) = (&armed.bp_id, armed.line, &armed.method_name);
 
@@ -10906,9 +11130,31 @@ async fn resolve_class_by_dotted(
     conn: &mut jdwp_client::JdwpConnection,
     dotted: &str,
 ) -> Result<Option<u64>, String> {
+    // A caller can pin the copy (BP-5, #79) — `com.example.Utils@0x7f3a…`, the id `list_stop_points`
+    // and the ambiguity note both print. Without one this keeps today's choice, which is what makes the
+    // change additive for everything already scripted against it.
+    let (dotted, want_loader) = split_loader_selector(dotted);
     for sig in descriptor_candidates(dotted) {
         let classes =
             conn.classes_by_signature(&sig).await.map_err(|e| format!("classes_by_signature failed: {e}"))?;
+        if classes.is_empty() {
+            continue;
+        }
+        if let Some(want) = want_loader {
+            let ids: Vec<u64> = classes.iter().map(|c| c.type_id).collect();
+            let labels = describe_class_loaders(conn, &ids).await;
+            let needle = format!("0x{want:x}");
+            // A miss is an error, never a quiet fall back to the first copy: being handed a different
+            // copy than the one you pinned is precisely the failure the selector exists to prevent.
+            let Some((&id, _)) = ids.iter().zip(&labels).find(|(_, l)| l.contains(&needle)) else {
+                return Err(format!(
+                    "{dotted} is loaded {} time(s), but none by classloader {needle}. Loaded by: {}.",
+                    ids.len(),
+                    labels.join("; ")
+                ));
+            };
+            return Ok(Some(id));
+        }
         if let Some(c) = classes.iter().find(|c| c.ref_type_tag == 1).or_else(|| classes.first()) {
             return Ok(Some(c.type_id));
         }
