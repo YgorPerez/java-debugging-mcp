@@ -290,6 +290,26 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## ✅ Shipped (context)
 
+- **Collections read without a suspended thread (EVAL-10/#92)** — a subscript, slice or predicate filter
+  on a `java.util.HashMap`, `LinkedHashMap`, `ConcurrentHashMap` or `ArrayList` is now answered by **field
+  reads and array indexing only**, both of which JDWP does with nothing suspended. Before this, `map["k"]`
+  invoked `get()` and a filter invoked `entrySet()`/`toArray()`, and invoking needs a suspended thread — so
+  on the shared 8180 the commonest cache question was unreachable, even though the *static field holding the
+  map* was always readable. `HashMap` walks `table[]` then each `Node`'s `key`/`value`/`next`, which covers a
+  **treeified** bin unchanged because `TreeNode` keeps that chain; `LinkedHashMap` uses the table for a key
+  and `head`/`after` for iteration ORDER, which is the half a table walk would get wrong; `ConcurrentHashMap`
+  is treated separately (its value field is `val`, a bin head can be a `TreeBin` or a `ForwardingNode`, and
+  its count is `baseCount` + `counterCells`); `ArrayList` reads `elementData` bounded by `size`, since the
+  backing array is routinely longer and the spare slots are null. Recognition is by the runtime type's
+  **exact signature** — a `HashMap` subclass and a `Collections.synchronizedMap` wrapper both fall back to
+  invoking, because a silently-wrong structural walk is far worse than a refusal — and **the reply says
+  which path it took**, including that the walk took no lock, so a value read this way is a sample rather
+  than a transaction. Read-only gains reach for free: a walk invokes nothing, so ADR-0001 no longer refuses
+  `order.lines[0]`. Proven by `structural_and_invoking_collection_reads_agree`, which reads every collection
+  twice — once walked, once through a wrapper of the SAME object that must invoke — and asserts the two
+  answers equal **to each other** rather than to a written-down expectation, so they cannot drift; and by
+  `collection_reads_walk_the_layout_with_no_suspended_thread`, whose premise (`only_suspended` is `0/N`) is
+  asserted before and after rather than inferred.
 - **Wildcard and batched arming (FILT-3/#74, FILT-4/#75)** — `class_pattern` on all four arming tools now
   takes an exact class, a **wildcard**, or a **list** of either. A wildcard on `debug.set_line_stop` requires
   `method` and refuses `line` (`:412` is a different statement in every class it matches), arms one `bp_` per

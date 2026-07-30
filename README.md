@@ -27,6 +27,13 @@ natural language.
 - **Collection Subscripts**: `lines[0]`, `counts["key"]`, `lines[2..5]` (slice) and
   **`lines[?qty > 3]`** (filter, with the left side resolved against each element). Filtering a `Map`
   keeps the keys (`key → value`), and a single element can be **written** as well as read
+- **Collection reads that need no suspended thread**: a subscript, slice or filter on a
+  `java.util.HashMap`, `LinkedHashMap`, `ConcurrentHashMap` or `ArrayList` is answered by **walking the
+  collection's own fields** (`table[]` → `Node.key/value/next`, `elementData[0..size]`) instead of
+  invoking `get()` / `entrySet()` / `toArray()` in the debuggee — so the commonest cache question works
+  on a JVM you must not freeze, and under `read_only`. Any other implementation falls back to invoking,
+  and **the reply says which path it took**; a structural read also states that it took no lock, so the
+  value is a sample rather than a transaction
 - **Which link went null**: `debug.evaluate_chain` walks a chained expression left to right and names the
   first link that is null, with every link's value above it and a count of the ones it never reached —
   the one-call answer to a question that otherwise costs one `debug.evaluate` per link. Each method in

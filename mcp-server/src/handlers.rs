@@ -997,7 +997,11 @@ impl RequestHandler {
             None => None,
         };
 
-        let resolved = resolve_expression_multi(conn, thread_id, frame.as_ref(), expression)
+        // EVAL-10: how a collection was reached is part of the answer, not an implementation detail —
+        // a structural walk and an invoked `get()` can disagree on a type whose internals this server
+        // does not know, and only one of them takes no lock.
+        let mut read_path = ReadPath::default();
+        let resolved = resolve_expression_multi(conn, thread_id, frame.as_ref(), expression, &mut read_path)
             .await
             .map_err(explain_readonly)?;
         let deep = (a.expand_objects && !read_only).then(|| DeepOpts {
@@ -1035,7 +1039,7 @@ impl RequestHandler {
         } else {
             ""
         };
-        Ok(format!("{ro_note}{} = {}", expression.trim(), rendered))
+        Ok(format!("{ro_note}{} = {}{}", expression.trim(), rendered, read_path.render()))
     }
 
     /// `debug.evaluate_chain` (EVAL-6, #70): walk a chained expression link by link and name the first
@@ -9658,18 +9662,19 @@ async fn apply_subscripts(
     base: jdwp_client::types::Value,
     subs: &[Subscript],
     label: &str,
+    path: &mut ReadPath,
 ) -> Result<Resolved, String> {
     let mut current = base;
     for (i, sub) in subs.iter().enumerate() {
         match sub {
             Subscript::Index(key) => {
-                current = apply_index(conn, thread_id, frame, &current, key, label).await?;
+                current = apply_index(conn, thread_id, frame, &current, key, label, path).await?;
             }
             Subscript::Range(from, to) => {
                 if i + 1 < subs.len() {
                     return Err(multi_then_chain_error(label));
                 }
-                return apply_range(conn, thread_id, &current, *from, *to, label).await;
+                return apply_range(conn, thread_id, &current, *from, *to, label, path).await;
             }
             Subscript::Filter(pred) => {
                 if i + 1 < subs.len() {
@@ -9677,7 +9682,7 @@ async fn apply_subscripts(
                 }
                 // Boxed: a predicate re-enters expression resolution, which can reach a nested
                 // subscript, and every such cycle runs through here.
-                return apply_filter_boxed(conn, thread_id, frame, &current, pred, label).await;
+                return apply_filter_boxed(conn, thread_id, frame, &current, pred, label, path).await;
             }
         }
     }
@@ -9686,8 +9691,13 @@ async fn apply_subscripts(
 
 /// `expr[i]` on an array or `List`, or `expr[key]` on a `Map`.
 ///
-/// A `Map` is tried first when the object has `get(Object)`, because `counts["a"]` should mean the
-/// mapping, not an ordinal position.
+/// Three paths, in this order. An **array** is indexed on the wire. A collection whose runtime type is
+/// a [`Layout`] this server recognises is **walked structurally** — field reads and array indexing
+/// only, so it needs no suspended thread (EVAL-10). Anything else falls back to **invoking** `get()`,
+/// and `path` records which of the last two happened, because a caller cannot tell from the answer.
+///
+/// A `Map` is tried before a `List` in the invoking path when the object has `get(Object)`, because
+/// `counts["a"]` should mean the mapping, not an ordinal position.
 async fn apply_index(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: Option<u64>,
@@ -9695,39 +9705,89 @@ async fn apply_index(
     base: &jdwp_client::types::Value,
     key: &ArgLit,
     label: &str,
+    path: &mut ReadPath,
 ) -> Result<jdwp_client::types::Value, String> {
     let id =
         as_object_id(base).ok_or_else(|| format!("Cannot index '{label}' — it is null or a primitive"))?;
 
     // Arrays are indexable without invoking anything, so handle them before touching the debuggee.
     if base.tag == 91 {
-        let ArgLit::Int(i) = key else {
-            return Err(format!("An array index must be an int, got {key:?} on '{label}'"));
-        };
-        let len = conn
-            .get_array_length(id)
-            .await
-            .map_err(|e| format!("Failed to read length of '{label}': {e}"))?;
-        if *i < 0 || *i >= len {
-            return Err(format!("Index {i} is out of bounds for '{label}' (length {len})"));
-        }
-        return conn
-            .get_array_values(id, *i, 1)
-            .await
-            .map_err(|e| format!("Failed to read '{label}[{i}]': {e}"))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| format!("No value returned for '{label}[{i}]'"));
+        return index_array(conn, id, key, label).await;
     }
 
-    let tid = thread_id.ok_or_else(|| {
-        format!("Indexing '{label}' needs a suspended thread — it calls get() in the debuggee")
-    })?;
+    // The runtime type comes first now, because it decides whether a thread is needed at all: a
+    // recognised layout is read by walking fields, which JDWP does with nothing suspended.
     let type_id = conn
         .get_object_reference_type(id)
         .await
         .map_err(|e| format!("Failed to resolve type of '{label}': {e}"))?;
+    let name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+    let mut declined = None;
+    if let Some(layout) = recognise_layout(conn, type_id).await {
+        let mut ids = FieldIds::default();
+        match structural_index(conn, &mut ids, id, layout, key, label).await? {
+            Walked::Read(v) => {
+                path.walked(layout, &name);
+                return Ok(v);
+            }
+            Walked::Declined(why) => declined = Some(why),
+        }
+    }
+    match &declined {
+        Some(why) => path.invoked(&name, why),
+        None => path.unrecognised(&name),
+    }
 
+    let tid = thread_id.ok_or_else(|| {
+        format!(
+            "Indexing '{label}' needs a suspended thread — {name} is read by calling get() in the \
+             debuggee{}",
+            declined.map_or_else(
+                || format!(" (structural reads cover {KNOWN_LAYOUTS})"),
+                |why| format!(" ({name} {why})")
+            )
+        )
+    })?;
+
+    index_by_invoking(conn, thread_id, frame, tid, id, type_id, key, label).await
+}
+
+/// `expr[i]` on a real array — `ArrayReference` reads, so no thread and no invocation ever.
+async fn index_array(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    key: &ArgLit,
+    label: &str,
+) -> Result<jdwp_client::types::Value, String> {
+    let ArgLit::Int(i) = key else {
+        return Err(format!("An array index must be an int, got {key:?} on '{label}'"));
+    };
+    let len =
+        conn.get_array_length(id).await.map_err(|e| format!("Failed to read length of '{label}': {e}"))?;
+    if *i < 0 || *i >= len {
+        return Err(format!("Index {i} is out of bounds for '{label}' (length {len})"));
+    }
+    conn.get_array_values(id, *i, 1)
+        .await
+        .map_err(|e| format!("Failed to read '{label}[{i}]': {e}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("No value returned for '{label}[{i}]'"))
+}
+
+/// `expr[key]` through the debuggee's own `get(…)`, for a container whose runtime type is not a
+/// recognised [`Layout`].
+#[allow(clippy::too_many_arguments)]
+async fn index_by_invoking(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: Option<u64>,
+    frame: Option<&jdwp_client::thread::Frame>,
+    tid: u64,
+    id: u64,
+    type_id: u64,
+    key: &ArgLit,
+    label: &str,
+) -> Result<jdwp_client::types::Value, String> {
     // Look `get` up by *arity*, not by argument type, and read its parameter to decide how to call
     // it. Two reasons: a type-aware lookup can't match `Map.get(Object)` against an int key at all
     // (that needs boxing first), and "no 1-arg get()" is the only honest test for "not indexable" —
@@ -9794,6 +9854,852 @@ async fn box_primitive(
     (exc == 0).then_some(ret)
 }
 
+// ----- structural collection reads: EVAL-10 -----
+
+/// How many chained nodes one hash bin may be walked through before the walk gives up.
+///
+/// Nothing is locked, so a `next` pointer read while another thread splits a bin can point back into
+/// the chain it came from. A cycle would otherwise spin forever inside a diagnostic, so the walk is
+/// bounded and declines rather than hangs.
+const BIN_CHAIN_GUARD: usize = 4096;
+
+/// How many `table[]` slots one `ArrayReference.GetValues` reads. A production map's table can be
+/// millions of slots and most of them empty; reading it in chunks keeps one packet's reply bounded
+/// while still costing far fewer round trips than a slot at a time.
+const TABLE_CHUNK: i32 = 4096;
+
+/// `ConcurrentHashMap`'s reserved bin-head hashes. A bin head with one of these is not an entry: it is
+/// a `ForwardingNode` left by a resize (`MOVED`), a red-black `TreeBin` (`TREEBIN`), or a slot a
+/// `computeIfAbsent` has claimed but not filled (`RESERVED`). Reading its `key`/`val` as if it were an
+/// entry is exactly the silently-wrong answer this whole path exists to avoid.
+const CHM_MOVED: i32 = -1;
+const CHM_TREEBIN: i32 = -2;
+const CHM_RESERVED: i32 = -3;
+
+/// How many `ForwardingNode` hops a lookup follows before deciding the map is resizing under it.
+const CHM_FORWARD_HOPS: usize = 8;
+
+/// A JDK collection whose contents this server reads by **field reads and array indexing only**
+/// (EVAL-10, [#92](https://github.com/YgorPerez/java-debugging-mcp/issues/92)).
+///
+/// Both of those are JDWP commands that need no thread at all, which is the whole point. Indexing a
+/// `Map` or a `List` used to mean invoking `get()` in the debuggee, and invoking needs a **suspended**
+/// thread — so the commonest cache question in a stack full of hand-rolled `Map` caches was
+/// unreachable on the shared 8180, the one instance this tool exists to be pointed at. The static
+/// field holding the map was always readable; only the step from "here is the map" to "here is the
+/// entry" was not.
+///
+/// Recognition is by the runtime type's **exact signature**, never by a superclass or an interface. A
+/// `HashMap` subclass may keep its entries somewhere else entirely and a `Collections.synchronizedMap`
+/// wrapper holds a delegate rather than a table, so a walk that guessed would return a confident wrong
+/// answer — worse than the fall back to invoking that an unrecognised implementation gets instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// `java.util.HashMap` — a `table[]` of `Node`s chained by `next`.
+    HashMap,
+    /// `java.util.LinkedHashMap` — a `HashMap` for lookup, plus a `head`/`after` list that IS its
+    /// iteration order. The two halves are read for different questions; see [`linked_map_entries`].
+    LinkedHashMap,
+    /// `java.util.concurrent.ConcurrentHashMap` — also a `table[]`, but its value field is `val`, a
+    /// bin head can be a `TreeBin` or a `ForwardingNode`, and its count lives in `baseCount` plus the
+    /// striped `counterCells` rather than in a `size` field.
+    ConcurrentHashMap,
+    /// `java.util.ArrayList` — `elementData[]`, whose length is the CAPACITY, plus `size`.
+    ArrayList,
+}
+
+impl Layout {
+    /// Whether a subscript on this layout means a key lookup rather than a position.
+    const fn is_map(self) -> bool {
+        !matches!(self, Self::ArrayList)
+    }
+
+    /// What the walk actually reads, named in the reply so a caller can check the claim against the
+    /// JDK's own source rather than take it on trust.
+    const fn fields_walked(self) -> &'static str {
+        match self {
+            Self::HashMap => "table[] → Node.key/value/next, treeified bins included",
+            Self::LinkedHashMap => "table[] for a key, head/after for iteration order",
+            Self::ConcurrentHashMap => "table[] → Node.key/val/next, TreeBin.first included",
+            Self::ArrayList => "elementData[0..size]",
+        }
+    }
+}
+
+/// The layouts this server walks, as the reply names them when it declines to walk something else.
+const KNOWN_LAYOUTS: &str =
+    "java.util.HashMap, java.util.LinkedHashMap, java.util.concurrent.ConcurrentHashMap, java.util.ArrayList";
+
+/// Recognise a runtime type by its exact signature. `None` means "fall back and say so".
+async fn recognise_layout(conn: &mut jdwp_client::JdwpConnection, type_id: u64) -> Option<Layout> {
+    match conn.get_signature(type_id).await.ok()?.as_str() {
+        "Ljava/util/HashMap;" => Some(Layout::HashMap),
+        "Ljava/util/LinkedHashMap;" => Some(Layout::LinkedHashMap),
+        "Ljava/util/concurrent/ConcurrentHashMap;" => Some(Layout::ConcurrentHashMap),
+        "Ljava/util/ArrayList;" => Some(Layout::ArrayList),
+        _ => None,
+    }
+}
+
+/// What a structural attempt produced.
+enum Walked<T> {
+    /// The walk answered.
+    Read(T),
+    /// The walk cannot answer this one, for the named reason, and the caller must fall back to
+    /// invoking. The reason reaches the caller in the reply: a decline is a fact about the debuggee
+    /// (an unfamiliar field layout, a map resizing under the read), not an internal detail.
+    Declined(String),
+}
+
+/// Field ids by (runtime type, name), so a bin walk resolves each name once per node **class** rather
+/// than once per node. A treeified bin and a plain one are different classes, so one walk meets a
+/// handful of them at most.
+#[derive(Default)]
+struct FieldIds(std::collections::HashMap<(u64, &'static str), Option<u64>>);
+
+impl FieldIds {
+    async fn id(
+        &mut self,
+        conn: &mut jdwp_client::JdwpConnection,
+        type_id: u64,
+        name: &'static str,
+    ) -> Option<u64> {
+        if let Some(hit) = self.0.get(&(type_id, name)) {
+            return *hit;
+        }
+        let found = find_field(conn, type_id, name).await.ok().flatten();
+        self.0.insert((type_id, name), found);
+        found
+    }
+
+    /// Read several named fields of one object in a single `ObjectReference.GetValues`.
+    ///
+    /// `None` when the object does not declare all of them — which is the signal that this JDK's
+    /// layout is not the one this code was written against, and the only honest response to that is to
+    /// fall back rather than read whatever fields do happen to match.
+    async fn read(
+        &mut self,
+        conn: &mut jdwp_client::JdwpConnection,
+        obj: u64,
+        names: &[&'static str],
+    ) -> Option<Vec<jdwp_client::types::Value>> {
+        let type_id = conn.get_object_reference_type(obj).await.ok()?;
+        let mut fids = Vec::with_capacity(names.len());
+        for n in names {
+            fids.push(self.id(conn, type_id, n).await?);
+        }
+        let vals = conn.get_object_values(obj, fids).await.ok()?;
+        (vals.len() == names.len()).then_some(vals)
+    }
+}
+
+const fn as_int(v: &jdwp_client::types::Value) -> Option<i32> {
+    match v.data {
+        jdwp_client::types::ValueData::Int(n) => Some(n),
+        _ => None,
+    }
+}
+
+const fn as_long(v: &jdwp_client::types::Value) -> Option<i64> {
+    match v.data {
+        jdwp_client::types::ValueData::Long(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// The `value` field of a `java.lang.*` wrapper, read rather than invoked.
+async fn boxed_data(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    id: u64,
+) -> Option<jdwp_client::types::ValueData> {
+    Some(ids.read(conn, id, &["value"]).await?.into_iter().next()?.data)
+}
+
+/// The `hashCode()` the JDK **specifies** for the key literals a subscript can carry, computed here so
+/// that nothing runs in the debuggee.
+///
+/// Each of these is fixed by its javadoc rather than by an implementation: `String`'s is the
+/// `s[0]*31^(n-1) + …` sum over UTF-16 code units, `Integer`'s is the value, `Long`'s is
+/// `(int)(v ^ (v >>> 32))`, `Boolean`'s is 1231/1237. That is what makes computing it here safe where
+/// computing a general object's would not be.
+///
+/// `None` for a key this cannot hash — `null`, or an expression resolving to some other object — which
+/// declines to the invoking path rather than scanning every bin in the table.
+fn java_hash(key: &ArgLit) -> Option<i32> {
+    Some(match key {
+        ArgLit::Str(s) => s.encode_utf16().fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(i32::from(c))),
+        ArgLit::Int(i) => *i,
+        ArgLit::Long(n) => {
+            // `(int)(v ^ (v >>> 32))` written without a cast: an i64 arithmetic-shifted right by 32 is
+            // exactly the high word and always fits an i32, and the low word reinterpreted as signed
+            // is `(x ^ 2^31) - 2^31`. XOR is bitwise, so XORing the two signed halves is the same
+            // number Java's truncating cast produces.
+            let hi = i32::try_from(*n >> 32).unwrap_or(0);
+            let lo = i32::try_from(((*n & 0xFFFF_FFFF) ^ 0x8000_0000) - 0x8000_0000).unwrap_or(0);
+            hi ^ lo
+        }
+        ArgLit::Bool(b) => {
+            if *b {
+                1231
+            } else {
+                1237
+            }
+        }
+        ArgLit::Null | ArgLit::Expr(_) => return None,
+    })
+}
+
+/// `HashMap`'s own spread: `h ^ (h >>> 16)`. The `& 0xFFFF` is how a logical shift is spelled without
+/// a sign-losing cast — an i32 shifted right 16 arithmetically differs from the logical shift only in
+/// the bits that mask off.
+const fn hashmap_spread(h: i32) -> i32 {
+    h ^ ((h >> 16) & 0xFFFF)
+}
+
+/// `ConcurrentHashMap`'s spread, which additionally clears the sign bit (`HASH_BITS`) so that a real
+/// entry's hash can never collide with the reserved negative bin-head hashes.
+const fn chm_spread(h: i32) -> i32 {
+    (h ^ ((h >> 16) & 0xFFFF)) & 0x7fff_ffff
+}
+
+/// How a key literal is named when the walk declines to hash it.
+const fn arglit_kind(key: &ArgLit) -> &'static str {
+    match key {
+        ArgLit::Str(_) => "String",
+        ArgLit::Int(_) => "int",
+        ArgLit::Long(_) => "long",
+        ArgLit::Bool(_) => "boolean",
+        ArgLit::Null => "null",
+        ArgLit::Expr(_) => "expression",
+    }
+}
+
+/// Whether a key stored in the map equals the key literal the caller wrote — decided by reading the
+/// stored key's contents, never by invoking `equals()`.
+///
+/// This reproduces the JDK's own equality for these four types, **including its strictness about
+/// class**: `Integer.valueOf(1).equals(Long.valueOf(1))` is false, and the invoking path agrees,
+/// because it boxes an int literal to `Integer` before calling `get`. Anything else is reported
+/// unequal rather than guessed at, so a map keyed by some other type simply never matches and the
+/// lookup answers `null` — exactly what `get()` would have answered.
+async fn key_matches(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    stored: &jdwp_client::types::Value,
+    want: &ArgLit,
+) -> bool {
+    use jdwp_client::types::ValueData;
+    let Some(id) = as_object_id(stored) else { return false };
+    let Ok(type_id) = conn.get_object_reference_type(id).await else { return false };
+    let sig = conn.get_signature(type_id).await.unwrap_or_default();
+    match (want, sig.as_str()) {
+        (ArgLit::Str(s), "Ljava/lang/String;") => {
+            conn.get_string_value(id).await.is_ok_and(|read| read == *s)
+        }
+        (ArgLit::Int(i), "Ljava/lang/Integer;") => {
+            matches!(boxed_data(conn, ids, id).await, Some(ValueData::Int(n)) if n == *i)
+        }
+        (ArgLit::Long(l), "Ljava/lang/Long;") => {
+            matches!(boxed_data(conn, ids, id).await, Some(ValueData::Long(n)) if n == *l)
+        }
+        (ArgLit::Bool(b), "Ljava/lang/Boolean;") => {
+            matches!(boxed_data(conn, ids, id).await, Some(ValueData::Boolean(n)) if n == *b)
+        }
+        _ => false,
+    }
+}
+
+/// Why a bin walk gave up — always because nothing was locked, never because the map is malformed.
+fn bin_guard_reason() -> String {
+    format!(
+        "a hash bin was still going after {BIN_CHAIN_GUARD} nodes, which a concurrent resize can make \
+         a read look like"
+    )
+}
+
+/// Why a bin walk gave up on a node that is not shaped like the JDK's.
+fn node_shape_reason(value_field: &str) -> String {
+    format!("a bin node has no key/{value_field}/next, so this is not the layout walked here")
+}
+
+/// Walk one bin's `next` chain looking for `key`, comparing the stored hash first and the key's
+/// contents only when that matches — the same order the maps' own `getNode`/`find` use.
+///
+/// A **treeified** bin needs no special case. `HashMap.TreeNode` extends `Node` and the JDK keeps the
+/// bin's `next` chain intact alongside the red-black tree — `untreeify` walks exactly this chain — so
+/// one linear walk covers both shapes. It costs O(bin) rather than O(log bin) on a bin holding eight
+/// or more colliding keys, which is the right trade here: a JDWP round trip dwarfs the comparison, and
+/// reading `left`/`right`/`red` would bind this to the tree's internals for no measurable gain.
+///
+/// `value_field` is the only thing that differs between the two maps' nodes: `HashMap.Node` calls it
+/// `value` and `ConcurrentHashMap.Node` calls it `val`.
+async fn bin_lookup(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    start: Option<u64>,
+    hash: i32,
+    key: &ArgLit,
+    value_field: &'static str,
+) -> Result<Walked<jdwp_client::types::Value>, String> {
+    let mut cur = start;
+    let mut guard = 0usize;
+    while let Some(node) = cur {
+        guard += 1;
+        if guard > BIN_CHAIN_GUARD {
+            return Ok(Walked::Declined(bin_guard_reason()));
+        }
+        let Some(nf) = ids.read(conn, node, &["hash", "key", value_field, "next"]).await else {
+            return Ok(Walked::Declined(node_shape_reason(value_field)));
+        };
+        if nf.first().and_then(as_int) == Some(hash) {
+            if let Some(k) = nf.get(1) {
+                if key_matches(conn, ids, k, key).await {
+                    return Ok(Walked::Read(nf.get(2).cloned().unwrap_or_else(value_null)));
+                }
+            }
+        }
+        cur = nf.get(3).and_then(as_object_id);
+    }
+    // The chain ended without a match, which is `null` — the same answer `get()` gives.
+    Ok(Walked::Read(value_null()))
+}
+
+/// Collect one bin's `next` chain into `out`, stopping at the scan cap. `Some(reason)` declines.
+async fn bin_collect(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    start: Option<u64>,
+    value_field: &'static str,
+    out: &mut Vec<(jdwp_client::types::Value, jdwp_client::types::Value)>,
+    cap: usize,
+) -> Option<String> {
+    let mut cur = start;
+    let mut guard = 0usize;
+    while let Some(node) = cur {
+        if out.len() >= cap {
+            return None;
+        }
+        guard += 1;
+        if guard > BIN_CHAIN_GUARD {
+            return Some(bin_guard_reason());
+        }
+        let Some(nf) = ids.read(conn, node, &["key", value_field, "next"]).await else {
+            return Some(node_shape_reason(value_field));
+        };
+        out.push((
+            nf.first().cloned().unwrap_or_else(value_null),
+            nf.get(1).cloned().unwrap_or_else(value_null),
+        ));
+        cur = nf.get(2).and_then(as_object_id);
+    }
+    None
+}
+
+/// The table of a `HashMap`-shaped map, or the reason the walk declined. `Ok(None)` is an empty map:
+/// a `HashMap` allocates its table lazily, so a null one has no entries rather than no layout.
+async fn map_table(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    map: u64,
+    names: &[&'static str],
+) -> Result<Walked<(Option<u64>, i32)>, String> {
+    let Some(f) = ids.read(conn, map, names).await else {
+        let listed = names.join("/");
+        return Ok(Walked::Declined(format!("it has no {listed}, so this is not the layout walked here")));
+    };
+    let extra = f.get(1).and_then(as_int).unwrap_or(0);
+    Ok(Walked::Read((f.first().and_then(as_object_id), extra)))
+}
+
+/// `HashMap`/`LinkedHashMap` key lookup, by the map's own algorithm: spread the key's hash, index the
+/// table, walk the bin.
+async fn hash_map_lookup(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    map: u64,
+    key: &ArgLit,
+) -> Result<Walked<jdwp_client::types::Value>, String> {
+    let Some(hash) = java_hash(key).map(hashmap_spread) else {
+        return Ok(Walked::Declined(unhashable_key(key)));
+    };
+    let table = match map_table(conn, ids, map, &["table"]).await? {
+        Walked::Read((Some(t), _)) => t,
+        Walked::Read((None, _)) => return Ok(Walked::Read(value_null())),
+        Walked::Declined(why) => return Ok(Walked::Declined(why)),
+    };
+    let n = conn.get_array_length(table).await.map_err(|e| format!("Failed to read the map's table: {e}"))?;
+    if n <= 0 {
+        return Ok(Walked::Read(value_null()));
+    }
+    let head = conn
+        .get_array_values(table, (n - 1) & hash, 1)
+        .await
+        .map_err(|e| format!("Failed to read the map's bin: {e}"))?;
+    bin_lookup(conn, ids, head.first().and_then(as_object_id), hash, key, "value").await
+}
+
+/// Why a key literal cannot be hashed here, and therefore cannot be looked up without invoking.
+fn unhashable_key(key: &ArgLit) -> String {
+    format!("a {} key cannot be hashed without invoking hashCode() in the debuggee", arglit_kind(key))
+}
+
+/// Where a `ConcurrentHashMap` bin head sends a reader.
+enum Bin {
+    /// Walk this `next` chain.
+    Chain(Option<u64>),
+    /// The bin has already been moved by a resize; look in this table instead.
+    Forward(Option<u64>),
+    /// Nothing to find in this bin.
+    Empty,
+}
+
+/// Dispatch on a `ConcurrentHashMap` bin head's hash, which is how the class itself tells an entry
+/// from a `TreeBin`, a `ForwardingNode` or a claimed-but-unfilled slot.
+async fn chm_bin(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    head_id: u64,
+) -> Result<Walked<Bin>, String> {
+    let Some(hf) = ids.read(conn, head_id, &["hash"]).await else {
+        return Ok(Walked::Declined(
+            "a bin head has no `hash` field, so this is not the layout walked here".to_string(),
+        ));
+    };
+    Ok(Walked::Read(match hf.first().and_then(as_int) {
+        Some(CHM_TREEBIN) => match ids.read(conn, head_id, &["first"]).await {
+            Some(tf) => Bin::Chain(tf.first().and_then(as_object_id)),
+            None => {
+                return Ok(Walked::Declined(
+                    "a TreeBin has no `first` field, so this is not the layout walked here".to_string(),
+                ))
+            }
+        },
+        Some(CHM_MOVED) => match ids.read(conn, head_id, &["nextTable"]).await {
+            Some(nf) => Bin::Forward(nf.first().and_then(as_object_id)),
+            None => {
+                return Ok(Walked::Declined(
+                    "a ForwardingNode has no `nextTable` field, so this is not the layout walked here"
+                        .to_string(),
+                ))
+            }
+        },
+        Some(CHM_RESERVED) => Bin::Empty,
+        _ => Bin::Chain(Some(head_id)),
+    }))
+}
+
+/// `ConcurrentHashMap` key lookup, following the same bin dispatch `ConcurrentHashMap.get` does.
+///
+/// The `ForwardingNode` case is the interesting one: a resize leaves one at the head of every bin it
+/// has already moved, pointing at the new table, and the lookup re-derives its bin there. Bounded to
+/// [`CHM_FORWARD_HOPS`], because nothing here holds a lock and a torn read could otherwise chase
+/// forwardings indefinitely.
+async fn chm_lookup(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    map: u64,
+    key: &ArgLit,
+) -> Result<Walked<jdwp_client::types::Value>, String> {
+    let Some(hash) = java_hash(key).map(chm_spread) else {
+        return Ok(Walked::Declined(unhashable_key(key)));
+    };
+    let mut table = match map_table(conn, ids, map, &["table"]).await? {
+        Walked::Read((Some(t), _)) => t,
+        Walked::Read((None, _)) => return Ok(Walked::Read(value_null())),
+        Walked::Declined(why) => return Ok(Walked::Declined(why)),
+    };
+    for _ in 0..CHM_FORWARD_HOPS {
+        let n =
+            conn.get_array_length(table).await.map_err(|e| format!("Failed to read the map's table: {e}"))?;
+        if n <= 0 {
+            return Ok(Walked::Read(value_null()));
+        }
+        let head = conn
+            .get_array_values(table, (n - 1) & hash, 1)
+            .await
+            .map_err(|e| format!("Failed to read the map's bin: {e}"))?;
+        let Some(head_id) = head.first().and_then(as_object_id) else {
+            return Ok(Walked::Read(value_null()));
+        };
+        match chm_bin(conn, ids, head_id).await? {
+            Walked::Declined(why) => return Ok(Walked::Declined(why)),
+            Walked::Read(Bin::Empty | Bin::Forward(None)) => return Ok(Walked::Read(value_null())),
+            Walked::Read(Bin::Chain(start)) => return bin_lookup(conn, ids, start, hash, key, "val").await,
+            Walked::Read(Bin::Forward(Some(next))) => table = next,
+        }
+    }
+    Ok(Walked::Declined(format!(
+        "the map forwarded to a new table more than {CHM_FORWARD_HOPS} times — it is resizing under the read"
+    )))
+}
+
+/// `ArrayList`'s backing array and its length **as a list**.
+///
+/// `elementData.length` is the CAPACITY, which is routinely larger: a list grown by `add()` allocates
+/// 1.5× and leaves the spare slots null. Reading the array alone would leak those trailing nulls as if
+/// they were elements, so `size` is read in the same packet and bounds everything below.
+async fn array_list_backing(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    obj: u64,
+) -> Result<Walked<(Option<u64>, i32)>, String> {
+    let (arr, size) = match map_table(conn, ids, obj, &["elementData", "size"]).await? {
+        Walked::Read(v) => v,
+        Walked::Declined(why) => return Ok(Walked::Declined(why)),
+    };
+    let Some(arr) = arr else {
+        return Ok(Walked::Read((None, 0)));
+    };
+    let cap = conn
+        .get_array_length(arr)
+        .await
+        .map_err(|e| format!("Failed to read the list's backing array: {e}"))?;
+    // Clamped rather than trusted: `size` and `elementData` are two reads of a list nothing is holding
+    // still, so a concurrent `remove` between them could leave size pointing past the array.
+    Ok(Walked::Read((Some(arr), size.clamp(0, cap))))
+}
+
+/// One subscript, answered by reading fields — or a decline naming what stopped it (EVAL-10).
+async fn structural_index(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    id: u64,
+    layout: Layout,
+    key: &ArgLit,
+    label: &str,
+) -> Result<Walked<jdwp_client::types::Value>, String> {
+    match layout {
+        Layout::HashMap | Layout::LinkedHashMap => hash_map_lookup(conn, ids, id, key).await,
+        Layout::ConcurrentHashMap => chm_lookup(conn, ids, id, key).await,
+        Layout::ArrayList => array_list_index(conn, ids, id, key, label).await,
+    }
+}
+
+/// `list[i]` by reading `elementData`, bounded by `size` rather than by the array's length.
+async fn array_list_index(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    id: u64,
+    key: &ArgLit,
+    label: &str,
+) -> Result<Walked<jdwp_client::types::Value>, String> {
+    let ArgLit::Int(i) = key else {
+        return Err(format!("A list index must be an int — '{label}' is a java.util.ArrayList, got {key:?}"));
+    };
+    let (arr, size) = match array_list_backing(conn, ids, id).await? {
+        Walked::Read(v) => v,
+        Walked::Declined(why) => return Ok(Walked::Declined(why)),
+    };
+    if *i < 0 || *i >= size {
+        return Err(format!("Index {i} is out of bounds for '{label}' (length {size})"));
+    }
+    let Some(arr) = arr else {
+        return Err(format!("Index {i} is out of bounds for '{label}' (length 0)"));
+    };
+    conn.get_array_values(arr, *i, 1)
+        .await
+        .map_err(|e| format!("Failed to read '{label}[{i}]': {e}"))?
+        .into_iter()
+        .next()
+        .map(Walked::Read)
+        .ok_or_else(|| format!("No value returned for '{label}[{i}]'"))
+}
+
+/// A map's entries as (key, value) pairs, together with the map's own count of them.
+type Entries = (Vec<(jdwp_client::types::Value, jdwp_client::types::Value)>, i32);
+
+/// The scan cap as a `usize`, for bounding a `Vec`.
+fn scan_cap() -> usize {
+    usize::try_from(SUBSCRIPT_SCAN_CAP).unwrap_or(1000)
+}
+
+/// A `HashMap`'s entries in table order — which is also `entrySet()`'s iteration order, so a slice or
+/// filter reports them in the same order the invoking path would.
+async fn hash_map_entries(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    map: u64,
+) -> Result<Walked<Entries>, String> {
+    let (table, size) = match map_table(conn, ids, map, &["table", "size"]).await? {
+        Walked::Read(v) => v,
+        Walked::Declined(why) => return Ok(Walked::Declined(why)),
+    };
+    let Some(table) = table else {
+        return Ok(Walked::Read((Vec::new(), size)));
+    };
+    let n = conn.get_array_length(table).await.map_err(|e| format!("Failed to read the map's table: {e}"))?;
+    let cap = scan_cap();
+    let mut out = Vec::new();
+    let mut slot = 0i32;
+    while slot < n && out.len() < cap {
+        let chunk = TABLE_CHUNK.min(n - slot);
+        let heads = conn
+            .get_array_values(table, slot, chunk)
+            .await
+            .map_err(|e| format!("Failed to read the map's bins: {e}"))?;
+        for h in &heads {
+            if out.len() >= cap {
+                break;
+            }
+            if let Some(why) = bin_collect(conn, ids, as_object_id(h), "value", &mut out, cap).await {
+                return Ok(Walked::Declined(why));
+            }
+        }
+        slot += chunk;
+    }
+    Ok(Walked::Read((out, size)))
+}
+
+/// A `LinkedHashMap`'s entries in **iteration** order, which is the whole reason the class exists and
+/// which its table does not give you.
+///
+/// `entrySet()` iterates `head` → `after`, so this does too. Walking the table instead would return
+/// the right entries in the wrong order, and every slice and filter would disagree with the invoking
+/// path — the exact silent divergence this feature must not introduce.
+async fn linked_map_entries(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    map: u64,
+) -> Result<Walked<Entries>, String> {
+    let (head, size) = match map_table(conn, ids, map, &["head", "size"]).await? {
+        Walked::Read(v) => v,
+        Walked::Declined(why) => return Ok(Walked::Declined(why)),
+    };
+    let cap = scan_cap();
+    let mut cur = head;
+    let mut out = Vec::new();
+    while let Some(node) = cur {
+        if out.len() >= cap {
+            break;
+        }
+        let Some(nf) = ids.read(conn, node, &["key", "value", "after"]).await else {
+            return Ok(Walked::Declined(
+                "an entry has no key/value/after, so this is not the layout walked here".to_string(),
+            ));
+        };
+        out.push((
+            nf.first().cloned().unwrap_or_else(value_null),
+            nf.get(1).cloned().unwrap_or_else(value_null),
+        ));
+        cur = nf.get(2).and_then(as_object_id);
+    }
+    Ok(Walked::Read((out, size)))
+}
+
+/// `ConcurrentHashMap` has no `size` field: its count is `baseCount` plus the striped `counterCells`,
+/// which is what `sumCount()` adds up. Reading it structurally is what keeps the truncation note
+/// honest — "the first 1000 of 40000" needs the 40000.
+///
+/// `None` when either field is absent, which is how a future JDK moving the counter shows up here.
+async fn chm_size(conn: &mut jdwp_client::JdwpConnection, ids: &mut FieldIds, map: u64) -> Option<i32> {
+    let f = ids.read(conn, map, &["baseCount", "counterCells"]).await?;
+    let mut total = as_long(f.first()?)?;
+    if let Some(cells) = f.get(1).and_then(as_object_id) {
+        let n = conn.get_array_length(cells).await.ok()?;
+        let vals = conn.get_array_values(cells, 0, n).await.ok()?;
+        for c in &vals {
+            let Some(cid) = as_object_id(c) else { continue };
+            if let Some(cf) = ids.read(conn, cid, &["value"]).await {
+                total += cf.first().and_then(as_long).unwrap_or(0);
+            }
+        }
+    }
+    i32::try_from(total.max(0)).ok()
+}
+
+/// A `ConcurrentHashMap`'s entries in table order, which is the order its own `Traverser` yields.
+///
+/// A `ForwardingNode` declines the whole scan rather than being followed. A lookup can follow one
+/// safely — it re-derives a single bin — but a full scan spanning both tables would either duplicate
+/// the entries already moved or miss the ones not yet moved, and there is no way to tell from outside
+/// which happened. Falling back is the honest answer; guessing is not.
+async fn chm_entries(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    map: u64,
+) -> Result<Walked<Entries>, String> {
+    let table = match map_table(conn, ids, map, &["table"]).await? {
+        Walked::Read((t, _)) => t,
+        Walked::Declined(why) => return Ok(Walked::Declined(why)),
+    };
+    let counted = chm_size(conn, ids, map).await;
+    let Some(table) = table else {
+        return Ok(Walked::Read((Vec::new(), counted.unwrap_or(0))));
+    };
+    let n = conn.get_array_length(table).await.map_err(|e| format!("Failed to read the map's table: {e}"))?;
+    let cap = scan_cap();
+    let mut out = Vec::new();
+    let mut slot = 0i32;
+    while slot < n && out.len() < cap {
+        let chunk = TABLE_CHUNK.min(n - slot);
+        let heads = conn
+            .get_array_values(table, slot, chunk)
+            .await
+            .map_err(|e| format!("Failed to read the map's bins: {e}"))?;
+        if let Some(why) = chm_collect_bins(conn, ids, &heads, &mut out, cap).await? {
+            return Ok(Walked::Declined(why));
+        }
+        slot += chunk;
+    }
+    let len = match counted {
+        Some(s) => s,
+        // Without the counter there is no total to report, and reporting the walked count as the total
+        // would turn a truncated scan into a complete-looking one.
+        None if out.len() >= cap => {
+            return Ok(Walked::Declined(
+                "its baseCount/counterCells could not be read, so a truncated scan could not say how \
+                 much it left out"
+                    .to_string(),
+            ))
+        }
+        None => i32::try_from(out.len()).unwrap_or(i32::MAX),
+    };
+    Ok(Walked::Read((out, len)))
+}
+
+/// Collect one chunk of a `ConcurrentHashMap` table's bins into `out`. `Some(reason)` declines the
+/// whole scan; `None` means the chunk is done, whether or not it contributed anything.
+async fn chm_collect_bins(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    heads: &[jdwp_client::types::Value],
+    out: &mut Vec<(jdwp_client::types::Value, jdwp_client::types::Value)>,
+    cap: usize,
+) -> Result<Option<String>, String> {
+    for h in heads {
+        if out.len() >= cap {
+            break;
+        }
+        let Some(head_id) = as_object_id(h) else { continue };
+        let start = match chm_bin(conn, ids, head_id).await? {
+            Walked::Declined(why) => return Ok(Some(why)),
+            Walked::Read(Bin::Empty) => continue,
+            Walked::Read(Bin::Forward(_)) => return Ok(Some(chm_resizing_reason())),
+            Walked::Read(Bin::Chain(start)) => start,
+        };
+        if let Some(why) = bin_collect(conn, ids, start, "val", out, cap).await {
+            return Ok(Some(why));
+        }
+    }
+    Ok(None)
+}
+
+/// Why a whole-map scan gives up on a `ConcurrentHashMap` that is mid-resize.
+fn chm_resizing_reason() -> String {
+    "one of its bins had already been moved by a resize running now, and a scan spanning both tables \
+     would double-count or lose entries"
+        .to_string()
+}
+
+/// A bounded prefix of a recognised collection's elements, read by walking its fields (EVAL-10).
+///
+/// Keys are **rendered** with the caller's thread, exactly as the invoking path renders them, so the
+/// two agree line for line. That rendering may call `toString()` on a key object — ADR-0006's default,
+/// unchanged here. What this path removes is the invocation needed to *reach* the entries, which is
+/// the part that required a suspended thread.
+async fn structural_scan(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    id: u64,
+    layout: Layout,
+    thread_id: Option<u64>,
+    name: String,
+) -> Result<Walked<Scan>, String> {
+    let entries = match layout {
+        Layout::ArrayList => return array_list_scan(conn, ids, id, name).await,
+        Layout::HashMap => hash_map_entries(conn, ids, id).await?,
+        Layout::LinkedHashMap => linked_map_entries(conn, ids, id).await?,
+        Layout::ConcurrentHashMap => chm_entries(conn, ids, id).await?,
+    };
+    let (pairs, len) = match entries {
+        Walked::Read(v) => v,
+        Walked::Declined(why) => return Ok(Walked::Declined(why)),
+    };
+    let mut values = Vec::with_capacity(pairs.len());
+    let mut keys = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        keys.push(render_value(conn, &k, thread_id, 120).await);
+        values.push(v);
+    }
+    Ok(Walked::Read(Scan { values, keys, len, name }))
+}
+
+/// An `ArrayList`'s elements, bounded by `size` so the backing array's spare capacity never leaks.
+async fn array_list_scan(
+    conn: &mut jdwp_client::JdwpConnection,
+    ids: &mut FieldIds,
+    id: u64,
+    name: String,
+) -> Result<Walked<Scan>, String> {
+    let (arr, size) = match array_list_backing(conn, ids, id).await? {
+        Walked::Read(v) => v,
+        Walked::Declined(why) => return Ok(Walked::Declined(why)),
+    };
+    let take = size.min(SUBSCRIPT_SCAN_CAP);
+    let values = match (arr, take) {
+        (Some(a), t) if t > 0 => conn
+            .get_array_values(a, 0, t)
+            .await
+            .map_err(|e| format!("Failed to read the list's elements: {e}"))?,
+        _ => Vec::new(),
+    };
+    Ok(Walked::Read(Scan { values, keys: Vec::new(), len: size, name }))
+}
+
+/// Which path a collection read took to reach its values, so the reply can say (EVAL-10, #92).
+///
+/// A structural read and an invoking one differ in more than cost. A hand-rolled `Map` subclass or a
+/// `Collections.synchronizedMap` wrapper has different internals, so a caller reading an answer needs
+/// to know whether it came from a walk of a layout this server recognises or from the debuggee's own
+/// `get()`. And a walk takes **no lock**: reading a live `HashMap`'s table while another thread
+/// resizes it can see a torn state, which is acceptable for a diagnostic but has to be stated, because
+/// a value read that way is a sample rather than a transaction.
+#[derive(Default)]
+struct ReadPath {
+    notes: Vec<String>,
+}
+
+impl ReadPath {
+    /// Record that a recognised layout was walked.
+    fn walked(&mut self, layout: Layout, name: &str) {
+        self.push(format!(
+            "📐 read structurally: {name} was walked through its own fields ({}) — nothing was invoked \
+             in the debuggee and no thread had to be suspended. Nothing was locked either, so this is a \
+             SAMPLE of a live collection, not a transaction: a concurrent resize or write can make it \
+             inconsistent.",
+            layout.fields_walked()
+        ));
+    }
+
+    /// Record that the read fell back to invoking, and why.
+    fn invoked(&mut self, name: &str, why: &str) {
+        self.push(format!("⚙️ read by invoking in the debuggee (needs a suspended thread): {name} {why}."));
+    }
+
+    /// The reason an unrecognised implementation gets, which is the commonest one by far.
+    fn unrecognised(&mut self, name: &str) {
+        self.invoked(
+            name,
+            &format!("is not one of the layouts read structurally ({KNOWN_LAYOUTS}), so it fell back rather than guess at its internals"),
+        );
+    }
+
+    fn push(&mut self, note: String) {
+        if !self.notes.contains(&note) {
+            self.notes.push(note);
+        }
+    }
+
+    /// The notes as trailing lines, or nothing at all when no collection was read.
+    fn render(&self) -> String {
+        if self.notes.is_empty() {
+            return String::new();
+        }
+        format!("\n{}", self.notes.join("\n"))
+    }
+}
+
 /// What one scan of a container yielded.
 struct Scan {
     /// The elements read — for a `Map`, its *values*.
@@ -9818,54 +10724,71 @@ enum MapScan {
 
 /// Read a bounded prefix of an array's, collection's, or map's elements.
 ///
-/// A `Collection` needs a suspended thread (it calls `toArray()`); arrays don't. A `Map` needs one too,
-/// and costs the most: `entrySet()`, `toArray()`, then `getKey()`/`getValue()` per entry — which is why
-/// the scan cap matters more here than anywhere else.
+/// Arrays are read on the wire. A recognised [`Layout`] is **walked structurally**, so a slice or
+/// filter over a `HashMap`, `LinkedHashMap`, `ConcurrentHashMap` or `ArrayList` needs no suspended
+/// thread (EVAL-10). Anything else needs one: a `Collection` calls `toArray()`, and a `Map` costs the
+/// most — `entrySet()`, `toArray()`, then `getKey()`/`getValue()` per entry, which is why the scan cap
+/// matters more here than anywhere else.
 async fn scan_elements(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: Option<u64>,
     base: &jdwp_client::types::Value,
     label: &str,
     maps: MapScan,
+    path: &mut ReadPath,
 ) -> Result<Scan, String> {
     let id = as_object_id(base)
         .ok_or_else(|| format!("Cannot slice or filter '{label}' — it is null or a primitive"))?;
     let name = type_name_of(conn, id).await;
+    if base.tag == 91 {
+        return scan_array(conn, id, label, name).await;
+    }
 
-    let arr = if base.tag == 91 {
-        id
-    } else {
-        let tid = thread_id.ok_or_else(|| {
-            format!("Slicing or filtering '{label}' needs a suspended thread — it calls toArray() in the debuggee")
-        })?;
-        let type_id = conn
-            .get_object_reference_type(id)
-            .await
-            .map_err(|e| format!("Failed to resolve type of '{label}': {e}"))?;
-        match classify_container(conn, type_id, &name).await {
-            Some(ContainerKind::Collection) => invoke_no_arg(conn, id, type_id, tid, "toArray")
-                .await
-                .as_ref()
-                .and_then(as_object_id)
-                .ok_or_else(|| format!("toArray() on '{label}' returned nothing usable"))?,
-            Some(ContainerKind::Map) if maps == MapScan::Entries => {
-                return scan_map_entries(conn, id, type_id, tid, label, name).await
-            }
-            // A slice needs positional order, which a Map has none of.
-            Some(ContainerKind::Map) => {
-                return Err(format!(
-                    "'{label}' is a Map, so there is no order to slice. Use {label}[\"key\"] for one \
-                     entry, or a filter ({label}[?…]) which keeps the keys."
-                ))
-            }
-            _ => {
-                return Err(format!(
-                    "'{label}' is not sliceable — expected an array or a Collection, got {name}"
-                ))
-            }
+    let type_id = conn
+        .get_object_reference_type(id)
+        .await
+        .map_err(|e| format!("Failed to resolve type of '{label}': {e}"))?;
+    let mut declined = None;
+    if let Some(layout) = recognise_layout(conn, type_id).await {
+        // A Map has no positional order whichever way it is read, so the refusal comes before the walk
+        // rather than after it.
+        if layout.is_map() && maps == MapScan::Refuse {
+            return Err(no_order_to_slice(label));
         }
-    };
+        let mut ids = FieldIds::default();
+        match structural_scan(conn, &mut ids, id, layout, thread_id, name.clone()).await? {
+            Walked::Read(scan) => {
+                path.walked(layout, &name);
+                return Ok(scan);
+            }
+            Walked::Declined(why) => declined = Some(why),
+        }
+    }
+    match &declined {
+        Some(why) => path.invoked(&name, why),
+        None => path.unrecognised(&name),
+    }
+    let tid = thread_id.ok_or_else(|| {
+        format!(
+            "Slicing or filtering '{label}' needs a suspended thread — {name} is read by calling \
+             toArray() in the debuggee{}",
+            declined.map_or_else(
+                || format!(" (structural reads cover {KNOWN_LAYOUTS})"),
+                |why| format!(" ({name} {why})")
+            )
+        )
+    })?;
+    scan_by_invoking(conn, tid, id, type_id, label, name, maps).await
+}
 
+/// Read a bounded prefix of a real array — the shape every other path funnels into, since a
+/// `Collection` reaches one through `toArray()`.
+async fn scan_array(
+    conn: &mut jdwp_client::JdwpConnection,
+    arr: u64,
+    label: &str,
+    name: String,
+) -> Result<Scan, String> {
     let len =
         conn.get_array_length(arr).await.map_err(|e| format!("Failed to read length of '{label}': {e}"))?;
     let take = len.min(SUBSCRIPT_SCAN_CAP);
@@ -9877,6 +10800,44 @@ async fn scan_elements(
             .map_err(|e| format!("Failed to read elements of '{label}': {e}"))?
     };
     Ok(Scan { values, keys: Vec::new(), len, name })
+}
+
+/// The invoking half of [`scan_elements`], for a container whose runtime type is not a recognised
+/// [`Layout`]. Needs a suspended thread by definition — every route through it runs code in the
+/// debuggee.
+async fn scan_by_invoking(
+    conn: &mut jdwp_client::JdwpConnection,
+    tid: u64,
+    id: u64,
+    type_id: u64,
+    label: &str,
+    name: String,
+    maps: MapScan,
+) -> Result<Scan, String> {
+    match classify_container(conn, type_id, &name).await {
+        Some(ContainerKind::Collection) => {
+            let arr = invoke_no_arg(conn, id, type_id, tid, "toArray")
+                .await
+                .as_ref()
+                .and_then(as_object_id)
+                .ok_or_else(|| format!("toArray() on '{label}' returned nothing usable"))?;
+            scan_array(conn, arr, label, name).await
+        }
+        Some(ContainerKind::Map) if maps == MapScan::Entries => {
+            scan_map_entries(conn, id, type_id, tid, label, name).await
+        }
+        // A slice needs positional order, which a Map has none of.
+        Some(ContainerKind::Map) => Err(no_order_to_slice(label)),
+        _ => Err(format!("'{label}' is not sliceable — expected an array or a Collection, got {name}")),
+    }
+}
+
+/// Why a `Map` cannot be sliced, in the one wording both the structural and the invoking path use.
+fn no_order_to_slice(label: &str) -> String {
+    format!(
+        "'{label}' is a Map, so there is no order to slice. Use {label}[\"key\"] for one entry, or a \
+         filter ({label}[?…]) which keeps the keys."
+    )
 }
 
 /// Read a `Map`'s entries as (rendered key, value) pairs, so a filter over the values can still say
@@ -9943,8 +10904,10 @@ async fn apply_range(
     from: i64,
     to: i64,
     label: &str,
+    path: &mut ReadPath,
 ) -> Result<Resolved, String> {
-    let Scan { values, len, name, .. } = scan_elements(conn, thread_id, base, label, MapScan::Refuse).await?;
+    let Scan { values, len, name, .. } =
+        scan_elements(conn, thread_id, base, label, MapScan::Refuse, path).await?;
     if from < 0 {
         return Err(format!("Range start must not be negative in '{label}[{from}..{to}]'"));
     }
@@ -9975,8 +10938,9 @@ fn apply_filter_boxed<'a>(
     base: &'a jdwp_client::types::Value,
     predicate: &'a str,
     label: &'a str,
+    path: &'a mut ReadPath,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Resolved, String>> + Send + 'a>> {
-    Box::pin(apply_filter(conn, thread_id, frame, base, predicate, label))
+    Box::pin(apply_filter(conn, thread_id, frame, base, predicate, label, path))
 }
 
 /// `expr[?predicate]` — keep the elements the predicate holds for.
@@ -9987,6 +10951,7 @@ async fn apply_filter(
     base: &jdwp_client::types::Value,
     predicate: &str,
     label: &str,
+    path: &mut ReadPath,
 ) -> Result<Resolved, String> {
     // Prepare the predicate BEFORE reading any elements. Two reasons, one of them a correctness bug
     // found the hard way: `scan_elements` invokes `toArray()` in the debuggee, and JDWP invalidates a
@@ -9998,7 +10963,7 @@ async fn apply_filter(
     // A Map filters by its VALUES — `meters[?id.name == "x"]` reads naturally that way — and the
     // matching keys come along so the result can say which entry each survivor was.
     let Scan { values, keys, len, name } =
-        scan_elements(conn, thread_id, base, label, MapScan::Entries).await?;
+        scan_elements(conn, thread_id, base, label, MapScan::Entries, path).await?;
     let scanned = i32::try_from(values.len()).unwrap_or(i32::MAX);
     let is_map = !keys.is_empty();
 
@@ -10180,9 +11145,13 @@ async fn resolve_relative(
 ) -> Result<jdwp_client::types::Value, String> {
     let segs = parse_expr(expr)?;
     let mut current = base.clone();
+    // A local, discarded [`ReadPath`]: this resolves ONE ELEMENT of a scan, so a note here would be
+    // about the element's own nested collection and would repeat once per element. The note that
+    // matters — how the scanned container itself was read — is recorded by the caller.
+    let mut path = ReadPath::default();
     for seg in &segs {
         let member = resolve_member(conn, thread_id, frame, &current, seg).await?;
-        current = apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name)
+        current = apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name, &mut path)
             .await?
             .single("A filter predicate")?;
     }
@@ -10349,7 +11318,11 @@ async fn resolve_expression(
     frame: Option<&jdwp_client::thread::Frame>,
     expr: &str,
 ) -> Result<jdwp_client::types::Value, String> {
-    resolve_expression_multi(conn, thread_id, frame, expr).await?.single("This")
+    // A discarded [`ReadPath`]: these callers (conditions, `set_value` targets, call arguments, trace
+    // expressions) consume a value rather than print a reply, so there is nowhere to say which path a
+    // collection read took. `debug.evaluate` and `debug.evaluate_chain` keep theirs.
+    let mut path = ReadPath::default();
+    resolve_expression_multi(conn, thread_id, frame, expr, &mut path).await?.single("This")
 }
 
 async fn resolve_expression_multi(
@@ -10357,6 +11330,7 @@ async fn resolve_expression_multi(
     thread_id: Option<u64>,
     frame: Option<&jdwp_client::thread::Frame>,
     expr: &str,
+    path: &mut ReadPath,
 ) -> Result<Resolved, String> {
     let segs = parse_expr(expr)?;
     let Some(head_seg) = segs.first() else {
@@ -10394,7 +11368,7 @@ async fn resolve_expression_multi(
     let head_owner = segs
         .get(start.saturating_sub(1))
         .ok_or_else(|| "Internal error: head resolution consumed no segments".to_string())?;
-    match apply_subscripts(conn, thread_id, frame, current, &head_owner.subs, &head_owner.name).await? {
+    match apply_subscripts(conn, thread_id, frame, current, &head_owner.subs, &head_owner.name, path).await? {
         Resolved::One(v) => current = v,
         // A multi-value subscript must be the last thing in the expression.
         many @ Resolved::Many { .. } => {
@@ -10405,7 +11379,7 @@ async fn resolve_expression_multi(
     let last = segs.len().saturating_sub(1);
     for (i, seg) in segs.iter().enumerate().skip(start) {
         let member = resolve_member(conn, thread_id, frame, &current, seg).await?;
-        match apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name).await? {
+        match apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name, path).await? {
             Resolved::One(v) => current = v,
             many @ Resolved::Many { .. } => {
                 return if i < last { Err(multi_then_chain_error(&seg.name)) } else { Ok(many) };
@@ -10422,6 +11396,10 @@ struct ChainWalk {
     /// Kept so the report can say how many were never evaluated rather than leaving their absence to be
     /// read as "these were fine".
     total_links: usize,
+    /// How any collection link was read — structurally or by invoking (EVAL-10). A chain is where a
+    /// `[…]` subscript is most likely to sit, so the walk carries the same honesty the single-value
+    /// reply does.
+    path: ReadPath,
 }
 
 /// One link of a walked expression chain (EVAL-6).
@@ -10482,13 +11460,16 @@ async fn walk_expression_chain(
     // recognises is not `segs.len()`.
     let total_links = segs.len() + 1 - start;
     let mut steps = Vec::with_capacity(total_links);
+    let mut path = ReadPath::default();
     // A static head consumed a dotted class prefix as well as the member, so the label is all of it.
     let head_label =
         segs.get(..start).map_or_else(String::new, |s| s.iter().map(seg_label).collect::<Vec<_>>().join("."));
     let head_owner = segs
         .get(start.saturating_sub(1))
         .ok_or_else(|| "Internal error: head resolution consumed no segments".to_string())?;
-    match apply_subscripts(conn, thread_id, frame, current, &head_owner.subs, &head_owner.name).await? {
+    match apply_subscripts(conn, thread_id, frame, current, &head_owner.subs, &head_owner.name, &mut path)
+        .await?
+    {
         Resolved::One(v) => {
             steps.push(chain_step(conn, head_label, &v, max_len).await);
             current = v;
@@ -10500,7 +11481,7 @@ async fn walk_expression_chain(
                 rendered: "(several values — a slice or filter ends the chain)".to_string(),
                 is_null: false,
             });
-            return Ok(ChainWalk { steps, total_links });
+            return Ok(ChainWalk { steps, total_links, path });
         }
     }
 
@@ -10512,7 +11493,7 @@ async fn walk_expression_chain(
             break;
         }
         let member = resolve_member(conn, thread_id, frame, &current, seg).await?;
-        match apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name).await? {
+        match apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name, &mut path).await? {
             Resolved::One(v) => {
                 steps.push(chain_step(conn, seg_label(seg), &v, max_len).await);
                 current = v;
@@ -10523,11 +11504,11 @@ async fn walk_expression_chain(
                     rendered: "(several values — a slice or filter ends the chain)".to_string(),
                     is_null: false,
                 });
-                return Ok(ChainWalk { steps, total_links });
+                return Ok(ChainWalk { steps, total_links, path });
             }
         }
     }
-    Ok(ChainWalk { steps, total_links })
+    Ok(ChainWalk { steps, total_links, path })
 }
 
 /// Render one resolved link into a [`ChainStep`].
@@ -10605,6 +11586,7 @@ fn render_expression_chain(expr: &str, walk: &ChainWalk) -> String {
             );
         }
     }
+    out.push_str(&walk.path.render());
     out
 }
 
@@ -15423,5 +16405,42 @@ mod tests {
         assert_eq!(line_window(1000, Some(500), 100, 1), (500, 500));
         // The cap never widens a window the caller asked to be narrow.
         assert_eq!(line_window(1000, Some(500), 2, 400), (498, 502));
+    }
+
+    /// EVAL-10 (#92): the key hashes a structural lookup computes HERE, checked against the values
+    /// the JDK's own `hashCode()` produces.
+    ///
+    /// Worth a unit test rather than leaving it to the JVM suite, because this is the one piece of
+    /// the walk that reimplements the debuggee instead of reading it: get it wrong and a lookup
+    /// silently misses the bin and answers `null`, which reads exactly like an absent key.
+    #[test]
+    fn java_hashes_match_the_jdks_own() {
+        // "b".hashCode() and "hello".hashCode(), which are fixed by String's javadoc.
+        assert_eq!(java_hash(&ArgLit::Str("b".to_string())), Some(98));
+        assert_eq!(java_hash(&ArgLit::Str("hello".to_string())), Some(99_162_322));
+        assert_eq!(java_hash(&ArgLit::Str(String::new())), Some(0));
+        // The classic collision, and the construction `CollectionProbe` uses to treeify a bin: any
+        // concatenation of "Aa" and "BB" hashes alike.
+        assert_eq!(
+            java_hash(&ArgLit::Str("AaAaAaAa".to_string())),
+            java_hash(&ArgLit::Str("BBBBBBBB".to_string()))
+        );
+        // Integer.hashCode is the value; Long.hashCode is `(int)(v ^ (v >>> 32))`, which is where a
+        // sloppy shift or a sign-extended cast would show up.
+        assert_eq!(java_hash(&ArgLit::Int(-7)), Some(-7));
+        assert_eq!(java_hash(&ArgLit::Long(1)), Some(1));
+        assert_eq!(java_hash(&ArgLit::Long(1 << 32)), Some(1));
+        assert_eq!(java_hash(&ArgLit::Long(-1)), Some(0));
+        assert_eq!(java_hash(&ArgLit::Long(i64::MIN)), Some(i32::MIN));
+        assert_eq!(java_hash(&ArgLit::Bool(true)), Some(1231));
+        assert_eq!(java_hash(&ArgLit::Bool(false)), Some(1237));
+        // A key this cannot hash declines to the invoking path rather than scanning every bin.
+        assert_eq!(java_hash(&ArgLit::Null), None);
+        assert_eq!(java_hash(&ArgLit::Expr("other.key".to_string())), None);
+        // HashMap's spread folds the high half in; ConcurrentHashMap's also clears the sign bit, so
+        // no real entry can ever look like one of its reserved bin heads.
+        assert_eq!(hashmap_spread(0x1234_5678), 0x1234_5678 ^ 0x1234);
+        assert!(chm_spread(-1) >= 0);
+        assert!(chm_spread(i32::MIN) >= 0);
     }
 }

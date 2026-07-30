@@ -14,6 +14,7 @@
 //   - an inherited field (Order extends Record), which must show up alongside declared ones
 //   - a List<Line> with a mix of paid/unpaid and varying totals, for OBJ-2 slice/filter subscripts
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -87,6 +88,10 @@ public class DeepProbe {
         // OBJ-4: a Map whose VALUES have fields worth filtering on, so `byId[?qty > 3]` has real work
         // and the surviving entries have keys worth keeping.
         Map<String, Line> byId = new LinkedHashMap<>();
+        // EVAL-10 (#92): a Map that is NOT one of the layouts read structurally, wrapping one that is.
+        // A subscript on it therefore still has to invoke get() in the debuggee, which is what makes it
+        // the read-only refusal case now that `counts["a"]` is a plain field walk.
+        Map<String, Integer> wrappedCounts = Collections.synchronizedMap(counts);
         int threshold = 3;
 
         Order() {
