@@ -30,8 +30,16 @@ pub struct DebugSession {
     pub event_listener_task: Option<JoinHandle<()>>,
     /// Thread of the most recent suspension event — used to default `thread_id`.
     pub last_thread: Option<u64>,
-    /// Active single-step request id (must be cleared before the next resume).
-    pub pending_step: Option<i32>,
+    /// Active single-step request, as `(JDWP request id, the thread it was armed on)` — it must be
+    /// cleared before the next resume, or it re-fires the instant threads run again.
+    ///
+    /// The **thread** joined the tuple with SAFE-11, and it is a pair rather than two fields for the same
+    /// reason `suspended_since`/`suspended_cause` are set together: two fields that mean one thing drift,
+    /// which is the bug SAFE-5 fixed. `debug.resume_thread` needs the thread, because releasing one thread
+    /// that still has a step armed on it re-suspends it at the very next line — and JDWP's step events are
+    /// `SuspendPolicy::All`, so a per-thread resume would freeze the WHOLE VM. That is a new way to leave
+    /// the debuggee suspended, which is precisely what the resume-honesty matrix's `Freeze` list is for.
+    pub pending_step: Option<(i32, u64)>,
     /// When the VM last suspended; cleared on resume. Drives the watchdog.
     pub suspended_since: Option<std::time::Instant>,
     /// **Why** the VM is suspended, recorded at suspension time and cleared on resume.
@@ -41,6 +49,25 @@ pub struct DebugSession {
     /// the one whose freeze never got disarmed (SAFE-5). One authoritative field instead of two sources
     /// of truth, and it also lets a manual `debug.pause` be told apart from a stop-point hit (SAFE-4).
     pub suspended_cause: Option<SuspendCause>,
+    /// Threads this session is holding suspended **one at a time** (SAFE-11), keyed by thread id.
+    ///
+    /// Separate from [`suspended_since`](Self::suspended_since) on purpose, and the separation is the
+    /// whole design. That field means *the VM is stopped* — every thread, nobody's request served — and
+    /// `debug.continue` is what ends it. This one means *these N threads are stopped and the rest of the
+    /// JVM is serving normally*, which is a different fact, ends a different way, and has a different
+    /// blast radius. Collapsing them would make `debug.list_sessions` say `SUSPENDED` about a VM that is
+    /// running fine, and would make `debug.pause`'s idempotency check refuse a pause because one worker
+    /// was held.
+    ///
+    /// **It is bookkeeping, never the authority.** ADR-0003 rejected tracking our own suspend depth and
+    /// resuming that many times, because the count drifts the moment anything outside this session
+    /// suspends the same thread — another debugger, an IDE left attached, an `EventThread` event. So this
+    /// records *what this session asked for*, and every reply about whether a thread is actually running
+    /// still comes from `ThreadReference.SuspendCount`.
+    ///
+    /// A `BTreeMap` so listings and rescue notes name threads in a stable order rather than a hash order,
+    /// matching [`redefinitions`](Self::redefinitions).
+    pub thread_suspends: std::collections::BTreeMap<u64, ThreadSuspend>,
     pub watchdog_task: Option<JoinHandle<()>>,
     /// What the watchdog last did, if anything — surfaced in `list_stop_points` and `get_last_event`
     /// so a caller who was away learns the VM was auto-resumed and which stop point was disarmed (SAFE-2).
@@ -194,6 +221,29 @@ pub enum SuspendCause {
     /// `debug.pause` suspended every thread by hand. There is **no** stop point to disarm, so a
     /// watchdog resume here must not claim it failed to identify one (SAFE-4).
     ManualPause,
+}
+
+/// One thread `debug.suspend_thread` is holding (SAFE-11).
+#[derive(Debug, Clone)]
+pub struct ThreadSuspend {
+    /// The thread's name, read once when it was suspended.
+    ///
+    /// Kept rather than re-read because the rescue path needs it most and can afford it least: the
+    /// watchdog reporting "released 0x7f2c…" tells a caller nothing they can act on, and by the time it
+    /// fires the thread may be gone, so asking then would answer with an error instead of a name.
+    pub name: String,
+    /// When this session **first** suspended it — the age the watchdog measures against
+    /// `JDWP_WATCHDOG_SECS`, and the "held for" figure the listings show.
+    ///
+    /// Deliberately not refreshed by a second `debug.suspend_thread` on the same thread. The hazard the
+    /// watchdog exists for is how long a worker has been off the pool, and that clock started at the
+    /// first suspend; restarting it on every call would let a caller keep a thread frozen forever by
+    /// suspending it repeatedly.
+    pub since: std::time::Instant,
+    /// How many `debug.suspend_thread` calls this session has made against this thread without a
+    /// matching `debug.resume_thread`. Reported, never trusted — see
+    /// [`thread_suspends`](DebugSession::thread_suspends).
+    pub issued: u32,
 }
 
 /// One class this session redefined, and what is worth saying about it afterwards (SWAP-2).
@@ -969,6 +1019,7 @@ impl SessionManager {
             pending_step: None,
             suspended_since: None,
             suspended_cause: None,
+            thread_suspends: std::collections::BTreeMap::new(),
             watchdog_task: None,
             last_watchdog_note: None,
             last_watchdog_seq: None,

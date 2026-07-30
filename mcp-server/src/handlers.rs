@@ -151,6 +151,8 @@ impl RequestHandler {
         let args = call_params.arguments;
         let result = if let Some(r) = self.dispatch_control(name, args.clone()).await {
             r
+        } else if let Some(r) = self.dispatch_threads(name, args.clone()).await {
+            r
         } else if let Some(r) = self.dispatch_discovery(name, args.clone()).await {
             r
         } else if let Some(r) = self.dispatch_inspect(name, args).await {
@@ -193,6 +195,18 @@ impl RequestHandler {
             "debug.list_sessions" => self.handle_list_sessions().await,
             "debug.disconnect" => self.handle_disconnect(args).await,
             "debug.panic" => self.handle_panic(args).await,
+            _ => return None,
+        })
+    }
+
+    /// The per-thread suspend pair (SAFE-11). Its own group rather than two more arms on
+    /// [`dispatch_control`](Self::dispatch_control), which was already at the complexity budget — and the
+    /// line is a real one: these two are the only tools here that act on ONE thread's execution while
+    /// leaving the rest of the debuggee running.
+    async fn dispatch_threads(&self, name: &str, args: serde_json::Value) -> Option<Result<String, String>> {
+        Some(match name {
+            "debug.suspend_thread" => self.handle_suspend_thread(args).await,
+            "debug.resume_thread" => self.handle_resume_thread(args).await,
             _ => return None,
         })
     }
@@ -756,16 +770,25 @@ impl RequestHandler {
         let mut session = session_guard.lock().await;
 
         // Drop any pending single-step request first, or it would re-fire on resume.
-        if let Some(req) = session.pending_step.take() {
+        if let Some((req, _)) = session.pending_step.take() {
             let _ = session.connection.clear_step(req).await;
         }
         // "Continue" means the application actually runs again, so clear any counted suspend depth
         // rather than issuing one resume and hoping (SAFE-7).
         let note = resume_and_verify(&mut session).await?;
         session.mark_resumed();
+        // SAFE-11. `debug.continue` deliberately does NOT release a thread held by
+        // `debug.suspend_thread`, and this line is what makes that defensible rather than silent. The two
+        // are different counts with different remedies — this clears the VM's depth, `debug.resume_thread`
+        // clears a thread's — and a caller who froze one worker on purpose, then continued past a
+        // breakpoint, should not lose the worker they were reading. But an unmentioned held thread is the
+        // invisible suspension this whole issue exists to stop, so the reply names it, and says STILL
+        // suspended about the thread rather than about the VM.
+        let held = verify_thread_suspends(&mut session).await;
         drop(session);
 
-        Ok(note.map_or_else(|| "▶️  Execution resumed".to_string(), |n| format!("▶️  {n}")))
+        let base = note.map_or_else(|| "▶️  Execution resumed".to_string(), |n| format!("▶️  {n}"));
+        Ok(format!("{base}{held}"))
     }
 
     async fn handle_step_over(&self, args: serde_json::Value) -> Result<String, String> {
@@ -796,7 +819,7 @@ impl RequestHandler {
             .ok_or_else(|| "No thread to step. Pass thread_id, or hit a breakpoint first.".to_string())?;
 
         // One active step request at a time; clear the previous before setting a new one.
-        if let Some(req) = session.pending_step.take() {
+        if let Some((req, _)) = session.pending_step.take() {
             let _ = session.connection.clear_step(req).await;
         }
         let req = session
@@ -804,7 +827,7 @@ impl RequestHandler {
             .set_step(thread_id, depth)
             .await
             .map_err(|e| format!("Failed to set step: {e}"))?;
-        session.pending_step = Some(req);
+        session.pending_step = Some((req, thread_id));
         session.mark_resumed();
         session.connection.resume_all().await.map_err(|e| format!("Failed to resume for step: {e}"))?;
         drop(session);
@@ -819,7 +842,7 @@ impl RequestHandler {
             self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
-        if let Some(req) = session.pending_step.take() {
+        if let Some((req, _)) = session.pending_step.take() {
             let _ = session.connection.clear_step(req).await;
         }
         let n = session.breakpoints.len();
@@ -871,14 +894,41 @@ impl RequestHandler {
         // depth and report honestly if it couldn't (SAFE-7).
         let note = resume_and_verify(&mut session).await?;
         session.mark_resumed();
+        // SAFE-11: `resume_all_fully` clears the VM-WIDE depth, and stops as soon as the thread it probes
+        // reaches zero — a worker held by `debug.suspend_thread` can sit at a higher count than that and
+        // stay frozen through a panic that reported "resumed all threads". The panic button's whole
+        // promise is that the application is running afterwards, so per-thread suspends are released
+        // explicitly and named, rather than left to a VM-wide resume that was never counting them.
+        let (freed, stuck) = release_thread_suspends(&mut session, None).await;
         // Panic reads as "put everything back", and for stop points and suspension it is. It cannot
         // un-redefine a class, so it must say what it is leaving in place rather than let the caller infer
         // from a clean-looking reply that the JVM is as it found it (SWAP-2).
         let residue = describe_outstanding_redefinitions(&session.redefinitions);
         drop(session);
 
+        // Named rather than counted, for the reason the redefinition residue is: "released 2 thread(s)"
+        // leaves a caller who was holding one with no way to tell whether it was theirs.
+        let mut threads = String::new();
+        if !freed.is_empty() {
+            let _ = write!(
+                threads,
+                "\n   ▶️  Also released {} thread(s) held by debug.suspend_thread: {}",
+                freed.len(),
+                freed.join(", ")
+            );
+        }
+        if !stuck.is_empty() {
+            let _ = write!(
+                threads,
+                "\n   ⚠️  {} thread(s) are STILL suspended after {MAX_RESUME_ATTEMPTS} resumes each: {} \
+                 — something outside this session is holding them.",
+                stuck.len(),
+                stuck.join(", ")
+            );
+        }
+
         Ok(format!(
-            "🧯 Panic: cleared {} breakpoint(s){}{}{}{}{} and resumed all threads.{}{residue}",
+            "🧯 Panic: cleared {} breakpoint(s){}{}{}{}{} and resumed all threads.{}{threads}{residue}",
             n,
             if nf > 0 { format!(" + {nf} wildcard family(ies)") } else { String::new() },
             if np > 0 { format!(" + {np} deferred") } else { String::new() },
@@ -1099,6 +1149,13 @@ impl RequestHandler {
                 .await;
         let cost = session.connection.packets_sent().saturating_sub(before);
         let wire = wire_from.elapsed();
+        // SAFE-11: an invisible suspension is the kind that gets forgotten, and this listing is where a
+        // caller looks to find out what the JVM is doing. Read from session state, so it costs **zero**
+        // extra JDWP packets — which matters, because the cost line below would otherwise start lying
+        // about what the call spent, and because a listing on a 300-thread pool cannot afford a
+        // `SuspendCount` per row.
+        let held: std::collections::BTreeMap<u64, (String, std::time::Duration)> =
+            session.thread_suspends.iter().map(|(t, r)| (*t, (r.name.clone(), r.since.elapsed()))).collect();
         drop(session);
 
         let shown = rows.len();
@@ -1115,10 +1172,30 @@ impl RequestHandler {
         let mut output = format!("{shown}/{total} thread(s){note}:\n");
         output.push_str(&family_order_note(shown, &selection));
         for (tid, name, status) in &rows {
+            // The mark goes on the row rather than only in a footer, because the question a caller
+            // brings here — "which of these did I freeze?" — is per thread, and a count at the bottom
+            // of a 40-row listing answers it for none of them.
+            let mine = held.get(tid).map_or_else(String::new, |(_, since)| {
+                format!(" ⏸️ SUSPENDED BY YOU ({} ago, debug.resume_thread releases it)", ago(*since))
+            });
             let _ = match status {
-                Some(s) => writeln!(output, "0x{tid:x} {name} [{s}]"),
-                None => writeln!(output, "0x{tid:x} {name}"),
+                Some(s) => writeln!(output, "0x{tid:x} {name} [{s}]{mine}"),
+                None => writeln!(output, "0x{tid:x} {name}{mine}"),
             };
+        }
+        // Held threads the page did not show are the ones most likely to be forgotten, so they are named
+        // rather than left to a `limit` the caller chose for another reason.
+        let unshown: Vec<String> = held
+            .iter()
+            .filter(|(t, _)| !rows.iter().any(|(r, _, _)| r == *t))
+            .map(|(t, (n, since))| format!("0x{t:x} \"{n}\" ({} ago)", ago(*since)))
+            .collect();
+        if !unshown.is_empty() {
+            let _ = writeln!(
+                output,
+                "⏸️  Also held by debug.suspend_thread but not on this page: {}",
+                unshown.join(", ")
+            );
         }
         if hidden > 0 {
             let _ = writeln!(
@@ -1610,6 +1687,190 @@ impl RequestHandler {
         ))
     }
 
+    /// SAFE-11: freeze **one** thread, so a frame becomes evaluable without stopping the JVM.
+    ///
+    /// `ThreadReference.Suspend` had a constant in the command table and no call sites, which meant every
+    /// capability gated on "needs a suspended thread" — `debug.evaluate` with a method call, `set_value`
+    /// on a local, `force_return`, `pop_frame` — was reachable only through a whole-VM freeze. On the
+    /// shared instance this tool exists for, that is a cost nobody agreed to, so those capabilities were
+    /// effectively unreachable rather than merely expensive.
+    ///
+    /// Four things have to happen before the Suspend goes out, and each is a trap this repo has been
+    /// bitten by:
+    ///
+    /// 1. **Finished and vanished are different answers** (`CONTEXT.md`, and DUMP-4/#47 is what happened
+    ///    when a reply confused them). A finished thread is nameable and never suspendable; a vanished
+    ///    one has no identity left at all. `HotSpot` answers `INVALID_THREAD` for the first, which reads
+    ///    as "you typed the id wrong" and is not what happened — so both are classified here rather than
+    ///    passed through.
+    /// 2. **Suspends are counted** (ADR-0003), so the depth is read back from the JVM rather than
+    ///    assumed to be 1. A thread already held by a stop point or a `debug.pause` lands at 2, and a
+    ///    caller told "suspended" would then be surprised by a resume that does not resume.
+    /// 3. **The watchdog covers this**, on the same `JDWP_WATCHDOG_SECS` timer as a whole-VM freeze — see
+    ///    ADR-0021 for why a per-thread suspend is less harmful but not harmless. The reply states the
+    ///    number, exactly as `debug.pause` does.
+    /// 4. **A suspended thread does not make its whole world readable.** Its own frames and its own lock
+    ///    set, yes; other threads' frames and the monitor graph still need those threads suspended, which
+    ///    is `debug.thread_dump {suspend:true}`. The reply says so, because the natural reading of
+    ///    "suspended" is that the JVM is now still, and it is not.
+    async fn handle_suspend_thread(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::SuspendThreadArgs = crate::args::parse(&args)?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+
+        let tid =
+            crate::args::parse_thread_id(Some(&a.thread_id)).ok_or_else(|| bad_thread_id(&a.thread_id))?;
+
+        let name = session.connection.get_thread_name(tid).await.ok();
+        let (status, already) = match classify_thread(&mut session.connection, tid).await {
+            ThreadLiveness::Vanished => return Err(vanished_thread_note(tid)),
+            ThreadLiveness::Finished => return Err(finished_thread_note(tid, name.as_deref())),
+            ThreadLiveness::Unreadable(e) => {
+                return Err(format!(
+                    "Could not read thread 0x{tid:x}'s status, so it was NOT suspended: {e}\n   \
+                     Nothing was sent. debug.list_threads re-reads the JVM's own list."
+                ));
+            }
+            ThreadLiveness::Live(ts, ss) => (ts, ss),
+        };
+
+        session
+            .connection
+            .suspend_thread(tid)
+            .await
+            .map_err(|e| format!("Failed to suspend thread 0x{tid:x}: {e}"))?;
+
+        // The JVM is the authority on the depth, never our own count (ADR-0003's rejected alternative).
+        let depth = session.connection.suspend_count(tid).await.unwrap_or(-1);
+        let label = name.clone().unwrap_or_else(|| "?".to_string());
+        let entry = session.thread_suspends.entry(tid).or_insert_with(|| crate::session::ThreadSuspend {
+            name: label.clone(),
+            since: std::time::Instant::now(),
+            issued: 0,
+        });
+        entry.issued += 1;
+        let ours = entry.issued;
+        let secs = watchdog_secs();
+        let vm_held = session.suspended_cause;
+        drop(session);
+
+        Ok(render_thread_suspend(&ThreadSuspendReply {
+            tid,
+            name: &label,
+            depth,
+            ours,
+            secs,
+            vm_held,
+            status: thread_status_name(status),
+            was_already_suspended: already != 0,
+        }))
+    }
+
+    /// SAFE-11's other half: give one suspended thread back.
+    ///
+    /// **One call, one decrement** — and that is a decision rather than an oversight. ADR-0003's rejected
+    /// alternative was tracking our own suspend depth and resuming that many times, on the grounds that
+    /// the count drifts the moment anything outside this session touches the same thread. So this issues
+    /// exactly one `ThreadReference.Resume`, then **asks the JVM** whether the thread is running, and says
+    /// out loud when it is not. A caller who suspended twice gets told they are one call short instead of
+    /// being told they succeeded.
+    ///
+    /// The word `STILL suspended` in the failure reply is load-bearing: it is what the resume-honesty
+    /// matrix reads to tell an honest failure from a false success.
+    async fn handle_resume_thread(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::ResumeThreadArgs = crate::args::parse(&args)?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+
+        let tid = match a.thread_id.as_deref() {
+            Some(raw) => crate::args::parse_thread_id(Some(raw)).ok_or_else(|| bad_thread_id(raw))?,
+            // Defaulting is safe in exactly one shape — one held thread — and guessing among several
+            // would resume a worker the caller is still reading. So the ambiguous case lists them.
+            None => match session.thread_suspends.len() {
+                0 => return Err(nothing_held_note(session.suspended_cause)),
+                1 => *session.thread_suspends.keys().next().unwrap_or(&0),
+                _ => return Err(which_thread_note(&session.thread_suspends)),
+            },
+        };
+
+        // A thread that ended while we held it is not an error to hide: the bookkeeping has to go, and
+        // the reading must be the right one of the two (DUMP-4).
+        let gone = match classify_thread(&mut session.connection, tid).await {
+            ThreadLiveness::Vanished => Some(vanished_thread_note(tid)),
+            ThreadLiveness::Finished => {
+                let name = session.connection.get_thread_name(tid).await.ok();
+                Some(finished_thread_note(tid, name.as_deref()))
+            }
+            ThreadLiveness::Live(_, _) | ThreadLiveness::Unreadable(_) => None,
+        };
+        if let Some(note) = gone {
+            let held = session.thread_suspends.remove(&tid).is_some();
+            drop(session);
+            return Err(format!(
+                "{note}\n   {}",
+                if held {
+                    "This session was holding it suspended; that record has been dropped. A thread that \
+                     has ended cannot hold anyone up, so there is nothing left to release."
+                } else {
+                    "This session was not holding it suspended either."
+                }
+            ));
+        }
+
+        // A step armed on THIS thread must go before the resume, or the thread runs one line and stops
+        // again — and JDWP step events are `SuspendPolicy::All`, so this tool would then have frozen the
+        // WHOLE VM while reporting that it released one worker. `debug.continue`, `debug.panic` and the
+        // watchdog have always done this; the per-thread door needed it too, and the resume-honesty
+        // matrix's `(Step, ResumeThread)` cell is what says so out loud. A step on a DIFFERENT thread is
+        // left alone: it is not in the way of this thread, and dropping it would silently cancel
+        // somebody's step.
+        let dropped_step = match session.pending_step {
+            Some((req, owner)) if owner == tid => {
+                let _ = session.connection.clear_step(req).await;
+                session.pending_step = None;
+                true
+            }
+            _ => false,
+        };
+
+        session
+            .connection
+            .resume_thread(tid)
+            .await
+            .map_err(|e| format!("Failed to resume thread 0x{tid:x}: {e}"))?;
+        let left = session.connection.suspend_count(tid).await.unwrap_or(0);
+
+        let name = session.thread_suspends.get(&tid).map_or_else(
+            || format!("0x{tid:x}"),
+            |r| format!("0x{tid:x} \"{}\" (held {})", r.name, ago(r.since.elapsed())),
+        );
+        // Drop our claim by one. When our own count reaches zero the entry goes, even if the JVM still
+        // reports depth — whatever is left is not ours, and saying otherwise would put this session's
+        // name on somebody else's suspension.
+        if let Some(rec) = session.thread_suspends.get_mut(&tid) {
+            rec.issued = rec.issued.saturating_sub(1);
+            if rec.issued == 0 {
+                session.thread_suspends.remove(&tid);
+            }
+        }
+        let vm_held = session.suspended_cause;
+        drop(session);
+
+        Ok(format!(
+            "{}{}",
+            render_thread_resume(&name, left, vm_held),
+            if dropped_step {
+                "\n   A pending single step on this thread was dropped first — it would have re-stopped \
+                 the thread on the next line, and a step event suspends every thread. Arm another with \
+                 debug.step_over once it is suspended again."
+            } else {
+                ""
+            }
+        ))
+    }
+
     async fn handle_disconnect(&self, args: serde_json::Value) -> Result<String, String> {
         let target = match args.get("session_id").and_then(|v| v.as_str()) {
             Some(s) => Some(s.to_string()),
@@ -1628,12 +1889,20 @@ impl RequestHandler {
         let safety = if let Some(guard) = self.session_manager.get_session_by_id(&session_id).await {
             let mut session = guard.lock().await;
             let was_suspended = session.suspended_since.is_some();
+            // SAFE-11. `VirtualMachine.Dispose` resumes threads suspended by the THREAD-level command as
+            // many times as necessary as well as those suspended VM-wide — that is the spec's own
+            // wording, and the resume-honesty matrix asserts it against the probe's ticks rather than
+            // taking it on trust. So there is nothing extra to send; what there is to do is stop
+            // claiming to hold threads we no longer hold, and tell the caller which ones went.
+            let held: Vec<String> =
+                session.thread_suspends.values().map(|r| format!("\"{}\"", r.name)).collect();
+            session.thread_suspends.clear();
             let stops = session.breakpoints.len()
                 + session.pending_breakpoints.len()
                 + session.exception_requests.len()
                 + session.watchpoints.len()
                 + session.pattern_sets.len();
-            if let Some(req) = session.pending_step.take() {
+            if let Some((req, _)) = session.pending_step.take() {
                 let _ = session.connection.clear_step(req).await;
             }
             let note = if session.connection.dispose().await.is_ok() {
@@ -1657,7 +1926,16 @@ impl RequestHandler {
             // often the whole point of the run.
             let launched = end_launched_jvm(&mut session).await;
             drop(session);
-            Some((note, was_suspended, format!("{residue}{launched}")))
+            let threads = if held.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n   {} thread(s) this session had suspended one at a time were released too: {}",
+                    held.len(),
+                    held.join(", ")
+                )
+            };
+            Some((note, was_suspended, format!("{threads}{residue}{launched}")))
         } else {
             None
         };
@@ -2376,7 +2654,7 @@ async fn set_field_by_path(
 
     Err(instance_err.map_or_else(
         || format!(
-            "Could not write '{target}': '{container_expr}' is not a loaded class, and there's no suspended thread to resolve it as an object."
+            "Could not write '{target}': '{container_expr}' is not a loaded class, and there's no suspended thread to resolve it as an object. {HOW_TO_SUSPEND}."
         ),
         |e| format!(
             "Could not write '{target}': '{container_expr}' didn't resolve to an object ({e}) and isn't a loaded class."
@@ -3432,6 +3710,26 @@ fn render_session_line(
         stops,
         s.connection.packets_sent(),
     );
+    // SAFE-11. Deliberately NOT folded into `state` above: `SUSPENDED` there means the whole VM is
+    // stopped and nobody's requests are being served, and a session holding one worker while the JVM
+    // serves normally is a different fact with a different remedy (debug.resume_thread, not
+    // debug.continue). Shown for every session rather than only the current one, for the same reason the
+    // redefinition residue is: a session somebody else walked away from is the case that matters, and
+    // this listing is the only place a third party can discover that a worker is frozen.
+    if !s.thread_suspends.is_empty() {
+        const NAMED: usize = 3;
+        let oldest = s.thread_suspends.values().map(|r| r.since.elapsed()).max().unwrap_or_default();
+        let names: Vec<&str> = s.thread_suspends.values().take(NAMED).map(|r| r.name.as_str()).collect();
+        let rest = s.thread_suspends.len().saturating_sub(names.len());
+        let _ = write!(
+            line,
+            ", ⏸️ {} thread(s) suspended by you: {}{} (oldest {} ago)",
+            s.thread_suspends.len(),
+            names.join(", "),
+            if rest > 0 { format!(" +{rest} more") } else { String::new() },
+            ago(oldest)
+        );
+    }
     // LAUNCH-1: whether this JVM is OURS is the single fact that decides how the rest of the session may
     // behave — freely suspendable, and terminated on disconnect — so it belongs on the line that identifies
     // the session, not only in the launch reply nobody re-reads.
@@ -7892,6 +8190,67 @@ fn stop_point_id(session: &crate::session::DebugSession, req: i32) -> Option<Str
         .or_else(|| session.method_exits.iter().find(|(_, m)| m.request_id == hit).map(|(k, _)| k.clone()))
 }
 
+/// How to *get* a suspended thread, named in one place because a dozen refusals need to say it (SAFE-11).
+///
+/// The remedies are not equal and the order is the whole point. Until SAFE-11 these refusals named only
+/// `debug.pause` or "hit a breakpoint" — one a whole-VM freeze, the other a wait for traffic through a
+/// line you had to guess at — so the capabilities gated on a suspended thread advertised the most
+/// expensive route to themselves, and on the shared instance this tool exists for that reads as "not
+/// available". `debug.suspend_thread` costs one worker, which is the difference between a capability a
+/// caller can reach and one they cannot.
+const HOW_TO_SUSPEND: &str = "debug.suspend_thread with a thread_id freezes ONE thread and leaves the \
+                              rest of the JVM serving (debug.list_threads has the ids); a stop point \
+                              hit or debug.pause also gives you one, and both cost more";
+
+/// The same question for the operations that INVOKE, where the answer is different and narrower.
+///
+/// Kept apart from [`HOW_TO_SUSPEND`] rather than merged with a caveat, because merging them is how the
+/// old wording went wrong: one sentence covering "any suspended thread" and "an event-suspended thread"
+/// has to be true of the stricter case to be true at all, and it was not.
+const HOW_TO_SUSPEND_FOR_AN_INVOKE: &str =
+    "this one INVOKES a method, and JDWP only allows that on a thread suspended BY AN EVENT — so a \
+     suspending stop point on the code you want to ask about, not debug.suspend_thread and not \
+     debug.pause (measured: both answer INVALID_THREAD). Reads of the frame — locals, fields, \
+     expand_objects — need none of that";
+
+/// What an invocation failure means when the JVM answers `INVALID_THREAD` (SAFE-11).
+///
+/// **Measured, not read off the spec** (JDK 21, `SuspendProbe`): the same thread id that had just
+/// answered `ThreadReference.Frames` with a full stack and readable locals answered `INVALID_THREAD` to
+/// `ClassType.InvokeMethod`. So the error does not mean what it says — the id is fine. JDWP permits
+/// invocation only on a thread suspended **by an event**, which is the spec's own wording ("Method
+/// invocation can occur only if the specified thread has been suspended by an event. Method invocation
+/// is not supported when the target VM has been suspended by the front-end"), and `HotSpot` enforces it
+/// by having no invoke slot for a thread that is not parked in its event handler.
+///
+/// Three consequences a caller has to be told, because none of them is guessable from the error:
+///
+/// - `debug.suspend_thread` cannot unlock an invocation. It unlocks everything else about the frame —
+///   the stack, the locals, `expand_objects`, `set_value` on a local, the thread's own monitors — all
+///   measured against this probe.
+/// - **Neither can `debug.pause`**, and that was true before SAFE-11 existed. The refusals used to say
+///   "pause one or hit a breakpoint first", and half of that advice never worked: a whole-VM front-end
+///   suspend is exactly the case the spec excludes. So the expensive remedy this issue set out to
+///   replace was not merely expensive, it was wrong.
+/// - A stop point hit is the remedy, and `trace:true` is not — a traced hit resumes immediately, so
+///   there is no suspended frame left to invoke against.
+const INVOKE_NEEDS_AN_EVENT: &str =
+    "\n   The JVM answered INVALID_THREAD, which here does NOT mean the id was wrong: JDWP allows a \
+     method to be invoked only on a thread suspended BY AN EVENT — a stop point hit or a step landing. \
+     Neither debug.suspend_thread nor debug.pause qualifies (measured, and it is the spec's own rule), \
+     so an invocation needs a suspending stop point on the code you want to ask about. Everything that \
+     does NOT invoke still works on a thread you suspended: the stack and its locals, expand_objects \
+     (which reads fields), and debug.set_value on a local.";
+
+/// Append [`INVOKE_NEEDS_AN_EVENT`] when a failed invocation was refused for that reason, so every
+/// invoking path explains it the same way instead of passing a wire error through.
+const fn invoke_hint(e: &jdwp_client::JdwpError) -> &'static str {
+    match e {
+        jdwp_client::JdwpError::JdwpErrorCode(10, _) => INVOKE_NEEDS_AN_EVENT,
+        _ => "",
+    }
+}
+
 /// Upper bound on resume attempts when clearing a suspend depth (SAFE-7). A depth above this means
 /// something is suspending in a loop, which is worth reporting rather than spinning on.
 const MAX_RESUME_ATTEMPTS: u32 = 8;
@@ -7928,6 +8287,356 @@ async fn resume_and_verify(session: &mut crate::session::DebugSession) -> Result
     Ok((issued > 1).then(|| format!("cleared a suspend depth of {issued}")))
 }
 
+/// What the debuggee says about one thread's existence — **three** answers, not two.
+///
+/// `CONTEXT.md` keeps **Finished** and **Vanished** apart, and DUMP-4 (#47) is what happened when a reply
+/// did not: a finished thread is still a row the debugger can name and describe and can *never* suspend,
+/// while a vanished one has no identity left to describe at all. They also reach us differently —
+/// `ThreadReference.Status` answers `ZOMBIE` for the first and `INVALID_OBJECT` for the second — so the
+/// distinction is available, and collapsing it would be a choice.
+enum ThreadLiveness {
+    /// Alive, carrying `(threadStatus, suspendStatus)` exactly as the JVM gave them.
+    Live(i32, i32),
+    /// Run to completion. JDWP still answers while the debugger holds the `Thread` object.
+    Finished,
+    /// The id is no longer valid. A thread id is a weak reference, so on a pool that retires workers
+    /// this is the ordinary case rather than the exotic one.
+    Vanished,
+    /// Neither reading is established — the status read failed for some other reason. Its own arm
+    /// because "we could not look" is not "it is gone", and guessing here would invent the very finding
+    /// DUMP-4 warns about.
+    Unreadable(String),
+}
+
+/// Ask the debuggee which of the three a thread id is.
+async fn classify_thread(conn: &mut jdwp_client::JdwpConnection, tid: u64) -> ThreadLiveness {
+    match conn.get_thread_status(tid).await {
+        // 0 is ZOMBIE — see `thread_status_name`.
+        Ok((0, _)) => ThreadLiveness::Finished,
+        Ok((ts, ss)) => ThreadLiveness::Live(ts, ss),
+        Err(jdwp_client::JdwpError::JdwpErrorCode(code, _)) if code == 20 || code == 10 => {
+            ThreadLiveness::Vanished
+        }
+        Err(e) => ThreadLiveness::Unreadable(e.to_string()),
+    }
+}
+
+/// The refusal for an id that is not a thread id at all, kept in one place so both new tools word it the
+/// same way. Deliberately names where ids come from: the format is hex and every listing prints it.
+fn bad_thread_id(raw: &str) -> String {
+    format!(
+        "thread_id '{raw}' is not a thread id. They are hex, as debug.list_threads and \
+         debug.thread_dump print them — 0x7f2c1a0b3800. debug.list_threads {{name_filter:\"worker\"}} \
+         is the usual way to find the one you want."
+    )
+}
+
+/// The **vanished** reading (`CONTEXT.md`): listed once, already collected.
+fn vanished_thread_note(tid: u64) -> String {
+    format!(
+        "Thread 0x{tid:x} has VANISHED — the JVM no longer recognises the id, so there is nothing to \
+         name, describe or suspend. A thread id is a weak reference, so on a pool that retires workers \
+         this is ordinary rather than exotic: the id was valid when it was listed and the thread ended \
+         between then and now. Re-read debug.list_threads and pick a current one. This is NOT the same \
+         as a finished thread, which is still a row you can read."
+    )
+}
+
+/// The **finished** reading (`CONTEXT.md`): run to completion, still nameable, never suspendable.
+fn finished_thread_note(tid: u64, name: Option<&str>) -> String {
+    format!(
+        "Thread 0x{tid:x}{} has FINISHED — it ran to completion, and the JVM answers ZOMBIE for it while \
+         the debugger still holds its Thread object. It can be named and described but never suspended, \
+         so there is no frame here to evaluate against and nothing this call could unlock. Pick a running \
+         thread from debug.list_threads. This is NOT the same as a vanished thread, whose id is gone \
+         entirely.",
+        name.map_or_else(String::new, |n| format!(" \"{n}\""))
+    )
+}
+
+/// `debug.resume_thread` with no argument and nothing held.
+fn nothing_held_note(vm_held: Option<crate::session::SuspendCause>) -> String {
+    let vm = match vm_held {
+        Some(crate::session::SuspendCause::ManualPause) => {
+            "\n   The whole VM is suspended by an earlier debug.pause, which is a different subject: \
+             debug.continue is what clears that, and it releases every thread at once."
+        }
+        Some(crate::session::SuspendCause::StopPoint(_)) => {
+            "\n   The whole VM is suspended at a stop point, which is a different subject: \
+             debug.continue is what clears that, and it releases every thread at once."
+        }
+        None => "",
+    };
+    format!(
+        "This session is not holding any thread with debug.suspend_thread, so there is nothing for \
+         debug.resume_thread to release.{vm}"
+    )
+}
+
+/// `debug.resume_thread` with no argument and several threads held — list them rather than pick one.
+fn which_thread_note(held: &std::collections::BTreeMap<u64, crate::session::ThreadSuspend>) -> String {
+    let mut out = format!(
+        "This session is holding {} threads suspended, so thread_id is required — resuming the wrong \
+         one lets a worker you are still reading run away. Held now:\n",
+        held.len()
+    );
+    for (tid, rec) in held {
+        let _ = writeln!(out, "   0x{tid:x} \"{}\" — held {}", rec.name, ago(rec.since.elapsed()));
+    }
+    out
+}
+
+/// Everything `debug.suspend_thread`'s reply is built from, gathered so the renderer takes one argument
+/// instead of six (clippy's `too_many_arguments`, and the fields document themselves).
+struct ThreadSuspendReply<'a> {
+    tid: u64,
+    name: &'a str,
+    /// The JVM's own `SuspendCount` after the suspend — `-1` when it could not be read.
+    depth: i32,
+    /// How many `debug.suspend_thread` calls this session has outstanding on the thread.
+    ours: u32,
+    secs: u64,
+    vm_held: Option<crate::session::SuspendCause>,
+    /// The thread's `threadStatus` as it was read **before** the suspend — what it was doing when we
+    /// froze it, which decides how much of this reply is a warning. `monitor` is the one that matters:
+    /// a thread blocked entering a lock, or one holding one, is the deadlock case below.
+    status: &'static str,
+    /// Whether the JVM already reported it suspended before this call. Worth saying, because it means
+    /// the depth this reply quotes was not built here.
+    was_already_suspended: bool,
+}
+
+/// Render `debug.suspend_thread`'s reply.
+///
+/// Three things it must say, in this order, because each is a way the call has surprised somebody:
+/// what is now readable, what is **not** (a suspended thread does not still the JVM around it), and how
+/// this ends if the caller walks away.
+fn render_thread_suspend(r: &ThreadSuspendReply) -> String {
+    let mut out = format!(
+        "⏸️  Suspended thread 0x{:x} \"{}\" — ONLY this thread. Every other thread in the JVM is still \
+         running and still serving requests.\n",
+        r.tid, r.name
+    );
+    match r.depth {
+        // Depth 1 and it is our first suspend: the simple case, and the one the caller expects.
+        1 => out.push_str("   Suspend depth 1 — one debug.resume_thread gives it back.\n"),
+        d if d > 1 => {
+            let _ = writeln!(
+                out,
+                "   ⚠️  Suspend depth {d}, not 1 — JDWP counts suspends, so this thread needs {d} \
+                 resumes before it runs. {} debug.resume_thread decrements ONE at a time and tells you \
+                 what is left.",
+                if r.ours > 1 {
+                    format!("{} of them are this session's debug.suspend_thread calls;", r.ours)
+                } else {
+                    "Something else is holding it too — a stop point that suspended it, a debug.pause, \
+                     or another debugger;"
+                        .to_string()
+                }
+            );
+        }
+        // Below 1 means the count could not be read, or the JVM disagrees with the command we just sent.
+        _ => out.push_str(
+            "   ⚠️  Could not read this thread's suspend count back, so the depth is unknown — check \
+             with debug.list_threads before relying on the frame.\n",
+        ),
+    }
+    if r.was_already_suspended {
+        out.push_str(
+            "   It was ALREADY suspended before this call, so the depth above was not built here.\n",
+        );
+    }
+    // What follows was MEASURED against `SuspendProbe` on JDK 21 rather than inferred, because the
+    // obvious inference is wrong in both directions: a suspended thread reads more than you would guess
+    // (a whole stack of locals, a field walk through a LinkedHashMap's internals) and invokes nothing at
+    // all. Getting this paragraph wrong would be the SAFE-11 version of every bug in this file's
+    // history — a tool that says it did something it did not.
+    let _ = write!(
+        out,
+        "   It was [{}] when it stopped.\n   NOW READABLE on this thread: debug.get_stack with its \
+         locals, debug.evaluate of a local or a field, expand_objects (it walks fields and invokes \
+         nothing), debug.set_value on a local, and this thread's own monitors via debug.thread_dump.\n",
+        r.status
+    );
+    out.push_str(
+        "   NOT UNLOCKED — method INVOCATION. JDWP allows an invoke only on a thread suspended by an \
+         EVENT, so a Map subscript, a getter, .toArray() and a toString() all answer INVALID_THREAD \
+         here, and debug.pause does not help either: only a suspending stop point does. Nor are other \
+         threads' frames or the monitor GRAPH — a lock cycle needs the threads on both ends suspended, \
+         which is debug.thread_dump with suspend:true.\n",
+    );
+    // A thread parked in `Thread.sleep`, a socket read or any other native poll has a native top frame,
+    // and both of these operate on the top frame — so they answer OPAQUE_FRAME (measured). Most idle
+    // pool workers are exactly that, which makes this the common case rather than the exotic one.
+    if matches!(r.status, "sleeping" | "wait" | "monitor") {
+        out.push_str(
+            "   Its top frame is almost certainly native ([sleeping]/[wait] threads are parked inside \
+             the JVM), so debug.force_return and debug.pop_frame will answer OPAQUE_FRAME — they act on \
+             the top frame, and a native one cannot be popped. Reading and writing locals in the Java \
+             frames below it works: pass frame_index (debug.get_stack numbers them).\n",
+        );
+    }
+    // The deadlock this makes easy to reach deliberately: an invocation runs ON this thread, so if the
+    // invoked code needs a lock this thread is holding or waiting for, it can never complete. The
+    // invocation budget bounds how long YOU wait, not the debuggee — JDWP has no cancel — so say it here
+    // rather than let a caller discover it as a hang. `monitor` is the state where it is likely rather
+    // than merely possible.
+    if r.status == "monitor" {
+        out.push_str(
+            "   ⚠️  It is BLOCKED ON A MONITOR. Two consequences: other threads waiting for whatever it \
+             holds are stalled for as long as you hold it, and a debug.evaluate that INVOKES a method \
+             runs on this thread, so an invocation needing that same lock cannot complete. The \
+             invocation budget (2s) returns control to YOU; it does not cancel anything in the JVM. \
+             Prefer expand_objects:true, which reads fields and invokes nothing.\n",
+        );
+    }
+    if let Some(cause) = r.vm_held {
+        let _ = writeln!(
+            out,
+            "   Note: the whole VM is ALSO suspended ({}), so \"the rest of the JVM is running\" is not \
+             true right now — debug.continue is what ends that.",
+            match cause {
+                crate::session::SuspendCause::ManualPause => "by an earlier debug.pause",
+                crate::session::SuspendCause::StopPoint(_) => "at a stop point",
+            }
+        );
+    }
+    let _ = write!(
+        out,
+        "   {}",
+        if r.secs == 0 {
+            "⚠️ The watchdog is disabled (JDWP_WATCHDOG_SECS=0), so nothing will release this thread but \
+             you: debug.resume_thread, debug.panic or debug.disconnect."
+                .to_string()
+        } else {
+            format!(
+                "The watchdog releases it after {}s if you don't (JDWP_WATCHDOG_SECS) — a suspended \
+                 worker holding a monitor can stall a pool, so this is not a freeze you can leave lying \
+                 around.",
+                r.secs
+            )
+        }
+    );
+    out
+}
+
+/// Render `debug.resume_thread`'s reply. `left` is the JVM's own count *after* the resume, which is the
+/// only thing that decides which of these two answers is true.
+fn render_thread_resume(name: &str, left: i32, vm_held: Option<crate::session::SuspendCause>) -> String {
+    if left <= 0 {
+        return format!(
+            "▶️  Resumed thread {name} — its suspend count is 0, so it is running again.\n   Any frame \
+             id or variable you read from it is now stale: the thread has moved on."
+        );
+    }
+    let vm = match vm_held {
+        Some(crate::session::SuspendCause::ManualPause) => {
+            " At least one of them is the debug.pause holding the whole VM — debug.continue clears that, \
+             and this tool cannot."
+        }
+        Some(crate::session::SuspendCause::StopPoint(_)) => {
+            " At least one of them is the stop point holding the whole VM — debug.continue clears that, \
+             and this tool cannot."
+        }
+        None => "",
+    };
+    format!(
+        "⚠️  Thread {name} is STILL suspended — {left} suspend(s) left after that resume, so it is not \
+         running.\n   That is JDWP being counted, not a failure: this decrements ONE. The extra depth \
+         comes from another debug.suspend_thread, a stop point that suspended this thread, or a \
+         debug.pause.{vm}\n   Call debug.resume_thread again to take the next one off, or debug.panic to \
+         clear everything."
+    )
+}
+
+/// Release every thread this session is holding with `debug.suspend_thread`, verifying each one against
+/// the JVM rather than trusting the command (ADR-0003). Returns `(released, still stuck)` as name lists.
+///
+/// Shared by `debug.panic` and the watchdog, which is the point: a rescue path that resumed the VM but
+/// left a per-thread suspend in place would be exactly the shape of every safety bug this repo has had —
+/// the thing that reports success is not the thing that was frozen.
+///
+/// It resumes each thread to a count of **0**, which can include depth this session did not add. That is
+/// deliberate and matches what the VM-wide rescue already does: a rescue's job is that the application
+/// runs, not that our bookkeeping balances.
+///
+/// `only` narrows it to a subset — the watchdog releases the threads that are *overdue* rather than
+/// every one it can see, because a thread suspended ten seconds ago is a caller at work, not a leak.
+/// `None` means all of them, which is `debug.panic`'s case.
+async fn release_thread_suspends(
+    session: &mut crate::session::DebugSession,
+    only: Option<&[u64]>,
+) -> (Vec<String>, Vec<String>) {
+    let held: Vec<(u64, String)> = session
+        .thread_suspends
+        .iter()
+        .filter(|(t, _)| only.is_none_or(|ids| ids.contains(t)))
+        .map(|(t, r)| (*t, r.name.clone()))
+        .collect();
+    let (mut freed, mut stuck) = (Vec::new(), Vec::new());
+    for (tid, name) in held {
+        let mut left = session.connection.suspend_count(tid).await.unwrap_or(0);
+        for _ in 0..MAX_RESUME_ATTEMPTS {
+            if left <= 0 {
+                break;
+            }
+            if session.connection.resume_thread(tid).await.is_err() {
+                // A thread that vanished under us cannot be holding anything up — treat the read
+                // failure as "nothing left to release" rather than as a stuck thread.
+                left = 0;
+                break;
+            }
+            left = session.connection.suspend_count(tid).await.unwrap_or(0);
+        }
+        if left > 0 {
+            stuck.push(format!("0x{tid:x} \"{name}\" ({left} left)"));
+        } else {
+            freed.push(format!("0x{tid:x} \"{name}\""));
+            session.thread_suspends.remove(&tid);
+        }
+    }
+    (freed, stuck)
+}
+
+/// Re-read the JVM's suspend count for every thread this session is holding, and render what is left
+/// (SAFE-11). Empty when nothing is held, which is the overwhelmingly common case, so a normal
+/// `debug.continue` reply is byte-for-byte what it always was.
+///
+/// Asking rather than reporting the bookkeeping is the whole point: ADR-0003's rejected alternative was
+/// trusting our own count, and a thread that reached 0 by some other route must not be advertised as
+/// frozen. A thread that answers 0 has its record dropped here, so the claim expires by itself.
+async fn verify_thread_suspends(session: &mut crate::session::DebugSession) -> String {
+    if session.thread_suspends.is_empty() {
+        return String::new();
+    }
+    let ids: Vec<u64> = session.thread_suspends.keys().copied().collect();
+    let mut still: Vec<String> = Vec::new();
+    for tid in ids {
+        let left = session.connection.suspend_count(tid).await.unwrap_or(0);
+        if left > 0 {
+            if let Some(rec) = session.thread_suspends.get(&tid) {
+                still.push(format!(
+                    "0x{tid:x} \"{}\" ({left} suspend(s), held {})",
+                    rec.name,
+                    ago(rec.since.elapsed())
+                ));
+            }
+        } else {
+            session.thread_suspends.remove(&tid);
+        }
+    }
+    if still.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n   ⏸️  {} thread(s) held by debug.suspend_thread are STILL suspended and this did not release \
+         them: {}\n   That is deliberate — debug.continue clears the VM's suspend depth, which is a \
+         different count. debug.resume_thread gives a thread back; debug.panic clears both.",
+        still.len(),
+        still.join(", ")
+    )
+}
+
 /// How long the VM may sit suspended before the watchdog resumes it: `JDWP_WATCHDOG_SECS`, default 120,
 /// `0` to disable. Read in one place so the tools can *report* the value they're promising.
 fn watchdog_secs() -> u64 {
@@ -7956,7 +8665,7 @@ fn spawn_watchdog(
                 if since.elapsed().as_secs() >= secs {
                     // A pending single-step must be cleared before the resume, or the next resume
                     // re-fires it.
-                    if let Some(req) = s.pending_step.take() {
+                    if let Some((req, _)) = s.pending_step.take() {
                         let _ = s.connection.clear_step(req).await;
                     }
                     // Disarm whatever caused the suspension rather than only resuming — otherwise the
@@ -8027,11 +8736,80 @@ fn spawn_watchdog(
                     if let Some(note) = &s.last_watchdog_note {
                         s.alerter.alert(level, &json!({ "watchdog": note }));
                     }
-                    drop(s);
                 }
             }
+            rescue_overdue_thread_suspends(&mut s, secs).await;
+            drop(s);
         }
     })
+}
+
+/// The watchdog's second arm (SAFE-11): release threads `debug.suspend_thread` has held past `secs`.
+///
+/// **Why the watchdog covers this at all**, argued in full in ADR-0021: a forgotten per-thread suspend is
+/// less harmful than a forgotten whole-VM one and is not harmless. A worker frozen inside a
+/// `synchronized` block holds its monitor for as long as we hold the thread, so every other worker that
+/// needs that lock piles up behind it — a stall the caller never asked for, produced by the *cheap* tool,
+/// and one nothing else here would ever resume.
+///
+/// **Why it is a separate arm** rather than folded into the VM-wide one: `suspended_since` means "the VM
+/// is stopped", and these threads are a different fact with a different remedy, so the two must be able
+/// to fire independently. A session can easily be in one state and not the other.
+///
+/// Only the **overdue** ones. A thread suspended ten seconds ago is a caller at work, not a leak, and
+/// sweeping it up with one held for three minutes would make the tool unusable for its purpose. And, as
+/// everywhere else here, a thread it could not free keeps its record so the next tick tries again —
+/// never go quiet on a false success (SAFE-7).
+async fn rescue_overdue_thread_suspends(s: &mut crate::session::DebugSession, secs: u64) {
+    let overdue: Vec<u64> = s
+        .thread_suspends
+        .iter()
+        .filter(|(_, r)| r.since.elapsed().as_secs() >= secs)
+        .map(|(t, _)| *t)
+        .collect();
+    if overdue.is_empty() {
+        return;
+    }
+    let held_for = s
+        .thread_suspends
+        .iter()
+        .filter(|(t, _)| overdue.contains(t))
+        .map(|(_, r)| r.since.elapsed())
+        .max()
+        .unwrap_or_default();
+    let (freed, stuck) = release_thread_suspends(s, Some(&overdue)).await;
+    let (note, level) = if stuck.is_empty() {
+        (
+            format!(
+                "watchdog released {} thread(s) suspended by debug.suspend_thread after {secs}s (held \
+                 up to {}): {}",
+                freed.len(),
+                ago(held_for),
+                freed.join(", ")
+            ),
+            "warning",
+        )
+    } else {
+        (
+            format!(
+                "⚠️ watchdog tried to release {} thread(s) suspended by debug.suspend_thread after \
+                 {secs}s, but {} are STILL suspended: {}",
+                freed.len() + stuck.len(),
+                stuck.len(),
+                stuck.join(", ")
+            ),
+            "error",
+        )
+    };
+    if stuck.is_empty() {
+        info!("{note}");
+    } else {
+        warn!("{note}");
+    }
+    s.note_watchdog(note);
+    if let Some(n) = &s.last_watchdog_note {
+        s.alerter.alert(level, &json!({ "watchdog": n }));
+    }
 }
 
 /// Everything needed to arm one breakpoint, resolved once from the tool arguments.
@@ -9352,7 +10130,8 @@ async fn set_element(
 ) -> Result<String, String> {
     let tid = thread_opt.ok_or_else(|| {
         format!(
-            "Writing '{container_expr}[…]' needs a suspended thread — pause one or hit a breakpoint first"
+            "Writing '{container_expr}[…]' needs a suspended thread — {HOW_TO_SUSPEND}. And if \
+             '{container_expr}' is a List or a Map rather than an array, {HOW_TO_SUSPEND_FOR_AN_INVOKE}"
         )
     })?;
     let frames = conn
@@ -9421,7 +10200,7 @@ async fn set_collection_element(
     let (ret, exc) = conn
         .invoke_method(id, tid, decl, m.method_id, args)
         .await
-        .map_err(|e| format!("{}() on '{container_expr}' failed: {e}", m.name))?;
+        .map_err(|e| format!("{}() on '{container_expr}' failed: {e}{}", m.name, invoke_hint(&e)))?;
     let displaced = invoke_result(conn, &m.name, ret, exc).await?;
     let old = render_value(conn, &displaced, Some(tid), 200).await;
     Ok(format!("✅ Set {container_expr}[{}] = {raw_value} (was {old}) via {}()", render_arglit(key), m.name))
@@ -9721,7 +10500,7 @@ async fn apply_index(
     }
 
     let tid = thread_id.ok_or_else(|| {
-        format!("Indexing '{label}' needs a suspended thread — it calls get() in the debuggee")
+        format!("Indexing '{label}' needs a suspended thread, and {HOW_TO_SUSPEND_FOR_AN_INVOKE}")
     })?;
     let type_id = conn
         .get_object_reference_type(id)
@@ -9765,7 +10544,7 @@ async fn apply_index(
     let (ret, exc) = conn
         .invoke_method(id, tid, decl, m.method_id, vec![arg])
         .await
-        .map_err(|e| format!("'{label}[…]' get() failed: {e}"))?;
+        .map_err(|e| format!("'{label}[…]' get() failed: {e}{}", invoke_hint(&e)))?;
     invoke_result(conn, "get", ret, exc).await
 }
 
@@ -9836,7 +10615,10 @@ async fn scan_elements(
         id
     } else {
         let tid = thread_id.ok_or_else(|| {
-            format!("Slicing or filtering '{label}' needs a suspended thread — it calls toArray() in the debuggee")
+            format!(
+                "Slicing or filtering '{label}' needs a suspended thread — it calls toArray() in the \
+                 debuggee, and {HOW_TO_SUSPEND_FOR_AN_INVOKE}"
+            )
         })?;
         let type_id = conn
             .get_object_reference_type(id)
@@ -10225,7 +11007,7 @@ async fn invoke_segment_method(
     arglits: &[ArgLit],
 ) -> Result<jdwp_client::types::Value, String> {
     let tid = thread_id.ok_or_else(|| {
-        format!("Calling '.{}()' needs a suspended thread — pause one or hit a breakpoint first", seg.name)
+        format!("Calling '.{}()' needs a suspended thread, and {HOW_TO_SUSPEND_FOR_AN_INVOKE}", seg.name)
     })?;
     let argvals = eval_args(conn, thread_id, frame, arglits).await?;
     let (decl, m) =
@@ -10241,7 +11023,7 @@ async fn invoke_segment_method(
     let (ret, exc) = conn
         .invoke_method(obj_id, tid, decl, m.method_id, argvals)
         .await
-        .map_err(|e| format!("invoke {}() failed: {}", seg.name, e))?;
+        .map_err(|e| format!("invoke {}() failed: {}{}", seg.name, e, invoke_hint(&e)))?;
     invoke_result(conn, &seg.name, ret, exc).await
 }
 
@@ -10692,7 +11474,7 @@ async fn invoke_static_member(
 ) -> Result<jdwp_client::types::Value, String> {
     let tid = thread_id.ok_or_else(|| {
         format!(
-            "Calling static '{}.{}()' needs a suspended thread — pause one or hit a breakpoint first",
+            "Calling static '{}.{}()' needs a suspended thread, and {HOW_TO_SUSPEND_FOR_AN_INVOKE}",
             dotted, member.name
         )
     })?;
@@ -10708,10 +11490,9 @@ async fn invoke_static_member(
         })?;
     // Box any primitive the chosen overload declares as a reference (`f(Integer)` given `5`).
     let argvals = coerce_args(conn, tid, &m.signature, argvals).await?;
-    let (ret, exc) = conn
-        .invoke_static_method(decl, tid, m.method_id, argvals)
-        .await
-        .map_err(|e| format!("invoke static {}.{}() failed: {}", dotted, member.name, e))?;
+    let (ret, exc) = conn.invoke_static_method(decl, tid, m.method_id, argvals).await.map_err(|e| {
+        format!("invoke static {}.{}() failed: {}{}", dotted, member.name, e, invoke_hint(&e))
+    })?;
     invoke_result(conn, &member.name, ret, exc).await
 }
 
@@ -11533,9 +12314,7 @@ async fn value_to_write(
     match parse_lit(value_str.trim())? {
         ArgLit::Expr(e) => {
             let tid = thread_opt.ok_or_else(|| {
-                format!(
-                "Copying the live value '{e}' needs a suspended thread — pause one or hit a breakpoint first"
-            )
+                format!("Copying the live value '{e}' needs a suspended thread — {HOW_TO_SUSPEND}")
             })?;
             let frame = conn
                 .get_frames(tid, 0, -1)

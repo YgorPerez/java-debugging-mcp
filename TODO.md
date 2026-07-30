@@ -195,10 +195,18 @@ So there is now a test for the invariant itself, not another happy path
 > After **any** resume path, from **any** suspended state, the VM is genuinely running — or the reply
 > said out loud that it isn't.
 
-It is a matrix of 5 suspended states × 4 resume paths (`continue`, `panic`, watchdog, `disconnect`),
-asserted against the **probe's own output**, because every tool reports success either way — which is
-exactly how these bugs survived. Each of SAFE-1, SAFE-4 and SAFE-7 was reverted in turn to confirm the
-matrix names the offending `(state, path)` pair rather than passing anyway.
+It is a matrix of **7 suspended states × 5 resume paths** (`continue`, `panic`, watchdog, `disconnect`,
+`resume_thread`), asserted against the **probe's own output**, because every tool reports success either
+way — which is exactly how these bugs survived. Each of SAFE-1, SAFE-4 and SAFE-7 was reverted in turn to
+confirm the matrix names the offending `(state, path)` pair rather than passing anyway, and SAFE-11 was
+verified the same way twice: dropping its `SuspendCount` check named `(ThreadSuspendTwice, ResumeThread)`,
+and leaving a pending step armed on the thread it releases named `(Step, ResumeThread)`.
+
+SAFE-11 added the seventh and sixth states (`ThreadSuspend`, `ThreadSuspendTwice` — one thread frozen by
+`debug.suspend_thread`, and the same thread frozen twice) and the fifth path. The per-thread states are
+run against every path including the ones that cannot fix them: `debug.continue` is about the VM's
+suspend depth and deliberately does not release a held thread, so its honest answer there is to name what
+it left behind.
 
 **If you add a resume path, add it to `Resume`. If you find a new way to leave the VM suspended, add it to
 `Freeze`.** That is cheaper than the next review finding it, and it is the whole point of the matrix.
@@ -289,6 +297,29 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 ---
 
 ## ✅ Shipped (context)
+
+- **A per-thread suspend, and what it turns out not to unlock (SAFE-11/#90)** — `ThreadReference.Suspend`
+  had a constant and zero call sites, so the only evaluable frame cost a whole-VM freeze and every
+  capability gated on "needs a suspended thread" was unreachable at acceptable cost on the shared 8180.
+  `debug.suspend_thread {thread_id}` freezes ONE thread and leaves the rest of the JVM serving;
+  `debug.resume_thread` gives it back — a second tool rather than a flag or a fold into `debug.continue`,
+  per ADR-0015 and argued in **ADR-0021**. It decrements **one** suspend and then asks the JVM, so
+  suspending twice and resuming once reports `STILL suspended` instead of a success it did not achieve
+  (ADR-0003's rule at the per-thread door; tracking our own depth and resuming that many times is that
+  ADR's *rejected* alternative). The watchdog covers it on the same timer, because a worker frozen inside
+  a `synchronized` block stalls everyone behind that lock; `panic` and `disconnect` clear it too, and the
+  hold is visible in `list_threads` and `list_sessions` at zero extra JDWP packets.
+  **What testing this found, and it contradicts the issue's own acceptance criterion:** a per-thread
+  suspend does **not** unlock method invocation. Measured on JDK 21 — the same thread id that answers
+  `ThreadReference.Frames` with a full stack of readable locals answers `INVALID_THREAD` to
+  `ClassType.InvokeMethod`, because JDWP grants invocation only to a thread suspended **by an event**.
+  Neither does `debug.pause`, measured the same way, so the refusals' old advice ("pause one or hit a
+  breakpoint first") was half wrong before this issue existed. What it *does* unlock is everything else:
+  the stack with locals, a local or field chain, `expand_objects` (fields only, no invocation),
+  `set_value` on a local — the last proved by the probe printing the written value — and that thread's own
+  monitors. The refusal text is split in two accordingly, and the invoke failure explains itself instead
+  of passing `INVALID_THREAD` out. `force_return`/`pop_frame` need the thread stopped in *Java* code; a
+  worker parked in `Thread.sleep` answers `OPAQUE_FRAME`, and so does every frame below it.
 
 - **Wildcard and batched arming (FILT-3/#74, FILT-4/#75)** — `class_pattern` on all four arming tools now
   takes an exact class, a **wildcard**, or a **list** of either. A wildcard on `debug.set_line_stop` requires

@@ -342,6 +342,24 @@ the ordinary case rather than the exotic one, and it is a third reason a dump is
 row, a vanished one is only a count.
 _Avoid_: dropped, lost (both suggest the debugger mislaid it)
 
+**Held thread**:
+One thread this session froze with `debug.suspend_thread` while the rest of the JVM goes on serving. Its
+own term because the whole-VM words do not fit: the debuggee is not **suspended** — a caller reading
+`SUSPENDED` about it would go looking for a freeze that is not there — and the remedy is
+`debug.resume_thread` rather than `debug.continue`. What it makes readable is the thread's own frames,
+locals and monitors; what it does **not** make possible is **invocation**, which JDWP grants only to a
+thread suspended by an event.
+_Avoid_: pinned, parked, frozen (the first two are application states, the third reads as the whole VM)
+
+**Event-suspended**:
+Held because a stop point fired *on this thread* or a step landed on it, as opposed to held by a
+`debug.pause` or a `debug.suspend_thread`. The distinction is invisible in every listing and decides
+exactly one thing, which is why it needs a name: **only an event-suspended thread can have a method
+invoked on it**. Measured, not read off the spec — a thread suspended any other way answers
+`INVALID_THREAD` to an invoke while answering a full stack of locals to a frame read.
+_Avoid_: "properly suspended", "really suspended" (both imply the other kinds are defective; they are
+not — they read everything except an invocation)
+
 **Suspend depth**:
 How many outstanding suspends a thread carries. The reason a resume must ask the debuggee whether it is
 actually running rather than assume one resume was enough.

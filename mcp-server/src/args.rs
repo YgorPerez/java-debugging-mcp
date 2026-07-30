@@ -399,6 +399,28 @@ pub struct StepArgs {
     pub thread_id: Option<String>,
 }
 
+/// Arguments for `debug.suspend_thread` (SAFE-11).
+///
+/// `thread_id` is **required**, unlike every other `thread_id` in this file. Those default to the thread
+/// that last hit a stop point, which is a safe guess because that thread is already suspended and the
+/// call is about it. Here the argument names the thread to *freeze*, and guessing wrong freezes a worker
+/// nobody asked about on a JVM other people are using. `debug.list_threads` is where the id comes from.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SuspendThreadArgs {
+    /// Thread ID to suspend, as `debug.list_threads` and `debug.thread_dump` print it (`0x7f2c…`).
+    pub thread_id: String,
+}
+
+/// Arguments for `debug.resume_thread` (SAFE-11).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResumeThreadArgs {
+    /// Thread ID to resume. Optional: with one thread held by `debug.suspend_thread` it defaults to
+    /// that one, which is the case a caller is in almost every time. With several held it is required,
+    /// and the reply lists them rather than picking.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
+
 /// Arguments for `debug.get_stack`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetStackArgs {
