@@ -685,6 +685,11 @@ pub struct ExceptionRequestInfo {
     pub request_id: Option<i32>,
     /// Whether this request is currently armed in the JVM.
     pub enabled: bool,
+    /// Set when the **debuggee** removed this request rather than the caller (FILT-8). See
+    /// [`BreakpointInfo::spent`].
+    pub spent: bool,
+    /// The `Count` modifier this request was armed with, kept so a re-arm reproduces it (FILT-8).
+    pub hit_count: Option<i32>,
     /// How many throws the JVM has reported on this request (FILT-10). See [`BreakpointInfo::hits`] for
     /// what the number counts and why it is not called `hit_count`.
     pub hits: u32,
@@ -715,15 +720,24 @@ pub struct ExceptionRequestInfo {
     pub thread_filter: Option<u64>,
 }
 
+// Five bools, and each is an independent property of the JDWP request as the protocol defines it
+// (armed / spent by the debuggee / static / traced / which touches) rather than a parameter bag that
+// wants splitting up — the same reason `ExceptionRequestInfo` carries this allow.
 /// An active field watchpoint: a `FIELD_ACCESS` or `FIELD_MODIFICATION` event request on one field.
 /// Tracked so it shows in `list_stop_points` and is cleared by `clear_stop_point` / panic like a
 /// normal breakpoint — `ClearAllBreakpoints` does not touch it.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct WatchpointInfo {
     /// The live JDWP event-request id, or `None` while disabled (BP-2).
     pub request_id: Option<i32>,
     /// Whether this watch is currently armed in the JVM.
     pub enabled: bool,
+    /// Set when the **debuggee** removed this request rather than the caller (FILT-8). See
+    /// [`BreakpointInfo::spent`].
+    pub spent: bool,
+    /// The `Count` modifier this watch was armed with, kept so a re-arm reproduces it (FILT-8).
+    pub hit_count: Option<i32>,
     /// How many accesses or modifications the JVM has reported on this watch (FILT-10). See
     /// [`BreakpointInfo::hits`] for what the number counts and why it is not called `hit_count`.
     pub hits: u32,
@@ -771,12 +785,27 @@ pub struct WatchpointInfo {
 /// bug — and this is the kind least survivable if left armed, since a suspending method exit on a hot
 /// method freezes the VM faster than anything else here.
 #[derive(Debug, Clone)]
+// Five bools, each an independent property of the JDWP request as the protocol defines it (armed /
+// spent by the debuggee / traced / return-value kind / suspending) rather than a parameter bag.
+#[allow(clippy::struct_excessive_bools)]
 pub struct MethodExitRequestInfo {
     /// The `mexit_` id reported to the caller.
     pub id: String,
     /// The live JDWP request id, or `None` while disabled (BP-2).
     pub request_id: Option<i32>,
     pub enabled: bool,
+    /// Set when the **debuggee** removed this request rather than the caller (FILT-8). See
+    /// [`BreakpointInfo::spent`].
+    pub spent: bool,
+    /// The `Count` modifier this request was armed with, kept so a re-arm reproduces it (FILT-8).
+    ///
+    /// Refused together with [`Self::method`], and that refusal is the whole reason this field is not
+    /// simply plumbed through like the other two: JDWP applies `Count` to the **request**, which fires
+    /// for every method of a matching class, while the method filter is applied here. `Count` 3 with a
+    /// filter on `save` therefore means "the 3rd exit of *any* method of this class" — usually a
+    /// different method, which this side then drops, leaving a stop point the JVM has already deleted
+    /// and that reported nothing. See `arm_one_method_exit`.
+    pub hit_count: Option<i32>,
     /// How many exits of the *asked-for* method the JVM has reported (FILT-10). See
     /// [`BreakpointInfo::hits`] for what the number counts and why it is not called `hit_count`.
     ///
@@ -1047,6 +1076,24 @@ pub struct BreakpointInfo {
     /// Whether the breakpoint is currently armed in the JVM. A disabled breakpoint stays listed (so
     /// its `condition`/`trace_expr` aren't lost) but has no JDWP request and never fires (BP-1).
     pub enabled: bool,
+    /// Set when the **debuggee** removed this stop point's request rather than the caller (FILT-8).
+    ///
+    /// A stop point armed with the `hit_count` (`Count`) modifier fires **once**, on the Nth occurrence,
+    /// and the JVM then deletes the request itself. Nothing tracked that, so such a stop point went on
+    /// being listed as armed forever and `clear_stop_point` went on trying to clear a request that was
+    /// gone — the exact shape `CONTEXT.md` § **Request id** warns about, since ids are allocated by the
+    /// debuggee and recur.
+    ///
+    /// The bookkeeping is exact rather than heuristic, and this is why: `Count` means the JVM reports
+    /// **only** the Nth occurrence, so the *first* event ever received for such a request **is** the
+    /// Nth. Any hit on a stop point carrying `hit_count: Some(_)` therefore makes it spent, with no
+    /// counting on this side and no window in which we could be wrong about it.
+    ///
+    /// Distinct from `enabled: false`, which is the BP-1 toggle — a state the **caller** chose and can
+    /// undo. Both end with no live request, and both keep the definition so a re-arm reproduces it, but
+    /// only one of them is something the caller did. `enabled` is set false alongside this so the
+    /// existing re-arm path is reached unchanged; the listing distinguishes them.
+    pub spent: bool,
     /// How many times the JVM has reported a hit on this stop point (FILT-10).
     ///
     /// Named `hits` and not `hit_count` on purpose. `hit_count` is the *requested* `Count` modifier

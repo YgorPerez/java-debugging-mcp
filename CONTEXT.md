@@ -375,7 +375,9 @@ construction; a spent stop point is something the debuggee did, so its records a
 event, no reply and no acknowledgement — the request id we hold is one the JVM has forgotten. Two consequences
 follow from that and from nothing else, which is why the distinction earns a term: such a stop point must not be
 listed as armed, and clearing it must not send a clear for a **request id** the debuggee may have since reissued
-to someone else.
+to someone else. Both are now true — `list_stop_points` renders `SPENT` with its own glyph and
+`clear_stop_point` sends no packet and says it did not (FILT-8, #99; ADR-0026, which also records why "always
+clear and ignore the error" is wrong *here* specifically).
 _Avoid_: disarmed (this cluster's word for the automatic case, and the conflation that hides the staleness —
 the watchdog and a trace budget disarm are ours and known, this is neither), expired (suggests time),
 consumed, retired (both already spoken for — an entity read, and a pool worker)

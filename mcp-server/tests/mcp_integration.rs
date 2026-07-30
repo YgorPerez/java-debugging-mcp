@@ -9672,6 +9672,167 @@ fn hits_for(listing: &str, id: &str) -> Option<u32> {
         .find_map(|l| l.trim().strip_prefix("Hits: ").and_then(|n| n.trim().parse().ok()))
 }
 
+/// FILT-8 (#99): a `hit_count` stop point fires on the Nth occurrence, ONCE, and is then **spent** —
+/// deleted by the JVM, not by us — and everything downstream has to say so.
+///
+/// The exactness comes from [`Probe::launch_delayed`]: the JVM is up and answering JDWP before the probe
+/// class has run at all, so the stop point arms (deferred, on `CLASS_PREPARE`) with nothing yet executed
+/// and "the 3rd hit" is unambiguously the 3rd time the line ran. Arming against a probe already in its
+/// loop could only assert a window, because writes land between the reply and the next call.
+///
+/// Four things, and the last two are the ones that were broken before this change rather than missing:
+///
+///  - **It fires on the 3rd and not before.** `trace_expr: "i"` records the loop counter, and the one
+///    record has to read `i => 2`. The probe's own stdout is the witness that it reached that iteration.
+///  - **`trace_max_hits: 200` buys ONE snapshot, not 200.** The two counters sound alike and compose the
+///    other way round from how they read; the arm reply says so and the buffer has to agree.
+///  - **`list_stop_points` reports it SPENT, not armed.** Nothing tracked that at all before FILT-8: a
+///    counted stop point that had fired was listed as armed indefinitely.
+///  - **Clearing it sends nothing to the debuggee, and says so.** The alternative — always send the
+///    `Clear` and ignore the error — is what most debuggers do and is wrong here, because JDWP request
+///    ids are allocated by the debuggee and recur (`CONTEXT.md` § **Request id**), so a `Clear` naming a
+///    long-deleted id can land on whatever holds it now.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_counted_stop_point_fires_on_the_nth_hit_and_is_then_spent() {
+    let Some(jdk) = jdk_or_skip("a_counted_stop_point_fires_on_the_nth_hit_and_is_then_spent") else {
+        return;
+    };
+    // The JVM answers JDWP for 8s before the probe's first instruction, so the arm happens with nothing
+    // executed and the count starts from zero occurrences.
+    let probe = Probe::launch_delayed(&jdk, "FinallyProbe", std::time::Duration::from_secs(8));
+    let probe = probe.expect("launch FinallyProbe delayed");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let src = probe_source("FinallyProbe");
+    let line = probe_line(&src, "// BP2");
+
+    let set = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "FinallyProbe", "line": line, "hit_count": 3,
+            "trace": true, "trace_expr": "i", "trace_max_hits": 200,
+        }),
+    );
+    assert!(set.contains("bp_1"), "the counted stop point did not arm: {set}");
+
+    // The probe has to actually reach its third iteration, or "one record" below is vacuous.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 4"))
+        .expect("probe never reached its fifth tick");
+
+    let traces = server
+        .wait_for_traces("i => (int) 2", EVENT_TIMEOUT)
+        .expect("the counted stop point never recorded the 3rd hit — Count was not passed through");
+    let rows: Vec<&str> = traces.lines().filter(|l| l.contains("FinallyProbe.main")).collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "hit_count:3 with trace_max_hits:200 must yield exactly ONE snapshot — the stop point is spent \
+         after its single hit, so the budget never gets a chance to apply:\n{traces}"
+    );
+    assert!(
+        rows[0].contains("i => (int) 2"),
+        "the one recorded hit must be the 3rd occurrence (i == 2 on a 0-based loop), not the first:\
+         \n{traces}"
+    );
+
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(
+        listed.contains("SPENT"),
+        "a stop point whose hit_count has fired must be reported SPENT rather than armed — the JVM \
+         deleted the request itself and nothing tracked that before FILT-8:\n{listed}"
+    );
+    assert!(
+        !listed.contains("DISABLED"),
+        "spent is not the BP-1 toggle: reporting it as DISABLED tells the caller they switched \
+         something off that they never touched:\n{listed}"
+    );
+    assert_eq!(
+        hits_for(&listed, "bp_1"),
+        Some(1),
+        "a counted stop point fires exactly once, so its tally is 1:\n{listed}"
+    );
+
+    let cleared = server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": "bp_1"}));
+    assert_contains_all(
+        "clearing a spent stop point is a no-op that says it was one",
+        &cleared,
+        &["✅", "already SPENT", "nothing", "was sent to the debuggee"],
+    );
+    let after = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(after.contains("No breakpoints set"), "clear left something listed: {after}");
+
+    server.panic_reset();
+}
+
+/// FILT-8 (#99): the three kinds that never accepted `hit_count` at all now do, and an exception stop is
+/// the one the target stack actually wanted — a supplier `consulta` retried after a sleep, where the
+/// SECOND attempt is the interesting one and the first failing is expected.
+///
+/// Asserted on an exception request rather than all three because the pass-through is one shared shape
+/// (the `*_ex` client methods already took `count`, only the call sites passed `None`), while what is
+/// worth a live JVM is the part that is NOT shared: that the JVM really does delete the request, that one
+/// hit is all you get, and that the arm reply says both of those before it happens rather than after.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_exception_stop_takes_a_hit_count_and_says_what_it_buys() {
+    let Some(jdk) = jdk_or_skip("an_exception_stop_takes_a_hit_count_and_says_what_it_buys") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // An exception request needs a concrete reference type, so the class must be loaded: no deferring.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 0 "))
+        .expect("probe never threw once, so its exception class never loaded");
+
+    let set = server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({
+            "class_pattern": "ExcProbe$SwallowedException", "trace": true, "hit_count": 3,
+            "trace_max_hits": 200,
+        }),
+    );
+    assert_contains_all(
+        "the arm reply states what a Count buys before it fires, not after",
+        &set,
+        &["Stops on hit #3", "SPENT", "trace_max_hits: 200 cannot apply"],
+    );
+
+    // Far enough past the third throw that "one record" means "it stopped", not "it has not caught up".
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("attempts=12"))
+        .expect("probe never reached its twelfth throw");
+
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    let rows = traces.lines().filter(|l| l.contains("ExcProbe")).count();
+    assert_eq!(
+        rows, 1,
+        "a Count of 3 must produce exactly one record even with a budget of 200, and even after twelve \
+         throws — the JVM deletes the request after reporting the 3rd:\n{traces}"
+    );
+
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(
+        listed.contains("SPENT"),
+        "the exception stop must be reported SPENT once its Count has fired:\n{listed}"
+    );
+    assert_eq!(hits_for(&listed, "exc_1"), Some(1), "a counted stop point fires once:\n{listed}");
+
+    let cleared = server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": "exc_1"}));
+    assert!(
+        cleared.contains("already SPENT"),
+        "clearing a self-deleted request must say nothing was sent to the debuggee, because sending a \
+         Clear for a recurring id is how you clear somebody else's request: {cleared}"
+    );
+
+    server.panic_reset();
+}
+
 /// FILT-10 (#110), the half the obvious implementation gets wrong: a method-exit stop point counts exits
 /// of the method the caller **asked for**, not every exit the JDWP request received.
 ///

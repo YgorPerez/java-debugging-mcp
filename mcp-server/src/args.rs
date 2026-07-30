@@ -885,6 +885,18 @@ pub struct SetExceptionBreakpointArgs {
     /// Break on exceptions that are NOT caught (propagate out; default true).
     #[serde(default = "default_true")]
     pub uncaught: bool,
+    /// Only fire on the Nth occurrence (optional), then never again.
+    ///
+    /// JDWP's `Count` modifier, and the semantics surprise people: the stop point fires **once**, on the
+    /// Nth occurrence, and is then **gone** — deleted by the JVM itself, not by this server. It is not
+    /// "the first N", which is what `trace_max_hits` provides and what ADR-0002 explains `Count` cannot
+    /// express. `debug.list_stop_points` reports such a stop point as SPENT rather than as armed.
+    ///
+    /// With `trace:true` the two counters compose in the way that reads wrongly: `hit_count: 5` with a
+    /// `trace_max_hits` of 200 yields **one** snapshot, not 200, because the stop point is spent after
+    /// its single hit. The arm reply says so rather than echoing both numbers.
+    #[serde(default)]
+    pub hit_count: Option<i32>,
     /// Logpoint mode: on each throw, snapshot (throw location, thread, in-scope locals, exception
     /// type, catch location) into a ring buffer and resume immediately WITHOUT suspending — the safe
     /// choice on a shared instance, where a suspending exception breakpoint freezes other people's
@@ -988,6 +1000,18 @@ pub struct SetWatchpointArgs {
     /// Also break on reads (`FIELD_ACCESS`). Noisy on a hot field; off by default.
     #[serde(default)]
     pub access: bool,
+    /// Only fire on the Nth occurrence (optional), then never again.
+    ///
+    /// JDWP's `Count` modifier, and the semantics surprise people: the stop point fires **once**, on the
+    /// Nth occurrence, and is then **gone** — deleted by the JVM itself, not by this server. It is not
+    /// "the first N", which is what `trace_max_hits` provides and what ADR-0002 explains `Count` cannot
+    /// express. `debug.list_stop_points` reports such a stop point as SPENT rather than as armed.
+    ///
+    /// With `trace:true` the two counters compose in the way that reads wrongly: `hit_count: 5` with a
+    /// `trace_max_hits` of 200 yields **one** snapshot, not 200, because the stop point is spent after
+    /// its single hit. The arm reply says so rather than echoing both numbers.
+    #[serde(default)]
+    pub hit_count: Option<i32>,
     /// Logpoint mode: on each hit, snapshot (mutating location, thread, in-scope locals, the field's
     /// old → new pair) into a ring buffer and resume immediately WITHOUT suspending — the safe choice
     /// on a shared instance. Read snapshots with `debug.get_traces`.
@@ -1085,6 +1109,25 @@ pub struct SetMethodBreakpointArgs {
     /// are dropped here. Overloads all match, since the name is all JDWP gives us to compare.
     #[serde(default)]
     pub method: Option<String>,
+    /// Only fire on the Nth occurrence (optional), then never again. **Refused together with `method`,
+    /// and the refusal is the honest answer rather than a missing feature.**
+    ///
+    /// JDWP's `Count` modifier, with the same semantics as everywhere else here: the stop point fires
+    /// once, on the Nth occurrence, and the JVM then deletes the request itself —
+    /// `debug.list_stop_points` reports it as SPENT rather than as armed.
+    ///
+    /// What makes this kind different is *what* the JVM is counting. A method-exit request is a
+    /// `ClassMatch`, so it fires for **every method** of every matching class, and `method` is applied on
+    /// this side afterwards. `Count` is applied by the JVM, before that filter can see anything. So
+    /// `hit_count: 3` with `method: "save"` means "the 3rd exit of any method of this class" — almost
+    /// always a different method, which this side then drops, leaving a stop point that reported nothing
+    /// and that the JVM has already deleted. There is no way to make it mean what it reads like: JDWP
+    /// has no method-name modifier, which is the same absence `method` itself exists to work around.
+    ///
+    /// Without `method` it means exactly what it says, and is the way to catch the Nth return out of a
+    /// class regardless of which method produced it.
+    #[serde(default)]
+    pub hit_count: Option<i32>,
     /// Logpoint mode: snapshot each return (location, thread, in-scope locals, the returned value) and
     /// resume immediately WITHOUT suspending. **Defaults to true, unlike every other stop point** — a
     /// suspending method exit on a hot method is the fastest way to freeze a shared JVM this tool

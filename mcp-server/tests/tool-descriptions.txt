@@ -321,7 +321,12 @@ and the capture count answer different questions rather than repeating one), and
 only exits of the method you ASKED for, not the every-method-of-the-class traffic JDWP delivers it. Counted
 once per hit and not once per armed location, so a finally line armed at 2 locations reports the number of
 times it ran. Cumulative across a toggle_stop_point disable and re-arm, since that keeps the same stop point
-rather than making a new one.
+rather than making a new one. A STOP POINT ARMED WITH hit_count IS REPORTED **SPENT** ONCE IT HAS FIRED, which
+is a third state and not a synonym for disabled: disabled is something YOU did with toggle_stop_point and can
+undo, spent is something the DEBUGGEE did — JDWP's Count modifier makes the JVM report the Nth occurrence and
+delete the request itself. Before this existed such a stop point was listed as armed forever, which is the
+same silence-reads-as-an-answer failure the Hits line above removes. toggle_stop_point re-arms a spent stop
+point with the same count.
 
 ## debug.list_threads
 List threads by name (one `0x<id> <name>` line each). A JVM like WildFly has hundreds of threads — filter with
@@ -450,7 +455,14 @@ sightings are FOLDED: the original throw and the point where it escapes are both
 become a `↻ rethrow of #<seq> (+N collapsed)` note on the escaping record, and a collapsed rethrow does not
 spend trace_max_hits. Without that a budget of 30 was gone on one instance walking WildFly's interceptors, and
 the only informative record was the 9th. debug.list_stop_points reports the cost this request is actually
-incurring once throws have landed.
+incurring once throws have landed. PASS hit_count TO FIRE ONLY ON THE Nth THROW, and read that literally: it
+is JDWP's Count modifier, so the JVM reports the Nth occurrence and then DELETES THE REQUEST ITSELF. The stop
+point fires once and is gone — debug.list_stop_points shows it SPENT rather than armed, debug.clear_stop_point
+on it sends nothing to the debuggee and says so, and debug.toggle_stop_point is what re-arms it with the same
+count. It is NOT "the first N": that is trace_max_hits, counted on this side, and combining the two gives you
+ONE snapshot rather than trace_max_hits of them — the arm reply says so instead of reporting two numbers that
+cannot both apply. The retry loop is what it is for: a supplier consulta retried after a sleep, where the
+SECOND attempt is the interesting one and the first failing is expected.
 
 ## debug.set_field_stop
 Break when a field is read or written — answers "who mutates this?" for a field that changes behind your back
@@ -470,7 +482,12 @@ in-scope local, 200 for the old → new pair and the trace_expr result — and t
 stores, so debug.get_traces can never recover the rest; raise all of them with trace_max_length (ceiling
 4000), which is what you need when the watched field holds a payload rather than a flag. A request above the
 ceiling is clamped and the reply says so. debug.list_stop_points reports what the watch is actually costing
-once hits have landed. A watched field can't be JIT-optimised, so clear it when done.
+once hits have landed. A watched field can't be JIT-optimised, so clear it when done. PASS hit_count TO FIRE
+ONLY ON THE Nth TOUCH, with JDWP's Count semantics: the JVM reports the Nth write (or read) and then deletes
+the request itself, so the watch fires ONCE and is then SPENT — debug.list_stop_points says so rather than
+listing it as armed, clearing it sends nothing to the debuggee, and debug.toggle_stop_point re-arms it with
+the same count. Not "the first N", which is trace_max_hits; the two together yield one snapshot, and the arm
+reply says so.
 
 ## debug.set_line_stop
 Set a breakpoint at a location (class_pattern + line and/or method). class_pattern takes AN EXACT CLASS, A
@@ -550,7 +567,14 @@ can never recover the rest — raise both with trace_max_length (ceiling 4000) w
 JSON/XML payload rather than a status. A request above the ceiling is clamped and the reply says so. Composes
 with thread_id, trace_max_hits and trace_frames; debug.list_stop_points reports what a traced request is
 actually costing once hits have landed. A JVM below JDWP 1.6 degrades to the return site without the value,
-and says so.
+and says so. hit_count IS ACCEPTED ONLY WITHOUT method, AND THE REFUSAL IS THE HONEST ANSWER RATHER THAN A
+MISSING FEATURE. JDWP applies Count to the REQUEST, and this request is a ClassMatch firing for every method
+of the class; `method` is filtered on our side afterwards. So hit_count:3 with method:"save" would ask the JVM
+for the 3rd exit of ANY method of the class — almost certainly a getter — which we then drop as the wrong
+method, leaving a stop point that reported nothing and that the JVM has already deleted. There is no way to
+make it mean what it reads like, so it is refused with that explanation. WITHOUT method it means exactly what
+it says: the Nth return out of the class, whichever method produced it, after which the request is gone and
+debug.list_stop_points reports it SPENT.
 
 ## debug.set_value
 Write a value to a local variable, a static field (e.g. ConfigDefaultUtils.dsInfra — flip tenant/infra on a

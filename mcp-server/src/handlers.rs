@@ -640,7 +640,12 @@ impl RequestHandler {
             if let Some(req) = er.request_id {
                 let _ = session.connection.clear_exception_request(req).await;
             }
-            return Ok(format!("✅ Exception breakpoint cleared: {} ({})", bp_id, er.class_pattern));
+            return Ok(format!(
+                "✅ Exception breakpoint cleared: {} ({}){}",
+                bp_id,
+                er.class_pattern,
+                spent_clear_note(er.spent)
+            ));
         }
 
         // A watchpoint lives in watchpoints as a FIELD_ACCESS / FIELD_MODIFICATION request; Clear
@@ -650,11 +655,12 @@ impl RequestHandler {
                 let _ = session.connection.clear_field_watch(req, wp.kind).await;
             }
             return Ok(format!(
-                "✅ Watchpoint cleared: {} ({}.{} {})",
+                "✅ Watchpoint cleared: {} ({}.{} {}){}",
                 bp_id,
                 wp.class_name,
                 wp.field_name,
-                wp.kind.label()
+                wp.kind.label(),
+                spent_clear_note(wp.spent)
             ));
         }
 
@@ -665,11 +671,13 @@ impl RequestHandler {
             if let Some(req) = me.request_id {
                 let _ = session.connection.clear_method_exit_request(req, me.with_return_value).await;
             }
+            let note = spent_clear_note(me.spent);
             return Ok(format!(
-                "✅ Method-exit reporting cleared: {} ({}{})",
+                "✅ Method-exit reporting cleared: {} ({}{}){}",
                 bp_id,
                 me.class_pattern,
-                me.method.map_or_else(|| ".*".to_string(), |m| format!(".{m}"))
+                me.method.map_or_else(|| ".*".to_string(), |m| format!(".{m}")),
+                note
             ));
         }
 
@@ -711,15 +719,20 @@ impl RequestHandler {
         drop(session);
 
         Ok(format!(
-            "✅ Breakpoint cleared: {} at {}:{}\n   JDWP Request ID: {}{family_note}",
+            "✅ Breakpoint cleared: {} at {}:{}\n   JDWP Request ID: {}{family_note}{}",
             bp_id,
             bp_info.class_pattern,
             bp_info.line,
             if bp_info.request_ids.is_empty() {
-                "(disabled)".to_string()
+                if bp_info.spent {
+                    "(spent)".to_string()
+                } else {
+                    "(disabled)".to_string()
+                }
             } else {
                 bp_info.request_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
             },
+            spent_clear_note(bp_info.spent)
         ))
     }
 
@@ -2653,6 +2666,7 @@ impl RequestHandler {
         for p in &patterns {
             refuse_broad_suspending_method_exit(a.trace, p, method.as_deref())?;
         }
+        refuse_counted_method_filter(a.hit_count, method.as_deref())?;
 
         let session_guard = self
             .resolve_session(&args)
@@ -2846,6 +2860,37 @@ async fn set_field_by_path(
             "Could not write '{target}': '{container_expr}' didn't resolve to an object ({e}) and isn't a loaded class."
         ),
     ))
+}
+
+/// Refuse `hit_count` together with `method` on a method-exit stop point (FILT-8), because the two
+/// cannot mean what the pair reads like and the failure is silent.
+///
+/// JDWP applies `Count` to the **request**, and a method-exit request is a `ClassMatch` firing for every
+/// method of every matching class. The `method` filter is applied on this side, after. So `hit_count: 3`
+/// with `method: "save"` asks the JVM for "the 3rd exit of any method of this class" — very likely a
+/// getter — which this side then drops as the wrong method, while the JVM has already deleted the
+/// request. The caller gets a stop point that reported nothing and is spent, and no reply anywhere would
+/// have said why.
+///
+/// Refused rather than warned about, and rather than emulated by counting on this side: "the Nth" is a
+/// selector the debuggee has to apply, and a server-side count of the first N is a different thing that
+/// already exists as `trace_max_hits` (ADR-0002). The other three kinds have no such filter, so this is
+/// the only place the combination is refused.
+fn refuse_counted_method_filter(hit_count: Option<i32>, method: Option<&str>) -> Result<(), String> {
+    match (hit_count, method) {
+        (Some(n), Some(m)) => Err(format!(
+            "hit_count and method cannot be combined on a method-exit stop point. JDWP applies the Count \
+             modifier to the REQUEST, which fires for every method of the class — there is no \
+             method-name modifier, which is why `method` is filtered on this side in the first place. So \
+             hit_count:{n} with method:\"{m}\" would ask the JVM for exit number {n} of ANY method of \
+             this class, drop it here as the wrong method, and leave the stop point spent having \
+             reported nothing. Either drop `method` (hit_count:{n} then means return number {n} out of \
+             the class, whichever method produced it), or drop `hit_count` and use trace_max_hits to \
+             bound how many exits of `{m}` are recorded — that is a server-side count of the FIRST N, \
+             which is what you usually want anyway."
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Refuse a SUSPENDING method-exit request that would report more than anyone can have meant to freeze
@@ -3264,6 +3309,8 @@ struct WatchSpec<'a> {
     /// Per-value capture length (TRACE-9), already clamped to `MAX_TRACE_LENGTH`; `None` for the defaults.
     trace_max_length: Option<usize>,
     thread_filter: Option<u64>,
+    /// The `Count` modifier this watch is armed with (FILT-8); `None` for an ordinary watch.
+    hit_count: Option<i32>,
 }
 
 /// Arm one kind of field watch and register it, returning its `watch_<kind>_<n> (<kind>)` id label.
@@ -3285,7 +3332,7 @@ async fn arm_one_field_watch(
             field_id,
             kind,
             suspend_policy_for(spec.trace),
-            None,
+            spec.hit_count,
             spec.thread_filter,
         )
         .await
@@ -3303,6 +3350,8 @@ async fn arm_one_field_watch(
         crate::session::WatchpointInfo {
             request_id: Some(request_id),
             enabled: true,
+            spent: false,
+            hit_count: spec.hit_count,
             hits: 0,
             arm: spec.arm,
             kind,
@@ -3362,6 +3411,7 @@ async fn arm_field_on_named_class(
         trace_frames: arm.trace_frames,
         trace_max_length: arm.trace_max_length,
         thread_filter,
+        hit_count: a.hit_count,
     };
     let mut ids = Vec::with_capacity(arm.kinds.len());
     for kind in arm.kinds {
@@ -3459,6 +3509,7 @@ async fn arm_field_on_one_class(
         trace_frames: arm.trace_frames,
         trace_max_length: arm.trace_max_length,
         thread_filter,
+        hit_count: a.hit_count,
     };
     let mut ids = Vec::with_capacity(arm.kinds.len());
     for kind in arm.kinds {
@@ -3488,6 +3539,7 @@ fn field_batch_trailer(
     if let Some(t) = thread_filter {
         let _ = write!(trailer, "\n   Thread filter: 0x{t:x} (only touches on this thread)");
     }
+    trailer.push_str(&describe_hit_count(a.hit_count, a.trace, trace_budget, 1));
     trailer.push_str(&describe_trace_budget(a.trace, trace_budget));
     trailer.push_str(&describe_trace_frames(
         a.trace,
@@ -3551,7 +3603,7 @@ async fn arm_one_method_exit(
             class_pattern,
             arm.with_return_value,
             suspend_policy_for(a.trace),
-            None,
+            a.hit_count,
             arm.thread_filter,
         )
         .await
@@ -3564,6 +3616,8 @@ async fn arm_one_method_exit(
             id: mexit_id.clone(),
             request_id: Some(request_id),
             enabled: true,
+            spent: false,
+            hit_count: a.hit_count,
             hits: 0,
             class_pattern: class_pattern.to_string(),
             method: method.cloned(),
@@ -3628,6 +3682,7 @@ fn describe_method_exit_arm(
     if let Some(t) = arm.thread_filter {
         let _ = write!(extra, "\n   Thread filter: 0x{t:x} (only returns on this thread)");
     }
+    extra.push_str(&describe_hit_count(a.hit_count, a.trace, arm.trace_budget, 1));
     extra.push_str(&describe_trace_budget(a.trace, arm.trace_budget));
     extra.push_str(&describe_trace_frames(a.trace, arm.trace_frames, frames_note, "returning frame only"));
     if a.trace {
@@ -3681,6 +3736,7 @@ fn render_exception_stop_reply(
     if let Some(t) = r.thread_filter {
         let _ = write!(extra, "\n   Thread filter: 0x{t:x} (only throws on this thread)");
     }
+    extra.push_str(&describe_hit_count(a.hit_count, a.trace, trace_budget_for(a.trace, a.trace_max_hits), 1));
     extra.push_str(&describe_trace_budget(a.trace, trace_budget_for(a.trace, a.trace_max_hits)));
     extra.push_str(&describe_trace_frames(
         a.trace,
@@ -3812,7 +3868,7 @@ async fn arm_one_exception(
             a.caught,
             a.uncaught,
             suspend_policy_for(a.trace),
-            None,
+            a.hit_count,
             thread_filter,
         )
         .await
@@ -3825,6 +3881,8 @@ async fn arm_one_exception(
             id: exc_id.clone(),
             request_id: Some(request_id),
             enabled: true,
+            spent: false,
+            hit_count: a.hit_count,
             hits: 0,
             ref_type,
             class_pattern: class_pattern.to_string(),
@@ -3916,6 +3974,12 @@ fn exception_batch_trailer(
     if let Some(t) = thread_filter {
         let _ = write!(trailer, "\n   Thread filter: 0x{t:x} (only throws on this thread)");
     }
+    trailer.push_str(&describe_hit_count(
+        a.hit_count,
+        a.trace,
+        trace_budget_for(a.trace, a.trace_max_hits),
+        1,
+    ));
     trailer.push_str(&describe_trace_budget(a.trace, trace_budget_for(a.trace, a.trace_max_hits)));
     trailer.push_str(&describe_trace_frames(
         a.trace,
@@ -3953,6 +4017,7 @@ fn render_field_stop_reply(
     if let Some(t) = spec.thread_filter {
         let _ = write!(extra, "\n   Thread filter: 0x{t:x} (only touches on this thread)");
     }
+    extra.push_str(&describe_hit_count(a.hit_count, a.trace, spec.trace_budget, 1));
     extra.push_str(&describe_trace_budget(a.trace, spec.trace_budget));
     extra.push_str(&describe_trace_frames(
         a.trace,
@@ -3985,6 +4050,48 @@ fn render_field_stop_reply(
 /// and tops out near 720 hits/s — so a site firing faster than that is throttled for as long as the stop
 /// point stays armed. Not freezing is not the same as not slowing. That trade is the caller's to make,
 /// but not one to make by accident.
+/// What a `hit_count` (`Count`) actually buys, for the arm reply of any kind (FILT-8).
+///
+/// Three things a caller cannot see from the argument they passed, and each has produced a wrong
+/// expectation:
+///
+///  - **It fires once and is then gone.** Not "stop from the Nth onwards" — the JVM reports the Nth
+///    occurrence and deletes the request itself. Before FILT-8 nothing tracked that, so the stop point
+///    went on being listed as armed forever.
+///  - **It does not compose with `trace_max_hits`.** A budget of 200 beside a `Count` of 5 yields ONE
+///    snapshot. Saying "auto-disarms after 200 trace hits" and leaving the caller to work that out is
+///    exactly the reporting-two-numbers-that-cannot-both-apply failure this repo keeps finding.
+///  - **JDWP counts per REQUEST, and one stop point can own several.** A `finally` line is armed at two
+///    bytecode copies (BP-4) and a class loaded by two loaders at two types (BP-5), each with its own
+///    independent count. So it fires when whichever copy first reaches N, which is not "the Nth time the
+///    line ran". Stated only when it applies, so an ordinary single-location arm reads as it always has.
+fn describe_hit_count(hit_count: Option<i32>, trace: bool, budget: Option<u32>, locations: usize) -> String {
+    let Some(c) = hit_count else { return String::new() };
+    let mut out = format!(
+        "\n   Stops on hit #{c} — ONCE, and then it is gone: JDWP's Count modifier makes the JVM report \
+         occurrence #{c} and delete the request itself. debug.list_stop_points then shows this stop \
+         point SPENT rather than armed, and debug.toggle_stop_point re-arms it with the same count."
+    );
+    if trace {
+        if let Some(b) = budget.filter(|b| *b > 1) {
+            let _ = write!(
+                out,
+                "\n   ⚠️  trace_max_hits: {b} cannot apply here — spent after one hit means ONE snapshot, \
+                 not {b}. Drop hit_count if you wanted the first {b}; that is what the budget counts."
+            );
+        }
+    }
+    if locations > 1 {
+        let _ = write!(
+            out,
+            "\n   ⚠️  Armed at {locations} locations, and JDWP counts PER LOCATION — each copy has its own \
+             independent count, so this fires when whichever copy first reaches #{c}, not on execution \
+             #{c} of the line. The other copies are cleared at that moment."
+        );
+    }
+    out
+}
+
 fn describe_trace_budget(trace: bool, budget: Option<u32>) -> String {
     if !trace {
         return String::new();
@@ -4118,6 +4225,56 @@ fn render_session_line(
     line
 }
 
+/// The clause `clear_stop_point` appends when the stop point it just dropped was already **spent**
+/// (FILT-8) — its `hit_count` had fired and the JVM deleted the request itself.
+///
+/// Worth a clause rather than silence because "✅ cleared" otherwise claims something that did not
+/// happen: no JDWP packet was sent, because there was no request left to name. The alternative most
+/// debuggers take — always send the `Clear` and ignore the error — is specifically wrong here. Request
+/// ids are allocated by the debuggee and **recur** (`CONTEXT.md` § **Request id**), so a `Clear` naming a
+/// long-deleted id can land on whatever now holds it. Not sending it is the correctness property; saying
+/// so is how the caller can tell it was not sent.
+const fn spent_clear_note(spent: bool) -> &'static str {
+    if spent {
+        " — it was already SPENT (its hit_count had fired and the JVM deleted the request), so nothing \
+         was sent to the debuggee; only the bookkeeping is gone"
+    } else {
+        ""
+    }
+}
+
+/// The trailing state clause for a stop point in `list_stop_points` (FILT-8).
+///
+/// Three states, not two, and the third is the point. `enabled: false` is BP-1's toggle — something the
+/// CALLER did and can undo. **Spent** is something the DEBUGGEE did: a stop point armed with `hit_count`
+/// fires once, on the Nth occurrence, and the JVM deletes the request itself. Both end with nothing armed
+/// and both keep the definition, so they render through one function; collapsing them into one WORDING
+/// would tell a caller their own toggle turned something off that they never touched.
+///
+/// Before FILT-8 there was no third state at all: a spent stop point listed as armed, indefinitely, and
+/// `clear_stop_point` on it tried to clear a request the JVM had removed.
+const fn stop_point_state_suffix(enabled: bool, spent: bool) -> &'static str {
+    if enabled {
+        ""
+    } else if spent {
+        " — SPENT (its hit_count fired, and the JVM deleted the request itself — nothing is armed. \
+         debug.toggle_stop_point re-arms it with the same count)"
+    } else {
+        " — DISABLED (definition kept; toggle to re-arm)"
+    }
+}
+
+/// The status glyph for a stop point, where a spent one is neither armed nor switched off by anyone.
+const fn stop_point_glyph(enabled: bool, spent: bool, armed: &'static str) -> &'static str {
+    if enabled {
+        armed
+    } else if spent {
+        "⏹"
+    } else {
+        "✗"
+    }
+}
+
 /// Format one active breakpoint into the `debug.list_stop_points` output. `bp_id` is its map key.
 fn render_breakpoint_line(
     output: &mut String,
@@ -4128,14 +4285,14 @@ fn render_breakpoint_line(
     let _ = writeln!(
         output,
         "  {} [{}] {}:{}{}{}{}{}",
-        if bp.enabled { "✓" } else { "✗" },
+        stop_point_glyph(bp.enabled, bp.spent, "✓"),
         bp_id,
         bp.class_pattern,
         bp.line,
         if bp.trace { " (trace)" } else { "" },
         trace_budget_tag(bp.trace, bp.trace_budget),
         trace_frames_tag(bp.trace, bp.trace_frames),
-        if bp.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
+        stop_point_state_suffix(bp.enabled, bp.spent),
     );
     let tag = dead_filter_tag(bp.arm.thread_filter, dead);
     if !tag.is_empty() {
@@ -4347,14 +4504,14 @@ fn render_exception_line(
     let _ = writeln!(
         output,
         "  {} [{}] exception {} ({which}){}{}{}{}{}",
-        if er.enabled { "⚡" } else { "✗" },
+        stop_point_glyph(er.enabled, er.spent, "⚡"),
         er.id,
         er.class_pattern,
         if er.trace { " (trace)" } else { "" },
         trace_budget_tag(er.trace, er.trace_budget),
         trace_frames_tag(er.trace, er.trace_frames),
         er.thread_filter.map_or_else(String::new, |t| format!(" thread=0x{t:x}")),
-        if er.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
+        stop_point_state_suffix(er.enabled, er.spent),
     );
     let tag = dead_filter_tag(er.thread_filter, dead);
     if !tag.is_empty() {
@@ -4803,7 +4960,7 @@ fn render_watchpoint_line(
     let _ = writeln!(
         output,
         "  {} [{}] watch {}.{} on {} ({}){}{}{}{}",
-        if wp.enabled { "👁" } else { "✗" },
+        stop_point_glyph(wp.enabled, wp.spent, "👁"),
         watch_id,
         wp.class_name,
         wp.field_name,
@@ -4812,7 +4969,7 @@ fn render_watchpoint_line(
         if wp.trace { " (trace)" } else { "" },
         trace_frames_tag(wp.trace, wp.trace_frames),
         wp.thread_filter.map_or_else(String::new, |t| format!(" thread=0x{t:x}")),
-        if wp.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
+        stop_point_state_suffix(wp.enabled, wp.spent),
     );
     // Budget on its own line to keep the header stable; harmless when absent.
     if let Some(n) = wp.trace_budget {
@@ -4839,7 +4996,7 @@ fn render_method_exit_line(
     let _ = writeln!(
         output,
         "  {} [{}] method-exit {}{} ({}){}{}{}{}",
-        if me.enabled { "↩" } else { "✗" },
+        stop_point_glyph(me.enabled, me.spent, "↩"),
         me.id,
         me.class_pattern,
         me.method.as_ref().map_or_else(|| ".* (every method)".to_string(), |m| format!(".{m}")),
@@ -4847,7 +5004,7 @@ fn render_method_exit_line(
         if me.trace { " (trace)" } else { " ⚠️ SUSPENDING" },
         trace_budget_tag(me.trace, me.trace_budget),
         trace_frames_tag(me.trace, me.trace_frames),
-        if me.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
+        stop_point_state_suffix(me.enabled, me.spent),
     );
     if let Some(t) = me.thread_filter {
         let _ = writeln!(output, "     Thread filter: 0x{t:x}");
@@ -7643,6 +7800,7 @@ async fn try_arm_deferred_breakpoints(
                                 method: Some(method.name),
                                 drift,
                                 enabled: true,
+                                spent: false,
                                 hits: 0,
                                 condition: pend.condition,
                                 trace: pend.trace,
@@ -8409,7 +8567,7 @@ async fn rearm_method_exit(
             &me.class_pattern,
             me.with_return_value,
             suspend_policy_for(me.trace),
-            None,
+            me.hit_count,
             me.thread_filter,
         )
         .await
@@ -8417,6 +8575,10 @@ async fn rearm_method_exit(
     if let Some(m) = session.method_exits.get_mut(id) {
         m.request_id = Some(req);
         m.enabled = true;
+        // FILT-8: a re-arm issues a NEW JDWP request, so whatever the debuggee deleted is no longer
+        // the state of this stop point. Cleared here rather than at the toggle handler so every
+        // re-arm path clears it, including the ones a future kind adds.
+        m.spent = false;
         m.trace_budget = refreshed_budget(m.trace_budget);
         reset_trace_cost(&mut m.trace_cost);
     }
@@ -8471,6 +8633,10 @@ async fn rearm_line_breakpoint(
     if let Some(b) = session.breakpoints.get_mut(id) {
         b.request_ids = request_ids;
         b.enabled = true;
+        // FILT-8: a re-arm issues a NEW JDWP request, so whatever the debuggee deleted is no longer
+        // the state of this stop point. Cleared here rather than at the toggle handler so every
+        // re-arm path clears it, including the ones a future kind adds.
+        b.spent = false;
         b.arm = arm;
         b.trace_budget = refreshed_budget(b.trace_budget);
         reset_trace_cost(&mut b.trace_cost);
@@ -8503,7 +8669,7 @@ async fn rearm_exception_request(
             er.caught,
             er.uncaught,
             suspend_policy_for(er.trace),
-            None,
+            er.hit_count,
             er.thread_filter,
         )
         .await
@@ -8511,6 +8677,10 @@ async fn rearm_exception_request(
     if let Some(e) = session.exception_requests.get_mut(id) {
         e.request_id = Some(req);
         e.enabled = true;
+        // FILT-8: a re-arm issues a NEW JDWP request, so whatever the debuggee deleted is no longer
+        // the state of this stop point. Cleared here rather than at the toggle handler so every
+        // re-arm path clears it, including the ones a future kind adds.
+        e.spent = false;
         e.ref_type = ref_type;
         e.trace_budget = refreshed_budget(e.trace_budget);
         reset_trace_cost(&mut e.trace_cost);
@@ -8543,7 +8713,7 @@ async fn rearm_watchpoint(
             field.field_id,
             wp.kind,
             suspend_policy_for(wp.trace),
-            None,
+            wp.hit_count,
             wp.thread_filter,
         )
         .await
@@ -8551,6 +8721,10 @@ async fn rearm_watchpoint(
     if let Some(w) = session.watchpoints.get_mut(id) {
         w.request_id = Some(req);
         w.enabled = true;
+        // FILT-8: a re-arm issues a NEW JDWP request, so whatever the debuggee deleted is no longer
+        // the state of this stop point. Cleared here rather than at the toggle handler so every
+        // re-arm path clears it, including the ones a future kind adds.
+        w.spent = false;
         w.arm = (declaring, field.field_id);
         w.trace_budget = refreshed_budget(w.trace_budget);
         reset_trace_cost(&mut w.trace_cost);
@@ -8696,6 +8870,11 @@ async fn try_record_trace(
             session.note_trace_disarm(label);
         }
     }
+    // FILT-8, and LAST on purpose: everything above finds this stop point by request id, and retiring it
+    // any earlier leaves the cost and the budget reporting a stop point they can no longer see. Outside
+    // the `recorded` branch because a Count is spent by the HIT, not by whether we chose to record it —
+    // a condition that turned out false still consumed the JVM's one report.
+    spend_if_counted(session, req_id).await;
     true
 }
 
@@ -8775,6 +8954,62 @@ fn record_stop_point_hit(session: &mut crate::session::DebugSession, req_id: i32
     }
 }
 
+/// Retire a stop point that carries a `hit_count`, because this hit was its last (FILT-8).
+///
+/// The bookkeeping is exact rather than heuristic, and this is why: `Count` means the JVM reports **only**
+/// the Nth occurrence and then deletes the request, so the *first* event ever received for such a request
+/// **is** the Nth. There is nothing to count on this side and no window in which we could be wrong.
+///
+/// **Called last, after everything else that hit needs.** It was first, beside the tally, and that shipped
+/// two wrong numbers in one listing: the trace cost read "nothing captured yet" and the budget read "200
+/// hit(s) left" beside a real snapshot, because `record_trace_cost` and `charge_trace_budget` both find
+/// their stop point by request id and this had already removed it. The tally has no such dependency,
+/// which is why the two are separate calls rather than one.
+///
+/// The multi-location case is the other half. JDWP applies `Count` per **request** and a stop point can
+/// own several — one per bytecode copy of a `finally` line (BP-4), one per classloader that defines the
+/// class (BP-5) — each with its own independent count. The JVM deleted only the one that fired, so the
+/// survivors are cleared here or they stay armed in the debuggee with nothing left on this side able to
+/// match their hits. `req_id` itself is deliberately not among them: sending a `Clear` for an id the JVM
+/// has already removed is exactly the operation that can land on a **reused** id belonging to something
+/// else (`CONTEXT.md` § **Request id**).
+async fn spend_if_counted(session: &mut crate::session::DebugSession, req_id: i32) {
+    let mut survivors: Vec<i32> = Vec::new();
+    if let Some(b) = session.breakpoints.values_mut().find(|b| b.owns_request(req_id)) {
+        if b.arm.hit_count.is_none() {
+            return;
+        }
+        survivors = b.request_ids.iter().copied().filter(|r| *r != req_id).collect();
+        b.request_ids.clear();
+        b.enabled = false;
+        b.spent = true;
+    } else if let Some(e) = session.exception_requests.values_mut().find(|e| e.request_id == Some(req_id)) {
+        if e.hit_count.is_none() {
+            return;
+        }
+        e.request_id = None;
+        e.enabled = false;
+        e.spent = true;
+    } else if let Some(w) = session.watchpoints.values_mut().find(|w| w.request_id == Some(req_id)) {
+        if w.hit_count.is_none() {
+            return;
+        }
+        w.request_id = None;
+        w.enabled = false;
+        w.spent = true;
+    } else if let Some(m) = session.method_exits.values_mut().find(|m| m.request_id == Some(req_id)) {
+        if m.hit_count.is_none() {
+            return;
+        }
+        m.request_id = None;
+        m.enabled = false;
+        m.spent = true;
+    }
+    for req in survivors {
+        let _ = session.connection.clear_breakpoint(req).await;
+    }
+}
+
 /// Decrement the matching stop point's trace budget in place, returning the count left afterwards, or
 /// `None` when the request has no budget (unbounded) or isn't found.
 fn decrement_trace_budget(session: &mut crate::session::DebugSession, req_id: i32) -> Option<u32> {
@@ -8827,6 +9062,9 @@ async fn store_reportable_event(
     // Set when the condition MATCHED and the escalation to a VM-wide suspend failed. Carried onto the
     // event record so `get_last_event` can report both halves; see `escalate_to_vm_suspend`.
     let mut escalation = None;
+    // The request id this event carried, kept for the FILT-8 retirement at the very end of this
+    // function — `event_set` is moved into the buffer before then.
+    let mut counted_req_id = None;
     if let (Some((thread, loc)), Some(req_id)) = (
         event_set.events.first().and_then(|e| event_location(&e.details)),
         event_set.events.first().map(|e| e.request_id),
@@ -8852,6 +9090,7 @@ async fn store_reportable_event(
         if !skip {
             record_stop_point_hit(session, req_id);
         }
+        counted_req_id = Some(req_id);
         let cond =
             session.breakpoints.values().find(|b| b.owns_request(req_id)).and_then(|b| b.condition.clone());
         if !skip {
@@ -8897,6 +9136,13 @@ async fn store_reportable_event(
         if suspends {
             notify_suspension(session, seq).await;
         }
+    }
+    // FILT-8, and after the event is buffered for the same reason the traced path retires last: the
+    // suspend cause records this request id, and a stop point removed before that is a stop point the
+    // watchdog cannot name. Runs for a dropped hit too — a Count is spent by the JVM's one report,
+    // whatever this side decided to do with it.
+    if let Some(req_id) = counted_req_id {
+        spend_if_counted(session, req_id).await;
     }
 }
 
@@ -9999,6 +10245,7 @@ async fn arm_and_insert(
             method: Some(method.name.clone()),
             drift: drift.clone(),
             enabled: true,
+            spent: false,
             hits: 0,
             condition: spec.condition.clone(),
             trace: spec.trace,
@@ -10703,9 +10950,12 @@ async fn arm_single_named(
     let (bp_id, line, method_name) = (&armed.bp_id, armed.line, &armed.method_name);
 
     let mut extra = describe_trace_mode(spec, frames_note);
-    if let Some(c) = spec.hit_count {
-        let _ = write!(extra, "\n   Stops on hit #{c}");
-    }
+    extra.push_str(&describe_hit_count(
+        spec.hit_count,
+        spec.trace,
+        spec.trace_budget,
+        armed.request_ids.len().max(1),
+    ));
     if let Some(t) = spec.thread_filter {
         let _ = write!(extra, "\n   Thread filter: 0x{t:x}");
     }
@@ -16855,6 +17105,82 @@ async fn compare_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FILT-8: `hit_count` and `method` on a method-exit stop point cannot both mean what they say, so
+    /// the pair is refused — and the refusal has to explain the JDWP fact behind it, or it reads as an
+    /// arbitrary restriction someone will work around by removing the wrong one of the two.
+    #[test]
+    fn a_counted_method_exit_refuses_a_method_filter_and_says_why() {
+        let refused = refuse_counted_method_filter(Some(3), Some("save"))
+            .expect_err("hit_count with a method filter must be refused");
+        for needle in ["hit_count", "method", "Count", "every method of the class", "trace_max_hits"] {
+            assert!(refused.contains(needle), "the refusal must mention {needle}:\n{refused}");
+        }
+        assert!(
+            refused.contains("exit number 3 of ANY method"),
+            "the refusal has to name what the JVM would actually have counted, or the caller cannot \
+             tell it apart from a missing feature:\n{refused}"
+        );
+
+        // Each on its own is fine, and so is neither. Only the pair is a lie.
+        assert!(refuse_counted_method_filter(Some(3), None).is_ok(), "a Count with no filter is exact");
+        assert!(refuse_counted_method_filter(None, Some("save")).is_ok(), "a filter with no Count is fine");
+        assert!(refuse_counted_method_filter(None, None).is_ok());
+    }
+
+    /// FILT-8: the three states a stop point can be in are three, and the wordings must not collapse.
+    #[test]
+    fn spent_is_reported_as_neither_armed_nor_disabled() {
+        assert_eq!(stop_point_state_suffix(true, false), "", "an armed stop point says nothing extra");
+        assert!(stop_point_state_suffix(false, false).contains("DISABLED"));
+        let spent = stop_point_state_suffix(false, true);
+        assert!(spent.contains("SPENT"), "{spent}");
+        assert!(
+            !spent.contains("DISABLED"),
+            "spent must not read as the caller's own toggle — they did not switch this off:\n{spent}"
+        );
+        assert!(
+            spent.contains("toggle_stop_point"),
+            "a caller told their stop point is gone needs the way back:\n{spent}"
+        );
+        assert_eq!(stop_point_glyph(false, true, "✓"), "⏹", "spent has its own glyph");
+        assert_eq!(stop_point_glyph(false, false, "✓"), "✗");
+        assert_eq!(stop_point_glyph(true, false, "✓"), "✓");
+    }
+
+    /// FILT-8: what `describe_hit_count` promises the caller before the stop point fires.
+    #[test]
+    fn a_counted_arm_reply_states_the_three_surprises() {
+        assert!(describe_hit_count(None, true, Some(200), 1).is_empty(), "silent without a Count");
+
+        let plain = describe_hit_count(Some(5), false, None, 1);
+        assert!(plain.contains("Stops on hit #5"), "{plain}");
+        assert!(plain.contains("SPENT"), "the once-and-gone semantics are the surprise:\n{plain}");
+
+        // The budget note only where both are set and the budget could not possibly apply.
+        assert!(
+            describe_hit_count(Some(5), true, Some(200), 1).contains("trace_max_hits: 200 cannot apply"),
+            "a Count beside a budget of 200 must say ONE snapshot rather than report both numbers"
+        );
+        assert!(
+            !describe_hit_count(Some(5), true, Some(1), 1).contains("cannot apply"),
+            "a budget of 1 agrees with a Count, so there is nothing to warn about"
+        );
+        assert!(
+            !describe_hit_count(Some(5), false, Some(200), 1).contains("cannot apply"),
+            "a suspending stop point has no trace budget to contradict"
+        );
+
+        // Per-location counting, stated only when there is more than one location.
+        assert!(
+            describe_hit_count(Some(5), false, None, 2).contains("PER LOCATION"),
+            "a finally line owns two independent counts and that is not what hit_count reads like"
+        );
+        assert!(
+            !describe_hit_count(Some(5), false, None, 1).contains("PER LOCATION"),
+            "an ordinary single-location arm must read exactly as it always has"
+        );
+    }
 
     /// Render a parsed boolean tree as a flat string so precedence/grouping can be asserted.
     fn shape(t: &BoolTree) -> String {
