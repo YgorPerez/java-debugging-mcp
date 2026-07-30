@@ -292,6 +292,11 @@ pub struct SetBreakpointArgs {
     pub trace: bool,
     /// Only with `trace:true` — an expression to evaluate in the hit frame and record alongside
     /// the snapshot (e.g. `reserva.getStatus()`).
+    ///
+    /// A trailing `#<charset>` says how to render a `byte[]`/`char[]` this resolves to:
+    /// `log.dsRequest#ISO-8859-1`, or `#raw` for the element list. It composes here because there is no
+    /// schema to extend inside an expression string — see `debug.evaluate`'s `expression` for the full
+    /// list of names.
     #[serde(default)]
     pub trace_expr: Option<String>,
     /// Only with `trace:true` — disarm this logpoint automatically after recording this many hits, so
@@ -445,6 +450,16 @@ pub struct EvaluateArgs {
     /// Filtering a `Map` tests its **values** and renders survivors as `key → value`, so you keep the
     /// keys you were looking for; a `Map` can't be sliced (no positional order).
     /// A slice or filter selects several values, so nothing can be chained after it.
+    ///
+    /// `arr.length` works on any array (it reads `ArrayReference.Length`, not a field), and a `byte[]` /
+    /// `char[]` renders as DECODED TEXT with the encoding named — `byte[73] ISO-8859-1 "<?xml …"` —
+    /// rather than as a list of numbers. A trailing `#<charset>` picks the encoding: `UTF-8` (the
+    /// default), `ISO-8859-1` (aliases `latin1`), `US-ASCII` (`ascii`), or `#raw` for the element list
+    /// when the array really is binary. Punctuation and case in the name are ignored.
+    /// **`ISO-8859-1` is not exotic on this stack** — `it-common` pins its shared JAXB marshaller to it,
+    /// so `log.dsRequest#ISO-8859-1` is the reading a supplier envelope usually needs, and octets that
+    /// do not decode are marked `\xNN` rather than replaced, so a wrong charset looks wrong instead of
+    /// looking like a supplier bug.
     pub expression: String,
     /// Thread ID (optional; defaults to the last thread that hit a breakpoint).
     #[serde(default)]
@@ -478,6 +493,9 @@ pub struct EvaluateChainArgs {
     ///
     /// A single-link expression is accepted but answers nothing this tool is for: with one link there is
     /// no "which one" to find.
+    ///
+    /// Takes the same trailing `#<charset>` selector `debug.evaluate` does, applied to every link's
+    /// rendered value.
     pub expression: String,
     /// Thread ID (optional; defaults to the last thread that hit a breakpoint).
     #[serde(default)]
@@ -752,6 +770,11 @@ pub struct SetExceptionBreakpointArgs {
     pub trace: bool,
     /// Only with `trace:true` — an expression to evaluate in the throwing frame and record alongside
     /// the snapshot (e.g. `this.getStatus()`).
+    ///
+    /// A trailing `#<charset>` says how to render a `byte[]`/`char[]` this resolves to:
+    /// `log.dsRequest#ISO-8859-1`, or `#raw` for the element list. It composes here because there is no
+    /// schema to extend inside an expression string — see `debug.evaluate`'s `expression` for the full
+    /// list of names.
     #[serde(default)]
     pub trace_expr: Option<String>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit),
@@ -826,6 +849,11 @@ pub struct SetWatchpointArgs {
     pub trace: bool,
     /// Only with `trace:true` — an expression to evaluate in the mutating frame and record alongside
     /// the snapshot.
+    ///
+    /// A trailing `#<charset>` says how to render a `byte[]`/`char[]` this resolves to:
+    /// `log.dsRequest#ISO-8859-1`, or `#raw` for the element list. It composes here because there is no
+    /// schema to extend inside an expression string — see `debug.evaluate`'s `expression` for the full
+    /// list of names.
     #[serde(default)]
     pub trace_expr: Option<String>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit),
@@ -896,6 +924,11 @@ pub struct SetMethodBreakpointArgs {
     pub trace: bool,
     /// Only with `trace:true` — an expression evaluated in the returning frame and recorded alongside
     /// the snapshot.
+    ///
+    /// A trailing `#<charset>` says how to render a `byte[]`/`char[]` this resolves to:
+    /// `log.dsRequest#ISO-8859-1`, or `#raw` for the element list. It composes here because there is no
+    /// schema to extend inside an expression string — see `debug.evaluate`'s `expression` for the full
+    /// list of names.
     #[serde(default)]
     pub trace_expr: Option<String>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit).

@@ -27,6 +27,13 @@ natural language.
 - **Collection Subscripts**: `lines[0]`, `counts["key"]`, `lines[2..5]` (slice) and
   **`lines[?qty > 3]`** (filter, with the left side resolved against each element). Filtering a `Map`
   keeps the keys (`key → value`), and a single element can be **written** as well as read
+- **`byte[]` as text**: a `byte[]` / `char[]` renders as **decoded text with the encoding named** —
+  `byte[73] ISO-8859-1 "<?xml version=…"` — rather than as a list of signed integers, and `arr.length`
+  works on any array. A trailing **`#<charset>`** on the expression picks the reading (`UTF-8` by
+  default, `ISO-8859-1`, `US-ASCII`, or `#raw` for the octets), and it composes with `trace_expr`, so a
+  supplier envelope is readable from a **non-suspending** stop point. Octets that do not decode are
+  marked `\xNN` rather than replaced, so a wrong charset looks wrong instead of looking like a bug in
+  whatever produced the payload
 - **Which link went null**: `debug.evaluate_chain` walks a chained expression left to right and names the
   first link that is null, with every link's value above it and a count of the ones it never reached —
   the one-call answer to a question that otherwise costs one `debug.evaluate` per link. Each method in
@@ -179,7 +186,7 @@ Adjust the path to match where you saved the downloaded binary (or `target/relea
 | `debug.step_into` | Step into a method call |
 | `debug.step_out` | Step out of the current method |
 | `debug.get_stack` | Stack frames, compact `#i class.method:line` with typed locals indented |
-| `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods, object arguments, `[i]`/`["k"]`/`[a..b]`/`[?pred]` subscripts (predicates support `&&`/`||`), and `expand_objects` for a deep field tree |
+| `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods, object arguments, `[i]`/`["k"]`/`[a..b]`/`[?pred]` subscripts (predicates support `&&`/`||`), `arr.length` on any array, a `byte[]`/`char[]` rendered as decoded text with a `#<charset>` selector, and `expand_objects` for a deep field tree |
 | `debug.evaluate_chain` | **Which link went null?** Walks the same chained expression `debug.evaluate` takes, link by link, printing each one's value and naming the first null — plus how many links after it were never evaluated. For a chain that returns null or an empty collection without throwing, which otherwise costs one `debug.evaluate` per link, bisected by hand. Every method in the chain runs **exactly once** (each link resolves against the previous link's value, not by re-evaluating longer prefixes) and no `toString()` is invoked. A separate tool rather than a flag, per ADR-0015 — "where did this become null" is a different question from "what is this value". If the chain *throws*, prefer the exception's own message: on JDK 15+ it names the failing subexpression |
 | `debug.set_value` | Write a local variable, a static field (`Class.field`), an instance field (`this.field`), or one element (`xs[0]`, `counts["k"]`) — from a literal or a copied live reference (`this.a = other.b`) |
 | `debug.set_field_stop` | Break when a field is written (or read) — reports the mutating location + old → new value; optional `thread_id` filter; `trace:true` (with `trace_max_hits` / `trace_frames`) collects hits without suspending |
@@ -637,6 +644,9 @@ instead.
       48% fewer JDWP packets on a cold deep expansion, 62% warm (values are never cached)
 - [x] **Collection subscripts** — index, `Map` key lookup (with key boxing), half-open slice, and
       predicate filter with element-relative left sides; bounded by a documented scan cap
+- [x] **`byte[]` / `char[]` as decoded text** with the encoding named, a `#<charset>` selector on the
+      expression (UTF-8 / ISO-8859-1 / US-ASCII, or `#raw`) that composes with `trace_expr`, undecodable
+      octets marked rather than replaced, and `array.length` on any array (EVAL-7)
 - [x] **Conditional breakpoints** — `condition` evaluated in the hit frame (`expr OP expr` or boolean chains); auto-resumes when false
 - [x] **Multiple concurrent sessions** — `debug.attach` returns a `session_id`; tools take an optional `session_id` (defaults to current); `debug.list_sessions` finds one you lost
 - [x] **Arguments** in `evaluate` / conditions: literals (int, long `123L`, boolean, null, `"string"`) or expressions
