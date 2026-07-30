@@ -846,12 +846,43 @@ impl FaultRelay {
         Self::start_with_events(target_port, faults, None)
     }
 
+    /// Listen on a fresh port and make the JVM **refuse** the named commands — the debuggee answers each
+    /// with an error and, crucially, *performs nothing*.
+    ///
+    /// The difference from a [`Fault::Error`] on the same command is the difference between a lie and a
+    /// refusal, and it is not cosmetic. A `Fault` rewrites the REPLY, so the command has already landed
+    /// and the debuggee has already acted; only the answer is wrong. That is the right instrument for
+    /// "the JVM is misreporting" and the wrong one for "the JVM would not do it", which is the state most
+    /// error branches are actually written for. FILT-7's failed escalation needs the second: a
+    /// `VirtualMachine.Suspend` that errors AND leaves the application running, so a reply claiming the
+    /// application is running can be checked against the probe rather than merely read.
+    ///
+    /// Implemented by dropping the request on the way out and answering it `NOT_IMPLEMENTED` from the
+    /// relay, so the debuggee never sees it at all. The first attempt repointed the packet at an unused
+    /// command number instead, on the assumption that the JVM would refuse it — `HotSpot`'s debug agent does
+    /// not bounds-check the command byte and crashed in native code, which is worth knowing before
+    /// anybody tries it again.
+    pub fn start_refusing(target_port: u16, refuse: Vec<(u8, u8)>) -> Result<Self, String> {
+        Self::start_full(target_port, vec![], None, refuse)
+    }
+
     /// As [`start`](Self::start), and additionally apply `on_events` to the debuggee's composite event
     /// packets — the traffic nobody asked for, which [`Fault`] cannot key on.
     pub fn start_with_events(
         target_port: u16,
         faults: Vec<(u8, u8, Fault)>,
         on_events: Option<EventFault>,
+    ) -> Result<Self, String> {
+        Self::start_full(target_port, faults, on_events, vec![])
+    }
+
+    /// Every policy at once. The three public constructors are named for the question each answers; this
+    /// is the one place they are wired.
+    fn start_full(
+        target_port: u16,
+        faults: Vec<(u8, u8, Fault)>,
+        on_events: Option<EventFault>,
+        refuse: Vec<(u8, u8)>,
     ) -> Result<Self, String> {
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let for_relay = Arc::clone(&counter);
@@ -860,10 +891,11 @@ impl FaultRelay {
             let faults = faults.clone();
             let on_events = on_events.clone();
             let counter = Arc::clone(&for_relay);
+            let refuse = refuse.clone();
             // Counted across the whole session rather than per packet, so `times: 1` means "one event
             // only" and a test can stage a second, clean event after it.
             let duplicated = Arc::clone(&counter);
-            wire_framed(client, server, move |seen| {
+            wire_framed(client, server, refuse, move |seen| {
                 let (command, reply) = match seen {
                     // Composite events are *command* packets (set 64) from the debuggee's side. Untouched
                     // unless a policy asks for them: faulting them blindly breaks the event pump rather
@@ -1021,14 +1053,23 @@ enum FromDebuggee<'a> {
     Event(&'a [u8]),
 }
 
+/// JDWP's `NOT_IMPLEMENTED`, which is what a refused command is answered with.
+const JDWP_NOT_IMPLEMENTED: u16 = 99;
+
 /// Wire both directions of a **framing** proxy, calling `on_reply` for everything the debuggee sends back.
 /// `on_reply` returns a replacement packet, or `None` to forward what arrived.
+///
+/// `refuse` lists `(command set, command)` pairs the debuggee must never see: the request is dropped on
+/// the way out and answered `NOT_IMPLEMENTED` from here, so the JVM does not perform it — see
+/// [`FaultRelay::start_refusing`](FaultRelay::start_refusing) for why that is a different instrument from
+/// faulting the reply.
 ///
 /// Returns the flag from [`pump_framed`] for the debuggee direction: `true` once the debuggee side has
 /// closed, which is the last moment anything can still be recorded.
 fn wire_framed(
     client: std::net::TcpStream,
     server: std::net::TcpStream,
+    refuse: Vec<(u8, u8)>,
     mut on_reply: impl FnMut(FromDebuggee<'_>) -> Option<Vec<u8>> + Send + 'static,
 ) -> Arc<std::sync::atomic::AtomicBool> {
     // Which command — and which request payload — each id belongs to, learned from the request direction
@@ -1037,19 +1078,39 @@ fn wire_framed(
     let (Ok(c_read), Ok(s_read)) = (client.try_clone(), server.try_clone()) else {
         return Arc::new(std::sync::atomic::AtomicBool::new(true));
     };
+    // A third handle on the debugger's socket, for answering a refusal without the debuggee's help. Two
+    // threads therefore write to it, which is safe here for the reason it would not be in general: a
+    // refusal is one 11-byte packet, written with a single `write_all` that becomes a single `send`.
+    let mut refusals_to = client.try_clone().ok();
 
     let outbound = Arc::clone(&pending);
     pump_framed(c_read, server, move |pkt| {
-        if let (Some(id), Some(flags), Some(set), Some(cmd)) =
+        let (Some(id), Some(flags), Some(set), Some(cmd)) =
             (packet_id(pkt), pkt.get(8).copied(), pkt.get(9).copied(), pkt.get(10).copied())
-        {
-            if flags & JDWP_REPLY_FLAG == 0 {
-                if let Ok(mut m) = outbound.lock() {
-                    m.insert(id, (set, cmd, pkt.get(JDWP_HEADER..).unwrap_or_default().to_vec()));
-                }
-            }
+        else {
+            return None;
+        };
+        if flags & JDWP_REPLY_FLAG != 0 {
+            return None;
         }
-        None
+        if !refuse.contains(&(set, cmd)) {
+            if let Ok(mut m) = outbound.lock() {
+                m.insert(id, (set, cmd, pkt.get(JDWP_HEADER..).unwrap_or_default().to_vec()));
+            }
+            return None;
+        }
+        // Answered here and never forwarded — the whole point is a command the JVM does not perform, so
+        // it must not arrive. Deliberately NOT recorded as pending either: no reply will come back from
+        // the debuggee for it, and an entry nothing removes would leak for the session.
+        //
+        // Repointing the packet at an unused command number was the first attempt and is why this is
+        // written the long way: `HotSpot`'s debug agent does not bounds-check the command byte, and
+        // `(1, 0xFF)` crashed the JVM in native code rather than being refused.
+        if let Some(w) = refusals_to.as_mut() {
+            let _ = std::io::Write::write_all(w, &reply_packet(id, JDWP_NOT_IMPLEMENTED, &[]));
+        }
+        // An empty replacement writes nothing, which is how this pump drops a packet.
+        Some(Vec::new())
     });
 
     pump_framed(s_read, client, move |pkt| {

@@ -195,13 +195,23 @@ So there is now a test for the invariant itself, not another happy path
 > After **any** resume path, from **any** suspended state, the VM is genuinely running — or the reply
 > said out loud that it isn't.
 
-It is a matrix of 5 suspended states × 4 resume paths (`continue`, `panic`, watchdog, `disconnect`),
+It is a matrix of 6 suspended states × 4 resume paths (`continue`, `panic`, watchdog, `disconnect`),
 asserted against the **probe's own output**, because every tool reports success either way — which is
 exactly how these bugs survived. Each of SAFE-1, SAFE-4 and SAFE-7 was reverted in turn to confirm the
 matrix names the offending `(state, path)` pair rather than passing anyway.
 
 **If you add a resume path, add it to `Resume`. If you find a new way to leave the VM suspended, add it to
 `Freeze`.** That is cheaper than the next review finding it, and it is the whole point of the matrix.
+
+FILT-7 (#91) added the sixth state, `ConditionEscalated`: a conditional stop point is now armed at
+`EventThread` and the **debugger** issues the VM-wide suspend when the condition holds (ADR-0019). It
+reaches suspend depth 2 on the hit thread the way `BreakpointThenPause` does, but with no `debug.pause`
+anywhere in the sequence. That issue also produced a state the matrix deliberately does **not** cover,
+because it is not a suspended one: a condition that matched while the escalation *failed*, leaving one
+thread held and the application running. It has its own test
+(`a_matched_condition_that_cannot_freeze_the_vm_reports_both_facts`), asserting the same invariant in the
+same shape — whatever the reply says about the VM, the probe agrees — across both worlds a failed suspend
+can leave behind.
 
 Its scope is deliberately stated in the test: it covers *resume* honesty, not *disarm* honesty (a VM that
 resumes but is immediately re-frozen by a still-armed stop point — the SAFE-2/SAFE-5 harm). That half is

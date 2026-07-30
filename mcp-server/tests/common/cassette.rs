@@ -259,7 +259,8 @@ impl CassetteRecorder {
         let relay = Relay::start("cassette recorder", Some(target_port), move |client, server| {
             let Some(server) = server else { return };
             let (tape, seen) = (Arc::clone(&tape), Arc::clone(&seen));
-            let flag = wire_framed(client, server, move |from| {
+            // Nothing refused either, for the same reason nothing is rewritten below.
+            let flag = wire_framed(client, server, vec![], move |from| {
                 match from {
                     FromDebuggee::Reply { command, request, reply } => {
                         // Nothing is rewritten — the recording must be of the session that really happened,

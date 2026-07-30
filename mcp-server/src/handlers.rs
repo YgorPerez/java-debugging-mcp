@@ -471,7 +471,7 @@ impl RequestHandler {
             ));
         }
 
-        let suspend_policy = suspend_policy_for(a.trace);
+        let suspend_policy = suspend_policy_for_line(a.trace, a.condition.is_some());
         let (trace_frames, frames_note) = clamp_trace_frames(a.trace, a.trace_frames);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
         // One definition, pointed at each pattern in turn below.
@@ -1710,7 +1710,14 @@ impl RequestHandler {
             }
         }
         // The newest event is the last one printed, so this describes the state you are in now.
-        let suspended = shown.last().is_some_and(|r| event_suspends(&r.set));
+        //
+        // FILT-7: a conditional stop point whose condition held but whose VM-wide suspend FAILED has an
+        // event whose suspend policy says a thread was suspended, while the application may well be
+        // running. `[suspended]` follows what the escalation VERIFIED against the debuggee, and the
+        // `[escalation]` line below explains it — the two are printed together or not at all.
+        let escalation = shown.last().and_then(|r| r.escalation.clone());
+        let suspended = shown.last().is_some_and(|r| event_suspends(&r.set))
+            && !escalation.as_ref().is_some_and(|e| e.vm_running);
         if a.drain {
             session.events.clear();
         }
@@ -1720,6 +1727,11 @@ impl RequestHandler {
         drop(session);
 
         lines.push(format!("[suspended] {suspended}"));
+        // Printed straight after `[suspended]` so the two are read as one statement: the condition the
+        // caller armed did fire, and the freeze they were entitled to expect did not happen (FILT-7).
+        if let Some(e) = escalation {
+            lines.push(format!("[escalation] {}", e.note));
+        }
         // If the watchdog auto-resumed while the caller was away, they'd otherwise read a stale
         // "suspended" state — tell them the VM was rescued and which stop point was disarmed (SAFE-2).
         //
@@ -2464,6 +2476,32 @@ const fn suspend_policy_for(trace: bool) -> jdwp_client::SuspendPolicy {
         jdwp_client::SuspendPolicy::EventThread
     } else {
         jdwp_client::SuspendPolicy::All
+    }
+}
+
+/// The suspend policy a **line breakpoint** should be armed with (FILT-7, [#91]). Same rule as
+/// [`suspend_policy_for`], plus the one thing only this kind has: a `condition`.
+///
+/// A conditional stop point is armed at `EventThread` even when it will eventually suspend the VM,
+/// because the condition has to be evaluated before anyone knows whether it should. Armed at `All` — as
+/// it was until FILT-7 — every hit stopped every thread, `evaluate_condition_on_thread` spent several
+/// round trips (a `get_frames`, a variable table, a `get_frame_values`, plus any invoke in the condition)
+/// with the whole application frozen, and `resume_all` let it go again when the answer was *false*. The
+/// cost was paid on every hit regardless of the outcome, which is precisely backwards: `condition` is the
+/// argument you reach for to make a stop point CHEAP on a busy shared instance.
+///
+/// So the policy says what the JVM must hold **to decide**, and `store_reportable_event` escalates to a
+/// VM-wide suspend on the hits where the condition holds. Measured on `CondProbe` (JDK 17, five runs
+/// each): across 120 non-matching hits an unrelated CPU-bound thread completed **10–14** units of work at
+/// `All` and **81–119** at `EventThread`. The debugger's replies are identical in both arms, which is why
+/// the test reads the debuggee's stdout and nothing else.
+///
+/// [#91]: https://github.com/YgorPerez/java-debugging-mcp/issues/91
+const fn suspend_policy_for_line(trace: bool, conditional: bool) -> jdwp_client::SuspendPolicy {
+    if conditional {
+        jdwp_client::SuspendPolicy::EventThread
+    } else {
+        suspend_policy_for(trace)
     }
 }
 
@@ -6643,7 +6681,7 @@ async fn try_arm_deferred_breakpoints(
                 // Destructured rather than cloned: `method` is needed three times below and `lines`
                 // once, and taking both by value costs nothing per iteration.
                 let ResolvedLocation { method, code_index: index, line, lines } = loc;
-                let sp = suspend_policy_for(pend.trace);
+                let sp = suspend_policy_for_line(pend.trace, pend.condition.is_some());
                 match session
                     .connection
                     .set_breakpoint_ex(
@@ -6910,7 +6948,7 @@ fn spec_from_pattern_set(set: &crate::session::PatternStopSet, fqn: &str, signat
         trace_expr: set.trace_expr.clone(),
         trace_budget: set.trace_budget,
         trace_frames: set.trace_frames,
-        suspend_policy: suspend_policy_for(set.trace),
+        suspend_policy: suspend_policy_for_line(set.trace, set.condition.is_some()),
     }
 }
 
@@ -7782,11 +7820,28 @@ fn decrement_trace_budget(session: &mut crate::session::DebugSession, req_id: i3
 
 /// Evaluate a conditional breakpoint on the hit thread and auto-resume (without reporting) when the
 /// condition is not true; otherwise record the suspension and store the event for the caller.
+///
+/// FILT-7 ([#91](https://github.com/YgorPerez/java-debugging-mcp/issues/91)) split what "resume" and
+/// "suspended" mean here in two, because a conditional stop point is now armed at `EventThread` and the
+/// VM-wide suspend happens on *this* side, only for the hits that match. See
+/// [`suspend_policy_for_line`] for why, and [`escalate_to_vm_suspend`] for the window it opens.
 async fn store_reportable_event(
     session: &mut crate::session::DebugSession,
     event_set: jdwp_client::EventSet,
 ) {
+    // What the JVM has ALREADY done to the debuggee for this hit, read off the event set rather than
+    // re-derived from how we armed the request. Policy 1 (`EventThread`) means only the hit thread is
+    // held and the application is otherwise running; policy 2 (`All`) means every thread is stopped.
+    //
+    // Read from the wire on purpose: it is the debuggee's own account of the state we are standing in,
+    // and it stays right if a request is ever armed by a path that forgets to consult
+    // `suspend_policy_for_line`. Both branches below depend on it — a hit that has to be dropped must
+    // release exactly what was held, and a hit that matches must suspend what is still running.
+    let held_thread_only = event_set.suspend_policy == jdwp_client::SuspendPolicy::EventThread as u8;
     let mut skip = false;
+    // Set when the condition MATCHED and the escalation to a VM-wide suspend failed. Carried onto the
+    // event record so `get_last_event` can report both halves; see `escalate_to_vm_suspend`.
+    let mut escalation = None;
     if let (Some((thread, loc)), Some(req_id)) = (
         event_set.events.first().and_then(|e| event_location(&e.details)),
         event_set.events.first().map(|e| e.request_id),
@@ -7802,7 +7857,7 @@ async fn store_reportable_event(
         if method_filter.is_some()
             && !method_name_matches(&mut session.connection, method_filter.as_deref(), &loc).await
         {
-            let _ = session.connection.resume_all().await;
+            release_dropped_hit(session, thread, held_thread_only).await;
             skip = true;
         }
         let cond = session
@@ -7812,8 +7867,16 @@ async fn store_reportable_event(
             .and_then(|b| b.condition.clone());
         if !skip {
             if let Some(cond) = cond {
-                if !evaluate_condition_on_thread(&mut session.connection, thread, &cond).await {
-                    let _ = session.connection.resume_all().await;
+                if evaluate_condition_on_thread(&mut session.connection, thread, &cond).await {
+                    // The condition holds, so this hit is the one the caller armed the stop point for.
+                    // It must end in the same observable state a non-conditional hit does — VM suspended,
+                    // event buffered, alert pushed — which for an `EventThread` arming means suspending
+                    // the rest of the VM now.
+                    if held_thread_only {
+                        escalation = escalate_to_vm_suspend(session, thread).await;
+                    }
+                } else {
+                    release_dropped_hit(session, thread, held_thread_only).await;
                     skip = true;
                 }
             }
@@ -7827,18 +7890,113 @@ async fn store_reportable_event(
         if suspends {
             // Record WHICH request suspended us, here and now. The watchdog used to re-derive this from
             // the newest buffered event, which `get_last_event {drain:true}` erases (SAFE-5).
+            //
+            // Recorded even when the escalation FAILED, and that is deliberate. The hit thread is still
+            // held — deliberately, so the frame the caller asked for survives — and this is the only
+            // record that anything is holding it. Without it the watchdog has no clock to run and no
+            // stop point to disarm, so one thread of a shared JVM would stay suspended forever with
+            // nothing anywhere able to notice. The reply is where the distinction is drawn instead:
+            // `get_last_event` reports the VM as running and names the held thread.
             let cause = event_set.events.first().map_or(crate::session::SuspendCause::ManualPause, |e| {
                 crate::session::SuspendCause::StopPoint(e.request_id)
             });
             session.mark_suspended(cause);
         }
-        let seq = session.push_event(event_set);
+        let seq = session.push_event(event_set, escalation);
         // Buffer first, then push. The buffer is the authoritative record and must be written whether
         // or not anyone is listening; the notification is a hint that one exists (EVT-2).
         if suspends {
             notify_suspension(session, seq).await;
         }
     }
+}
+
+/// Let go of a hit the pump has decided not to surface — a wrong-method exit (METH-1) or a condition
+/// that turned out false (FILT-7) — releasing exactly what the JVM held for it and nothing more.
+///
+/// The distinction is the whole of FILT-7's saving. At `All` policy the debuggee is stopped and a
+/// `resume_all` is the only thing that can restart it; at `EventThread` only the hit thread is held, and
+/// a `resume_all` there would decrement **every** thread's suspend depth — including one parked at
+/// somebody else's breakpoint — which is the ADR-0003 hazard pointing the other way.
+async fn release_dropped_hit(
+    session: &mut crate::session::DebugSession,
+    thread: u64,
+    held_thread_only: bool,
+) {
+    if held_thread_only {
+        let _ = session.connection.resume_thread(thread).await;
+    } else {
+        let _ = session.connection.resume_all().await;
+    }
+}
+
+/// FILT-7's escalation: a condition held on a stop point armed at `EventThread`, so turn the one held
+/// thread into a stopped VM. Returns `None` when the VM is now suspended, or a
+/// [`FailedEscalation`](crate::session::FailedEscalation) naming BOTH facts when the suspend did not
+/// return cleanly.
+///
+/// **The window is real and is not closed by this function.** Between the condition returning true and
+/// `VirtualMachine.Suspend` completing, every thread except the hit thread is still running, so the state
+/// the caller goes on to read is the state a round trip *after* the hit, not the state at the moment of
+/// it. That is a genuine semantic change from the freeze-everything arming it replaces, and the price of
+/// not paying that freeze on the hits that do not match. It is stated in the tool description and in
+/// ADR-0019 rather than papered over; a caller who needs the instant of the hit itself wants a stop point
+/// with no condition, which the JVM freezes for us before it tells us anything.
+///
+/// What this function does guarantee is the half that would silently lose the caller's data: **the hit
+/// thread is never released around the escalation.** It stays held by the event's own `EventThread`
+/// suspension throughout, so the frame the condition just read is the frame `get_stack` will find. The
+/// consequence is a suspend depth of 2 on that thread (its own hold plus the VM-wide one), which
+/// `resume_all_fully` was built for — see ADR-0003.
+async fn escalate_to_vm_suspend(
+    session: &mut crate::session::DebugSession,
+    thread: u64,
+) -> Option<crate::session::FailedEscalation> {
+    let Err(e) = session.connection.suspend_all().await else { return None };
+    // Both halves or neither. "The condition matched" alone reads as a normal suspending hit and sends
+    // the caller to `get_stack` on a moving target; "the suspend failed" alone loses the one thing they
+    // were waiting for. This is the resume-honesty family (ADR-0003, TODO.md) seen from the other side:
+    // there, a resume must not claim a freeze it did not lift; here, a stop point must not claim a
+    // freeze it did not take.
+    //
+    // And the second half is MEASURED rather than deduced from the error, for ADR-0003's reason. "The
+    // command failed, therefore the VM is running" is exactly the assumption SAFE-7 punished in the
+    // opposite direction, and it is wrong whenever the suspend lands and the answer does not come back —
+    // a severed reply, a proxy in the path, a JVM that errors after acting. So ask.
+    match another_thread_is_suspended(session, thread).await {
+        Some(true) => Some(crate::session::FailedEscalation {
+            vm_running: false,
+            note: format!(
+                "the condition MATCHED and the VM-wide suspend reported an error ({e}), but another \
+                 thread is verified suspended, so the application does appear to be stopped after all — \
+                 something on this connection is misreporting. The frame is readable and this session \
+                 still holds the VM, so debug.continue is still what releases it."
+            ),
+        }),
+        verdict => Some(crate::session::FailedEscalation {
+            vm_running: true,
+            note: format!(
+                "the condition MATCHED, but suspending the rest of the VM FAILED ({e}) — the application \
+                 is {} RUNNING and only the hit thread 0x{thread:x} is held. Its frames are readable \
+                 (debug.get_stack, debug.evaluate), but anything they point at may be being mutated by \
+                 another thread as you read it. debug.continue releases the thread; debug.pause retries \
+                 the VM-wide suspend.",
+                if verdict.is_some() { "STILL" } else { "as far as this session can tell STILL" }
+            ),
+        }),
+    }
+}
+
+/// Whether some thread OTHER than `hit` is suspended — the debuggee's own answer to "did that VM-wide
+/// suspend actually land?". `None` when the question could not be put (no other thread, or the JVM would
+/// not answer), which is a third outcome and not a `false`.
+///
+/// The hit thread cannot answer it: it is held by its own event either way, so its suspend count says
+/// nothing about the rest of the VM. Two round trips, on a path that has already gone wrong.
+async fn another_thread_is_suspended(session: &mut crate::session::DebugSession, hit: u64) -> Option<bool> {
+    let all = session.connection.get_all_threads().await.ok()?;
+    let other = all.into_iter().find(|t| *t != hit)?;
+    Some(session.connection.suspend_count(other).await.ok()? > 0)
 }
 
 /// Push a `notifications/message` for a hit that has just frozen the debuggee (EVT-2).
@@ -7865,7 +8023,15 @@ async fn notify_suspension(session: &mut crate::session::DebugSession, seq: u64)
     // The fact that separates this from a trace snapshot, and the reason it is worth interrupting the
     // caller for at all: the VM is stopped, other people's requests are stalled behind it, and the
     // watchdog clock is now running.
-    obj.insert("suspended".to_string(), json!(true));
+    //
+    // Except when FILT-7's escalation failed, where none of that is true and saying it would be the
+    // exact false alarm this notification exists to avoid being. The alert stays — the condition DID
+    // match, which is news — and carries the sentence `get_last_event` prints, so a caller acting on
+    // the notification alone still sees both halves.
+    obj.insert("suspended".to_string(), json!(!rec.escalation.as_ref().is_some_and(|e| e.vm_running)));
+    if let Some(e) = &rec.escalation {
+        obj.insert("escalation".to_string(), json!(e.note));
+    }
     if let Some(id) = stop_point_id(session, ev.request_id) {
         obj.insert("stopPoint".to_string(), json!(id));
     }
