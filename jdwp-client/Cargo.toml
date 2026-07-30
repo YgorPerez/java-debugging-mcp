@@ -26,6 +26,10 @@ tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [[example]]
+name = "probe_heap_queries"
+path = "examples/probe_heap_queries.rs"
+
+[[example]]
 name = "test_connection"
 path = "../examples/test_connection.rs"
 
