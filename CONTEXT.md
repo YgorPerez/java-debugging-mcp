@@ -351,6 +351,19 @@ _Avoid_: suspend count (JDWP's own word for the reading; depth is the accumulate
 How long this debugger kept the debuggee suspended for an operation of its own. The cost a diagnostic
 imposed on everyone else using a shared instance, as opposed to how long the operation took to answer.
 
+**Escalation**:
+Turning a hit that suspended only its own thread into a stopped VM, by issuing the VM-wide suspend from
+this side. What a **conditional** stop point does on the hits where the condition holds (ADR-0020): the JVM
+is asked to hold only what is needed to *decide*, and the freeze everyone else pays for is deferred until
+there is something to freeze for.
+
+Its cost is the **escalation window** — the round trip between the condition holding and the suspend
+landing, during which every thread but the hit thread is still running. So a caller reading state after an
+escalated hit is reading the moment after it, not the moment of it. Named rather than glossed because it is
+the one promise a conditional stop point cannot make, and a tool here says what it cannot promise.
+_Avoid_: upgrade, promote (both suggest the stop point changed kind; the arming is unchanged and only the
+suspension widened)
+
 **Watchdog**:
 The timer that resumes a debuggee left suspended too long and disarms whatever froze it, so a forgotten
 stop point cannot hold a shared instance indefinitely.

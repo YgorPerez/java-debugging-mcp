@@ -4335,6 +4335,342 @@ fn boolean_operators_in_predicates_and_conditions() {
     server.panic_reset();
 }
 
+// ---------------------------------------------------------------------------------------------
+// FILT-7 (#91): what a `condition` on a SUSPENDING stop point costs the rest of the JVM.
+//
+// A conditional stop point is the feature you reach for to reduce noise on a busy shared instance, and
+// before this it was the most expensive thing you could arm: `SuspendPolicy::All` on every hit, the
+// condition evaluated with the whole VM already stopped, and a `resume_all` when it turned out false.
+// So the cost was paid on every hit regardless of the outcome, which is the opposite of what the
+// argument is for.
+//
+// THE ONLY EVIDENCE IS THE PROBE'S OWN STDOUT. The debugger reports success either way — the condition
+// works, the right hit suspends, the wrong ones do not — whether or not it froze the world in between.
+// `CondProbe`'s ticker is CPU-bound so its tick RATE reads the fraction of the wall clock the VM spent
+// running; see the probe for why a sleeping ticker would have been a useless witness.
+// ---------------------------------------------------------------------------------------------
+
+/// How many non-matching hits the measured window spans. Big enough that the ratio below is a rate and
+/// not a coincidence, small enough that the window is under a second on an idle box.
+const COND_WINDOW_HITS: i64 = 120;
+
+/// How long the measured window may take. Deliberately larger than `EVENT_TIMEOUT`, which budgets for one
+/// event: this waits for [`COND_WINDOW_HITS`] of them in a row, each costing a condition evaluation, and
+/// under a whole suite on a contended box that is minutes rather than seconds.
+const COND_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The floor: one tick per this many non-matching hits, over the window.
+///
+/// Measured on this tree rather than chosen. Five runs of each arm on JDK 17, over the same 120 hits:
+/// **81–119** ticks with the fix, **10–14** with `suspend_policy_for_line` reverted to arm a conditional
+/// stop point at `All`. A divisor of 4 puts the floor at 30 — 2.1x above the worst passing-when-broken
+/// reading and 2.7x below the worst passing-when-fixed one, which is as much room as this measurement
+/// has to give on both sides at once.
+const COND_TICK_FLOOR_DIVISOR: i64 = 4;
+
+/// The `n` in `work <n>` — how many times `CondProbe.hot` has been called.
+fn work_index(line: &str) -> Option<i64> {
+    line.strip_prefix("work ")?.split_whitespace().next()?.parse().ok()
+}
+
+/// The highest `work` index the probe has printed so far.
+fn highest_work(probe: &Probe) -> Option<i64> {
+    probe.output().iter().filter_map(|l| work_index(l)).max()
+}
+
+/// FILT-7's first acceptance criterion: non-matching hits must leave the other threads running.
+///
+/// Asserted as a ratio (ticks per non-matching hit) rather than as an absolute tick count, so the
+/// reading is normalised against how fast this machine and this JDK happen to be — both arms measure the
+/// same probe over the same number of hits, and only the debugger's behaviour differs between them.
+///
+/// The second half of the test is the other side of the same coin: when the condition finally DOES hold,
+/// the VM must genuinely stop. A fix that simply never suspended would pass the first assertion and be a
+/// worse bug than the one being fixed, so the ticker is required to go quiet at the matching hit and to
+/// start again after `debug.continue` — which also exercises the suspend depth of 2 the escalation
+/// builds (`EventThread` hold + VM-wide suspend), the ADR-0003 case.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_false_condition_holds_one_thread_and_a_true_one_stops_the_vm() {
+    let Some(jdk) = jdk_or_skip("a_false_condition_holds_one_thread_and_a_true_one_stops_the_vm") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "CondProbe").expect("launch CondProbe");
+    // The watchdog off: this test deliberately leaves the VM suspended at the matching hit, and a rescue
+    // would resume it under the assertion that it is stopped.
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    probe.attach(&mut server);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    let line = probe_line(&probe_source("CondProbe"), "// BP1");
+    // The match is placed past the measured window on purpose, so every hit inside it is a non-matching
+    // one — the case that used to cost a full VM freeze. Only just past it: every hit before the match
+    // costs a round trip, so the distance between the two is time this test spends waiting, and a full
+    // suite on a contended box is where that turns into a timeout rather than a slow pass.
+    let matches_at = COND_WINDOW_HITS + 60;
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "CondProbe",
+            "line": line,
+            "condition": format!("n == {matches_at}"),
+        }),
+    );
+    assert_contains_all("the conditional breakpoint armed", &armed, &["bp_"]);
+
+    probe.send_line("go").expect("cue the worker");
+    // Start measuring after the first few hits: the very first one pays for the line table and the
+    // variable table, which are cached afterwards, and charging that to the steady-state rate would
+    // understate the fix rather than the bug.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| work_index(l).is_some_and(|n| n >= 10))
+        .expect("the worker never reached its 10th hit");
+
+    let (work_from, tick_from) = (highest_work(&probe).unwrap_or(0), highest_tick(&probe).unwrap_or(0));
+    // Not `EVENT_TIMEOUT`: that budget is for ONE event to arrive, and this waits for 120 of them, each
+    // costing a full condition evaluation. On a box running the whole suite that is a different order of
+    // magnitude, and a timeout here would read as "the fix does not work" when it means "the box is busy".
+    probe
+        .wait_for_line(COND_WINDOW_TIMEOUT, |l| {
+            work_index(l).is_some_and(|n| n >= work_from + COND_WINDOW_HITS)
+        })
+        .expect("the worker never finished the measured window");
+    let (work_to, tick_to) = (highest_work(&probe).unwrap_or(0), highest_tick(&probe).unwrap_or(0));
+
+    let (hits, ticks) = (work_to - work_from, tick_to - tick_from);
+    let floor = hits / COND_TICK_FLOOR_DIVISOR;
+    println!("FILT-7: {ticks} ticks across {hits} non-matching hits (floor {floor})");
+    assert!(
+        ticks >= floor,
+        "the OTHER threads were frozen while non-matching hits were evaluated: only {ticks} ticks across \
+         {hits} non-matching conditional hits, which is below the floor of {floor}. A conditional stop \
+         point is being armed at SuspendPolicy::All, so every hit stops the whole VM to find out that the \
+         condition is false.\n  probe tail: {:?}",
+        probe.output().iter().rev().take(12).collect::<Vec<_>>(),
+    );
+
+    // --- and the matching hit must still stop the VM, exactly as before ---
+    // `COND_WINDOW_TIMEOUT` for the same reason as above: the sixty hits between the window and the match
+    // are sixty round trips, not one event.
+    let hit = server
+        .wait_for_event(&format!("\"line\":{line}"), COND_WINDOW_TIMEOUT)
+        .expect("the matching hit never surfaced as an event");
+    assert_contains_all("the matching hit suspended the VM", &hit, &["[suspended] true"]);
+    assert_contains_all(
+        "the matching hit is readable exactly as before",
+        &server.evaluate("n"),
+        &[&format!("(int) {matches_at}")],
+    );
+
+    // The probe's own witness that the escalation actually landed: the ticker had a core to itself a
+    // moment ago and must now be going nowhere.
+    let stopped_at = highest_tick(&probe).unwrap_or(0);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let after = highest_tick(&probe).unwrap_or(0);
+    assert!(
+        after - stopped_at <= 2,
+        "the condition HELD but the VM kept running: the ticker advanced {} ticks while the reply said \
+         [suspended] true. An escalation that reports a freeze it did not perform is worse than the \
+         freeze-everything bug it replaced.",
+        after - stopped_at
+    );
+
+    // ADR-0003: the escalation leaves the hit thread suspended TWICE (its `EventThread` hold plus the
+    // VM-wide suspend), so this is also a live check that `continue` clears the depth it built.
+    //
+    // The stop point is CLEARED first, and that is not tidying. `CondProbe`'s worker calls the conditioned
+    // line in a tight loop, so a breakpoint left armed across the resume re-fires immediately and keeps
+    // re-firing — which is the *disarm*-honesty case TODO.md deliberately keeps out of the resume-honesty
+    // matrix, because `continue` may legitimately re-freeze there. Leaving it armed made this assertion
+    // fail on a loaded box against a VM that had genuinely been resumed, which is the confound rather than
+    // the bug. Resume honesty for this state is asserted properly by the matrix's `ConditionEscalated`
+    // arm, which uses a one-shot breakpoint for exactly this reason.
+    let bp_id = grab_token(&armed, "bp_").expect("no bp id in the arming reply");
+    server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": bp_id}));
+    let cont = server.call("debug.continue", serde_json::json!({}));
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > after + 4)).is_some(),
+        "the VM never resumed after the escalation — `continue` said: {cont}\n  probe tail: {:?}",
+        probe.output().iter().rev().take(12).collect::<Vec<_>>(),
+    );
+
+    server.panic_reset();
+}
+
+/// FILT-7's other half: `trace:true` + `condition` must be **unchanged**.
+///
+/// It was already the safe path — `EventThread` policy, condition evaluated in `try_record_trace`, and a
+/// condition-skipped hit not charged to the trace budget (ADR-0002) — and the risk of #91 was regressing
+/// it while moving the *suspending* path onto the same policy. An earlier audit claimed this path was
+/// broken and was wrong; nothing here rebuilds it, so this test exists to keep it that way.
+///
+/// Three properties, and the first two would both look like success without the others: that the matching
+/// hit is recorded, that the non-matching ones are NOT (so a condition still filters), and that the budget
+/// is spent only on what was recorded — arm 3, match once, expect 2 left rather than 0.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_traced_conditional_stop_point_records_only_matches_and_never_suspends() {
+    let Some(jdk) = jdk_or_skip("a_traced_conditional_stop_point_records_only_matches_and_never_suspends")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "CondProbe").expect("launch CondProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    probe.attach(&mut server);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    let line = probe_line(&probe_source("CondProbe"), "// BP1");
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "CondProbe",
+            "line": line,
+            "condition": "n == 7",
+            "trace": true,
+            "trace_max_hits": 3,
+        }),
+    );
+    probe.send_line("go").expect("cue the worker");
+
+    let traces = server
+        .wait_for_traces("CondProbe.hot", EVENT_TIMEOUT)
+        .expect("the traced conditional stop point never recorded the matching hit");
+    assert_contains_all("the matching hit was recorded with its frame", &traces, &["n=(int) 7"]);
+    assert_eq!(
+        traces.matches("CondProbe.hot").count(),
+        1,
+        "a condition must still filter in trace mode — every hit was recorded, not only n == 7:\n{traces}"
+    );
+
+    // ADR-0002's contract, and the half a condition makes visible: only a RECORDED hit is charged, so a
+    // budget of 3 survives dozens of skipped hits with 2 left.
+    assert_contains_all(
+        "a condition-skipped hit is not charged to the budget",
+        &server.call("debug.list_stop_points", serde_json::json!({})),
+        &["2 hit(s) left"],
+    );
+
+    // And it never suspended anything — read off the probe, which is still ticking, rather than off the
+    // absence of an event.
+    let before = highest_tick(&probe).unwrap_or(0);
+    assert!(
+        probe
+            .wait_for_line(std::time::Duration::from_secs(5), |l| tick_index(l)
+                .is_some_and(|n| n > before + 4))
+            .is_some(),
+        "a traced conditional stop point suspended the VM\n  probe tail: {:?}",
+        probe.output().iter().rev().take(12).collect::<Vec<_>>(),
+    );
+
+    server.panic_reset();
+}
+
+/// How a `VirtualMachine.Suspend` can go wrong, and why both arms are needed to pin one branch each.
+#[derive(Debug, Clone, Copy)]
+enum SuspendFault {
+    /// The debuggee never performs it and answers with its own error — the ordinary shape of a refusal,
+    /// and the world in which "the application is STILL RUNNING" is the true thing to say.
+    Refused,
+    /// The debuggee performs it and the ANSWER is an error — a lying connection. The application really
+    /// is stopped, so a reply that deduced "it failed, therefore it is running" would be wrong here, and
+    /// this arm is the reason the fix measures the second half instead of deducing it.
+    Misreported,
+}
+
+/// FILT-7's honest-failure path: the condition MATCHED and the escalation to a VM-wide suspend did not
+/// come back clean.
+///
+/// The state has no precedent in this codebase — the stop point the caller armed did fire, one thread is
+/// held, and the application may or may not be stopped — and each half on its own is a lie. Reported as a
+/// normal suspending hit it sends the caller to `debug.get_stack` on a moving target; reported as a bare
+/// failure it throws away the one hit they were waiting for. So both, or nothing.
+///
+/// **The two arms taught the fix, and are kept because reverting either half is invisible to the other.**
+/// The first cut of this test used [`SuspendFault::Misreported`] alone and asserted the wording it
+/// expected ("STILL RUNNING") — and failed against the probe, which had stopped ticking, because
+/// `FaultRelay::start` rewrites the debuggee's REPLY and the suspend had landed regardless. A
+/// `suspend_all` that returns an error does not prove the application is running, so the fix now measures
+/// that against another thread's suspend count rather than deducing it from the error: ADR-0003's rule
+/// ("ask the JVM, do not assume") pointed at a suspend instead of a resume. What both arms assert is the
+/// invariant that holds whichever world the connection is in:
+///
+/// > the reply names the match, and whatever it says about the VM, the probe agrees.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_matched_condition_that_cannot_freeze_the_vm_reports_both_facts() {
+    let Some(jdk) = jdk_or_skip("a_matched_condition_that_cannot_freeze_the_vm_reports_both_facts") else {
+        return;
+    };
+    for fault in [SuspendFault::Refused, SuspendFault::Misreported] {
+        assert_failed_escalation_is_honest(&jdk, fault);
+    }
+}
+
+/// Drive one failed-escalation arm and assert the invariant, naming the arm in every failure so a break
+/// says which of the two worlds it broke in.
+fn assert_failed_escalation_is_honest(jdk: &Jdk, fault: SuspendFault) {
+    // VirtualMachine.Suspend — set 1, command 8. Nothing else in a session issues it on the hit path, so
+    // neither instrument disturbs anything but the escalation itself.
+    let mut probe = Probe::launch(jdk, "CondProbe").expect("launch CondProbe");
+    let relay = match fault {
+        SuspendFault::Refused => FaultRelay::start_refusing(probe.port, vec![(1, 8)]),
+        SuspendFault::Misreported => FaultRelay::start(probe.port, vec![(1, 8, Fault::Error(113))]),
+    }
+    .expect("start the fault relay");
+    // The watchdog off: it would rescue the held thread mid-assertion, and what is under test is what the
+    // reply says at the moment of the hit, not whether anything eventually cleans up.
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    server.attach(relay.port);
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).is_some(),
+        "{fault:?}: probe never ticked, so the relay may not be passing traffic at all\n  output: {:?}",
+        probe.output()
+    );
+
+    let line = probe_line(&probe_source("CondProbe"), "// BP1");
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "CondProbe", "line": line, "condition": "n == 5"}),
+    );
+    probe.send_line("go").expect("cue the worker");
+
+    let hit = server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("{fault:?}: the matching hit never surfaced as an event"));
+    // Half one, and the half a bare failure report would drop: the stop point the caller armed DID fire.
+    assert_contains_all(
+        &format!("{fault:?}: a failed escalation still reports the match"),
+        &hit,
+        &["[escalation]", "MATCHED"],
+    );
+
+    // Half two, checked against the debuggee rather than taken from the reply. The ticker is CPU-bound,
+    // so whether it advances is the VM's own answer to the question the reply just claimed to settle.
+    let said_running = hit.contains("[suspended] false");
+    let before = highest_tick(&probe).unwrap_or(0);
+    let advanced = probe
+        .wait_for_line(std::time::Duration::from_secs(3), |l| tick_index(l).is_some_and(|n| n > before + 4))
+        .is_some();
+    assert_eq!(
+        said_running,
+        advanced,
+        "INVARIANT VIOLATED — {fault:?}: the reply and the debuggee disagree about whether the \
+         application is running after a failed escalation (reply said running: {said_running}, probe \
+         advanced: {advanced}).\n  said: {hit}\n  probe tail: {:?}",
+        probe.output().iter().rev().take(12).collect::<Vec<_>>(),
+    );
+
+    // The promise a failed escalation keeps either way: the hit thread was never released around it, so
+    // the frame that satisfied the condition is the frame that is still there to read.
+    assert_contains_all(
+        &format!("{fault:?}: the hit thread is still held and readable"),
+        &server.evaluate("n"),
+        &["(int) 5"],
+    );
+
+    server.panic_reset();
+}
+
 /// BP-1: `toggle_stop_point` silences and re-arms a breakpoint without losing its definition. Tested
 /// on a trace breakpoint so the probe never freezes: disabled -> no new snapshots; re-enabled -> they
 /// resume.
@@ -4898,6 +5234,16 @@ enum Freeze {
     BreakpointDrained,
     /// Suspended at the end of a single step, so a pending step request is armed.
     Step,
+    /// FILT-7's escalation: a CONDITIONAL breakpoint whose condition held, so the debugger — not the JVM
+    /// — issued the VM-wide suspend, on top of the hold the event's own `EventThread` policy had already
+    /// taken on the hit thread.
+    ///
+    /// New to the axis with #91, and it belongs here for the reason the axis exists: it is a way of
+    /// leaving the VM suspended that no resume path was written against. It arrives at suspend depth 2 on
+    /// the hit thread the way `BreakpointThenPause` does, but by a route with no `debug.pause` in it — so
+    /// a rescue that re-derived the depth from the tools it had seen called would be wrong here and right
+    /// there, which is exactly the shape of every bug this matrix has caught.
+    ConditionEscalated,
 }
 
 /// A way we claim to un-freeze it.
@@ -4911,8 +5257,14 @@ enum Resume {
 }
 
 impl Freeze {
-    const ALL: [Self; 5] =
-        [Self::Breakpoint, Self::Pause, Self::BreakpointThenPause, Self::BreakpointDrained, Self::Step];
+    const ALL: [Self; 6] = [
+        Self::Breakpoint,
+        Self::Pause,
+        Self::BreakpointThenPause,
+        Self::BreakpointDrained,
+        Self::Step,
+        Self::ConditionEscalated,
+    ];
 }
 
 /// Drive one (freeze, resume) pair and assert the invariant. Panics with the offending combination
@@ -4961,6 +5313,31 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
             server
                 .wait_for_event("\"event\":\"step\"", EVENT_TIMEOUT)
                 .unwrap_or_else(|| panic!("{freeze:?}: step never landed"));
+        }
+        Freeze::ConditionEscalated => {
+            // A condition that is already true — the probe has ticked, so `counter` is past zero — so the
+            // first hit escalates rather than being dropped. Still `hit_count: 1`, so the request expires
+            // and this stays a test about resume honesty rather than about disarming.
+            server.call(
+                "debug.set_line_stop",
+                serde_json::json!({
+                    "class_pattern": "WatchProbe",
+                    "line": line,
+                    "hit_count": 1,
+                    "condition": "WatchProbe.counter > 0",
+                }),
+            );
+            let hit = server
+                .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+                .unwrap_or_else(|| panic!("{freeze:?}: the conditional breakpoint never fired"));
+            // The state is only the one under test if the escalation actually took the VM. A failed one is
+            // its own case, asserted by `a_matched_condition_that_cannot_freeze_the_vm_reports_both_facts`,
+            // and letting it through here would quietly turn this into a test of a running VM.
+            assert!(
+                hit.contains("[suspended] true"),
+                "{freeze:?}: the escalation did not suspend the VM, so this is not the state under \
+                 test: {hit}"
+            );
         }
     }
 

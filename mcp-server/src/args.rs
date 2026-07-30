@@ -284,6 +284,12 @@ pub struct SetBreakpointArgs {
     #[serde(default)]
     pub method: Option<String>,
     /// Only stop on the Nth hit (optional).
+    ///
+    /// **It counts hits, not matches, so it does not compose with `condition` the way it reads.** This is
+    /// JDWP's `Count` modifier and it expires inside the JVM: `hit_count: 5` with a condition means
+    /// "evaluate the condition on the 5th hit", not "the 5th hit where the condition holds" — and if the
+    /// condition is false on that hit, the stop point is spent and will never fire again. Use one or the
+    /// other unless you mean exactly that.
     #[serde(default)]
     pub hit_count: Option<i32>,
     /// Only stop when this thread (hex id) hits it (optional).
@@ -294,6 +300,19 @@ pub struct SetBreakpointArgs {
     /// `reserva.getReservaPacote().getReservaHotelList().size() > 0`, `getSgMoeda() == "BRL"`, or
     /// `total > Config.LIMITE`. Either side may be a literal or an expression; two Strings compare
     /// by content, other objects by identity.
+    ///
+    /// **A non-matching hit holds only the thread that hit it — the rest of the JVM keeps running.** That
+    /// is what makes this argument safe to arm on a hot line on a shared instance, and it is why it is
+    /// worth preferring over a bare breakpoint there.
+    ///
+    /// **The trade, stated because no reply can show it to you:** when the condition DOES hold, the
+    /// debugger suspends the rest of the VM at that point, and the other threads keep running for the one
+    /// round trip that takes. So the state you then read is the state a moment *after* the hit, not the
+    /// state at the instant of it — the hit thread's own frame is exactly as the condition saw it, but
+    /// anything it points at may have been touched by another thread in between. A stop point with no
+    /// `condition` does not have this gap, because the JVM freezes everything before it tells us anything.
+    /// If the escalation fails, `debug.get_last_event` says so explicitly and states whether the
+    /// application is still running, rather than reporting either half alone.
     #[serde(default)]
     pub condition: Option<String>,
     /// Logpoint mode: on hit, snapshot (location, thread, in-scope locals/args, optional

@@ -183,6 +183,32 @@ pub const MAX_EVENTS: usize = 100;
 pub struct EventRecord {
     pub seq: u64,
     pub set: EventSet,
+    /// FILT-7 ([#91](https://github.com/YgorPerez/java-debugging-mcp/issues/91)): set only when a
+    /// conditional stop point's condition HELD but the escalation to a VM-wide suspend failed.
+    ///
+    /// A field on the record rather than a session flag, because it is a fact about **this hit** and the
+    /// next hit may escalate cleanly. The state it names — matched, one thread held, application still
+    /// running — is one no other field can express: the event's own suspend policy says a thread was
+    /// suspended, and `suspended_since` says this session is holding something, and both are true while
+    /// the VM is emphatically not stopped.
+    pub escalation: Option<FailedEscalation>,
+}
+
+/// What a failed escalation left behind (FILT-7), as a reply has to state it.
+///
+/// Two fields rather than one sentence because the two answers have different audiences: `vm_running`
+/// decides what `[suspended]` says and what the pushed notification claims, and `note` is the prose that
+/// tells a caller what to do about it.
+#[derive(Debug, Clone)]
+pub struct FailedEscalation {
+    /// Whether the application is still running, **as verified against the debuggee** rather than
+    /// inferred from the failure — ADR-0003's rule applied to a suspend instead of a resume. `true` also
+    /// covers "could not tell", because assuming the VM is running is the answer that makes a caller
+    /// distrust the frame they are about to read, and distrusting a good frame costs less than trusting
+    /// a moving one.
+    pub vm_running: bool,
+    /// The sentence `debug.get_last_event` prints, naming both halves of the state.
+    pub note: String,
 }
 
 /// Why the VM is currently suspended — what the watchdog needs to act correctly on a timeout.
@@ -238,13 +264,16 @@ impl DebugSession {
     }
 
     /// Push a reportable event, evicting the oldest if the buffer is full. Returns the assigned seq.
-    pub fn push_event(&mut self, set: EventSet) -> u64 {
+    ///
+    /// `escalation` is FILT-7's failed-escalation note, and is `None` for every hit that did not have to
+    /// escalate or escalated cleanly — see [`EventRecord::escalation`].
+    pub fn push_event(&mut self, set: EventSet, escalation: Option<FailedEscalation>) -> u64 {
         self.event_seq += 1;
         if self.events.len() >= MAX_EVENTS {
             self.events.pop_front();
             self.events_dropped += 1;
         }
-        self.events.push_back(EventRecord { seq: self.event_seq, set });
+        self.events.push_back(EventRecord { seq: self.event_seq, set, escalation });
         self.event_seq
     }
 
