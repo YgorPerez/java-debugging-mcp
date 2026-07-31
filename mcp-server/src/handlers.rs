@@ -14188,12 +14188,113 @@ async fn resolve_any_head(
     if let Some(Ok(v)) = head_result {
         return Ok((v, 1));
     }
-    resolve_static_head(conn, thread_id, frame, segs).await.map_err(|static_err| match &head_result {
-        Some(Err(head_err)) => format!("{head_err} (also not a resolvable static member: {static_err})"),
-        _ => format!(
-            "No suspended frame to read locals from, and not a resolvable static member: {static_err}"
-        ),
+    // EVAL-12 (#112): a bare name that is not a local can still be a member of the frame's OWN class,
+    // which is what it means in Java source and therefore what a caller types. Tried here — after the
+    // local, before the dotted static path — because the dotted path needs at least `Class.field` and a
+    // single segment falls straight through the gap between the two.
+    if head_seg.args.is_none() {
+        if let (Some(tid), Some(fr)) = (thread_id, frame) {
+            if let Some(v) = resolve_bare_member_of_frame(conn, tid, fr, &head_seg.name).await {
+                return Ok((v, 1));
+            }
+        }
+    }
+    let static_err = match resolve_static_head(conn, thread_id, frame, segs).await {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    // The single-segment case has its own message. The generic one describes the resolver's arity
+    // requirement ("a static access needs at least Class.field") — true, about the wrong thing, and
+    // silent on the fact that qualifying the name is the fix. Naming the class costs one round trip on
+    // a path that has already failed.
+    Err(match (&head_result, frame) {
+        (Some(Err(_)), Some(fr)) if segs.len() == 1 && head_seg.args.is_none() => {
+            bare_name_not_found(conn, fr, &head_seg.name).await
+        }
+        (Some(Err(head_err)), _) => {
+            format!("{head_err} (also not a resolvable static member: {static_err})")
+        }
+        _ => {
+            format!(
+                "No suspended frame to read locals from, and not a resolvable static member: {static_err}"
+            )
+        }
     })
+}
+
+/// Resolve a bare name as a member of the frame's own class: an instance field of `this`, else a static
+/// (EVAL-12, #112). `None` means "not one of those", leaving the caller's own error to stand.
+///
+/// **The lookup class is the frame's declaring class, not `this`'s runtime class**, and that is the whole
+/// of what makes this match Java rather than approximate it. A bare name in Java source is resolved
+/// lexically, in the class the code was written in; resolving it against the runtime type would reach
+/// fields of a *subclass* the executing method cannot see, and on a CDI codebase — where nearly every
+/// bean is standing in a generated `Foo_Subclass` (`CONTEXT.md` § **Augmented class**) — that is not a
+/// hypothetical. Both branches therefore look the name up on `frame.location.class_id`.
+///
+/// Instance before static, as Java resolves them, and `find_field_info` walks the superclass chain for
+/// both so an inherited member answers to its bare name. Reused rather than reimplemented so the bare
+/// form and the qualified `Class.field` form cannot drift into disagreeing about what exists.
+async fn resolve_bare_member_of_frame(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    frame: &jdwp_client::thread::Frame,
+    name: &str,
+) -> Option<jdwp_client::types::Value> {
+    let class_id = frame.location.class_id;
+
+    // An instance field, read off `this`. A static method has no `this`, and `get_this_object` answers 0
+    // there rather than failing — so this branch simply does not apply, which is also true in Java.
+    if let Ok(this_obj) = conn.get_this_object(thread_id, frame.frame_id).await {
+        if this_obj != 0 {
+            if let Ok(Some((_, f))) = find_field_info(conn, class_id, name, Some(false)).await {
+                if let Ok(vals) = conn.get_object_values(this_obj, vec![f.field_id]).await {
+                    if let Some(v) = vals.into_iter().next() {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+    }
+
+    // A static of the declaring class or any supertype. `get_reference_values` reads it off the type
+    // that declares it, which is what `find_field_info` returns alongside the field.
+    if let Ok(Some((declaring, f))) = find_field_info(conn, class_id, name, Some(true)).await {
+        if let Ok(vals) = conn.get_reference_values(declaring, vec![f.field_id]).await {
+            return vals.into_iter().next();
+        }
+    }
+    None
+}
+
+/// What to say when a one-segment name is not a local, not a field of `this`, and not a static of the
+/// frame's class (EVAL-12, #112).
+///
+/// Names the class that was searched and the form that would work. The message it replaces was accurate
+/// about the resolver — *"a static access needs at least Class.field"* — and useless to the reader, who
+/// has not asked for a static access and cannot tell from it that qualifying the name is the fix.
+async fn bare_name_not_found(
+    conn: &mut jdwp_client::JdwpConnection,
+    frame: &jdwp_client::thread::Frame,
+    name: &str,
+) -> String {
+    // Named, not described. "the class this frame is executing in" is something the reader has to go and
+    // look up before they can act on it, and on a CDI codebase it is quite often not the class they
+    // think (`CONTEXT.md` § **Augmented class**) — which is itself the answer in some of these cases.
+    let class = conn
+        .get_signature(frame.location.class_id)
+        .await
+        .ok()
+        .map(|sig| decode_signature(&sig))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("class@{:x}", frame.location.class_id));
+    format!(
+        "'{name}' is not a local variable in this frame, and {class} (nor any of its superclasses) \
+         declares a field by that name — so there is nothing for a bare '{name}' to mean here. If it \
+         belongs to another class, qualify it: `Klass.{name}` for a static, or `someLocal.{name}` for a \
+         field of an object this frame can reach. debug.list_fields on {class} shows what it does have, \
+         and debug.get_stack with locals shows what this frame has."
+    )
 }
 
 async fn resolve_expression_multi(

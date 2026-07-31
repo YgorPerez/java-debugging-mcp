@@ -93,51 +93,56 @@ as necessary, so those go too), and names any class this session installed with 
 outlives the session and only a redeploy restores it, so this is the last moment anyone is told.
 
 ## debug.evaluate
-Evaluate a Java expression in frame context. Heads: a local, this, a class name, or an OBJECT HANDLE
-(@0x1f4c); then chain .field and .method(args), including static fields and static methods
-(ConfigDefaultUtils.getUrl()). Arguments may be literals or expressions passed by reference
-(svc.matches(reserva), foo.handle(this)). Method calls need a suspended thread; a plain static-field read does
-not. Subscripts work on arrays/List/Map: lines[0] (index, keeps chaining), counts["key"] (map lookup),
-lines[2..5] (half-open slice), lines[?qty > 3] (filter, whose left side resolves against each element;
-filtering a Map tests its values and keeps the keys as key → value). A subscript, slice or filter on a
-java.util.HashMap, LinkedHashMap, ConcurrentHashMap or ArrayList needs NO SUSPENDED THREAD: those four are
-read by walking their own fields (table[] → Node.key/value/next, elementData[0..size]), which JDWP does
-without stopping anything — so a cache lookup on a shared instance is a plain read now, and it works under
-read_only too. Any other implementation (a Map subclass, a Collections.synchronizedMap wrapper) falls back to
-invoking get()/entrySet()/toArray() and still needs a suspended thread, because guessing at internals it does
-not recognise would be a confidently wrong answer. THE REPLY SAYS WHICH PATH IT TOOK, and a structural read
-also says it took no lock — a value read while another thread resizes the map is a sample, not a transaction.
-Pass expand_objects:true to get a recursive field tree instead of one line — it walks nested objects, arrays,
-and List/Set/Map/Optional contents to max_depth, detects cycles, and unboxes Integer/Long/etc. NOTE: the
-DEFAULT rendering calls the value's toString() in the debuggee, and on some framework objects that cannot
-complete (it may need a lock held by another suspended thread) — it is bounded to 2s and the expiry is
-reported in the value. expand_objects:true reads FIELDS and invokes nothing, so on those objects it is both
-faster and more informative than the default. A byte[] or char[] renders as DECODED TEXT with the encoding
-named (byte[73] ISO-8859-1 "<?xml …") instead of a list of numbers, and arr.length works on any array. A
-trailing #<charset> on the expression picks the encoding — UTF-8 (default), ISO-8859-1 (alias latin1),
-US-ASCII, or #raw for the element list when the array really is binary; octets that do not decode are marked
-\xNN rather than replaced. ISO-8859-1 is the reading a marshalled supplier envelope usually needs. Reading a
-LOCAL or a field chain needs a suspended thread, and debug.suspend_thread with a thread_id is the cheap way to
-get one — it freezes a single thread and leaves the rest of the JVM serving. INVOKING is stricter and the
-difference is measured, not assumed: a method call, a Map/List subscript, a slice or filter, and the default
-toString() rendering all need a thread suspended BY AN EVENT (a stop point hit or a step landing). Neither
-debug.suspend_thread nor debug.pause qualifies — both answer INVALID_THREAD — so an invoke needs a suspending
-stop point on the code you want to ask about. expand_objects:true is the way round it: it reads FIELDS and
-invokes nothing, so it works against a thread you suspended yourself, and on framework objects it is both
-faster and more informative than the default line. A handle is the @0x… that every reply prints beside an
-object (a trace snapshot's locals and captures, an expanded field tree, debug.list_instances), and pasting one
-back in reaches THAT object with no suspended frame and no root to reach it from — which is how you drill into
-a snapshot after the fact. It must be the FIRST segment. A JDWP object id is a WEAK reference, so a handle can
-stop working: the reply then says `Vanished: @0x…` and explains which of the two readings it is (the debuggee
-says the object was collected, or it has no record of the id at all). Nothing pins objects to prevent that,
-deliberately — see ADR-0022. ONE READ IS DESTRUCTIVE AND read_only DOES NOT STOP IT: a JAX-RS Response entity
-is SINGLE-PASS, so evaluating response.readEntity(String.class) CONSUMES it and the application's own read
-afterwards gets an empty body — you corrupt the live request by looking at it. read_only lets it through
-correctly (it invokes a method you asked for, writes no field, forces no return), and nothing here can know
-which of the debuggee's methods tolerate being asked twice. Read at or AFTER the assignment to a local, where
-the entity is a re-readable String, or capture the returned value with debug.set_method_exit_stop on the
-reading method. Suspended BEFORE the read, only getStatus() and getHeaders() are safe. The same caution
-applies to any one-shot stream — an InputStream, a Scanner, an Iterator — where reading it is what spends it.
+Evaluate a Java expression in frame context. Heads: a local, this, a class name, a BARE FIELD NAME of the
+frame's own class, or an OBJECT HANDLE (@0x1f4c); then chain .field and .method(args), including static fields
+and static methods (ConfigDefaultUtils.getUrl()). A ONE-SEGMENT name resolves the way Java reads it — local,
+then a field of `this`, then a static of the class this frame is executing in, each walking superclasses — so
+inside SpentCheck.tick the bare `calls` finds SpentCheck.calls and needs no qualification. A local still
+shadows both fields, and an instance field still wins over a static of the same name inherited from a
+supertype. When a bare name is none of those, the error NAMES the class it searched and the qualified form to
+type instead. Arguments may be literals or expressions passed by reference (svc.matches(reserva),
+foo.handle(this)). Method calls need a suspended thread; a plain static-field read does not. Subscripts work
+on arrays/List/Map: lines[0] (index, keeps chaining), counts["key"] (map lookup), lines[2..5] (half-open
+slice), lines[?qty > 3] (filter, whose left side resolves against each element; filtering a Map tests its
+values and keeps the keys as key → value). A subscript, slice or filter on a java.util.HashMap, LinkedHashMap,
+ConcurrentHashMap or ArrayList needs NO SUSPENDED THREAD: those four are read by walking their own fields
+(table[] → Node.key/value/next, elementData[0..size]), which JDWP does without stopping anything — so a cache
+lookup on a shared instance is a plain read now, and it works under read_only too. Any other implementation (a
+Map subclass, a Collections.synchronizedMap wrapper) falls back to invoking get()/entrySet()/toArray() and
+still needs a suspended thread, because guessing at internals it does not recognise would be a confidently
+wrong answer. THE REPLY SAYS WHICH PATH IT TOOK, and a structural read also says it took no lock — a value
+read while another thread resizes the map is a sample, not a transaction. Pass expand_objects:true to get a
+recursive field tree instead of one line — it walks nested objects, arrays, and List/Set/Map/Optional contents
+to max_depth, detects cycles, and unboxes Integer/Long/etc. NOTE: the DEFAULT rendering calls the value's
+toString() in the debuggee, and on some framework objects that cannot complete (it may need a lock held by
+another suspended thread) — it is bounded to 2s and the expiry is reported in the value. expand_objects:true
+reads FIELDS and invokes nothing, so on those objects it is both faster and more informative than the default.
+A byte[] or char[] renders as DECODED TEXT with the encoding named (byte[73] ISO-8859-1 "<?xml …") instead of
+a list of numbers, and arr.length works on any array. A trailing #<charset> on the expression picks the
+encoding — UTF-8 (default), ISO-8859-1 (alias latin1), US-ASCII, or #raw for the element list when the array
+really is binary; octets that do not decode are marked \xNN rather than replaced. ISO-8859-1 is the reading a
+marshalled supplier envelope usually needs. Reading a LOCAL or a field chain needs a suspended thread, and
+debug.suspend_thread with a thread_id is the cheap way to get one — it freezes a single thread and leaves the
+rest of the JVM serving. INVOKING is stricter and the difference is measured, not assumed: a method call, a
+Map/List subscript, a slice or filter, and the default toString() rendering all need a thread suspended BY AN
+EVENT (a stop point hit or a step landing). Neither debug.suspend_thread nor debug.pause qualifies — both
+answer INVALID_THREAD — so an invoke needs a suspending stop point on the code you want to ask about.
+expand_objects:true is the way round it: it reads FIELDS and invokes nothing, so it works against a thread you
+suspended yourself, and on framework objects it is both faster and more informative than the default line. A
+handle is the @0x… that every reply prints beside an object (a trace snapshot's locals and captures, an
+expanded field tree, debug.list_instances), and pasting one back in reaches THAT object with no suspended
+frame and no root to reach it from — which is how you drill into a snapshot after the fact. It must be the
+FIRST segment. A JDWP object id is a WEAK reference, so a handle can stop working: the reply then says
+`Vanished: @0x…` and explains which of the two readings it is (the debuggee says the object was collected, or
+it has no record of the id at all). Nothing pins objects to prevent that, deliberately — see ADR-0022. ONE
+READ IS DESTRUCTIVE AND read_only DOES NOT STOP IT: a JAX-RS Response entity is SINGLE-PASS, so evaluating
+response.readEntity(String.class) CONSUMES it and the application's own read afterwards gets an empty body —
+you corrupt the live request by looking at it. read_only lets it through correctly (it invokes a method you
+asked for, writes no field, forces no return), and nothing here can know which of the debuggee's methods
+tolerate being asked twice. Read at or AFTER the assignment to a local, where the entity is a re-readable
+String, or capture the returned value with debug.set_method_exit_stop on the reading method. Suspended BEFORE
+the read, only getStatus() and getHeaders() are safe. The same caution applies to any one-shot stream — an
+InputStream, a Scanner, an Iterator — where reading it is what spends it.
 
 ## debug.evaluate_chain
 Answer "WHICH LINK of this chain went null?" in one call. Takes the same chained expression debug.evaluate

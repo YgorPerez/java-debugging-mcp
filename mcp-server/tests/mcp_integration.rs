@@ -11186,3 +11186,106 @@ fn an_armed_instance_filter_pins_its_object_and_reports_it_once_that_is_released
 
     server.panic_reset();
 }
+
+/// EVAL-12 (#112): a ONE-SEGMENT name resolves against the frame's own class — local, then `this`,
+/// then static — instead of failing between the local lookup and the dotted-static one.
+///
+/// The ordering is the substance, so all four shapes are driven in one run against a probe that puts a
+/// static and an instance field of the same name in scope at the same point. Any of them measured alone
+/// would pass against a resolver that had simply stopped trying at the first thing it found.
+///
+/// Driven through `trace_expr` rather than `debug.evaluate` because that is where the bug actually bites:
+/// the failure is per-record text, not an arming error, so a broken resolver gives you an armed,
+/// apparently-healthy logpoint whose every capture is an error string — and you learn that only when you
+/// read the snapshots. The issue was found exactly that way.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_bare_name_resolves_against_the_frames_own_class_in_the_java_order() {
+    let Some(jdk) = jdk_or_skip("a_bare_name_resolves_against_the_frames_own_class_in_the_java_order") else {
+        return;
+    };
+    let probe =
+        Probe::launch_running(&jdk, "BareNameProbe", |l| l.starts_with("ready")).expect("launch probe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 2"))
+        .unwrap_or_else(|| panic!("the probe never ticked twice\n  output: {:?}", probe.output()));
+
+    let src = probe_source("BareNameProbe");
+    // Five traced stop points, each carrying the one expression its site is about.
+    let sites = [
+        ("BP1", "BareNameProbe$Child", "shadowed", "a local wins over both fields"),
+        ("BP2", "BareNameProbe$Child", "shadowed", "`this` field wins over the inherited static"),
+        ("BP3", "BareNameProbe$Child", "inherited", "a static inherited from a superclass"),
+        ("BP4", "BareNameProbe", "calls", "a static of the frame's own class, from a STATIC method"),
+        // Its own line, not BP4's: two traced stop points on one line is #102 (BP-6), still open.
+        ("BP5", "BareNameProbe", "nosuchthing", "a name that is genuinely nowhere"),
+    ];
+    for (marker, class, expr, what) in sites {
+        let set = server.call(
+            "debug.set_line_stop",
+            serde_json::json!({
+                "class_pattern": class, "line": probe_line(&src, &format!("// {marker}")),
+                "trace": true, "trace_expr": expr,
+            }),
+        );
+        assert!(set.contains("bp_"), "could not arm {what}: {set}");
+    }
+
+    // Let every site record. All five are traced, so the probe must keep running throughout.
+    let base = probe.output().len();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(probe.output().len() > base, "the probe stopped under five traced stop points");
+
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    let value_of = |method: &str, expr: &str| -> String {
+        traces
+            .lines()
+            .filter(|l| l.starts_with('#') && l.contains(method) && l.contains(&format!("{expr} =>")))
+            .find_map(|l| l.split(&format!("{expr} =>")).nth(1).map(|t| t.trim().to_string()))
+            .unwrap_or_else(|| panic!("no record for {method} carrying `{expr}`:\n{traces}"))
+    };
+
+    // 1. A local shadows everything, which is the existing behaviour and must not regress.
+    let local = value_of("localWins", "shadowed");
+    assert!(local.contains("30"), "a local must win over both fields — got `{local}`");
+
+    // 2. No local: the instance field of `this`, NOT the static of the same name on the superclass.
+    //    Both are in scope here, which is what makes this an ordering assertion rather than a lookup.
+    let instance = value_of("instanceWins", "shadowed");
+    assert!(
+        instance.contains("20") && !instance.contains("10"),
+        "with no local, `this.shadowed` (20) must win over the inherited static Base.shadowed (10) — \
+         got `{instance}`"
+    );
+
+    // 3. A static declared on the SUPERCLASS, by its bare name. Java reaches it; so must this.
+    let inherited = value_of("inheritedStatic", "inherited");
+    assert!(inherited.contains('7'), "an inherited static must resolve by its bare name — got `{inherited}`");
+
+    // 4. The issue's own case: a static of the frame's own class, read from a STATIC method — where
+    //    there is no `this` to fall back on, so the static step is the only thing that can answer.
+    let calls = value_of("tick", "calls");
+    assert!(
+        !calls.contains("<error"),
+        "a static of the frame's own class must resolve from a static method, which is what the issue \
+         was filed about — got `{calls}`"
+    );
+    assert!(calls.contains("(int)"), "the capture must be a value, not prose — got `{calls}`");
+
+    // 5. A name that is nowhere. The message must name the class searched and the fix, rather than
+    //    describing the resolver's arity requirement.
+    let unknown = value_of("unknownSite", "nosuchthing");
+    assert_contains_all(
+        "an unresolvable bare name says where it looked and what to type instead",
+        &unknown,
+        &["BareNameProbe", "nosuchthing"],
+    );
+    assert!(
+        !unknown.contains("needs at least Class.field"),
+        "the failure should name the fix, not the resolver's arity rule — got `{unknown}`"
+    );
+
+    server.panic_reset();
+}
