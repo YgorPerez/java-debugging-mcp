@@ -567,12 +567,24 @@ fn a_full_family_parks_its_class_load_watch_and_takes_it_back_when_a_member_is_c
             listed.lines().skip_while(|l| !l.contains("FamilyGamma")).take(6).any(|l| l.trim() == "Hits: 0");
         // The probe prints one line per gamma invocation (TEST-31), which is the fact that splits the two
         // failures apart. Without it, `Hits: 0` on an armed stop point is silence about two different bugs.
-        let invocations = probe.output().iter().filter(|l| l.starts_with("gamma invoked ")).count();
-        let diagnosis = if armed && hits_zero && invocations == 0 {
-            "FamilyGamma IS armed, and the probe's worker NEVER INVOKED IT — no `gamma invoked` line. So \
-             the debugger is not at fault: nothing called the method the stop point is on. Look at the \
-             probe's worker (did it stop? did the volatile handoff of `gammaHandle` not become visible?), \
-             not at the class-load watch."
+        let out = probe.output();
+        let invocations = out.iter().filter(|l| l.starts_with("gamma invoked ")).count();
+        // The worker's heartbeat (TEST-31): printed every tenth pass at the TOP of the loop, before the
+        // calls that a cleared traced stop point could have left it suspended at. Its LAST value is what
+        // separates "frozen" from "running but not reaching gamma".
+        let beats = out.iter().filter(|l| l.starts_with("worker alive ")).count();
+        let loaded_at = out.iter().position(|l| l == "gamma loaded");
+        let beats_after_load =
+            loaded_at.map_or(0, |i| out[i..].iter().filter(|l| l.starts_with("worker alive ")).count());
+        let diagnosis = if armed && hits_zero && invocations == 0 && beats_after_load == 0 {
+            "FamilyGamma IS armed, and the probe's worker is FROZEN — it printed no heartbeat after \
+             `gamma loaded`, so it never even reached the top of the loop again. This is a suspended \
+             worker, not a visibility problem: suspect a traced hit whose request was cleared while the \
+             hit was in flight (TRACE-8's window, #72) leaving the thread held. That is a DEBUGGER bug."
+        } else if armed && hits_zero && invocations == 0 {
+            "FamilyGamma IS armed and the worker is ALIVE (heartbeats after `gamma loaded`) but never \
+             invoked gamma. So it is looping past the `gammaHandle != null` check — the volatile handoff \
+             is not being observed, which is a PROBE bug and not the debugger's."
         } else if armed && hits_zero {
             "FamilyGamma IS armed, the worker DID invoke it, and the stop point still did not fire. This \
              is a real debugger bug and the most interesting outcome: an armed JDWP request that misses \
@@ -588,8 +600,8 @@ fn a_full_family_parks_its_class_load_watch_and_takes_it_back_when_a_member_is_c
         };
         panic!(
             "no traced hit on FamilyGamma within the timeout.\n  DIAGNOSIS: {diagnosis}\n  gamma \
-             invocations the probe reported: {invocations}\n  probe output: {:?}\n  stop points: {listed}",
-            probe.output(),
+             invocations the probe reported: {invocations}\n  heartbeats after `gamma loaded`: \
+             {beats_after_load} (total {beats})\n  probe output: {out:?}\n  stop points: {listed}"
         )
     });
     assert!(late.contains("FamilyGamma"), "traces: {late}");
@@ -9902,6 +9914,88 @@ fn step_into_skips_the_jdk_by_default_and_steps_into_it_when_asked() {
          code — either the comparator the JDK calls back into, or the next line — and not inside \
          java.util:\n{filtered}"
     );
+
+    server.panic_reset();
+}
+
+/// TRACE-8 (#72) on the path a caller actually drives: **clearing a traced stop point must not leave the
+/// hit thread frozen.**
+///
+/// The original fix put the in-flight bookkeeping in `disarm_request`, under a comment saying it therefore
+/// covered "the watchdog and a manual `clear_stop_point`". It did not: `clear_stop_point` never calls
+/// `disarm_request` — it clears the JDWP requests directly — so the one path a caller drives deliberately
+/// was the one still open. TEST-31 (#114) caught it as a probe whose only worker was **frozen for the life
+/// of the JVM**, and the heartbeat that found it is why it stopped being a mystery.
+///
+/// **Nothing else rescues this.** A traced hit suspends only the hit thread (`EventThread` policy) and
+/// never calls `mark_suspended`, so the watchdog — which acts on a VM-wide suspension — has no reason to
+/// look, and by then the stop point is gone so there would be nothing for it to disarm. That makes it
+/// strictly worse than the budget-disarm case the original fix was written against.
+///
+/// **This test does NOT reproduce that window, and saying so is the point.** It arms a traced stop point on
+/// a line the probe runs constantly, waits for a hit, clears it, and asserts the probe is still ticking —
+/// twenty times over. Run against the *unfixed* server it still passes, so it is a **guard, not a proof**:
+/// it would catch a gross regression in the arm/clear path but it does not land a clear inside the window
+/// where the JVM has generated a hit the server has not finished with. Waiting for a recorded trace is
+/// precisely what steps past that window, and arming/clearing back to back without waiting did not close
+/// on it either.
+///
+/// So the fix it accompanies rests on **inspection plus a field sighting**, not on this test:
+/// `note_disarmed_traced` was reachable only from `disarm_request`, which `clear_stop_point` and
+/// `clear_pattern_family` do not call, and #114 observed the resulting frozen worker. A test that
+/// genuinely reproduces it needs a way to hold a hit mid-flight — a fault-injection point rather than a
+/// timing coincidence — and that does not exist here yet. Recorded rather than papered over, because a
+/// test named after a bug it cannot catch is worse than no test.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn clearing_a_traced_stop_point_repeatedly_leaves_the_probe_running() {
+    let Some(jdk) = jdk_or_skip("clearing_a_traced_stop_point_repeatedly_leaves_the_probe_running") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some())
+        .expect("probe never ticked, so it was never a witness");
+
+    // `bumpCounter` runs on every pass of the worker's loop, so a stop point on it is guaranteed to be in
+    // flight often — which is the condition this test needs rather than a coincidence it hopes for.
+    for round in 1..=20 {
+        let set = server.call(
+            "debug.set_line_stop",
+            serde_json::json!({
+                "class_pattern": "WatchProbe", "method": "bumpCounter", "trace": true,
+            }),
+        );
+        let Some(id) = set
+            .split_whitespace()
+            .find(|t| t.starts_with("bp_"))
+            .map(|t| t.trim_end_matches(|c: char| !c.is_alphanumeric()).to_string())
+        else {
+            panic!("round {round}: no bp_ id in the arm reply: {set}")
+        };
+
+        // Wait until it has really fired, so the clear below lands in the window rather than before it.
+        server
+            .wait_for_traces("WatchProbe", EVENT_TIMEOUT)
+            .unwrap_or_else(|| panic!("round {round}: the traced stop point never recorded a hit"));
+
+        let before = probe.output().iter().filter_map(|l| tick_index(l)).max().unwrap_or(0);
+        server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": id}));
+        server.call("debug.get_traces", serde_json::json!({"clear": true}));
+
+        // The whole assertion: the probe must keep going. Pre-fix, one of these rounds strands a hit and
+        // the only worker never ticks again — and nothing in any reply says so.
+        assert!(
+            probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > before + 1)).is_some(),
+            "round {round}: the probe stopped ticking after its traced stop point was cleared — a hit that \
+             was in flight when the request went away was never resumed, so the worker is frozen and no \
+             watchdog is watching a per-thread suspend. Last tick before the clear was {before}; probe \
+             output: {:?}",
+            probe.output(),
+        );
+    }
 
     server.panic_reset();
 }

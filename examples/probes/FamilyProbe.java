@@ -44,6 +44,18 @@ public class FamilyProbe {
             int i = 0;
             while (true) {
                 try {
+                    // HEARTBEAT (TEST-31/#114). The remaining question there is why a worker that is
+                    // alive reports zero gamma invocations: it is either blocked BEFORE the gamma call —
+                    // most plausibly suspended at a traced hit on one of the calls below whose request was
+                    // cleared mid-flight (TRACE-8's window, #72) — or it never observed the volatile
+                    // handoff. A heartbeat at the TOP of the loop separates them: if it stops, the worker
+                    // is frozen and the next question is which stop point froze it; if it keeps printing
+                    // while `gamma invoked` never appears, the handoff is the suspect. Every tenth pass, so
+                    // it is a witness rather than a flood.
+                    if (i % 10 == 0) {
+                        System.out.println("worker alive " + i);
+                        System.out.flush();
+                    }
                     alpha.handle(i);
                     beta.handle(i);
                     none.other();

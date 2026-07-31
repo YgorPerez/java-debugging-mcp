@@ -637,6 +637,7 @@ impl RequestHandler {
         // An exception breakpoint lives in exception_requests as an EXCEPTION event request. A disabled
         // one has no live request, so there is only the stored definition to drop.
         if let Some(er) = session.exception_requests.remove(bp_id) {
+            note_traced_in_flight(&mut session, er.trace, er.request_id.as_slice());
             if let Some(req) = er.request_id {
                 let _ = session.connection.clear_exception_request(req).await;
             }
@@ -651,6 +652,7 @@ impl RequestHandler {
         // A watchpoint lives in watchpoints as a FIELD_ACCESS / FIELD_MODIFICATION request; Clear
         // must name the same event kind the request was created with.
         if let Some(wp) = session.watchpoints.remove(bp_id) {
+            note_traced_in_flight(&mut session, wp.trace, wp.request_id.as_slice());
             if let Some(req) = wp.request_id {
                 let _ = session.connection.clear_field_watch(req, wp.kind).await;
             }
@@ -668,6 +670,7 @@ impl RequestHandler {
         // with (41 vs 42), or JDWP looks up a different key and silently leaves the request armed —
         // which for this kind means a possibly-suspending stop point nobody can find.
         if let Some(me) = session.method_exits.remove(bp_id) {
+            note_traced_in_flight(&mut session, me.trace, me.request_id.as_slice());
             if let Some(req) = me.request_id {
                 let _ = session.connection.clear_method_exit_request(req, me.with_return_value).await;
             }
@@ -705,6 +708,7 @@ impl RequestHandler {
         // nothing to clear there, only the stored definition to drop (BP-1).
         // Every one of them: a `finally` line owns a request per inlined copy (BP-4, #78), and clearing
         // one would leave the others firing under an id the caller has already been told is gone.
+        note_traced_in_flight(&mut session, bp_info.trace, &bp_info.request_ids);
         for req in &bp_info.request_ids {
             session
                 .connection
@@ -4295,6 +4299,28 @@ fn render_session_line(
     }
     line.push('\n');
     line
+}
+
+/// Record the in-flight hits of a **traced** stop point about to be cleared by hand (TRACE-8, #72).
+///
+/// `disarm_request` already does this and its comment claimed to cover "a manual `clear_stop_point`" —
+/// but `clear_stop_point` never goes through `disarm_request`; it clears the JDWP requests directly. So
+/// this window was open on the one path a caller drives deliberately, and TEST-31 (#114) caught it: a
+/// probe's only worker was left **frozen for the life of the JVM** after its traced stop point was
+/// cleared while a hit was in flight.
+///
+/// **Nothing else would have rescued it.** A traced hit suspends only the hit thread (`EventThread`
+/// policy) and never calls `mark_suspended`, so the watchdog — which acts on a VM-wide suspension — has
+/// no reason to look. And the stop point is gone by then, so there is nothing left for it to disarm even
+/// if it did. That makes this strictly worse than the budget-disarm case the original fix was written
+/// for, which at least ends with a stop point still on the books.
+fn note_traced_in_flight(session: &mut crate::session::DebugSession, traced: bool, reqs: &[i32]) {
+    if !traced {
+        return;
+    }
+    for r in reqs {
+        session.note_disarmed_traced(*r);
+    }
 }
 
 /// The clause `clear_stop_point` appends when the stop point it just dropped was already **spent**
@@ -8603,6 +8629,10 @@ async fn clear_pattern_family(
     let mut cleared = 0usize;
     for member in &set.members {
         if let Some(info) = session.breakpoints.remove(member) {
+            // Same in-flight window as the single-stop-point clear, on the path a wildcard family takes —
+            // and this is the one TEST-31 (#114) actually caught, since a family clears its members here
+            // rather than through `handle_clear_stop_point`.
+            note_traced_in_flight(session, info.trace, &info.request_ids);
             for req in &info.request_ids {
                 let _ = session.connection.clear_breakpoint(*req).await;
             }
@@ -9048,10 +9078,12 @@ fn record_stop_point_hit(session: &mut crate::session::DebugSession, req_id: i32
 /// else (`CONTEXT.md` § **Request id**).
 async fn spend_if_counted(session: &mut crate::session::DebugSession, req_id: i32) {
     let mut survivors: Vec<i32> = Vec::new();
+    let mut traced = false;
     if let Some(b) = session.breakpoints.values_mut().find(|b| b.owns_request(req_id)) {
         if b.arm.hit_count.is_none() {
             return;
         }
+        traced = b.trace;
         survivors = b.request_ids.iter().copied().filter(|r| *r != req_id).collect();
         b.request_ids.clear();
         b.enabled = false;
@@ -9078,6 +9110,9 @@ async fn spend_if_counted(session: &mut crate::session::DebugSession, req_id: i3
         m.enabled = false;
         m.spent = true;
     }
+    // The same in-flight window, on the path FILT-8 added: these siblings are live requests the JVM has
+    // not deleted, so a hit already generated by one of them must still be resumed rather than surfaced.
+    note_traced_in_flight(session, traced, &survivors);
     for req in survivors {
         let _ = session.connection.clear_breakpoint(req).await;
     }
