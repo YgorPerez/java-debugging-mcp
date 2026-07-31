@@ -5563,64 +5563,126 @@ fn a_resume_that_cannot_free_the_vm_reports_it_instead_of_claiming_success() {
     );
 }
 
-/// Invariant: `debug.continue` either resumes the VM or says it didn't — from every suspended state.
-#[test]
-#[ignore = "needs a JDK and a live JVM; run with --ignored"]
-fn continue_is_honest_from_every_suspended_state() {
-    let Some(jdk) = jdk_or_skip("continue_is_honest_from_every_suspended_state") else { return };
-    for freeze in Freeze::ALL {
-        assert_resume_is_honest(&jdk, freeze, Resume::Continue);
-    }
-}
-
-/// Invariant: `debug.panic` — the escape hatch — either resumes the VM or says it didn't.
-#[test]
-#[ignore = "needs a JDK and a live JVM; run with --ignored"]
-fn panic_is_honest_from_every_suspended_state() {
-    let Some(jdk) = jdk_or_skip("panic_is_honest_from_every_suspended_state") else { return };
-    for freeze in Freeze::ALL {
-        assert_resume_is_honest(&jdk, freeze, Resume::Panic);
-    }
-}
-
-/// Invariant: the watchdog either resumes the VM or says it didn't. This is the one that matters most —
-/// it acts while nobody is watching, so a false success is invisible until the JVM is found frozen.
-#[test]
-#[ignore = "needs a JDK and a live JVM; run with --ignored"]
-fn the_watchdog_is_honest_from_every_suspended_state() {
-    let Some(jdk) = jdk_or_skip("the_watchdog_is_honest_from_every_suspended_state") else { return };
-    for freeze in Freeze::ALL {
-        assert_resume_is_honest(&jdk, freeze, Resume::Watchdog);
-    }
-}
-
-/// Invariant: `debug.disconnect` leaves the VM running from every suspended state. This is SAFE-1's bug
-/// generalised — walking away used to freeze the JVM permanently, and it is the tool whose name most
-/// suggests it is the safe way out.
-#[test]
-#[ignore = "needs a JDK and a live JVM; run with --ignored"]
-fn disconnect_is_honest_from_every_suspended_state() {
-    let Some(jdk) = jdk_or_skip("disconnect_is_honest_from_every_suspended_state") else { return };
-    for freeze in Freeze::ALL {
-        assert_resume_is_honest(&jdk, freeze, Resume::Disconnect);
-    }
-}
-
-/// Invariant: `debug.resume_thread` either gives the named thread back or says it didn't (SAFE-11).
+/// One `#[test]` per (suspended state, resume path) cell of the honesty matrix — 40 of them.
 ///
-/// The per-thread door is new, so every state it can be asked from is new too — including the ones it
-/// cannot fix. `Freeze::ThreadSuspendTwice` is the interesting cell: one call decrements one suspend, so
-/// the thread stays stopped, and the whole question is whether the reply admits it. `Freeze::Step` is the
-/// other: a step armed on the thread would re-stop it on the very next line, at `SuspendPolicy::All`, so
-/// releasing one worker would have frozen the entire VM.
+/// **They used to be five tests looping over `Freeze::ALL` in-process, and that made them the suite's
+/// floor** (TEST-35). Each cell launches its own probe JVM and its own server, so a loop of eight ran
+/// eight JVMs *sequentially* inside one libtest thread while the other fifteen sat idle. Measured: the
+/// watchdog matrix took **35 s**, and per-cell instrumentation put only ~2 s of each cell in the wait the
+/// assertion actually needs — the rest is launch, attach and arm.
+///
+/// **A single test cannot be split by `scripts/shard-plan.py`**, so those five were a hard floor under
+/// every shard count. That floor is why ADR-0025 stopped at two shards, and — after TEST-30 took the
+/// other three down — why a third shard still bought only 3.6 s. Splitting them removes it rather than
+/// working around it.
+///
+/// Spelled out per cell rather than generated from a nested macro, because the cell name is what a
+/// failure prints and what `timings.tsv` keys on: `the_watchdog_is_honest_from_a_step` says which
+/// combination broke without anyone opening the file. The loop version had to panic with
+/// `{resume:?} from {freeze:?}` to say the same thing.
+/// The matrix is complete, and this is what says so now that the cells are spelled out.
+///
+/// `Freeze::ALL` used to *be* the guarantee — five loops over it meant a new suspended state was covered
+/// by every resume path the moment it was added to the array. Spelling the cells out (TEST-35) trades
+/// that for schedulability, and the trade is only safe if the loss is caught: without this, adding a
+/// ninth `Freeze` variant would silently get zero tests and every existing one would still pass.
+///
+/// So it is asserted rather than derived. A count is a weak check — swap two variants and it holds — but
+/// the failure mode being guarded is *addition*, which a count catches exactly, and it costs no JVM.
 #[test]
-#[ignore = "needs a JDK and a live JVM; run with --ignored"]
-fn resume_thread_is_honest_from_every_suspended_state() {
-    let Some(jdk) = jdk_or_skip("resume_thread_is_honest_from_every_suspended_state") else { return };
-    for freeze in Freeze::ALL {
-        assert_resume_is_honest(&jdk, freeze, Resume::OneThread);
-    }
+fn the_resume_honesty_matrix_covers_every_suspended_state() {
+    assert_eq!(
+        Freeze::ALL.len(),
+        8,
+        "a suspended state was added to or removed from Freeze::ALL. The honesty matrix is now one \
+         `resume_honesty_case!` line per cell rather than a loop, so it does NOT pick the change up on \
+         its own: add (or remove) one line in EACH of the five groups below — continue, panic, watchdog, \
+         disconnect, resume_thread — and update this count. Five uncovered cells is what this exists to \
+         stop, because every one of them would still pass."
+    );
 }
+
+macro_rules! resume_honesty_case {
+    ($name:ident, $resume:ident, $freeze:ident) => {
+        #[test]
+        #[ignore = "needs a JDK and a live JVM; run with --ignored"]
+        fn $name() {
+            let Some(jdk) = jdk_or_skip(stringify!($name)) else { return };
+            assert_resume_is_honest(&jdk, Freeze::$freeze, Resume::$resume);
+        }
+    };
+}
+
+// Invariant: `debug.continue` either resumes the VM or says it didn't — from every suspended state.
+resume_honesty_case!(continue_is_honest_from_a_breakpoint, Continue, Breakpoint);
+resume_honesty_case!(continue_is_honest_from_a_pause, Continue, Pause);
+resume_honesty_case!(continue_is_honest_from_a_pause_on_top_of_a_breakpoint, Continue, BreakpointThenPause);
+resume_honesty_case!(continue_is_honest_from_a_drained_breakpoint, Continue, BreakpointDrained);
+resume_honesty_case!(continue_is_honest_from_a_step, Continue, Step);
+resume_honesty_case!(continue_is_honest_from_an_escalated_condition, Continue, ConditionEscalated);
+resume_honesty_case!(continue_is_honest_from_a_suspended_thread, Continue, ThreadSuspend);
+resume_honesty_case!(continue_is_honest_from_a_twice_suspended_thread, Continue, ThreadSuspendTwice);
+
+// Invariant: `debug.panic` — the escape hatch — either resumes the VM or says it didn't.
+resume_honesty_case!(panic_is_honest_from_a_breakpoint, Panic, Breakpoint);
+resume_honesty_case!(panic_is_honest_from_a_pause, Panic, Pause);
+resume_honesty_case!(panic_is_honest_from_a_pause_on_top_of_a_breakpoint, Panic, BreakpointThenPause);
+resume_honesty_case!(panic_is_honest_from_a_drained_breakpoint, Panic, BreakpointDrained);
+resume_honesty_case!(panic_is_honest_from_a_step, Panic, Step);
+resume_honesty_case!(panic_is_honest_from_an_escalated_condition, Panic, ConditionEscalated);
+resume_honesty_case!(panic_is_honest_from_a_suspended_thread, Panic, ThreadSuspend);
+resume_honesty_case!(panic_is_honest_from_a_twice_suspended_thread, Panic, ThreadSuspendTwice);
+
+// Invariant: the watchdog either resumes the VM or says it didn't. This is the one that matters most —
+// it acts while nobody is watching, so a false success is invisible until the JVM is found frozen.
+resume_honesty_case!(the_watchdog_is_honest_from_a_breakpoint, Watchdog, Breakpoint);
+resume_honesty_case!(the_watchdog_is_honest_from_a_pause, Watchdog, Pause);
+resume_honesty_case!(
+    the_watchdog_is_honest_from_a_pause_on_top_of_a_breakpoint,
+    Watchdog,
+    BreakpointThenPause
+);
+resume_honesty_case!(the_watchdog_is_honest_from_a_drained_breakpoint, Watchdog, BreakpointDrained);
+resume_honesty_case!(the_watchdog_is_honest_from_a_step, Watchdog, Step);
+resume_honesty_case!(the_watchdog_is_honest_from_an_escalated_condition, Watchdog, ConditionEscalated);
+resume_honesty_case!(the_watchdog_is_honest_from_a_suspended_thread, Watchdog, ThreadSuspend);
+resume_honesty_case!(the_watchdog_is_honest_from_a_twice_suspended_thread, Watchdog, ThreadSuspendTwice);
+
+// Invariant: `debug.disconnect` leaves the VM running from every suspended state. This is SAFE-1's bug
+// generalised — walking away used to freeze the JVM permanently, and it is the tool whose name most
+// suggests it is the safe way out.
+resume_honesty_case!(disconnect_is_honest_from_a_breakpoint, Disconnect, Breakpoint);
+resume_honesty_case!(disconnect_is_honest_from_a_pause, Disconnect, Pause);
+resume_honesty_case!(
+    disconnect_is_honest_from_a_pause_on_top_of_a_breakpoint,
+    Disconnect,
+    BreakpointThenPause
+);
+resume_honesty_case!(disconnect_is_honest_from_a_drained_breakpoint, Disconnect, BreakpointDrained);
+resume_honesty_case!(disconnect_is_honest_from_a_step, Disconnect, Step);
+resume_honesty_case!(disconnect_is_honest_from_an_escalated_condition, Disconnect, ConditionEscalated);
+resume_honesty_case!(disconnect_is_honest_from_a_suspended_thread, Disconnect, ThreadSuspend);
+resume_honesty_case!(disconnect_is_honest_from_a_twice_suspended_thread, Disconnect, ThreadSuspendTwice);
+
+// Invariant: `debug.resume_thread` either gives the named thread back or says it didn't (SAFE-11).
+//
+// The per-thread door is new, so every state it can be asked from is new too — including the ones it
+// cannot fix. `…_from_a_twice_suspended_thread` is the interesting cell: one call decrements one
+// suspend, so the thread stays stopped, and the whole question is whether the reply admits it.
+// `…_from_a_step` is the other: a step armed on the thread would re-stop it on the very next line, at
+// `SuspendPolicy::All`, so releasing one worker would have frozen the entire VM.
+resume_honesty_case!(resume_thread_is_honest_from_a_breakpoint, OneThread, Breakpoint);
+resume_honesty_case!(resume_thread_is_honest_from_a_pause, OneThread, Pause);
+resume_honesty_case!(
+    resume_thread_is_honest_from_a_pause_on_top_of_a_breakpoint,
+    OneThread,
+    BreakpointThenPause
+);
+resume_honesty_case!(resume_thread_is_honest_from_a_drained_breakpoint, OneThread, BreakpointDrained);
+resume_honesty_case!(resume_thread_is_honest_from_a_step, OneThread, Step);
+resume_honesty_case!(resume_thread_is_honest_from_an_escalated_condition, OneThread, ConditionEscalated);
+resume_honesty_case!(resume_thread_is_honest_from_a_suspended_thread, OneThread, ThreadSuspend);
+resume_honesty_case!(resume_thread_is_honest_from_a_twice_suspended_thread, OneThread, ThreadSuspendTwice);
 
 // ---------------------------------------------------------------------------------------------
 // SAFE-11 — a per-thread suspend, asserted against the probe's OWN per-thread ticks
