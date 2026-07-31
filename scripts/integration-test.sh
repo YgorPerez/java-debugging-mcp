@@ -118,16 +118,23 @@ set -- ${ARGS[@]+"${ARGS[@]}"}
 # finishing sooner. `JDWP_TEST_THREADS` overrides it; an explicit `--test-threads` on the command line
 # still beats both, which is what keeps `--test-threads=1` usable for reading a failure.
 # --------------------------------------------------------------------------------------------------
+THREADS=()
 if [[ " $* " != *" --test-threads"* ]]; then
+  cores=$(nproc 2>/dev/null || echo 4)
   if [ -n "${JDWP_TEST_THREADS:-}" ]; then
     threads=$JDWP_TEST_THREADS
+    why="JDWP_TEST_THREADS"
   else
-    cores=$(nproc 2>/dev/null || echo 4)
     threads=$((cores * 4))
-    [ "$threads" -gt 40 ] && threads=40
+    if [ "$threads" -gt 40 ]; then threads=40; fi
+    why="4x cores, capped at 40"
   fi
-  echo "Test threads: $threads (oversubscribing ${cores:-?} core(s) — this suite waits on JVMs more than it computes; JDWP_TEST_THREADS overrides)"
-  set -- "$@" "--test-threads=$threads"
+  echo "Test threads: $threads on $cores core(s) — $why. This suite waits on probe JVMs more than it computes, so it is oversubscribed on purpose (TEST-32)."
+  # A libtest FLAG, and it must not go into "$@": the positional args are the test-name filter, and
+  # `--shard` refuses to run alongside one. Appending it here is what broke all six CI legs in
+  # TEST-32 — locally every run after the change had been unsharded, and `--shard` is the only way
+  # CI ever calls this script. Kept in its own array beside TIMING, which is passed the same way.
+  THREADS=("--test-threads=$threads")
 fi
 
 # Build with a clean environment — see the note above on RUSTC_BOOTSTRAP and the fingerprint. Build output
@@ -190,7 +197,7 @@ fi
 run_suite() {
   set +e
   # pipefail is set, so ${PIPESTATUS[0]} is read before anything can overwrite it.
-  RUSTC_BOOTSTRAP=1 "$BIN" --ignored --nocapture "${TIMING[@]}" \
+  RUSTC_BOOTSTRAP=1 "$BIN" --ignored --nocapture "${TIMING[@]}" ${THREADS[@]+"${THREADS[@]}"} \
     ${SELECTION[@]+"${SELECTION[@]}"} "$@" 2>&1 | tee "$LOG"
   status=${PIPESTATUS[0]}
   set -e
