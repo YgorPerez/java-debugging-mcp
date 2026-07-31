@@ -300,6 +300,39 @@ The callers above a hit, recorded on a snapshot as locations only. Answers which
 without the suspension that reading a full stack would need.
 _Avoid_: stack, backtrace (both imply the whole stack, with locals)
 
+**Filter**:
+A modifier on an event request that the *debuggee* applies, so an occurrence that does not match
+produces no event at all — no packet, no suspension, no work on this side. The ones in use here are
+`ThreadOnly` (one thread), `InstanceOnly` (one object), `ClassOnly` / `ClassExclude` (class patterns, used
+by stepping) and `Count` (the Nth occurrence only, after which the request is **spent**).
+Worth its own word because it is the only mechanism here that reduces what the debuggee *does* rather than
+what the debugger reports, which is the difference that matters on **the shared 8180**. Everything else —
+a **condition**, a method-name narrowing on a method-exit request, a trace budget — filters after the event
+has already crossed the wire.
+Two hazards, each with its own term: a filter the debuggee accepts and does not apply is **inert**, and a
+filter naming an object or thread the debuggee has collected simply stops matching, which reads as *the code
+never ran*.
+_Avoid_: condition (ours, and paid for per hit), narrowing (vague about which side does it)
+
+**Condition**:
+A boolean expression **we** evaluate, on the hit thread, after the debuggee has already reported the hit.
+That is the whole of what distinguishes it from a **filter**, and the distinction decides what each one
+costs: a filter (`ThreadOnly`, `InstanceOnly`, `ClassExclude`) is a modifier the *debuggee* applies, so a
+non-match costs no packet and no suspension at all, while a condition costs a hit, a hold and several round
+trips **every time**, whether or not it turns out true.
+So the two are not interchangeable and neither dominates. A filter is free and can only ask what the
+protocol has a modifier for; a condition can ask anything the expression grammar can express — a field, a
+chain, a comparison — and is paid for per hit. Reach for the filter where one exists.
+What a condition costs was not always this: until FILT-7 ([#91]) a conditional stop point froze the whole
+VM to decide, so the argument reached for to make a hot line *cheap* was the most expensive thing available.
+It now holds only the hit thread and releases it when the answer is false — see **escalation** for the
+window that opens when the answer is true, and ADR-0020 for why the policy is `EventThread`.
+_Avoid_: filter (the debuggee applies those; conflating them hides that one is free per non-match and the
+other is not), predicate (fine in prose, but the caller-facing argument is `condition` and the glossary
+should agree with the schema)
+
+[#91]: https://github.com/YgorPerez/java-debugging-mcp/issues/91
+
 **Trace budget**:
 How many hits a traced stop point will **charge** before disarming itself. Bounds work done in the debuggee,
 not memory.
@@ -383,6 +416,24 @@ the watchdog and a trace budget disarm are ours and known, this is neither), exp
 consumed, retired (both already spoken for — an entity read, and a pool worker)
 _Also avoid_ using **spent** for a **trace budget** running out. That is a disarm: we count it, we do it, and we
 know when it happened.
+
+**Inert**:
+A **filter** the debuggee accepts and then does not apply. The request is armed, the filter is on it, and
+the filter does nothing — with no error and nothing in any reply to say so.
+**The capability bit is not a guide, which is the trap.** `canUseInstanceFilters` reads *true* on the JVM
+where the filter is inert: the debuggee is telling the truth about what it supports and still not applying
+it on the request in front of it. So a bit that says yes licenses nothing about a particular event kind.
+Its own state in the cluster above, because the failure direction is the opposite of the others: **spent**
+and **vanished** are the debuggee having removed something we still believe in, while this is the debuggee
+keeping something that was never in effect. So the stop point reports *more* than it should rather than
+less, which is the reading no caller checks for.
+Measured on Temurin 17, `HotSpot` (FILT-9, #101): an `InstanceOnly` filter is accepted and **not applied**
+on a `METHOD_EXIT` request, on a line stop in a `static` method, and on a watch of a `static` field — three
+shapes, all silent. The consequence is a rule rather than a caveat: **acceptance is not application**, so a
+filter must be refused up front where it is known to be inert, since neither the reply nor the JVM will ever
+mention it again.
+_Avoid_: unsupported (the debuggee took it — an unsupported modifier is one it *refuses*, which is the
+honest case and needs no word), ignored (true but reads as ours to fix)
 
 **Disarming stops future hits, not hits that already exist.** A stop point can be armed and gone while hits
 it caused are still unhandled — see **in-flight hit**. Treating "disarmed" as "silent" is what froze a
@@ -483,8 +534,15 @@ _Avoid_: upgrade, promote (both suggest the stop point changed kind; the arming 
 suspension widened)
 
 **Watchdog**:
-The timer that resumes a debuggee left suspended too long and disarms whatever froze it, so a forgotten
-stop point cannot hold a shared instance indefinitely.
+The timer that resumes a debuggee left **VM-wide** suspended too long and disarms whatever froze it, so a
+forgotten suspending stop point cannot hold a shared instance indefinitely.
+**It does not cover a thread held by a traced hit**, and the word "VM-wide" is the whole of the difference.
+A traced hit suspends only the hit thread and never records a suspension, so nothing the watchdog reads is
+set and it has no reason to look — which is why an in-flight traced hit whose request went away could leave
+one application thread frozen for the life of the JVM (#114). `debug.panic` was the only escape, because it
+resumes the VM outright rather than by reading who is holding it.
+_Avoid_ reading this as "nothing stays frozen": it bounds the suspension a **caller asked for**, not every
+way a thread can end up held.
 
 ### Identity
 
@@ -562,6 +620,18 @@ Each is named for the shape it reproduces, not the feature that uses it.
 **Tick**:
 A line a probe prints while running. The only evidence that a stop point left nothing suspended, because
 the debugger reports success either way.
+
+**Witness**:
+A probe's standing as independent evidence — it prints the thing under test, so a test can distinguish what
+the debuggee did from what the debugger claims. A probe **stops being a witness** when it stops printing,
+and the word exists because that state is silent and reads as a debugger bug.
+Three separate flakes were spent on this before it had a name (TEST-31/#114, TEST-33): a worker that caught
+an exception and returned; a worker frozen by a held hit; a stop point armed on a method nothing was
+calling. Every one presented as *the debugger armed something and it never fired*, and none of them was
+that. The rule the term is for: **a probe must announce that it has stopped**, because the absence of a
+**tick** is the same absence whatever caused it, and only the probe can say which.
+_Avoid_: "the probe is alive" — a live thread that no longer executes the code under test is exactly the
+case that misled three investigations.
 
 **Running** (of a probe):
 Having executed code — as opposed to **listening**, which is all a successful attach proves. The JDWP agent
