@@ -758,10 +758,52 @@ fn launch_suspends_before_the_first_instruction_and_disconnect_terminates_it() {
     // to catch it.
     server.call("debug.continue", serde_json::json!({}));
     let hit = server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).unwrap_or_else(|| {
+        // TEST-34 (#118). This message used to say `suspend=y did not hold the JVM`, and printed a listing
+        // underneath that exonerated it in the same breath: the breakpoint DEFERRED — asserted twenty lines
+        // above, and nothing can defer unless the JVM was held before its class loaded. So `suspend=y` is
+        // the one mechanism this failure rules OUT, and the reader it sent to audit it lost the trip.
+        //
+        // What actually did not complete is prepare -> arm -> hit, after `debug.continue`. Two observations
+        // separate its four readings, and both are already here: the stop point's own state, and whether
+        // the probe printed from inside `<clinit>`. `debug.disconnect` is what carries a launched JVM's
+        // captured stdout (`end_launched_jvm` — while it is alive, nothing else does), and ending a JVM we
+        // are about to abandon costs nothing.
+        let listing = server.call("debug.list_stop_points", serde_json::json!({}));
+        let farewell = server.call("debug.disconnect", serde_json::json!({}));
+        let deferred = listing.contains("waiting for class load");
+        let clinit_ran = farewell.contains("clinit ");
+        let hits: u32 = listing
+            .split("Hits: ")
+            .nth(1)
+            .and_then(|rest| rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok())
+            .unwrap_or(0);
+        let reading = match (deferred, clinit_ran, hits) {
+            (true, false, _) => {
+                "THE CLASS NEVER PREPARED. The stop point is still `waiting for class load` and the probe \
+                 never printed from `<clinit>`, so the JVM did not get as far as loading StartupProbe. The \
+                 resume is the suspect, not the arming."
+            }
+            (true, true, _) => {
+                "THE CLASS PREPARED AND THE DEFERRED ARM DID NOT LAND. The probe's own stdout shows \
+                 `<clinit>` ran, yet the stop point is STILL `waiting for class load` — so the CLASS_PREPARE \
+                 handler never armed it. This is the reading that makes it a race rather than a slow box."
+            }
+            (false, _, 0) => {
+                "ARMED, NEVER HIT. The class prepared and the breakpoint armed, with zero hits. If the \
+                 output below shows `<clinit>` ran, the arm landed AFTER the line had already executed — \
+                 the same race, one step later."
+            }
+            (false, _, _) => {
+                "ARMED AND HIT, BUT NO EVENT ARRIVED. Hits are non-zero, so the arming chain is not the \
+                 problem at all: the event did not reach the buffer within EVENT_TIMEOUT."
+            }
+        };
         panic!(
-            "the breakpoint inside the static initialiser never fired — suspend=y did not hold the JVM \
-             before class initialisation.\n  launch reply: {launched}\n  stop points: {}",
-            server.call("debug.list_stop_points", serde_json::json!({}))
+            "the breakpoint inside the static initialiser never fired within {EVENT_TIMEOUT:?}. \
+             `suspend=y` is NOT the suspect — the stop point deferred, which only a held JVM allows.\n  \
+             READING: {reading}\n  hits seen: {hits}, still deferred: {deferred}, <clinit> printed: \
+             {clinit_ran}\n  launch reply: {launched}\n  stop points: {listing}\n  the probe's own output, \
+             via disconnect: {farewell}"
         )
     });
     assert_contains_all(
