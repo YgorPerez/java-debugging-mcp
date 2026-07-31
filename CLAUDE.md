@@ -112,7 +112,11 @@ nightly-only features in silently. Arguments still go straight to libtest and th
 **CI runs six legs now: three JDKs x two shards** (TEST-29, #106; ADR-0025). A shard is half the suite split by
 *measured* duration — `scripts/shard-plan.py` reading `mcp-server/tests/timings.tsv` — because a split by name
 had a 1-in-8 chance of piling the four resume-honesty tests into one shard and making it the whole wall clock.
-Measured on CI: **workflow wall clock 223 s → 147 s (−34%), runner-seconds 648 → 747 (+15%)**. Two shards and
+Measured on CI when sharding landed: **workflow wall clock 223 s → 147 s (−34%), runner-seconds 648 → 747
+(+15%)** — wall clock bought *at the cost of* runner-seconds. **Re-measured after TEST-30 and TEST-32: wall
+clock 91 s, slowest leg 88 s, runner-seconds 494 s**, so both are now better than either earlier state and
+runner-seconds are below the *unsharded* baseline. **33 s of that 88 s leg is not the tests** (16 s build,
+the rest checkout/toolchain/cache), so fixed cost per leg is what now argues against a third shard. Two shards and
 not three for two reasons — the slowest single test was **70 s** and cannot be split, and a 60-test shard only
 reaches ~2.6x concurrent on 4 vCPU against 3.7x for the full 118, so halving a shard's test time does *not*
 halve its wall clock. **The first reason expired with TEST-30** (floor now 35 s); re-measured on 4 vCPU,

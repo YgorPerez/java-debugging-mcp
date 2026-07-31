@@ -60,6 +60,23 @@ between them against 188 s unsharded — roughly 5% of duplicated per-process wa
 its own 28 s of fixed cost. Recorded because the trade is wall clock *for* runner-seconds, and only one of the
 two was projected accurately.
 
+> **Re-measured after TEST-30 and TEST-32 (run `d1d3ec2`): both numbers improved, so this row's trade is no
+> longer being paid.**
+>
+> | | v0.9.0 | this ADR | now |
+> |---|---|---|---|
+> | workflow wall clock | 223 s | 147 s | **91 s** |
+> | slowest leg | — | 151 s | **88 s** (55 s of it the test step, 16 s build) |
+> | runner-seconds | 648 s | 747 s | **494 s** |
+>
+> Sharding bought wall clock *at the cost of* runner-seconds; making the tests themselves faster and more
+> concurrent bought both. Runner-seconds are now **below the unsharded v0.9.0 figure**, which is the one
+> outcome this ADR did not consider possible.
+>
+> Worth noting where the remaining time now sits: **33 s of the slowest 88 s leg is not the tests** (16 s
+> build, the rest checkout/toolchain/cache). Fixed cost per leg is becoming the argument against more
+> shards, replacing the floor argument that TEST-30 retired.
+
 ## Why two shards and not three
 
 Two reasons, and the second is the stronger one and was only visible after measuring on CI.
