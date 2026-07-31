@@ -31,6 +31,78 @@ pub struct RequestHandler {
     alerter: crate::protocol::Alerter,
 }
 
+/// The single-pattern (or catch-all) half of `debug.set_exception_stop`, with the reply it has always had.
+///
+/// Split out so the handler stays under the complexity gate. The split is along a real seam: this path
+/// answers about ONE exception class and returns a paragraph addressed to the caller, while the batch
+/// path below returns one row per class. `pattern: None` is the catch-all, which is a different reply
+/// again — hence `matches_all` rather than inferring it downstream from an empty string.
+#[allow(clippy::too_many_arguments)] // one argument per thing the reply must state; a struct here would
+                                     // only move the list, and the batch path takes the same set as
+                                     // `BatchLimits` already.
+async fn arm_single_exception_pattern(
+    session: &mut crate::session::DebugSession,
+    a: &crate::args::SetExceptionBreakpointArgs,
+    pattern: Option<&str>,
+    filters: StopFilters,
+    trace_frames: usize,
+    trace_max_length: Option<usize>,
+    frames_note: Option<&str>,
+) -> Result<String, String> {
+    // The class must be loaded; unlike a line breakpoint we don't defer, because an exception request
+    // needs a concrete referenceTypeID up front.
+    let ref_type = match pattern {
+        Some(p) => Some(resolve_exception_class(session, p).await?),
+        None => None,
+    };
+    let class_pattern = pattern.unwrap_or("*").to_string();
+    let exc_id =
+        arm_one_exception(session, a, ref_type, &class_pattern, filters, trace_frames, trace_max_length)
+            .await?;
+    Ok(render_exception_stop_reply(
+        a,
+        &ExceptionStopReply {
+            class_pattern: &class_pattern,
+            exc_id: &exc_id,
+            matches_all: pattern.is_none(),
+            trace_frames,
+            frames_note,
+            thread_filter: filters.thread,
+            instance_filter: filters.instance,
+        },
+    ))
+}
+
+/// Whether the stop point `id` is currently armed, whichever of the four maps owns it.
+///
+/// Extracted from `handle_toggle_stop_point` so that function stays under the complexity gate, but the
+/// deferred arm is the reason it is worth having a name: a pending breakpoint holds only a
+/// `CLASS_PREPARE` watch and no request to silence, and answering "not found" for an id
+/// `debug.list_stop_points` is showing is the misleading reply BP-3 removed.
+fn enabled_state_of(session: &crate::session::DebugSession, id: &str) -> Result<bool, String> {
+    if let Some(b) = session.breakpoints.get(id) {
+        return Ok(b.enabled);
+    }
+    if let Some(e) = session.exception_requests.get(id) {
+        return Ok(e.enabled);
+    }
+    if let Some(w) = session.watchpoints.get(id) {
+        return Ok(w.enabled);
+    }
+    if let Some(m) = session.method_exits.get(id) {
+        return Ok(m.enabled);
+    }
+    if let Some(pb) = session.pending_breakpoints.iter().find(|p| p.bp_id == id) {
+        return Err(format!(
+            "{id} is a deferred breakpoint waiting for {} to load — it holds no active breakpoint \
+             request yet, so there is nothing to toggle. Use debug.clear_stop_point to drop it, or \
+             toggle it once the class loads and it arms.",
+            pb.class_pattern
+        ));
+    }
+    Err(format!("Stop point not found: {id}"))
+}
+
 impl RequestHandler {
     pub fn new(alerter: crate::protocol::Alerter) -> Self {
         Self { session_manager: SessionManager::new(alerter.clone()), alerter }
@@ -521,6 +593,7 @@ impl RequestHandler {
             method_hint: a.method.clone(),
             hit_count: a.hit_count,
             thread_filter: crate::args::parse_thread_id(a.thread_id.as_deref()),
+            instance_filter: parse_instance_filter(a.instance_id.as_deref())?,
             condition: a.condition.clone(),
             trace: a.trace,
             trace_expr: a.trace_expr.clone(),
@@ -536,6 +609,7 @@ impl RequestHandler {
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
         check_readonly_exprs(session.read_only, base.condition.as_deref(), base.trace_expr.as_deref())?;
+        check_instance_filter_supported(&mut session.connection, base.instance_filter).await?;
         check_thread_filter(&mut session.connection, base.thread_filter).await?;
 
         // ONE EXACT CLASS KEEPS THE REPLY IT HAS ALWAYS HAD, down to the wording — including the error
@@ -610,14 +684,28 @@ impl RequestHandler {
         );
 
         render_every_stop_point(&mut output, &session, &dead);
-        if !dead.is_empty() {
+        if !dead.dead_threads.is_empty() {
             let _ = write!(
                 output,
                 "\n⚠️  {} stop point(s) above are filtered to a thread that no longer exists. A pool that \
                  retires idle workers (which is what a thread filter is usually for) invalidates the id, \
                  and the stop point then reports nothing at all — silence that reads like \"no hits\". \
                  Re-read debug.list_threads for a live id and re-arm.\n",
-                dead.len()
+                dead.dead_threads.len()
+            );
+        }
+        // FILT-9, and kept as its own sentence rather than folded into the one above: the cause is
+        // different (the debuggee collected the object, not retired a thread), the fix is different (a
+        // fresh handle, not a live thread id), and a caller who has only ever used one of the two
+        // filters should not have to work out which half applies to them.
+        if !dead.vanished_objects.is_empty() {
+            let _ = write!(
+                output,
+                "\n⚠️  {} stop point(s) above are scoped to an object the debuggee has since collected. A \
+                 JDWP object id is a WEAK reference and nothing here pins it (ADR-0022), so the filter \
+                 stops matching and the stop point goes quiet — which is indistinguishable from the code \
+                 never running. Take a fresh handle from debug.list_instances and re-arm.\n",
+                dead.vanished_objects.len()
             );
         }
         drop(session);
@@ -769,28 +857,7 @@ impl RequestHandler {
             return out;
         }
 
-        // Current state, whichever map owns this id.
-        let current = if let Some(b) = session.breakpoints.get(&id) {
-            b.enabled
-        } else if let Some(e) = session.exception_requests.get(&id) {
-            e.enabled
-        } else if let Some(w) = session.watchpoints.get(&id) {
-            w.enabled
-        } else if let Some(m) = session.method_exits.get(&id) {
-            m.enabled
-        } else if let Some(pb) = session.pending_breakpoints.iter().find(|p| p.bp_id == id) {
-            // A deferred breakpoint isn't armed at all yet — it holds only a CLASS_PREPARE watch, so
-            // there is no request to silence. Say that, rather than the misleading "not found" this
-            // used to return for an id `list_stop_points` was showing (BP-3).
-            return Err(format!(
-                "{id} is a deferred breakpoint waiting for {} to load — it holds no active breakpoint \
-                 request yet, so there is nothing to toggle. Use debug.clear_stop_point to drop it, or \
-                 toggle it once the class loads and it arms.",
-                pb.class_pattern
-            ));
-        } else {
-            return Err(format!("Stop point not found: {id}"));
-        };
+        let current = enabled_state_of(&session, &id)?;
 
         // Omitted `enabled` flips the current state.
         let want = a.enabled.unwrap_or(!current);
@@ -798,6 +865,15 @@ impl RequestHandler {
             return Ok(format!("No change: {id} is already {}.", if current { "armed" } else { "disabled" }));
         }
 
+        // FILT-9: a re-arm is the ONLY place an `InstanceOnly` filter can have lost its object, and it
+        // is therefore the only place worth checking. While the stop point was armed the modifier pinned
+        // the object (measured, ADR-0027) so it could not be collected; disabling released that pin, and
+        // whatever was holding it on the application's side may since have let go. Re-arming a filter
+        // whose object is gone produces a stop point that reports nothing forever — indistinguishable
+        // from the code not running, which is the failure this whole feature is arranged against.
+        if want {
+            check_instance_filter_still_live(&mut session, &id).await?;
+        }
         let what = if want {
             rearm_stop_point(&mut session, &id).await?
         } else {
@@ -2541,6 +2617,12 @@ impl RequestHandler {
         check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
+        let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
+        // Allowed here, and it is the only one of the four that was in doubt: HotSpot both accepts AND
+        // applies InstanceOnly on an EXCEPTION request. Measured on Temurin 17/21/25 against two live
+        // instances throwing the same type from the same line — 26 records, all of them the filtered
+        // instance, none from its twin (FILT-9, ADR-0027).
+        check_instance_filter_supported(&mut session.connection, instance_filter).await?;
         check_thread_filter(&mut session.connection, thread_filter).await?;
         let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
         let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
@@ -2549,36 +2631,18 @@ impl RequestHandler {
 
         // The catch-all and the one named class keep exactly the reply they have always had.
         if patterns.len() <= 1 && !patterns.first().is_some_and(|p| is_wildcard(p)) {
-            let pattern = patterns.first().map(String::as_str);
-            // The class must be loaded; unlike a line breakpoint we don't defer, because an exception
-            // request needs a concrete referenceTypeID up front.
-            let ref_type = match pattern {
-                Some(p) => Some(resolve_exception_class(&mut session, p).await?),
-                None => None,
-            };
-            let class_pattern = pattern.unwrap_or("*").to_string();
-            let exc_id = arm_one_exception(
+            let out = arm_single_exception_pattern(
                 &mut session,
                 &a,
-                ref_type,
-                &class_pattern,
-                thread_filter,
+                patterns.first().map(String::as_str),
+                StopFilters { thread: thread_filter, instance: instance_filter },
                 trace_frames,
                 trace_max_length,
+                frames_note.as_deref(),
             )
-            .await?;
+            .await;
             drop(session);
-            return Ok(render_exception_stop_reply(
-                &a,
-                &ExceptionStopReply {
-                    class_pattern: &class_pattern,
-                    exc_id: &exc_id,
-                    matches_all: pattern.is_none(),
-                    trace_frames,
-                    frames_note: frames_note.as_deref(),
-                    thread_filter,
-                },
-            ));
+            return out;
         }
 
         // Several patterns, or a wildcard: one exc_ per resolved class, and a row per class (FILT-3/FILT-4).
@@ -2595,14 +2659,21 @@ impl RequestHandler {
                     &a,
                     p,
                     &index,
-                    &BatchLimits { max_classes, thread_filter, trace_frames, trace_max_length },
+                    &BatchLimits {
+                        instance_filter,
+                        max_classes,
+                        thread_filter,
+                        trace_frames,
+                        trace_max_length,
+                    },
                 )
                 .await,
             );
         }
         drop(session);
 
-        let trailer = exception_batch_trailer(&a, thread_filter, trace_frames, frames_note.as_deref());
+        let trailer =
+            exception_batch_trailer(&a, thread_filter, instance_filter, trace_frames, frames_note.as_deref());
         Ok(render_batch_arming("exception stop(s)", &batches, max_classes, &trailer))
     }
 
@@ -2625,6 +2696,8 @@ impl RequestHandler {
         check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
+        let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
+        check_instance_filter_supported(&mut session.connection, instance_filter).await?;
         check_thread_filter(&mut session.connection, thread_filter).await?;
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
         let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
@@ -2636,9 +2709,16 @@ impl RequestHandler {
 
         // One named class keeps exactly the reply it has always had.
         if let (1, Some(only)) = (classes.len(), classes.first().filter(|c| !is_wildcard(c))) {
-            let out =
-                arm_field_on_named_class(&mut session, &a, only, &arm, thread_filter, frames_note.as_deref())
-                    .await;
+            let out = arm_field_on_named_class(
+                &mut session,
+                &a,
+                only,
+                &arm,
+                thread_filter,
+                instance_filter,
+                frames_note.as_deref(),
+            )
+            .await;
             drop(session);
             return out;
         }
@@ -2649,15 +2729,22 @@ impl RequestHandler {
         } else {
             Vec::new()
         };
-        let limits = BatchLimits { max_classes, thread_filter, trace_frames, trace_max_length };
+        let limits =
+            BatchLimits { instance_filter, max_classes, thread_filter, trace_frames, trace_max_length };
         let mut batches = Vec::with_capacity(classes.len());
         for pattern in &classes {
             batches.push(field_rows_for_pattern(&mut session, &a, pattern, &index, &arm, &limits).await);
         }
         drop(session);
 
-        let trailer =
-            field_batch_trailer(&a, trace_budget, thread_filter, trace_frames, frames_note.as_deref());
+        let trailer = field_batch_trailer(
+            &a,
+            trace_budget,
+            thread_filter,
+            instance_filter,
+            trace_frames,
+            frames_note.as_deref(),
+        );
         Ok(render_batch_arming("watchpoint(s)", &batches, max_classes, &trailer))
     }
 
@@ -2688,14 +2775,22 @@ impl RequestHandler {
         let with_return_value = session.connection.can_get_method_return_values().await.unwrap_or(false);
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
+        let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
+        refuse_instance_filter_on_method_exit(instance_filter)?;
         check_thread_filter(&mut session.connection, thread_filter).await?;
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
         let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
         let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
         let frames_note = merge_clamp_notes(depth_note, length_note);
 
-        let mexit =
-            MethodExitArm { with_return_value, thread_filter, trace_budget, trace_frames, trace_max_length };
+        let mexit = MethodExitArm {
+            instance_filter,
+            with_return_value,
+            thread_filter,
+            trace_budget,
+            trace_frames,
+            trace_max_length,
+        };
         let (extra, mode) = describe_method_exit_arm(&a, method.as_ref(), &mexit, frames_note.as_deref());
 
         // One pattern keeps exactly the reply it has always had — including a WILDCARD one, which has
@@ -2732,16 +2827,27 @@ impl RequestHandler {
         // filter is pinned to a dead thread — "no snapshots" and "this can never fire again" look
         // identical from here otherwise.
         let dead = dead_filter_threads(&mut session).await;
-        let dead_note = if dead.is_empty() {
-            String::new()
-        } else {
-            format!(
+        let mut dead_note = String::new();
+        if !dead.dead_threads.is_empty() {
+            let _ = write!(
+                dead_note,
                 "\n⚠️  {} stop point(s) are filtered to a thread that no longer exists, so they cannot \
                  record anything — this silence is not \"no hits\". See debug.list_stop_points, and re-arm \
                  with a live thread_id from debug.list_threads.",
-                dead.len()
-            )
-        };
+                dead.dead_threads.len()
+            );
+        }
+        // FILT-9: the same argument as FILT-2's, for the other filter. An empty trace buffer is exactly
+        // where a filter that can no longer match needs to announce itself.
+        if !dead.vanished_objects.is_empty() {
+            let _ = write!(
+                dead_note,
+                "\n⚠️  {} stop point(s) are scoped to an object the debuggee has collected, so they cannot \
+                 record anything — this silence is not \"no hits\" either. See debug.list_stop_points, and \
+                 re-arm with a fresh handle from debug.list_instances.",
+                dead.vanished_objects.len()
+            );
+        }
 
         if session.traces.is_empty() && session.trace_disarms.is_empty() {
             return Ok(format!(
@@ -2868,6 +2974,185 @@ async fn set_field_by_path(
             "Could not write '{target}': '{container_expr}' didn't resolve to an object ({e}) and isn't a loaded class."
         ),
     ))
+}
+
+/// Parse an `instance_id` argument into the object id an `InstanceOnly` modifier needs (FILT-9).
+///
+/// Accepts the `@0x…` handle every reply prints, and a bare `0x…` for the caller who strips the `@`.
+/// Refused rather than ignored when it is neither: a filter silently dropped is a stop point that fires
+/// on all 400 objects while the caller believes it is scoped to one, which is worse than not offering
+/// the argument.
+fn parse_instance_filter(raw: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(t) = raw.map(str::trim).filter(|t| !t.is_empty()) else { return Ok(None) };
+    if let Some(id) = parse_object_handle(t) {
+        return Ok(Some(id));
+    }
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        if !hex.is_empty() {
+            if let Ok(id) = u64::from_str_radix(hex, 16) {
+                return Ok(Some(id));
+            }
+        }
+    }
+    Err(format!(
+        "instance_id '{t}' is not an object handle. Use the @0x… form every reply prints beside an \
+         object — a trace snapshot's locals, an expanded field tree, or debug.list_instances."
+    ))
+}
+
+/// The one sentence every `InstanceOnly` refusal ends with, so a caller who hits any of them learns the
+/// same rule rather than four unrelated-looking restrictions.
+///
+/// `CONTEXT.md` calls this state **inert**, and the rule it yields is *acceptance is not application*.
+const INERT_RULE: &str = "This is refused up front because HotSpot ACCEPTS an InstanceOnly modifier here \
+                          and then does not apply it — no error, no warning, and a reply saying the stop \
+                          point is scoped when it is not. Measured on Temurin 17/21/25 (FILT-9, ADR-0027). \
+                          Drop instance_id, or use a condition, which we evaluate on our side and which \
+                          works on every kind.";
+
+/// Refuse an `InstanceOnly` filter on a JVM whose `canUseInstanceFilters` bit is clear (FILT-9).
+///
+/// The bit is worth consulting even though it is **not** a guide to whether the filter will be *applied*
+/// — see [`INERT_RULE`] and `CONTEXT.md` § **Inert**, where a `true` bit sits on top of three shapes that
+/// silently ignore the modifier. What a `false` bit does tell us is the honest case: this JVM will refuse
+/// the request outright, and the alternative to checking is an `INTERNAL` (113) that names nothing.
+async fn check_instance_filter_supported(
+    conn: &mut jdwp_client::JdwpConnection,
+    instance_filter: Option<u64>,
+) -> Result<(), String> {
+    if instance_filter.is_none() {
+        return Ok(());
+    }
+    // An unreadable capability set is not a refusal: older JVMs answer CapabilitiesNew fine, and a
+    // transport hiccup here should not turn into a false claim about what the debuggee supports.
+    if matches!(conn.capabilities_new().await, Ok(caps) if !caps.can_use_instance_filters) {
+        return Err(
+            "This JVM reports canUseInstanceFilters = false, so it will refuse an InstanceOnly modifier \
+             outright (JDWP answers INTERNAL (113), which names nothing). Drop instance_id and use a \
+             condition instead — we evaluate that on our side, so it needs nothing from the debuggee."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Refuse `instance_id` on a method-exit request (FILT-9). **Measured inert, on every method.**
+///
+/// The worst of the three, and the one that decided the policy: a method-exit request has a `this` — it
+/// is an instance method's return — so there is no structural reason for the filter not to work, and the
+/// reply looks correct. It simply records every instance.
+fn refuse_instance_filter_on_method_exit(instance_filter: Option<u64>) -> Result<(), String> {
+    if instance_filter.is_none() {
+        return Ok(());
+    }
+    Err(format!(
+        "instance_id is not supported on debug.set_method_exit_stop. {INERT_RULE} A method-exit request \
+         records both instances even when the filter names one, which is why this one is refused rather \
+         than passed through: there is a `this` on the event, so nothing about the reply would look wrong."
+    ))
+}
+
+/// Refuse a re-arm whose `InstanceOnly` object the debuggee has collected since it was disabled (FILT-9).
+///
+/// Refused rather than warned about, because the alternative is a stop point that looks armed in every
+/// listing and can never fire. The remedy is in the message and it is cheap — take a fresh handle and
+/// arm a new stop point — so there is nothing lost by refusing.
+async fn check_instance_filter_still_live(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+) -> Result<(), String> {
+    let filter = session
+        .breakpoints
+        .get(id)
+        .and_then(|b| b.arm.instance_filter)
+        .or_else(|| session.exception_requests.get(id).and_then(|e| e.instance_filter))
+        .or_else(|| session.watchpoints.get(id).and_then(|w| w.instance_filter))
+        .or_else(|| session.method_exits.get(id).and_then(|m| m.instance_filter));
+    let Some(oid) = filter else { return Ok(()) };
+    // Both readings mean the same thing to a re-arm: collected, or collected long enough ago that the
+    // JVM dropped the mapping. An unreachable debuggee is left alone — the re-arm below will say so.
+    let gone = object_is_gone(&mut session.connection, oid).await;
+    if gone {
+        return Err(format!(
+            "Cannot re-arm {id}: it is scoped to @0x{oid:x}, and the debuggee has collected that object. \
+             While {id} was armed the InstanceOnly modifier pinned it (ADR-0027); disabling {id} released \
+             that pin, and the application has since dropped its own last reference. Re-arming would give \
+             you a stop point that lists itself as armed and can never fire — silence that reads as the \
+             code never running. Take a fresh handle from debug.list_instances and arm a new stop point, \
+             or clear this one and re-arm it unscoped."
+        ));
+    }
+    Ok(())
+}
+
+/// The `Instance filter: @0x…` line an arm reply carries, including what the filter COSTS the debuggee.
+///
+/// **An armed `InstanceOnly` modifier pins its object**, which is the opposite of what a JDWP object id
+/// normally implies and is why this is stated in every arm reply rather than left to the ADR. Measured on
+/// Temurin 17/21/25 (FILT-9, ADR-0027), five arms against one probe that drops an instance on cue:
+///
+/// | armed | object collected after the drop |
+/// |---|---|
+/// | nothing | yes |
+/// | a breakpoint on the same method, unfiltered | yes |
+/// | the same breakpoint **with `instance_id`** | **no** |
+/// | filtered, then disabled | yes |
+/// | filtered, then cleared | yes |
+///
+/// So the modifier — not the stop point, not the handle — is the strong reference, and clearing or
+/// disabling the request releases it. On a shared JVM that makes a scoped stop point a retention of the
+/// object's whole reachable graph for as long as it is armed, which is a cost the caller is entitled to
+/// know about at the moment they pay it (ADR-0010's precedent: report the cost, do not refuse the tool).
+///
+/// The consolation is that it removes the hazard `CONTEXT.md` warns about for the *other* filter: while
+/// armed, this one cannot silently stop matching, because the debuggee cannot collect what it is holding.
+/// That hazard moves to the disable/re-arm cycle, where `debug.list_stop_points` reports it.
+fn instance_filter_line(instance_filter: Option<u64>, what_it_narrows: &str) -> String {
+    instance_filter.map_or_else(String::new, |o| {
+        format!(
+            "\n   Instance filter: @0x{o:x} ({what_it_narrows}) — the JVM does this matching, so any other \
+             instance costs no packet and no snapshot at all. NOTE: an armed InstanceOnly modifier PINS \
+             the object, so this stop point keeps @0x{o:x} and everything it references alive until you \
+             clear or disable it (measured; ADR-0027)."
+        )
+    })
+}
+
+/// Whether the debuggee has lost an object, for the purposes of a **filter** that names it (FILT-9).
+///
+/// Two JDWP answers, one meaning. `IsCollected` says so directly; `INVALID_OBJECT` means the id was
+/// collected long enough ago that the mapping went too. `resolve_object_handle` keeps them apart because
+/// a caller reading a value is owed the difference — one is certain and the other is not — but a filter
+/// is equally dead either way, and merging them here is what lets a listing say one thing. Anything else
+/// (an unreachable debuggee, a transport error) is deliberately NOT "gone": guessing there would report a
+/// working filter as broken.
+async fn object_is_gone(conn: &mut jdwp_client::JdwpConnection, oid: u64) -> bool {
+    matches!(
+        conn.is_collected(oid).await,
+        Ok(true) | Err(jdwp_client::JdwpError::JdwpErrorCode(jdwp_client::protocol::ERR_INVALID_OBJECT, _))
+    )
+}
+
+/// The two **filters** a stop point can carry on this side, kept together because they always travel
+/// together and because a listing has to check both (`FilterHealth`). The debuggee applies both, so a
+/// non-match costs nothing at all — see `CONTEXT.md` § **Filter** for why that is the distinction from a
+/// **condition**, and ADR-0027 for the one asymmetry between them: an armed `instance` filter pins its
+/// object, and a `thread` filter does not.
+#[derive(Debug, Clone, Copy, Default)]
+struct StopFilters {
+    thread: Option<u64>,
+    instance: Option<u64>,
+}
+
+/// Refuse `instance_id` on a stop point that has no `this` to match (FILT-9). **Measured inert.**
+///
+/// `what` names the shape (`a static method`, `a static field`) and `where_` names the site, so the
+/// refusal says which of several classes in a batch it is about.
+fn refuse_instance_filter_without_this(what: &str, where_: &str) -> String {
+    format!(
+        "instance_id cannot scope {where_}, because {what} has no `this` for an InstanceOnly modifier to \
+         match. {INERT_RULE}"
+    )
 }
 
 /// The class patterns stepping skips unless the caller says otherwise (STEP-1).
@@ -3385,6 +3670,8 @@ struct WatchSpec<'a> {
     thread_filter: Option<u64>,
     /// The `Count` modifier this watch is armed with (FILT-8); `None` for an ordinary watch.
     hit_count: Option<i32>,
+    /// The object this watch is scoped to (`InstanceOnly`, FILT-9); `None` for an unscoped watch.
+    instance_filter: Option<u64>,
 }
 
 /// Arm one kind of field watch and register it, returning its `watch_<kind>_<n> (<kind>)` id label.
@@ -3399,6 +3686,15 @@ async fn arm_one_field_watch(
     spec: &WatchSpec<'_>,
 ) -> Result<String, String> {
     let (declaring_type, field_id) = spec.arm;
+    // FILT-9: a static field's write has no `this`, and HotSpot accepts the modifier anyway. Refused at
+    // this choke point rather than in the two callers so the named-class path and every row of a
+    // wildcard batch answer the same way.
+    if spec.instance_filter.is_some() && spec.is_static {
+        return Err(refuse_instance_filter_without_this(
+            "a static field",
+            &format!("a watch on {}.{}", spec.class_name, spec.field_name),
+        ));
+    }
     let request_id = session
         .connection
         .set_field_watch_ex(
@@ -3406,8 +3702,7 @@ async fn arm_one_field_watch(
             field_id,
             kind,
             suspend_policy_for(spec.trace),
-            spec.hit_count,
-            spec.thread_filter,
+            jdwp_client::EventFilters { count: spec.hit_count, thread: spec.thread_filter, instance: spec.instance_filter },
         )
         .await
         .map_err(|e| {
@@ -3426,6 +3721,7 @@ async fn arm_one_field_watch(
             enabled: true,
             spent: false,
             hit_count: spec.hit_count,
+            instance_filter: spec.instance_filter,
             hits: 0,
             arm: spec.arm,
             kind,
@@ -3460,6 +3756,7 @@ async fn arm_field_on_named_class(
     class_name: &str,
     arm: &FieldArm<'_>,
     thread_filter: Option<u64>,
+    instance_filter: Option<u64>,
     frames_note: Option<&str>,
 ) -> Result<String, String> {
     // A watchpoint needs a concrete fieldID up front, so — unlike a line breakpoint — it can't be deferred
@@ -3486,6 +3783,7 @@ async fn arm_field_on_named_class(
         trace_max_length: arm.trace_max_length,
         thread_filter,
         hit_count: a.hit_count,
+        instance_filter,
     };
     let mut ids = Vec::with_capacity(arm.kinds.len());
     for kind in arm.kinds {
@@ -3533,8 +3831,16 @@ async fn field_rows_for_pattern(
             skipped_at_cap += 1;
             continue;
         }
-        let row =
-            arm_field_on_one_class(session, a, &fqn, type_id, arm, limits.thread_filter, wildcard).await;
+        let row = arm_field_on_one_class(
+            session,
+            a,
+            &fqn,
+            type_id,
+            arm,
+            StopFilters { thread: limits.thread_filter, instance: limits.instance_filter },
+            wildcard,
+        )
+        .await;
         if matches!(row, BatchRow::Armed(_)) {
             armed += 1;
         }
@@ -3553,7 +3859,7 @@ async fn arm_field_on_one_class(
     fqn: &str,
     type_id: u64,
     arm: &FieldArm<'_>,
-    thread_filter: Option<u64>,
+    filters: StopFilters,
     wildcard: bool,
 ) -> BatchRow {
     let found = find_field_info(&mut session.connection, type_id, arm.field_name, None).await;
@@ -3582,8 +3888,9 @@ async fn arm_field_on_one_class(
         trace_budget: arm.trace_budget,
         trace_frames: arm.trace_frames,
         trace_max_length: arm.trace_max_length,
-        thread_filter,
+        thread_filter: filters.thread,
         hit_count: a.hit_count,
+        instance_filter: filters.instance,
     };
     let mut ids = Vec::with_capacity(arm.kinds.len());
     for kind in arm.kinds {
@@ -3606,6 +3913,7 @@ fn field_batch_trailer(
     a: &crate::args::SetWatchpointArgs,
     trace_budget: Option<u32>,
     thread_filter: Option<u64>,
+    instance_filter: Option<u64>,
     trace_frames: usize,
     frames_note: Option<&str>,
 ) -> String {
@@ -3613,6 +3921,7 @@ fn field_batch_trailer(
     if let Some(t) = thread_filter {
         let _ = write!(trailer, "\n   Thread filter: 0x{t:x} (only touches on this thread)");
     }
+    trailer.push_str(&instance_filter_line(instance_filter, "only touches on this object"));
     trailer.push_str(&describe_hit_count(a.hit_count, a.trace, trace_budget, 1));
     trailer.push_str(&describe_trace_budget(a.trace, trace_budget));
     trailer.push_str(&describe_trace_frames(
@@ -3655,6 +3964,8 @@ fn watch_kinds(a: &crate::args::SetWatchpointArgs) -> Result<Vec<jdwp_client::Wa
 
 /// How every method-exit request in one call is armed — the part that does not vary per pattern.
 struct MethodExitArm {
+    /// The object this request is scoped to (`InstanceOnly`, FILT-9); `None` for an unscoped request.
+    instance_filter: Option<u64>,
     with_return_value: bool,
     thread_filter: Option<u64>,
     trace_budget: Option<u32>,
@@ -3677,9 +3988,12 @@ async fn arm_one_method_exit(
             class_pattern,
             arm.with_return_value,
             suspend_policy_for(a.trace),
-            a.hit_count,
-            arm.thread_filter,
             a.exclude_classes.as_deref().unwrap_or(&[]),
+            jdwp_client::EventFilters {
+                count: a.hit_count,
+                thread: arm.thread_filter,
+                instance: arm.instance_filter,
+            },
         )
         .await
         .map_err(|e| format!("Failed to set method-exit request on '{class_pattern}': {e}"))?;
@@ -3693,6 +4007,7 @@ async fn arm_one_method_exit(
             enabled: true,
             spent: false,
             hit_count: a.hit_count,
+            instance_filter: arm.instance_filter,
             hits: 0,
             class_pattern: class_pattern.to_string(),
             exclude_classes: a.exclude_classes.clone().unwrap_or_default(),
@@ -3783,6 +4098,7 @@ struct ExceptionStopReply<'a> {
     trace_frames: usize,
     frames_note: Option<&'a str>,
     thread_filter: Option<u64>,
+    instance_filter: Option<u64>,
 }
 
 /// The `debug.set_exception_stop` reply: which throws it selected, under which id, and what it costs.
@@ -3812,6 +4128,7 @@ fn render_exception_stop_reply(
     if let Some(t) = r.thread_filter {
         let _ = write!(extra, "\n   Thread filter: 0x{t:x} (only throws on this thread)");
     }
+    extra.push_str(&instance_filter_line(r.instance_filter, "only throws from this object"));
     extra.push_str(&describe_hit_count(a.hit_count, a.trace, trace_budget_for(a.trace, a.trace_max_hits), 1));
     extra.push_str(&describe_trace_budget(a.trace, trace_budget_for(a.trace, a.trace_max_hits)));
     extra.push_str(&describe_trace_frames(
@@ -3933,7 +4250,7 @@ async fn arm_one_exception(
     a: &crate::args::SetExceptionBreakpointArgs,
     ref_type: Option<u64>,
     class_pattern: &str,
-    thread_filter: Option<u64>,
+    filters: StopFilters,
     trace_frames: usize,
     trace_max_length: Option<usize>,
 ) -> Result<String, String> {
@@ -3944,8 +4261,11 @@ async fn arm_one_exception(
             a.caught,
             a.uncaught,
             suspend_policy_for(a.trace),
-            a.hit_count,
-            thread_filter,
+            jdwp_client::EventFilters {
+                count: a.hit_count,
+                thread: filters.thread,
+                instance: filters.instance,
+            },
         )
         .await
         .map_err(|e| format!("Failed to set exception breakpoint: {e}"))?;
@@ -3959,6 +4279,7 @@ async fn arm_one_exception(
             enabled: true,
             spent: false,
             hit_count: a.hit_count,
+            instance_filter: filters.instance,
             hits: 0,
             ref_type,
             class_pattern: class_pattern.to_string(),
@@ -3970,7 +4291,7 @@ async fn arm_one_exception(
             trace_frames,
             trace_max_length,
             trace_cost: crate::session::TraceCost::default(),
-            thread_filter,
+            thread_filter: filters.thread,
         },
     );
     Ok(exc_id)
@@ -3978,6 +4299,8 @@ async fn arm_one_exception(
 
 /// The parts of a batched arming call that are the same for every pattern in it (FILT-4).
 struct BatchLimits {
+    /// The object every member of this batch is scoped to (`InstanceOnly`, FILT-9), if any.
+    instance_filter: Option<u64>,
     max_classes: usize,
     thread_filter: Option<u64>,
     trace_frames: usize,
@@ -4023,7 +4346,7 @@ async fn exception_rows_for_pattern(
             a,
             Some(tid),
             &fqn,
-            limits.thread_filter,
+            StopFilters { thread: limits.thread_filter, instance: limits.instance_filter },
             limits.trace_frames,
             limits.trace_max_length,
         )
@@ -4043,6 +4366,7 @@ async fn exception_rows_for_pattern(
 fn exception_batch_trailer(
     a: &crate::args::SetExceptionBreakpointArgs,
     thread_filter: Option<u64>,
+    instance_filter: Option<u64>,
     trace_frames: usize,
     frames_note: Option<&str>,
 ) -> String {
@@ -4050,6 +4374,7 @@ fn exception_batch_trailer(
     if let Some(t) = thread_filter {
         let _ = write!(trailer, "\n   Thread filter: 0x{t:x} (only throws on this thread)");
     }
+    trailer.push_str(&instance_filter_line(instance_filter, "only throws from this object"));
     trailer.push_str(&describe_hit_count(
         a.hit_count,
         a.trace,
@@ -4093,6 +4418,7 @@ fn render_field_stop_reply(
     if let Some(t) = spec.thread_filter {
         let _ = write!(extra, "\n   Thread filter: 0x{t:x} (only touches on this thread)");
     }
+    extra.push_str(&instance_filter_line(spec.instance_filter, "only touches on this object"));
     extra.push_str(&describe_hit_count(a.hit_count, a.trace, spec.trace_budget, 1));
     extra.push_str(&describe_trace_budget(a.trace, spec.trace_budget));
     extra.push_str(&describe_trace_frames(
@@ -4378,7 +4704,7 @@ fn render_breakpoint_line(
     output: &mut String,
     bp_id: &str,
     bp: &crate::session::BreakpointInfo,
-    dead: &std::collections::BTreeSet<u64>,
+    dead: &FilterHealth,
 ) {
     let _ = writeln!(
         output,
@@ -4392,7 +4718,7 @@ fn render_breakpoint_line(
         trace_frames_tag(bp.trace, bp.trace_frames),
         stop_point_state_suffix(bp.enabled, bp.spent),
     );
-    let tag = dead_filter_tag(bp.arm.thread_filter, dead);
+    let tag = dead_filter_tag(bp.arm.thread_filter, bp.arm.instance_filter, dead);
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
@@ -4428,6 +4754,9 @@ fn render_breakpoint_line(
     if let Some(t) = bp.arm.thread_filter {
         let _ = writeln!(output, "     Thread filter: 0x{t:x}");
     }
+    if let Some(o) = bp.arm.instance_filter {
+        let _ = writeln!(output, "     Instance filter: @0x{o:x}");
+    }
     if let Some(c) = &bp.condition {
         let _ = writeln!(output, "     Condition: {c}");
     }
@@ -4444,11 +4773,7 @@ fn render_breakpoint_line(
 }
 
 /// Format one deferred (class-prepare) breakpoint into the `debug.list_stop_points` output.
-fn render_pending_line(
-    output: &mut String,
-    pb: &crate::session::PendingBreakpoint,
-    dead: &std::collections::BTreeSet<u64>,
-) {
+fn render_pending_line(output: &mut String, pb: &crate::session::PendingBreakpoint, dead: &FilterHealth) {
     let where_ = match (pb.line, &pb.method) {
         (Some(l), _) => format!("line {l}"),
         (None, Some(m)) => format!("method {m}"),
@@ -4460,7 +4785,7 @@ fn render_pending_line(
         pb.bp_id,
         pb.class_pattern,
         where_,
-        dead_filter_tag(pb.thread_filter, dead)
+        dead_filter_tag(pb.thread_filter, pb.instance_filter, dead)
     );
 }
 
@@ -4474,11 +4799,7 @@ fn render_pending_line(
 /// somewhere different (FILT-5): parked comes back on its own when a member is cleared, disabled comes back
 /// when the family is re-armed, failed never comes back. One shared "not watching" would answer "will this
 /// catch the class my next deployment generates?" wrongly in two of the three cases.
-fn render_pattern_set_line(
-    output: &mut String,
-    set: &crate::session::PatternStopSet,
-    dead: &std::collections::BTreeSet<u64>,
-) {
+fn render_pattern_set_line(output: &mut String, set: &crate::session::PatternStopSet, dead: &FilterHealth) {
     use crate::session::ClassLoadWatch;
     let _ = writeln!(
         output,
@@ -4496,7 +4817,7 @@ fn render_pattern_set_line(
         },
         if set.enabled { "" } else { " — DISABLED (definition kept; toggle to re-arm)" },
     );
-    let tag = dead_filter_tag(set.thread_filter, dead);
+    let tag = dead_filter_tag(set.thread_filter, set.instance_filter, dead);
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
@@ -4505,6 +4826,9 @@ fn render_pattern_set_line(
     }
     if let Some(t) = set.thread_filter {
         let _ = writeln!(output, "     Thread filter: 0x{t:x}");
+    }
+    if let Some(o) = set.instance_filter {
+        let _ = writeln!(output, "     Instance filter: @0x{o:x}");
     }
     if let Some(c) = &set.condition {
         let _ = writeln!(output, "     Condition: {c}");
@@ -4562,11 +4886,7 @@ fn render_pattern_set_line(
 ///
 /// Families come after the individual breakpoints deliberately: their members ARE some of those `bp_` lines,
 /// and the family line is what explains why one call produced nine of them — and what to clear to undo it.
-fn render_every_stop_point(
-    output: &mut String,
-    session: &crate::session::DebugSession,
-    dead: &std::collections::BTreeSet<u64>,
-) {
+fn render_every_stop_point(output: &mut String, session: &crate::session::DebugSession, dead: &FilterHealth) {
     for (bp_id, bp) in &session.breakpoints {
         render_breakpoint_line(output, bp_id, bp, dead);
     }
@@ -4591,7 +4911,7 @@ fn render_every_stop_point(
 fn render_exception_line(
     output: &mut String,
     er: &crate::session::ExceptionRequestInfo,
-    dead: &std::collections::BTreeSet<u64>,
+    dead: &FilterHealth,
 ) {
     let which = match (er.caught, er.uncaught) {
         (true, true) => "caught+uncaught",
@@ -4611,7 +4931,10 @@ fn render_exception_line(
         er.thread_filter.map_or_else(String::new, |t| format!(" thread=0x{t:x}")),
         stop_point_state_suffix(er.enabled, er.spent),
     );
-    let tag = dead_filter_tag(er.thread_filter, dead);
+    if let Some(o) = er.instance_filter {
+        let _ = writeln!(output, "     Instance filter: @0x{o:x}");
+    }
+    let tag = dead_filter_tag(er.thread_filter, er.instance_filter, dead);
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
@@ -5053,7 +5376,7 @@ fn render_watchpoint_line(
     output: &mut String,
     watch_id: &str,
     wp: &crate::session::WatchpointInfo,
-    dead: &std::collections::BTreeSet<u64>,
+    dead: &FilterHealth,
 ) {
     let _ = writeln!(
         output,
@@ -5073,7 +5396,10 @@ fn render_watchpoint_line(
     if let Some(n) = wp.trace_budget {
         let _ = writeln!(output, "     Trace budget: {n} hit(s) left");
     }
-    let tag = dead_filter_tag(wp.thread_filter, dead);
+    if let Some(o) = wp.instance_filter {
+        let _ = writeln!(output, "     Instance filter: @0x{o:x}");
+    }
+    let tag = dead_filter_tag(wp.thread_filter, wp.instance_filter, dead);
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
@@ -5089,7 +5415,7 @@ fn render_watchpoint_line(
 fn render_method_exit_line(
     output: &mut String,
     me: &crate::session::MethodExitRequestInfo,
-    dead: &std::collections::BTreeSet<u64>,
+    dead: &FilterHealth,
 ) {
     let _ = writeln!(
         output,
@@ -5110,7 +5436,7 @@ fn render_method_exit_line(
     if let Some(e) = &me.trace_expr {
         let _ = writeln!(output, "     Trace expr: {e}");
     }
-    let tag = dead_filter_tag(me.thread_filter, dead);
+    let tag = dead_filter_tag(me.thread_filter, me.instance_filter, dead);
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
@@ -7847,8 +8173,11 @@ async fn try_arm_deferred_breakpoints(
                         method.method_id,
                         index,
                         sp,
-                        pend.hit_count,
-                        pend.thread_filter,
+                        jdwp_client::EventFilters {
+                            count: pend.hit_count,
+                            thread: pend.thread_filter,
+                            instance: pend.instance_filter,
+                        },
                     )
                     .await
                 {
@@ -7871,6 +8200,7 @@ async fn try_arm_deferred_breakpoints(
                             suspend_policy: sp,
                             hit_count: pend.hit_count,
                             thread_filter: pend.thread_filter,
+                            instance_filter: pend.instance_filter,
                         };
                         let extra_copies = arm_extra_line_copies(session, &arm).await;
                         arm.extra_locations = extra_copies.armed;
@@ -8123,6 +8453,7 @@ fn spec_from_pattern_set(set: &crate::session::PatternStopSet, fqn: &str, signat
         method_hint: set.method.clone(),
         hit_count: set.hit_count,
         thread_filter: set.thread_filter,
+        instance_filter: set.instance_filter,
         condition: set.condition.clone(),
         trace: set.trace,
         trace_expr: set.trace_expr.clone(),
@@ -8247,6 +8578,22 @@ async fn thread_is_alive(conn: &mut jdwp_client::JdwpConnection, tid: u64) -> bo
     matches!(conn.get_thread_status(tid).await, Ok((status, _)) if status != THREAD_STATUS_ZOMBIE)
 }
 
+/// Whether a `ThreadOnly` thread has died or an `InstanceOnly` object has been collected, for every
+/// stop point in the session (FILT-2 and FILT-9).
+///
+/// Two hazards, one struct, because they are the same fact about a **filter** from the caller's side:
+/// *this stop point can never fire again, and it still lists itself as armed*. `CONTEXT.md` keeps the
+/// words apart — a thread is **gone**, an object has **vanished** — and they reach us through different
+/// commands, so they are collected separately and reported separately. What they share is the failure
+/// direction, which is the one no caller checks for: silence that reads as "the bug didn't reproduce".
+#[derive(Default)]
+struct FilterHealth {
+    /// `ThreadOnly` ids whose thread is gone.
+    dead_threads: std::collections::BTreeSet<u64>,
+    /// `InstanceOnly` ids whose object the debuggee has collected.
+    vanished_objects: std::collections::BTreeSet<u64>,
+}
+
 /// The `ThreadOnly` filter threads that have died, across every kind of stop point (FILT-2).
 ///
 /// Checked once per **distinct** thread rather than once per stop point, since several stop points are
@@ -8255,7 +8602,7 @@ async fn thread_is_alive(conn: &mut jdwp_client::JdwpConnection, tid: u64) -> bo
 /// This exists because a filter pinned to a dead thread can never match again: the stop point reports
 /// nothing and, before this, still listed itself as armed. On a pool that reaps idle workers — which is
 /// exactly where FILT-1 recommends the filter — that silence read as "the bug didn't reproduce".
-async fn dead_filter_threads(session: &mut crate::session::DebugSession) -> std::collections::BTreeSet<u64> {
+async fn dead_filter_threads(session: &mut crate::session::DebugSession) -> FilterHealth {
     let mut filters: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     filters.extend(session.breakpoints.values().filter_map(|b| b.arm.thread_filter));
     filters.extend(session.exception_requests.values().filter_map(|e| e.thread_filter));
@@ -8264,26 +8611,70 @@ async fn dead_filter_threads(session: &mut crate::session::DebugSession) -> std:
     filters.extend(session.pending_breakpoints.iter().filter_map(|p| p.thread_filter));
     filters.extend(session.pattern_sets.values().filter_map(|s| s.thread_filter));
 
-    let mut dead = std::collections::BTreeSet::new();
+    let mut health = FilterHealth::default();
     for tid in filters {
         if !thread_is_alive(&mut session.connection, tid).await {
-            dead.insert(tid);
+            health.dead_threads.insert(tid);
         }
     }
-    dead
+
+    // The `InstanceOnly` half (FILT-9). Distinct ids only, same as the threads: an object id is a WEAK
+    // reference (ADR-0022), so the filter simply stops matching when the debuggee collects it and the
+    // stop point goes quiet without a word. `IsCollected` is asked rather than inferred from a failed
+    // read, for the reason `resolve_object_handle` gives — every other command answers INVALID_OBJECT
+    // for a collected object AND for a typo.
+    let mut objects: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    objects.extend(session.breakpoints.values().filter_map(|b| b.arm.instance_filter));
+    objects.extend(session.exception_requests.values().filter_map(|e| e.instance_filter));
+    objects.extend(session.watchpoints.values().filter_map(|w| w.instance_filter));
+    objects.extend(session.method_exits.values().filter_map(|m| m.instance_filter));
+    objects.extend(session.pending_breakpoints.iter().filter_map(|p| p.instance_filter));
+    objects.extend(session.pattern_sets.values().filter_map(|s| s.instance_filter));
+    for oid in objects {
+        // Both readings mean the same thing here: collected, or so long collected the JVM dropped the
+        // mapping. Unlike `resolve_object_handle`, a listing has no use for the distinction — the filter
+        // is dead either way — so an unreachable debuggee is the only case left alone.
+        if object_is_gone(&mut session.connection, oid).await {
+            health.vanished_objects.insert(oid);
+        }
+    }
+    health
 }
 
-/// The ` ⚠️ FILTER THREAD 0x… IS GONE` marker for a stop point whose `ThreadOnly` thread has died.
+/// The ` ⚠️ FILTER … IS GONE` marker for a stop point whose filter can no longer match anything.
 ///
 /// Deliberately loud, and deliberately replaces nothing else on the line: the point is that a caller
-/// scanning a listing for "is this working?" cannot miss it.
-fn dead_filter_tag(thread_filter: Option<u64>, dead: &std::collections::BTreeSet<u64>) -> String {
-    match thread_filter {
-        Some(t) if dead.contains(&t) => format!(
-            " ⚠️  FILTER THREAD 0x{t:x} IS GONE — this can never fire again; re-arm with a live thread_id"
-        ),
-        _ => String::new(),
+/// scanning a listing for "is this working?" cannot miss it. Both hazards get the same treatment because
+/// the caller-visible consequence is identical — an armed stop point that reports nothing, forever.
+///
+/// Both are shown when both apply. Picking one would make the listing's silence about the other exactly
+/// the failure this tag exists to remove.
+fn dead_filter_tag(
+    thread_filter: Option<u64>,
+    instance_filter: Option<u64>,
+    health: &FilterHealth,
+) -> String {
+    let mut tag = String::new();
+    if let Some(t) = thread_filter {
+        if health.dead_threads.contains(&t) {
+            let _ = write!(
+                tag,
+                " ⚠️  FILTER THREAD 0x{t:x} IS GONE — this can never fire again; re-arm with a live thread_id"
+            );
+        }
     }
+    if let Some(o) = instance_filter {
+        if health.vanished_objects.contains(&o) {
+            let _ = write!(
+                tag,
+                " ⚠️  FILTER OBJECT @0x{o:x} HAS VANISHED — the debuggee collected it, so this can never \
+                 fire again and its silence does NOT mean the code did not run. A JDWP object id is a \
+                 WEAK reference and nothing here pins it (ADR-0022); take a fresh handle from \
+                 debug.list_instances and re-arm"
+            );
+        }
+    }
+    tag
 }
 
 /// Whether a hit's location is in the method a request was narrowed to (METH-1).
@@ -8669,9 +9060,12 @@ async fn rearm_method_exit(
             &me.class_pattern,
             me.with_return_value,
             suspend_policy_for(me.trace),
-            me.hit_count,
-            me.thread_filter,
             &me.exclude_classes,
+            jdwp_client::EventFilters {
+                count: me.hit_count,
+                thread: me.thread_filter,
+                instance: me.instance_filter,
+            },
         )
         .await
         .map_err(|e| format!("Failed to re-arm method-exit request: {e}"))?;
@@ -8721,8 +9115,11 @@ async fn rearm_line_breakpoint(
             arm.method_id,
             arm.bytecode_index,
             arm.suspend_policy,
-            arm.hit_count,
-            arm.thread_filter,
+            jdwp_client::EventFilters {
+                count: arm.hit_count,
+                thread: arm.thread_filter,
+                instance: arm.instance_filter,
+            },
         )
         .await
         .map_err(|e| format!("Failed to re-arm breakpoint: {e}"))?;
@@ -8772,8 +9169,11 @@ async fn rearm_exception_request(
             er.caught,
             er.uncaught,
             suspend_policy_for(er.trace),
-            er.hit_count,
-            er.thread_filter,
+            jdwp_client::EventFilters {
+                count: er.hit_count,
+                thread: er.thread_filter,
+                instance: er.instance_filter,
+            },
         )
         .await
         .map_err(|e| format!("Failed to re-arm exception breakpoint: {e}"))?;
@@ -8816,8 +9216,11 @@ async fn rearm_watchpoint(
             field.field_id,
             wp.kind,
             suspend_policy_for(wp.trace),
-            wp.hit_count,
-            wp.thread_filter,
+            jdwp_client::EventFilters {
+                count: wp.hit_count,
+                thread: wp.thread_filter,
+                instance: wp.instance_filter,
+            },
         )
         .await
         .map_err(|e| format!("Failed to re-arm watchpoint: {e}"))?;
@@ -10029,6 +10432,8 @@ async fn rescue_overdue_thread_suspends(s: &mut crate::session::DebugSession, se
 /// [`for_pattern`](BreakpointSpec::for_pattern): each member carries one concrete class, which is why a
 /// member's stop point reads `com.example.OrderRepo:88` rather than the pattern it came from.
 struct BreakpointSpec {
+    /// The object this stop point is scoped to (`InstanceOnly`, FILT-9); `None` for an unscoped one.
+    instance_filter: Option<u64>,
     class_pattern: String,
     signature: String,
     line_opt: Option<i32>,
@@ -10058,6 +10463,7 @@ impl BreakpointSpec {
             method_hint: self.method_hint.clone(),
             hit_count: self.hit_count,
             thread_filter: self.thread_filter,
+            instance_filter: self.instance_filter,
             condition: self.condition.clone(),
             trace: self.trace,
             trace_expr: self.trace_expr.clone(),
@@ -10205,8 +10611,11 @@ async fn arm_extra_line_copies(
                 loc.method_id,
                 loc.bytecode_index,
                 arm.suspend_policy,
-                arm.hit_count,
-                arm.thread_filter,
+                jdwp_client::EventFilters {
+                    count: arm.hit_count,
+                    thread: arm.thread_filter,
+                    instance: arm.instance_filter,
+                },
             )
             .await
         {
@@ -10297,6 +10706,16 @@ async fn arm_and_insert(
     .map_err(|e| ArmError::from_location(&e, &spec.class_pattern))?;
     let (method, index, extra, line, jvm_lines) =
         (loc.method, loc.code_index, loc.extra_code_indices, loc.line, loc.lines);
+    // FILT-9: a static method has no `this`, and HotSpot accepts the modifier anyway rather than saying
+    // so. Checked here because this is the first point at which the method — and therefore its
+    // ACC_STATIC bit — is known; `debug.set_line_stop` takes a line or a method name, neither of which
+    // tells us before the class is resolved.
+    if spec.instance_filter.is_some() && (method.mod_bits & ACC_STATIC) != 0 {
+        return Err(ArmError::Other(refuse_instance_filter_without_this(
+            "a static method",
+            &format!("a line stop in {}.{}", spec.class_pattern, method.name),
+        )));
+    }
     let request_id = session
         .connection
         .set_breakpoint_ex(
@@ -10304,8 +10723,11 @@ async fn arm_and_insert(
             method.method_id,
             index,
             spec.suspend_policy,
-            spec.hit_count,
-            spec.thread_filter,
+            jdwp_client::EventFilters {
+                count: spec.hit_count,
+                thread: spec.thread_filter,
+                instance: spec.instance_filter,
+            },
         )
         .await
         .map_err(|e| ArmError::Other(format!("Failed to set breakpoint: {e}")))?;
@@ -10327,6 +10749,7 @@ async fn arm_and_insert(
         suspend_policy: spec.suspend_policy,
         hit_count: spec.hit_count,
         thread_filter: spec.thread_filter,
+        instance_filter: spec.instance_filter,
     };
     let extra_copies = arm_extra_line_copies(session, &arm).await;
     arm.extra_locations = extra_copies.armed;
@@ -10413,6 +10836,18 @@ async fn defer_breakpoint(
     spec: &BreakpointSpec,
     bp_id: String,
 ) -> Result<DeferResult, String> {
+    // FILT-9: there is no honest way to defer this one. The static-method check needs the resolved
+    // method, which does not exist yet — and it could not be reported to anyone if it failed later,
+    // since arming happens on the event pump with no reply to carry a reason. Refusing costs nothing
+    // real: `InstanceOnly` matches the event's `this`, so the filter object would have to be an instance
+    // of the class the stop point is in (or a subclass, which cannot load first), and an unloaded class
+    // has none. A handle that parses here is therefore pointing at something else.
+    if spec.instance_filter.is_some() {
+        return Err(format!(
+            "instance_id cannot be used on a stop point for '{}', which is not loaded yet. An              InstanceOnly filter matches the hit's `this`, so the object would have to be an instance of              that class — and a class the JVM has not loaded has none, so the handle you passed belongs              to something else. Arm the stop point without it, then re-arm with instance_id once the              class has loaded and debug.list_instances can give you a handle that means what you want.",
+            spec.class_pattern,
+        ));
+    }
     let cp_req = session
         .connection
         .set_class_prepare(&spec.class_pattern, jdwp_client::SuspendPolicy::EventThread)
@@ -10437,6 +10872,7 @@ async fn defer_breakpoint(
         method: spec.method_hint.clone(),
         hit_count: spec.hit_count,
         thread_filter: spec.thread_filter,
+        instance_filter: spec.instance_filter,
         condition: spec.condition.clone(),
         trace: spec.trace,
         trace_expr: spec.trace_expr.clone(),
@@ -10935,6 +11371,7 @@ async fn arm_pattern_family(
             method: spec.method_hint.clone(),
             hit_count: spec.hit_count,
             thread_filter: spec.thread_filter,
+            instance_filter: spec.instance_filter,
             condition: spec.condition.clone(),
             trace: spec.trace,
             trace_expr: spec.trace_expr.clone(),
@@ -11067,6 +11504,7 @@ async fn arm_single_named(
     if let Some(t) = spec.thread_filter {
         let _ = write!(extra, "\n   Thread filter: 0x{t:x}");
     }
+    extra.push_str(&instance_filter_line(spec.instance_filter, "only hits where `this` is that object"));
     if let Some(c) = &spec.condition {
         let _ = write!(extra, "\n   Condition: {c}");
     }
@@ -11263,6 +11701,7 @@ fn describe_shared_arming_settings(base: &BreakpointSpec, frames_note: Option<&s
     if let Some(t) = base.thread_filter {
         let _ = write!(extra, "\n   Thread filter: 0x{t:x}");
     }
+    extra.push_str(&instance_filter_line(base.instance_filter, "only hits where `this` is that object"));
     if let Some(c) = &base.condition {
         let _ = write!(extra, "\n   Condition: {c}");
     }
@@ -17657,6 +18096,7 @@ mod tests {
             method: Some("handle".to_string()),
             hit_count: None,
             thread_filter: None,
+            instance_filter: None,
             condition: None,
             trace: true,
             trace_expr: None,
@@ -17668,7 +18108,7 @@ mod tests {
             no_method: 6,
         };
         let mut out = String::new();
-        render_pattern_set_line(&mut out, &set, &std::collections::BTreeSet::new());
+        render_pattern_set_line(&mut out, &set, &FilterHealth::default());
         assert!(out.contains("[bpset_1]"), "addressable: {out}");
         assert!(out.contains("family of 2 breakpoint(s)"), "{out}");
         assert!(out.contains("Members: bp_2, bp_3"), "the members can be cleared individually: {out}");
@@ -17685,7 +18125,7 @@ mod tests {
         set.skipped_at_cap = 4;
         set.watch = ClassLoadWatch::Parked;
         let mut full = String::new();
-        render_pattern_set_line(&mut full, &set, &std::collections::BTreeSet::new());
+        render_pattern_set_line(&mut full, &set, &FilterHealth::default());
         assert!(full.contains("FULL at max_classes: 2"), "a full family says it is full: {full}");
         assert!(full.contains("4 matching class(es) were not armed"), "{full}");
         assert!(full.contains("not watching while it is full"), "the header points at the reason: {full}");
@@ -17696,7 +18136,7 @@ mod tests {
         // say neither, because the whole block hung off the skip count.
         set.skipped_at_cap = 0;
         let mut exact = String::new();
-        render_pattern_set_line(&mut exact, &set, &std::collections::BTreeSet::new());
+        render_pattern_set_line(&mut exact, &set, &FilterHealth::default());
         assert!(exact.contains("FULL at max_classes: 2"), "{exact}");
         assert!(!exact.contains("class(es) were not armed"), "nothing was refused, so say nothing: {exact}");
         assert!(exact.contains("watch is parked"), "{exact}");
@@ -17705,7 +18145,7 @@ mod tests {
         set.enabled = false;
         set.watch = ClassLoadWatch::Disabled;
         let mut off = String::new();
-        render_pattern_set_line(&mut off, &set, &std::collections::BTreeSet::new());
+        render_pattern_set_line(&mut off, &set, &FilterHealth::default());
         assert!(off.contains("not watching (disabled)"), "{off}");
         assert!(off.contains("DISABLED"), "{off}");
         assert!(!off.contains("watch is parked"), "disabled is not parked — it will not unpark: {off}");
@@ -17715,7 +18155,7 @@ mod tests {
         set.enabled = true;
         set.watch = ClassLoadWatch::Failed;
         let mut broken = String::new();
-        render_pattern_set_line(&mut broken, &set, &std::collections::BTreeSet::new());
+        render_pattern_set_line(&mut broken, &set, &FilterHealth::default());
         assert!(broken.contains("NOT watching for new classes"), "{broken}");
         assert!(
             broken.contains("could not be registered"),

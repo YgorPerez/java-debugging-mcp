@@ -10870,3 +10870,319 @@ fn an_object_handle_outlives_its_snapshot_and_reports_when_it_has_not() {
 
     server.panic_reset();
 }
+
+/// Pull the `@0x…` handle for one named `InstProbe` instance out of a `debug.list_instances` reply.
+///
+/// By identity rather than by position: the two ids come back in whichever order the heap walk found
+/// them, and which one is `X` differs between JDKs — measured, 17 answers `@0x3` and 21 answers `@0x4`
+/// for the same source. A test that indexed the list would pass on one and fail on the other.
+fn inst_probe_handle(server: &mut Server, listed: &str, want: &str) -> String {
+    let handles: Vec<String> = listed
+        .lines()
+        .filter(|l| l.starts_with("  ") && l.contains("InstProbe @0x"))
+        .filter_map(|l| l.split_whitespace().find(|w| w.starts_with("@0x")))
+        .map(str::to_string)
+        .collect();
+    assert!(handles.len() >= 2, "expected two live InstProbe instances, got {handles:?} in:\n{listed}");
+    for h in &handles {
+        if server.evaluate(&format!("{h}.name")).contains(&format!("\"{want}\"")) {
+            return h.clone();
+        }
+    }
+    panic!("no InstProbe instance named {want} among {handles:?}");
+}
+
+/// FILT-9 (#101): a stop point can be scoped to ONE object, and every shape where that silently would
+/// not work is refused rather than armed.
+///
+/// The refusals are the substance here, not the feature. `InstanceOnly` is a **filter** the debuggee
+/// applies (`CONTEXT.md`), and `HotSpot` accepts the modifier on three shapes where it then ignores it —
+/// no error, no warning, and a reply saying the stop point is scoped when it fires for every instance.
+/// `CONTEXT.md` calls that state **inert**, and the rule it yields is *acceptance is not application*.
+/// So this test asserts the negative space: what the tool refuses, and that it names why.
+///
+/// The positive half is measured against a **twin**. Both instances do the same work in the same loop,
+/// so "the filter worked" can only be established by the twin's records being absent — not by the
+/// filtered instance's being present, which an unfiltered stop point would also produce. That is what
+/// caught the method-exit case: it looked correct until someone asked what the other object was doing.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+#[allow(clippy::too_many_lines)]
+fn a_stop_point_scoped_to_one_object_ignores_its_twin_and_refuses_where_it_could_not() {
+    let Some(jdk) =
+        jdk_or_skip("a_stop_point_scoped_to_one_object_ignores_its_twin_and_refuses_where_it_could_not")
+    else {
+        return;
+    };
+    let probe =
+        Probe::launch_running(&jdk, "InstProbe", |l| l.starts_with("ready")).expect("launch InstProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // `Boom` has to be loaded before an exception request can pin a ref type to it, and both instances
+    // have to have run for the twin comparison to mean anything.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("work Y 2"))
+        .unwrap_or_else(|| panic!("the probe never worked twice\n  output: {:?}", probe.output()));
+
+    let listed = server
+        .call("debug.list_instances", serde_json::json!({"class_names": ["InstProbe"], "max_instances": 5}));
+    let x = inst_probe_handle(&mut server, &listed, "X");
+    let y = inst_probe_handle(&mut server, &listed, "Y");
+    assert_ne!(x, y, "the two instances must be distinct objects");
+
+    // 1. A line stop in an INSTANCE method, scoped to X. The reply says so, and the records agree.
+    let set = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "InstProbe", "method": "work", "trace": true, "instance_id": x,
+        }),
+    );
+    assert_contains_all(
+        "a scoped line stop says what it is scoped to",
+        &set,
+        &[&format!("Instance filter: {x}")],
+    );
+
+    // 2. An EXCEPTION stop, scoped to X. This is the combination FILT-9 stopped on: HotSpot accepts the
+    //    modifier on every kind, and this is the only one besides an instance line stop and an instance
+    //    field watch where it is actually applied. Measured on Temurin 17/21/25 before it was allowed.
+    let exc = server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({
+            "class_pattern": "InstProbe$Boom", "trace": true, "instance_id": x,
+        }),
+    );
+    assert_contains_all(
+        "a scoped exception stop says what it is scoped to",
+        &exc,
+        &[&format!("Instance filter: {x}")],
+    );
+
+    // 3. A field watch on an INSTANCE field, scoped to X.
+    let watch = server.call(
+        "debug.set_field_stop",
+        serde_json::json!({
+            "class_name": "InstProbe", "field_name": "touched", "trace": true, "instance_id": x,
+        }),
+    );
+    assert_contains_all(
+        "a scoped field watch says what it is scoped to",
+        &watch,
+        &[&format!("Instance filter: {x}")],
+    );
+
+    // Let all three collect a useful number of hits. Y is doing the identical work throughout.
+    let base = probe.output().len();
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("alive "))
+        .expect("probe stopped ticking under three traced stop points");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(probe.output().len() > base, "the probe must keep running — every stop point here is traced");
+
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    let records: Vec<&str> = traces.lines().filter(|l| l.starts_with('#')).collect();
+    assert!(
+        records.len() >= 3,
+        "expected records from all three stop points, got {}:\n{traces}",
+        records.len()
+    );
+
+    // THE assertion. Not "X appears" — an unfiltered stop point would give that too — but "Y never
+    // does", across every kind at once.
+    // By whole token, not substring: `@0x3` is a prefix of `@0x30`, and the `Boom` object a record
+    // carries landed there — which made a correctly-filtered run report itself as a leak. The first
+    // version of this assertion was wrong in the direction that fails loudly, which is the good
+    // direction, but a `contains` over hex handles is a trap worth naming rather than just fixing.
+    let leaked: Vec<&&str> = records
+        .iter()
+        .filter(|l| l.split(|c: char| !(c.is_ascii_alphanumeric() || c == 'x' || c == '@')).any(|w| w == y))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "a stop point scoped to {x} recorded the twin {y} — the filter was accepted and NOT applied, \
+         which is the inert case this feature exists to refuse.\n  {} leaked record(s):\n{}",
+        leaked.len(),
+        leaked.iter().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n"),
+    );
+    assert!(
+        records.iter().any(|l| l.contains(&x)),
+        "no record names the filtered instance {x} at all, so the run proves nothing:\n{traces}"
+    );
+
+    // 4. The listing carries the filter, so a later reader can tell why a quiet stop point is quiet.
+    let listing = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert_contains_all("the listing repeats the scope", &listing, &[&format!("Instance filter: {x}")]);
+
+    // 5. The refusals, each naming the JDWP fact rather than the argument. A static method and a static
+    //    field have no `this`; a method exit HAS one, which is what makes its silence the worst of the
+    //    three and why the refusal has to be explicit rather than left to look like an oversight.
+    let static_line = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "InstProbe", "method": "stat", "trace": true, "instance_id": x}),
+    );
+    assert_contains_all(
+        "a static method is refused, with the reason",
+        &static_line,
+        &["a static method has no `this`", "ACCEPTS an InstanceOnly modifier here"],
+    );
+
+    let static_field = server.call(
+        "debug.set_field_stop",
+        serde_json::json!({"class_name": "InstProbe", "field_name": "statics", "trace": true, "instance_id": x}),
+    );
+    assert_contains_all(
+        "a static field is refused, with the reason",
+        &static_field,
+        &["a static field has no `this`", "ACCEPTS an InstanceOnly modifier here"],
+    );
+
+    let mexit = server.call(
+        "debug.set_method_exit_stop",
+        serde_json::json!({"class_pattern": "InstProbe", "method": "work", "instance_id": x}),
+    );
+    assert_contains_all(
+        "method exit is refused outright, and says the reply would have looked correct",
+        &mexit,
+        &["not supported on debug.set_method_exit_stop", "records both instances"],
+    );
+
+    let deferred = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "NoSuchClassHere", "line": 1, "instance_id": x}),
+    );
+    assert_contains_all(
+        "an unloaded class is refused, because no instance of it can exist",
+        &deferred,
+        &["not loaded yet", "has none"],
+    );
+
+    // Nothing above armed anything: four refusals, and the three stop points from before.
+    let after = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(
+        !after.contains("InstProbe.stat") && !after.contains("NoSuchClassHere"),
+        "a refusal must not leave a stop point behind:\n{after}"
+    );
+
+    server.panic_reset();
+}
+
+/// FILT-9 (#101): an armed `InstanceOnly` filter PINS its object, and the listing says when it has gone.
+///
+/// Two facts in one run, and the first is the surprise. `CONTEXT.md` warns that a filter naming a
+/// collected object "simply stops matching, which reads as *the code never ran*" — true of a thread
+/// filter, and **false of this one while it is armed**, because `HotSpot` holds the object the modifier
+/// names. Measured five ways on Temurin 17/21/25 (ADR-0027): nothing armed, an unfiltered breakpoint on
+/// the same method, a filtered one, filtered-then-disabled and filtered-then-cleared. Only the filtered
+/// arm survives the drop, so the modifier is the strong reference and clearing or disabling releases it.
+///
+/// That inverts what needs asserting. While armed there is no silent-quiet hazard at all — the debuggee
+/// cannot collect what it is holding — but there IS a retention the caller is paying for on a shared JVM,
+/// so the arm reply has to state it. The hazard moves to the **disable → re-arm** cycle, which is the
+/// whole point of `toggle_stop_point` and which this test therefore drives end to end.
+///
+/// Both halves are asserted against the *same* object in the *same* run, because either alone is
+/// ambiguous: "still live while armed" could just be a slow collector, and "collected after disable"
+/// could just be a drop that finally took. Together they are the pin.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_armed_instance_filter_pins_its_object_and_reports_it_once_that_is_released() {
+    let Some(jdk) =
+        jdk_or_skip("an_armed_instance_filter_pins_its_object_and_reports_it_once_that_is_released")
+    else {
+        return;
+    };
+    let mut probe =
+        Probe::launch_running(&jdk, "InstProbe", |l| l.starts_with("ready")).expect("launch InstProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("work Y 2"))
+        .unwrap_or_else(|| panic!("the probe never worked twice\n  output: {:?}", probe.output()));
+
+    let listed = server
+        .call("debug.list_instances", serde_json::json!({"class_names": ["InstProbe"], "max_instances": 5}));
+    let y = inst_probe_handle(&mut server, &listed, "Y");
+
+    let set = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "InstProbe", "method": "work", "trace": true, "instance_id": y}),
+    );
+    let bp = set
+        .lines()
+        .find_map(|l| l.split_whitespace().find(|w| w.starts_with("bp_")))
+        .unwrap_or_else(|| panic!("no bp_ id in:\n{set}"))
+        .to_string();
+    // The cost is stated where it is incurred, not only in the ADR.
+    assert_contains_all(
+        "the arm reply says the filter pins the object",
+        &set,
+        &["PINS the object", "until you clear or disable it"],
+    );
+
+    // 1. The pin. The probe drops its last reference to Y and runs two collections; the object survives
+    //    them, because the armed modifier is holding it.
+    probe.send_line("drop").expect("send drop cue");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("dropped"))
+        .unwrap_or_else(|| panic!("the probe never dropped Y\n  output: {:?}", probe.output()));
+    let still = server.evaluate(&format!("{y}.name"));
+    assert!(
+        still.contains("\"Y\""),
+        "the probe dropped Y and collected twice, yet an ARMED instance filter must keep it alive — this \
+         is the measured behaviour the arm reply promises the caller. Got: {still}"
+    );
+    let armed_listing = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(
+        !armed_listing.contains("HAS VANISHED"),
+        "nothing has vanished while the filter is armed:\n{armed_listing}"
+    );
+
+    // 2. Disabling releases the pin, and only then can the object go.
+    server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": bp, "enabled": false}));
+    // Ask for another collection, and this is load-bearing rather than belt-and-braces: the two the
+    // probe ran on the `drop` cue happened while the modifier still pinned Y, and nothing collects an
+    // unreachable object that nobody asks about. Skipping this would report "still pinned" for a JVM
+    // that had simply not been asked again — a false negative shaped exactly like the finding.
+    probe.send_line("gc").expect("send gc cue");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.contains("collected"))
+        .unwrap_or_else(|| panic!("the probe never collected again\n  output: {:?}", probe.output()));
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+    let mut listing;
+    loop {
+        listing = server.call("debug.list_stop_points", serde_json::json!({}));
+        if listing.contains("HAS VANISHED") || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert_contains_all(
+        "the listing says the filter can never match again, and why its silence is not `no hits`",
+        &listing,
+        &[
+            &format!("FILTER OBJECT {y} HAS VANISHED"),
+            "does NOT mean the code did not run",
+            "stop point(s) above are scoped to an object the debuggee has since collected",
+        ],
+    );
+
+    // The reader of an empty trace buffer is exactly who needs this, and gets it there too.
+    assert_contains_all(
+        "get_traces says it as well",
+        &server.call("debug.get_traces", serde_json::json!({})),
+        &["scoped to an object the debuggee has collected"],
+    );
+
+    // 3. And the re-arm is refused, rather than producing a stop point that lists as armed and never
+    //    fires. This is the outcome the whole disable/re-arm path was at risk of.
+    let rearm =
+        server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": bp, "enabled": true}));
+    assert_contains_all(
+        "re-arming a filter whose object is gone is refused, with the remedy",
+        &rearm,
+        &["collected that object", "debug.list_instances"],
+    );
+
+    server.panic_reset();
+}

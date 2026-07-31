@@ -312,6 +312,21 @@ has already crossed the wire.
 Two hazards, each with its own term: a filter the debuggee accepts and does not apply is **inert**, and a
 filter naming an object or thread the debuggee has collected simply stops matching, which reads as *the code
 never ran*.
+**The second hazard does not apply to an ARMED `InstanceOnly` filter, and the reason is a third fact about
+filters that is easy to get backwards.** Measured on Temurin 17/21/25 (FILT-9, ADR-0027): an armed
+`InstanceOnly` modifier holds a **strong** reference to its object, so the debuggee cannot collect what the
+filter names. Isolated against four controls — nothing armed, an unfiltered breakpoint on the same method,
+the filtered one, and the filtered one after a disable and after a clear — only the armed filtered case
+survives a drop plus two `System.gc()`s. So the modifier is the reference, and clearing or disabling
+releases it.
+Which trades one hazard for another rather than removing it. While armed, the filter cannot go silently
+quiet — but it is a **retention** in the debuggee, holding the object and everything it reaches for as long
+as the stop point exists, which on **the shared 8180** is a cost the caller is paying and must be told
+about. And the collection hazard is not gone, only displaced: it lands on the **disable → re-arm** cycle,
+where the pin is released, the application drops its own last reference, and a re-arm would produce a stop
+point that lists as armed and can never fire. A `ThreadOnly` filter has no equivalent — a thread is not kept
+alive by being named — which is why the two are checked by different commands and reported in different
+sentences.
 _Avoid_: condition (ours, and paid for per hit), narrowing (vague about which side does it)
 
 **Condition**:
@@ -427,11 +442,16 @@ Its own state in the cluster above, because the failure direction is the opposit
 and **vanished** are the debuggee having removed something we still believe in, while this is the debuggee
 keeping something that was never in effect. So the stop point reports *more* than it should rather than
 less, which is the reading no caller checks for.
-Measured on Temurin 17, `HotSpot` (FILT-9, #101): an `InstanceOnly` filter is accepted and **not applied**
-on a `METHOD_EXIT` request, on a line stop in a `static` method, and on a watch of a `static` field — three
-shapes, all silent. The consequence is a rule rather than a caveat: **acceptance is not application**, so a
-filter must be refused up front where it is known to be inert, since neither the reply nor the JVM will ever
-mention it again.
+Measured on Temurin 17/21/25, `HotSpot` (FILT-9, #101, ADR-0027): an `InstanceOnly` filter is accepted and
+**not applied** on a `METHOD_EXIT` request, on a line stop in a `static` method, and on a watch of a
+`static` field — three shapes, all silent. The consequence is a rule rather than a caveat: **acceptance is
+not application**, so a filter must be refused up front where it is known to be inert, since neither the
+reply nor the JVM will ever mention it again.
+The rule cuts both ways, and the fourth shape is why it has to be measured per kind rather than reasoned
+about. `METHOD_EXIT` has a `this` and is still inert; `EXCEPTION` also has one and **works** — the same
+probe, two instances throwing the same type from the same line, 26 records and every one of them the
+filtered instance. Neither outcome is predictable from the protocol, the capability bit or the presence of
+a `this`, so each kind is one probe run and the table is the answer.
 _Avoid_: unsupported (the debuggee took it — an unsupported modifier is one it *refuses*, which is the
 honest case and needs no word), ignored (true but reads as ours to fix)
 

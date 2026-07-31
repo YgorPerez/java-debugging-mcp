@@ -4,7 +4,7 @@
 use crate::commands::{command_sets, event_commands, event_kinds, step_depths, step_sizes, vm_commands};
 use crate::connection::JdwpConnection;
 use crate::eval::{write_tagged_value, write_untagged_value};
-use crate::eventrequest::SuspendPolicy;
+use crate::eventrequest::{EventFilters, SuspendPolicy};
 use crate::protocol::{CommandPacket, JdwpResult};
 use crate::reader::{read_i32, read_u64, read_u8, read_value_by_tag};
 use crate::types::{FrameId, MethodId, ObjectId, ReferenceTypeId, ThreadId, Value, ValueData};
@@ -20,6 +20,8 @@ const MOD_CLASS_ONLY: u8 = 4;
 const MOD_CLASS_EXCLUDE: u8 = 6;
 const MOD_LOCATION_ONLY: u8 = 7;
 const MOD_STEP: u8 = 10;
+/// `InstanceOnly` (11): restrict the request to hits whose `this` is one specific object (FILT-9).
+const MOD_INSTANCE_ONLY: u8 = 11;
 // ArrayReference command set (13)
 const ARRAY_LENGTH: u8 = 1;
 const ARRAY_GET_VALUES: u8 = 2;
@@ -51,15 +53,17 @@ impl JdwpConnection {
         method_id: MethodId,
         bytecode_index: u64,
         suspend_policy: SuspendPolicy,
-        count: Option<i32>,
-        thread: Option<ThreadId>,
+        filters: EventFilters,
     ) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
         packet.data.put_u8(event_kinds::BREAKPOINT);
         packet.data.put_u8(suspend_policy as u8);
 
-        let n_mods = 1 + i32::from(count.is_some()) + i32::from(thread.is_some());
+        let n_mods = 1
+            + i32::from(filters.count.is_some())
+            + i32::from(filters.thread.is_some())
+            + i32::from(filters.instance.is_some());
         packet.data.put_i32(n_mods);
 
         // LocationOnly
@@ -69,13 +73,17 @@ impl JdwpConnection {
         packet.data.put_u64(method_id);
         packet.data.put_u64(bytecode_index);
 
-        if let Some(c) = count {
+        if let Some(c) = filters.count {
             packet.data.put_u8(MOD_COUNT);
             packet.data.put_i32(c);
         }
-        if let Some(t) = thread {
+        if let Some(t) = filters.thread {
             packet.data.put_u8(MOD_THREAD_ONLY);
             packet.data.put_u64(t);
+        }
+        if let Some(o) = filters.instance {
+            packet.data.put_u8(MOD_INSTANCE_ONLY);
+            packet.data.put_u64(o);
         }
 
         let reply = self.send_command(packet).await?;

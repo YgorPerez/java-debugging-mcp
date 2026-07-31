@@ -75,7 +75,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lt = conn.get_line_table(cp_ref, m.method_id).await?;
     let entry = lt.lines.iter().min_by_key(|e| e.line_code_index).ok_or("no line table")?;
     let bp_req = conn
-        .set_breakpoint_ex(cp_ref, m.method_id, entry.line_code_index, SuspendPolicy::All, None, None)
+        .set_breakpoint_ex(
+            cp_ref,
+            m.method_id,
+            entry.line_code_index,
+            SuspendPolicy::All,
+            jdwp_client::EventFilters::default(),
+        )
         .await?;
     println!("✓ Armed breakpoint at {class}.{method}:{} (request id {bp_req})", entry.line_number);
 

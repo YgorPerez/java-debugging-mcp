@@ -35,6 +35,7 @@ these lazily, when decisions actually get resolved; that point arrived.
 | [0024](0024-per-test-timings-come-from-libtest.md) | Per-test timings come from libtest's `--report-time` — so the runner builds and runs in two steps — and not from cargo-nextest, whose process-per-test scheduling is the one variable that must not move while the flakes are open |
 | [0025](0025-the-suite-is-sharded-two-ways-by-measured-duration.md) | The suite is sharded two ways per JDK, split by *measured* duration rather than by name — and stops at two, because the 70 s slowest test is a floor a third shard cannot get under |
 | [0026](0026-a-spent-stop-point-is-reported-spent-and-clearing-it-sends-nothing.md) | A stop point whose `hit_count` has fired is reported **SPENT** — a third state, because the *debuggee* removed it — and clearing it sends no packet, since JDWP request ids recur and a `Clear` for a deleted id can land on somebody else's |
+| [0027](0027-an-instance-filter-is-offered-only-where-it-was-measured-to-apply.md) | `instance_id` is offered only on the stop-point kinds where `InstanceOnly` was **measured** to apply — HotSpot accepts it on three more and silently ignores it — and the arm reply says that an armed filter *pins* its object |
 
 The downstream consumer's contract is [`docs/toolkit-contract.md`](../toolkit-contract.md) — what shipping
 a change here costs the toolkit that packages it.

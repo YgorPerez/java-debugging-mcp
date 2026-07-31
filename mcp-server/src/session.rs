@@ -718,6 +718,12 @@ pub struct ExceptionRequestInfo {
     pub trace_cost: TraceCost,
     /// Thread this request is filtered to (`ThreadOnly`), if any — for the `list_stop_points` line (FILT-1).
     pub thread_filter: Option<u64>,
+    /// The one object this stop point is scoped to (`InstanceOnly`, FILT-9), if any.
+    ///
+    /// A **weak** reference, like every object id here (ADR-0022): the debuggee may collect it, at which
+    /// point the filter silently stops matching and the stop point reads as "never fired" — which is the
+    /// failure this whole codebase corrects for, so `list_stop_points` checks and says so.
+    pub instance_filter: Option<u64>,
 }
 
 // Five bools, and each is an independent property of the JDWP request as the protocol defines it
@@ -775,6 +781,12 @@ pub struct WatchpointInfo {
     pub trace_cost: TraceCost,
     /// Thread this watch is filtered to (`ThreadOnly`), if any — for the `list_stop_points` line (FILT-1).
     pub thread_filter: Option<u64>,
+    /// The one object this stop point is scoped to (`InstanceOnly`, FILT-9), if any.
+    ///
+    /// A **weak** reference, like every object id here (ADR-0022): the debuggee may collect it, at which
+    /// point the filter silently stops matching and the stop point reads as "never fired" — which is the
+    /// failure this whole codebase corrects for, so `list_stop_points` checks and says so.
+    pub instance_filter: Option<u64>,
 }
 
 /// An active method-exit request (METH-1): a `METHOD_EXIT` / `METHOD_EXIT_WITH_RETURN_VALUE` request
@@ -841,6 +853,12 @@ pub struct MethodExitRequestInfo {
     /// Observed capture cost, reported by `list_stop_points` (TRACE-7).
     pub trace_cost: TraceCost,
     pub thread_filter: Option<u64>,
+    /// The one object this stop point is scoped to (`InstanceOnly`, FILT-9), if any.
+    ///
+    /// A **weak** reference, like every object id here (ADR-0022): the debuggee may collect it, at which
+    /// point the filter silently stops matching and the stop point reads as "never fired" — which is the
+    /// failure this whole codebase corrects for, so `list_stop_points` checks and says so.
+    pub instance_filter: Option<u64>,
 }
 
 /// A breakpoint waiting for its class to load. The `CLASS_PREPARE` request suspends the preparing
@@ -859,6 +877,8 @@ pub struct PendingBreakpoint {
     pub line: Option<i32>,
     pub method: Option<String>,
     pub hit_count: Option<i32>,
+    /// The one object this stop point will be scoped to once it arms (`InstanceOnly`, FILT-9), if any.
+    pub instance_filter: Option<u64>,
     pub thread_filter: Option<u64>,
     pub condition: Option<String>,
     /// Arm as a non-suspending trace/logpoint (`EventThread` suspend, snapshot, resume).
@@ -922,6 +942,8 @@ pub struct PatternStopSet {
     /// loading in an hour is armed the same way the first one was.
     pub method: Option<String>,
     pub hit_count: Option<i32>,
+    /// The object every member of this family is scoped to (`InstanceOnly`, FILT-9), if any.
+    pub instance_filter: Option<u64>,
     pub thread_filter: Option<u64>,
     pub condition: Option<String>,
     pub trace: bool,
@@ -1192,6 +1214,12 @@ pub struct BreakpointArm {
     pub suspend_policy: jdwp_client::SuspendPolicy,
     pub hit_count: Option<i32>,
     pub thread_filter: Option<u64>,
+    /// The one object this stop point is scoped to (`InstanceOnly`, FILT-9), if any.
+    ///
+    /// A **weak** reference, like every object id here (ADR-0022): the debuggee may collect it, at which
+    /// point the filter silently stops matching and the stop point reads as "never fired" — which is the
+    /// failure this whole codebase corrects for, so `list_stop_points` checks and says so.
+    pub instance_filter: Option<u64>,
 }
 
 /// One concrete place a stop point is armed: a bytecode index in a method of a reference type.

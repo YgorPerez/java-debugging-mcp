@@ -83,14 +83,23 @@ pub struct VmCapabilitiesNew {
     /// Whether [`pop_frames`](JdwpConnection::pop_frames) will work — the other half of a useful swap,
     /// since a frame already on the stack keeps running the code it entered with.
     pub can_pop_frames: bool,
+    /// Whether a request may carry an `InstanceOnly` modifier (modKind 11) — position **12**.
+    ///
+    /// Decoded in the same change that consults it (FILT-9, #101), per this struct's rule. It matters
+    /// more than most bits here because of *how* the JVM refuses a modifier it cannot honour: not with
+    /// `NOT_IMPLEMENTED`, but with `INTERNAL` (113), which says nothing about which modifier was the
+    /// problem. Reading the bit first turns that into a sentence.
+    ///
+    /// Measured `true` on Temurin 17.0.20 — `docs/heap-query-measurements.md` has the full vector.
+    pub can_use_instance_filters: bool,
     /// Whether [`instances`](JdwpConnection::instances) and
     /// [`instance_counts`](JdwpConnection::instance_counts) will work — position **16**, four bits past
     /// where this decoder used to stop.
     ///
-    /// Decoded in the same change that consults it (DISC-10, #84). Positions 12-15
-    /// (`canUseInstanceFilters`, `canGetSourceDebugExtension`, `canRequestVMDeathEvent`,
-    /// `canSetDefaultStratum`) are read past rather than named, for the reason this struct's
-    /// documentation gives: a bit nothing reads is the mistake `IDSizes` was deleted for.
+    /// Decoded in the same change that consults it (DISC-10, #84). Positions 13-15
+    /// (`canGetSourceDebugExtension`, `canRequestVMDeathEvent`, `canSetDefaultStratum`) are read past
+    /// rather than named, for the reason this struct's documentation gives: a bit nothing reads is the
+    /// mistake `IDSizes` was deleted for. Position 12 joined the named ones with FILT-9 (#101).
     pub can_get_instance_info: bool,
 }
 
@@ -166,7 +175,7 @@ impl JdwpConnection {
     /// only here, so the first seven bytes are read past rather than decoded twice — the two commands
     /// answer about the same JVM and disagreeing about the overlap is not a state worth representing.
     /// Everything past the sixteenth bit is skipped for the reason [`VmCapabilitiesNew`] gives, and so
-    /// are 12-15, which sit between two bits that *are* consulted.
+    /// are 13-15, which sit between bits that *are* consulted.
     ///
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
@@ -187,9 +196,11 @@ impl JdwpConnection {
         let can_add_method = flag()?;
         let can_unrestrictedly_redefine_classes = flag()?;
         let can_pop_frames = flag()?;
-        // 12-15: canUseInstanceFilters, canGetSourceDebugExtension, canRequestVMDeathEvent,
-        // canSetDefaultStratum. Read past, not named — nothing here consults them yet.
-        for _ in 0..4 {
+        // 12: canUseInstanceFilters, consulted by FILT-9 (#101).
+        let can_use_instance_filters = flag()?;
+        // 13-15: canGetSourceDebugExtension, canRequestVMDeathEvent, canSetDefaultStratum. Read past,
+        // not named — nothing here consults them yet.
+        for _ in 0..3 {
             flag()?;
         }
         Ok(VmCapabilitiesNew {
@@ -197,6 +208,7 @@ impl JdwpConnection {
             can_add_method,
             can_unrestrictedly_redefine_classes,
             can_pop_frames,
+            can_use_instance_filters,
             can_get_instance_info: flag()?,
         })
     }

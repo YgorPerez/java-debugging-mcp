@@ -462,7 +462,15 @@ on it sends nothing to the debuggee and says so, and debug.toggle_stop_point is 
 count. It is NOT "the first N": that is trace_max_hits, counted on this side, and combining the two gives you
 ONE snapshot rather than trace_max_hits of them — the arm reply says so instead of reporting two numbers that
 cannot both apply. The retry loop is what it is for: a supplier consulta retried after a sleep, where the
-SECOND attempt is the interesting one and the first failing is expected.
+SECOND attempt is the interesting one and the first failing is expected. PASS instance_id TO SCOPE THE STOP
+POINT TO THROWS FROM ONE OBJECT — the @0x… handle any reply prints. This is JDWP's InstanceOnly modifier and
+the JVM applies it, so a throw from any other instance costs nothing at all on either side; it matches the
+`this` of the frame that threw, so it only narrows throws from an INSTANCE method. Measured working on Temurin
+17/21/25 against two instances throwing the same type from the same line — this is the one stop-point kind
+where HotSpot both accepts AND applies the modifier, which is why the other kinds refuse it rather than
+offering it (FILT-9, ADR-0027). THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the debuggee collects the object
+the filter stops matching and the stop point goes quiet, which is indistinguishable from the exception never
+being thrown — debug.list_stop_points checks and says so.
 
 ## debug.set_field_stop
 Break when a field is read or written — answers "who mutates this?" for a field that changes behind your back
@@ -487,7 +495,15 @@ ONLY ON THE Nth TOUCH, with JDWP's Count semantics: the JVM reports the Nth writ
 the request itself, so the watch fires ONCE and is then SPENT — debug.list_stop_points says so rather than
 listing it as armed, clearing it sends nothing to the debuggee, and debug.toggle_stop_point re-arms it with
 the same count. Not "the first N", which is trace_max_hits; the two together yield one snapshot, and the arm
-reply says so.
+reply says so. PASS instance_id TO WATCH ONE OBJECT'S COPY OF THE FIELD — the @0x… handle any reply prints.
+This is JDWP's InstanceOnly modifier, so the JVM does the matching and a write to any other instance's copy
+costs no packet and no snapshot: the way to answer "who is clearing THIS session's total?" on an instance
+where 400 of them are live. REFUSED ON A STATIC FIELD, because a static write has no `this` for the modifier
+to match — and HotSpot accepts it anyway and then reports every write, with no error and a reply claiming the
+watch is scoped (measured on Temurin 17/21/25). A static field is one copy in the whole JVM, so there is
+nothing to narrow to; watch it unfiltered and use trace_expr or a condition. THE HANDLE IS A WEAK REFERENCE
+(ADR-0022): if the debuggee collects the object the watch goes quiet, which reads as the field never being
+touched — debug.list_stop_points checks and says so.
 
 ## debug.set_line_stop
 Set a breakpoint at a location (class_pattern + line and/or method). class_pattern takes AN EXACT CLASS, A
@@ -548,7 +564,18 @@ defines its own type with its own statics, and on WildFly a library packed into 
 WEB-INF/lib is genuinely loaded once per war. All of those copies are armed, the reply says `Armed on N
 classloaders`, and debug.list_stop_points names each loader so a read can be pinned to one. Arming a single
 copy is how a stop point reported "armed" and then never fired, which is indistinguishable from a wrong
-hypothesis about the code path.
+hypothesis about the code path. PASS instance_id TO SCOPE THE STOP POINT TO ONE OBJECT — the @0x… handle any
+reply prints, from a trace snapshot's locals, an expanded field tree or debug.list_instances. This is JDWP's
+InstanceOnly modifier, so the JVM does the matching: a hit on any other instance costs no packet, no snapshot
+and no suspension at all, which is what makes "trace salvar() on THIS Reserva, not all 400 in flight" cheap on
+a shared instance. That is the difference from condition, which we evaluate on our side and therefore pay for
+on EVERY hit. REFUSED IN TWO CASES, BOTH BECAUSE THE ALTERNATIVE IS A SILENT LIE: on a STATIC method, which
+has no `this` to match — HotSpot accepts the modifier there and then fires for every hit, with no error and a
+reply claiming the stop point is scoped (measured on Temurin 17/21/25); and on a class that is NOT LOADED yet,
+because a deferred stop point cannot be checked for the first case and no instance of an unloaded class can
+exist anyway, so the handle would belong to something else. THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the
+debuggee collects the object the filter simply stops matching and the stop point goes quiet, which is
+indistinguishable from the code never running — debug.list_stop_points checks for that and says so.
 
 ## debug.set_method_exit_stop
 Report what a method actually RETURNED, without having to guess which `return` statement runs — for a method
@@ -580,7 +607,15 @@ every proxy and interceptor the container generates and each unwanted exit costs
 method-name filter on this side can discard it. A ClassExclude is applied by the JVM instead. There is
 deliberately NO default set here, unlike the stepping tools — a method-exit class_pattern is something you
 wrote, and silently subtracting from it would answer a different question from the one you asked. Measured: a
-request accepts at least 5000 exclusion patterns, so the list is not a resource to ration.
+request accepts at least 5000 exclusion patterns, so the list is not a resource to ration. instance_id IS
+ACCEPTED AND ALWAYS REFUSED HERE, AND THE REFUSAL IS THE ANSWER RATHER THAN A MISSING FEATURE. A method exit
+HAS a `this`, so nothing about the request looks wrong — HotSpot accepts an InstanceOnly modifier on it,
+replies success, and then records exits from every instance regardless (measured on Temurin 17/21/25, re-run
+on its own to be sure: FILT-9, ADR-0027). There is no signal of any kind that the scope was dropped, so
+passing it through would mean a reply saying the stop point is scoped to one object while it reports all 400 —
+which is the exact failure this server is built to refuse. Use a condition instead (evaluated on our side, so
+it works on every kind), or put the stop point on a LINE inside an instance method, where instance_id does
+work.
 
 ## debug.set_value
 Write a value to a local variable, a static field (e.g. ConfigDefaultUtils.dsInfra — flip tenant/infra on a

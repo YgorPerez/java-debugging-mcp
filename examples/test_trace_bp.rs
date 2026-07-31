@@ -63,7 +63,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The crux of a logpoint: EventThread suspend policy — only the hit thread pauses, briefly.
     let req = conn
-        .set_breakpoint_ex(cid, m.method_id, entry.line_code_index, SuspendPolicy::EventThread, None, None)
+        .set_breakpoint_ex(
+            cid,
+            m.method_id,
+            entry.line_code_index,
+            SuspendPolicy::EventThread,
+            jdwp_client::EventFilters::default(),
+        )
         .await?;
     println!("✓ Trace breakpoint set on {class}.{method} (EventThread policy, request id {req})");
 

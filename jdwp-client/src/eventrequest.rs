@@ -6,8 +6,28 @@ use crate::commands::{command_sets, event_commands, event_kinds};
 use crate::connection::JdwpConnection;
 use crate::protocol::{CommandPacket, JdwpResult};
 use crate::reader::read_i32;
-use crate::types::{FieldId, MethodId, ReferenceTypeId, ThreadId};
+use crate::types::{FieldId, MethodId, ObjectId, ReferenceTypeId, ThreadId};
 use bytes::BufMut;
+
+/// The three per-request modifiers every `EventRequest.Set` here can carry, in one value.
+///
+/// Bundled rather than passed as a trailing trio because they travel together on all four request
+/// builders and are the same concept in each — `CONTEXT.md` calls them **filters**: modifiers the
+/// *debuggee* applies, so a non-match produces no event at all. Keeping them in one place is also where
+/// the surprise lives, and it is per-kind rather than per-modifier: `HotSpot` accepts every one of these on
+/// every kind below and does not always **apply** them. See ADR-0027 for the measured table — an
+/// `InstanceOnly` on a `METHOD_EXIT` is accepted and ignored, on an `EXCEPTION` it works — and note that
+/// `canUseInstanceFilters` reads `true` either way, so the capability bit does not settle it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EventFilters {
+    /// `Count` (1): report only the Nth occurrence, after which the **debuggee** deletes the request.
+    pub count: Option<i32>,
+    /// `ThreadOnly` (10): restrict to hits on one thread.
+    pub thread: Option<ThreadId>,
+    /// `InstanceOnly` (11): restrict to hits whose `this` is one specific object. An armed one **pins**
+    /// that object in the debuggee until the request is cleared (measured; ADR-0027).
+    pub instance: Option<ObjectId>,
+}
 
 /// Suspend policy for events
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +48,12 @@ mod mod_kinds {
     /// `ClassExclude` (6): drop events from classes matching a pattern. One modifier per pattern —
     /// JDWP carries a single string each, so N exclusions occupy N of the request's modifier slots.
     pub const CLASS_EXCLUDE: u8 = 6;
+    /// `InstanceOnly` (11): restrict the request to hits whose `this` is one specific object.
+    ///
+    /// Filters **inside the JVM**, so an excluded hit costs no packet and no thread suspension — the
+    /// distinction that matters on a shared instance, where every other narrowing this crate offers
+    /// happens after the event has already crossed the wire.
+    pub const INSTANCE_ONLY: u8 = 11;
     pub const LOCATION_ONLY: u8 = 7;
     pub const EXCEPTION_ONLY: u8 = 8;
     pub const FIELD_ONLY: u8 = 9;
@@ -165,7 +191,8 @@ impl JdwpConnection {
         uncaught: bool,
         suspend_policy: SuspendPolicy,
     ) -> JdwpResult<i32> {
-        self.set_exception_request_ex(ref_type, caught, uncaught, suspend_policy, None, None).await
+        self.set_exception_request_ex(ref_type, caught, uncaught, suspend_policy, EventFilters::default())
+            .await
     }
 
     /// As [`set_exception_request`](Self::set_exception_request), plus optional `ThreadOnly` (report
@@ -194,8 +221,7 @@ impl JdwpConnection {
         caught: bool,
         uncaught: bool,
         suspend_policy: SuspendPolicy,
-        count: Option<i32>,
-        thread: Option<ThreadId>,
+        filters: EventFilters,
     ) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
@@ -203,8 +229,11 @@ impl JdwpConnection {
         packet.data.put_u8(event_kinds::EXCEPTION);
         packet.data.put_u8(suspend_policy as u8);
 
-        // ExceptionOnly is always present; ThreadOnly and Count are added when asked for.
-        let n_mods = 1 + i32::from(count.is_some()) + i32::from(thread.is_some());
+        // ExceptionOnly is always present; ThreadOnly, Count and InstanceOnly are added when asked for.
+        let n_mods = 1
+            + i32::from(filters.count.is_some())
+            + i32::from(filters.thread.is_some())
+            + i32::from(filters.instance.is_some());
         packet.data.put_i32(n_mods);
 
         // ExceptionOnly — refType (0 = all), caught flag, uncaught flag.
@@ -213,7 +242,8 @@ impl JdwpConnection {
         packet.data.put_u8(u8::from(caught));
         packet.data.put_u8(u8::from(uncaught));
 
-        write_count_thread(&mut packet, count, thread);
+        write_count_thread(&mut packet, filters.count, filters.thread);
+        write_instance_only(&mut packet, filters.instance);
 
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
@@ -258,7 +288,7 @@ impl JdwpConnection {
         kind: WatchKind,
         suspend_policy: SuspendPolicy,
     ) -> JdwpResult<i32> {
-        self.set_field_watch_ex(ref_type, field_id, kind, suspend_policy, None, None).await
+        self.set_field_watch_ex(ref_type, field_id, kind, suspend_policy, EventFilters::default()).await
     }
 
     /// As [`set_field_watch`](Self::set_field_watch), plus optional `ThreadOnly` (report only touches
@@ -276,8 +306,7 @@ impl JdwpConnection {
         field_id: FieldId,
         kind: WatchKind,
         suspend_policy: SuspendPolicy,
-        count: Option<i32>,
-        thread: Option<ThreadId>,
+        filters: EventFilters,
     ) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
@@ -285,8 +314,11 @@ impl JdwpConnection {
         packet.data.put_u8(kind.event_kind());
         packet.data.put_u8(suspend_policy as u8);
 
-        // FieldOnly is always present; ThreadOnly and Count are added when asked for.
-        let n_mods = 1 + i32::from(count.is_some()) + i32::from(thread.is_some());
+        // FieldOnly is always present; ThreadOnly, Count and InstanceOnly are added when asked for.
+        let n_mods = 1
+            + i32::from(filters.count.is_some())
+            + i32::from(filters.thread.is_some())
+            + i32::from(filters.instance.is_some());
         packet.data.put_i32(n_mods);
 
         // FieldOnly — the declaring type plus the field itself.
@@ -294,7 +326,8 @@ impl JdwpConnection {
         packet.data.put_u64(ref_type);
         packet.data.put_u64(field_id);
 
-        write_count_thread(&mut packet, count, thread);
+        write_count_thread(&mut packet, filters.count, filters.thread);
+        write_instance_only(&mut packet, filters.instance);
 
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
@@ -332,8 +365,14 @@ impl JdwpConnection {
         count: Option<i32>,
         thread: Option<ThreadId>,
     ) -> JdwpResult<i32> {
-        self.set_method_exit_request_ex(class_pattern, with_return_value, suspend_policy, count, thread, &[])
-            .await
+        self.set_method_exit_request_ex(
+            class_pattern,
+            with_return_value,
+            suspend_policy,
+            &[],
+            EventFilters { count, thread, instance: None },
+        )
+        .await
     }
 
     /// [`set_method_exit_request`](Self::set_method_exit_request) with `ClassExclude` patterns (STEP-1).
@@ -354,9 +393,8 @@ impl JdwpConnection {
         class_pattern: &str,
         with_return_value: bool,
         suspend_policy: SuspendPolicy,
-        count: Option<i32>,
-        thread: Option<ThreadId>,
         exclude: &[String],
+        filters: EventFilters,
     ) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
@@ -367,8 +405,8 @@ impl JdwpConnection {
         // ClassMatch is always present; ThreadOnly, Count and one ClassExclude per pattern are added
         // when asked for.
         let n_mods = 1
-            + i32::from(count.is_some())
-            + i32::from(thread.is_some())
+            + i32::from(filters.count.is_some())
+            + i32::from(filters.thread.is_some())
             + i32::try_from(exclude.len()).unwrap_or(0);
         packet.data.put_i32(n_mods);
 
@@ -384,7 +422,8 @@ impl JdwpConnection {
             packet.data.extend_from_slice(b);
         }
 
-        write_count_thread(&mut packet, count, thread);
+        write_count_thread(&mut packet, filters.count, filters.thread);
+        write_instance_only(&mut packet, filters.instance);
 
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
@@ -455,6 +494,19 @@ fn write_count_thread(packet: &mut CommandPacket, count: Option<i32>, thread: Op
     if let Some(t) = thread {
         packet.data.put_u8(mod_kinds::THREAD_ONLY);
         packet.data.put_u64(t);
+    }
+}
+
+/// Write an `InstanceOnly` modifier (FILT-9), when one was asked for.
+///
+/// Kept beside [`write_count_thread`] and separate from it because it is not universal: the modifier
+/// tests the event's `this`, so it is meaningless where there is none, and which kinds the JVM will
+/// actually accept it on is measured rather than assumed — see `mcp-server`'s arming paths, which refuse
+/// the combinations that do not work instead of letting the JVM answer `INTERNAL` (113).
+fn write_instance_only(packet: &mut CommandPacket, instance: Option<ObjectId>) {
+    if let Some(o) = instance {
+        packet.data.put_u8(mod_kinds::INSTANCE_ONLY);
+        packet.data.put_u64(o);
     }
 }
 

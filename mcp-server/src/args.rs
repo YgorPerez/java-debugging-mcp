@@ -292,6 +292,18 @@ pub struct SetBreakpointArgs {
     /// other unless you mean exactly that.
     #[serde(default)]
     pub hit_count: Option<i32>,
+    /// Scope this stop point to ONE object: only hits whose `this` is that object are reported
+    /// (JDWP's `InstanceOnly`, FILT-9). Give the `@0x…` handle any reply prints beside an object.
+    ///
+    /// **Filters inside the JVM**, unlike a `condition`: an excluded hit costs no packet and no thread
+    /// suspension, which is what makes "trace `salvar()` on THIS Reserva, not all 400 in flight" cheap
+    /// on a shared instance rather than the most expensive thing you can arm.
+    ///
+    /// The handle is a **weak** reference (ADR-0022). If the debuggee collects the object the filter
+    /// stops matching and the stop point goes quiet, which is indistinguishable from the code never
+    /// running — so `debug.list_stop_points` checks and says when that has happened.
+    #[serde(default)]
+    pub instance_id: Option<String>,
     /// Only stop when this thread (hex id) hits it (optional).
     #[serde(default)]
     pub thread_id: Option<String>,
@@ -912,6 +924,18 @@ pub struct SetExceptionBreakpointArgs {
     /// its single hit. The arm reply says so rather than echoing both numbers.
     #[serde(default)]
     pub hit_count: Option<i32>,
+    /// Scope this stop point to ONE object: only hits whose `this` is that object are reported
+    /// (JDWP's `InstanceOnly`, FILT-9). Give the `@0x…` handle any reply prints beside an object.
+    ///
+    /// **Filters inside the JVM**, unlike a `condition`: an excluded hit costs no packet and no thread
+    /// suspension, which is what makes "trace `salvar()` on THIS Reserva, not all 400 in flight" cheap
+    /// on a shared instance rather than the most expensive thing you can arm.
+    ///
+    /// The handle is a **weak** reference (ADR-0022). If the debuggee collects the object the filter
+    /// stops matching and the stop point goes quiet, which is indistinguishable from the code never
+    /// running — so `debug.list_stop_points` checks and says when that has happened.
+    #[serde(default)]
+    pub instance_id: Option<String>,
     /// Logpoint mode: on each throw, snapshot (throw location, thread, in-scope locals, exception
     /// type, catch location) into a ring buffer and resume immediately WITHOUT suspending — the safe
     /// choice on a shared instance, where a suspending exception breakpoint freezes other people's
@@ -1027,6 +1051,18 @@ pub struct SetWatchpointArgs {
     /// its single hit. The arm reply says so rather than echoing both numbers.
     #[serde(default)]
     pub hit_count: Option<i32>,
+    /// Scope this stop point to ONE object: only hits whose `this` is that object are reported
+    /// (JDWP's `InstanceOnly`, FILT-9). Give the `@0x…` handle any reply prints beside an object.
+    ///
+    /// **Filters inside the JVM**, unlike a `condition`: an excluded hit costs no packet and no thread
+    /// suspension, which is what makes "trace `salvar()` on THIS Reserva, not all 400 in flight" cheap
+    /// on a shared instance rather than the most expensive thing you can arm.
+    ///
+    /// The handle is a **weak** reference (ADR-0022). If the debuggee collects the object the filter
+    /// stops matching and the stop point goes quiet, which is indistinguishable from the code never
+    /// running — so `debug.list_stop_points` checks and says when that has happened.
+    #[serde(default)]
+    pub instance_id: Option<String>,
     /// Logpoint mode: on each hit, snapshot (mutating location, thread, in-scope locals, the field's
     /// old → new pair) into a ring buffer and resume immediately WITHOUT suspending — the safe choice
     /// on a shared instance. Read snapshots with `debug.get_traces`.
@@ -1143,6 +1179,18 @@ pub struct SetMethodBreakpointArgs {
     /// class regardless of which method produced it.
     #[serde(default)]
     pub hit_count: Option<i32>,
+    /// Scope this stop point to ONE object: only hits whose `this` is that object are reported
+    /// (JDWP's `InstanceOnly`, FILT-9). Give the `@0x…` handle any reply prints beside an object.
+    ///
+    /// **Filters inside the JVM**, unlike a `condition`: an excluded hit costs no packet and no thread
+    /// suspension, which is what makes "trace `salvar()` on THIS Reserva, not all 400 in flight" cheap
+    /// on a shared instance rather than the most expensive thing you can arm.
+    ///
+    /// The handle is a **weak** reference (ADR-0022). If the debuggee collects the object the filter
+    /// stops matching and the stop point goes quiet, which is indistinguishable from the code never
+    /// running — so `debug.list_stop_points` checks and says when that has happened.
+    #[serde(default)]
+    pub instance_id: Option<String>,
     /// Class patterns this request must NOT fire for (STEP-1), as JDWP `ClassExclude` modifiers.
     ///
     /// What makes a *wildcard* `class_pattern` usable on a framework-heavy JVM. The match is done by the
