@@ -5389,8 +5389,21 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
     };
 
     // --- the invariant ---
-    let advanced =
-        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 2)).is_some();
+    //
+    // **A path that has already SAID it left the debuggee suspended does not need the full
+    // `EVENT_TIMEOUT` to prove the probe is not ticking**, and waiting it out is what made this matrix
+    // the slowest thing in the suite. `WatchProbe` ticks every 150 ms, so `frozen_at + 2` is ~450 ms of
+    // ticking away; `STUCK_CONFIRM` is still an order of magnitude more than that, while 25 s is two.
+    //
+    // Read off `reply` and not off the fuller `said` gathered below, deliberately. `reply` is the
+    // resume path's own inline account, and the shortening must not depend on anything that only
+    // appears *after* the wait — `Resume::Watchdog` has an empty `reply` by construction (its point is
+    // that it acts unasked), so it keeps the full timeout and cannot be shortened by this at all.
+    //
+    // The cry-wolf half of the invariant survives: ~20 ticks fit in `STUCK_CONFIRM`, so a path that
+    // claims "STILL suspended" while the VM is plainly running is still caught by the assertion below.
+    let wait = if reply.contains("STILL suspended") { STUCK_CONFIRM } else { EVENT_TIMEOUT };
+    let advanced = probe.wait_for_line(wait, |l| tick_index(l).is_some_and(|n| n > frozen_at + 2)).is_some();
 
     // Whatever the path says about itself, gathered after the fact: `continue`/`panic` answer inline,
     // the watchdog leaves its note on `list_stop_points` / `get_last_event`. After a disconnect there is
@@ -5609,6 +5622,15 @@ fn thread_id_named(server: &mut Server, name: &str) -> String {
 ///
 /// JDWP's Suspend reply means the thread is stopped, but a line it printed a moment earlier may still be
 /// in the pipe — and reading the mark too early would credit the freeze with a tick it never prevented.
+/// How long to keep watching a probe that a resume path has already reported it left frozen.
+///
+/// This is a bound on observing an **absence**, which is why it is its own constant and much smaller
+/// than [`EVENT_TIMEOUT`]: the positive it is ruling out — `WatchProbe` advancing two ticks at 150 ms
+/// each — takes ~450 ms, so 3 s is a 6x margin on the thing that would falsify the claim. The 25 s
+/// `EVENT_TIMEOUT` is sized for a JVM that has to *do* something before the event can appear, which is
+/// the opposite situation.
+const STUCK_CONFIRM: std::time::Duration = std::time::Duration::from_secs(3);
+
 const PIPE_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// SAFE-11's headline claim, and the only assertion that can prove it: suspending ONE thread stops ITS

@@ -67,6 +67,19 @@ Two reasons, and the second is the stronger one and was only visible after measu
 **The floor.** The slowest single test is **70 s** (`resume_thread_is_honest_from_every_suspended_state`) and a
 test cannot be split, so no shard is ever shorter than that.
 
+> **Amended (TEST-30): this reason no longer holds, and the second one still does.** The resume-honesty
+> matrix was waiting out a 25 s `EVENT_TIMEOUT` to observe an *absence* — it established "this path
+> correctly did not resume" by letting the wait expire, three times across the matrix. Reading the resume
+> path's own `STILL suspended` admission instead took `resume_thread` from **70 s to 26 s** and `continue`
+> from 45 s to 23 s, so **the floor is now 35 s** (`the_watchdog_is_honest_from_every_suspended_state`,
+> which cannot be shortened this way: its reply is empty by construction).
+>
+> Re-measured on 4 vCPU afterwards: **unsharded 139 s, shard 1/2 85 s (3.4x concurrent), shard 1/3 63.5 s
+> (2.8x)**. So a third shard now buys about **−25 s on the critical leg for +50 % runners**, and the
+> concurrency argument below is the whole of what still decides it — the floor has stopped being the
+> binding constraint. **Two shards is kept**, but it is now a judgement about runner cost rather than an
+> arithmetic impossibility, which is a different decision and should be revisited on its own terms.
+
 **Concurrency falls as shards get smaller, which is the constraint that actually binds.** A 60-test shard
 reaches only **~2.6x concurrent** on 4 vCPU — 283 s of test time in a 107 s test step — against 3.7x for the
 full 118. There is less overlap available at the tail of a smaller shard, so halving a shard's test time does

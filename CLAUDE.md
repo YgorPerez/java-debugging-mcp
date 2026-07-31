@@ -79,8 +79,13 @@ easy to swap: **test time** is the sum of every test's own duration — occupanc
 is what you wait for, 177.3 s under `taskset -c 0-3`. Neither includes the build, the JDK install or the
 cache restore. It exists because a triage estimate of the largest available saving was **4x too high**; the
 same section warning you about the two backwards flake investigations applies to speed claims. As of v0.9.0
-the four `*_is_honest_from_every_suspended_state` tests are **29% of the suite's test time** between them,
-and the slowest single test is 74 s — which is the floor for anything that splits the suite up.
+the four `*_is_honest_from_every_suspended_state` tests were **29% of the suite's test time** between them,
+and the slowest single test was 74 s. **TEST-30 cut that**: they were waiting out a 25 s `EVENT_TIMEOUT` to
+observe an *absence* — proving "this path correctly did not resume" by letting the wait expire — and reading
+the path's own `STILL suspended` admission instead took the suite from **609 s to 540 s of test time** and the
+floor from **70 s to 35 s**. The lesson generalises past this suite: **a negative observation needs only as
+long as the positive would have taken.** `WatchProbe` ticks every 150 ms, so 25 s was two orders of magnitude
+more than ruling it out required.
 
 Because the timing flag is nightly-gated, `integration-test.sh` now **builds with `cargo test --no-run` and
 runs the test binary directly**, keeping `RUSTC_BOOTSTRAP=1` off `cargo` — it is hashed into the build
@@ -92,9 +97,11 @@ nightly-only features in silently. Arguments still go straight to libtest and th
 *measured* duration — `scripts/shard-plan.py` reading `mcp-server/tests/timings.tsv` — because a split by name
 had a 1-in-8 chance of piling the four resume-honesty tests into one shard and making it the whole wall clock.
 Measured on CI: **workflow wall clock 223 s → 147 s (−34%), runner-seconds 648 → 747 (+15%)**. Two shards and
-not three for two reasons — the slowest single test is **70 s** and cannot be split, and a 60-test shard only
+not three for two reasons — the slowest single test was **70 s** and cannot be split, and a 60-test shard only
 reaches ~2.6x concurrent on 4 vCPU against 3.7x for the full 118, so halving a shard's test time does *not*
-halve its wall clock.
+halve its wall clock. **The first reason expired with TEST-30** (floor now 35 s); re-measured on 4 vCPU,
+shard 1/3 runs in 63.5 s against shard 1/2's 85 s, so a third shard is worth about −25 s on the critical leg
+for +50 % runners. Still two, but now on cost grounds alone — ADR-0025 carries the amendment.
 
 **Run the unsharded suite when you are working a flake.** `scripts/integration-test.sh` with no `--shard` still
 runs all 118 tests in one process, which is the contention CI used to have. Sharding *reduces* how many probe
