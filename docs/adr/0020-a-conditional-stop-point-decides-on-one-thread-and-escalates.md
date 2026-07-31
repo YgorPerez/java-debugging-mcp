@@ -42,6 +42,27 @@ pushed, caller expected to resume.
 
 Four consequences had to be decided rather than assumed:
 
+> **Amended (FILT-9/BP-6 measurements, 2026-07-31): "holds only the hit thread" has an exception, and it
+> is not in this decision's gift.** The policy above is what the request *asks* for. What it gets is the
+> policy of its **event set** — one packet per hit, carrying one event per request that matched, and a
+> single policy which is the **strongest** any member asked for. Measured on Temurin 17/21/25: a set
+> carrying one `All` request and two `EventThread` ones arrives as `All`.
+>
+> So a *suspending* stop point at the same location makes this conditional one hold the whole VM from the
+> moment of the hit — before the condition is evaluated, not after it holds. The escalation still works;
+> it is simply no longer the only thing that can take the VM, and "a false condition costs one thread
+> briefly held and nothing else" is false in that configuration.
+>
+> **The decision stands and nothing here needs rebuilding** — `EventThread` is still the right ask, and it
+> is still what a conditional stop point gets whenever it does not share a location. What changes is that
+> the premise was a property of the stop point and is really a property of the set, so the guarantee is
+> conditional in a way this document did not say. `CONTEXT.md` gains **event set** for the concept and
+> corrects **trace** for the same reason; [#117] decides what the caller is told, which is the part still
+> open. Practical form, in the caller's terms: on a shared instance, keep every stop point on a given line
+> traced.
+>
+> [#117]: https://github.com/YgorPerez/java-debugging-mcp/issues/117
+
 **1. The escalation window is real, and is stated rather than closed.** Between the condition returning
 true and `VirtualMachine.Suspend` completing, every thread except the hit thread is still running. So the
 state the caller goes on to read is the state a round trip *after* the hit, not the state at the instant of

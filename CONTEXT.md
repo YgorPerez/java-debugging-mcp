@@ -271,9 +271,28 @@ were both called `hit_count` in the code, and the tally sat dead and always zero
 never report it. Fixed in FILT-10 (#110) by renaming the tally to `hits` and leaving `hit_count` to mean the
 argument alone.
 
+**Event set**:
+What the debuggee actually sends: **one** packet carrying one **event** per request that matched at that
+moment, plus a single suspend policy for all of them. Three stop points on one line produce one event set
+with three members, not three arrivals.
+Its own word because two facts belong to the set and to nothing inside it, and both were found as bugs
+rather than read off the spec. **The thread is suspended once for the set**, however many members it
+carries — so a resume per member undoes suspensions the hit never took (BP-6, [#102]). And **the policy is
+the strongest any member asked for**: measured on Temurin 17/21/25, a set carrying one `All` request and
+two `EventThread` ones arrives as `All`, which is how a **trace** stops being non-suspending without
+anything saying so ([#117]).
+So "the stop point suspends the VM" is a sentence about a set, and a reader who has only the singular word
+will write code that reads the first member — which is exactly what [#102] was.
+_Avoid_: composite (JDWP's wire word for the packet, `Event.Composite`; fine when quoting the protocol,
+wrong as this concept's name — the same rule **alert** applies to `notifications/message`), event (the
+singular is a member of one, and conflating them is the defect above)
+
+[#102]: https://github.com/YgorPerez/java-debugging-mcp/issues/102
+[#117]: https://github.com/YgorPerez/java-debugging-mcp/issues/117
+
 **Event**:
-A hit that suspended the debuggee and is reported to the caller, who is expected to resume it. Reported
-**two** ways, and both always happen: recorded in a bounded buffer the caller polls, and pushed as an
+One member of an **event set**: a hit that suspended the debuggee and is reported to the caller, who is
+expected to resume it. Reported **two** ways, and both always happen: recorded in a bounded buffer the caller polls, and pushed as an
 alert. The buffer is the record; the alert is a hint that one exists.
 
 **Alert**:
@@ -293,7 +312,17 @@ _Avoid_: log line, log entry
 **Trace**:
 The non-suspending mode of any stop point — snapshot the hit, resume the thread, never surface an event.
 The safe mode on a shared instance, and the word this project uses throughout for it.
-_Avoid_: logpoint, tracepoint
+**It is a property of the event set, not of the stop point, and the difference is not pedantic.** A traced
+stop point asks for `EventThread`; what it *gets* is whatever policy the strongest member of its **event
+set** asked for. So a suspending stop point at the same location makes every traced one there suspend the
+whole VM, and the listing goes on printing `(trace)` beside them. Measured on Temurin 17/21/25 ([#117]);
+the sentence above holds for a stop point that does not share its location, which is every case anyone has
+been in so far, and fails silently for the one that does.
+The rule that follows is worth stating in the caller's terms rather than the protocol's: **on a shared
+instance, keep every stop point on a given line traced.** One suspending stop point revokes the promise for
+all of them.
+_Avoid_: logpoint, tracepoint; and "non-suspending stop point" as a standalone claim, which is the
+overstatement above
 
 **Caller chain**:
 The callers above a hit, recorded on a snapshot as locations only. Answers which path reached the hit
@@ -347,6 +376,25 @@ other is not), predicate (fine in prose, but the caller-facing argument is `cond
 should agree with the schema)
 
 [#91]: https://github.com/YgorPerez/java-debugging-mcp/issues/91
+
+**Filter pin**:
+The debuggee holding an object alive because an **armed** `InstanceOnly` **filter** names it. Released by
+clearing or disabling the stop point, and by nothing else.
+It needs a name because **there are two pins in this project and only one of them is ours**, and their two
+ADRs read as a contradiction without this sentence. ADR-0022 — *"an object handle is printed weak and never
+pinned"* — is about the debugger declining to pin: `ObjectReference.DisableCollection` is available, is not
+used, and never will be, because the debugger must not be the reason a live heap cannot be collected. A
+filter pin is the *debuggee's*, taken on its own initiative, bounded by the stop point's lifetime and
+invisible in the protocol. ADR-0027 measured it; nothing chose it.
+The consequence a caller pays is real either way: an armed scoped stop point retains that object **and
+everything it references** on **the shared 8180**, which is why every arm reply states it rather than
+leaving it to the ADR. The consequence they *gain* is that while armed, the filter cannot silently stop
+matching — the debuggee cannot collect what it is holding — so the **vanished** hazard moves to the
+disable-then-re-arm cycle and lives nowhere else.
+_Avoid_: pinned, on its own and unqualified (the bare word is on **held thread**'s avoid list for a
+different and still-correct reason — a *pinned thread* is an application state, and these are objects),
+retention, leak (the first is vague about who is holding, and the second says the debuggee is at fault for
+doing exactly what the protocol asks of it)
 
 **Trace budget**:
 How many hits a traced stop point will **charge** before disarming itself. Bounds work done in the debuggee,
@@ -508,7 +556,9 @@ own term because the whole-VM words do not fit: the debuggee is not **suspended*
 `debug.resume_thread` rather than `debug.continue`. What it makes readable is the thread's own frames,
 locals and monitors; what it does **not** make possible is **invocation**, which JDWP grants only to a
 thread suspended by an event.
-_Avoid_: pinned, parked, frozen (the first two are application states, the third reads as the whole VM)
+_Avoid_: pinned, parked, frozen (the first two are application states, the third reads as the whole VM).
+The bar on *pinned* is about **threads** and is not retracted by **filter pin**, which is a different
+subject — an object the debuggee holds — and is always qualified for that reason.
 
 **Event-suspended**:
 Held because a stop point fired *on this thread* or a step landed on it, as opposed to held by a
