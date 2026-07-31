@@ -87,6 +87,16 @@ floor from **70 s to 35 s**. The lesson generalises past this suite: **a negativ
 long as the positive would have taken.** `WatchProbe` ticks every 150 ms, so 25 s was two orders of magnitude
 more than ruling it out required.
 
+**TEST-35 then removed the floor altogether, and the cause was not the one the timings suggested.** The five
+resume-honesty tests each looped over eight suspended states *inside one test body*, and every cell launches its
+own probe JVM and its own server — so eight JVMs ran **sequentially in one libtest thread** while the other
+fifteen sat idle. Per-cell instrumentation found each cell waiting ~2 s and advancing, so barely half of the
+35 s was the assertions at all; the unshortenable 25 s wait in the watchdog cell was the obvious suspect and was
+not the cost. Splitting them into **40 per-cell `#[test]`s** took the slowest single test to **18.7 s** and
+shard 1/2 on 4 vCPU from **53.7 s to 30.7 s**, for no extra runners. **Check whether a slow test can be
+*scheduled* before looking at the timeouts inside it** — `shard-plan.py` cannot split one test, so a long loop
+is a floor under every shard count.
+
 **The suite is oversubscribed on purpose, and the runner prints the number** (TEST-32). Almost every test
 waits on a probe JVM rather than computing, so libtest's `available_parallelism()` default leaves the cores
 idle. Measured on 4 vCPU: **4 threads 139.1 s (3.8x concurrent), 8 threads 87.7 s (6.3x), 16 threads 63.8 s
@@ -119,12 +129,15 @@ runner-seconds are below the *unsharded* baseline. **33 s of that 88 s leg is no
 the rest checkout/toolchain/cache), so fixed cost per leg is what now argues against a third shard. Two shards and
 not three for two reasons — the slowest single test was **70 s** and cannot be split, and a 60-test shard only
 reaches ~2.6x concurrent on 4 vCPU against 3.7x for the full 118, so halving a shard's test time does *not*
-halve its wall clock. **The first reason expired with TEST-30** (floor now 35 s); re-measured on 4 vCPU,
-shard 1/3 runs in 63.5 s against shard 1/2's 85 s, so a third shard is worth about −25 s on the critical leg
-for +50 % runners. Still two, but now on cost grounds alone — ADR-0025 carries the amendment.
+halve its wall clock. **Both reasons have now expired, and the answer did not
+change.** TEST-30 took the floor to 35 s and TEST-35 removed it (18.7 s, and that one is a single test rather
+than a loop). Re-measured on 4 vCPU with no floor left: **shard 1/2 = 30.7 s at 14.0x concurrent, shard 1/3 =
+30.6 s at 11.6x** — falling concurrency cancels the smaller workload exactly, so a third shard is worth
+**0.1 s** for +50 % runners. Still two, now on a measurement rather than a caveat; ADR-0025 carries both
+amendments. Note what moved the needle each time: a *test* got faster, never the shard arithmetic.
 
 **Run the unsharded suite when you are working a flake.** `scripts/integration-test.sh` with no `--shard` still
-runs all 118 tests in one process, which is the contention CI used to have. Sharding *reduces* how many probe
+runs all 164 tests in one process, which is the contention CI used to have. Sharding *reduces* how many probe
 JVMs compete, so **a flake that stops reproducing under CI's new shape is not fixed** — #45, #56, #64 and #71
 were open when this landed and the trade was accepted with that stated. Refresh the timings file with
 `scripts/test-timings.py --emit-timings <log> > mcp-server/tests/timings.tsv`; it is generated, never hand-edited,
@@ -145,7 +158,7 @@ JAVA_HOME=~/.jdks/jdk-17.0.20+8 scripts/integration-test.sh   # and quote the `J
 
 **A single test on an idle 16-core box is a *gentler* environment than CI, not a harsher one.** Worth
 saying because two separate flake investigations here got it backwards and spent thousands of cycles
-proving very little. CI runs all 117 `#[ignore]`d tests at once on a 4-vCPU runner, so the contention that
+proving very little. CI runs all 164 `#[ignore]`d tests at once on a 4-vCPU runner, so the contention that
 produces these failures comes from dozens of probe JVMs competing, not from CPU scarcity alone. To
 reproduce that, pin the whole suite instead of adding load:
 

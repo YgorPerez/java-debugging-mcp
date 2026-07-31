@@ -97,6 +97,40 @@ test cannot be split, so no shard is ever shorter than that.
 > binding constraint. **Two shards is kept**, but it is now a judgement about runner cost rather than an
 > arithmetic impossibility, which is a different decision and should be revisited on its own terms.
 
+> **Amended again (TEST-35): the floor is gone entirely, the third shard was revisited on its own terms as
+> the note above asks, and it buys nothing. Two shards, and now for a measured reason rather than a
+> caveat.**
+>
+> The remaining floor was never the timeout. Per-cell instrumentation of the 35 s watchdog matrix found
+> every one of its eight cells waiting ~2 s and advancing — ~17 s of waiting in a 35 s test, with the rest
+> being setup. The cost was that **each cell launches its own probe JVM and its own server, and a loop of
+> eight ran them sequentially inside one libtest thread** while the other fifteen sat idle. The suite is
+> oversubscribed 4x precisely because it waits on probe JVMs (TEST-32), and the five looping tests were the
+> one place that lever could not reach. `Resume::Watchdog`'s empty reply — the reason TEST-30 could not
+> shorten this case — was the obvious suspect and was not the cause.
+>
+> Splitting the five loops into 40 per-cell `#[test]`s (TEST-35) took the **slowest single test from 35 s
+> to 18.7 s** and, on 4 vCPU, **shard 1/2 from 53.7 s to 30.7 s**. That is −23 s on the critical leg from
+> the split alone — roughly six times what the third shard was ever projected to be worth — for **zero**
+> extra runners.
+>
+> And with the floor gone, the third shard's benefit went with it. Measured on 4 vCPU after the split:
+>
+> | | wall clock | concurrency |
+> |---|---|---|
+> | shard 1/2 (82 tests, 374 s of test time) | **30.7 s** | 14.0x |
+> | shard 1/3 (54 tests, 249 s of test time) | **30.6 s** | 11.6x |
+>
+> **0.1 s, which is noise.** The concurrency argument below is not merely still the binding constraint — it
+> now cancels the smaller workload *exactly*. A third of the test time at 11.6x costs the same wall clock as
+> a half of it at 14.0x. On CI, where 33 s of an 88 s leg was never the tests at all, the leg stays about
+> where it is and the runner count goes from six to nine.
+>
+> **The transferable lesson is the one that keeps recurring here** (`CLAUDE.md` on the 4x-too-high triage
+> estimate, and TEST-32 on Brent's bound): the −25 s above was a projection, and acting on it would have
+> bought 0.1 s for half again the runners while leaving the real 23 s on the table. The lever was never the
+> shard count. It was a test that could not be scheduled.
+
 **Concurrency falls as shards get smaller, which is the constraint that actually binds.** A 60-test shard
 reaches only **~2.6x concurrent** on 4 vCPU — 283 s of test time in a 107 s test step — against 3.7x for the
 full 118. There is less overlap available at the tail of a smaller shard, so halving a shard's test time does
@@ -104,7 +138,10 @@ full 118. There is less overlap available at the tail of a smaller shard, so hal
 reason. A third shard would divide test time against a concurrency factor that falls again, for three more
 runners per push.
 
-So two shards is not a cautious first step towards more. It is where this stops being worth anything.
+So two shards is not a cautious first step towards more. It is where this stops being worth anything —
+and TEST-35 has now measured that directly rather than projecting it, with the floor that muddied the
+question removed first. Anyone reopening this should note that both times the answer changed, it changed
+because a *test* got faster, not because the arithmetic did.
 
 ## The risk, accepted with the trade stated
 
@@ -117,7 +154,7 @@ anyone rebalanced a shard.
 with the risk named. Two things follow, and both are load-bearing:
 
 - **A flake investigation must run the unsharded suite.** `scripts/integration-test.sh` with no `--shard` still
-  runs all 118 tests in one process, which is the contention CI used to have. `CLAUDE.md`'s soak instructions
+  runs all 164 tests in one process, which is the contention CI used to have. `CLAUDE.md`'s soak instructions
   are unchanged and still correct.
 - **A flake that stops reproducing after this is not evidence it is fixed.** It is evidence the contention
   changed. Anyone closing one of those four needs a reason that does not rest on a green sharded run.
