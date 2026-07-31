@@ -674,9 +674,22 @@ pub fn probe_line(source: &str, marker: &str) -> i32 {
 
 /// Ask the OS for a free TCP port by binding to port 0 and immediately releasing it.
 ///
-/// Inherently racy — another process could take the port before the JVM binds it. Nothing portable
-/// does better, since the JVM must open the port itself, and each test picking a fresh port keeps
-/// concurrent tests from colliding, which is the failure that actually happened in practice.
+/// Inherently racy — another process could take the port before the JVM binds it, because the JVM must
+/// open the port itself and does so about a second after this returns.
+///
+/// **The race cannot be closed here, but it does not have to be fatal, which is what this comment used to
+/// imply by saying nothing portable does better** (TEST-33). The loser is announced by the agent as
+/// `bind failed: Address already in use`, so [`launch_built_by`] retries with a fresh port. Measured: the
+/// collision showed up at roughly 1 run in 20 once TEST-32 raised the suite to 16 threads on 4 cores, as a
+/// flat test failure with a 90 s timeout in front of it.
+/// Marker on the one launch failure that is worth retrying rather than reporting (TEST-33).
+///
+/// [`free_port`] hands out a port that is free *at that moment* and the JVM binds it about a second later,
+/// so under a 16-way-parallel suite two probes can be given the same port and the second one dies with
+/// `bind failed: Address already in use`. Observed as a real test failure at ~1 run in 20 once TEST-32
+/// raised the concurrency.
+const PORT_TAKEN: &str = "PROBE_PORT_TAKEN";
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").ok().and_then(|l| l.local_addr().ok()).map_or(0, |a| a.port())
 }
@@ -1401,11 +1414,42 @@ impl Probe {
     /// `javac` flag (TEST-14, #39), the other an attribute `javac` has no option to emit at all (TEST-15,
     /// #40). Everything downstream of the class files is identical — the port, the agent argument, the
     /// reader threads, the listen wait — so it stays in one place rather than being copied per variant.
+    /// Launch, retrying only the lost-port-race failure (TEST-33).
+    ///
+    /// Bounded at three attempts and **only** on [`PORT_TAKEN`]: every other launch failure is reported
+    /// unchanged and on the first try, because retrying a broken classpath or a probe that throws in
+    /// `main` would turn one clear error into three slow identical ones. The retry is announced rather
+    /// than silent — a suite that quietly relaunches probes is a suite where a *systematic* port problem
+    /// looks like nothing at all.
     fn launch_built_by(
         jdk: &Jdk,
         name: &str,
         start_delay: Option<Duration>,
-        build: impl FnOnce(&Jdk, &str, &Path) -> Result<(), String>,
+        build: impl Fn(&Jdk, &str, &Path) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        const ATTEMPTS: u32 = 3;
+        let mut last = String::new();
+        for attempt in 1..=ATTEMPTS {
+            match Self::launch_built_by_once(jdk, name, start_delay, &build) {
+                Ok(p) => return Ok(p),
+                Err(e) if e.starts_with(PORT_TAKEN) && attempt < ATTEMPTS => {
+                    eprintln!(
+                        "note: probe {name} lost the port race (attempt {attempt}/{ATTEMPTS}), \
+                         retrying with a fresh port — {e}"
+                    );
+                    last = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(format!("probe {name} lost the port race {ATTEMPTS} times running: {last}"))
+    }
+
+    fn launch_built_by_once(
+        jdk: &Jdk,
+        name: &str,
+        start_delay: Option<Duration>,
+        build: &impl Fn(&Jdk, &str, &Path) -> Result<(), String>,
     ) -> Result<Self, String> {
         let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         build(jdk, name, dir.path())?;
@@ -1501,7 +1545,17 @@ impl Probe {
         // may print `host:port`, and the transport name is the agent's to spell.
         let port = self.port.to_string();
         let banner = |l: &str| l.starts_with("Listening for transport ") && l.trim_end().ends_with(&port);
-        if self.wait_for_line(Self::PROBE_LISTEN_TIMEOUT, banner).is_some() {
+        // TEST-33: the agent says which of the two it is, so wait for EITHER rather than only for success.
+        // A lost port race is announced within about a second, and waiting the full 90 s for a banner that
+        // can no longer arrive turned a retryable condition into a dead test AND made it the slowest
+        // failure in the suite. `PORT_TAKEN` is what [`launch_built_by`] retries on.
+        let lost_race = |l: &str| l.contains("Address already in use") || l.contains("TRANSPORT_INIT");
+        if self.wait_for_line(Self::PROBE_LISTEN_TIMEOUT, |l| banner(l) || lost_race(l)).is_some() {
+            if self.output().iter().any(|l| lost_race(l)) {
+                return Err(format!(
+                    "{PORT_TAKEN}: another process took port {port} before this JVM bound it"
+                ));
+            }
             return Ok(());
         }
 

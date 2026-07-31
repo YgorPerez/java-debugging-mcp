@@ -556,12 +556,40 @@ fn a_full_family_parks_its_class_load_watch_and_takes_it_back_when_a_member_is_c
         .wait_for_line(EVENT_TIMEOUT, |l| l.contains("gamma loaded"))
         .expect("probe never loaded FamilyGamma");
     let late = server.wait_for_traces("FamilyGamma", EVENT_TIMEOUT).unwrap_or_else(|| {
+        // TEST-31 (#114): this used to report "the family never armed FamilyGamma" for BOTH failures, and
+        // they are different bugs with different fixes. The wait is on a *trace*, so an arm that lands and
+        // never fires looks identical to an arm that never happened — and the once-observed failure was the
+        // former, while the message sent the reader after the latter. The listing already holds the
+        // evidence to tell them apart, so read it rather than guessing.
+        let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+        let armed = listed.lines().any(|l| l.contains("FamilyGamma") && l.contains("] Family"));
+        let hits_zero =
+            listed.lines().skip_while(|l| !l.contains("FamilyGamma")).take(6).any(|l| l.trim() == "Hits: 0");
+        // The probe prints one line per gamma invocation (TEST-31), which is the fact that splits the two
+        // failures apart. Without it, `Hits: 0` on an armed stop point is silence about two different bugs.
+        let invocations = probe.output().iter().filter(|l| l.starts_with("gamma invoked ")).count();
+        let diagnosis = if armed && hits_zero && invocations == 0 {
+            "FamilyGamma IS armed, and the probe's worker NEVER INVOKED IT — no `gamma invoked` line. So \
+             the debugger is not at fault: nothing called the method the stop point is on. Look at the \
+             probe's worker (did it stop? did the volatile handoff of `gammaHandle` not become visible?), \
+             not at the class-load watch."
+        } else if armed && hits_zero {
+            "FamilyGamma IS armed, the worker DID invoke it, and the stop point still did not fire. This \
+             is a real debugger bug and the most interesting outcome: an armed JDWP request that misses \
+             calls. Suspect the arm landing on the wrong reference type or bytecode index — our \
+             bookkeeping says armed, and only the JVM can say whether the request exists."
+        } else if armed {
+            "FamilyGamma is armed and the tally is non-zero, so hits happened but no TRACE was recorded — \
+             which is a trace-capture problem, not a watch problem."
+        } else {
+            "FamilyGamma is NOT armed: no member of the family names it. The watch did not come back when \
+             the slot freed — a parked watch that never unparks is worse than one that was never parked. \
+             This is the class-load watch."
+        };
         panic!(
-            "the family never armed FamilyGamma, so its watch did not come back when the slot freed — a \
-             parked watch that never unparks is worse than one that was never parked.\n  probe output: \
-             {:?}\n  stop points: {}",
+            "no traced hit on FamilyGamma within the timeout.\n  DIAGNOSIS: {diagnosis}\n  gamma \
+             invocations the probe reported: {invocations}\n  probe output: {:?}\n  stop points: {listed}",
             probe.output(),
-            server.call("debug.list_stop_points", serde_json::json!({}))
         )
     });
     assert!(late.contains("FamilyGamma"), "traces: {late}");
@@ -9625,9 +9653,39 @@ fn a_listing_says_how_many_times_each_stop_point_has_fired() {
 
     // The probe's own account first: without it every assertion below could pass vacuously on a run
     // where the probe never got going.
-    probe
-        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 3"))
-        .expect("probe never reached its fourth tick, so the finally line ran fewer than 8 times");
+    //
+    // TEST-33: the failure has to say HOW FAR the probe got, because that is the whole diagnosis and the
+    // original message did not carry it. This test arms **two self-disarming** traced stop points (budgets
+    // of 6 and 4) on a probe whose forward progress is the assertion — the only place in the suite that
+    // combines those — so a stall here is the in-flight-hit window TRACE-8 (#72) is about: the budget
+    // reaches zero, the request is disarmed, and a hit the JVM had already generated arrives for a request
+    // that is gone. If that hit is not resumed, the probe's only thread stays suspended forever.
+    //
+    // Reached tick 0 or nothing => stalled, and that is a product bug worth chasing.
+    // Reached tick 1-2 => merely slow, and this budget is too tight for the concurrency TEST-32 introduced.
+    // The two want opposite fixes, so the message names which it was rather than leaving it to be guessed.
+    if probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 3")).is_none() {
+        let out = probe.output();
+        let ticks: Vec<&String> = out.iter().filter(|l| l.starts_with("tick ")).collect();
+        let reached = ticks.len();
+        let verdict = if reached == 0 {
+            "the probe printed NO tick at all — it is stalled, not slow. Suspect a traced hit that was \
+             never resumed (TRACE-8's in-flight window, which the two self-disarming budgets here open)."
+        } else if reached <= 2 {
+            "the probe was still ticking but had not reached tick 3 — this is SLOWNESS, not a stall, so \
+             the timeout is too tight for the capture cost under this concurrency rather than anything \
+             being frozen."
+        } else {
+            "the probe passed tick 3 but the matching line was not seen — look at the predicate, not the \
+             debuggee."
+        };
+        panic!(
+            "probe never reached its fourth tick, so the finally line ran fewer than 8 times.\n  \
+             DIAGNOSIS: {verdict}\n  ticks printed: {reached} (last few: {:?})\n  full probe output: {:?}",
+            ticks.iter().rev().take(3).rev().collect::<Vec<_>>(),
+            out,
+        );
+    }
 
     // Both budgets have to be spent before the listing is read, or a tally is caught mid-fill.
     server

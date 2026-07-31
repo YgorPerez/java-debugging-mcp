@@ -27,6 +27,10 @@ public class FamilyProbe {
 
     // Written by the main thread after the cue, read by the worker — volatile because the worker must
     // see it without any synchronisation the debugger could be holding.
+    // How many times the worker has actually invoked `FamilyGamma.handle`, printed on each one — see the
+    // call site. Not volatile: only the worker touches it.
+    static int gammaCalls = 0;
+
     static volatile Object gamma = null;
     static volatile Method gammaHandle = null;
 
@@ -46,6 +50,14 @@ public class FamilyProbe {
                     Method m = gammaHandle;
                     if (m != null) {
                         m.invoke(gamma, i);
+                        // PRINTED, because the test's whole question after the cue is "is gamma being
+                        // called?" and until TEST-31 this loop answered it only by silence. Two separate
+                        // sightings of the flake left `Hits: 0` on an armed stop point with no way to tell
+                        // "the worker never invoked it" from "it invoked and the breakpoint did not fire" —
+                        // which are different bugs with nothing in common. Every invocation says so now,
+                        // and the count is the witness the assertion quotes.
+                        System.out.println("gamma invoked " + (++gammaCalls));
+                        System.out.flush();
                     }
                     Thread.sleep(100);
                 } catch (InterruptedException e) {
