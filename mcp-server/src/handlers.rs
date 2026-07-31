@@ -13527,6 +13527,22 @@ impl ReadPath {
         );
     }
 
+    /// EVAL-13 (#116): a static member resolved against a copy of its class that was not the first one
+    /// tried. Said out loud because the answer is right but the reason is not obvious, and because the
+    /// shape it names — the retired deployment's copy still loaded and still sorting first — is the same
+    /// one that produces the *silent* half of this failure family (BP-7, #115).
+    fn answered_by_later_copy(&mut self, class: &str, member: &str, used: usize, labels: &[String]) {
+        self.push(format!(
+            "⚠️  '{class}' is loaded by {} classloaders and '{member}' is not on all of them: copy {} \
+             answered, after copy #0 was tried and did not have it. That asymmetry is what a redeploy \
+             leaves behind — the retired deployment's copy is still loaded, and it is the one that sorts \
+             first. Loaded by: {}. Pin a specific copy with {class}@<the 0x… you want>.",
+            labels.len(),
+            labels.get(used).map_or("?", String::as_str),
+            labels.join("; ")
+        ));
+    }
+
     fn push(&mut self, note: String) {
         if !self.notes.contains(&note) {
             self.notes.push(note);
@@ -14211,6 +14227,7 @@ async fn resolve_any_head(
     frame: Option<&jdwp_client::thread::Frame>,
     segs: &[Seg],
     head_seg: &Seg,
+    path: &mut ReadPath,
 ) -> Result<(jdwp_client::types::Value, usize), String> {
     if let Some(id) = parse_object_handle(&head_seg.name) {
         return Ok((resolve_object_handle(conn, id).await?, 1));
@@ -14233,7 +14250,7 @@ async fn resolve_any_head(
             }
         }
     }
-    let static_err = match resolve_static_head(conn, thread_id, frame, segs).await {
+    let static_err = match resolve_static_head(conn, thread_id, frame, segs, path).await {
         Ok(v) => return Ok(v),
         Err(e) => e,
     };
@@ -14343,7 +14360,7 @@ async fn resolve_expression_multi(
         return Err("Empty expression".to_string());
     };
 
-    let (mut current, start) = resolve_any_head(conn, thread_id, frame, &segs, head_seg).await?;
+    let (mut current, start) = resolve_any_head(conn, thread_id, frame, &segs, head_seg, path).await?;
 
     // The head's own subscripts still have to be applied — `orders[0]` is a single segment. For a
     // static head, `start` counts the class-name prefix too, so the member is the last consumed one.
@@ -14422,13 +14439,14 @@ async fn walk_expression_chain(
     let Some(head_seg) = segs.first() else {
         return Err("Empty expression".to_string());
     };
-    let (mut current, start) = resolve_any_head(conn, thread_id, frame, &segs, head_seg).await?;
+    // Declared before the head resolves, because the head is where EVAL-13's copy-retry caveat is raised.
+    let mut path = ReadPath::default();
+    let (mut current, start) = resolve_any_head(conn, thread_id, frame, &segs, head_seg, &mut path).await?;
 
     // A static head folds a dotted class prefix and its member into ONE link, so the count the caller
     // recognises is not `segs.len()`.
     let total_links = segs.len() + 1 - start;
     let mut steps = Vec::with_capacity(total_links);
-    let mut path = ReadPath::default();
     // A static head consumed a dotted class prefix as well as the member, so the label is all of it.
     let head_label =
         segs.get(..start).map_or_else(String::new, |s| s.iter().map(seg_label).collect::<Vec<_>>().join("."));
@@ -14577,11 +14595,19 @@ fn multi_then_chain_error(name: &str) -> String {
 ///
 /// A static field read needs no suspended thread; a static method call does (JDWP runs the
 /// invocation on a thread), and says so if none is available.
+/// **Every loaded copy of the class prefix is tried, not just the first** (EVAL-13, #116). A name resolves
+/// to one reference type per classloader, and after a redeploy the retired deployment's copy is still
+/// loaded and still sorts first — so a member added or re-signed in the running code is absent from the
+/// copy this resolver would otherwise have inspected, and the old message ("has no static method … accepting
+/// 4 argument(s) of these types") was true of that copy, false of the one serving requests, and named
+/// neither. Trying the others costs nothing on the overwhelmingly common single-copy path and only happens
+/// once a lookup has already failed.
 async fn resolve_static_head(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: Option<u64>,
     frame: Option<&jdwp_client::thread::Frame>,
     segs: &[Seg],
+    path: &mut ReadPath,
 ) -> Result<(jdwp_client::types::Value, usize), String> {
     let n = segs.len();
     if n < 2 {
@@ -14597,33 +14623,95 @@ async fn resolve_static_head(
             continue;
         }
         let dotted = class_segs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".");
-        let Some(type_id) = resolve_class_by_dotted(conn, &dotted).await? else { continue };
-        let v = match &member.args {
-            Some(arglits) => {
-                invoke_static_member(conn, thread_id, frame, type_id, &dotted, member, arglits).await?
+        let copies = resolve_class_copies_by_dotted(conn, &dotted).await?;
+        if copies.is_empty() {
+            continue;
+        }
+        // The first `Absent` is what gets reported: it came from the copy this used to inspect, so a
+        // single-copy JVM reads exactly as it did before.
+        let mut absent: Option<String> = None;
+        for (i, &type_id) in copies.iter().enumerate() {
+            let attempt = match &member.args {
+                Some(arglits) => {
+                    invoke_static_member(conn, thread_id, frame, type_id, &dotted, member, arglits).await
+                }
+                None => read_static_field(conn, type_id, &dotted, &member.name).await,
+            };
+            match attempt {
+                Ok(v) => {
+                    // Only when a LATER copy answered. Copy #0 answering is the ordinary case and says
+                    // nothing worth a line.
+                    if i > 0 {
+                        let labels = describe_class_loaders(conn, &copies).await;
+                        path.answered_by_later_copy(&dotted, &member.name, i, &labels);
+                    }
+                    return Ok((v, k + 1));
+                }
+                // Not a lookup miss — a missing thread, an unresolvable argument, an invoke that threw.
+                // Retrying those against another copy would repeat the same failure N times and bury it.
+                Err(StaticMemberMiss::Fatal(e)) => return Err(e),
+                Err(StaticMemberMiss::Absent(e)) => {
+                    absent.get_or_insert(e);
+                }
             }
-            None => read_static_field(conn, type_id, &dotted, &member.name).await?,
-        };
-        return Ok((v, k + 1));
+        }
+        // `absent` is the thing that was looked for, stated POSITIVELY and without an article
+        // ("static field 'x'"), so each composer below can negate it in its own grammar. Wording it as
+        // the negative — which is how it reads in the single-copy message — produced "NONE of the 2
+        // copies has no static field 'x'" the first time this was written.
+        let absent = absent.unwrap_or_else(|| format!("member '{}'", member.name));
+        if copies.len() == 1 {
+            return Err(format!("class '{dotted}' has no {absent}"));
+        }
+        // Absent from EVERY copy, which is a different and more useful answer than absent from one:
+        // it rules the stale-copy explanation out rather than leaving the reader to suspect it.
+        let labels = describe_class_loaders(conn, &copies).await;
+        return Err(format!(
+            "'{dotted}' is loaded {} times — one class per classloader — and NONE of the {} copies has a \
+             {absent}. All {} were searched, so this is not the retired-deployment copy answering for the \
+             running one; the name or the signature is wrong. Searched: {}.",
+            copies.len(),
+            copies.len(),
+            copies.len(),
+            labels.join("; ")
+        ));
     }
     Err("no loaded class matches the leading segment(s)".to_string())
 }
 
+/// Why a static member did not resolve, and — the only reason this is an enum — whether another loaded
+/// copy of the class is worth trying (EVAL-13, #116).
+///
+/// Collapsing both into one `String` is what made the retry impossible to add safely: "needs a suspended
+/// thread" and "the invoked method threw" would each be repeated once per classloader, and the caller
+/// would read four copies of an error that had nothing to do with copies.
+enum StaticMemberMiss {
+    /// This copy has no such member. Another copy might.
+    Absent(String),
+    /// Anything else. Retrying would reproduce it.
+    Fatal(String),
+}
+
 /// Read `Class.field` off a resolved reference type. Needs no suspended thread.
+///
+/// The `Absent` / `Fatal` split is EVAL-13's (#116): only "this copy has no such field" is worth retrying
+/// against another classloader's copy.
 async fn read_static_field(
     conn: &mut jdwp_client::JdwpConnection,
     type_id: u64,
     dotted: &str,
     name: &str,
-) -> Result<jdwp_client::types::Value, String> {
+) -> Result<jdwp_client::types::Value, StaticMemberMiss> {
     let fid = find_static_field(conn, type_id, name)
-        .await?
-        .ok_or_else(|| format!("class '{dotted}' has no static field '{name}'"))?;
-    let vals = conn
-        .get_reference_values(type_id, vec![fid])
         .await
-        .map_err(|e| format!("Failed to read static field '{name}': {e}"))?;
-    vals.into_iter().next().ok_or_else(|| "No value returned for static field".to_string())
+        .map_err(StaticMemberMiss::Fatal)?
+        .ok_or_else(|| StaticMemberMiss::Absent(format!("static field '{name}'")))?;
+    let vals = conn.get_reference_values(type_id, vec![fid]).await.map_err(|e| {
+        StaticMemberMiss::Fatal(format!("Failed to read static field '{name}' on '{dotted}': {e}"))
+    })?;
+    vals.into_iter()
+        .next()
+        .ok_or_else(|| StaticMemberMiss::Fatal("No value returned for static field".to_string()))
 }
 
 /// Invoke `Class.method(args)` via `ClassType.InvokeMethod`.
@@ -14640,29 +14728,41 @@ async fn invoke_static_member(
     dotted: &str,
     member: &Seg,
     arglits: &[ArgLit],
-) -> Result<jdwp_client::types::Value, String> {
+) -> Result<jdwp_client::types::Value, StaticMemberMiss> {
     let tid = thread_id.ok_or_else(|| {
-        format!(
+        StaticMemberMiss::Fatal(format!(
             "Calling static '{}.{}()' needs a suspended thread, and {HOW_TO_SUSPEND_FOR_AN_INVOKE}",
             dotted, member.name
-        )
+        ))
     })?;
-    let argvals = eval_args(conn, thread_id, frame, arglits).await?;
-    let (decl, m) =
-        find_method_for_args(conn, type_id, &member.name, &argvals, Some(true)).await?.ok_or_else(|| {
-            format!(
-                "class '{}' has no static method '{}' accepting {} argument(s) of these types",
-                dotted,
+    let argvals = eval_args(conn, thread_id, frame, arglits).await.map_err(StaticMemberMiss::Fatal)?;
+    // EVAL-13 (#116): the ONLY outcome here that another copy could answer differently. Note what it
+    // deliberately does not say any more — which class was inspected, and that the arity or the argument
+    // types are the problem. `score_param` matches by JNI signature string, which is identical for the
+    // same FQN under every loader, so multiple copies can never make an argument unassignable; the caller
+    // sent to re-check their types by the old wording was reading a message about the wrong class.
+    let (decl, m) = find_method_for_args(conn, type_id, &member.name, &argvals, Some(true))
+        .await
+        .map_err(StaticMemberMiss::Fatal)?
+        .ok_or_else(|| {
+            StaticMemberMiss::Absent(format!(
+                "static method '{}' accepting {} argument(s) of these types",
                 member.name,
                 argvals.len()
-            )
+            ))
         })?;
     // Box any primitive the chosen overload declares as a reference (`f(Integer)` given `5`).
-    let argvals = coerce_args(conn, tid, &m.signature, argvals).await?;
+    let argvals = coerce_args(conn, tid, &m.signature, argvals).await.map_err(StaticMemberMiss::Fatal)?;
     let (ret, exc) = conn.invoke_static_method(decl, tid, m.method_id, argvals).await.map_err(|e| {
-        format!("invoke static {}.{}() failed: {}{}", dotted, member.name, e, invoke_hint(&e))
+        StaticMemberMiss::Fatal(format!(
+            "invoke static {}.{}() failed: {}{}",
+            dotted,
+            member.name,
+            e,
+            invoke_hint(&e)
+        ))
     })?;
-    invoke_result(conn, &member.name, ret, exc).await
+    invoke_result(conn, &member.name, ret, exc).await.map_err(StaticMemberMiss::Fatal)
 }
 
 /// Resolve a dotted class name to a loaded reference type id.
@@ -14679,10 +14779,31 @@ async fn resolve_class_by_dotted(
     conn: &mut jdwp_client::JdwpConnection,
     dotted: &str,
 ) -> Result<Option<u64>, String> {
-    // A caller can pin the copy (BP-5, #79) — `com.example.Utils@0x7f3a…`, the id `list_stop_points`
-    // and the ambiguity note both print. Without one this keeps today's choice, which is what makes the
-    // change additive for everything already scripted against it.
+    Ok(resolve_class_copies_by_dotted(conn, dotted).await?.first().copied())
+}
+
+/// Every loaded copy of a dotted class name, best-first — the list [`resolve_class_by_dotted`] used to
+/// throw away after taking its head (EVAL-13, #116).
+///
+/// Element 0 is byte-for-byte the copy the single-value resolver returned before this existed (a class
+/// before an interface, otherwise `classes_by_signature` order), so nothing that already worked chooses
+/// differently. What is new is that the *rest* survive the call, which is what lets a failed member lookup
+/// ask the other copies instead of blaming the caller's signature.
+///
+/// A pinned copy (`com.example.Utils@0x7f3a…`, BP-5 #79) still yields exactly one entry, and a miss stays
+/// an error: being handed a different copy than the one you pinned is the failure the selector prevents,
+/// and "we tried the others for you" would be the same failure wearing a caveat.
+async fn resolve_class_copies_by_dotted(
+    conn: &mut jdwp_client::JdwpConnection,
+    dotted: &str,
+) -> Result<Vec<u64>, String> {
     let (dotted, want_loader) = split_loader_selector(dotted);
+    // Classes first, then interfaces — preserving `classes_by_signature` order within each group.
+    let rank = |classes: &[jdwp_client::vm::ClassInfo]| -> Vec<u64> {
+        let mut ids: Vec<u64> = classes.iter().filter(|c| c.ref_type_tag == 1).map(|c| c.type_id).collect();
+        ids.extend(classes.iter().filter(|c| c.ref_type_tag != 1).map(|c| c.type_id));
+        ids
+    };
     for sig in descriptor_candidates(dotted) {
         let classes =
             conn.classes_by_signature(&sig).await.map_err(|e| format!("classes_by_signature failed: {e}"))?;
@@ -14702,26 +14823,20 @@ async fn resolve_class_by_dotted(
                     labels.join("; ")
                 ));
             };
-            return Ok(Some(id));
+            return Ok(vec![id]);
         }
-        if let Some(c) = classes.iter().find(|c| c.ref_type_tag == 1).or_else(|| classes.first()) {
-            return Ok(Some(c.type_id));
-        }
+        return Ok(rank(&classes));
     }
 
     if !dotted.contains('.') {
         let suffix = format!("/{dotted};");
         let bare = format!("L{dotted};"); // default-package class
         let all = conn.all_classes().await.map_err(|e| format!("all_classes failed: {e}"))?;
-        let matches = |s: &str| s.ends_with(&suffix) || s == bare;
-        if let Some(c) = all.iter().find(|c| c.ref_type_tag == 1 && matches(&c.signature)) {
-            return Ok(Some(c.type_id));
-        }
-        if let Some(c) = all.iter().find(|c| matches(&c.signature)) {
-            return Ok(Some(c.type_id));
-        }
+        let matched: Vec<_> =
+            all.into_iter().filter(|c| c.signature.ends_with(&suffix) || c.signature == bare).collect();
+        return Ok(rank(&matched));
     }
-    Ok(None)
+    Ok(Vec::new())
 }
 
 /// Find a static field by name, walking the superclass chain. Skips instance fields so the id we

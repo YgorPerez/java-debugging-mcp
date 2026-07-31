@@ -48,6 +48,27 @@ with `/` and `.` treated alike and, when the class is there, names the spelling 
 about a class the debugger is looking at is not one of two honest readings; it is a wrong answer.
 _Avoid_: exists, defined (both invite the source tree as the authority)
 
+**Copy**:
+One of the **reference types** a class *name* resolves to — one per classloader that defined it. Not a
+synonym for the class: `br.com.infotera.common.util.Utils` genuinely exists several times in a WildFly JVM,
+each with its own statics, so a value read from the wrong one is a wrong answer rather than a slow one
+(BP-5, [#79](https://github.com/YgorPerez/java-debugging-mcp/issues/79)). Every reply that had to choose
+between copies says so, and `Name@0x<loader>` pins one.
+
+**A redeploy is what makes the copies disagree, and that is what makes this a word rather than a detail.**
+The retired deployment's module classloader keeps its copy loaded, so one name resolves to the old
+bytecode and the new bytecode at once — and the old copy is the one that sorts first. Two failures come out
+of that single asymmetry and they look nothing alike from the caller's chair. A **member lookup** against
+the stale copy fails *loudly and misdirectingly*: it blames the caller's signature for a member the running
+code has, sending them to re-check an arity that was never wrong (EVAL-13,
+[#116](https://github.com/YgorPerez/java-debugging-mcp/issues/116)) — so a lookup now tries every copy, and
+says which one answered. An **armed stop point** on the stale copy fails *silently*: it stays listed, stays
+enabled, and never fires, which is indistinguishable from the hypothesis about the code being wrong (BP-7,
+[#115](https://github.com/YgorPerez/java-debugging-mcp/issues/115)).
+_Avoid_: "the class" once more than one copy is loaded (that names a name, not a type); **reload** for this
+(a copy is a second *definition* under a second loader, not a redefinition of the first — see the entry
+under **The target**)
+
 **Hidden class**:
 A class the JVM made rather than a compiler — what is actually behind a lambda, a method reference or a
 generated proxy. Named `<class>/<a suffix the JVM assigned>`, where the `/` is part of the name rather

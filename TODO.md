@@ -312,6 +312,25 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## ✅ Shipped (context)
 
+- **A member lookup searches every classloader's copy (EVAL-13/#116)** — `debug.evaluate` resolved a dotted
+  class head to whichever copy `classes_by_signature` returned first and threw the rest away, so a
+  `VendaUtils.montaWSIngressoPesquisaPorChave(a, b, c, d)` against a **redeployed** WildFly answered *"class
+  … has no static method … accepting 4 argument(s) of these types"*. That sentence is true of the copy it
+  inspected, false of the copy serving requests, and names neither — and it points at arity and argument
+  types, which is where the reader then spends their time. **It cannot be an argument-type problem**:
+  `score_param` matches by JNI signature string, identical for the same FQN under every loader, so the only
+  way copies produce that error is the chosen one genuinely lacking the member. Now
+  `resolve_class_copies_by_dotted` keeps the whole list (element 0 unchanged, so nothing that worked chooses
+  differently), and a lookup that misses tries the others. A later copy that answers appends a caveat naming
+  it and how to pin one; absent from **all** of them says how many were searched, which *rules out* the
+  stale copy rather than leaving the reader to suspect their own signature. The retry is gated on a new
+  `StaticMemberMiss::Absent`/`Fatal` split — collapsing both into one `String` is what made it unsafe, since
+  "needs a suspended thread" would otherwise be repeated once per classloader. Proven by
+  `a_member_on_only_one_classloaders_copy_resolves_and_the_reply_names_the_copy` against `TwinMemberProbe`,
+  which defines one name twice and rewrites three equal-length UTF8 entries in the second copy's constant
+  pool, so each copy has a member the other lacks — asserted in **both** directions, because
+  `classes_by_signature` promises no order and a one-directional assertion would be a coin flip. The
+  silent half of the same asymmetry — an armed stop point left watching the retired copy — is BP-7 (#115).
 - **Collections read without a suspended thread (EVAL-10/#92)** — a subscript, slice or predicate filter
   on a `java.util.HashMap`, `LinkedHashMap`, `ConcurrentHashMap` or `ArrayList` is now answered by **field
   reads and array indexing only**, both of which JDWP does with nothing suspended. Before this, `map["k"]`

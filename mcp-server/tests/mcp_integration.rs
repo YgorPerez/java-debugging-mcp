@@ -10595,6 +10595,105 @@ fn an_exact_class_name_arms_every_classloaders_copy() {
     server.panic_reset();
 }
 
+/// EVAL-13 (#116): a member that exists on only ONE copy of a twice-loaded class name resolves, and the
+/// reply says which copy answered.
+///
+/// The failure this replaces is loud but misdirecting. `resolve_class_by_dotted` took the first copy,
+/// `find_method_for_args` came back empty, and the error said the class "has no static method … accepting
+/// 4 argument(s) of these types" — so the reader goes and re-checks their arity and their argument types,
+/// both of which are fine. It is not an argument-type problem and cannot be one: `score_param` matches by
+/// JNI signature string, which is identical for the same FQN under every loader, so two copies can never
+/// make an argument unassignable. The only way multiple copies produce that error is the one here — the
+/// chosen copy genuinely lacks the member.
+///
+/// **Both directions are asserted because `classes_by_signature` promises no order.** `markerAAA` exists
+/// only on the unpatched copy and `markerBBB` only on the patched one, so whichever the resolver reaches
+/// first, exactly one of the two reads has to survive by trying the other copy — and exactly one of the two
+/// replies carries the caveat. Asserting "the caveat appeared" against a single read would pass for the
+/// wrong reason half the time and be a coin flip the rest.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_member_on_only_one_classloaders_copy_resolves_and_the_reply_names_the_copy() {
+    let Some(jdk) =
+        jdk_or_skip("a_member_on_only_one_classloaders_copy_resolves_and_the_reply_names_the_copy")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "TwinMemberProbe").expect("launch TwinMemberProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // The probe's own three premises, stated by the JVM rather than assumed by the test: the name loaded
+    // twice, and each copy is missing the other's member. Without these a green run could mean the loaders
+    // collapsed into one type, in which case there is no multiplicity and nothing was proven.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("loaded twice=true"))
+        .expect("probe did not load the class twice — nothing for this test to assert about");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l == "alpha lacks senseBBB=true")
+        .expect("the unpatched copy has the patched copy's member — the byte surgery did not take");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l == "beta lacks senseAAA=true")
+        .expect("the patched copy still has the original member — the byte surgery did not take");
+    // Both copies must have RUN before reading: a class the JVM has not linked yet is not in
+    // classes_by_signature, so reading early would legitimately find one copy.
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("ran beta:")).expect("second copy never ran");
+
+    // Static FIELDS first, because they need no suspended thread at all — so this half of the assertion
+    // costs the debuggee nothing and would hold on the shared 8180.
+    let aaa = server.evaluate("TwinMemberProbe$Widget.markerAAA");
+    let bbb = server.evaluate("TwinMemberProbe$Widget.markerBBB");
+    assert_contains_all("the member on the unpatched copy resolves", &aaa, &["AAA-value"]);
+    assert_contains_all("the member on the patched copy resolves", &bbb, &["BBB-value"]);
+
+    let caveat = "is loaded by 2 classloaders and";
+    let carried: Vec<&str> = [("markerAAA", &aaa), ("markerBBB", &bbb)]
+        .iter()
+        .filter(|(_, r)| r.contains(caveat))
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        carried.len(),
+        1,
+        "exactly one of the two reads must have been answered by a copy that was not tried first, and say \
+         so — one is on each copy, so the ordering decides which. Got {carried:?}.\n  markerAAA: {aaa}\n  \
+         markerBBB: {bbb}"
+    );
+    let noted = if carried[0] == "markerAAA" { &aaa } else { &bbb };
+    assert_contains_all(
+        "the caveat names the copy that answered and how to pin one",
+        noted,
+        &["TwinLoader", "Pin a specific copy with"],
+    );
+
+    // A genuine typo still fails — and the message says how many copies were searched, which is what turns
+    // "your signature is wrong" from a guess into a statement. Absent from EVERY copy rules the stale-copy
+    // reading OUT, and that is worth more to the reader than the arity sentence it replaces.
+    let typo = server.evaluate("TwinMemberProbe$Widget.markerCCC");
+    assert_contains_all(
+        "a member on no copy at all says how many were searched",
+        &typo,
+        &["is loaded 2 times", "NONE of the 2 copies", "All 2 were searched"],
+    );
+
+    // And the invoke path, which is where #116 was actually seen. It needs a suspended thread, so this
+    // half costs a breakpoint.
+    let line = probe_line(&probe_source("TwinMemberProbe"), "// BP1");
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "TwinMemberProbe$Widget", "line": line}),
+    );
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in TwinMemberProbe$Widget.work never fired");
+    let call_aaa = server.evaluate("TwinMemberProbe$Widget.senseAAA()");
+    let call_bbb = server.evaluate("TwinMemberProbe$Widget.senseBBB()");
+    assert_contains_all("the static call on the unpatched copy resolves", &call_aaa, &["sense AAA-value"]);
+    assert_contains_all("the static call on the patched copy resolves", &call_bbb, &["sense BBB-value"]);
+
+    server.panic_reset();
+}
+
 /// EVAL-7 (#81), the half that decides whether any of it is usable on the shared 8180: a decoded
 /// `byte[]` and an `array.length` both have to be reachable from a `trace_expr`, which is the only way
 /// to read a value on an instance other people are using without freezing it.
