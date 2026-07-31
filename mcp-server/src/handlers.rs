@@ -9289,22 +9289,57 @@ async fn try_record_trace(
     session: &mut crate::session::DebugSession,
     event_set: &jdwp_client::EventSet,
 ) -> bool {
-    let (Some((thread, loc)), Some((req_id, details))) = (
-        event_set.events.first().and_then(|e| event_location(&e.details)),
-        event_set.events.first().map(|e| (e.request_id, e.details.clone())),
-    ) else {
-        return false;
-    };
+    // EVERY event in the composite, not just the first (BP-6, #102). Measured on Temurin 17/21/25: three
+    // `BREAKPOINT` requests at one bytecode location get three DISTINCT request ids, and every hit
+    // arrives as ONE composite carrying all three. Reading `events.first()` therefore recorded exactly
+    // one of them and silently dropped the rest — two `trace_expr`s on one statement, which is the
+    // natural way to watch two variables at a site you cannot suspend, and the second one's buffer just
+    // stayed empty. That reads as "the code never ran".
+    let mut handled_thread = None;
+    let mut all_ours = !event_set.events.is_empty();
+    for event in &event_set.events {
+        match record_one_traced_event(session, event).await {
+            Some(thread) => handled_thread = Some(thread),
+            None => all_ours = false,
+        }
+    }
+    // Resumed ONCE, and only when every event in the set was ours. Once, because the JVM suspended the
+    // thread once for the composite however many events it carries, and a resume per event would undo
+    // suspensions this hit never took. Only when all of them were ours, because a set mixing a traced
+    // request with a suspending one has already been given the stronger policy by the JVM (measured: a
+    // composite carrying one `All` request and two `EventThread` ones arrives with `All`) — its
+    // snapshots are taken above, but the resume decision belongs to the suspending path, which is what
+    // `false` hands it to.
+    match (all_ours, handled_thread) {
+        (true, Some(thread)) => {
+            let _ = session.connection.resume_thread(thread).await;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// One event out of a composite: record it if it belongs to a traced stop point, and say which thread it
+/// suspended so the caller can resume once for the whole set.
+///
+/// Returns `None` for an event that is not a traced request's — that is what makes the set "not all
+/// ours" and hands the resume to the suspending path.
+async fn record_one_traced_event(
+    session: &mut crate::session::DebugSession,
+    event: &jdwp_client::events::Event,
+) -> Option<u64> {
+    let (thread, loc) = event_location(&event.details)?;
+    let (req_id, details) = (event.request_id, event.details.clone());
     let Some(req) = find_traced_request(session, req_id) else {
         // TRACE-8 (#72): the request is gone, but the JVM had already generated this hit and suspended the
         // thread for it. Falling through here would surface a *traced* hit as a suspending event and
         // leave the thread frozen — trace mode's one promise, broken exactly when a budget disarm makes
-        // it hardest to notice. Resume and drop it: the budget said stop recording, not stop the VM.
+        // it hardest to notice. Drop it and let the caller resume: the budget said stop recording, not
+        // stop the VM.
         if session.was_traced_and_disarmed(req_id) {
-            let _ = session.connection.resume_thread(thread).await;
-            return true;
+            return Some(thread);
         }
-        return false;
+        return None;
     };
     // Two reasons to drop a hit without recording it, and neither charges the trace budget — so
     // "exactly N traces, then it stops" still holds:
@@ -9362,7 +9397,6 @@ async fn try_record_trace(
         }
         session.traces.push_back(rec);
     }
-    let _ = session.connection.resume_thread(thread).await;
     // TRACE-3: charge the hit against this stop point's budget and disarm it once it runs out, so a
     // hot throw/field can't keep flooding the debuggee. Only a recorded hit is charged, so the
     // "exactly N traces, then it stops" contract holds even when a condition skips some.
@@ -9381,7 +9415,7 @@ async fn try_record_trace(
     // the `recorded` branch because a Count is spent by the HIT, not by whether we chose to record it —
     // a condition that turned out false still consumed the JVM's one report.
     spend_if_counted(session, req_id).await;
-    true
+    Some(thread)
 }
 
 /// Charge one hit against a traced stop point's budget (TRACE-3). When the budget reaches zero, disarm

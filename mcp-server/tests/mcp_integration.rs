@@ -11289,3 +11289,82 @@ fn a_bare_name_resolves_against_the_frames_own_class_in_the_java_order() {
 
     server.panic_reset();
 }
+
+/// BP-6 (#102): two traced stop points on the SAME line both record.
+///
+/// The brief asked which of three problems this was, and one probe run settled it. On Temurin 17/21/25,
+/// three `BREAKPOINT` requests at one bytecode location get three **distinct** request ids, and every hit
+/// arrives as **one composite carrying all three**. So `HotSpot` is not the constraint and the ids are not
+/// colliding — the trace path was reading `events.first()` and dropping the rest.
+///
+/// Asserted against the probe's own stdout as well as the traces, because "it recorded" and "the line
+/// ran" are the two readings that have to be told apart here: an empty buffer for the second stop point
+/// looked exactly like the code never executing, which is why the bug survived being noticed once.
+///
+/// Two different `trace_expr` values, since that is the reason to want this at all — watching two
+/// variables at one statement you cannot afford to suspend, which on the shared 8180 is most of them.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn two_traced_stop_points_on_one_line_both_record() {
+    let Some(jdk) = jdk_or_skip("two_traced_stop_points_on_one_line_both_record") else { return };
+    let probe =
+        Probe::launch_running(&jdk, "BareNameProbe", |l| l.starts_with("ready")).expect("launch probe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 2")).expect("probe never ticked");
+
+    let line = probe_line(&probe_source("BareNameProbe"), "// BP4");
+    // Two expressions that both RESOLVE, and resolve differently: a bare name (EVAL-12) and the
+    // qualified form. An expression that errors would satisfy "each recorded its own text" with an
+    // error string, which is not the same claim.
+    for expr in ["calls", "BareNameProbe$Child.shadowed"] {
+        let set = server.call(
+            "debug.set_line_stop",
+            serde_json::json!({
+                "class_pattern": "BareNameProbe", "line": line, "trace": true, "trace_expr": expr,
+            }),
+        );
+        assert!(set.contains("bp_"), "could not arm a second stop point on line {line}: {set}");
+    }
+
+    // The line must actually run while both are armed, and the probe must keep running — both stop
+    // points are traced, so nothing may freeze.
+    let ticks_before = probe.output().iter().filter(|l| l.starts_with("tick ")).count();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let ticks_after = probe.output().iter().filter(|l| l.starts_with("tick ")).count();
+    assert!(
+        ticks_after > ticks_before + 1,
+        "the probe must keep ticking under two traced stop points — it went {ticks_before} -> \
+         {ticks_after}\n  output tail: {:?}",
+        probe.output().iter().rev().take(5).collect::<Vec<_>>(),
+    );
+
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    let bp1: Vec<&str> = traces.lines().filter(|l| l.starts_with('#') && l.contains("[bp_1]")).collect();
+    let bp2: Vec<&str> = traces.lines().filter(|l| l.starts_with('#') && l.contains("[bp_2]")).collect();
+    assert!(
+        !bp1.is_empty() && !bp2.is_empty(),
+        "BOTH stop points on line {line} must record — bp_1 has {} record(s), bp_2 has {}. The probe \
+         ticked {} time(s) in the window, so the line certainly ran.\n{traces}",
+        bp1.len(),
+        bp2.len(),
+        ticks_after - ticks_before,
+    );
+    // Each carries its own expression, so this is two stop points and not one reported twice.
+    assert!(
+        bp1.iter().any(|l| l.contains("| calls => (int)")),
+        "bp_1 must record its own expression as a VALUE:\n  {bp1:?}"
+    );
+    assert!(
+        bp2.iter().any(|l| l.contains("BareNameProbe$Child.shadowed => (int) 10")),
+        "bp_2 must record its own, different expression as a value:\n  {bp2:?}"
+    );
+    // And the hit counts are each stop point's own, not one shared tally.
+    let listing = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(
+        !listing.contains("Hits: 0"),
+        "neither stop point should report zero hits after the line ran:\n{listing}"
+    );
+
+    server.panic_reset();
+}
