@@ -87,6 +87,22 @@ floor from **70 s to 35 s**. The lesson generalises past this suite: **a negativ
 long as the positive would have taken.** `WatchProbe` ticks every 150 ms, so 25 s was two orders of magnitude
 more than ruling it out required.
 
+**The suite is oversubscribed on purpose, and the runner prints the number** (TEST-32). Almost every test
+waits on a probe JVM rather than computing, so libtest's `available_parallelism()` default leaves the cores
+idle. Measured on 4 vCPU: **4 threads 139.1 s (3.8x concurrent), 8 threads 87.7 s (6.3x), 16 threads 63.8 s
+(10.2x)** — *ten times concurrent on four cores*. Sixteen cores continue it: 16 -> 56.9 s, 24 -> 50.1 s,
+40 -> 45.6 s. `integration-test.sh` therefore runs **4x cores capped at 40**, and `JDWP_TEST_THREADS`
+overrides.
+
+**Do not re-derive this from Brent's bound** (`total_work / threads`), which says four threads is already
+97 % efficient and is how the lever stayed invisible: that bound assumes CPU-bound work, and this suite is
+not. Neither is copying a neighbour's number the answer — `b2c-next`'s vitest takes one worker per core and
+`~/html/infotravel-doc` caps Playwright at `workers: 4`, both correct for CPU-bound JS. The transferable
+part is *do not accept a default that assumes work you do not have*.
+
+**It raises contention, which is what the flakes come from.** Accepted deliberately: the trade is stated in
+TEST-32's commit and #114 carries the one flake the soak surfaced.
+
 Because the timing flag is nightly-gated, `integration-test.sh` now **builds with `cargo test --no-run` and
 runs the test binary directly**, keeping `RUSTC_BOOTSTRAP=1` off `cargo` — it is hashed into the build
 fingerprint, so setting it on a `cargo test` recompiles the workspace and compiles it under a flag that lets
@@ -133,9 +149,13 @@ reproduce that, pin the whole suite instead of adding load:
 taskset -c 0-3 cargo test --test mcp_integration -- --ignored --nocapture
 ```
 
-Pass **no** `--test-threads`: libtest derives it from `available_parallelism()`, which honours CPU affinity
-on Linux, so four cores make it choose four the way CI does. And prefer this to CPU hogs — a hog-based arm
-leaked 32 processes twice, because `trap … EXIT` does not fire on SIGKILL.
+Pass **no** `--test-threads`: `integration-test.sh` now computes one (**4x cores, capped at 40** — TEST-32)
+and prints it, and under `taskset -c 0-3` that comes out at **16**, which is exactly what CI passes. So the
+recipe still reproduces CI's contention; it just is not libtest's default any more. Overriding with
+`JDWP_TEST_THREADS`, or an explicit `--test-threads`, changes the shape and stops it being CI's.
+
+And prefer this to CPU hogs — a hog-based arm leaked 32 processes twice, because `trap … EXIT` does not
+fire on SIGKILL.
 
 **Run a soak against a copied binary, never the working tree.** `cp $(cargo test --no-run …) /tmp/arm.bin`
 first. An arm that rebuilds while you edit reports *your compile errors* as failures: that produced a

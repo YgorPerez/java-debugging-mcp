@@ -48,7 +48,18 @@ public class FamilyProbe {
                         m.invoke(gamma, i);
                     }
                     Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    // Transient and NOT a reason to stop being a witness. This loop is the only thing
+                    // that makes an armed stop point fire, so a worker that returns here leaves the test
+                    // waiting for a hit that can no longer happen — and the test then reports "the family
+                    // never armed", which is a wrong diagnosis of a real event (TEST-31).
+                    System.out.println("worker interrupted, continuing");
+                    System.out.flush();
                 } catch (Exception e) {
+                    // Anything else genuinely ends the loop, but it must NOT end it silently: the absence
+                    // of hits is otherwise indistinguishable from a debugger bug.
+                    System.out.println("worker stopping: " + e);
+                    System.out.flush();
                     return;
                 }
                 i++;

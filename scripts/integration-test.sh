@@ -92,6 +92,44 @@ while [ $# -gt 0 ]; do
 done
 set -- ${ARGS[@]+"${ARGS[@]}"}
 
+# --------------------------------------------------------------------------------------------------
+# Concurrency: OVERSUBSCRIBE, because this suite waits far more than it computes (TEST-32).
+#
+# libtest defaults to `available_parallelism()`, which is the right default for CPU-bound tests and the
+# wrong one here. Almost every test in this suite spends its time waiting on a probe JVM — to start, to
+# load a class, to reach a tick — so at one thread per core the cores sit idle. Measured on 4 vCPU
+# (`taskset -c 0-3`), 124 tests, 540 s of test time:
+#
+#     threads   wall clock   concurrency
+#           4        139.1s          3.8x   <- libtest's default, what this used to run
+#           8         87.7s          6.3x
+#          16         63.8s         10.2x
+#
+# 10.2x concurrent on FOUR cores. Sixteen cores continue the curve: 16 -> 56.9s, 24 -> 50.1s, 40 -> 45.6s.
+#
+# Worth stating why the neighbouring repos do not do this and are not wrong: `b2c-next`'s vitest takes the
+# default of one worker per core and `~/html/infotravel-doc` caps Playwright at `workers: 4` on CI. Both are
+# CPU-bound JS. Copying their NUMBER here would be copying the wrong half of the idea; the transferable part
+# is "do not accept a default that assumes work you do not have".
+#
+# 4x cores, capped at 40 — both ends measured (4 vCPU -> 16, this workspace's 16 cores -> 40). The cap is
+# there because the gain is flattening by then (24 -> 40 buys 4.5 s) while each thread is another probe JVM
+# competing for memory, and a machine with less RAM than cores*300MB would start swapping rather than
+# finishing sooner. `JDWP_TEST_THREADS` overrides it; an explicit `--test-threads` on the command line
+# still beats both, which is what keeps `--test-threads=1` usable for reading a failure.
+# --------------------------------------------------------------------------------------------------
+if [[ " $* " != *" --test-threads"* ]]; then
+  if [ -n "${JDWP_TEST_THREADS:-}" ]; then
+    threads=$JDWP_TEST_THREADS
+  else
+    cores=$(nproc 2>/dev/null || echo 4)
+    threads=$((cores * 4))
+    [ "$threads" -gt 40 ] && threads=40
+  fi
+  echo "Test threads: $threads (oversubscribing ${cores:-?} core(s) — this suite waits on JVMs more than it computes; JDWP_TEST_THREADS overrides)"
+  set -- "$@" "--test-threads=$threads"
+fi
+
 # Build with a clean environment — see the note above on RUSTC_BOOTSTRAP and the fingerprint. Build output
 # goes to the terminal, not into $LOG: the guards below grep for test results, and a `Compiling` line has
 # never been one.
