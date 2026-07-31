@@ -468,6 +468,14 @@ fn a_wildcard_family_arms_every_match_grows_with_class_loading_and_clears_as_one
         &list,
         &[&bpset, "armed since"],
     );
+    // BP-7 (#115) must not tell a family's member to re-arm after a redeploy. A member holds no standing
+    // watch of its own because the FAMILY holds one, and a redeploy's copy matches the pattern and is
+    // armed as a new member — so that sentence would be false here, and false is worse than absent.
+    assert!(
+        !list.contains("NOT watching for later copies"),
+        "a wildcard family's member is covered by the family's own class-prepare watch, so it must not \
+         claim it needs re-arming after a redeploy: {list}"
+    );
 
     // One id takes all of it: three breakpoints and the watch. A watch left behind would keep arming
     // classes for a family the caller believes is gone.
@@ -10589,6 +10597,98 @@ fn an_exact_class_name_arms_every_classloaders_copy() {
 
     let cleared = server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": "bp_1"}));
     assert_contains_all("one clear removes both copies", &cleared, &["✅", "bp_1"]);
+    let after = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(after.contains("No breakpoints set"), "clear left something armed: {after}");
+
+    server.panic_reset();
+}
+
+/// BP-7 (#115): a stop point armed before a redeploy fires after it, with no re-arm.
+///
+/// The sequence this covers contains no re-arm, which is why BP-4's explicit re-resolve (#9) and BP-5's
+/// arm-every-copy (#79) both miss it: `set_line_stop` → *the class loads again under a new classloader* →
+/// the request that reaches the line. A deferred stop point held a `CLASS_PREPARE` watch and
+/// `session.rs` cleared it the moment it armed, and a stop point that armed immediately never registered
+/// one at all — so an exact name watched for its class exactly **once, ever**, and a redeploy is precisely
+/// "this class loads again".
+///
+/// **The failure it replaces is silent**, which is what makes it expensive: the stop point stays listed,
+/// stays enabled, and `get_traces` is empty — indistinguishable from the predicted code path not being the
+/// one running, so the reader goes back to the source instead of re-arming.
+///
+/// The second copy loads on a **cue**, not a timer: the arming has to happen while only `v1` exists, and
+/// a timer racing the arm would make a green run mean nothing.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_stop_point_armed_before_a_redeploy_arms_the_new_classloaders_copy_too() {
+    let Some(jdk) = jdk_or_skip("a_stop_point_armed_before_a_redeploy_arms_the_new_classloaders_copy_too")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "RedeployProbe").expect("launch RedeployProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l == "deployed v1").expect("probe never deployed v1");
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("ran v1:")).expect("v1's copy never ran");
+
+    // Armed while exactly ONE copy is loaded. That is the premise: two copies at arm time is #79's case
+    // and would arm both without any of this.
+    let line = probe_line(&probe_source("RedeployProbe"), "// BP1");
+    let set = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "RedeployProbe$Widget", "line": line,
+            "trace": true, "trace_expr": "this.owner",
+        }),
+    );
+    assert!(set.contains("bp_"), "the stop point did not arm on the only loaded copy: {set}");
+    assert!(
+        !set.contains("Armed on 2 classloaders"),
+        "the second copy is not supposed to exist yet — this test's premise is gone: {set}"
+    );
+    server
+        .wait_for_traces("this.owner => \"v1\"", EVENT_TIMEOUT)
+        .expect("no traced hit from the copy that WAS loaded when the stop point armed");
+
+    // The redeploy. Nothing is re-armed, on purpose — that is the whole issue.
+    probe.send_line("redeploy").expect("send the redeploy cue");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l == "second copy is a different type=true")
+        .expect("the second load collapsed into the first type — nothing for this test to assert about");
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("ran v2:")).expect("v2's copy never ran");
+
+    // The assertion. Pre-fix this is where it hangs out the full EVENT_TIMEOUT and reports nothing,
+    // which is exactly how the bug presents in a real session.
+    server.wait_for_traces("this.owner => \"v2\"", EVENT_TIMEOUT).unwrap_or_else(|| {
+        panic!(
+            "the copy loaded by the SECOND classloader never reported, so the stop point is still \
+             watching only the retired deployment's copy — this is BP-7, and note that nothing about the \
+             listing says so on its own.\n  stop points: {}",
+            server.call("debug.list_stop_points", serde_json::json!({}))
+        )
+    });
+
+    // Still ONE stop point (ADR-0005), and the listing has to separate what is armed NOW from what will
+    // be armed later — "Armed on 2 classloaders" alone cannot tell a redeploy from a library packed into
+    // two wars, and only one of those means a copy may have arrived since you last looked.
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert_eq!(
+        listed.matches("bp_1").count(),
+        1,
+        "a copy armed by the class-load watch must join the existing stop point, not become a second: \
+         {listed}"
+    );
+    assert_contains_all(
+        "the listing separates the copies armed now from the standing watch",
+        &listed,
+        &["Armed on 2 classloaders", "DeployLoader", "loaded SINCE it was armed", "Watching for more"],
+    );
+
+    // And the watch is not left behind. A watch outliving its stop point would go on arming copies for an
+    // id the caller has been told is gone — FILT-3's mistake in a new place.
+    let cleared = server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": "bp_1"}));
+    assert_contains_all("one clear removes the stop point and its watch", &cleared, &["✅", "bp_1"]);
     let after = server.call("debug.list_stop_points", serde_json::json!({}));
     assert!(after.contains("No breakpoints set"), "clear left something armed: {after}");
 

@@ -312,6 +312,30 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## ✅ Shipped (context)
 
+- **An armed exact-name stop point keeps watching for later copies (BP-7/#115, ADR-0028)** — the redeploy
+  loop contains no re-arm, which is why BP-4's explicit re-resolve (#9) and BP-5's arm-every-copy (#79)
+  both miss it: `set_line_stop` → *edit, recompile, redeploy* → the request that reaches the line →
+  `get_traces` says **"No trace snapshots yet"**. The stop point was still enabled, still listed, and
+  watching the retired deployment's copy. The mechanism read as deliberate — `PendingBreakpoint`'s
+  `class_prepare_request_id` was documented *"cleared once armed"*, and a stop point that armed
+  immediately never registered a watch at all — so an exact name watched for its class **once, ever**,
+  while a wildcard family kept arming new classes by design. **A redeploy is precisely "this class loads
+  again."** Now `BreakpointInfo` carries a `ReArmWatch` for life and a later `CLASS_PREPARE` arms the new
+  copy into the **same** `bp_` id; `clear_stop_point` and `debug.panic` take the watch with it. The
+  location is re-resolved from what the caller **asked for** (`line_opt` / `method_hint`), not from what
+  the first copy resolved to — reusing a resolved line would land a method-named stop point wherever that
+  number happens to sit in the changed class, silently, in the one scenario where the class has just
+  changed. `list_stop_points` keeps two facts apart: armed **now**, and loaded **since** — "Armed on 4
+  classloaders" cannot tell a library packed into four wars from three redeploys of one, and only the
+  second reading means a copy you care about may have arrived. A stop point that is *not* watching says
+  so, rather than being indistinguishable from a fixed one. **Why not just report the staleness**, the
+  issue's own fallback: it is false exactly when the bug bites — the retired copy *is* still loaded — and
+  the honest version of the warning is one `classes_by_signature` away from simply arming the copies.
+  ADR-0028 carries that. Proven by `a_stop_point_armed_before_a_redeploy_arms_the_new_classloaders_copy_too`
+  against `RedeployProbe`, whose second copy loads **on a cue**: the arm must happen while only the first
+  exists, and a timer racing it would make a green run mean nothing. Defeat-the-fix confirmed — without the
+  watch the test waits out `EVENT_TIMEOUT` and reports nothing, which is how the bug presents in a session.
+  Its loud twin is EVAL-13 (#116); `CONTEXT.md` § **Copy** names both.
 - **A member lookup searches every classloader's copy (EVAL-13/#116)** — `debug.evaluate` resolved a dotted
   class head to whichever copy `classes_by_signature` returned first and threw the rest away, so a
   `VendaUtils.montaWSIngressoPesquisaPorChave(a, b, c, d)` against a **redeployed** WildFly answered *"class

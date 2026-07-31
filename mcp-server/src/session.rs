@@ -386,6 +386,9 @@ impl DebugSession {
             // A deferred breakpoint's CLASS_PREPARE is a live request too, and arming the real breakpoint
             // when it fires is not something to skip.
             || self.pending_breakpoints.iter().any(|p| p.class_prepare_request_id == req_id)
+            // And an ARMED stop point keeps one for the rest of its life (BP-7, #115), which is how a copy
+            // loaded by a redeploy's new classloader gets armed at all.
+            || self.breakpoints.values().any(|b| b.rearm.watch().is_some_and(|w| w.request_id == req_id))
     }
 
     /// Classify a traced exception hit as a first throw or a rethrow of an instance already captured,
@@ -1167,6 +1170,76 @@ pub struct BreakpointInfo {
     /// Everything needed to re-arm this breakpoint at the same location after a `toggle_stop_point`
     /// disable (BP-1). Kept for every armed breakpoint so disable→enable round-trips exactly.
     pub arm: BreakpointArm,
+    /// Whether copies of this class loaded LATER will be armed, and by what (BP-7, #115).
+    pub rearm: RearmState,
+}
+
+/// What is watching for later copies of an armed stop point's class (BP-7, #115).
+///
+/// Three states rather than an `Option`, because two of the three "no standing watch of my own" cases mean
+/// opposite things to a caller and the listing has to say so. A wildcard family's member is covered by the
+/// FAMILY's watch — a redeploy's copy matches the pattern and is armed as a new member, under its own
+/// `bp_` id — so telling its owner to re-arm after a redeploy would be false. A stop point whose watch
+/// could not be registered genuinely does need re-arming, and that has to be legible rather than inferred
+/// from an absent line.
+#[derive(Debug, Clone)]
+pub enum RearmState {
+    /// Holding its own watch, and will arm later copies into this same stop point.
+    Watching(ReArmWatch),
+    /// A wildcard family's member (FILT-3). The family owns one watch between all of them.
+    CoveredByFamily,
+    /// Nothing is watching. Said out loud, because it behaves exactly as everything did before #115.
+    Unwatched,
+}
+
+impl RearmState {
+    /// The watch, when this stop point owns one.
+    pub const fn watch(&self) -> Option<&ReArmWatch> {
+        match self {
+            Self::Watching(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    /// The watch, mutably — for the counter that makes a redeploy legible in `list_stop_points`.
+    pub const fn watch_mut(&mut self) -> Option<&mut ReArmWatch> {
+        match self {
+            Self::Watching(w) => Some(w),
+            _ => None,
+        }
+    }
+}
+
+/// The `CLASS_PREPARE` watch an **armed** exact-name stop point keeps for the rest of its life (BP-7, #115).
+///
+/// Before this, an exact name watched for its class exactly once, ever: [`PendingBreakpoint`] cleared its
+/// watch the moment it armed, and a stop point that armed immediately never registered one. A wildcard
+/// family kept arming classes that loaded later by design; an exact name did not — and **a redeploy is
+/// precisely "this class loads again"**. The new deployment gets a new module classloader, nothing arms the
+/// copy in it, and the stop point stays enabled, stays listed, and watches the retired deployment's copy.
+///
+/// What makes that worth a whole mechanism rather than a caveat is that the failure is **silent and
+/// shaped exactly like being wrong**: Rule 0 puts you on `trace:true`, which by design produces nothing
+/// when it does not fire, so an empty `get_traces` reads as "the code path I predicted is not the one
+/// running" and you go back to re-read the code. Its loud twin — a member lookup against the same retired
+/// copy — is EVAL-13 (#116). See `CONTEXT.md` § **Copy**.
+#[derive(Debug, Clone)]
+pub struct ReArmWatch {
+    /// The live `CLASS_PREPARE` request id. Cleared when the stop point is cleared, never when it arms.
+    pub request_id: i32,
+    /// The JNI signature this watch matches, compared against the `ClassPrepare` event's own.
+    pub signature: String,
+    /// How many copies this watch has armed SINCE the stop point was set. Counted because it is the one
+    /// number that distinguishes "armed on 4 classloaders because this library is in four wars" from
+    /// "armed on 4 because you have redeployed three times", and `list_stop_points` is where a reader
+    /// goes to tell those apart.
+    pub later_copies: usize,
+    /// The location as the CALLER asked for it, not as it resolved. A later copy is re-resolved from
+    /// these, and it has to be: a stop point armed by method name whose resolved line was then reused as
+    /// the target would land wherever that line number happens to be in the redeployed class, which is
+    /// exactly the drift the caller never asked for.
+    pub line: Option<i32>,
+    pub method: Option<String>,
 }
 
 impl BreakpointInfo {

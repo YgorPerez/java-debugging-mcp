@@ -62,9 +62,12 @@ of that single asymmetry and they look nothing alike from the caller's chair. A 
 the stale copy fails *loudly and misdirectingly*: it blames the caller's signature for a member the running
 code has, sending them to re-check an arity that was never wrong (EVAL-13,
 [#116](https://github.com/YgorPerez/java-debugging-mcp/issues/116)) — so a lookup now tries every copy, and
-says which one answered. An **armed stop point** on the stale copy fails *silently*: it stays listed, stays
-enabled, and never fires, which is indistinguishable from the hypothesis about the code being wrong (BP-7,
-[#115](https://github.com/YgorPerez/java-debugging-mcp/issues/115)).
+says which one answered. An **armed stop point** on the stale copy failed *silently*: it stayed listed,
+stayed enabled, and never fired, which is indistinguishable from the hypothesis about the code being wrong
+(BP-7, [#115](https://github.com/YgorPerez/java-debugging-mcp/issues/115)) — so an exact name now keeps its
+class-load watch for life and arms the new copy itself (ADR-0028). The two fixes are asymmetric on purpose,
+and the asymmetry is the point: the loud one could be *answered better*, the silent one had to be
+*prevented*, because nothing a reply says can reach someone who is reading an absence.
 _Avoid_: "the class" once more than one copy is loaded (that names a name, not a type); **reload** for this
 (a copy is a second *definition* under a second loader, not a redefinition of the first — see the entry
 under **The target**)

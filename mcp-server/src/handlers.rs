@@ -805,6 +805,13 @@ impl RequestHandler {
                 .map_err(|e| format!("Failed to clear breakpoint: {e}"))?;
         }
 
+        // And its standing class-load watch (BP-7, #115). A watch left behind would go on arming copies
+        // of a class for a stop point the caller has been told is gone — the FILT-3 mistake in a new
+        // place, and the hits would arrive under an id nothing owns any more.
+        if let Some(w) = bp_info.rearm.watch() {
+            let _ = session.connection.clear_class_prepare(w.request_id).await;
+        }
+
         // Remove from session
         session.breakpoints.remove(bp_id);
         let family_note = release_family_slot(&mut session, bp_id).await;
@@ -980,45 +987,7 @@ impl RequestHandler {
         let ne = session.exception_requests.len();
         let nw = session.watchpoints.len();
         let nm = session.method_exits.len();
-        let _ = session.connection.clear_all_breakpoints().await;
-        session.breakpoints.clear();
-        // Also drop deferred breakpoints' CLASS_PREPARE watches.
-        let pend: Vec<i32> =
-            session.pending_breakpoints.drain(..).map(|p| p.class_prepare_request_id).collect();
-        for req in pend {
-            let _ = session.connection.clear_class_prepare(req).await;
-        }
-        // A wildcard family's members are BREAKPOINT requests, so `ClearAllBreakpoints` above already took
-        // them — but its class-prepare watch is a different event kind and would survive, re-arming new
-        // classes on a VM the caller just asked to be left alone (FILT-3).
-        let sets: Vec<i32> = session.pattern_sets.drain().filter_map(|(_, s)| s.watch.request_id()).collect();
-        for req in sets {
-            let _ = session.connection.clear_class_prepare(req).await;
-        }
-        // ClearAllBreakpoints only removes BREAKPOINT requests — clear exception requests too. A
-        // disabled one holds no live request, so there is nothing to clear in the JVM for it.
-        let excs: Vec<i32> = session.exception_requests.drain().filter_map(|(_, e)| e.request_id).collect();
-        for req in excs {
-            let _ = session.connection.clear_exception_request(req).await;
-        }
-        // Field watches are likewise untouched by ClearAllBreakpoints, and leaving one armed keeps
-        // the debuggee de-optimised — so panic must drop them too.
-        let watches: Vec<(i32, jdwp_client::WatchKind)> =
-            session.watchpoints.drain().filter_map(|(_, w)| w.request_id.map(|r| (r, w.kind))).collect();
-        for (req, kind) in watches {
-            let _ = session.connection.clear_field_watch(req, kind).await;
-        }
-        // Method-exit requests are the most important thing for panic to drop: a suspending one on a hot
-        // method re-freezes the VM on the very next return, so resuming without clearing them would be
-        // no rescue at all. `ClearAllBreakpoints` does not touch them either.
-        let mexits: Vec<(i32, bool)> = session
-            .method_exits
-            .drain()
-            .filter_map(|(_, m)| m.request_id.map(|r| (r, m.with_return_value)))
-            .collect();
-        for (req, with_value) in mexits {
-            let _ = session.connection.clear_method_exit_request(req, with_value).await;
-        }
+        disarm_everything(&mut session).await;
         // The panic button's whole job is to leave the VM running, so it must clear a counted suspend
         // depth and report honestly if it couldn't (SAFE-7).
         let note = resume_and_verify(&mut session).await?;
@@ -4751,6 +4720,35 @@ fn render_breakpoint_line(
             bp.class_pattern
         );
     }
+    // BP-7 (#115). Two facts, kept apart on purpose: how many copies are armed NOW, and whether more
+    // will be. "Armed on 4 classloaders" alone cannot tell a library packed into four wars from three
+    // redeploys of one — and the second reading is the one that means a copy you care about may have
+    // arrived since you last looked.
+    if let crate::session::RearmState::Watching(w) = &bp.rearm {
+        if w.later_copies > 0 {
+            let _ = writeln!(
+                output,
+                "     ↻ {} copy/copies of this class have loaded SINCE it was armed and were armed too \
+                 — that is what a redeploy looks like from here, and the retired copies above are still \
+                 listed because their loaders have not been collected yet",
+                w.later_copies
+            );
+        }
+        let _ = writeln!(
+            output,
+            "     👀 Watching for more copies — a class loaded again under a new classloader is armed \
+             automatically, so this stop point does NOT need re-arming after a redeploy"
+        );
+    } else if bp.is_armed() && matches!(bp.rearm, crate::session::RearmState::Unwatched) {
+        // Said out loud rather than left to be inferred from an absent line. NOT printed for a wildcard
+        // family's member: the family's own watch arms a redeploy's copy as a new member, so telling its
+        // owner to re-arm would be false.
+        let _ = writeln!(
+            output,
+            "     ⚠️  NOT watching for later copies — re-arm this stop point after a redeploy, or a copy \
+             loaded under a new classloader will never fire and the silence will read as a wrong guess"
+        );
+    }
     if let Some(t) = bp.arm.thread_filter {
         let _ = writeln!(output, "     Thread filter: 0x{t:x}");
     }
@@ -8208,7 +8206,7 @@ async fn try_arm_deferred_breakpoints(
                         request_ids.extend(extra_copies.request_ids);
                         // Do the bookkeeping that only borrows `pend` first, so its owned fields can
                         // be moved (not cloned) into the stored BreakpointInfo below.
-                        let _ = session.connection.clear_class_prepare(pend.class_prepare_request_id).await;
+                        let rearm = crate::session::RearmState::Watching(handover_watch(&pend));
                         session.pending_breakpoints.retain(|p| p.bp_id != pend.bp_id);
                         info!(
                             "Armed deferred breakpoint {} on {} (line {})",
@@ -8239,9 +8237,11 @@ async fn try_arm_deferred_breakpoints(
                                 trace_cost: crate::session::TraceCost::default(),
                                 // A CLASS_PREPARE names exactly one reference type, so a deferred arm
                                 // has no multiplicity to report — a second classloader loading the same
-                                // name fires its own event and is a separate concern.
+                                // name fires its own event, and the standing watch below is what now
+                                // catches it (BP-7, #115).
                                 loaders: Vec::default(),
                                 arm,
+                                rearm,
                             },
                         );
                     }
@@ -8255,8 +8255,208 @@ async fn try_arm_deferred_breakpoints(
         }
     }
     arm_pattern_set_members(session, cp_ref, &cp_sig).await;
+    rearm_later_copies(session, cp_ref, &cp_sig).await;
     let _ = session.connection.resume_thread(cp_thread).await;
     true
+}
+
+/// Clear every stop-point request this session owns, of every event kind, and forget them.
+///
+/// Extracted from `debug.panic` because the list is long, the reason each entry is on it is different, and
+/// they are the same reason: **`ClearAllBreakpoints` removes `BREAKPOINT` requests and nothing else.**
+/// Every other kind here — class-prepare watches (deferred, wildcard-family, and BP-7's standing one),
+/// exception requests, field watches, method exits — survives it, and each survives it *differently*
+/// enough to be worth its own sentence.
+async fn disarm_everything(session: &mut crate::session::DebugSession) {
+    let _ = session.connection.clear_all_breakpoints().await;
+    clear_standing_rearm_watches(session).await;
+    session.breakpoints.clear();
+    // Also drop deferred breakpoints' CLASS_PREPARE watches.
+    let pend: Vec<i32> = session.pending_breakpoints.drain(..).map(|p| p.class_prepare_request_id).collect();
+    for req in pend {
+        let _ = session.connection.clear_class_prepare(req).await;
+    }
+    // A wildcard family's members are BREAKPOINT requests, so `ClearAllBreakpoints` above already took
+    // them — but its class-prepare watch is a different event kind and would survive, re-arming new
+    // classes on a VM the caller just asked to be left alone (FILT-3).
+    let sets: Vec<i32> = session.pattern_sets.drain().filter_map(|(_, s)| s.watch.request_id()).collect();
+    for req in sets {
+        let _ = session.connection.clear_class_prepare(req).await;
+    }
+    // ClearAllBreakpoints only removes BREAKPOINT requests — clear exception requests too. A
+    // disabled one holds no live request, so there is nothing to clear in the JVM for it.
+    let excs: Vec<i32> = session.exception_requests.drain().filter_map(|(_, e)| e.request_id).collect();
+    for req in excs {
+        let _ = session.connection.clear_exception_request(req).await;
+    }
+    // Field watches are likewise untouched by ClearAllBreakpoints, and leaving one armed keeps
+    // the debuggee de-optimised — so panic must drop them too.
+    let watches: Vec<(i32, jdwp_client::WatchKind)> =
+        session.watchpoints.drain().filter_map(|(_, w)| w.request_id.map(|r| (r, w.kind))).collect();
+    for (req, kind) in watches {
+        let _ = session.connection.clear_field_watch(req, kind).await;
+    }
+    // Method-exit requests are the most important thing for panic to drop: a suspending one on a hot
+    // method re-freezes the VM on the very next return, so resuming without clearing them would be
+    // no rescue at all. `ClearAllBreakpoints` does not touch them either.
+    let mexits: Vec<(i32, bool)> = session
+        .method_exits
+        .drain()
+        .filter_map(|(_, m)| m.request_id.map(|r| (r, m.with_return_value)))
+        .collect();
+    for (req, with_value) in mexits {
+        let _ = session.connection.clear_method_exit_request(req, with_value).await;
+    }
+}
+
+/// Drop every armed stop point's standing class-load watch (BP-7, #115).
+///
+/// `ClearAllBreakpoints` takes BREAKPOINT requests only, and these are `CLASS_PREPARE` — the same
+/// different-event-kind survival FILT-3's family watch has, and one left behind would go on arming classes
+/// on a VM the caller has just asked to be left alone.
+async fn clear_standing_rearm_watches(session: &mut crate::session::DebugSession) {
+    let standing: Vec<i32> =
+        session.breakpoints.values().filter_map(|b| b.rearm.watch().map(|w| w.request_id)).collect();
+    for req in standing {
+        let _ = session.connection.clear_class_prepare(req).await;
+    }
+}
+
+/// The standing class-load watch a deferred stop point hands over at the moment it arms (BP-7, #115).
+///
+/// It is KEPT, not cleared, and that single change is the whole of the fix. Clearing it here is what made
+/// an exact name watch for its class exactly once, ever — so a redeploy, which is precisely "this class
+/// loads again", left the stop point armed on the retired deployment's copy: still listed, still enabled,
+/// and silent.
+fn handover_watch(pend: &crate::session::PendingBreakpoint) -> crate::session::ReArmWatch {
+    crate::session::ReArmWatch {
+        request_id: pend.class_prepare_request_id,
+        signature: pend.signature.clone(),
+        later_copies: 0,
+        line: pend.line,
+        method: pend.method.clone(),
+    }
+}
+
+/// One armed stop point's share of what [`rearm_later_copies`] needs, taken in a single pass.
+///
+/// Collected up front rather than looked up per iteration because the loop needs `&mut session.connection`
+/// and cannot hold a borrow of `session.breakpoints` across it — and because doing it in one pass is where
+/// the copying belongs, instead of once per newly-loaded class inside the body.
+struct LaterCopyTarget {
+    bp_id: String,
+    /// The location as the CALLER asked for it. See [`crate::session::ReArmWatch::line`].
+    line: Option<i32>,
+    method: Option<String>,
+    arm: crate::session::BreakpointArm,
+}
+
+/// A class just loaded: arm it for every ARMED exact-name stop point still watching for later copies
+/// (BP-7, #115).
+///
+/// **This is the redeploy case and it has no reply**, running in the event pump — so the only place a
+/// caller learns it happened is `debug.list_stop_points`, which is why the count is stored rather than
+/// merely logged. What it prevents is not a missing feature but a *silence*: before this, the new
+/// deployment's copy was unarmed, the stop point stayed listed and enabled, and an empty `get_traces`
+/// read exactly like the hypothesis about the code being wrong.
+async fn rearm_later_copies(session: &mut crate::session::DebugSession, cp_ref: u64, cp_sig: &str) {
+    let targets: Vec<LaterCopyTarget> = session
+        .breakpoints
+        .iter()
+        .filter(|(_, b)| b.enabled && !b.spent && b.rearm.watch().is_some_and(|w| w.signature == cp_sig))
+        // Already armed on this very reference type. The load race in `defer_breakpoint` closes by arming
+        // from `classes_by_signature` while the watch is live, so the event for that same copy still
+        // arrives — and arming it twice would double every hit on one caller-facing stop point.
+        .filter(|(_, b)| {
+            b.arm.class_id != cp_ref && !b.arm.extra_locations.iter().any(|l| l.class_id == cp_ref)
+        })
+        .map(|(id, b)| LaterCopyTarget {
+            bp_id: id.clone(),
+            line: b.rearm.watch().and_then(|w| w.line),
+            method: b.rearm.watch().and_then(|w| w.method.clone()),
+            arm: b.arm.clone(),
+        })
+        .collect();
+    for LaterCopyTarget { bp_id, line, method, arm } in targets {
+        let loc = match resolve_bp_location(&mut session.connection, cp_ref, line, method.as_deref()).await {
+            Ok(loc) => loc,
+            // A copy that does not have the location is news, not an error: the redeployed class may
+            // genuinely no longer have that line. There is no reply to carry it, so it is logged and the
+            // stop point keeps the copies it has.
+            Err(e) => {
+                warn!("{bp_id}: {cp_sig} loaded again but the location did not resolve in the new copy: {e}");
+                continue;
+            }
+        };
+        let mut fresh = crate::session::BreakpointArm {
+            class_id: cp_ref,
+            method_id: loc.method.method_id,
+            bytecode_index: loc.code_index,
+            // The duplicated bytecode copies of this line INSIDE the new class (BP-4, #78) — a `finally`
+            // is inlined per exit path in every copy of the class, not just the first one armed.
+            extra_locations: loc
+                .extra_code_indices
+                .into_iter()
+                .map(|bytecode_index| crate::session::ArmedLocation {
+                    class_id: cp_ref,
+                    method_id: loc.method.method_id,
+                    bytecode_index,
+                })
+                .collect(),
+            suspend_policy: arm.suspend_policy,
+            hit_count: arm.hit_count,
+            thread_filter: arm.thread_filter,
+            instance_filter: arm.instance_filter,
+        };
+        let primary = match session
+            .connection
+            .set_breakpoint_ex(
+                cp_ref,
+                loc.method.method_id,
+                loc.code_index,
+                arm.suspend_policy,
+                jdwp_client::EventFilters {
+                    count: arm.hit_count,
+                    thread: arm.thread_filter,
+                    instance: arm.instance_filter,
+                },
+            )
+            .await
+        {
+            Ok(req) => req,
+            Err(e) => {
+                warn!("{bp_id}: failed to arm the newly loaded copy of {cp_sig}: {e}");
+                continue;
+            }
+        };
+        let extra = arm_extra_line_copies(session, &fresh).await;
+        fresh.extra_locations = extra.armed;
+
+        // Recomputed from the arm rather than appended to, so the labels stay in one order and a copy
+        // whose loader has since been collected is not silently kept in the list.
+        let mut class_ids: Vec<u64> = vec![arm.class_id];
+        class_ids.extend(arm.extra_locations.iter().map(|l| l.class_id));
+        class_ids.push(cp_ref);
+        class_ids.extend(fresh.extra_locations.iter().map(|l| l.class_id));
+        let mut seen = std::collections::HashSet::new();
+        class_ids.retain(|id| seen.insert(*id));
+        let loaders = describe_class_loaders(&mut session.connection, &class_ids).await;
+
+        let Some(info) = session.breakpoints.get_mut(&bp_id) else { continue };
+        info.request_ids.push(primary);
+        info.request_ids.extend(extra.request_ids);
+        info.arm.extra_locations.push(crate::session::ArmedLocation {
+            class_id: cp_ref,
+            method_id: fresh.method_id,
+            bytecode_index: fresh.bytecode_index,
+        });
+        info.arm.extra_locations.extend(fresh.extra_locations);
+        info.loaders = loaders;
+        if let Some(w) = info.rearm.watch_mut() {
+            w.later_copies += 1;
+        }
+        info!("{bp_id}: armed a newly loaded copy of {cp_sig} (BP-7) — now {} copies", class_ids.len());
+    }
 }
 
 /// A class just loaded: arm it for every wildcard family whose pattern it matches (FILT-3).
@@ -8303,7 +8503,7 @@ async fn arm_pattern_set_members(
             spec_from_pattern_set(set, &fqn, signature)
         };
         let bp_id = session.next_stop_id("bp_");
-        match arm_and_insert(session, &[class_ref], &spec, bp_id).await {
+        match arm_and_insert(session, &[class_ref], &spec, bp_id, RearmPlan::family_member()).await {
             Ok(armed) => {
                 info!("Armed {} on newly loaded {} for family {}", armed.bp_id, fqn, set_id);
                 if let Some(s) = session.pattern_sets.get_mut(&set_id) {
@@ -10726,6 +10926,7 @@ async fn arm_and_insert(
     class_type_ids: &[u64],
     spec: &BreakpointSpec,
     bp_id: String,
+    rearm: RearmPlan,
 ) -> Result<ArmedBreakpoint, ArmError> {
     let Some((&class_type_id, other_copies)) = class_type_ids.split_first() else {
         return Err(ArmError::Other(format!("{} is not loaded", spec.class_pattern)));
@@ -10791,6 +10992,13 @@ async fn arm_and_insert(
     request_ids.extend(extra_copies.request_ids);
     let mut partial = extra_copies.refused;
     partial.extend(unresolved);
+    // BP-7 (#115). A watch that could not be registered is REPORTED, not dropped: a stop point that is
+    // not watching for later copies behaves exactly as it did before #115, and that is the failure this
+    // mechanism exists to remove — it must not be indistinguishable from the fixed one.
+    let RearmPlan { watch: rearm, refusal } = rearm;
+    if let Some(r) = refusal {
+        partial.push(r);
+    }
     let loader_count = class_type_ids.len();
     // Only when there is an ambiguity to report: naming a loader costs three round trips per copy, and
     // the single-copy case is nearly every class.
@@ -10821,6 +11029,7 @@ async fn arm_and_insert(
             trace_cost: crate::session::TraceCost::default(),
             loaders,
             arm,
+            rearm,
         },
     );
     // After arming, not before: the breakpoint is the thing the caller asked for, and a drift check that
@@ -10852,6 +11061,66 @@ async fn register_deferred_breakpoint(
             spec.class_pattern,
             describe_where(spec.line_opt, spec.method_hint.as_deref())
         )),
+    }
+}
+
+/// What an exact-name arm decided about the standing class-load watch it keeps (BP-7, #115).
+struct RearmPlan {
+    watch: crate::session::RearmState,
+    /// Worded for the arm reply when the watch could NOT be registered. Never silent, because a stop
+    /// point without one behaves exactly as it did before #115.
+    refusal: Option<String>,
+}
+
+impl RearmPlan {
+    /// A wildcard family's member. The family owns ONE watch between all of them (FILT-3), and a
+    /// per-member watch would arm every newly-loaded class twice.
+    const fn family_member() -> Self {
+        Self { watch: crate::session::RearmState::CoveredByFamily, refusal: None }
+    }
+
+    /// Adopt a watch already registered for this signature — the deferred path's, which used to be
+    /// cleared the moment it armed.
+    fn watching(request_id: i32, spec: &BreakpointSpec) -> Self {
+        Self {
+            watch: crate::session::RearmState::Watching(crate::session::ReArmWatch {
+                request_id,
+                signature: spec.signature.clone(),
+                later_copies: 0,
+                line: spec.line_opt,
+                method: spec.method_hint.clone(),
+            }),
+            refusal: None,
+        }
+    }
+}
+
+/// Register the standing `CLASS_PREPARE` watch an exact-name stop point keeps for its whole life (BP-7).
+///
+/// `EventThread` suspend, matching the deferred path: the preparing thread is held so the new copy is
+/// armed before any of its code runs, and the pump resumes that one thread. The cost is one filter
+/// evaluation in the JVM per class load, against one exact signature — a redeploy is the only thing that
+/// makes it fire twice.
+async fn register_rearm_watch(
+    session: &mut crate::session::DebugSession,
+    spec: &BreakpointSpec,
+) -> RearmPlan {
+    match session
+        .connection
+        .set_class_prepare(&spec.class_pattern, jdwp_client::SuspendPolicy::EventThread)
+        .await
+    {
+        Ok(request_id) => RearmPlan::watching(request_id, spec),
+        Err(e) => RearmPlan {
+            watch: crate::session::RearmState::Unwatched,
+            refusal: Some(format!(
+                "⚠️  Armed, but the class-load watch could NOT be registered ({e}), so a copy of {} \
+                 loaded later — which is what a redeploy is — will not be armed. That silence would be \
+                 indistinguishable from the code path not running, so: re-arm this stop point after \
+                 every redeploy.",
+                spec.class_pattern
+            )),
+        },
     }
 }
 
@@ -10892,8 +11161,11 @@ async fn defer_breakpoint(
     if !recheck.is_empty() {
         // Every copy, not the first: the race can close on a name several classloaders hold (BP-5, #79).
         let ctids: Vec<u64> = recheck.iter().map(|c| c.type_id).collect();
-        let _ = session.connection.clear_class_prepare(cp_req).await;
-        let armed = arm_and_insert(session, &ctids, spec, bp_id).await.map_err(ArmError::into_message)?;
+        // The watch is KEPT rather than cleared (BP-7, #115): it was registered a moment ago for exactly
+        // this signature, and an armed exact-name stop point now needs one for the rest of its life.
+        let plan = RearmPlan::watching(cp_req, spec);
+        let armed =
+            arm_and_insert(session, &ctids, spec, bp_id, plan).await.map_err(ArmError::into_message)?;
         return Ok(DeferResult::ArmedOnRecheck(armed));
     }
 
@@ -11363,7 +11635,7 @@ async fn arm_pattern_family(
         }
         let per_class = spec.for_pattern(&fqn);
         let bp_id = session.next_stop_id("bp_");
-        match arm_and_insert(session, &[type_id], &per_class, bp_id).await {
+        match arm_and_insert(session, &[type_id], &per_class, bp_id, RearmPlan::family_member()).await {
             Ok(armed) => members.push(FamilyMember { class: fqn, armed }),
             // Not a failure: the pattern matched a class that is not a target. Counted, never listed —
             // a broad pattern would otherwise bury the real failures under dozens of these.
@@ -11489,7 +11761,8 @@ async fn arm_one_pattern(
     }
     // Every classloader's copy (BP-5, #79), same as the single-named path.
     let type_ids: Vec<u64> = classes.iter().map(|c| c.type_id).collect();
-    match arm_and_insert(session, &type_ids, spec, bp_id).await {
+    let plan = register_rearm_watch(session, spec).await;
+    match arm_and_insert(session, &type_ids, spec, bp_id, plan).await {
         Ok(armed) => PatternOutcome::Armed(armed),
         Err(e) => PatternOutcome::Failed(e.into_message()),
     }
@@ -11523,8 +11796,9 @@ async fn arm_single_named(
     // other deployment's copy.
     let class_type_ids: Vec<u64> = classes.iter().map(|c| c.type_id).collect();
 
+    let plan = register_rearm_watch(session, spec).await;
     let armed =
-        arm_and_insert(session, &class_type_ids, spec, bp_id).await.map_err(ArmError::into_message)?;
+        arm_and_insert(session, &class_type_ids, spec, bp_id, plan).await.map_err(ArmError::into_message)?;
     let request_id = armed.describe_requests();
     let (bp_id, line, method_name) = (&armed.bp_id, armed.line, &armed.method_name);
 
