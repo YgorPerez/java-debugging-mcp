@@ -247,11 +247,17 @@ jobs:
           # the summary. Set explicitly and said out loud because it nearly did not: a local negative test
           # printed "exit=0" while the check had in fact failed, because `$?` after a pipeline is `tee`'s.
           set -o pipefail
-          # Spelled out rather than as a `${{ cond && 'a' || 'b' }}` ternary: in that idiom an empty string
-          # is falsy, so the natural `inputs.gate_semver && '' || '--report-only'` silently passes
-          # --report-only in BOTH directions. `inputs` is an empty context on the push/PR triggers, so an
-          # unset value compares unequal to "true" and reports rather than gates — which is the safe way
-          # round for the branch that is not the tag.
+          # Spelled out in bash rather than as GitHub's and-or ternary idiom, for two reasons and the
+          # second one broke this file once. FIRST: in that idiom an empty string is falsy, so the natural
+          # `inputs.gate_semver && '' || '--report-only'` silently passes --report-only in BOTH directions
+          # and would ungate the release. SECOND: an expression written in a COMMENT is still an
+          # expression — GitHub interpolates the whole `run:` body before the shell ever sees it, so a
+          # worked example naming a context that does not exist is a workflow-file parse error, and the
+          # run fails with zero jobs and no annotation on any step. That is how the commit introducing
+          # this input failed: the comment warning about the idiom contained the idiom.
+          #
+          # `inputs` is an empty context on the push/PR triggers, so an unset value compares unequal to
+          # "true" and reports rather than gates — the safe way round for the branch that is not the tag.
           args=()
           if [ "${{ inputs.gate_semver }}" != "true" ]; then args+=(--report-only); fi
           scripts/semver-check.sh "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
