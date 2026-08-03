@@ -143,6 +143,20 @@ were open when this landed and the trade was accepted with that stated. Refresh 
 `scripts/test-timings.py --emit-timings <log> > mcp-server/tests/timings.tsv`; it is generated, never hand-edited,
 and drift is reported rather than fatal.
 
+**A shard number written down anywhere is stale, and following one costs a green run of nothing.** #118's
+reproduction recipe named `--shard 1/2`; six runs of it passed cleanly and the test it was supposed to
+exercise had moved to shard **2/2**, because the split is by *measured* duration and the suite had grown from
+180 tests to 197 with `timings.tsv` refreshed several times in between. Six green runs that proved nothing and
+looked like they proved something. **Check membership before trusting a shard number:**
+
+```bash
+scripts/shard-plan.py --tests <(<the-test-binary> --ignored --list) --which launch_suspends
+# 2/2  launch_suspends_before_the_first_instruction_and_disconnect_terminates_it
+```
+
+`--which` exits non-zero and says so when the name is in **no** shard, which is the case that otherwise looks
+like a pass. Prefer the unsharded form in anything you write down: it has no shard number to rot.
+
 **Getting the JDKs CI has.** "More than one" was aspirational for a while because this workspace had only
 JDK 11 and a snap JBR, so every result ended in "17 and 21 are CI's to confirm" — which is a slow way to
 learn that a test is version-locked. Adoptium tarballs need no root and no package manager:

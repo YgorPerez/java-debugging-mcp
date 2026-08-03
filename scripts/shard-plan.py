@@ -131,6 +131,39 @@ def report(buckets, loads, unknown, median, floor, timings, tests, shards):
         )
 
 
+def which_shard(buckets, needle):
+    """Say which shard holds each test matching `needle`, for checking a written-down shard number.
+
+    This exists because of an hour lost to the recipe in a flake issue (#118): it named
+    `--shard 1/2`, six runs of that shard passed cleanly, and the test it was supposed to exercise had
+    moved to shard 2/2 — so the runs proved nothing and looked like they proved something. The split is by
+    MEASURED duration, so it moves whenever a test is added or `timings.tsv` is refreshed, and `CLAUDE.md`
+    already warns that any shard number written down is stale. What was missing was a cheap way to check,
+    rather than a three-step pipeline through `--list` and `grep` that nobody builds until after the fact.
+    """
+    hits = [
+        (number, name)
+        for number, bucket in enumerate(buckets, 1)
+        for name in sorted(bucket)
+        if needle in name
+    ]
+    if not hits:
+        print(
+            f"shard-plan: no test matches {needle!r}. It is not in ANY shard, so no --shard run can "
+            "exercise it — check the name against `<the-test-binary> --ignored --list`.",
+            file=sys.stderr,
+        )
+        return 1
+    for number, name in hits:
+        print(f"{number}/{len(buckets)}\t{name}")
+    print(
+        f"shard-plan: {len(hits)} test(s) matched. Re-check this before trusting a shard number written "
+        "down anywhere — the split is by measured duration and moves with every added test.",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Assign tests to shards by measured duration.")
     ap.add_argument("--tests", required=True, help="file holding libtest `--list` output")
@@ -138,6 +171,11 @@ def main():
     ap.add_argument("--shard", help="which shard to print, as N/M")
     ap.add_argument("--plan", action="store_true", help="print every shard instead of one")
     ap.add_argument("--shards", type=int, default=2, help="how many shards, when --shard is absent")
+    ap.add_argument(
+        "--which",
+        metavar="SUBSTRING",
+        help="which shard holds the test(s) matching SUBSTRING, instead of printing names",
+    )
     args = ap.parse_args()
 
     if args.shard:
@@ -176,6 +214,9 @@ def main():
 
     buckets, loads, unknown, median, floor = assign(tests, timings, shards)
     report(buckets, loads, unknown, median, floor, timings, tests, shards)
+
+    if args.which:
+        return which_shard(buckets, args.which)
 
     if args.plan:
         for number, bucket in enumerate(buckets, 1):
