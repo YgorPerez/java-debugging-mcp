@@ -8418,6 +8418,15 @@ fn swap_tick(line: &str) -> Option<i64> {
     after.split_whitespace().next()?.parse().ok()
 }
 
+/// The highest tick `SwapProbe` has printed. [`highest_tick`]'s counterpart for this probe, and needed
+/// separately because `tick_index` keys on a line *starting* with `tick ` while `SwapProbe` prints the
+/// answer first. Reaching for `highest_tick` here does not pass quietly — it returns `None`, the wait it
+/// feeds can never match, and the test fails after the full timeout complaining that the probe froze while
+/// the output plainly shows it ticking. Costly to read, so: `SwapProbe` uses this one.
+fn swap_probe_tick(probe: &Probe) -> Option<i64> {
+    probe.output().iter().filter_map(|l| swap_tick(l)).max()
+}
+
 /// The answer `SwapProbe` last printed, and the tick it printed it on.
 fn last_answer(probe: &Probe) -> Option<(i64, i64)> {
     probe.output().iter().rev().find_map(|l| {
@@ -8529,6 +8538,172 @@ fn bytecode_comparison_does_not_cry_stale_on_the_running_build() {
         &out,
         &["Both evidences agree", "identical bytecode", "strongest answer"],
     );
+}
+
+/// TRACE-12 (#117): a suspending stop point converts every traced stop point on the same line into a
+/// VM-freezing one, and until this nothing said so.
+///
+/// **Asserted against the probe's own stdout**, which the issue makes a criterion, and rightly: the whole
+/// bug is that every *reply* looked correct. `debug.list_stop_points` printed an unqualified `(trace)` for
+/// a stop point that was freezing the VM on every hit, so a test that only read the debugger's words would
+/// have passed before the fix and after it.
+///
+/// The order here is the one a caller stumbles into: trace first — proven cheap by the probe still
+/// ticking — then a suspending stop point on the same line, after which the probe must stop.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_suspending_stop_point_escalates_a_trace_on_the_same_line_and_says_so() {
+    let Some(jdk) = jdk_or_skip("a_suspending_stop_point_escalates_a_trace_on_the_same_line_and_says_so")
+    else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let traced = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "SwapProbe", "line": 39, "trace": true}),
+    );
+    assert!(traced.contains("Stop-point ID"), "the traced stop point must arm: {traced}");
+    assert!(
+        !traced.contains("FREEZE THE VM ANYWAY"),
+        "nothing suspends here yet, so there is nothing to warn about:\n{traced}"
+    );
+
+    // The premise: a lone traced stop point really does leave the probe running. Without this the freeze
+    // below could be anything.
+    let before = swap_probe_tick(&probe).unwrap_or(0);
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| swap_tick(l).is_some_and(|n| n > before + 2)).is_some(),
+        "a traced stop point alone must not freeze the probe\n  output: {:?}",
+        probe.output(),
+    );
+
+    // Now the same line, suspending. The reply has to name the stop point whose behaviour just changed.
+    let suspending =
+        server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "SwapProbe", "line": 39}));
+    assert_contains_all(
+        "the arm reports that it just escalated somebody else's stop point",
+        &suspending,
+        &["MAKES 1 TRACED STOP POINT(S) FREEZE THE VM", "bp_1", "event set", "Clearing this stop point"],
+    );
+
+    // The claim, from the debuggee. `STUCK_CONFIRM` rather than `EVENT_TIMEOUT`: ~20 ticks fit in it, so
+    // ruling out progress does not need the full wait — a negative observation costs what the positive
+    // would have (TEST-30).
+    let frozen_at = swap_probe_tick(&probe).unwrap_or(0);
+    let advanced =
+        probe.wait_for_line(STUCK_CONFIRM, |l| swap_tick(l).is_some_and(|n| n > frozen_at + 2)).is_some();
+    assert!(
+        !advanced,
+        "the probe kept ticking, so the traced stop point was NOT escalated and this test is no longer \
+         testing the thing it was written for\n  output: {:?}",
+        probe.output(),
+    );
+
+    // And the listing, which is where somebody asking "why did the VM freeze?" actually looks.
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(
+        listed.contains("(trace — SUSPEND POLICY OVERRIDDEN)"),
+        "an unqualified (trace) here is the most misleading thing this listing could print:\n{listed}"
+    );
+    assert_contains_all(
+        "and it explains itself rather than just flagging",
+        &listed,
+        &["DOES freeze the VM on every hit", "bp_2"],
+    );
+
+    // Leave the probe running for the harness's reaping.
+    server.panic_reset();
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| swap_tick(l).is_some_and(|n| n > frozen_at + 2)).is_some(),
+        "the probe never recovered after the stop points were cleared\n  output: {:?}",
+        probe.output(),
+    );
+}
+
+/// The other order, which the issue calls the likelier one: a suspending stop point is already on the line
+/// and somebody adds a `trace_expr` expecting the cheap thing.
+///
+/// The VM is frozen at the suspending breakpoint while the trace is armed, which is exactly the state a
+/// caller is in when they reach for a trace — they are looking at a suspended thread and want the next hit
+/// recorded without one.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn arming_a_trace_onto_an_already_suspending_line_warns_it_will_not_be_cheap() {
+    let Some(jdk) = jdk_or_skip("arming_a_trace_onto_an_already_suspending_line_warns_it_will_not_be_cheap")
+    else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let suspending =
+        server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "SwapProbe", "line": 39}));
+    assert!(suspending.contains("Stop-point ID"), "the suspending stop point must arm: {suspending}");
+    assert!(
+        !suspending.contains("FREEZE THE VM"),
+        "nothing is traced here yet, so there is nothing to warn about:\n{suspending}"
+    );
+
+    let traced = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "SwapProbe", "line": 39, "trace": true, "trace_expr": "v"}),
+    );
+    assert!(traced.contains("Stop-point ID"), "the trace is accepted, not refused: {traced}");
+    assert_contains_all(
+        "and it says the trace will freeze the VM anyway, naming what is responsible",
+        &traced,
+        &["THIS TRACE WILL FREEZE THE VM ANYWAY", "bp_1", "does NOT make this cheap", "event set"],
+    );
+
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(
+        listed.contains("(trace — SUSPEND POLICY OVERRIDDEN)"),
+        "the listing must not claim this one snapshots and resumes:\n{listed}"
+    );
+
+    server.panic_reset();
+}
+
+/// The control, and the one that decides whether the two warnings above are worth having: two traced stop
+/// points on one line are `EventThread` plus `EventThread`, which is still `EventThread`. Nothing is
+/// escalated, the probe keeps running, and neither reply may mention freezing.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn two_traced_stop_points_on_one_line_do_not_warn_and_do_not_freeze() {
+    let Some(jdk) = jdk_or_skip("two_traced_stop_points_on_one_line_do_not_warn_and_do_not_freeze") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let args = serde_json::json!({"class_pattern": "SwapProbe", "line": 39, "trace": true});
+    let first = server.call("debug.set_line_stop", args.clone());
+    let second = server.call("debug.set_line_stop", args);
+
+    for (which, reply) in [("first", &first), ("second", &second)] {
+        assert!(reply.contains("Stop-point ID"), "the {which} trace must arm: {reply}");
+        assert!(!reply.contains("FREEZE THE VM"), "false escalation warning on the {which}:\n{reply}");
+    }
+
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(listed.contains("(trace)"), "both must still read as plain traces:\n{listed}");
+    assert!(!listed.contains("OVERRIDDEN"), "nothing was overridden:\n{listed}");
+
+    let before = swap_probe_tick(&probe).unwrap_or(0);
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| swap_tick(l).is_some_and(|n| n > before + 2)).is_some(),
+        "two traced stop points on one line must not freeze the probe\n  output: {:?}",
+        probe.output(),
+    );
+    server.panic_reset();
 }
 
 /// The JVMTI error code out of a `debug.reload_class` refusal — `… SCHEMA_CHANGE_NOT_IMPLEMENTED (64).`

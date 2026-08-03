@@ -348,22 +348,27 @@ point also reports what it has ACTUALLY cost: the mean capture per hit, the rate
 share of the window spent capturing — measured on your JVM rather than taken from the ~720 hits/s figure in
 the other tools' descriptions, which is 1/mean and so recoverable from the mean reported here. Call it after
 arming a trace on a hot site to find out whether it is hurting the instance. A traced stop point that has
-captured nothing says so explicitly rather than reporting zero. EVERY stop point reports Hits: N — how many
-times the JVM has reported it firing — AND ZERO IS PRINTED RATHER THAN OMITTED, because "armed, no Hits line"
-would read as "this code never ran" and that is the reading this number exists to remove. It counts HITS, not
-the hits you were told about: a hit whose condition was FALSE still counts (so `Hits: 400` beside a condition
-that never matched is a different diagnosis from `Hits: 0`, and they used to look identical), a rethrow of an
-already-captured exception counts although it does not spend trace_max_hits (so on a traced stop point Hits
-and the capture count answer different questions rather than repeating one), and a method-exit request counts
-only exits of the method you ASKED for, not the every-method-of-the-class traffic JDWP delivers it. Counted
-once per hit and not once per armed location, so a finally line armed at 2 locations reports the number of
-times it ran. Cumulative across a toggle_stop_point disable and re-arm, since that keeps the same stop point
-rather than making a new one. A STOP POINT ARMED WITH hit_count IS REPORTED **SPENT** ONCE IT HAS FIRED, which
-is a third state and not a synonym for disabled: disabled is something YOU did with toggle_stop_point and can
-undo, spent is something the DEBUGGEE did — JDWP's Count modifier makes the JVM report the Nth occurrence and
-delete the request itself. Before this existed such a stop point was listed as armed forever, which is the
-same silence-reads-as-an-answer failure the Hits line above removes. toggle_stop_point re-arms a spent stop
-point with the same count.
+captured nothing says so explicitly rather than reporting zero. A TRACED STOP POINT THAT IS IN FACT FREEZING
+THE VM IS MARKED `(trace — SUSPEND POLICY OVERRIDDEN)` AND NOT A BARE `(trace)`, with a line naming what
+escalated it: a JDWP composite carries one suspend policy for the whole event set, the strongest any member
+asked for, so a suspending stop point at the same bytecode location revokes the non-suspending promise of
+every trace there. This is the place to look when the answer to "why did the VM freeze?" is a stop point you
+thought was cheap. EVERY stop point reports Hits: N — how many times the JVM has reported it firing — AND ZERO
+IS PRINTED RATHER THAN OMITTED, because "armed, no Hits line" would read as "this code never ran" and that is
+the reading this number exists to remove. It counts HITS, not the hits you were told about: a hit whose
+condition was FALSE still counts (so `Hits: 400` beside a condition that never matched is a different
+diagnosis from `Hits: 0`, and they used to look identical), a rethrow of an already-captured exception counts
+although it does not spend trace_max_hits (so on a traced stop point Hits and the capture count answer
+different questions rather than repeating one), and a method-exit request counts only exits of the method you
+ASKED for, not the every-method-of-the-class traffic JDWP delivers it. Counted once per hit and not once per
+armed location, so a finally line armed at 2 locations reports the number of times it ran. Cumulative across a
+toggle_stop_point disable and re-arm, since that keeps the same stop point rather than making a new one. A
+STOP POINT ARMED WITH hit_count IS REPORTED **SPENT** ONCE IT HAS FIRED, which is a third state and not a
+synonym for disabled: disabled is something YOU did with toggle_stop_point and can undo, spent is something
+the DEBUGGEE did — JDWP's Count modifier makes the JVM report the Nth occurrence and delete the request
+itself. Before this existed such a stop point was listed as armed forever, which is the same
+silence-reads-as-an-answer failure the Hits line above removes. toggle_stop_point re-arms a spent stop point
+with the same count.
 
 ## debug.list_threads
 List threads by name (one `0x<id> <name>` line each). A JVM like WildFly has hundreds of threads — filter with
@@ -582,49 +587,58 @@ are truncated AT CAPTURE TIME — 100 chars per in-scope local, 200 for the trac
 string is what the buffer stores, so debug.get_traces can never recover the rest; raise both with
 trace_max_length (ceiling 4000) when the thing you are tracing is a JSON body, a SOAP envelope or a built SQL
 string. A request above the ceiling is clamped and the reply says so. debug.list_stop_points then reports what
-this stop point is actually costing on this JVM, so you need not take the ~720 figure on trust. STALE BYTECODE
-IS REPORTED UNASKED: if a class root is configured (debug.attach {class_roots}, JDWP_CLASS_ROOTS) the reply
-appends a warning when the JVM's line table for the method you just armed does not match your compiled .class
-— the case where a breakpoint at :412 resolves against last week's build and then never fires, or fires with
-locals that make no sense for the code you are reading, which is indistinguishable from a wrong hypothesis. It
-speaks ONLY when it has a proof: no class root, no class file, or no line table on either side all stay silent
-rather than guessing, and a silent reply is not a claim that your build is current — ask debug.check_stale for
-that. Costs no extra JDWP packets, because arming already read the line table. ONE SOURCE LINE CAN BE SEVERAL
-BYTECODE LOCATIONS, AND ALL OF THEM ARE ARMED: javac does not compile a finally body once and jump to it, it
-inlines a copy per exit path, so a line inside a finally is in the line table twice — once for normal
-completion and once for the exception path. Arming only the first (which is what this did before) means the
-stop point reports the calls that SUCCEEDED and goes silent on the one that failed, which is the case you are
-debugging and is indistinguishable from the code never running. A finally is the idiomatic logpoint site
-precisely because the request and the response are both still in scope on both paths. The reply and
-debug.list_stop_points now say `Armed at N locations` whenever N > 1, and a line that maps to exactly one
-location reads exactly as it always has. It stays ONE stop point: one bp_ id, listed once, cleared or toggled
-once, and a traced hit charges trace_max_hits once per hit rather than once per armed location. THE SAME IS
-TRUE OF CLASSLOADERS: an exact class name is not unique in a JVM, because every classloader that has loaded it
-defines its own type with its own statics, and on WildFly a library packed into more than one deployment's
-WEB-INF/lib is genuinely loaded once per war. All of those copies are armed, the reply says `Armed on N
-classloaders`, and debug.list_stop_points names each loader so a read can be pinned to one. Arming a single
-copy is how a stop point reported "armed" and then never fired, which is indistinguishable from a wrong
-hypothesis about the code path. AND IT KEEPS WATCHING: an exact class name holds a class-load watch for the
-stop point's whole life, so a copy of that class loaded LATER — under a new module classloader, which is
-exactly what a redeploy produces — is armed into the SAME bp_ id with no re-arm from you. Before this it
-watched once and stopped, so the loop `set breakpoint, edit, recompile, redeploy, fire the request` went
-quiet: the stop point stayed enabled, stayed listed, and watched the retired deployment's copy, and an empty
-debug.get_traces reads as "the code path I predicted is not the one running" rather than as a stale arm.
-debug.list_stop_points keeps the two facts apart — how many copies are armed NOW, how many have loaded since
-you armed it, and whether it is still watching — because `Armed on 4 classloaders` alone cannot tell a library
-packed into four wars from three redeploys of one. A stop point that is NOT watching says so. PASS instance_id
-TO SCOPE THE STOP POINT TO ONE OBJECT — the @0x… handle any reply prints, from a trace snapshot's locals, an
-expanded field tree or debug.list_instances. This is JDWP's InstanceOnly modifier, so the JVM does the
-matching: a hit on any other instance costs no packet, no snapshot and no suspension at all, which is what
-makes "trace salvar() on THIS Reserva, not all 400 in flight" cheap on a shared instance. That is the
-difference from condition, which we evaluate on our side and therefore pay for on EVERY hit. REFUSED IN TWO
-CASES, BOTH BECAUSE THE ALTERNATIVE IS A SILENT LIE: on a STATIC method, which has no `this` to match —
-HotSpot accepts the modifier there and then fires for every hit, with no error and a reply claiming the stop
-point is scoped (measured on Temurin 17/21/25); and on a class that is NOT LOADED yet, because a deferred stop
-point cannot be checked for the first case and no instance of an unloaded class can exist anyway, so the
-handle would belong to something else. THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the debuggee collects the
-object the filter simply stops matching and the stop point goes quiet, which is indistinguishable from the
-code never running — debug.list_stop_points checks for that and says so.
+this stop point is actually costing on this JVM, so you need not take the ~720 figure on trust. THE
+NON-SUSPENDING PROMISE IS NOT THIS STOP POINT'S TO KEEP, AND THE REPLY NOW SAYS WHEN IT IS BROKEN: a JDWP
+composite carries ONE suspend policy for the whole event set — the strongest any member asked for — so a
+SUSPENDING stop point at the same bytecode location turns every trace:true stop point there into a VM-freezing
+one, on every hit (measured identical on Temurin 17/21/25). Arming either way round is ACCEPTED rather than
+refused, because suspending on a line you are already tracing is a legitimate thing to want; what changes is
+that the reply names the stop points whose behaviour just changed — in both directions, so a trace armed onto
+an already-suspending line is told it will not be cheap — and debug.list_stop_points marks them `(trace —
+SUSPEND POLICY OVERRIDDEN)` rather than a bare `(trace)`. Clearing the suspending stop point restores
+snapshot-and-resume. Two traced stop points on one line are unaffected, since EventThread plus EventThread is
+still EventThread. STALE BYTECODE IS REPORTED UNASKED: if a class root is configured (debug.attach
+{class_roots}, JDWP_CLASS_ROOTS) the reply appends a warning when the JVM's line table for the method you just
+armed does not match your compiled .class — the case where a breakpoint at :412 resolves against last week's
+build and then never fires, or fires with locals that make no sense for the code you are reading, which is
+indistinguishable from a wrong hypothesis. It speaks ONLY when it has a proof: no class root, no class file,
+or no line table on either side all stay silent rather than guessing, and a silent reply is not a claim that
+your build is current — ask debug.check_stale for that. Costs no extra JDWP packets, because arming already
+read the line table. ONE SOURCE LINE CAN BE SEVERAL BYTECODE LOCATIONS, AND ALL OF THEM ARE ARMED: javac does
+not compile a finally body once and jump to it, it inlines a copy per exit path, so a line inside a finally is
+in the line table twice — once for normal completion and once for the exception path. Arming only the first
+(which is what this did before) means the stop point reports the calls that SUCCEEDED and goes silent on the
+one that failed, which is the case you are debugging and is indistinguishable from the code never running. A
+finally is the idiomatic logpoint site precisely because the request and the response are both still in scope
+on both paths. The reply and debug.list_stop_points now say `Armed at N locations` whenever N > 1, and a line
+that maps to exactly one location reads exactly as it always has. It stays ONE stop point: one bp_ id, listed
+once, cleared or toggled once, and a traced hit charges trace_max_hits once per hit rather than once per armed
+location. THE SAME IS TRUE OF CLASSLOADERS: an exact class name is not unique in a JVM, because every
+classloader that has loaded it defines its own type with its own statics, and on WildFly a library packed into
+more than one deployment's WEB-INF/lib is genuinely loaded once per war. All of those copies are armed, the
+reply says `Armed on N classloaders`, and debug.list_stop_points names each loader so a read can be pinned to
+one. Arming a single copy is how a stop point reported "armed" and then never fired, which is
+indistinguishable from a wrong hypothesis about the code path. AND IT KEEPS WATCHING: an exact class name
+holds a class-load watch for the stop point's whole life, so a copy of that class loaded LATER — under a new
+module classloader, which is exactly what a redeploy produces — is armed into the SAME bp_ id with no re-arm
+from you. Before this it watched once and stopped, so the loop `set breakpoint, edit, recompile, redeploy,
+fire the request` went quiet: the stop point stayed enabled, stayed listed, and watched the retired
+deployment's copy, and an empty debug.get_traces reads as "the code path I predicted is not the one running"
+rather than as a stale arm. debug.list_stop_points keeps the two facts apart — how many copies are armed NOW,
+how many have loaded since you armed it, and whether it is still watching — because `Armed on 4 classloaders`
+alone cannot tell a library packed into four wars from three redeploys of one. A stop point that is NOT
+watching says so. PASS instance_id TO SCOPE THE STOP POINT TO ONE OBJECT — the @0x… handle any reply prints,
+from a trace snapshot's locals, an expanded field tree or debug.list_instances. This is JDWP's InstanceOnly
+modifier, so the JVM does the matching: a hit on any other instance costs no packet, no snapshot and no
+suspension at all, which is what makes "trace salvar() on THIS Reserva, not all 400 in flight" cheap on a
+shared instance. That is the difference from condition, which we evaluate on our side and therefore pay for on
+EVERY hit. REFUSED IN TWO CASES, BOTH BECAUSE THE ALTERNATIVE IS A SILENT LIE: on a STATIC method, which has
+no `this` to match — HotSpot accepts the modifier there and then fires for every hit, with no error and a
+reply claiming the stop point is scoped (measured on Temurin 17/21/25); and on a class that is NOT LOADED yet,
+because a deferred stop point cannot be checked for the first case and no instance of an unloaded class can
+exist anyway, so the handle would belong to something else. THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the
+debuggee collects the object the filter simply stops matching and the stop point goes quiet, which is
+indistinguishable from the code never running — debug.list_stop_points checks for that and says so.
 
 ## debug.set_method_exit_stop
 Report what a method actually RETURNED, without having to guess which `return` statement runs — for a method

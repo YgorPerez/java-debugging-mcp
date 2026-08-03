@@ -335,8 +335,8 @@ Its own word because two facts belong to the set and to nothing inside it, and b
 rather than read off the spec. **The thread is suspended once for the set**, however many members it
 carries — so a resume per member undoes suspensions the hit never took (BP-6, [#102]). And **the policy is
 the strongest any member asked for**: measured on Temurin 17/21/25, a set carrying one `All` request and
-two `EventThread` ones arrives as `All`, which is how a **trace** stops being non-suspending without
-anything saying so ([#117]).
+two `EventThread` ones arrives as `All`, which is how a **trace** stops being non-suspending — silently
+until TRACE-12 ([#117], ADR-0031) made both the arm reply and the listing say so.
 So "the stop point suspends the VM" is a sentence about a set, and a reader who has only the singular word
 will write code that reads the first member — which is exactly what [#102] was.
 _Avoid_: composite (JDWP's wire word for the packet, `Event.Composite`; fine when quoting the protocol,
@@ -371,9 +371,13 @@ The safe mode on a shared instance, and the word this project uses throughout fo
 **It is a property of the event set, not of the stop point, and the difference is not pedantic.** A traced
 stop point asks for `EventThread`; what it *gets* is whatever policy the strongest member of its **event
 set** asked for. So a suspending stop point at the same location makes every traced one there suspend the
-whole VM, and the listing goes on printing `(trace)` beside them. Measured on Temurin 17/21/25 ([#117]);
-the sentence above holds for a stop point that does not share its location, which is every case anyone has
-been in so far, and fails silently for the one that does.
+whole VM. Measured on Temurin 17/21/25 ([#117]); the sentence above holds for a stop point that does not
+share its location, which is every case anyone has been in so far.
+**It no longer fails silently.** Arming either way round is accepted — suspending on a line you are already
+tracing is a legitimate thing to want — and the reply names the stop points whose behaviour just changed,
+while `debug.list_stop_points` marks an escalated one `(trace — SUSPEND POLICY OVERRIDDEN)` rather than a
+bare `(trace)` (TRACE-12, ADR-0031). Two traced stop points on one line are untouched: `EventThread` plus
+`EventThread` is still `EventThread`.
 The rule that follows is worth stating in the caller's terms rather than the protocol's: **on a shared
 instance, keep every stop point on a given line traced.** One suspending stop point revokes the promise for
 all of them.

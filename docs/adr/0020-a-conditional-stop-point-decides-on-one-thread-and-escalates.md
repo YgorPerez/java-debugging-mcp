@@ -1,4 +1,4 @@
-# 0019 — A conditional stop point decides on one thread, and escalates to a VM-wide suspend only when the condition holds
+# ADR-0020 — A conditional stop point decides on one thread, and escalates to a VM-wide suspend only when the condition holds
 
 ## Context
 
@@ -57,9 +57,9 @@ Four consequences had to be decided rather than assumed:
 > is still what a conditional stop point gets whenever it does not share a location. What changes is that
 > the premise was a property of the stop point and is really a property of the set, so the guarantee is
 > conditional in a way this document did not say. `CONTEXT.md` gains **event set** for the concept and
-> corrects **trace** for the same reason; [#117] decides what the caller is told, which is the part still
-> open. Practical form, in the caller's terms: on a shared instance, keep every stop point on a given line
-> traced.
+> corrects **trace** for the same reason. **[#117] has since decided what the caller is told, and it is
+> ADR-0031: allow the arm and warn, on both replies and in `debug.list_stop_points`.** Practical form, in the
+> caller's terms: on a shared instance, keep every stop point on a given line traced.
 >
 > [#117]: https://github.com/YgorPerez/java-debugging-mcp/issues/117
 

@@ -634,9 +634,12 @@ impl RequestHandler {
             let spec = base.for_pattern(p);
             outcomes.push(arm_one_pattern(&mut session, &spec, &index, max_classes).await);
         }
+        // TRACE-12 (#117): swept before the lock is released, since it reads the whole stop-point table.
+        let overridden = describe_overridden_traces(&overridden_traces(&session));
         drop(session);
 
-        Ok(render_pattern_outcomes(&base, &patterns, &outcomes, frames_note.as_deref(), max_classes))
+        Ok(render_pattern_outcomes(&base, &patterns, &outcomes, frames_note.as_deref(), max_classes)
+            + &overridden)
     }
 
     async fn handle_list_stop_points(&self, args: serde_json::Value) -> Result<String, String> {
@@ -3378,6 +3381,143 @@ const fn suspend_policy_for_line(trace: bool, conditional: bool) -> jdwp_client:
     }
 }
 
+/// TRACE-12: every armed location of one stop point — the primary plus [`BreakpointArm::extra_locations`].
+fn armed_locations_of(arm: &crate::session::BreakpointArm) -> Vec<(u64, u64, u64)> {
+    let mut out = Vec::with_capacity(1 + arm.extra_locations.len());
+    out.push((arm.class_id, arm.method_id, arm.bytecode_index));
+    out.extend(arm.extra_locations.iter().map(|l| (l.class_id, l.method_id, l.bytecode_index)));
+    out
+}
+
+/// TRACE-12 (#117): the other ARMED stop points sharing a bytecode location, split by what each asked for.
+///
+/// Returns `(suspending ids, traced ids)`.
+///
+/// **The suspend policy is a property of the event SET, not of the stop point** — ADR-0020's amendment,
+/// measured on Temurin 17.0.20 / 21.0.12 / 25.0.3. The JVM sends one composite per hit, carrying one event
+/// per request that matched at that location, under a single policy: the strongest any member asked for.
+/// Two stop points can therefore land in one set exactly when they share an armed location, and when they
+/// do, `trace:true`'s promise to freeze nothing is not its own to keep.
+///
+/// Only `All` counts as suspending here. A *conditional* stop point is armed `EventThread` and escalates on
+/// our side when the condition holds (ADR-0020) — a decision taken after the set has already been
+/// delivered, so it does not make the other members freeze at hit time.
+///
+/// Disabled and spent stop points are skipped: with no live JDWP request they cannot be in anybody's set.
+fn co_located_stop_points<'a>(
+    session: &'a crate::session::DebugSession,
+    exclude: Option<&str>,
+    arm: &crate::session::BreakpointArm,
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    let mine = armed_locations_of(arm);
+    let mut suspending = Vec::new();
+    let mut traced = Vec::new();
+    for (id, bp) in &session.breakpoints {
+        if Some(id.as_str()) == exclude || !bp.is_armed() {
+            continue;
+        }
+        if !armed_locations_of(&bp.arm).iter().any(|l| mine.contains(l)) {
+            continue;
+        }
+        if bp.arm.suspend_policy == jdwp_client::SuspendPolicy::All {
+            suspending.push(id.as_str());
+        }
+        if bp.trace {
+            traced.push(id.as_str());
+        }
+    }
+    // Sorted so a reply naming several is stable rather than in `HashMap` order.
+    suspending.sort_unstable();
+    traced.sort_unstable();
+    (suspending, traced)
+}
+
+/// TRACE-12: the arm-time warning that this location's suspend policy is not this stop point's to decide.
+///
+/// Empty when there is nothing to say, which is almost always. Two directions, both real and the second
+/// likelier: arming a trace onto a line that already suspends, and arming a suspend onto a line that is
+/// already traced. The maintainer's decision is **allow and warn** rather than refuse — suspending on a
+/// line you are already tracing is a legitimate thing to want, and the caller who needs to know is told
+/// instead of blocked (ADR-0031).
+fn describe_policy_overlap(
+    new_policy: jdwp_client::SuspendPolicy,
+    new_is_trace: bool,
+    suspending: &[&str],
+    traced: &[&str],
+) -> String {
+    if new_is_trace && !suspending.is_empty() {
+        return format!(
+            "\n   ⚠️  THIS TRACE WILL FREEZE THE VM ANYWAY: {} already suspend(s) at this exact \
+             location, and a JDWP composite carries ONE suspend policy for the whole event set — the \
+             strongest any member asked for. So every hit here stops every thread, snapshot or not, and \
+             trace:true does NOT make this cheap on a shared instance. Clear or move {} to get \
+             snapshot-and-resume back.",
+            suspending.join(", "),
+            if suspending.len() == 1 { "it" } else { "them" },
+        );
+    }
+    // A traced stop point is never armed `All`, so the two branches cannot both apply.
+    if new_policy == jdwp_client::SuspendPolicy::All && !traced.is_empty() {
+        return format!(
+            "\n   ⚠️  THIS ALSO MAKES {} TRACED STOP POINT(S) FREEZE THE VM: {} {} armed trace:true at \
+             this exact location, and a JDWP composite carries ONE suspend policy for the whole event set \
+             — the strongest any member asked for. From this arm on, every hit here stops every thread, \
+             so {} no longer snapshot-and-resume and the promise their own replies made no longer holds. \
+             Clearing this stop point restores {}.",
+            traced.len(),
+            traced.join(", "),
+            if traced.len() == 1 { "is" } else { "are" },
+            if traced.len() == 1 { "it does" } else { "they do" },
+            if traced.len() == 1 { "it" } else { "them" },
+        );
+    }
+    String::new()
+}
+
+/// TRACE-12: every armed traced stop point in this session whose location is shared with a suspending one,
+/// paired with what is escalating it.
+///
+/// A session-wide sweep rather than a diff of what one call armed, and deliberately so: the overlap is a
+/// property of the *location*, it can be created from either direction, and a batch that arms dozens of
+/// stop points would otherwise need to work out which of them landed on somebody else's line.
+fn overridden_traces(session: &crate::session::DebugSession) -> Vec<(&str, Vec<&str>)> {
+    let mut out = Vec::new();
+    for (id, bp) in &session.breakpoints {
+        if !bp.trace || !bp.is_armed() {
+            continue;
+        }
+        let (suspending, _) = co_located_stop_points(session, Some(id), &bp.arm);
+        if !suspending.is_empty() {
+            out.push((id.as_str(), suspending));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// TRACE-12: the batch reply's tail when this session has traced stop points that now freeze the VM.
+///
+/// A roll-call rather than the full paragraph per member, for the reason DISC-8's stale-bytecode roll-call
+/// is one: a wildcard can arm dozens, and forty paragraphs is not a warning anybody reads.
+fn describe_overridden_traces(overridden: &[(&str, Vec<&str>)]) -> String {
+    if overridden.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n⚠️  SUSPEND POLICY OVERRIDDEN — these trace:true stop points freeze the WHOLE VM on every hit, \
+         because a JDWP composite carries one suspend policy for the entire event set (the strongest any \
+         member asked for) and something suspending is armed at the same location:\n",
+    );
+    for (id, by) in overridden {
+        let _ = writeln!(out, "   {id} — escalated by {}", by.join(", "));
+    }
+    out.push_str(
+        "   debug.list_stop_points marks them too; clearing the suspending stop point restores \
+         snapshot-and-resume.\n",
+    );
+    out
+}
+
 /// Whether `JDWP_READONLY` forces read-only mode for every session (SAFE-3). Truthy = `1`/`true`/`yes`
 /// (case-insensitive); anything else, or unset, is off.
 fn env_readonly() -> bool {
@@ -4716,45 +4856,54 @@ const fn stop_point_glyph(enabled: bool, spent: bool, armed: &'static str) -> &'
     }
 }
 
-/// Format one active breakpoint into the `debug.list_stop_points` output. `bp_id` is its map key.
-fn render_breakpoint_line(
-    output: &mut String,
+/// TRACE-12 (#117): the trace marker on a listing's header line.
+///
+/// An unqualified `(trace)` on a stop point that is in fact freezing the VM is the single most misleading
+/// thing this listing could print, and this listing is where somebody asking "why did the VM freeze?"
+/// actually looks.
+const fn trace_marker(trace: bool, overridden: bool) -> &'static str {
+    match (trace, overridden) {
+        (true, true) => " (trace — SUSPEND POLICY OVERRIDDEN)",
+        (true, false) => " (trace)",
+        _ => "",
+    }
+}
+
+/// TRACE-12: the listing's explanation of an overridden trace, or empty. Flagging without explaining
+/// would leave the reader to guess at a mechanism nothing else on this surface exposes.
+fn overridden_trace_note(overridden: bool, escalated_by: &[&str]) -> String {
+    if !overridden {
+        return String::new();
+    }
+    format!(
+        "     🚨 This stop point DOES freeze the VM on every hit, despite trace:true: {} {} armed \
+         suspending at the same location, and a JDWP composite carries one suspend policy for the whole \
+         event set — the strongest any member asked for. Clear {} for snapshot-and-resume.\n",
+        escalated_by.join(", "),
+        if escalated_by.len() == 1 { "is" } else { "are" },
+        if escalated_by.len() == 1 { "it" } else { "them" },
+    )
+}
+
+/// TRACE-12: what is escalating this stop point's suspend policy, or nothing when the question does not
+/// apply — a suspending stop point has no promise to break, and a disabled one is in nobody's event set.
+fn escalating_stop_points<'a>(
+    session: &'a crate::session::DebugSession,
     bp_id: &str,
     bp: &crate::session::BreakpointInfo,
-    dead: &FilterHealth,
-) {
-    let _ = writeln!(
-        output,
-        "  {} [{}] {}:{}{}{}{}{}",
-        stop_point_glyph(bp.enabled, bp.spent, "✓"),
-        bp_id,
-        bp.class_pattern,
-        bp.line,
-        if bp.trace { " (trace)" } else { "" },
-        trace_budget_tag(bp.trace, bp.trace_budget),
-        trace_frames_tag(bp.trace, bp.trace_frames),
-        stop_point_state_suffix(bp.enabled, bp.spent),
-    );
-    let tag = dead_filter_tag(bp.arm.thread_filter, bp.arm.instance_filter, dead);
-    if !tag.is_empty() {
-        let _ = writeln!(output, "   {tag}");
+) -> Vec<&'a str> {
+    if !bp.trace || !bp.is_armed() {
+        return Vec::new();
     }
-    if let Some(method) = &bp.method {
-        let _ = writeln!(output, "     Method: {method}");
-    }
-    // BP-4 (#78): one caller-facing stop point over several armed JDWP requests. Printed only when there
-    // is more than one, so an ordinary listing stays byte-identical — and printed at all because the
-    // count is the only place a *re-armed* duplicated line can report that a copy was refused, the event
-    // pump and `toggle_stop_point` having no reply to carry it.
-    if bp.is_armed() && bp.request_ids.len() > 1 {
-        let _ = writeln!(
-            output,
-            "     Armed at {} locations (JDWP requests {}) — one source line, several bytecode copies, \
-             which is what `javac` emits for a `finally` body",
-            bp.request_ids.len(),
-            bp.request_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-        );
-    }
+    co_located_stop_points(session, Some(bp_id), &bp.arm).0
+}
+
+/// The classloader and re-arm lines of one listed breakpoint (BP-5 #79, BP-7 #115).
+///
+/// Its own function because these four branches are one subject — *which copies of this class this stop
+/// point covers, now and later* — and because keeping them inline pushed `render_breakpoint_line` past
+/// doctor's complexity gate once TRACE-12 added a branch of its own.
+fn render_classloader_and_rearm(output: &mut String, bp: &crate::session::BreakpointInfo) {
     // BP-5 (#79): the class name is loaded more than once, so the copies have to be distinguishable —
     // otherwise "armed on 2 classloaders" is a fact the caller can read and not act on. Each `@0x…` is
     // usable as a selector on the read tools (debug.evaluate, list_fields, source, check_stale).
@@ -4797,6 +4946,51 @@ fn render_breakpoint_line(
              loaded under a new classloader will never fire and the silence will read as a wrong guess"
         );
     }
+}
+
+/// Format one active breakpoint into the `debug.list_stop_points` output. `bp_id` is its map key.
+fn render_breakpoint_line(
+    output: &mut String,
+    bp_id: &str,
+    bp: &crate::session::BreakpointInfo,
+    dead: &FilterHealth,
+    escalated_by: &[&str],
+) {
+    let overridden = bp.trace && !escalated_by.is_empty();
+    let _ = writeln!(
+        output,
+        "  {} [{}] {}:{}{}{}{}{}",
+        stop_point_glyph(bp.enabled, bp.spent, "✓"),
+        bp_id,
+        bp.class_pattern,
+        bp.line,
+        trace_marker(bp.trace, overridden),
+        trace_budget_tag(bp.trace, bp.trace_budget),
+        trace_frames_tag(bp.trace, bp.trace_frames),
+        stop_point_state_suffix(bp.enabled, bp.spent),
+    );
+    output.push_str(&overridden_trace_note(overridden, escalated_by));
+    let tag = dead_filter_tag(bp.arm.thread_filter, bp.arm.instance_filter, dead);
+    if !tag.is_empty() {
+        let _ = writeln!(output, "   {tag}");
+    }
+    if let Some(method) = &bp.method {
+        let _ = writeln!(output, "     Method: {method}");
+    }
+    // BP-4 (#78): one caller-facing stop point over several armed JDWP requests. Printed only when there
+    // is more than one, so an ordinary listing stays byte-identical — and printed at all because the
+    // count is the only place a *re-armed* duplicated line can report that a copy was refused, the event
+    // pump and `toggle_stop_point` having no reply to carry it.
+    if bp.is_armed() && bp.request_ids.len() > 1 {
+        let _ = writeln!(
+            output,
+            "     Armed at {} locations (JDWP requests {}) — one source line, several bytecode copies, \
+             which is what `javac` emits for a `finally` body",
+            bp.request_ids.len(),
+            bp.request_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        );
+    }
+    render_classloader_and_rearm(output, bp);
     if let Some(t) = bp.arm.thread_filter {
         let _ = writeln!(output, "     Thread filter: 0x{t:x}");
     }
@@ -4934,7 +5128,9 @@ fn render_pattern_set_line(output: &mut String, set: &crate::session::PatternSto
 /// and the family line is what explains why one call produced nine of them — and what to clear to undo it.
 fn render_every_stop_point(output: &mut String, session: &crate::session::DebugSession, dead: &FilterHealth) {
     for (bp_id, bp) in &session.breakpoints {
-        render_breakpoint_line(output, bp_id, bp, dead);
+        // TRACE-12: worked out here because the renderer has no session to ask.
+        let escalated_by = escalating_stop_points(session, bp_id, bp);
+        render_breakpoint_line(output, bp_id, bp, dead, &escalated_by);
     }
     for pb in &session.pending_breakpoints {
         render_pending_line(output, pb, dead);
@@ -12468,6 +12664,13 @@ async fn arm_single_named(
     let (bp_id, line, method_name) = (&armed.bp_id, armed.line, &armed.method_name);
 
     let mut extra = describe_trace_mode(spec, frames_note);
+    // TRACE-12 (#117). Read back out of the session rather than off `spec`, because what matters is the
+    // location this actually armed at — `spec` carries the line the caller asked for, and BP-4's several
+    // bytecode copies and BP-5's several classloaders are only known after arming.
+    if let Some(mine) = session.breakpoints.get(bp_id) {
+        let (suspending, traced) = co_located_stop_points(session, Some(bp_id), &mine.arm);
+        extra.push_str(&describe_policy_overlap(mine.arm.suspend_policy, mine.trace, &suspending, &traced));
+    }
     extra.push_str(&describe_hit_count(
         spec.hit_count,
         spec.trace,
@@ -20590,6 +20793,99 @@ mod tests {
         let out = render_redefine_forecast("OrderService", &f);
         assert!(out.contains("FIRST of these it reaches"), "must say the JVM stops at one:\n{out}");
         assert!(out.contains("javac"), "and must caveat the different-compiler false positive:\n{out}");
+    }
+
+    // ---- TRACE-12 (#117): a suspend policy belongs to the event SET, not to the stop point ----
+    //
+    // Measured on Temurin 17.0.20 / 21.0.12 / 25.0.3: three BREAKPOINT requests at one bytecode location,
+    // two armed EventThread and one armed All, arrive as ONE composite with suspend_policy = All. So a
+    // `trace:true` stop point's promise to freeze nothing is not its own to keep, and until this it was
+    // still printing `(trace)` while freezing the VM on every hit.
+
+    fn arm_at(index: u64, policy: jdwp_client::SuspendPolicy) -> crate::session::BreakpointArm {
+        crate::session::BreakpointArm {
+            class_id: 0x10,
+            method_id: 0x20,
+            bytecode_index: index,
+            extra_locations: Vec::new(),
+            suspend_policy: policy,
+            hit_count: None,
+            thread_filter: None,
+            instance_filter: None,
+        }
+    }
+
+    #[test]
+    fn an_armed_stop_point_reports_its_primary_location_and_every_extra() {
+        let mut arm = arm_at(4, jdwp_client::SuspendPolicy::EventThread);
+        // BP-4's second bytecode copy of one line, and BP-5's copy under another classloader.
+        arm.extra_locations = vec![
+            crate::session::ArmedLocation { class_id: 0x10, method_id: 0x20, bytecode_index: 19 },
+            crate::session::ArmedLocation { class_id: 0x99, method_id: 0x20, bytecode_index: 4 },
+        ];
+
+        assert_eq!(armed_locations_of(&arm), vec![(0x10, 0x20, 4), (0x10, 0x20, 19), (0x99, 0x20, 4)]);
+    }
+
+    // Direction one: a trace armed onto a line that already suspends. The caller asked for the cheap thing
+    // and is getting the expensive one, which no reply used to say.
+    #[test]
+    fn arming_a_trace_where_something_suspends_says_the_trace_will_freeze_anyway() {
+        let out = describe_policy_overlap(jdwp_client::SuspendPolicy::EventThread, true, &["bp_1"], &[]);
+
+        assert!(out.contains("WILL FREEZE THE VM ANYWAY"), "{out}");
+        assert!(out.contains("bp_1"), "must name the stop point responsible:\n{out}");
+        assert!(out.contains("event set"), "and must say why, since the reason is not guessable:\n{out}");
+        assert!(out.contains("does NOT make this cheap"), "{out}");
+    }
+
+    // Direction two, and the likelier one: a suspending stop point armed onto a line already traced. This
+    // changes an OLD stop point's behaviour, which is what makes refusing the arm the wrong answer and
+    // warning the right one.
+    #[test]
+    fn arming_a_suspend_where_traces_exist_names_every_trace_it_escalates() {
+        let out = describe_policy_overlap(jdwp_client::SuspendPolicy::All, false, &[], &["bp_2", "bp_7"]);
+
+        assert!(out.contains("MAKES 2 TRACED STOP POINT(S) FREEZE THE VM"), "{out}");
+        assert!(out.contains("bp_2, bp_7"), "must name them all:\n{out}");
+        assert!(out.contains("Clearing this stop point restores them"), "and the way back:\n{out}");
+    }
+
+    // The quiet cases, which is nearly every arm. A warning on an ordinary stop point would be noise on
+    // the most-used reply in the tool surface.
+    #[test]
+    fn an_arm_with_no_overlap_says_nothing_at_all() {
+        assert_eq!(describe_policy_overlap(jdwp_client::SuspendPolicy::EventThread, true, &[], &[]), "");
+        assert_eq!(describe_policy_overlap(jdwp_client::SuspendPolicy::All, false, &[], &[]), "");
+        // A traced stop point sharing a line with other TRACED ones is fine: EventThread plus EventThread
+        // is still EventThread, and warning here would train the reader to ignore the warning.
+        assert_eq!(
+            describe_policy_overlap(jdwp_client::SuspendPolicy::EventThread, true, &[], &["bp_9"]),
+            ""
+        );
+    }
+
+    // A conditional non-traced stop point is armed EventThread and escalates on OUR side once the condition
+    // holds (ADR-0020). That decision comes after the composite has been delivered, so it does not freeze
+    // the other members at hit time and must not be reported as if it did.
+    #[test]
+    fn a_conditional_stop_point_does_not_escalate_the_traces_beside_it() {
+        assert_eq!(
+            describe_policy_overlap(jdwp_client::SuspendPolicy::EventThread, false, &[], &["bp_3"]),
+            "",
+            "EventThread is what a conditional stop point asks for, and it escalates later, not in the set"
+        );
+    }
+
+    #[test]
+    fn the_batch_tail_is_a_roll_call_and_is_empty_when_nothing_is_overridden() {
+        assert_eq!(describe_overridden_traces(&[]), "");
+
+        let out = describe_overridden_traces(&[("bp_2", vec!["bp_1"]), ("bp_5", vec!["bp_1", "bp_4"])]);
+        assert!(out.contains("SUSPEND POLICY OVERRIDDEN"), "{out}");
+        assert!(out.contains("bp_2 — escalated by bp_1"), "{out}");
+        assert!(out.contains("bp_5 — escalated by bp_1, bp_4"), "{out}");
+        assert!(out.contains("list_stop_points"), "must point at where the state is visible:\n{out}");
     }
 
     // DISC-9: the byte-level difference has to be actionable, and a length change must not read as
