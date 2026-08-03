@@ -174,6 +174,35 @@ initial_prompt: |
   real probe JVMs from examples/probes/ and needs a JDK. `scripts/doctor.sh` is the lint gate, not
   `cargo clippy` (ADR-0007).
 
+  Which tool to reach for, calibrated against one session (2026-08-03) that used both these tools and
+  the plain ones on the same work. `handlers.rs` is **20,589 lines and 469 column-0 definitions**;
+  `mcp_integration.rs` is 11,673. That size is what decides most of the following, and it is why the
+  answers here are not the generic ones:
+
+    - `find_symbol` with `include_body` WHEN YOU HAVE A NAME. On a file this size it beats `Read` with
+      an offset, which needs a `grep` for the line first and then a guess at how far to extend.
+      `get_symbols_overview` on `handlers.rs` is 469 entries and is almost never the question being
+      asked.
+    - `replace_content` IN REGEX MODE FOR ONE LARGE STRUCTURAL REPLACEMENT. A `beginning.*?end` needle
+      rewrites a 40-line function without quoting the original, and an ambiguous match comes back as an
+      error rather than a silently wrong edit. This is the strongest reason to have these tools here.
+    - `grep` IS THE RIGHT DISCOVERY TOOL IN THIS REPO, and any instruction steering you off it is
+      calibrated for a different shape of question. Most questions here are "where does this reply text
+      come from" or "who calls this" — a string, not a symbol — and `grep -n` answers in one call with
+      the line numbers the next step needs anyway. `find_referencing_symbols` went untried across that
+      whole session because `grep` had already answered every caller question; that is an observation
+      about the questions this codebase raises, not a verdict on the tool.
+    - FOR A COORDINATED MULTI-SITE EDIT, one `python3 - <<'EOF'` heredoc doing every substitution with
+      `assert s.count(a) == 1` per site beats N `replace_content` calls. Same ambiguity guard, and it
+      fails BEFORE writing anything if one site has drifted — where N separate calls can leave the tree
+      half-converted and hand you the compile errors instead. BP-7's `RearmState` conversion (ten call
+      sites, all or nothing) is the shape.
+
+  ONE TRAP, and it is the reason this section exists. The harness counts consecutive `Read` calls and
+  blocks them to push you toward the symbolic tools. `Bash` with `sed -n` is NOT counted — so the
+  cheapest way to satisfy that block is the one tool that is worse than either of the two it is
+  choosing between. If you are being nudged off `Read`, the answer is `find_symbol`, not `sed`.
+
 # time budget (seconds) per tool call for the retrieval of additional symbol information
 # such as docstrings or parameter information.
 # This overrides the corresponding setting in the global configuration; see the documentation there.
