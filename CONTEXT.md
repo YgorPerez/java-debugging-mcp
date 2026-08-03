@@ -485,6 +485,16 @@ A hit that was recorded without suspending: its location, thread, in-scope local
 kind-specific detail, captured while only the hit thread was briefly held.
 _Avoid_: log line, log entry
 
+**The word acquired a homonym in the test suite** (DOC-7, DOC-8), and it is left there on the same test that
+kept `bracket` where it was. `tests/tool-descriptions.txt` and `tests/argument-schemas.txt` are *snapshots* in
+the ordinary snapshot-testing sense, and **both senses are test names in the same crate** — a handful read
+`…_snapshot_carries…` / `…_in_one_snapshot` and mean a captured hit, while `…_match_the_committed_snapshot`
+means a committed baseline. Snapshot testing is a general testing term rather than a concept of this domain, so
+it earns no entry of its own; what earns the note is that a reader who meets it and looks the word up here
+finds a trace capture instead. Written down rather than renamed away, and cheap to live with because the two
+never meet where it would matter: **no reply and no tool description uses the second sense**, so a caller can
+only ever encounter one of them.
+
 **Trace**:
 The non-suspending mode of any stop point — snapshot the hit, resume the thread, never surface an event.
 The safe mode on a shared instance, and the word this project uses throughout for it.
@@ -501,8 +511,17 @@ bare `(trace)` (TRACE-12, ADR-0031). Two traced stop points on one line are unto
 The rule that follows is worth stating in the caller's terms rather than the protocol's: **on a shared
 instance, keep every stop point on a given line traced.** One suspending stop point revokes the promise for
 all of them.
+**A second route breaks the same promise and has nothing to do with the event set** (DUMP-8, #123). A
+`trace_expr` is evaluated on the hit thread while it is briefly held, and JDWP cannot cancel an invocation: one
+that outruns its budget leaves the debuggee inside the call, and the JVM re-suspends that thread when the call
+finally returns — after this side has already resumed it and moved on. Measured at 1.2 s later on Temurin
+11.0.32 and 21.0.12, and the thread then stays suspended for good. An invoking `trace_expr` is refused on a
+monitor stop's `blocked` kind (ADR-0036), which closes the route where the dangerous expression is also the
+natural one; everywhere else it is accepted, and outside a **read-only** session nothing checks it. So the
+promise is "suspends nothing *of its own accord*" rather than "suspends nothing".
 _Avoid_: logpoint, tracepoint; and "non-suspending stop point" as a standalone claim, which is the
-overstatement above
+overstatement both paragraphs above are about — an escalated event set and a stalled invocation break it by
+routes with nothing in common, so ruling one out says nothing about the other
 
 **Caller chain**:
 The callers above a hit, recorded on a snapshot as locations only. Answers which path reached the hit
@@ -805,6 +824,11 @@ A traced hit suspends only the hit thread and never records a suspension, so not
 set and it has no reason to look — which is why an in-flight traced hit whose request went away could leave
 one application thread frozen for the life of the JVM (#114). `debug.panic` was the only escape, because it
 resumes the VM outright rather than by reading who is holding it.
+**It has now happened twice by unrelated routes**, which is what turns the `_Avoid_` below from a caution into
+a fact. #114 was an in-flight hit whose request went away; DUMP-8 (#123) is a `trace_expr` whose invocation
+outran its budget, where the JVM re-suspends the thread when the call finally returns — over a second after
+this side resumed it and moved on. Neither suspension is VM-wide and neither is one a caller asked for, so the
+watchdog reads nothing in either case, and the debuggee's own progress is the only thing that shows it.
 _Avoid_ reading this as "nothing stays frozen": it bounds the suspension a **caller asked for**, not every
 way a thread can end up held.
 
@@ -885,6 +909,19 @@ Each is named for the shape it reproduces, not the feature that uses it.
 A line a probe prints while running. The only evidence that a stop point left nothing suspended, because
 the debugger reports success either way.
 
+**Its existence and its contents answer different questions, and TEST-39 is what happens when a test confuses
+them.** That a tick appeared says the debuggee is still running; the figures *on* it say what state it is in.
+`a_thread_filter_holds_against_a_real_pool_of_reused_threads` needs a saturated pool for its premise to mean
+anything — it waited for *a* tick and then asked the **debugger** how many workers there were, getting 85,
+because `prestartAllCoreThreads()` had not finished starting 200 of them. The probe had been printing
+`pool=<size>` on every line the whole time.
+So: **where a probe announces the state a test's premise depends on, the test reads it from there.** The
+debugger's answer is a second opinion that can only agree or disagree with the debuggee, and a premise checked
+against the wrong side fails as an assertion about something else entirely.
+This is the test-side half of a rule the probes already keep on their own — `ContendedProbe`, `MonitorProbe`,
+`SyntheticProbe` and `WedgeProbe` each ask the JVM for a thread's real state rather than spinning on a flag,
+and each says so at the point of the wait.
+
 **Witness**:
 A probe's standing as independent evidence — it prints the thing under test, so a test can distinguish what
 the debuggee did from what the debugger claims. A probe **stops being a witness** when it stops printing,
@@ -894,6 +931,8 @@ an exception and returned; a worker frozen by a held hit; a stop point armed on 
 calling. Every one presented as *the debugger armed something and it never fired*, and none of them was
 that. The rule the term is for: **a probe must announce that it has stopped**, because the absence of a
 **tick** is the same absence whatever caused it, and only the probe can say which.
+Its counterpart is under **tick**, and TEST-39 cost a flake for want of it: announcing is only half the
+bargain, and what a probe announces has to be *read* rather than inferred from the fact that it spoke.
 _Avoid_: "the probe is alive" — a live thread that no longer executes the code under test is exactly the
 case that misled three investigations.
 
@@ -909,9 +948,12 @@ _Avoid_: "started", "up", "attached" — every one of them reads as either state
 
 **Cassette**:
 A recorded JDWP session — every request and the reply it got — kept in a file and served back to the
-debugger with no JVM behind the port. A snapshot of one debuggee on one JVM, so it complements a probe
-rather than replacing one: it cannot notice the debuggee changing, and it can be *edited* into a shape no
-JVM here could be asked to produce. See ADR-0014.
+debugger with no JVM behind the port. One debuggee on one JVM, fixed at the moment of recording, so it
+complements a probe rather than replacing one: it cannot notice the debuggee changing, and it can be *edited*
+into a shape no JVM here could be asked to produce. See ADR-0014.
+(This read "a **snapshot** of one debuggee" until the homonym under that term was written down. Neither sense
+was meant — a cassette is not a captured hit and not a committed baseline — which is the argument for the note
+rather than against it.)
 _Avoid_: mock, stub, fixture (the first two suggest something written to satisfy the test; a cassette is a
 transcript of a real session, and its authority comes from that)
 
