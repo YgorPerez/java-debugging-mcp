@@ -2774,8 +2774,30 @@ fn a_thread_filter_holds_against_a_real_pool_of_reused_threads() {
     let mut server = Server::start().expect("start server");
     server.attach(probe.port);
 
-    // The pool pre-starts every core thread, so waiting for one heartbeat is enough for all 200 to exist.
-    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    // TEST-39: wait for the pool the premise below needs, rather than for A heartbeat.
+    //
+    // This used to be `wait_for_line(|l| tick_index(l).is_some())`, on the stated reasoning that "the pool
+    // pre-starts every core thread, so waiting for one heartbeat is enough for all 200 to exist". It is
+    // not. `prestartAllCoreThreads()` runs before the loop, but starting 200 threads takes time the first
+    // heartbeat does not wait for, and under contention it is a lot of time: caught in a 4-vCPU soak with
+    // the whole suite at 16 threads, where the listing came back `85/91 thread(s) name~"pool-worker"` and
+    // the saturation assertion failed with `saw 86 worker(s)`.
+    //
+    // The probe has been reporting the answer all along — `tick <n> handled=<c> pool=<size>` is
+    // `getPoolSize()` — so this asks it rather than inferring it from the clock, which is the same
+    // correction `awaitBlocked` is in `MonitorProbe` and `hold` is in `WedgeProbe`. It waits for the very
+    // number the assertion then requires, so a failure past this point is about the FILTER rather than
+    // about a pool that had not finished starting.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_pool_size(l).is_some_and(|n| n >= MIN_SATURATED_POOL))
+        .unwrap_or_else(|| {
+            panic!(
+                "the pool never reached {MIN_SATURATED_POOL} threads within {EVENT_TIMEOUT:?}, so the \
+                 premise of this test was never true — this is a slow start, not a filter fault. The \
+                 probe's own last heartbeat: {:?}",
+                probe.output().iter().rev().find(|l| tick_pool_size(l).is_some())
+            )
+        });
     let base = highest_tick(&probe).expect("no tick to count from");
 
     let threads =
@@ -2784,8 +2806,12 @@ fn a_thread_filter_holds_against_a_real_pool_of_reused_threads() {
     // "the filter excluded the others" would prove almost nothing.
     let pool_size = threads.lines().filter(|l| l.contains("pool-worker")).count();
     assert!(
-        pool_size >= 100,
-        "the pool must be saturated for this test to mean anything, saw {pool_size} worker(s):\n{threads}"
+        pool_size >= MIN_SATURATED_POOL,
+        "the pool must be saturated for this test to mean anything, saw {pool_size} worker(s). The wait \
+         above already required {MIN_SATURATED_POOL} by the probe's own `pool=` count, so this is the \
+         LISTING disagreeing with the debuggee rather than a pool that had not started (TEST-39). The \
+         probe's last heartbeat: {:?}\n{threads}",
+        probe.output().iter().rev().find(|l| tick_pool_size(l).is_some())
     );
     let target = threads
         .lines()
@@ -3754,6 +3780,19 @@ fn stable_workers_in_debuggee(server: &mut Server) -> usize {
     let all =
         server.call("debug.list_threads", serde_json::json!({"name_filter": "stable-worker", "limit": 400}));
     all.lines().filter(|l| l.contains("stable-worker-")).count()
+}
+
+/// How many `PoolProbe` workers have to exist before "the filter excluded the others" proves anything.
+///
+/// The same number the saturation assertion uses, deliberately: the wait and the assertion must not be able
+/// to disagree, which is how a race becomes an assertion failure about something else (TEST-39).
+const MIN_SATURATED_POOL: usize = 100;
+
+/// The `pool=<size>` of `PoolProbe`'s `tick <n> handled=<c> pool=<size>` heartbeat — `getPoolSize()` as the
+/// debuggee itself reports it, which is the only thing that knows whether `prestartAllCoreThreads()` has
+/// finished.
+fn tick_pool_size(line: &str) -> Option<usize> {
+    line.split("pool=").nth(1)?.trim().parse().ok()
 }
 
 /// The `<n>` of `ExcProbe`'s / `WatchProbe`'s `tick <n> …` line. Both count something that only advances
