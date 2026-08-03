@@ -12660,3 +12660,274 @@ fn float_and_double_literals_reach_the_overload_they_name() {
 
     server.panic_reset();
 }
+
+// ---------------------------------------------------------------------------------------------
+// EVAL-9 (#86) — an UNLOADED Hibernate lazy association is a third answer
+//
+// The safety claim is that detection invokes NOTHING, so every test here ends by reading the
+// `initialized` flag again: still false means nothing was loaded. Both probes are STRUCTURAL — the
+// suite cannot depend on hibernate-core being installed — and each says at the top of its source what
+// that does and does not prove. The names were measured separately, against `javap` on three real
+// hibernate-core jars and against a real detached proxy through this debugger; #86 records both, and
+// nothing here is evidence for them.
+// ---------------------------------------------------------------------------------------------
+
+/// Fully-qualified main classes: these two probes declare a package, because the thing under test IS a
+/// fully-qualified type name (`org.hibernate.proxy.HibernateProxy`).
+const LAZY_PROXY_MAIN: &str = "org.hibernate.proxy.LazyProxyProbe";
+const LAZY_COLLECTION_MAIN: &str = "org.hibernate.collection.spi.LazyCollectionProbe";
+
+/// An unloaded entity proxy is reported rather than walked into — on a method call AND on an inherited
+/// field read, which is the case the brief does not name and the one with no error today.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_unloaded_proxy_is_reported_instead_of_being_initialised() {
+    let Some(jdk) = jdk_or_skip("an_unloaded_proxy_is_reported_instead_of_being_initialised") else {
+        return;
+    };
+    let mut probe = Probe::launch_in_package(&jdk, "LazyProxyProbe", LAZY_PROXY_MAIN).expect("launch");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("proxy implements marker: true"))
+        .expect("the probe never confirmed its own shape — the stand-in is not what this test assumes");
+
+    // A method call through the proxy: the case the issue was filed about.
+    let called = server.evaluate("LazyProxyProbe.unloaded.getRef()");
+    assert_contains_all(
+        "a method call through an unloaded proxy is reported, not performed",
+        &called,
+        &["UNLOADED Hibernate proxy", "getRef()", "NOT resolved", "force_initialize"],
+    );
+    assert!(
+        !called.contains("WALKED IN"),
+        "the getter RAN. That value is the probe's marker for a walk that should never have happened — a \
+         real proxy would have issued SELECTs or thrown here:\n{called}"
+    );
+
+    // An INHERITED field read: silently wrong today, which is worse than the invoke.
+    let field = server.evaluate("LazyProxyProbe.unloaded.id");
+    assert_contains_all(
+        "an inherited field read is reported too",
+        &field,
+        &["UNLOADED Hibernate proxy", ".id"],
+    );
+    assert!(
+        !field.contains("= null"),
+        "reading `.id` answered null. On a proxy that is the UNPOPULATED inherited copy, not the entity's \
+         id — a wrong answer with no error at all, which is why the check sits above the field/method \
+         split:\n{field}"
+    );
+
+    // The proxy's OWN declared field is still readable, and it has to be: it is what the detection reads.
+    assert_contains_all(
+        "a field the proxy itself declares is its own state and stays readable",
+        &server.evaluate("LazyProxyProbe.unloaded.$$_hibernate_interceptor.initialized"),
+        &["(boolean) false"],
+    );
+
+    // The Hibernate 3.x/4.x spelling reaches the same verdict through the other field name.
+    assert_contains_all(
+        "the Javassist-era `handler` field is found too",
+        &server.evaluate("LazyProxyProbe.unloadedJavassist.getRef()"),
+        &["UNLOADED Hibernate proxy"],
+    );
+
+    // --- and the three things that must be UNAFFECTED ---
+    assert_contains_all(
+        "an INITIALISED proxy is an ordinary object",
+        &server.evaluate("LazyProxyProbe.loaded.id"),
+        &["null"],
+    );
+    assert!(
+        !server.evaluate("LazyProxyProbe.loaded.id").contains("UNLOADED"),
+        "a proxy whose `initialized` is true must not be reported as unloaded"
+    );
+    // Named like a proxy, implements nothing: the INTERFACE decides, not the name.
+    let not_really = server.evaluate("LazyProxyProbe.notAProxy.id");
+    assert!(
+        !not_really.contains("UNLOADED"),
+        "a class merely NAMED `$HibernateProxy$` is not one. The name is a cost gate; the marker interface \
+         is the decision, and conflating them would report an unfetched row for any class named this \
+         way:\n{not_really}"
+    );
+    assert_contains_all("and it reads normally", &not_really, &["3"]);
+    assert_contains_all(
+        "a plain entity is untouched",
+        &server.evaluate("LazyProxyProbe.plainEntity.ref"),
+        &["\"plain\""],
+    );
+
+    // THE SAFETY CLAIM: after all of the above, nothing has been initialised.
+    assert_contains_all(
+        "detection invoked nothing — the flag is still false",
+        &server.evaluate("LazyProxyProbe.unloaded.$$_hibernate_interceptor.initialized"),
+        &["(boolean) false"],
+    );
+}
+
+/// `debug.evaluate_chain`'s third link ending, and the case a chain that ENDS on the lazy value would
+/// otherwise get wrong: a rendered collection that looks empty when nobody has fetched it.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_chain_stops_at_an_unfetched_collection_and_says_which_of_three_it_is() {
+    let Some(jdk) = jdk_or_skip("a_chain_stops_at_an_unfetched_collection_and_says_which_of_three_it_is")
+    else {
+        return;
+    };
+    let mut probe =
+        Probe::launch_in_package(&jdk, "LazyCollectionProbe", LAZY_COLLECTION_MAIN).expect("launch");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("implements marker: true"))
+        .expect("the probe never confirmed its own shape");
+
+    // A suspending stop point, so the invoking assertions below have a thread JDWP will run a method on.
+    // Setup, not the thing under test — the reports above and below need no suspension at all, which is
+    // itself part of the point.
+    let line = probe_line(&probe_source("LazyCollectionProbe"), "// BP1");
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": LAZY_COLLECTION_MAIN, "line": line}),
+    );
+    server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).expect("the setup stop never fired");
+
+    // The next link is what would load it, so THAT is what gets reported.
+    let sized = server.call(
+        "debug.evaluate_chain",
+        serde_json::json!({"expression": "LazyCollectionProbe.unfetched.size()"}),
+    );
+    assert_contains_all(
+        "calling size() on an unfetched collection is reported",
+        &sized,
+        &["UNLOADED Hibernate collection", "size()", "NOT resolved"],
+    );
+    assert!(
+        !sized.contains("-1"),
+        "size() RAN. -1 is the probe's marker for a call no real collection could answer, and reaching it \
+         means the deferred SELECT was issued:\n{sized}"
+    );
+
+    // A chain that ENDS on the collection: neither null nor a value, and it must not read as empty.
+    let ended = server
+        .call("debug.evaluate_chain", serde_json::json!({"expression": "LazyCollectionProbe.unfetched"}));
+    assert_contains_all(
+        "a chain ending on the collection names the third outcome",
+        &ended,
+        &["⏳", "UNLOADED Hibernate collection", "next link"],
+    );
+    assert!(
+        !ended.contains("no link in this chain is null or unfetched"),
+        "the walk reported a clean chain. An unfetched collection is not a clean answer — it is the \
+         difference between 'the association is empty' and 'nobody looked':\n{ended}"
+    );
+
+    // A field read triggers nothing on a collection, so it must NOT be refused — including the flag
+    // itself, which the first implementation refused.
+    assert_contains_all(
+        "a field read on a collection is safe and stays allowed",
+        &server.evaluate("LazyCollectionProbe.unfetched.initialized"),
+        &["(boolean) false"],
+    );
+    assert_contains_all(
+        "including one the bag declares itself",
+        &server.evaluate("LazyCollectionProbe.unfetched.role"),
+        &["Reserva.reservaHotelList"],
+    );
+
+    // --- unaffected ---
+    let fetched = server.call(
+        "debug.evaluate_chain",
+        serde_json::json!({"expression": "LazyCollectionProbe.fetched.size()"}),
+    );
+    assert!(
+        fetched.contains("-1") && !fetched.contains("UNLOADED"),
+        "an INITIALISED collection must behave exactly as before — size() runs:\n{fetched}"
+    );
+    let not_a_collection = server.call(
+        "debug.evaluate_chain",
+        serde_json::json!({"expression": "LazyCollectionProbe.notACollection.size()"}),
+    );
+    assert!(
+        !not_a_collection.contains("UNLOADED"),
+        "a class in org.hibernate.collection that implements the marker interface is a collection; one \
+         that merely lives in the package is not. The package is a cost gate, not the decision:\n\
+         {not_a_collection}"
+    );
+
+    assert_contains_all(
+        "detection invoked nothing — the flag is still false",
+        &server.evaluate("LazyCollectionProbe.unfetched.initialized"),
+        &["(boolean) false"],
+    );
+}
+
+/// `force_initialize:true` is the opt-in, and a read-only session refuses it by name.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn force_initialize_walks_in_when_the_caller_asks_for_it() {
+    let Some(jdk) = jdk_or_skip("force_initialize_walks_in_when_the_caller_asks_for_it") else { return };
+    let mut probe = Probe::launch_in_package(&jdk, "LazyProxyProbe", LAZY_PROXY_MAIN).expect("launch");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("proxy implements marker: true")).expect("shape");
+
+    let line = probe_line(&probe_source("LazyProxyProbe"), "// BP1");
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": LAZY_PROXY_MAIN, "line": line}));
+    server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).expect("the setup stop never fired");
+
+    // With the opt-in, the walk happens — and the probe's marker value is the proof that it did.
+    let forced = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "LazyProxyProbe.unloaded.getRef()", "force_initialize": true}),
+    );
+    assert!(
+        forced.contains("WALKED IN"),
+        "force_initialize:true must actually walk in — otherwise the argument is decoration and the \
+         caller has no way to get the value at all:\n{forced}"
+    );
+    // The chain tool takes it too, and the two must not disagree.
+    let forced_chain = server.call(
+        "debug.evaluate_chain",
+        serde_json::json!({"expression": "LazyProxyProbe.unloaded.getRef()", "force_initialize": true}),
+    );
+    assert!(
+        forced_chain.contains("WALKED IN"),
+        "evaluate_chain must honour force_initialize identically to evaluate:\n{forced_chain}"
+    );
+}
+
+/// The read-only half, and its own probe rather than a second session on the first one: a `dt_socket` agent
+/// with `server=y` stops listening once a debugger has handshaked, so two servers cannot hold one probe.
+///
+/// `force_initialize` is refused **at the argument**. The load runs Hibernate's deferred SELECTs inside the
+/// debuggee, so it is a write, and `read_only` exists to make a write impossible by accident. Refusing here
+/// rather than letting the invoke fail is what makes the message name what the caller asked for.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_read_only_session_refuses_force_initialize_by_name() {
+    let Some(jdk) = jdk_or_skip("a_read_only_session_refuses_force_initialize_by_name") else { return };
+    let probe = Probe::launch_in_package(&jdk, "LazyProxyProbe", LAZY_PROXY_MAIN).expect("launch");
+    let mut server = Server::start().expect("start server");
+    let attached = server.call("debug.attach", serde_json::json!({"port": probe.port, "read_only": true}));
+    assert_contains_all("the read-only session attached", &attached, &["Connected"]);
+
+    let refused = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "LazyProxyProbe.unloaded.getRef()", "force_initialize": true}),
+    );
+    assert_contains_all(
+        "read-only names force_initialize rather than failing inside the invoke",
+        &refused,
+        &["read-only", "force_initialize", "refused"],
+    );
+
+    // And without it, a read-only session still gets the honest answer rather than nothing — the report
+    // needs no write, which is the reason it is the default.
+    assert_contains_all(
+        "the report itself needs no write, so read-only still gets it",
+        &server.evaluate("LazyProxyProbe.unloaded.getRef()"),
+        &["UNLOADED Hibernate proxy"],
+    );
+}

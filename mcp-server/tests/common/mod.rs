@@ -1391,6 +1391,22 @@ impl Probe {
         Self::launch_built_by(jdk, name, None, Jdk::compile_probe_stripped)
     }
 
+    /// [`launch`](Self::launch) for a probe that declares a **package**, so its main class is not its file
+    /// name.
+    ///
+    /// Every other probe here is in the default package, and that is not laziness — it keeps the file name,
+    /// the class name and the main class one string. EVAL-9 (#86) is the case that cannot be: detecting an
+    /// unloaded Hibernate association turns on a fully-qualified type name
+    /// (`org.hibernate.proxy.HibernateProxy`), so a probe reproducing the shape must declare a type in that
+    /// package — and one `.java` file declares one package, which puts the probe's own class there too.
+    ///
+    /// `javac` only ties the FILE name to the class name, never to the package, so the source still lives at
+    /// `examples/probes/<name>.java` and `write_class_files` already lays the package directories out. All
+    /// that differs is what `java` is told to run.
+    pub fn launch_in_package(jdk: &Jdk, name: &str, main_class: &str) -> Result<Self, String> {
+        Self::launch_built_by_with_main(jdk, name, Some(main_class), None, Jdk::compile_probe)
+    }
+
     /// Like [`launch`](Self::launch), but with the probe's checked-in `<name>.smap` installed into
     /// `<name>.class` as a JSR-45 `SourceDebugExtension` before the JVM ever loads it — the state a
     /// JSP-derived servlet is in by the time it reaches the shared 8180 (TEST-15, #40).
@@ -1427,10 +1443,22 @@ impl Probe {
         start_delay: Option<Duration>,
         build: impl Fn(&Jdk, &str, &Path) -> Result<(), String>,
     ) -> Result<Self, String> {
+        Self::launch_built_by_with_main(jdk, name, None, start_delay, build)
+    }
+
+    /// [`launch_built_by`](Self::launch_built_by) with the main class spelled out — `None` means it is the
+    /// probe's own name, which is true of every probe in the default package.
+    fn launch_built_by_with_main(
+        jdk: &Jdk,
+        name: &str,
+        main_override: Option<&str>,
+        start_delay: Option<Duration>,
+        build: impl Fn(&Jdk, &str, &Path) -> Result<(), String>,
+    ) -> Result<Self, String> {
         const ATTEMPTS: u32 = 3;
         let mut last = String::new();
         for attempt in 1..=ATTEMPTS {
-            match Self::launch_built_by_once(jdk, name, start_delay, &build) {
+            match Self::launch_built_by_once(jdk, name, main_override, start_delay, &build) {
                 Ok(p) => return Ok(p),
                 Err(e) if e.starts_with(PORT_TAKEN) && attempt < ATTEMPTS => {
                     eprintln!(
@@ -1448,18 +1476,22 @@ impl Probe {
     fn launch_built_by_once(
         jdk: &Jdk,
         name: &str,
+        main_override: Option<&str>,
         start_delay: Option<Duration>,
         build: &impl Fn(&Jdk, &str, &Path) -> Result<(), String>,
     ) -> Result<Self, String> {
         let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         build(jdk, name, dir.path())?;
+        // The class `java` is told to run: the probe's own name, unless the probe declares a package — see
+        // [`launch_in_package`](Self::launch_in_package).
+        let runnable = main_override.unwrap_or(name).to_string();
         // Either the probe is the main class, or the wrapper is and the probe is loaded late — see
         // [`launch_delayed`](Self::launch_delayed).
         let main_class = match start_delay {
-            None => vec![name.to_string()],
+            None => vec![runnable],
             Some(delay) => {
                 compile_slow_start(jdk, dir.path())?;
-                vec![SLOW_START.to_string(), delay.as_millis().to_string(), name.to_string()]
+                vec![SLOW_START.to_string(), delay.as_millis().to_string(), runnable]
             }
         };
 

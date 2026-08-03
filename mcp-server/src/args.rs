@@ -638,6 +638,23 @@ pub struct EvaluateArgs {
     /// "… +N more" (default 16).
     #[serde(default = "default_max_children")]
     pub max_children: usize,
+    /// Walk INTO an unloaded Hibernate lazy association instead of reporting it (EVAL-9, #86).
+    ///
+    /// **Off by default, and the default is the honest answer.** An uninitialised proxy or persistent
+    /// collection is a third outcome alongside "a value" and "null": the row or the collection exists and
+    /// nobody has fetched it. Resolving through one issues the SELECTs Hibernate deferred — **into whatever
+    /// persistence context the debuggee thread is in**, which on a shared instance is someone else's
+    /// in-flight request whose entity graph you would have changed — or throws
+    /// `LazyInitializationException` if the entity is detached.
+    ///
+    /// Reading a FIELD instead is not the way round it: a proxy's own inherited fields are never
+    /// populated, so `.id` reads null while the proxy's identity is set. Measured against a real proxy,
+    /// not assumed.
+    ///
+    /// Set this when the load is what you actually want — a JVM that is yours, or a value you cannot get
+    /// any other way — and know that it is a write to the debuggee, not a read.
+    #[serde(default)]
+    pub force_initialize: bool,
 }
 
 /// Arguments for `debug.evaluate_chain` (EVAL-6).
@@ -662,6 +679,16 @@ pub struct EvaluateChainArgs {
     /// Maximum length of each link's rendered value.
     #[serde(default = "default_max_result_length")]
     pub max_result_length: usize,
+    /// Walk INTO an unloaded Hibernate lazy association instead of reporting it as a link (EVAL-9, #86).
+    ///
+    /// Off by default, and this is the tool where the default matters most: a chain runs to 7 links in the
+    /// target stack, so walking in would fire the deferred SELECTs of every lazy association along the way
+    /// — into whatever persistence context the debuggee thread is in. The walk otherwise stops at the
+    /// unfetched link and says which of the three outcomes it is: a value, `null`, or unfetched.
+    ///
+    /// It is a write to the debuggee. See `debug.evaluate`'s copy of this argument for what it costs.
+    #[serde(default)]
+    pub force_initialize: bool,
 }
 
 /// Arguments for `debug.list_threads`.

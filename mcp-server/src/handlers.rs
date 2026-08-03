@@ -1175,9 +1175,14 @@ impl RequestHandler {
         // a structural walk and an invoked `get()` can disagree on a type whose internals this server
         // does not know, and only one of them takes no lock.
         let mut read_path = ReadPath::default();
-        let resolved = resolve_expression_multi(conn, thread_id, frame.as_ref(), expression, &mut read_path)
-            .await
-            .map_err(explain_readonly)?;
+        // EVAL-9: `force_initialize` performs the load Hibernate deferred, which is a write to the
+        // debuggee — so a read-only session refuses it at the argument rather than letting it fail deep in
+        // an invoke with a message about something else.
+        let lazy = lazy_policy(a.force_initialize, read_only)?;
+        let resolved =
+            resolve_expression_multi(conn, thread_id, frame.as_ref(), expression, &mut read_path, lazy)
+                .await
+                .map_err(explain_readonly)?;
         let deep = (a.expand_objects && !read_only).then(|| DeepOpts {
             depth_limit: a.max_depth,
             child_limit: a.max_children.max(1),
@@ -1248,10 +1253,19 @@ impl RequestHandler {
             None => None,
         };
 
-        let walk =
-            walk_expression_chain(conn, thread_id, frame.as_ref(), expression, a.max_result_length, bytes)
-                .await
-                .map_err(explain_readonly)?;
+        let lazy = lazy_policy(a.force_initialize, session.read_only)?;
+        let conn = &mut session.connection;
+        let walk = walk_expression_chain(
+            conn,
+            thread_id,
+            frame.as_ref(),
+            expression,
+            a.max_result_length,
+            bytes,
+            lazy,
+        )
+        .await
+        .map_err(explain_readonly)?;
         drop(session);
         Ok(render_expression_chain(expression, &walk))
     }
@@ -15428,12 +15442,353 @@ async fn resolve_relative(
     // matters — how the scanned container itself was read — is recorded by the caller.
     let mut path = ReadPath::default();
     for seg in &segs {
-        let member = resolve_member(conn, thread_id, frame, &current, seg).await?;
+        // A predicate resolved against each element of a scan. `Report` rather than `Initialize`: a filter
+        // over 400 Reservas whose predicate touched a lazy association would be 400 SELECTs, and the
+        // honest outcome is to name the element that cannot be tested without them.
+        let member = resolve_member(conn, thread_id, frame, &current, seg, LazyPolicy::Report).await?;
         current = apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name, &mut path)
             .await?
             .single("A filter predicate")?;
     }
     Ok(current)
+}
+
+/// Turn `force_initialize` into a policy, refusing it in a read-only session.
+///
+/// Initialising a lazy association is a **write**: it runs Hibernate's deferred SELECTs against the
+/// debuggee's persistence context. `read_only` exists to make that impossible by accident, and refusing
+/// here — rather than letting the invoke inside the proxy fail — is what makes the refusal name the thing
+/// the caller actually asked for.
+fn lazy_policy(force_initialize: bool, read_only: bool) -> Result<LazyPolicy, String> {
+    if force_initialize && read_only {
+        return Err("🔒 read-only session: force_initialize is refused. Initialising a Hibernate lazy \
+                    association runs the SELECTs Hibernate deferred, in the debuggee, against whatever \
+                    persistence context that thread is in — a write, not a read. Without it the unfetched \
+                    link is still REPORTED, which is the answer read-only can give honestly."
+            .to_string());
+    }
+    Ok(if force_initialize { LazyPolicy::Initialize } else { LazyPolicy::Report })
+}
+
+// ----- EVAL-9 (#86): an UNLOADED Hibernate lazy value is a third answer -----
+//
+// `debug.evaluate_chain` is the right tool for this stack's dominant bug shape, and it INVOKED each link.
+// Against 1897 measured `FetchType.LAZY` associations and zero `EAGER`, that does one of two things, both
+// of them changes to the debuggee: it issues SELECTs into whatever persistence context the thread is in —
+// on a shared instance, someone else's in-flight request whose entity graph you just mutated — or it throws
+// `LazyInitializationException`, which the 471 `@TransactionAttribute(NOT_SUPPORTED)` sites make ordinary
+// rather than exotic, and the chain report then blames a link that is fine.
+//
+// EVERY NAME BELOW WAS MEASURED, not taken from documentation. `javap` against the three hibernate-core
+// jars in this workspace (3.5.6-Final, 4.3.1.Final, 5.4.25.Final) pinned the field names across
+// generations, and a real detached proxy built with `ByteBuddyProxyFactory` and a null session confirmed
+// the whole chain through this debugger: `proxy.$$_hibernate_interceptor.initialized` read `false` by pure
+// `GetValues`, with nothing suspended and nothing invoked. Issue #86 carries the table.
+
+/// The marker interface every Hibernate entity proxy implements, in all three generations. Preferred over
+/// the `$HibernateProxy$` shape of the generated class NAME, which is a Byte Buddy naming strategy rather
+/// than API — and over which a check could quietly fail open, the one outcome #86 rules out.
+const HIBERNATE_PROXY_IFACE: &str = "Lorg/hibernate/proxy/HibernateProxy;";
+
+/// The persistent-collection marker, which moved package in Hibernate 4.0. Both spellings are tried
+/// because the target stack spans the move.
+const HIBERNATE_COLLECTION_IFACES: &[&str] = &[
+    "Lorg/hibernate/collection/spi/PersistentCollection;",
+    "Lorg/hibernate/collection/PersistentCollection;",
+];
+
+/// Where a proxy keeps its lazy initialiser. `$$_hibernate_interceptor` since Hibernate 5.3, where the jar
+/// states it itself as `ProxyConfiguration.INTERCEPTOR_FIELD_NAME`; `handler` before that, from Javassist's
+/// own `ProxyFactory.HANDLER`. Tried in that order.
+const LAZY_INITIALIZER_FIELDS: &[&str] = &["$$_hibernate_interceptor", "handler"];
+
+/// The one name that is identical in all three generations: `private boolean initialized`, on
+/// `AbstractLazyInitializer` for a proxy and on `AbstractPersistentCollection` for a collection. Both are
+/// private and several classes up, which the ordinary superclass-walking field lookup handles.
+const INITIALIZED_FIELD: &str = "initialized";
+
+/// Which Hibernate shape a value turned out to be. The two need different sentences because the load
+/// happens at a different moment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LazyShape {
+    /// An entity proxy standing in for a row nobody fetched. Reading THIS link is already the problem.
+    EntityProxy,
+    /// A persistent collection. The value IS the collection and holding it is harmless — but nothing is in
+    /// it yet, so the NEXT link (`.size()`, an iteration, a subscript) is what would load it.
+    Collection,
+}
+
+/// What resolving through a value would do to a Hibernate lazy association.
+enum LazyState {
+    /// Not a Hibernate lazy value, or one that is already loaded. Proceed exactly as before — this is the
+    /// answer for every non-Hibernate JVM and it must stay byte-identical.
+    Loaded,
+    /// Uninitialised. Resolving through it would load it.
+    Unloaded(LazyShape),
+    /// It IS a Hibernate lazy value and the `initialized` flag could not be read, so this cannot say which
+    /// of the two above it is. Reported as a third answer rather than assumed either way: `check_stale`
+    /// models the same **cannot tell** (DISC-7), and guessing "loaded" here would fail open into precisely
+    /// the side effect the check exists to prevent.
+    Unknown(String),
+}
+
+/// Whether the caller asked for the load.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LazyPolicy {
+    /// Report an unloaded link and resolve nothing through it. The default, and the honest answer.
+    Report,
+    /// Walk in anyway — `force_initialize: true`. The side effect is the caller's, stated at the argument.
+    Initialize,
+}
+
+/// Does this class NAME make it a candidate for the check below? The **cost gate**, not the decision.
+///
+/// It exists because of a measurement. Running the authoritative interface check on every link of every
+/// expression took a 5-link chain against a probe with no Hibernate anywhere from **34 JDWP packets to 49
+/// (+44%)**, reproducibly — three interface-lattice walks per link, and a lattice walk returns `false` only
+/// after visiting the whole lattice. #86 requires that non-proxy chains behave as they did today, and a
+/// 44% round-trip tax is not that.
+///
+/// The names are fixed strings in the libraries, not conventions: `ByteBuddyProxyHelper`'s
+/// `PROXY_NAMING_SUFFIX` produces `<Class>$HibernateProxy$<random>` (verified against a real proxy —
+/// `RealHibernateProbe$Order$HibernateProxy$bVJLgnEW`), Javassist's `ProxyFactory` produces
+/// `_$$_javassist_<n>`, and every persistent collection lives under `org.hibernate.collection`.
+///
+/// **The gap, stated rather than left to be discovered:** a deployment that configures
+/// `hibernate.proxy.factory_class` with a factory using some other naming strategy would not be a candidate
+/// here, and its proxies would be walked into as before. The interface check below is authoritative for
+/// everything that IS a candidate, so there are no false positives — only that one shape of false negative,
+/// and it is not a shape stock Hibernate produces.
+fn hibernate_candidate(sig: &str) -> Option<LazyShape> {
+    if sig.contains("$HibernateProxy$") || sig.contains("_$$_javassist") {
+        return Some(LazyShape::EntityProxy);
+    }
+    sig.starts_with("Lorg/hibernate/collection/").then_some(LazyShape::Collection)
+}
+
+/// Is this object an UNLOADED Hibernate lazy value?
+///
+/// **Invokes nothing.** Type metadata and field reads only, which is the entire safety claim of EVAL-9 and
+/// is asserted directly by a test rather than left as a comment.
+///
+/// Two stages: the class name gates it for free (see [`hibernate_candidate`] for the measurement that
+/// made that necessary), and the marker INTERFACE decides it — the name is a library naming strategy,
+/// the interface is API, and a check that answered from the name alone would report a lazy value for any
+/// class somebody happened to name that way.
+async fn hibernate_lazy_state(
+    conn: &mut jdwp_client::JdwpConnection,
+    obj_id: u64,
+    type_id: u64,
+) -> LazyState {
+    let sig = conn.get_signature(type_id).await.unwrap_or_default();
+    let Some(candidate) = hibernate_candidate(&sig) else { return LazyState::Loaded };
+    match candidate {
+        LazyShape::EntityProxy => {
+            if !conn.implements_interface(type_id, HIBERNATE_PROXY_IFACE).await.unwrap_or(false) {
+                // Named like a proxy and is not one. Nothing to report: the interface decides.
+                return LazyState::Loaded;
+            }
+            // One hop first — the flag lives on the initialiser, not on the proxy.
+            let Some(init_id) = read_lazy_initializer(conn, obj_id, type_id).await else {
+                return LazyState::Unknown(format!(
+                    "it implements {} but has neither of the fields that hold a lazy initialiser ({}), so \
+                     whether the row has been fetched cannot be read without invoking something",
+                    decode_signature(HIBERNATE_PROXY_IFACE),
+                    LAZY_INITIALIZER_FIELDS.join(" or "),
+                ));
+            };
+            match read_initialized_flag(conn, init_id).await {
+                Ok(true) => LazyState::Loaded,
+                Ok(false) => LazyState::Unloaded(LazyShape::EntityProxy),
+                Err(why) => LazyState::Unknown(why),
+            }
+        }
+        LazyShape::Collection => {
+            let mut is_collection = false;
+            for iface in HIBERNATE_COLLECTION_IFACES {
+                if conn.implements_interface(type_id, iface).await.unwrap_or(false) {
+                    is_collection = true;
+                    break;
+                }
+            }
+            if !is_collection {
+                return LazyState::Loaded;
+            }
+            // A collection carries the flag directly — there is no initialiser object in between.
+            match read_initialized_flag(conn, obj_id).await {
+                Ok(true) => LazyState::Loaded,
+                Ok(false) => LazyState::Unloaded(LazyShape::Collection),
+                Err(why) => LazyState::Unknown(why),
+            }
+        }
+    }
+}
+
+/// The proxy's lazy-initialiser object, by field read. `None` when neither generation's field is there.
+async fn read_lazy_initializer(
+    conn: &mut jdwp_client::JdwpConnection,
+    obj_id: u64,
+    type_id: u64,
+) -> Option<u64> {
+    for name in LAZY_INITIALIZER_FIELDS {
+        let Ok(Some(fid)) = find_field(conn, type_id, name).await else { continue };
+        let Ok(vals) = conn.get_object_values(obj_id, vec![fid]).await else { continue };
+        if let Some(jdwp_client::types::ValueData::Object(id)) = vals.first().map(|v| &v.data) {
+            if *id != 0 {
+                return Some(*id);
+            }
+        }
+    }
+    None
+}
+
+/// Read the `initialized` boolean off `obj_id`, walking its superclasses the way every other field read
+/// here does — the field is `private` and three classes up on a Byte Buddy interceptor.
+async fn read_initialized_flag(conn: &mut jdwp_client::JdwpConnection, obj_id: u64) -> Result<bool, String> {
+    let type_id = conn
+        .get_object_reference_type(obj_id)
+        .await
+        .map_err(|e| format!("its lazy initialiser's own type could not be read ({e})"))?;
+    let fid = find_field(conn, type_id, INITIALIZED_FIELD)
+        .await
+        .map_err(|e| format!("looking for its `{INITIALIZED_FIELD}` field failed ({e})"))?
+        .ok_or_else(|| {
+            format!("it has no `{INITIALIZED_FIELD}` field, so this is not a layout this recognises")
+        })?;
+    let vals = conn
+        .get_object_values(obj_id, vec![fid])
+        .await
+        .map_err(|e| format!("reading its `{INITIALIZED_FIELD}` field failed ({e})"))?;
+    match vals.first().map(|v| &v.data) {
+        Some(jdwp_client::types::ValueData::Boolean(b)) => Ok(*b),
+        other => Err(format!("its `{INITIALIZED_FIELD}` field is {other:?}, not a boolean")),
+    }
+}
+
+/// What an unloaded value IS, said once so every place that has to say it says the same thing.
+const fn lazy_link_note(shape: LazyShape) -> &'static str {
+    match shape {
+        // Kept SHORT: this lands in a chain table where every link is one line, and the reason it matters
+        // is spelled out by `lazy_link_report` at the point a caller can act on it.
+        LazyShape::EntityProxy => "a row nobody has fetched — neither null nor a value",
+        LazyShape::Collection => "contents not fetched — neither empty nor populated",
+    }
+}
+
+/// Which of the two shapes, for the head of that sentence.
+const fn lazy_link_kind(shape: LazyShape) -> &'static str {
+    match shape {
+        LazyShape::EntityProxy => "Hibernate proxy",
+        LazyShape::Collection => "Hibernate collection",
+    }
+}
+
+/// The one-line form for a chain step, where the class name is the only place it appears.
+fn lazy_link_summary(shape: LazyShape, class_name: &str) -> String {
+    format!("⏳ UNLOADED {} ({class_name}) — {}", lazy_link_kind(shape), lazy_link_note(shape))
+}
+
+/// The full report that replaces resolving a link through an unloaded lazy association.
+///
+/// Long on purpose. "Uninitialized proxy" alone reads as a defect in the debugger; what a caller needs is
+/// that this is a third answer, what the alternative would have cost the debuggee, and the way to ask for
+/// it anyway.
+fn lazy_link_report(shape: LazyShape, class_name: &str, member: &str) -> String {
+    let head = lazy_link_summary(shape, class_name);
+    let what_it_would_do = match shape {
+        LazyShape::EntityProxy => {
+            "Resolving it would issue SELECTs into whatever persistence context this thread is in — on a \
+             shared instance that is someone ELSE's in-flight request, whose entity graph you would have \
+             mutated — or throw LazyInitializationException if the entity is detached, which is ordinary \
+             rather than exotic here.\n   A field read is NOT the safe alternative and this is measured, \
+             not assumed: a proxy's own inherited fields are never populated, so `.id` reads null while \
+             the proxy's identity is set. That is a wrong answer with no error at all."
+        }
+        LazyShape::Collection => {
+            "Resolving it would trigger the collection's initialisation — the SELECT Hibernate deferred — \
+             in whatever persistence context this thread is in. On a shared instance that is someone \
+             else's in-flight request."
+        }
+    };
+    format!(
+        "{head}\n   '.{member}' was NOT resolved. {what_it_would_do}\n   \
+         Pass force_initialize:true to walk in anyway, accepting the load; or read the association from a \
+         request that already fetched it."
+    )
+}
+
+/// The report for the third state: it is a lazy value and we cannot tell whether it is loaded.
+fn lazy_unknown_report(why: &str, class_name: &str, member: &str) -> String {
+    format!(
+        "❓ CANNOT TELL whether this Hibernate lazy value has been fetched ({class_name}) — {why}.\n   \
+         '.{member}' was NOT resolved, because the alternative is to guess 'already loaded' and then \
+         perform the very load this check exists to avoid. Pass force_initialize:true to resolve it \
+         anyway, accepting that."
+    )
+}
+
+/// Apply the policy to a receiver before any member of it is resolved.
+///
+/// This is the seam #86 names, and the live verification is what settled it: BOTH a method call and a
+/// FIELD read on an unloaded proxy are wrong, so the check has to sit above the two — where `evaluate` and
+/// `evaluate_chain` both pass through it.
+async fn check_lazy_receiver(
+    conn: &mut jdwp_client::JdwpConnection,
+    obj_id: u64,
+    type_id: u64,
+    seg: &Seg,
+    policy: LazyPolicy,
+) -> Result<(), String> {
+    if policy == LazyPolicy::Initialize {
+        return Ok(());
+    }
+    let member = &seg_member_display(seg);
+    let state = hibernate_lazy_state(conn, obj_id, type_id).await;
+    if matches!(state, LazyState::Loaded) {
+        return Ok(());
+    }
+    // **A field read is not always the unsafe thing, and which fields are safe differs between the two
+    // shapes.** Both exemptions came out of running this against real Hibernate, where the first version
+    // refused reads that trigger nothing at all — including the debugger's own diagnostic one.
+    //
+    // - On an ENTITY PROXY, a field the proxy class ITSELF declares is the proxy's own state:
+    //   `$$_hibernate_interceptor` is set at construction and is exactly what the detection above reads.
+    //   Only an INHERITED field hands back the unpopulated copy, and only a method is always intercepted.
+    // - On a PERSISTENT COLLECTION nothing about a field read triggers anything: the collection is not a
+    //   stand-in for something else, its fields ARE its state, and it is `size()`/`iterator()` that run the
+    //   deferred SELECT. So every field read is safe, `initialized` included.
+    if seg.args.is_none() {
+        let safe = match state {
+            LazyState::Unloaded(LazyShape::Collection) => true,
+            _ => declares_field(conn, type_id, &seg.name).await,
+        };
+        if safe {
+            return Ok(());
+        }
+    }
+    // Only reached once something IS a lazy value, so the extra signature read is off the hot path.
+    let class_name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+    match state {
+        LazyState::Loaded => Ok(()),
+        LazyState::Unloaded(shape) => Err(lazy_link_report(shape, &class_name, member)),
+        LazyState::Unknown(why) => Err(lazy_unknown_report(&why, &class_name, member)),
+    }
+}
+
+/// Does `type_id` DECLARE a field of this name — as opposed to inheriting one? Cached, so it costs nothing
+/// after the first object of a class.
+async fn declares_field(conn: &mut jdwp_client::JdwpConnection, type_id: u64, name: &str) -> bool {
+    conn.get_fields(type_id).await.is_ok_and(|fs| fs.iter().any(|f| f.name == name))
+}
+
+/// A segment as the message should name it: `.getRef()` for a call, `.id` for a field. The parentheses
+/// matter — they are what tells the reader which of the two was refused.
+fn seg_member_display(seg: &Seg) -> String {
+    if seg.args.is_some() {
+        format!("{}()", seg.name)
+    } else {
+        seg.name.clone()
+    }
 }
 
 async fn resolve_member(
@@ -15442,6 +15797,7 @@ async fn resolve_member(
     frame: Option<&jdwp_client::thread::Frame>,
     current: &jdwp_client::types::Value,
     seg: &Seg,
+    lazy: LazyPolicy,
 ) -> Result<jdwp_client::types::Value, String> {
     use jdwp_client::types::ValueData;
     // A handle addresses an object outright, so it is a head and only a head. Saying so here beats the
@@ -15462,6 +15818,10 @@ async fn resolve_member(
         .get_object_reference_type(obj_id)
         .await
         .map_err(|e| format!("Failed to resolve object type: {e}"))?;
+
+    // EVAL-9: above the field/method split on purpose. Both are wrong against an unloaded lazy value —
+    // the invoke loads it or throws, and the field read silently returns the proxy's own unpopulated copy.
+    check_lazy_receiver(conn, obj_id, type_id, seg, lazy).await?;
 
     if let Some(arglits) = &seg.args {
         invoke_segment_method(conn, thread_id, frame, obj_id, type_id, seg, arglits).await
@@ -15625,7 +15985,13 @@ async fn resolve_expression(
     // expressions) consume a value rather than print a reply, so there is nowhere to say which path a
     // collection read took. `debug.evaluate` and `debug.evaluate_chain` keep theirs.
     let mut path = ReadPath::default();
-    resolve_expression_multi(conn, thread_id, frame, expr, &mut path).await?.single("This")
+    // `Report`, and deliberately not the caller's choice: every route here is a condition, a filter
+    // predicate, a `trace_expr` or a `set_value` source, and one that quietly loads a lazy association on
+    // every hit is the read-only-looking diagnostic that changes the debuggee (EVAL-9). `force_initialize`
+    // is offered on `debug.evaluate` / `debug.evaluate_chain`, where a human asked for one answer.
+    resolve_expression_multi(conn, thread_id, frame, expr, &mut path, LazyPolicy::Report)
+        .await?
+        .single("This")
 }
 
 /// Resolve an expression's head, whichever of the three shapes it is, and say how many segments it ate.
@@ -15774,6 +16140,7 @@ async fn resolve_expression_multi(
     frame: Option<&jdwp_client::thread::Frame>,
     expr: &str,
     path: &mut ReadPath,
+    lazy: LazyPolicy,
 ) -> Result<Resolved, String> {
     let segs = parse_expr(expr)?;
     let Some(head_seg) = segs.first() else {
@@ -15797,7 +16164,7 @@ async fn resolve_expression_multi(
 
     let last = segs.len().saturating_sub(1);
     for (i, seg) in segs.iter().enumerate().skip(start) {
-        let member = resolve_member(conn, thread_id, frame, &current, seg).await?;
+        let member = resolve_member(conn, thread_id, frame, &current, seg, lazy).await?;
         match apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name, path).await? {
             Resolved::One(v) => current = v,
             many @ Resolved::Many { .. } => {
@@ -15827,8 +16194,26 @@ struct ChainStep {
     label: String,
     /// The link's value, rendered the way `debug.evaluate` renders one.
     rendered: String,
-    /// Whether the link resolved to `null`, which is what ends a walk.
-    is_null: bool,
+    /// Why the walk stopped at this link, if it did.
+    ///
+    /// **Three outcomes, not two** (EVAL-9, #86). `null` used to be the only thing that ended a walk; an
+    /// UNLOADED Hibernate lazy association is a third — the row or the collection exists, nobody has
+    /// fetched it, and it is resolving the next link that would fetch it. Folding that into `null` would
+    /// report "this link is null" about an association that is merely unfetched, which is the chain report
+    /// blaming a link that is fine.
+    end: Option<LinkEnd>,
+}
+
+/// Why a chain walk stopped.
+enum LinkEnd {
+    /// The link resolved to `null` — the original ending.
+    Null,
+    /// The link is an unloaded Hibernate lazy association (EVAL-9). Carries the shape because a proxy and
+    /// a collection need different sentences: reading the proxy is already wrong, while the collection is
+    /// fine to hold and it is the NEXT link that would load it.
+    Unloaded(LazyShape),
+    /// It is a Hibernate lazy association and whether it has been fetched could not be read.
+    CannotTell,
 }
 
 /// Walk an expression left to right, recording what each link resolved to, and stop at the first
@@ -15854,6 +16239,7 @@ async fn walk_expression_chain(
     expr: &str,
     max_len: usize,
     how: ByteRender,
+    lazy: LazyPolicy,
 ) -> Result<ChainWalk, String> {
     let segs = parse_expr(expr)?;
     let Some(head_seg) = segs.first() else {
@@ -15885,7 +16271,7 @@ async fn walk_expression_chain(
             steps.push(ChainStep {
                 label: head_label,
                 rendered: "(several values — a slice or filter ends the chain)".to_string(),
-                is_null: false,
+                end: None,
             });
             return Ok(ChainWalk { steps, total_links, path });
         }
@@ -15895,10 +16281,10 @@ async fn walk_expression_chain(
         // **This is the answer, not an error.** `current` is null and the caller wrote another link, so
         // resolving it would fail with a message about a null receiver — which is the question restated,
         // not answered. The walk stops here and the steps already recorded say where it survived to.
-        if steps.last().is_some_and(|s| s.is_null) {
+        if steps.last().is_some_and(|s| s.end.is_some()) {
             break;
         }
-        let member = resolve_member(conn, thread_id, frame, &current, seg).await?;
+        let member = resolve_member(conn, thread_id, frame, &current, seg, lazy).await?;
         match apply_subscripts(conn, thread_id, frame, member, &seg.subs, &seg.name, &mut path).await? {
             Resolved::One(v) => {
                 steps.push(chain_step(conn, seg_label(seg), &v, max_len, how).await);
@@ -15908,12 +16294,13 @@ async fn walk_expression_chain(
                 steps.push(ChainStep {
                     label: seg_label(seg),
                     rendered: "(several values — a slice or filter ends the chain)".to_string(),
-                    is_null: false,
+                    end: None,
                 });
                 return Ok(ChainWalk { steps, total_links, path });
             }
         }
     }
+    mark_trailing_lazy(conn, &mut steps, &current, lazy).await;
     Ok(ChainWalk { steps, total_links, path })
 }
 
@@ -15929,8 +16316,62 @@ async fn chain_step(
     max_len: usize,
     how: ByteRender,
 ) -> ChainStep {
-    let is_null = matches!(v.data, jdwp_client::types::ValueData::Object(0));
-    ChainStep { label, rendered: render_value(conn, v, None, max_len, how).await, is_null }
+    if matches!(v.data, jdwp_client::types::ValueData::Object(0)) {
+        let rendered = render_value(conn, v, None, max_len, how).await;
+        return ChainStep { label, rendered, end: Some(LinkEnd::Null) };
+    }
+    // No lazy classification here, and the reason is a measurement. Doing it per link cost **+4 packets
+    // on a 5-link chain** (34 → 38, and 24 → 28 on a second walk in the same session) because the
+    // object-to-type lookup is per OBJECT and cannot be cached, where `resolve_member`'s own check is free.
+    // Every link with a successor is already checked there, and the one case that is not — a chain that
+    // ENDS on the lazy value — is settled once by `mark_trailing_lazy` below. `render_value` renders an
+    // unloaded value as what it is rather than by invoking `toString()`, at no extra cost, because
+    // `render_object` has the type in hand already.
+    ChainStep { label, rendered: render_value(conn, v, None, max_len, how).await, end: None }
+}
+
+/// A chain can END on the lazy value — `reserva.getHoteis()` and nothing more — and `resolve_member` never
+/// sees a final link as a *receiver*, so nothing above has classified it. Without this the caller is handed
+/// a rendered collection with no hint that it is empty because nobody fetched it, which reads as "the
+/// association is empty": a different answer entirely.
+///
+/// One object-to-type lookup for the whole walk rather than one per link. `rendered` needs no fixing —
+/// `render_object` already refused to `toString()` it and wrote the summary.
+async fn mark_trailing_lazy(
+    conn: &mut jdwp_client::JdwpConnection,
+    steps: &mut [ChainStep],
+    v: &jdwp_client::types::Value,
+    lazy: LazyPolicy,
+) {
+    if steps.last().is_none_or(|s| s.end.is_some()) {
+        return;
+    }
+    let end = match lazy_state_of(conn, v, lazy).await {
+        Some(LazyState::Unloaded(shape)) => LinkEnd::Unloaded(shape),
+        Some(LazyState::Unknown(_)) => LinkEnd::CannotTell,
+        _ => return,
+    };
+    if let Some(last) = steps.last_mut() {
+        last.end = Some(end);
+    }
+}
+
+/// [`hibernate_lazy_state`] for a `Value` rather than an object id, skipping everything for a primitive, a
+/// null, or a caller who passed `force_initialize`.
+async fn lazy_state_of(
+    conn: &mut jdwp_client::JdwpConnection,
+    v: &jdwp_client::types::Value,
+    lazy: LazyPolicy,
+) -> Option<LazyState> {
+    if lazy == LazyPolicy::Initialize {
+        return None;
+    }
+    let jdwp_client::types::ValueData::Object(id) = v.data else { return None };
+    if id == 0 {
+        return None;
+    }
+    let type_id = conn.get_object_reference_type(id).await.ok()?;
+    Some(hibernate_lazy_state(conn, id, type_id).await)
 }
 
 /// One segment as the caller wrote it: `getConfigUhList()`, `sqQuarto`, `lines[0]`.
@@ -15963,17 +16404,49 @@ fn render_expression_chain(expr: &str, walk: &ChainWalk) -> String {
         let _ = writeln!(
             out,
             "  {} {:<width$}  {}",
-            if s.is_null { "✘" } else { "✔" },
+            match s.end {
+                None => "✔",
+                Some(LinkEnd::Null) => "✘",
+                // Its own glyph, because an unloaded association is not a failed link and must not read as
+                // one — the walk stopped to avoid a side effect, not because anything went wrong.
+                Some(LinkEnd::Unloaded(_)) => "⏳",
+                Some(LinkEnd::CannotTell) => "❓",
+            },
             s.label,
             s.rendered,
             width = width
         );
     }
     let _ = writeln!(out);
-    match steps.iter().position(|s| s.is_null) {
+    match steps.iter().position(|s| s.end.is_some()) {
         Some(at) => {
             let step = steps.get(at).map_or("?", |s| s.label.as_str());
-            let _ = write!(out, "⛔ null at link {} of {}: {step}", at + 1, walk.total_links);
+            let _ = match steps.get(at).and_then(|s| s.end.as_ref()) {
+                Some(LinkEnd::Unloaded(LazyShape::EntityProxy)) => write!(
+                    out,
+                    "⏳ link {} of {} is an UNLOADED Hibernate proxy: {step} — not null, and not a value. \
+                     The row it stands for may well exist; nobody has fetched it, and this walk stopped \
+                     rather than fetch it for you",
+                    at + 1,
+                    walk.total_links
+                ),
+                Some(LinkEnd::Unloaded(LazyShape::Collection)) => write!(
+                    out,
+                    "⏳ link {} of {} is an UNLOADED Hibernate collection: {step} — the collection exists \
+                     and its contents have not been fetched, so it is neither empty nor populated as far \
+                     as this can tell. The next link is what would fetch them",
+                    at + 1,
+                    walk.total_links
+                ),
+                Some(LinkEnd::CannotTell) => write!(
+                    out,
+                    "❓ link {} of {} is a Hibernate lazy value whose fetch state could not be read: \
+                     {step}. This walk stopped rather than guess 'already fetched' and perform the fetch",
+                    at + 1,
+                    walk.total_links
+                ),
+                _ => write!(out, "⛔ null at link {} of {}: {step}", at + 1, walk.total_links),
+            };
             // The links the caller wrote but the walk never reached. Said explicitly, because their
             // absence from the table above otherwise reads as "they were fine".
             let unreached = walk.total_links.saturating_sub(steps.len());
@@ -15988,8 +16461,8 @@ fn render_expression_chain(expr: &str, walk: &ChainWalk) -> String {
         None => {
             let _ = write!(
                 out,
-                "✅ no link in this chain is null. If you expected one to be, the value you are after is \
-                 the last line above — an empty collection or a zero counts as present here."
+                "✅ no link in this chain is null or unfetched. If you expected one to be, the value you \
+                 are after is the last line above — an empty collection or a zero counts as present here."
             );
         }
     }
@@ -17247,6 +17720,12 @@ async fn render_object(
     // stays a leaf there regardless of depth rather than being expanded into a `value` field.)
     if let Some(unboxed) = render_boxed_primitive(conn, id).await {
         return unboxed;
+    }
+    // EVAL-9: never `toString()` an unloaded Hibernate lazy value. On a proxy that call IS the load —
+    // rendering it would perform in the *renderer* exactly the side effect the resolver just refused to
+    // perform, and a caller whose chain ended on the proxy would have triggered it by asking what it is.
+    if let LazyState::Unloaded(shape) = hibernate_lazy_state(conn, id, type_id).await {
+        return format!("{name} @0x{id:x} ⏳ UNLOADED {} — {}", lazy_link_kind(shape), lazy_link_note(shape));
     }
     // best-effort toString() when we have a thread to run it on
     if let Some(tid) = thread_id {

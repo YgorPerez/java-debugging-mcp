@@ -17,6 +17,15 @@ _Avoid_: target, remote, server (the last belongs to the MCP server, which is th
 The `WildFly` instance several people use at once. Not an environment name — the constraint that decides
 every safety default, because freezing it stalls other people's requests.
 
+**Unfetched** (of a lazy association):
+A Hibernate entity proxy or persistent collection whose row or contents nobody has loaded. A **third
+answer** alongside a value and `null` (ADR-0032): the row very likely exists, and resolving through it is
+what would fetch it — issuing the deferred SELECTs into whatever persistence context the debuggee thread is
+in, or throwing `LazyInitializationException` if the entity is detached.
+_Avoid_: uninitialised (Hibernate's own word, but it reads as "not constructed"), empty (what an unfetched
+collection is mistaken FOR), null (what it is not — see **unbuilt source** for the same distinction about a
+class)
+
 **Attached** / **launched**:
 Whose JVM it is — the fact every safety default here is derived from. An **attached** debuggee was started by
 somebody else and is *presumed* shared, so suspending it may be stalling a request nobody told you about,
