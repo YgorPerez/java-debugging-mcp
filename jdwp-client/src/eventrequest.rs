@@ -44,6 +44,15 @@ pub enum SuspendPolicy {
 mod mod_kinds {
     pub const COUNT: u8 = 1;
     pub const THREAD_ONLY: u8 = 3;
+    /// `ClassOnly` (4): restrict to one reference type **and its subtypes**, by id rather than by pattern.
+    ///
+    /// **What it restricts is per event kind, and the monitor kinds are the exception the spec calls out.**
+    /// For most events it tests the *location*'s class; for `MONITOR_WAIT` and `MONITOR_WAITED` it tests
+    /// the class of the **monitor object**; for `CLASS_PREPARE` it tests the type being prepared. So the
+    /// same modifier on `MONITOR_CONTENDED_ENTER` and on `MONITOR_WAIT` answers two different questions —
+    /// which is why `set_monitor_request` documents what its caller is actually narrowing rather than
+    /// calling it "a filter on the lock's type" for all four (DUMP-7, #96, ADR-0035).
+    pub const CLASS_ONLY: u8 = 4;
     pub const CLASS_MATCH: u8 = 5;
     /// `ClassExclude` (6): drop events from classes matching a pattern. One modifier per pattern —
     /// JDWP carries a single string each, so N exclusions occupy N of the request's modifier slots.
@@ -466,6 +475,85 @@ impl JdwpConnection {
         Ok(v.jdwp_major > 1 || (v.jdwp_major == 1 && v.jdwp_minor >= 6))
     }
 
+    /// Report lock contention as it happens (EventRequest.Set, one of the four `MONITOR_*` kinds) — the
+    /// primitive behind `debug.set_monitor_stop`, answering "what are these threads blocked on?" **without
+    /// suspending anything** (DUMP-7, #96).
+    ///
+    /// The event-driven counterpart to [`owned_monitors`](Self::owned_monitors) /
+    /// [`current_contended_monitor`](Self::current_contended_monitor), which can only be asked of a thread
+    /// that is already suspended. That is the whole point: "requests are hanging on a lock" was the one
+    /// wedged-app-server question that forced a freeze of a shared instance.
+    ///
+    /// **Ask [`capabilities_new`](Self::capabilities_new) for `can_request_monitor_events` first.** Unlike
+    /// `METHOD_EXIT_WITH_RETURN_VALUE` this *is* a capability bit, so a JVM without it answers
+    /// `NOT_IMPLEMENTED` (99) — which is exactly the bare error code the capability rule exists to improve
+    /// on.
+    ///
+    /// `filters.thread` (`ThreadOnly`) is the cheap narrowing and acts inside the JVM. `monitor_class`
+    /// adds a `ClassOnly`, and **what it narrows depends on the kind**, per the JDWP spec's own wording for
+    /// modKind 4: for [`MonitorKind::Wait`] and [`MonitorKind::Waited`] it tests the class of the *monitor
+    /// object*, and for [`MonitorKind::Blocked`] and [`MonitorKind::Acquired`] it tests the class of the
+    /// *location* — the code that blocked, not the lock it blocked on. See [`mod_kinds::CLASS_ONLY`].
+    ///
+    /// `filters.count` and `filters.instance` are accepted by the signature because [`EventFilters`] is one
+    /// value, but see `mcp-server`'s arming path: `InstanceOnly` is refused there rather than passed
+    /// through, on the ADR-0027 rule that acceptance is not application.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed. `NOT_IMPLEMENTED`
+    /// (99) when the JVM lacks `canRequestMonitorEvents`.
+    pub async fn set_monitor_request(
+        &mut self,
+        kind: MonitorKind,
+        suspend_policy: SuspendPolicy,
+        monitor_class: Option<ReferenceTypeId>,
+        filters: EventFilters,
+    ) -> JdwpResult<i32> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::SET);
+
+        packet.data.put_u8(kind.event_kind());
+        packet.data.put_u8(suspend_policy as u8);
+
+        // Every modifier here is optional — a monitor request with none is the honest "report all
+        // contention", unlike a breakpoint, which cannot exist without a `LocationOnly`.
+        let n_mods = i32::from(monitor_class.is_some())
+            + i32::from(filters.count.is_some())
+            + i32::from(filters.thread.is_some())
+            + i32::from(filters.instance.is_some());
+        packet.data.put_i32(n_mods);
+
+        if let Some(t) = monitor_class {
+            packet.data.put_u8(mod_kinds::CLASS_ONLY);
+            packet.data.put_u64(t);
+        }
+        write_count_thread(&mut packet, filters.count, filters.thread);
+        write_instance_only(&mut packet, filters.instance);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        let mut data = reply.data();
+        let request_id = read_i32(&mut data)?;
+        Ok(request_id)
+    }
+
+    /// Clear a monitor request by id (EventRequest.Clear command). `kind` must match the one the request
+    /// was armed with — JDWP keys requests by (eventKind, requestID), and the four monitor kinds are four
+    /// separate keys, so clearing with the wrong one silently leaves the request armed.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn clear_monitor_request(&mut self, request_id: i32, kind: MonitorKind) -> JdwpResult<()> {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
+        packet.data.put_u8(kind.event_kind());
+        packet.data.put_i32(request_id);
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+        Ok(())
+    }
+
     /// Clear a field watch by id (EventRequest.Clear command). `kind` must match the one the
     /// request was created with — JDWP keys requests by (eventKind, requestID).
     ///
@@ -517,6 +605,76 @@ const fn method_exit_kind(with_return_value: bool) -> u8 {
         event_kinds::METHOD_EXIT_WITH_RETURN_VALUE
     } else {
         event_kinds::METHOD_EXIT
+    }
+}
+
+/// Which of the four monitor events a request fires on (DUMP-7, #96).
+///
+/// **They are two pairs, not four independent kinds, and the names say which.** `Blocked` → `Acquired`
+/// brackets one *contended entry* (a thread queued on a lock somebody else held, then got it), and `Wait`
+/// → `Waited` brackets one `Object.wait()`. Arming only one half of a pair is legitimate — it answers "is
+/// anything blocking at all" for the price of one request — but it can never yield a duration, because
+/// [neither half carries a
+/// timing](crate::events::EventKind::MonitorContendedEntered) and the elapsed is measured across the two.
+///
+/// The labels are deliberately not the JDWP constant names. `MONITOR_CONTENDED_ENTER` and
+/// `MONITOR_CONTENDED_ENTERED` differ by two letters and mean opposite ends of the same block, which is a
+/// reading mistake waiting to happen in a reply a human has to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorKind {
+    /// `MONITOR_CONTENDED_ENTER` (43): a thread began blocking on a monitor another thread owns.
+    Blocked,
+    /// `MONITOR_CONTENDED_ENTERED` (44): a thread that was blocking has acquired the monitor.
+    Acquired,
+    /// `MONITOR_WAIT` (45): a thread is about to `Object.wait()`, which **releases** the monitor.
+    Wait,
+    /// `MONITOR_WAITED` (46): a thread's `Object.wait()` returned, either notified or timed out.
+    Waited,
+}
+
+impl MonitorKind {
+    /// Every kind, in the order the protocol numbers them — so a caller arming "all of them" arms them in
+    /// a stable, reportable order rather than a hash order.
+    pub const ALL: [Self; 4] = [Self::Blocked, Self::Acquired, Self::Wait, Self::Waited];
+
+    /// The JDWP event kind this registers as, used for both Set and Clear.
+    #[must_use]
+    pub const fn event_kind(self) -> u8 {
+        match self {
+            Self::Blocked => event_kinds::MONITOR_CONTENDED_ENTER,
+            Self::Acquired => event_kinds::MONITOR_CONTENDED_ENTERED,
+            Self::Wait => event_kinds::MONITOR_WAIT,
+            Self::Waited => event_kinds::MONITOR_WAITED,
+        }
+    }
+
+    /// Lowercase label used in tool arguments and output.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Acquired => "acquired",
+            Self::Wait => "wait",
+            Self::Waited => "waited",
+        }
+    }
+
+    /// The other half of this kind's pair — the one an elapsed measurement needs armed as well.
+    #[must_use]
+    pub const fn partner(self) -> Self {
+        match self {
+            Self::Blocked => Self::Acquired,
+            Self::Acquired => Self::Blocked,
+            Self::Wait => Self::Waited,
+            Self::Waited => Self::Wait,
+        }
+    }
+
+    /// Whether a `ClassOnly` modifier on this kind tests the **monitor object**'s class rather than the
+    /// location's — true for the wait pair only, per [`mod_kinds::CLASS_ONLY`].
+    #[must_use]
+    pub const fn class_filter_tests_monitor(self) -> bool {
+        matches!(self, Self::Wait | Self::Waited)
     }
 }
 

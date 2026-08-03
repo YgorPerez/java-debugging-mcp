@@ -235,12 +235,13 @@ _Avoid_: resync, recover (there is nothing to resync *to*; the instinct this ter
 ### Stop points
 
 **Stop point**:
-Anything armed in the debuggee that reports when execution reaches it. The umbrella over all four kinds.
+Anything armed in the debuggee that reports when execution reaches it. The umbrella over all five kinds.
 _Avoid_: breakpoint (when you mean any kind rather than a line breakpoint specifically)
 
 The **tool names follow this**, as of VOCAB-1 (#20): `debug.set_line_stop`, `debug.set_exception_stop`,
 `debug.set_field_stop`, `debug.set_method_exit_stop`, and `debug.clear_stop_point` /
-`debug.list_stop_points` / `debug.toggle_stop_point` across all four. Before that, `breakpoint` named
+`debug.list_stop_points` / `debug.toggle_stop_point` across all of them. `debug.set_monitor_stop` (DUMP-7)
+was named to the same pattern from the start, which is the dividend of having taken the renames. Before that, `breakpoint` named
 three different scopes depending on where you read it — one source location in `set_breakpoint`, two
 things that were not source locations in `set_exception_breakpoint` and `set_method_breakpoint`, all four
 kinds in `clear_breakpoint` / `list_breakpoints` / `toggle_breakpoint`, and `set_watchpoint` was a stop
@@ -249,7 +250,7 @@ the window for doing it cheaply does not reopen.
 
 Two things deliberately did **not** change, so this is not re-filed as an inconsistency: the caller-facing
 argument names (`breakpoint_id` on clear/toggle, `bp_id` on `get_traces`) and the ids themselves, which are
-still `bp_1` / `exc_2` / `watch_modify_3` / `mexit_4` — see **Stop-point id**; and the internal type names
+still `bp_1` / `exc_2` / `watch_modify_3` / `mexit_4` / `mon_blocked_5` — see **Stop-point id**; and the internal type names
 (`BreakpointInfo`, `SetBreakpointArgs`, …), which can follow the glossary whenever someone is in there
 anyway. Renaming an argument breaks callers for no gain the tool name has not already delivered.
 The *concepts* below keep their own names: a line breakpoint is still a breakpoint.
@@ -269,6 +270,49 @@ pair.
 **Method-exit request**:
 A stop point on returns from a matching method, reporting which `return` was taken and the value it
 produced.
+
+**Monitor stop point**:
+A stop point on lock contention: one of the four `MONITOR_*` events, reporting which lock, which thread, and
+the code that blocked or waited (DUMP-7). The fifth kind, and the only one whose site the caller does **not**
+choose — contention happens wherever threads collide, which is why a suspending one needs a `thread_id` and
+why there is nothing else to narrow it to.
+_Avoid_: contention breakpoint; lock breakpoint (a "breakpoint" implies a location you picked)
+
+**Monitor bracket**:
+The **two** events that delimit one waiting period, and the unit a duration belongs to: `blocked` → `acquired`
+for a contended entry, `wait` → `waited` for an `Object.wait()`. Four event kinds, two brackets.
+_Avoid_: monitor pair (used for the internal type; "bracket" says what the two events *do*)
+
+**A duration is a property of the bracket, never of an event**, because no monitor event carries one — see
+**Debugger-measured**. Arming one half is legitimate and cheaper: it answers "is anything blocking at all" for
+one request instead of two, and its snapshots say the duration was not measurable rather than printing a zero.
+
+**The two brackets are named apart** (`blocked_for`, `waited_for`) rather than sharing one `elapsed`. Blocking
+is involuntary and a long one is a fault; `wait()` is voluntary and a long one is often a healthy idle worker.
+
+**Debugger-measured**:
+A figure this server computed rather than read off the wire, labelled as such wherever it is printed. So far
+there is exactly one: a monitor bracket's duration, timestamped at the opening event and subtracted at the
+closing one (ADR-0035). It includes our own capture latency (~0.86 ms per hit before caller frames), which is
+noise against a multi-second block and a material fraction of a 5 ms one — so the label is what lets a caller
+judge which case they are in.
+_Avoid_: elapsed; measured (unqualified — the point of the term is *whose* measurement it is)
+
+**Contrast it with a *reported* figure**, which is every other number in a reply: a line number, a returned
+value, a `timed_out` flag. Those are the debuggee's own account. The distinction matters because JDWP offers a
+figure that looks like the missing one — `MONITOR_WAIT`'s `timeout` — which is the value the caller passed to
+`wait(…)`, not how long it waited. Printing that as a duration would have been plausible on every reply.
+
+**Read-side filter**:
+A narrowing this server applies *after* the event has arrived, as opposed to a **filter**, which the debuggee
+applies and which therefore costs nothing when it does not match. A read-side filter reduces what lands in the
+trace buffer and nothing else — the packet has already been generated and has already cost the debuggee its
+notification. `min_duration_ms` is one; so is a **condition**.
+_Avoid_: server-side filter (accurate but ambiguous — this server *is* a server and so is the debuggee's host)
+
+**It is said out loud on every reply that offers one**, because the alternative reads as a cost saving that
+does not exist. The narrowings that do act inside the JVM are the thread filter, `ClassOnly`, `ClassMatch` /
+`ClassExclude`, and the trace-hit budget's disarm.
 
 **Class-load watch**:
 A request the debugger holds *instead of* a stop point, so a class it cannot arm yet can be armed the moment

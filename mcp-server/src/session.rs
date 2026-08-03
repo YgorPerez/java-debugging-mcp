@@ -173,6 +173,36 @@ pub struct DebugSession {
     pub watchpoints: HashMap<String, WatchpointInfo>,
     /// Active method-exit requests (METH-1), keyed by their `mexit_` id.
     pub method_exits: HashMap<String, MethodExitRequestInfo>,
+    /// Active monitor-contention requests (DUMP-7, #96), keyed by their `mon_<kind>_` id.
+    ///
+    /// One record per JDWP request, so a call arming both halves of a pair produces two — the same shape
+    /// `debug.set_field_stop` uses for `modify` + `access`, and for the same reason: every mechanism that
+    /// keys on a single request id (the hit tally, the trace budget, the cost, `clear`, `toggle`) then
+    /// works on a monitor stop point unchanged.
+    pub monitor_requests: HashMap<String, MonitorRequestInfo>,
+    /// Halves of a monitor pair still waiting for their other half (DUMP-7, ADR-0035).
+    ///
+    /// **This exists because no monitor event carries an elapsed time.** `MONITOR_CONTENDED_ENTERED`
+    /// reports that a thread got the lock and says nothing about how long it waited; `MONITOR_WAIT`
+    /// carries the timeout the caller *asked* for, not what it got. "How long was it blocked" — the
+    /// question a contention diagnosis is actually asking — is on neither half, so the only way to have it
+    /// is to timestamp the opening half here and subtract on the closing one. Every reply that prints the
+    /// result says the debugger measured it.
+    ///
+    /// **The key includes which pair.** `Object.wait()` releases its monitor and re-acquires it on wake,
+    /// and that re-acquisition can itself be contended — so one thread can legitimately have a
+    /// `Blocked`→`Acquired` and a `Wait`→`Waited` measurement outstanding on the *same* monitor at the
+    /// same time. Keyed on (thread, monitor) alone they would overwrite each other and report one
+    /// duration as the other.
+    ///
+    /// Bounded by [`MAX_MONITOR_PENDING`], because entries are removed by the *closing* half and there is
+    /// no guarantee one ever arrives: a thread can die blocked, and arming only the opening half of a pair
+    /// is a legitimate (cheaper) way to use this. Drops are counted rather than silent, like every other
+    /// bounded buffer here.
+    pub monitor_pending: HashMap<MonitorPairKey, std::time::Instant>,
+    /// How many pending monitor halves were dropped because [`monitor_pending`](Self::monitor_pending)
+    /// was full — reported, so a missing duration is explicable rather than mysterious.
+    pub monitor_pending_dropped: u64,
     /// Ring buffer of trace/logpoint snapshots (see `TraceRecord`). Bounded by `MAX_TRACES`.
     pub traces: VecDeque<TraceRecord>,
     /// Monotonic sequence for trace records (survives ring-buffer eviction).
@@ -197,6 +227,23 @@ pub const MAX_TRACES: usize = 500;
 /// Max distinct self-disarm notes retained per session (SAFE-8). Small on purpose: these are notices to
 /// act on, not a log, and repeats of the same one are collapsed into a count rather than taking a slot.
 pub const MAX_TRACE_DISARMS: usize = 32;
+
+/// Max outstanding monitor pair-halves retained per session (DUMP-7, #96).
+///
+/// Sized for how many threads can *plausibly* be blocked or waiting at one instant on the app server this
+/// tool exists for — Jetty's untuned default pool is 200 — rather than for the event rate, because an
+/// entry lives only from one half of a pair to the other and is removed when it closes. What it has to
+/// survive is the halves that never close: a thread that dies blocked, or a caller who armed the opening
+/// half only.
+///
+/// **A full map evicts its oldest entry rather than refusing the new one**, which is the opposite of what
+/// every other bound here does and is deliberate. Refusing would be self-defeating: the way this map fills
+/// is with halves that will never close, so a refusal would stop measuring durations *permanently* the
+/// first time 256 threads died blocked. Evicting the oldest keeps the mechanism alive and loses the entry
+/// least likely to still be waiting for its partner. The eviction is counted
+/// ([`monitor_pending_dropped`](DebugSession::monitor_pending_dropped)), so a duration that goes missing
+/// this way is explicable.
+pub const MAX_MONITOR_PENDING: usize = 256;
 
 /// Max reportable events retained per session; oldest are evicted, counted in `events_dropped`.
 ///
@@ -443,6 +490,42 @@ impl DebugSession {
         self.rethrow_chains
             .insert(key, RethrowChain { first_seq: next_seq, rolling_seq: None, collapsed: 0 });
         ThrowKind::First
+    }
+
+    /// Record that the **opening** half of a monitor bracket has arrived, so the closing half can measure
+    /// the duration (DUMP-7, ADR-0035). Returns the eviction note when the map was full.
+    ///
+    /// An opening half arriving twice for the same key **overwrites** rather than being ignored. That is
+    /// the honest reading: JDWP delivered a second "started blocking" without a matching "acquired", so
+    /// either the first bracket's close was never armed or the event was lost, and measuring the newer
+    /// bracket is right where measuring from a stale start would report a duration that includes work the
+    /// thread was not blocked for.
+    pub fn open_monitor_bracket(&mut self, key: MonitorPairKey, at: std::time::Instant) {
+        // Evict the OLDEST rather than refusing the new one — see `MAX_MONITOR_PENDING` for why this bound
+        // behaves opposite to every other one here.
+        if self.monitor_pending.len() >= MAX_MONITOR_PENDING && !self.monitor_pending.contains_key(&key) {
+            if let Some(oldest) = self.monitor_pending.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k) {
+                self.monitor_pending.remove(&oldest);
+                self.monitor_pending_dropped = self.monitor_pending_dropped.saturating_add(1);
+            }
+        }
+        self.monitor_pending.insert(key, at);
+    }
+
+    /// Close a monitor bracket, returning how long it was open — the **debugger-measured** duration, since
+    /// no monitor event carries one.
+    ///
+    /// `None` when this closing half has no matching opening half, which is a normal state rather than an
+    /// error and has three innocent causes: the opening kind was never armed, the bracket opened before
+    /// this stop point was, or the entry was evicted. A reply that got `None` must say the duration is
+    /// unavailable rather than print a zero, which would read as "it was not blocked at all".
+    pub fn close_monitor_bracket(
+        &mut self,
+        key: &MonitorPairKey,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let opened = self.monitor_pending.remove(key)?;
+        Some(now.saturating_duration_since(opened))
     }
 
     /// The watchdog note, but only when it is about the suspension a caller is *currently* looking at
@@ -883,6 +966,131 @@ pub struct MethodExitRequestInfo {
     /// point the filter silently stops matching and the stop point reads as "never fired" — which is the
     /// failure this whole codebase corrects for, so `list_stop_points` checks and says so.
     pub instance_filter: Option<u64>,
+}
+
+/// Which of the two monitor pairs a measurement belongs to (DUMP-7, #96).
+///
+/// Two rather than four, because the four event kinds are two *brackets*: a contended entry has a
+/// beginning (`Blocked`) and an end (`Acquired`), and an `Object.wait()` has a beginning (`Wait`) and an
+/// end (`Waited`). A duration is a property of the bracket, not of either event in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MonitorPair {
+    /// `MONITOR_CONTENDED_ENTER` → `MONITOR_CONTENDED_ENTERED`: how long a thread was **blocked** on a
+    /// lock somebody else held. The contention figure a wedged app server is asked about.
+    Contended,
+    /// `MONITOR_WAIT` → `MONITOR_WAITED`: how long a thread sat in `Object.wait()`. A *voluntary* pause,
+    /// so a long one is not by itself a fault — which is why it is not folded in with the above.
+    Wait,
+}
+
+impl MonitorPair {
+    /// Which pair an event kind belongs to, and whether it is the bracket's opening half.
+    #[must_use]
+    pub const fn of(kind: jdwp_client::MonitorKind) -> (Self, bool) {
+        match kind {
+            jdwp_client::MonitorKind::Blocked => (Self::Contended, true),
+            jdwp_client::MonitorKind::Acquired => (Self::Contended, false),
+            jdwp_client::MonitorKind::Wait => (Self::Wait, true),
+            jdwp_client::MonitorKind::Waited => (Self::Wait, false),
+        }
+    }
+
+    /// How a reply names the duration this pair measures. Not "elapsed" for both: what the two brackets
+    /// measure are different enough facts that one label for them would flatten the distinction the
+    /// variants exist to keep.
+    #[must_use]
+    pub const fn duration_label(self) -> &'static str {
+        match self {
+            Self::Contended => "blocked_for",
+            Self::Wait => "waited_for",
+        }
+    }
+}
+
+/// What identifies one outstanding monitor measurement: which thread, which monitor, which bracket.
+///
+/// See [`DebugSession::monitor_pending`] for why the bracket is in the key rather than left out as
+/// redundant — a `wait` re-acquires its monitor on wake, so one thread can have both brackets open on one
+/// object at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MonitorPairKey {
+    pub thread: u64,
+    /// The monitor object. A **weak** reference like every object id here (ADR-0022) — it is only ever
+    /// compared, never dereferenced, so a collected monitor costs an unmatched entry rather than an error.
+    pub monitor: u64,
+    pub pair: MonitorPair,
+}
+
+/// An active monitor-contention request (DUMP-7, #96): one of the four `MONITOR_*` event kinds, armed at
+/// `EventThread` in trace mode so lock contention can be observed on a shared JVM **without a suspend**.
+///
+/// The event-driven answer to the one wedged-app-server question that used to force a freeze:
+/// `debug.thread_dump` cannot read a running thread's locks, so "requests are hanging on a lock" needed
+/// `suspend:true` on an instance other people are using.
+///
+/// Tracked like every other stop point so `list_stop_points` shows it and `clear_stop_point` / `panic` /
+/// `toggle_stop_point` handle it — and `panic` matters more here than for most kinds, because a suspending
+/// monitor stop on a contended lock re-freezes the VM on the very next acquisition.
+#[derive(Debug, Clone)]
+// Four bools, each an independent property of the JDWP request as the protocol defines it (armed / spent
+// by the debuggee / traced / whether the pair's other half is armed) rather than a parameter bag — the
+// same reason `MethodExitRequestInfo` carries this allow.
+#[allow(clippy::struct_excessive_bools)]
+pub struct MonitorRequestInfo {
+    /// The `mon_<kind>_…` id reported to the caller.
+    pub id: String,
+    /// The live JDWP request id, or `None` while disabled (BP-2).
+    pub request_id: Option<i32>,
+    pub enabled: bool,
+    /// Set when the **debuggee** removed this request rather than the caller (FILT-8). See
+    /// [`BreakpointInfo::spent`].
+    pub spent: bool,
+    /// The `Count` modifier this request was armed with, kept so a re-arm reproduces it (FILT-8).
+    pub hit_count: Option<i32>,
+    /// How many events the JVM has reported on this request (FILT-10). See [`BreakpointInfo::hits`].
+    ///
+    /// Counted **before** the duration threshold, which is the whole reason the number is worth printing
+    /// on this kind: `Hits: 900` beside no snapshots means the lock is contended constantly and every
+    /// contention was shorter than `min_duration_ms`, where `Hits: 0` means nothing contended it at all.
+    /// Those are opposite findings and they read identically if only recorded snapshots are counted.
+    pub hits: u32,
+    /// Which of the four events this request is armed for. Needed to clear it — JDWP keys requests by
+    /// (eventKind, requestID) and the four kinds are four separate keys, so clearing with the wrong one
+    /// silently leaves a possibly-suspending stop point armed with nothing on this side able to find it.
+    pub kind: jdwp_client::MonitorKind,
+    /// Whether this call also armed the other half of this kind's pair.
+    ///
+    /// Recorded because it decides what a snapshot can honestly claim: a duration is measured **across**
+    /// the two halves, so an unpaired request can only report that the event happened. Kept on the record
+    /// rather than re-derived by scanning the map, so the answer cannot change under a caller who clears
+    /// the partner — at which point the remaining half must start saying it can no longer measure.
+    pub paired: bool,
+    /// The type a `ClassOnly` modifier was armed with, kept so a re-arm reproduces it — and stored as the
+    /// dotted NAME as well, because re-arming re-resolves by name (BP-4): a reference type id is only
+    /// valid while that type stays loaded.
+    pub monitor_class: Option<String>,
+    /// Only report a resolved bracket whose measured duration is at least this many milliseconds
+    /// (DUMP-7's `min_duration_ms`).
+    ///
+    /// **A filter on what you READ, not on what crosses the wire**, and the distinction is not pedantry:
+    /// JDWP has no duration modifier, so the event has already been generated, has already cost the
+    /// debuggee its notification, and has already arrived here before this can be applied. It reduces
+    /// noise in the trace buffer and nothing else. `None` records every bracket.
+    pub min_duration_ms: Option<u64>,
+    /// Non-suspending trace mode — the default for this kind, and the only safe shape on a shared JVM.
+    pub trace: bool,
+    /// The trace expressions this stop point records, in the order given (TRACE-11, #93).
+    pub trace_expr: Vec<String>,
+    pub trace_budget: Option<u32>,
+    /// Caller-frame depth for traced hits (TRACE-5).
+    pub trace_frames: usize,
+    /// Per-value length cap for this stop point's captures (TRACE-9), or `None` for the defaults.
+    pub trace_max_length: Option<usize>,
+    /// Observed capture cost, reported by `list_stop_points` (TRACE-7).
+    pub trace_cost: TraceCost,
+    /// Thread this request is filtered to (`ThreadOnly`), if any — the cheap narrowing, applied inside
+    /// the JVM (FILT-1).
+    pub thread_filter: Option<u64>,
 }
 
 /// A breakpoint waiting for its class to load. The `CLASS_PREPARE` request suspends the preparing
@@ -1390,6 +1598,9 @@ impl SessionManager {
             exception_requests: HashMap::new(),
             watchpoints: HashMap::new(),
             method_exits: HashMap::new(),
+            monitor_requests: HashMap::new(),
+            monitor_pending: HashMap::new(),
+            monitor_pending_dropped: 0,
             traces: VecDeque::new(),
             trace_seq: 0,
             stop_seq: 0,

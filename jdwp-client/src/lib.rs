@@ -45,7 +45,7 @@ pub mod vm;
 
 pub use connection::JdwpConnection;
 pub use eventloop::{spawn_event_loop, EventLoopHandle};
-pub use eventrequest::{EventFilters, SuspendPolicy, WatchKind};
+pub use eventrequest::{EventFilters, MonitorKind, SuspendPolicy, WatchKind};
 pub use events::EventSet;
 pub use protocol::{JdwpError, JdwpResult};
 

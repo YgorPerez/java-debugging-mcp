@@ -1416,6 +1416,150 @@ pub struct SetMethodBreakpointArgs {
     pub thread_id: Option<String>,
 }
 
+/// Arguments for `debug.set_monitor_stop` (DUMP-7, #96).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetMonitorStopArgs {
+    /// Which of the four monitor events to report. Omitted arms `["blocked", "acquired"]` — the
+    /// **contended-entry** pair, which is what "requests are hanging on a lock" asks about and the only
+    /// pairing that yields a blocked-for duration.
+    ///
+    /// They are two pairs, not four independent kinds:
+    ///
+    /// - `blocked` — a thread began waiting for a lock another thread owns (`MONITOR_CONTENDED_ENTER`).
+    /// - `acquired` — that thread got the lock (`MONITOR_CONTENDED_ENTERED`). Closes the bracket.
+    /// - `wait` — a thread is entering `Object.wait()`, which RELEASES the lock (`MONITOR_WAIT`).
+    /// - `waited` — its `wait()` returned, notified or timed out (`MONITOR_WAITED`). Closes the bracket.
+    ///
+    /// **A duration needs both halves of a pair**, because no monitor event carries one: it is measured on
+    /// this side, from the opening event to the closing one. One half alone is a legitimate and cheaper
+    /// arming — it answers "is anything blocking at all" for one request instead of two — and a snapshot
+    /// from it says the duration was not measurable rather than printing a zero.
+    ///
+    /// The two pairs are separate questions and mixing them is usually not what you want. Blocking is
+    /// involuntary and a long one is a fault; `wait()` is voluntary and a long one is often a healthy idle
+    /// worker.
+    #[serde(default)]
+    pub kinds: Option<Vec<String>>,
+    /// Only report events on this thread (hex id, e.g. `0x2a`) — JDWP's `ThreadOnly`, applied **inside the
+    /// JVM**, so a non-matching event costs no packet and no capture (FILT-1).
+    ///
+    /// The cheap narrowing, and the one to reach for first: on a busy app server every lock in the JDK's
+    /// own internals is contended constantly, and an unfiltered monitor stop point sees all of it.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Only report events whose MONITOR is an instance of this class (or a subclass) — JDWP's `ClassOnly`,
+    /// also applied inside the JVM.
+    ///
+    /// **Accepted only with `wait` / `waited`, and refused on `blocked` / `acquired`.** That asymmetry is
+    /// the JDWP spec's, not this tool's, and it is measured rather than assumed: on the contended pair
+    /// `HotSpot` applies the same modifier to the class of the **code that blocked** instead, so a request
+    /// asking for "only `Hashtable` locks" would silently become "only blocking inside `Hashtable`'s own
+    /// methods" and the reply would look correct. Measured on Temurin 11.0.32 — a `ClassOnly` naming the
+    /// lock's type produced 0 events on `blocked` and 74 on `wait`, and one naming the blocking code's
+    /// class produced 45 on `blocked` and 0 on `wait` (DUMP-7, ADR-0035).
+    ///
+    /// So it is refused where it does not mean what it reads like, on the same rule that refuses
+    /// `instance_id` elsewhere. Use `thread_id`, or `min_duration_ms`, to narrow the contended pair.
+    #[serde(default)]
+    pub monitor_class: Option<String>,
+    /// **Accepted and always refused**, and the refusal is the answer rather than a missing feature.
+    ///
+    /// It reads like exactly the right thing to want — "only report contention on THIS lock object" — which
+    /// is why it is declared here instead of left out: an undeclared argument is silently ignored, so a
+    /// caller would get a reply claiming the stop point was scoped to one lock while it reported every
+    /// lock in the JVM.
+    ///
+    /// JDWP's `InstanceOnly` tests the frame's `this`, not the monitor, and the monitor is a different
+    /// object from whatever the blocking code is executing on. `HotSpot` **accepts the modifier anyway and
+    /// then ignores it**: measured on Temurin 11.0.32 against a probe whose every frame is static (so
+    /// `this` is null and nothing could legitimately match), the request armed cleanly and reported all
+    /// three of its locks (FILT-9, ADR-0027, ADR-0035). Use `thread_id`, `monitor_class` on the wait pair,
+    /// or `min_duration_ms`.
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    /// Only record a bracket whose measured duration is at least this many milliseconds — the way to ask
+    /// "show me the blocks that actually hurt" on a lock that is contended thousands of times a second.
+    ///
+    /// **This filters what you READ, not what crosses the wire, and the difference is not pedantry.**
+    /// JDWP has no duration modifier, so by the time this can be applied the event has been generated, has
+    /// cost the debuggee its notification, and has already arrived here. It shrinks the trace buffer and
+    /// nothing else. `thread_id` is the filter that actually reduces debuggee cost.
+    ///
+    /// **Requires both halves of the pair, and changes what the opening half does.** A duration is known
+    /// only at the closing event, so with a threshold set the opening event stops producing snapshots and
+    /// becomes pure timestamping — otherwise a contended lock would spend its whole `trace_max_hits` budget
+    /// on "started blocking" lines before one long block was reported. `debug.list_stop_points` still
+    /// counts every hit, so `Hits: 900` with no snapshots means "contended constantly, never for long" —
+    /// a different finding from `Hits: 0`.
+    ///
+    /// **A bracket whose duration could not be measured is dropped while this is set**, rather than reported
+    /// with the figure missing. The routine cause is the first events after arming: those threads were
+    /// already blocked, so their start was never seen, and reporting them would put a 60 ms lock in a reply
+    /// that asked for 200 ms. With no threshold they are kept, and their detail says why there is no number.
+    #[serde(default)]
+    pub min_duration_ms: Option<u64>,
+    /// Only fire on the Nth occurrence (optional), then never again — JDWP's `Count`, with the same
+    /// semantics as everywhere else here: the JVM reports the Nth event and **deletes the request itself**,
+    /// so the stop point is then SPENT rather than armed. Not "the first N", which is `trace_max_hits`.
+    ///
+    /// Applied per JDWP request, and each armed kind is its own request — so with the default pair,
+    /// `hit_count: 5` means the 5th `blocked` AND the 5th `acquired`, which are not two halves of the same
+    /// bracket. Combined with `min_duration_ms` it yields nothing at all, and is refused rather than
+    /// silently producing an armed stop point that can never record.
+    #[serde(default)]
+    pub hit_count: Option<i32>,
+    /// Logpoint mode: snapshot each event (the lock, the thread, the blocking location, its callers and
+    /// in-scope locals, and the measured duration on a closing event) and resume immediately WITHOUT
+    /// suspending. **Defaults to true, and `false` requires a `thread_id`.**
+    ///
+    /// A suspending monitor stop is the most dangerous thing this server can arm. Contention is not a line
+    /// you chose — it is wherever threads happen to collide — so a VM-wide freeze on the next acquisition
+    /// of a hot lock stops the whole application, and it can fire again the instant you resume. There is no
+    /// class or method to narrow it to, which is why the only accepted narrowing for `trace:false` is one
+    /// named thread.
+    #[serde(default = "default_true")]
+    pub trace: bool,
+    /// Only with `trace:true` — an expression evaluated in the blocking/waiting frame and recorded with the
+    /// snapshot.
+    ///
+    /// **Read the caution, because this kind is the one where invoking can bite.** A thread suspended at a
+    /// `monitorenter` is blocked on the lock in the snapshot, and a method call that needs that same
+    /// monitor cannot complete — the debugger would wedge the thread it is reporting on. Field reads
+    /// (`this.pedido.id`) are safe; a getter that touches shared state under the same lock is not. This is
+    /// also why this kind has no `condition`.
+    ///
+    /// Accepts a LIST as well as a string (TRACE-11), each element evaluated against the same frame into
+    /// its own labelled slot.
+    #[serde(default)]
+    pub trace_expr: Option<TraceExprs>,
+    /// Only with `trace:true` — disarm automatically after this many recorded hits (default 200; 0 = no
+    /// limit), so a hot lock cannot flood the debuggee.
+    ///
+    /// **This bound matters more on this kind than on any other.** An uncontended lock produces nothing at
+    /// all, but a hot contended one produces two events per acquisition, and contention on a busy app
+    /// server can be far more frequent than any breakpoint you would choose to set — measured at 434
+    /// events in 3 seconds from a seven-thread probe. Capture is serialised at roughly **720 hits/s** with
+    /// the default 3 caller frames, so this is the easiest way yet to reach that ceiling. `0` removes the
+    /// protection; choose it knowingly. `debug.list_stop_points` reports what the stop point is actually
+    /// costing on your JVM once events have landed (TRACE-7).
+    #[serde(default)]
+    pub trace_max_hits: Option<u32>,
+    /// Only with `trace:true` — how many CALLER frames to record above the blocking frame (default 3; 0
+    /// for the blocking frame alone, capped at 20).
+    ///
+    /// Worth the default here more than anywhere: the lock and the blocking line rarely identify the
+    /// problem on their own, because the same `synchronized` block is entered from every request path. The
+    /// chain is what says WHICH path is wedged. Callers are recorded as `class.method:line` only — no
+    /// locals, no invocation.
+    #[serde(default = "default_trace_frames")]
+    pub trace_frames: usize,
+    /// Only with `trace:true` — raise the per-value length cap on each capture (unset keeps 100 characters
+    /// per in-scope local and 200 for a `trace_expr` result; ceiling 4000, and a larger request is clamped
+    /// with the clamp reported).
+    #[serde(default = "default_trace_max_length")]
+    pub trace_max_length: Option<usize>,
+}
+
 /// Arguments for `debug.force_return`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ForceReturnArgs {

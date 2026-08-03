@@ -37,7 +37,9 @@ pub struct VmVersion {
 /// (`canForceEarlyReturn`) and
 /// [`get_source_debug_extension`](JdwpConnection::get_source_debug_extension)
 /// (`canGetSourceDebugExtension`) both issue their command without checking first, and neither bit is
-/// decoded — [`VmCapabilitiesNew`] stops at `canPopFrames`. Both then surface the raw
+/// decoded — [`VmCapabilitiesNew`] reads through position 18 and names five of those, so 13
+/// (`canGetSourceDebugExtension`) is read past and 21 (`canForceEarlyReturn`) is never reached. Both then
+/// surface the raw
 /// `NOT_IMPLEMENTED` (99), which is precisely the bare error code this rule exists to improve on.
 /// Accepted for now rather than overlooked: adding a bit nothing consults is the mistake `IDSizes` was
 /// deleted for (CLEAN-1, #27), so the bits arrive with the check, not before it. Measured values for the
@@ -101,6 +103,29 @@ pub struct VmCapabilitiesNew {
     /// rather than named, for the reason this struct's documentation gives: a bit nothing reads is the
     /// mistake `IDSizes` was deleted for. Position 12 joined the named ones with FILT-9 (#101).
     pub can_get_instance_info: bool,
+    /// Whether [`set_monitor_request`](JdwpConnection::set_monitor_request) will work — position **17**,
+    /// the very next bit after 16, so DISC-10's decoder needed no positions skipped to reach it.
+    ///
+    /// Decoded in the same change that consults it (DUMP-7, #96), per this struct's rule, and consulted at
+    /// arming time rather than after the fact: a JVM without it answers `NOT_IMPLEMENTED` (99), and "this
+    /// JVM cannot report lock contention as it happens, so a lock diagnosis here still needs a suspending
+    /// `debug.thread_dump`" is a far more useful report — it names the fallback as well as the refusal.
+    pub can_request_monitor_events: bool,
+    /// Whether the JVM can say **at which stack depth** a thread acquired each monitor it owns
+    /// (`ThreadReference.OwnedMonitorsStackDepthInfo`) — position **18**.
+    ///
+    /// Named although no command here issues that request, which is a deliberate exception to this
+    /// struct's rule and needs its justification stated rather than assumed. What consults it is the
+    /// arming reply for a monitor stop point: a snapshot names the lock, the thread and the location that
+    /// blocked, and the obvious next question — *where in this thread's stack was the lock taken* — is
+    /// answerable on a JVM with this bit and not on one without. Reporting which of the two a caller is on
+    /// costs one already-issued command, where leaving it out invites the reading that the tool simply
+    /// does not report frame depth on any JVM.
+    ///
+    /// That is a *consulted* bit rather than an implied capability, which is the line `IDSizes` crossed
+    /// (CLEAN-1, #27): nothing here claims the frame-depth query exists. If it is ever built, this is the
+    /// bit it gates on.
+    pub can_get_monitor_frame_info: bool,
 }
 
 /// Class information from `ClassesBySignature`
@@ -174,7 +199,7 @@ impl JdwpConnection {
     /// The reply repeats [`capabilities`](Self::capabilities)' seven booleans before the ones that are
     /// only here, so the first seven bytes are read past rather than decoded twice — the two commands
     /// answer about the same JVM and disagreeing about the overlap is not a state worth representing.
-    /// Everything past the sixteenth bit is skipped for the reason [`VmCapabilitiesNew`] gives, and so
+    /// Everything past the eighteenth bit is skipped for the reason [`VmCapabilitiesNew`] gives, and so
     /// are 13-15, which sit between bits that *are* consulted.
     ///
     /// # Errors
@@ -209,7 +234,11 @@ impl JdwpConnection {
             can_unrestrictedly_redefine_classes,
             can_pop_frames,
             can_use_instance_filters,
+            // 16, 17, 18 — read in order, which is the only reason these three can be struct-literal
+            // fields rather than `let` bindings. Reordering them here reads every bit off the wrong byte.
             can_get_instance_info: flag()?,
+            can_request_monitor_events: flag()?,
+            can_get_monitor_frame_info: flag()?,
         })
     }
 

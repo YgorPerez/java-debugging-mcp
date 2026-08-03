@@ -13196,7 +13196,8 @@ fn conditional_field_and_method_exit_traces_filter_without_charging_the_budget()
     // `launch_running`, not `launch`: the first thing this test does is arm a WATCHPOINT, which cannot be
     // deferred, so the class has to be loaded before the arming — the TEST-17 (#49) race exactly. It lost
     // that race **deterministically on JDK 11** ("Class 'CondKindsProbe' is not loaded yet"), and passed on
-    // 17, 21 and 25: a slower start does not make a race less likely, it changes the outcome.
+    // 17, 21 and 25, which is the shape §5.5 of the handoff warns about: a slower start does not make a race
+    // less likely, it changes the outcome. Found while running the suite for DUMP-7; the race predates it.
     let mut probe =
         Probe::launch_running(&jdk, "CondKindsProbe", |l| l.starts_with("tick ")).expect("launch");
     let mut server = Server::start().expect("start server");
@@ -13356,5 +13357,452 @@ fn a_read_only_session_refuses_an_invoking_condition_on_every_kind() {
         "a field-comparison condition is allowed read-only, which is what makes the refusal useful",
         &ok,
         &["exc_"],
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// DUMP-7 (#96) — lock contention as events, with no suspend
+//
+// `MonitorProbe` is deliberately not `ContendedProbe`. That one takes locks and never gives them back,
+// which is right for a *dump* and useless here: `MONITOR_CONTENDED_ENTER` fires once per waiter and
+// `MONITOR_CONTENDED_ENTERED` never fires at all, so there is no pair and therefore no duration. This
+// probe contends and RELEASES, over and over, on two locks whose hold times are an order of magnitude
+// apart — which is what lets a `min_duration_ms` threshold be shown to keep one and drop the other,
+// rather than merely to filter everything or nothing.
+//
+// Every test here asserts the probe is still ticking. That is the only evidence trace mode kept its
+// promise: none of the six worker threads can report that it was never frozen, and main's tick stops the
+// moment the VM is suspended.
+// ---------------------------------------------------------------------------------------------
+
+/// JDWP's `VirtualMachine` command set and its `CapabilitiesNew` command — the pair a `FaultRelay` keys on
+/// to make the JVM lie about what it supports.
+const VM_COMMAND_SET: u8 = 1;
+const CAPABILITIES_NEW: u8 = 17;
+
+/// The readiness line `MonitorProbe` prints once contention and waiting have DEMONSTRABLY happened.
+///
+/// Not `tick `: a tick only says main is running, and arming against a probe that has not yet contended
+/// leaves a test waiting on events nothing produced — which fails as "the arming is broken" rather than as
+/// "we were early". The probe asks the JVM rather than guessing, exactly as `ContendedProbe` does.
+fn monitor_probe_ready(line: &str) -> bool {
+    line.starts_with("monitors ready")
+}
+
+/// All four kinds decode, are captured in trace mode, and the VM is never suspended.
+///
+/// The four acceptance criteria about decoding and volume land here: each kind is observed, a snapshot names
+/// the lock and the thread, `MONITOR_WAIT`'s requested timeout and `MONITOR_WAITED`'s `timed_out` are both
+/// reported — and **both readings of `timed_out`**, because "nobody signalled it" and "it was signalled" are
+/// opposite diagnoses and a hard-coded flag would pass against only one.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn all_four_monitor_kinds_are_decoded_and_traced_without_suspending_anything() {
+    let Some(jdk) = jdk_or_skip("all_four_monitor_kinds_are_decoded_and_traced_without_suspending_anything")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch_running(&jdk, "MonitorProbe", monitor_probe_ready).expect("launch");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    let before = highest_tick(&probe).unwrap_or(-1);
+    let armed = server.call(
+        "debug.set_monitor_stop",
+        // `all`, and `trace_max_hits: 0` because contention here runs at ~15 pairs/s plus ~60 waits/s and
+        // the default 200 would disarm mid-test. Safe in a probe nobody else is using; it is exactly the
+        // setting the tool description says to choose knowingly.
+        serde_json::json!({"kinds": ["all"], "trace_max_hits": 0, "trace_frames": 1}),
+    );
+    assert_contains_all(
+        "all four kinds armed, each under its own id",
+        &armed,
+        &["mon_blocked_", "mon_acquired_", "mon_wait_", "mon_waited_", "Mode: trace"],
+    );
+
+    // Each kind in turn. Polled separately rather than once for all four, so a failure names WHICH kind
+    // never arrived — the four are decoded by three different code paths and the tails differ in width.
+    for needle in ["monitor_blocked", "monitor_acquired", "monitor_wait", "monitor_waited"] {
+        assert!(
+            server.wait_for_traces(needle, EVENT_TIMEOUT).is_some(),
+            "no {needle} snapshot arrived. The probe reports its own contention on every tick line, so \
+             check whether it is producing any.\n  probe tail: {:?}",
+            probe.output().iter().rev().take(6).collect::<Vec<_>>(),
+        );
+    }
+
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    // A snapshot must NAME the lock, by type and by handle: "an Object" identifies nothing on a server
+    // holding hundreds, and the handle is what correlates two threads onto one lock.
+    assert_contains_all(
+        "the snapshots name the locks by type and handle",
+        &traces,
+        &["MonitorProbe$FastLock@0x", "MonitorProbe$TimeoutLock@0x", "thread=0x"],
+    );
+    // The two things the wire really does carry, as opposed to the duration it does not.
+    assert_contains_all(
+        "the requested wait timeout and both readings of timed_out are reported",
+        &traces,
+        &["40ms requested", "timed out — no notify arrived", "notified"],
+    );
+
+    // --- the probe's own account, which is what no reply can fake ---
+    let after = highest_tick(&probe).unwrap_or(-1);
+    assert!(
+        after > before,
+        "the probe stopped ticking, so a monitor stop point armed with trace:true suspended the VM — which \
+         is the one thing trace mode promises it will not do. before={before} after={after}\n  probe \
+         tail: {:?}",
+        probe.output().iter().rev().take(8).collect::<Vec<_>>(),
+    );
+
+    server.panic_reset();
+}
+
+/// A closed bracket carries a duration, and the reply says the DEBUGGER measured it.
+///
+/// The honesty half of ADR-0035, and it is the assertion that would catch the tempting shortcut: JDWP's
+/// `MONITOR_WAIT` carries a `timeout` field, so an implementation could print that and look plausible. It is
+/// the argument the caller passed to `wait(…)`, not a measurement — `wait(5000)` returning in 3ms still
+/// reports 5000. So this checks the contended pair, where no number exists on the wire at all, and checks
+/// that what is printed admits whose figure it is.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_paired_monitor_snapshot_carries_a_debugger_measured_duration() {
+    let Some(jdk) = jdk_or_skip("a_paired_monitor_snapshot_carries_a_debugger_measured_duration") else {
+        return;
+    };
+    let mut probe = Probe::launch_running(&jdk, "MonitorProbe", monitor_probe_ready).expect("launch");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    let before = highest_tick(&probe).unwrap_or(-1);
+    // The default kinds are exactly this pair, so passing none is also a test of that default.
+    let armed = server.call("debug.set_monitor_stop", serde_json::json!({"trace_max_hits": 0}));
+    assert_contains_all(
+        "the default arming is the contended pair, and the reply says whose measurement it is",
+        &armed,
+        &["mon_blocked_", "mon_acquired_", "blocked_for: measured across both events, BY THIS SERVER"],
+    );
+
+    let traces = server
+        .wait_for_traces("blocked_for=", EVENT_TIMEOUT)
+        .expect("no snapshot carried a blocked_for at all");
+    assert_contains_all(
+        "the closing snapshot admits the duration is the debugger's own",
+        &traces,
+        &["measured by the DEBUGGER across both events"],
+    );
+    // The opening half says where it started rather than printing a zero, which would read as "it was not
+    // blocked at all" — the opposite of the finding.
+    assert_contains_all(
+        "the opening half reports a pending measurement rather than a zero",
+        &traces,
+        &["<pending — this is where it started"],
+    );
+
+    // A real figure, and one that matches the probe's own hold time. FastLock is held 60ms and SlowLock
+    // 400ms, so anything under 10ms would mean the pairing matched the wrong two events.
+    let measured: Vec<i64> = traces
+        .lines()
+        .filter_map(|l| {
+            let (_, after) = l.split_once("blocked_for=")?;
+            after.split("ms ").next()?.trim().parse().ok()
+        })
+        .collect();
+    assert!(
+        measured.iter().any(|ms| *ms >= 10),
+        "every measured block was under 10ms, so the pairing is matching the wrong events — the probe holds \
+         its locks for 60ms and 400ms. measured={measured:?}"
+    );
+
+    let after = highest_tick(&probe).unwrap_or(-1);
+    assert!(after > before, "the probe stopped ticking: before={before} after={after}");
+    server.panic_reset();
+}
+
+/// `min_duration_ms` between the probe's two hold times keeps the slow lock and drops the fast one.
+///
+/// **The discriminating test, and the reason the probe has two locks.** A threshold that filtered everything
+/// and one that filtered nothing both look like success against a single duration. The gap here is an order
+/// of magnitude — 60ms against 400ms — so a threshold of 200ms has a right and a wrong answer.
+///
+/// It also pins the two behaviours the threshold changes that a caller would otherwise read as bugs: the
+/// opening half records nothing at all while it is set, and `Hits` keeps counting regardless — so "contended
+/// constantly, never for long" stays distinguishable from "never contended".
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_monitor_duration_threshold_keeps_the_slow_lock_and_drops_the_fast_one() {
+    let Some(jdk) = jdk_or_skip("a_monitor_duration_threshold_keeps_the_slow_lock_and_drops_the_fast_one")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch_running(&jdk, "MonitorProbe", monitor_probe_ready).expect("launch");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    let before = highest_tick(&probe).unwrap_or(-1);
+    let armed = server.call(
+        "debug.set_monitor_stop",
+        serde_json::json!({"min_duration_ms": 200, "trace_max_hits": 0, "trace_frames": 0}),
+    );
+    assert_contains_all(
+        "the reply states what the threshold filters and what it changes about the opening half",
+        &armed,
+        &["min_duration_ms: 200", "filters what is RECORDED", "becomes pure timestamping"],
+    );
+
+    let traces = server.wait_for_traces("MonitorProbe$SlowLock@0x", EVENT_TIMEOUT).unwrap_or_else(|| {
+        panic!("no SlowLock snapshot over 200ms arrived, though the probe holds it 400ms")
+    });
+    // The fast lock is held 60ms, so it must not be here at all.
+    assert!(
+        !traces.contains("MonitorProbe$FastLock@0x"),
+        "a FastLock block (held 60ms) got past a 200ms threshold, so the threshold is not being applied to \
+         the measured duration.\n  got: {traces}"
+    );
+    // And the opening half recorded nothing, which is what stops the budget going on "started blocking".
+    assert!(
+        !traces.contains("<pending — this is where it started"),
+        "the opening half recorded snapshots despite min_duration_ms — the budget would go on lines that \
+         cannot carry a duration.\n  got: {traces}"
+    );
+    // Nor may an UNMEASURABLE bracket get through. This is the case JDK 11 found and a faster JVM hid: the
+    // first closing events after arming have no matching start, because those threads were already blocked
+    // — so before this was fixed a 200ms threshold's very first snapshot was a 60ms lock. It is timing, not
+    // a JDK difference, so passing on one JVM proves nothing here.
+    assert!(
+        !traces.contains("<not measured — no matching start"),
+        "a bracket whose duration could not be measured was reported under a 200ms threshold. It might have \
+         lasted 1ms; the argument's only promise is that it did not.\n  got: {traces}"
+    );
+
+    // The hit tally is the part that keeps the silence readable: it counts every event the JVM reported,
+    // threshold or no threshold, so a quiet buffer beside a large Hits is an ANSWER rather than a gap.
+    let listing = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert_contains_all(
+        "the listing explains the suppression and still counts the hits",
+        &listing,
+        &["min_duration_ms: 200", "records NOTHING while it is set", "Hits: "],
+    );
+    let hits: Vec<i64> = listing
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("Hits: ")?.split_whitespace().next()?.parse().ok())
+        .collect();
+    assert!(
+        hits.iter().any(|h| *h > 0),
+        "every stop point reported Hits: 0 while snapshots were arriving — the tally is being charged after \
+         the threshold, which is the thing that makes a filtered silence unreadable. hits={hits:?}"
+    );
+
+    let after = highest_tick(&probe).unwrap_or(-1);
+    assert!(after > before, "the probe stopped ticking: before={before} after={after}");
+    server.panic_reset();
+}
+
+/// One half of a pair reports its events and says the duration is not measurable — rather than printing a
+/// zero, and rather than the reply implying a measurement it cannot make.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_unpaired_monitor_half_reports_events_but_no_duration() {
+    let Some(jdk) = jdk_or_skip("an_unpaired_monitor_half_reports_events_but_no_duration") else {
+        return;
+    };
+    let mut probe = Probe::launch_running(&jdk, "MonitorProbe", monitor_probe_ready).expect("launch");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    let armed = server.call(
+        "debug.set_monitor_stop",
+        serde_json::json!({"kinds": ["blocked"], "trace_max_hits": 0, "trace_frames": 0}),
+    );
+    assert_contains_all(
+        "the arm reply says up front that no duration is available and what to add",
+        &armed,
+        &["mon_blocked_", "blocked_for: NOT available", "Add 'acquired'"],
+    );
+    assert!(
+        !armed.contains("mon_acquired_"),
+        "arming one kind must not arm its partner behind the caller's back: {armed}"
+    );
+
+    let traces = server
+        .wait_for_traces("monitor_blocked", EVENT_TIMEOUT)
+        .expect("a lone opening half must still report its events");
+    assert_contains_all(
+        "the snapshot says the duration is not measurable, and why",
+        &traces,
+        &["<not measurable — the other half of this pair is not armed"],
+    );
+    // The listing must agree with the snapshot. Re-derived from the session rather than remembered, which
+    // is what makes clearing the partner change the answer.
+    assert_contains_all(
+        "the listing says the same thing",
+        &server.call("debug.list_stop_points", serde_json::json!({})),
+        &["blocked_for: unavailable", "'acquired' is not armed"],
+    );
+
+    server.panic_reset();
+}
+
+/// A flooding monitor stop point spends its trace budget, disarms itself, and SAYS so.
+///
+/// The acceptance criterion, and this is the easiest kind in the tool to make flood: the probe produces
+/// roughly 75 monitor events a second across its four locks, so a budget of 5 is reached in well under a
+/// second without any special arrangement.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_flooding_monitor_stop_disarms_itself_on_its_budget_and_says_so() {
+    let Some(jdk) = jdk_or_skip("a_flooding_monitor_stop_disarms_itself_on_its_budget_and_says_so") else {
+        return;
+    };
+    let mut probe = Probe::launch_running(&jdk, "MonitorProbe", monitor_probe_ready).expect("launch");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    let before = highest_tick(&probe).unwrap_or(-1);
+    server.call(
+        "debug.set_monitor_stop",
+        serde_json::json!({"kinds": ["wait"], "trace_max_hits": 5, "trace_frames": 0}),
+    );
+
+    let traces = server.wait_for_traces("reached its trace-hit budget", EVENT_TIMEOUT).unwrap_or_else(|| {
+        panic!(
+            "the budget note never appeared, so silence after 5 snapshots would read \
+                                   as \"no more contention\"\n  probe tail: {:?}",
+            probe.output().iter().rev().take(6).collect::<Vec<_>>()
+        )
+    });
+    assert_contains_all(
+        "the note names the remedy rather than only the fact",
+        &traces,
+        &["stopped recording", "trace_max_hits"],
+    );
+
+    // A disarm is not a freeze: the whole point of the TRACE-8 in-flight handling is that events the JVM
+    // had already generated are dropped and resumed rather than surfaced as suspending hits.
+    let after = highest_tick(&probe).unwrap_or(-1);
+    assert!(
+        after > before,
+        "the probe stopped ticking after the budget disarm, so an in-flight monitor event was surfaced as a \
+         suspending hit. before={before} after={after}\n  probe tail: {:?}",
+        probe.output().iter().rev().take(8).collect::<Vec<_>>(),
+    );
+
+    server.panic_reset();
+}
+
+/// A JVM that reports `canRequestMonitorEvents = false` is told what it cannot do AND what to use instead —
+/// not handed a bare `NOT_IMPLEMENTED (99)`.
+///
+/// Driven through a `FaultRelay` that rewrites the `CapabilitiesNew` reply, because no `HotSpot` this
+/// project has met answers `false`: every one measured says true, including Temurin 11.0.32. So the branch
+/// that reports the refusal is unreachable from a real JVM and would otherwise ship untested.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_jvm_that_cannot_report_monitor_events_is_told_so_with_the_fallback_named() {
+    let Some(jdk) = jdk_or_skip("a_jvm_that_cannot_report_monitor_events_is_told_so_with_the_fallback_named")
+    else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "MonitorProbe", monitor_probe_ready).expect("launch");
+
+    // `CapabilitiesNew` is 32 one-byte booleans. Positions 1-16 true so nothing else in the server changes
+    // behaviour, 17 (`canRequestMonitorEvents`) FALSE, 18 true — which also checks the decoder reads 17
+    // rather than its neighbour, since getting the offset wrong by one would report 18's value here.
+    let mut caps = vec![0u8; 32];
+    for byte in caps.iter_mut().take(16) {
+        *byte = 1;
+    }
+    caps[17] = 1;
+    // `VirtualMachine` (set 1), `CapabilitiesNew` (command 17). Named rather than inlined because a wrong
+    // pair here faults nothing and the test then passes for the wrong reason.
+    let relay = FaultRelay::start(probe.port, vec![(VM_COMMAND_SET, CAPABILITIES_NEW, Fault::Payload(caps))])
+        .expect("start fault relay");
+
+    let mut server = Server::start().expect("start server");
+    server.attach(relay.port);
+
+    let refused = server.call("debug.set_monitor_stop", serde_json::json!({}));
+    assert_contains_all(
+        "the refusal names the capability, says what it means, and names the fallback",
+        &refused,
+        &["canRequestMonitorEvents = false", "debug.thread_dump", "suspend:true"],
+    );
+    // The message MENTIONS `NOT_IMPLEMENTED (99)` on purpose — it is telling the caller what they were
+    // spared — so this cannot assert the string is absent. What it can assert is that the reply is the
+    // capability refusal rather than the arming failing: an unguarded path produces "Failed to arm".
+    assert!(
+        !refused.contains("Failed to arm"),
+        "the request reached the debuggee and was refused there, so the capability check did not fire: \
+         {refused}"
+    );
+    // Nothing was armed, so the refusal left the debuggee untouched.
+    assert_contains_all(
+        "a refused arming registers no stop point",
+        &server.call("debug.list_stop_points", serde_json::json!({})),
+        &["No breakpoints set"],
+    );
+
+    server.panic_reset();
+}
+
+/// Every up-front refusal, in one test because none of them reaches the debuggee.
+///
+/// They run before the session is even resolved, so this needs no JVM at all — which is why they are one
+/// cheap test rather than five slow ones. Three of the five exist because a JDWP modifier does not mean
+/// what the argument reads like on this event kind (measured, ADR-0035) and two because a duration measured
+/// across a pair needs the pair.
+#[test]
+fn every_monitor_arming_refusal_explains_itself_before_touching_the_debuggee() {
+    let mut server = Server::start().expect("start server");
+
+    let cases: Vec<(serde_json::Value, Vec<&str>)> = vec![
+        // InstanceOnly: accepted by HotSpot and ignored, so it is refused rather than passed through.
+        (
+            serde_json::json!({"instance_id": "@0x1f4c"}),
+            vec!["instance_id is not supported", "tests the frame's `this`", "Temurin 11.0.32"],
+        ),
+        // A suspending monitor stop has nothing to narrow to except one thread.
+        (
+            serde_json::json!({"trace": false}),
+            vec!["Refused", "no thread_id", "contention is not a site you chose"],
+        ),
+        // ClassOnly means the LOCATION's class on the contended pair — measured, and the numbers are in the
+        // message so a reader can see it was not inferred from the spec alone.
+        (
+            serde_json::json!({"monitor_class": "java.util.Hashtable"}),
+            vec!["monitor_class is refused with", "0 events on blocked and 74 on wait"],
+        ),
+        // A threshold with one half of a pair could never record anything.
+        (
+            serde_json::json!({"kinds": ["blocked"], "min_duration_ms": 100}),
+            vec!["min_duration_ms needs BOTH halves", "could never record anything"],
+        ),
+        // Count is applied per request by the JVM, so it and a threshold cannot both be satisfied.
+        (
+            serde_json::json!({"hit_count": 3, "min_duration_ms": 100}),
+            vec!["cannot both be set", "DELETES the request"],
+        ),
+        // An unknown kind names all four and says they are pairs.
+        (serde_json::json!({"kinds": ["entered"]}), vec!["is not a monitor event kind", "PAIRS"]),
+    ];
+    for (args, wants) in cases {
+        let refused = server.call("debug.set_monitor_stop", args.clone());
+        assert_contains_all(&format!("refusal for {args}"), &refused, &wants);
+        // The refusal must come from the argument check, not from there being no session — otherwise this
+        // test would pass against a build with no checks at all.
+        assert!(
+            !refused.contains("No active debug session"),
+            "refused for the wrong reason (no session) for {args}: {refused}"
+        );
+    }
+
+    // And a well-formed call gets past the argument checks, so the refusals are not simply "always no".
+    let no_session = server.call("debug.set_monitor_stop", serde_json::json!({}));
+    assert_contains_all(
+        "a valid arming reaches the session lookup",
+        &no_session,
+        &["No active debug session"],
     );
 }

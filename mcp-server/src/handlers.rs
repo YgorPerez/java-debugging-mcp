@@ -82,7 +82,7 @@ async fn arm_single_exception_pattern(
     ))
 }
 
-/// Whether the stop point `id` is currently armed, whichever of the four maps owns it.
+/// Whether the stop point `id` is currently armed, whichever of the five maps owns it.
 ///
 /// Extracted from `handle_toggle_stop_point` so that function stays under the complexity gate, but the
 /// deferred arm is the reason it is worth having a name: a pending breakpoint holds only a
@@ -99,6 +99,9 @@ fn enabled_state_of(session: &crate::session::DebugSession, id: &str) -> Result<
         return Ok(w.enabled);
     }
     if let Some(m) = session.method_exits.get(id) {
+        return Ok(m.enabled);
+    }
+    if let Some(m) = session.monitor_requests.get(id) {
         return Ok(m.enabled);
     }
     if let Some(pb) = session.pending_breakpoints.iter().find(|p| p.bp_id == id) {
@@ -290,7 +293,7 @@ impl RequestHandler {
         })
     }
 
-    /// Arming, listing and disarming **stop points** — all four kinds, plus the three tools that work
+    /// Arming, listing and disarming **stop points** — all five kinds, plus the three tools that work
     /// across them. Returns `None` if `name` isn't one of these.
     ///
     /// Its own group as of DISC-10 (#84), when a fifteenth arm pushed `dispatch_inspect` past the
@@ -307,6 +310,7 @@ impl RequestHandler {
             "debug.set_exception_stop" => self.handle_set_exception_stop(args).await,
             "debug.set_field_stop" => self.handle_set_field_stop(args).await,
             "debug.set_method_exit_stop" => self.handle_set_method_exit_stop(args).await,
+            "debug.set_monitor_stop" => self.handle_set_monitor_stop(args).await,
             "debug.list_stop_points" => self.handle_list_stop_points(args).await,
             "debug.clear_stop_point" => self.handle_clear_stop_point(args).await,
             "debug.toggle_stop_point" => self.handle_toggle_stop_point(args).await,
@@ -665,6 +669,7 @@ impl RequestHandler {
             && session.exception_requests.is_empty()
             && session.watchpoints.is_empty()
             && session.method_exits.is_empty()
+            && session.monitor_requests.is_empty()
             && session.pattern_sets.is_empty()
         {
             return Ok(session.last_watchdog_note.as_ref().map_or_else(
@@ -685,12 +690,14 @@ impl RequestHandler {
         }
         let _ = write!(
             output,
-            "📍 {} breakpoint(s), {} deferred, {} exception, {} watchpoint(s), {} method-exit{}:\n\n",
+            "📍 {} breakpoint(s), {} deferred, {} exception, {} watchpoint(s), {} method-exit, {} \
+             monitor{}:\n\n",
             session.breakpoints.len(),
             session.pending_breakpoints.len(),
             session.exception_requests.len(),
             session.watchpoints.len(),
             session.method_exits.len(),
+            session.monitor_requests.len(),
             if session.pattern_sets.is_empty() {
                 String::new()
             } else {
@@ -769,22 +776,19 @@ impl RequestHandler {
             ));
         }
 
-        // A method-exit request lives in method_exits; Clear must name the same event kind it was armed
-        // with (41 vs 42), or JDWP looks up a different key and silently leaves the request armed —
-        // which for this kind means a possibly-suspending stop point nobody can find.
-        if let Some(me) = session.method_exits.remove(bp_id) {
-            note_traced_in_flight(&mut session, me.trace, me.request_id.as_slice());
-            if let Some(req) = me.request_id {
-                let _ = session.connection.clear_method_exit_request(req, me.with_return_value).await;
-            }
-            let note = spent_clear_note(me.spent);
-            return Ok(format!(
-                "✅ Method-exit reporting cleared: {} ({}{}){}",
-                bp_id,
-                me.class_pattern,
-                me.method.map_or_else(|| ".*".to_string(), |m| format!(".{m}")),
-                note
-            ));
+        // A method-exit request needs its own clear — see `clear_method_exit_stop`.
+        if session.method_exits.contains_key(bp_id) {
+            let reply = clear_method_exit_stop(&mut session, bp_id).await;
+            drop(session);
+            return Ok(reply);
+        }
+
+        // A monitor request needs its own clear, and enough of one that it lives in a function — see
+        // `clear_monitor_request_stop`.
+        if session.monitor_requests.contains_key(bp_id) {
+            let reply = clear_monitor_request_stop(&mut session, bp_id).await;
+            drop(session);
+            return Ok(reply);
         }
 
         // A wildcard family (FILT-3) owns N breakpoints AND a class-prepare watch under one id, so
@@ -850,7 +854,7 @@ impl RequestHandler {
         ))
     }
 
-    /// Silence or re-arm a stop point without losing its definition (BP-1), for any of the three kinds
+    /// Silence or re-arm a stop point without losing its definition (BP-1), for any of the five kinds
     /// (BP-2): disabling clears the JDWP request but keeps the entry — location, `condition`,
     /// `trace_expr`, thread filter — and enabling re-arms it from that stored definition.
     ///
@@ -1002,6 +1006,7 @@ impl RequestHandler {
         let ne = session.exception_requests.len();
         let nw = session.watchpoints.len();
         let nm = session.method_exits.len();
+        let nmon = session.monitor_requests.len();
         disarm_everything(&mut session).await;
         // The panic button's whole job is to leave the VM running, so it must clear a counted suspend
         // depth and report honestly if it couldn't (SAFE-7).
@@ -1041,13 +1046,14 @@ impl RequestHandler {
         }
 
         Ok(format!(
-            "🧯 Panic: cleared {} breakpoint(s){}{}{}{}{} and resumed all threads.{}{threads}{residue}",
+            "🧯 Panic: cleared {} breakpoint(s){}{}{}{}{}{} and resumed all threads.{}{threads}{residue}",
             n,
             if nf > 0 { format!(" + {nf} wildcard family(ies)") } else { String::new() },
             if np > 0 { format!(" + {np} deferred") } else { String::new() },
             if ne > 0 { format!(" + {ne} exception") } else { String::new() },
             if nw > 0 { format!(" + {nw} watchpoint") } else { String::new() },
             if nm > 0 { format!(" + {nm} method-exit") } else { String::new() },
+            if nmon > 0 { format!(" + {nmon} monitor") } else { String::new() },
             note.map_or_else(String::new, |t| format!("\n   ⚠️  {t}"))
         ))
     }
@@ -2198,6 +2204,8 @@ impl RequestHandler {
                 + session.pending_breakpoints.len()
                 + session.exception_requests.len()
                 + session.watchpoints.len()
+                + session.method_exits.len()
+                + session.monitor_requests.len()
                 + session.pattern_sets.len();
             if let Some((req, _)) = session.pending_step.take() {
                 let _ = session.connection.clear_step(req).await;
@@ -2899,6 +2907,81 @@ impl RequestHandler {
         Ok(render_batch_arming("method-exit request(s)", &batches, 0, &trailer))
     }
 
+    /// `debug.set_monitor_stop` (DUMP-7, #96): report lock contention as it happens, without a suspend.
+    ///
+    /// One JDWP request per armed kind, one `mon_<kind>_…` id each — the shape `debug.set_field_stop` uses
+    /// for `modify` + `access`, so every per-request mechanism (hits, budget, cost, clear, toggle) works on
+    /// these unchanged.
+    ///
+    /// **All-or-nothing on the arming.** If the second kind of a pair fails to arm, the first is cleared
+    /// again before returning. A half-armed pair is not a degraded success: it is a stop point that reports
+    /// events and can never measure a duration, under an id whose reply said it would — and the caller
+    /// would have to read `list_stop_points` to discover it. This differs from the batched *pattern* arming
+    /// elsewhere, where each row is an independent question about a different class.
+    async fn handle_set_monitor_stop(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::SetMonitorStopArgs = crate::args::parse(&args)?;
+        let kinds = parse_monitor_kinds(a.kinds.as_deref())?;
+
+        // Every refusal before anything is armed, so a rejected call leaves the debuggee untouched.
+        refuse_bad_monitor_arming(&a, &kinds)?;
+
+        let session_guard = self
+            .resolve_session(&args)
+            .await
+            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
+        let mut session = session_guard.lock().await;
+        // No `condition` on this kind (see `find_traced_request`), so only the trace expressions can invoke.
+        check_readonly_exprs(session.read_only, None, &crate::args::trace_exprs(a.trace_expr.clone()))?;
+
+        // The capability, asked BEFORE arming — a JVM without it answers NOT_IMPLEMENTED (99), and "this
+        // JVM cannot report contention as it happens" plus the fallback is a far more useful reply.
+        let caps = monitor_capabilities(&mut session.connection).await;
+        refuse_without_monitor_capability(caps)?;
+
+        let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
+        check_thread_filter(&mut session.connection, thread_filter).await?;
+        let monitor_class_id = match a.monitor_class.as_deref() {
+            Some(name) => Some(resolve_monitor_class(&mut session.connection, name).await?),
+            None => None,
+        };
+
+        let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
+        let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
+        let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
+        let (trace_exprs, expr_note) = clamp_trace_exprs(crate::args::trace_exprs(a.trace_expr.clone()));
+        let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
+
+        let arm = MonitorArm {
+            thread_filter,
+            monitor_class: a.monitor_class.clone(),
+            monitor_class_id,
+            min_duration_ms: a.min_duration_ms,
+            trace_expr: trace_exprs,
+            trace_budget,
+            trace_frames,
+            trace_max_length,
+        };
+
+        let armed = match arm_monitor_kinds(&mut session, &a, &kinds, &arm).await {
+            Ok(armed) => armed,
+            Err(e) => {
+                drop(session);
+                return Err(e);
+            }
+        };
+        drop(session);
+
+        let rows: Vec<String> = armed
+            .iter()
+            .map(|(id, req, k)| format!("   {}  {id}  (JDWP request {req})", k.label()))
+            .collect();
+        Ok(format!(
+            "✅ Monitor contention reporting armed\n{}\n{}",
+            rows.join("\n"),
+            describe_monitor_arm(&a, &kinds, &arm, caps, frames_note.as_deref()),
+        ))
+    }
+
     async fn handle_get_traces(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::GetTracesArgs = crate::args::parse(&args)?;
         let session_guard =
@@ -3363,7 +3446,7 @@ fn refuse_broad_suspending_method_exit(
 /// The caller-depth lines shared by every traced stop point's arm reply (TRACE-5): the depth, and any
 /// clamp notice. `zero_hint` is the kind-specific "what you're missing at depth 0" wording.
 ///
-/// One helper for all four kinds so the depth reads the same wherever it is reported — and because
+/// One helper for all five kinds so the depth reads the same wherever it is reported — and because
 /// inlining these branches into each `handle_set_*` pushed them past the complexity gate.
 fn describe_trace_frames(trace: bool, frames: usize, note: Option<&str>, zero_hint: &str) -> String {
     let mut out = String::new();
@@ -3465,8 +3548,8 @@ fn describe_trace_mode(spec: &BreakpointSpec, frames_note: Option<&str>) -> Stri
     out
 }
 
-/// The suspend policy a stop point should be armed with. Shared by all three kinds (line breakpoint,
-/// exception breakpoint, watchpoint) so "traced" means one thing everywhere.
+/// The suspend policy a stop point should be armed with. Shared by every kind (line breakpoint,
+/// exception breakpoint, watchpoint, method exit, monitor) so "traced" means one thing everywhere.
 ///
 /// A traced hit suspends only the hit thread — enough to read its frame — and the event pump resumes
 /// it immediately, so nothing is left frozen. Anything else suspends every thread and waits for the
@@ -4326,6 +4409,437 @@ async fn arm_one_method_exit(
     Ok((mexit_id, request_id))
 }
 
+// ----- debug.set_monitor_stop (DUMP-7, #96) -----
+
+/// How every monitor request in one call is armed — the part that does not vary per kind.
+struct MonitorArm {
+    thread_filter: Option<u64>,
+    /// The dotted name as the caller gave it, kept for the record so a re-arm can re-resolve it (BP-4).
+    monitor_class: Option<String>,
+    /// The resolved type id, valid only while that type stays loaded — which is exactly why the name is
+    /// kept beside it rather than instead of it.
+    monitor_class_id: Option<u64>,
+    min_duration_ms: Option<u64>,
+    /// Already clamped to `MAX_TRACE_EXPRS` by the handler (TRACE-11).
+    trace_expr: Vec<String>,
+    trace_budget: Option<u32>,
+    trace_frames: usize,
+    trace_max_length: Option<usize>,
+}
+
+/// Which of the four kinds a `debug.set_monitor_stop` call asked for, or the refusal when it named
+/// something else.
+///
+/// Omitted means the **contended pair**, not all four. That default is a decision, not a convenience: the
+/// issue this tool answers is "requests are hanging on a lock", the contended pair is what reports it, and
+/// arming all four would double the event volume on a kind where volume is the design risk — half of it
+/// answering a different question (who is idle in `wait()`).
+///
+/// `"all"` is accepted as a shorthand because a caller who wants everything should not have to type four
+/// strings in the right order, and because that is what the test for "all four kinds decode" needs to say.
+fn parse_monitor_kinds(kinds: Option<&[String]>) -> Result<Vec<jdwp_client::MonitorKind>, String> {
+    use jdwp_client::MonitorKind as K;
+    let Some(list) = kinds.filter(|l| !l.is_empty()) else {
+        return Ok(vec![K::Blocked, K::Acquired]);
+    };
+    let mut out: Vec<K> = Vec::with_capacity(K::ALL.len());
+    for raw in list {
+        let name = raw.trim().to_lowercase();
+        if name == "all" {
+            // Every kind, in protocol order rather than the order they were typed, so the reply and the
+            // ids read the same however a caller spelled it.
+            return Ok(K::ALL.to_vec());
+        }
+        let kind = K::ALL.iter().copied().find(|k| k.label() == name).ok_or_else(|| {
+            format!(
+                "'{raw}' is not a monitor event kind. Use blocked (a thread started waiting for a lock), \
+                 acquired (it got the lock), wait (entering Object.wait()), waited (its wait returned), or \
+                 \"all\". blocked+acquired and wait+waited are PAIRS — a duration is measured across the \
+                 two, so arming one half reports the events without a duration."
+            )
+        })?;
+        // Deduplicated rather than rejected: the same kind twice is a harmless repetition of one intent,
+        // and arming it twice would produce two JDWP requests reporting every event twice.
+        if !out.contains(&kind) {
+            out.push(kind);
+        }
+    }
+    Ok(out)
+}
+
+/// The two monitor capability bits, or `None` when the JVM could not be asked.
+///
+/// `None` is not a refusal: an unreadable capability set should not turn into a false claim about what the
+/// debuggee supports — the same rule [`check_instance_filter_supported`] follows.
+async fn monitor_capabilities(conn: &mut jdwp_client::JdwpConnection) -> Option<(bool, bool)> {
+    conn.capabilities_new().await.ok().map(|c| (c.can_request_monitor_events, c.can_get_monitor_frame_info))
+}
+
+/// Refuse a monitor stop point on a JVM whose `canRequestMonitorEvents` bit is clear — with the fallback
+/// named, which is the half that makes this more useful than the error it replaces.
+fn refuse_without_monitor_capability(caps: Option<(bool, bool)>) -> Result<(), String> {
+    if !matches!(caps, Some((false, _))) {
+        return Ok(());
+    }
+    Err("This JVM reports canRequestMonitorEvents = false, so it cannot report lock contention as \
+         events at all — arming one would come back as a bare NOT_IMPLEMENTED (99). The only lock \
+         answer left on this JVM is debug.thread_dump with suspend:true, which reads every thread's \
+         monitors from a stopped VM. On a shared instance that freeze is the cost, so take one dump and \
+         read it rather than polling."
+        .to_string())
+}
+
+/// Refuse `instance_id` on a monitor request. **Measured accepted-and-ignored** (ADR-0027's *inert*).
+///
+/// The most tempting of the `InstanceOnly` refusals, because "scope this to THIS lock" is the obvious
+/// to want and the modifier looks like it would do it. It tests the frame's `this`, which is not the
+/// monitor. See [`crate::args::SetMonitorStopArgs::instance_id`] for the measurement.
+fn refuse_instance_filter_on_monitor(instance_id: Option<&str>) -> Result<(), String> {
+    if instance_id.map(str::trim).is_none_or(str::is_empty) {
+        return Ok(());
+    }
+    Err(format!(
+        "instance_id is not supported on debug.set_monitor_stop. {INERT_RULE} JDWP's InstanceOnly tests \
+         the frame's `this`, and the MONITOR is a different object from whatever the blocking code is \
+         executing on — so even if HotSpot applied it, it would not mean \"only this lock\". Measured on \
+         Temurin 11.0.32 against a probe whose every frame is static: the request armed cleanly and \
+         reported all three of its locks. Narrow with thread_id, with monitor_class on the wait pair, or \
+         with min_duration_ms."
+    ))
+}
+
+/// Refuse a SUSPENDING monitor stop that names no thread.
+///
+/// The strictest of the suspending refusals, and the reason is structural rather than a matter of degree.
+/// Every other kind has something to narrow to — a line, a class, a field, a method — because the caller
+/// *chose* where it fires. Contention is not chosen: it happens wherever threads collide, so a VM-wide
+/// freeze on the next acquisition of a hot lock stops the whole application and can re-fire the instant it
+/// is resumed. One named thread is the only narrowing that exists here.
+fn refuse_suspending_monitor_without_thread(trace: bool, thread_id: Option<&str>) -> Result<(), String> {
+    if trace || thread_id.map(str::trim).is_some_and(|t| !t.is_empty()) {
+        return Ok(());
+    }
+    Err("🛑 Refused: a SUSPENDING monitor stop point with no thread_id would freeze every thread on the \
+         next contended acquisition anywhere in the JVM — including inside the JDK's own internals, which \
+         are contended constantly. Unlike every other stop point there is no line, class or method to \
+         narrow it to, because contention is not a site you chose.\n   Either keep trace:true (the \
+         default — snapshots and resumes, read them with debug.get_traces), or name the one thread you are \
+         investigating: {\"thread_id\": \"0x2a\", \"trace\": false}."
+        .to_string())
+}
+
+/// Refuse `monitor_class` on the contended pair, where `HotSpot` applies `ClassOnly` to the location's
+/// class instead of the monitor's — measured, not inferred from the spec alone (ADR-0035).
+///
+/// Refused rather than passed through for the FILT-9 reason: a reply saying the stop point is scoped to a
+/// lock type, while the JVM has in fact scoped it to a code location, is a confidently wrong answer. The
+/// two are not even close — "only `Hashtable` locks" against "only blocking inside `Hashtable`'s methods".
+fn refuse_monitor_class_on_contended(
+    monitor_class: Option<&str>,
+    kinds: &[jdwp_client::MonitorKind],
+) -> Result<(), String> {
+    if monitor_class.map(str::trim).is_none_or(str::is_empty) {
+        return Ok(());
+    }
+    let wrong: Vec<&str> =
+        kinds.iter().filter(|k| !k.class_filter_tests_monitor()).map(|k| k.label()).collect();
+    if wrong.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "monitor_class is refused with {} — JDWP's ClassOnly modifier does not test the monitor's type on \
+         those kinds. The spec defines it per event kind and the monitor reading applies only to wait and \
+         waited; on blocked and acquired the JVM tests the class of the CODE THAT BLOCKED instead. \
+         Measured on Temurin 11.0.32 over 3s windows: a ClassOnly naming the lock's type gave 0 events on \
+         blocked and 74 on wait, and one naming the blocking code's class gave 45 on blocked and 0 on \
+         wait.\n   So passing it through would arm a stop point scoped to a code location while the reply \
+         claimed it was scoped to a lock type. Use monitor_class with kinds:[\"wait\",\"waited\"], or \
+         narrow the contended pair with thread_id or min_duration_ms.",
+        wrong.join(" and ")
+    ))
+}
+
+/// Refuse `min_duration_ms` unless both halves of a pair are armed: with one half there is nothing to
+/// measure, so the threshold would silence the stop point completely.
+///
+/// An armed logpoint that can never record anything is the "silence reads as an answer" failure this
+/// codebase exists to remove — and it would be invisible, because every listing would show it armed.
+fn refuse_unpaired_min_duration(
+    min_duration_ms: Option<u64>,
+    kinds: &[jdwp_client::MonitorKind],
+) -> Result<(), String> {
+    if min_duration_ms.is_none() {
+        return Ok(());
+    }
+    let unpaired: Vec<&str> =
+        kinds.iter().filter(|k| !kinds.contains(&k.partner())).map(|k| k.label()).collect();
+    if unpaired.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "min_duration_ms needs BOTH halves of a pair, and {} {} armed without its partner. No monitor \
+         event carries a duration — it is measured on this side from the opening event to the closing one \
+         — so with one half there is nothing to compare against a threshold and this stop point could \
+         never record anything, while every listing showed it armed.\n   Arm the pair: \
+         kinds:[\"blocked\",\"acquired\"] (the default) or kinds:[\"wait\",\"waited\"]. Or drop \
+         min_duration_ms and read every event.",
+        unpaired.join(" and "),
+        if unpaired.len() == 1 { "is" } else { "are" }
+    ))
+}
+
+/// Refuse `hit_count` together with `min_duration_ms`: the JVM deletes the request after the Nth event, and
+/// the Nth event of the opening kind is almost never the one that closes a bracket over the threshold.
+///
+/// The same shape as the method-exit `hit_count` + `method` refusal: `Count` is applied by the JVM, before
+/// anything on this side can see whether the hit was wanted.
+fn refuse_counted_min_duration(hit_count: Option<i32>, min_duration_ms: Option<u64>) -> Result<(), String> {
+    let (Some(n), Some(min)) = (hit_count, min_duration_ms) else {
+        return Ok(());
+    };
+    Err(format!(
+        "hit_count and min_duration_ms cannot both be set, and the combination yields nothing rather than \
+         something imprecise. hit_count is JDWP's Count: the JVM reports the {n}th event and then DELETES \
+         the request, and it applies that per request — so it would spend the count on the {n}th `blocked` \
+         and the {n}th `acquired`, which are not the two halves of one bracket. Both requests would then be \
+         gone, leaving no closing event to measure against {min}ms.\n   Pick one: min_duration_ms to see \
+         every block over a threshold (bounded by trace_max_hits instead), or hit_count to catch the Nth \
+         event whatever its duration."
+    ))
+}
+
+/// Resolve `monitor_class` to a loaded reference type, refusing a name the JVM has never loaded.
+///
+/// Refused rather than deferred, unlike a line breakpoint's class. A `ClassOnly` modifier needs a concrete
+/// type id — JDWP has no pattern form of it — so there is nothing to arm and nothing to arm it *with*
+/// later; and a lock type nothing has loaded cannot be being contended, so the honest answer is that this
+/// filter would match nothing. The remedy is in the message.
+async fn resolve_monitor_class(conn: &mut jdwp_client::JdwpConnection, dotted: &str) -> Result<u64, String> {
+    resolve_class_by_dotted(conn, dotted).await?.ok_or_else(|| {
+        format!(
+            "monitor_class '{dotted}' is not loaded in this JVM, so a ClassOnly filter on it would match \
+             nothing — and it cannot be deferred, because JDWP's ClassOnly takes a concrete type rather \
+             than a pattern. A lock type the JVM has never loaded is also not being contended. Exercise \
+             the code that uses it once, then arm; or drop monitor_class and filter with thread_id."
+        )
+    })
+}
+
+/// Every up-front refusal a `debug.set_monitor_stop` call can earn, in one place so all of them are checked
+/// before the first request reaches the debuggee.
+///
+/// Five, which is more than any other stop point, and that is what the kind is like rather than a sign of a
+/// bad argument set: three of them exist because a JDWP modifier does not mean what the argument reads like
+/// on this event (measured, ADR-0035), and two because a duration measured across a pair needs the pair.
+fn refuse_bad_monitor_arming(
+    a: &crate::args::SetMonitorStopArgs,
+    kinds: &[jdwp_client::MonitorKind],
+) -> Result<(), String> {
+    refuse_instance_filter_on_monitor(a.instance_id.as_deref())?;
+    refuse_suspending_monitor_without_thread(a.trace, a.thread_id.as_deref())?;
+    refuse_monitor_class_on_contended(a.monitor_class.as_deref(), kinds)?;
+    refuse_unpaired_min_duration(a.min_duration_ms, kinds)?;
+    refuse_counted_min_duration(a.hit_count, a.min_duration_ms)
+}
+
+/// Arm every requested kind, **rolling the whole set back** if any of them fails.
+///
+/// A half-armed pair is not a degraded success: it is a stop point that reports events and can never
+/// measure a duration, under an id whose reply said it would, and the caller would have to read
+/// `list_stop_points` to find out. This deliberately differs from the batched *pattern* arming elsewhere,
+/// where each row is an independent question about a different class and a partial answer is the honest one.
+async fn arm_monitor_kinds(
+    session: &mut crate::session::DebugSession,
+    a: &crate::args::SetMonitorStopArgs,
+    kinds: &[jdwp_client::MonitorKind],
+    arm: &MonitorArm,
+) -> Result<Vec<(String, i32, jdwp_client::MonitorKind)>, String> {
+    let mut armed: Vec<(String, i32, jdwp_client::MonitorKind)> = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        match arm_one_monitor(session, a, *kind, kinds, arm).await {
+            Ok(one) => armed.push(one),
+            Err(e) => {
+                for (id, req, k) in armed {
+                    let _ = session.connection.clear_monitor_request(req, k).await;
+                    session.monitor_requests.remove(&id);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(armed)
+}
+
+/// Arm one monitor event kind and register it, returning its `mon_…` id, the JDWP request id, and the kind.
+async fn arm_one_monitor(
+    session: &mut crate::session::DebugSession,
+    a: &crate::args::SetMonitorStopArgs,
+    kind: jdwp_client::MonitorKind,
+    all_kinds: &[jdwp_client::MonitorKind],
+    arm: &MonitorArm,
+) -> Result<(String, i32, jdwp_client::MonitorKind), String> {
+    // `ClassOnly` is only sent on the kinds where it tests the monitor's type — the handler has already
+    // refused the combination for the others, so this is belt-and-braces rather than a silent narrowing.
+    let class_filter = arm.monitor_class_id.filter(|_| kind.class_filter_tests_monitor());
+    let request_id = session
+        .connection
+        .set_monitor_request(
+            kind,
+            suspend_policy_for(a.trace),
+            class_filter,
+            jdwp_client::EventFilters {
+                count: a.hit_count,
+                thread: arm.thread_filter,
+                // Never sent: measured accepted-and-ignored on this kind, and refused at the handler.
+                instance: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to arm the '{}' monitor request: {e}", kind.label()))?;
+
+    let id = session.next_stop_id(&format!("mon_{}_", kind.label()));
+    session.monitor_requests.insert(
+        id.clone(),
+        crate::session::MonitorRequestInfo {
+            id: id.clone(),
+            request_id: Some(request_id),
+            enabled: true,
+            spent: false,
+            hit_count: a.hit_count,
+            hits: 0,
+            kind,
+            paired: all_kinds.contains(&kind.partner()),
+            monitor_class: arm.monitor_class.clone(),
+            min_duration_ms: arm.min_duration_ms,
+            trace: a.trace,
+            trace_expr: arm.trace_expr.clone(),
+            trace_budget: arm.trace_budget,
+            trace_frames: arm.trace_frames,
+            trace_max_length: arm.trace_max_length,
+            trace_cost: crate::session::TraceCost::default(),
+            thread_filter: arm.thread_filter,
+        },
+    );
+    Ok((id, request_id, kind))
+}
+
+/// Everything a monitor arm reply says about HOW it was armed — and, more than for any other kind, about
+/// what it can and cannot claim.
+///
+/// The pairing lines are not decoration. Whether a duration is available at all depends on which kinds were
+/// armed, whose figure it is depends on the fact that the wire carries none, and whether the opening half
+/// records snapshots depends on `min_duration_ms`. A caller who read only "armed" would draw the wrong
+/// conclusion from an empty trace buffer in three different ways.
+fn describe_monitor_arm(
+    a: &crate::args::SetMonitorStopArgs,
+    kinds: &[jdwp_client::MonitorKind],
+    arm: &MonitorArm,
+    caps: Option<(bool, bool)>,
+    frames_note: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "   Mode: {}",
+        if a.trace {
+            "trace (non-suspending — snapshots into the ring buffer, read with debug.get_traces)"
+        } else {
+            "⚠️  SUSPENDING — the VM freezes on every reported event until debug.continue"
+        }
+    );
+
+    // Which brackets can be measured, stated per pair rather than as one verdict: a call arming three kinds
+    // has one complete pair and one half, and "a duration is available" would be true and misleading.
+    for pair in [crate::session::MonitorPair::Contended, crate::session::MonitorPair::Wait] {
+        let members: Vec<jdwp_client::MonitorKind> =
+            kinds.iter().copied().filter(|k| crate::session::MonitorPair::of(*k).0 == pair).collect();
+        if members.is_empty() {
+            continue;
+        }
+        let label = pair.duration_label();
+        if members.len() == 2 {
+            let _ = write!(
+                out,
+                "\n   {label}: measured across both events, BY THIS SERVER — no monitor event carries a \
+                 duration, so the figure includes our own capture latency (~0.86ms/hit before caller \
+                 frames). Reliable at the multi-second scale a wedged lock shows; noisy below ~10ms."
+            );
+        } else if let Some(only) = members.first() {
+            let _ = write!(
+                out,
+                "\n   {label}: NOT available — only '{}' is armed, and a duration is measured across both \
+                 halves. Add '{}' to get one.",
+                only.label(),
+                only.partner().label()
+            );
+        }
+    }
+
+    if let Some(min) = arm.min_duration_ms {
+        let _ = write!(
+            out,
+            "\n   min_duration_ms: {min} — and note what it changes. It filters what is RECORDED, not what \
+             crosses the wire: the event has already been generated and has already cost the debuggee its \
+             notification. The opening event of each pair also stops producing snapshots and becomes pure \
+             timestamping, because at that instant nothing has elapsed to compare — otherwise the \
+             trace_max_hits budget would go on \"started blocking\" lines. debug.list_stop_points still \
+             counts every hit, so Hits with no snapshots means \"contended constantly, never for {min}ms\"."
+        );
+    }
+    match &arm.monitor_class {
+        Some(c) => {
+            let _ = write!(
+                out,
+                "\n   monitor_class: {c} — a JDWP ClassOnly, applied INSIDE the JVM, so a lock of any other \
+                 type costs no packet. Includes subclasses."
+            );
+        }
+        None => {
+            let _ = write!(
+                out,
+                "\n   monitor_class: none — every lock in the JVM reports, INCLUDING the JDK's own \
+                 internals. Measured on a seven-thread probe: a ReferenceQueue$Lock turned up beside the \
+                 application's locks within seconds."
+            );
+        }
+    }
+    match arm.thread_filter {
+        Some(t) => {
+            let _ = write!(out, "\n   Thread filter: 0x{t:x} (ThreadOnly — applied inside the JVM)");
+        }
+        None => {
+            let _ = write!(
+                out,
+                "\n   Thread filter: none. This is the only narrowing that reduces DEBUGGEE cost — pass \
+                 thread_id from debug.list_threads if you are chasing one request."
+            );
+        }
+    }
+    // Bit 18, consulted here — the one place it is read, and what it is read for is telling a caller which
+    // of two JVMs they are on rather than leaving an absent figure unexplained. See `VmCapabilitiesNew`.
+    if matches!(caps, Some((_, false))) {
+        let _ = write!(
+            out,
+            "\n   Note: this JVM reports canGetMonitorFrameInfo = false, so the stack DEPTH at which a \
+             thread acquired a lock is not obtainable from it by any means. A snapshot's caller chain still \
+             shows the path that blocked."
+        );
+    }
+    let _ = write!(
+        out,
+        "{}{}",
+        describe_trace_frames(
+            a.trace,
+            arm.trace_frames,
+            frames_note,
+            "the blocking frame only — but the chain is usually what says WHICH request path is wedged"
+        ),
+        describe_trace_budget(a.trace, arm.trace_budget)
+    );
+    let _ = write!(out, "{}", describe_trace_exprs(&arm.trace_expr));
+    out
+}
+
 /// One method-exit pattern's row: exactly one request, armed or refused.
 ///
 /// No expansion and no `matched` count, because JDWP does the matching for this event kind — one `ClassMatch`
@@ -4838,10 +5352,18 @@ fn render_session_line(
     };
     // A wildcard family's members are already counted in `breakpoints`, so only the family record itself is
     // added — the alternative double-counts the same locations twice for one call (FILT-3).
+    //
+    // `method_exits` was missing from this sum until DUMP-7 added the sixth kind and made the omission
+    // two-wide: a session holding nothing but method-exit requests reported `0 stop point(s)` while
+    // `list_stop_points` listed them, so the number a caller checks to see whether they left anything armed
+    // was the one that could not see the kind most able to freeze a shared JVM. Every kind now, and the
+    // same fix on `disconnect`'s "cleared N stop point(s)".
     let stops = s.breakpoints.len()
         + s.pending_breakpoints.len()
         + s.exception_requests.len()
         + s.watchpoints.len()
+        + s.method_exits.len()
+        + s.monitor_requests.len()
         + s.pattern_sets.len();
     let mut line = format!(
         "  {} [{}] {} — {}{}, {} stop point(s), {} JDWP packet(s)",
@@ -5293,6 +5815,9 @@ fn render_every_stop_point(output: &mut String, session: &crate::session::DebugS
     for me in session.method_exits.values() {
         render_method_exit_line(output, me, dead);
     }
+    for mon in session.monitor_requests.values() {
+        render_monitor_line(output, mon, session, dead);
+    }
 }
 
 /// Format one exception breakpoint into the `debug.list_stop_points` output.
@@ -5452,6 +5977,21 @@ async fn describe_event_into(
         // byte-identical to what it printed before TRACE-9.
         describe_field_event(conn, details, obj, DEFAULT_TRACE_EXPR_LENGTH).await;
         describe_method_exit_event(conn, details, obj, DEFAULT_TRACE_EXPR_LENGTH).await;
+        describe_monitor_event(conn, details, obj).await;
+        // DUMP-7: a SUSPENDING monitor hit carries no duration, and this is where that is stated rather
+        // than left as a gap. It is not a limitation of the pairing — it is that the figure would be
+        // meaningless: suspending at the opening half stops the thread from ever reaching the closing one
+        // until the caller resumes, so any elapsed measured across the two is mostly the caller's reading
+        // time. A number that measures the debugger instead of the debuggee is worse than no number.
+        if monitor_of(details).is_some() {
+            obj.insert(
+                "duration".to_string(),
+                json!(
+                    "<not measured on a suspending monitor stop — the freeze between the two halves \
+                     would BE the duration. Arm with trace:true for a measured figure>"
+                ),
+            );
+        }
         return;
     }
     // Events with no location still name their thread, and a class-prepare names its class.
@@ -5689,6 +6229,69 @@ async fn describe_method_exit_event(
     }
 }
 
+/// Add a monitor hit's details: which lock, and whatever outcome the event itself carries (DUMP-7, #96).
+///
+/// **Everything here comes off the event, so it is complete on its own.** The lock is named by its type
+/// plus its handle (`MonitorProbe$FastLock@0x1f4c`) — the type because "an `Object`" identifies nothing on
+/// a server holding hundreds of them, and the handle because it is what a caller pastes back into
+/// `debug.evaluate` to see *what* the contended object holds, or matches across two snapshots to see that
+/// two threads are queued on the same lock.
+///
+/// **Nothing about a duration is added here**, and that is the design rather than an omission. A duration
+/// is measured *across* two events and this function is handed one; the pairing lives where a session is
+/// in scope (`record_one_traced_event`), which is also the only place that knows whether the other half is
+/// armed. See ADR-0035.
+///
+/// `toString()` is deliberately not invoked on the monitor, unlike a value a caller explicitly named. Two
+/// reasons, and the second is the load-bearing one: rendering a hit must stay side-effect free, and a
+/// thread suspended at a `monitorenter` is *blocked on this very lock* — an invocation on it can need the
+/// monitor the thread cannot get, which is a debugger deadlocking the thread it is reporting on.
+async fn describe_monitor_event(
+    conn: &mut jdwp_client::JdwpConnection,
+    details: &EventKind,
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let Some((m, _)) = monitor_of(details) else {
+        return;
+    };
+    let lock_type = match conn.get_object_reference_type(m.monitor).await {
+        Ok(t) => decode_signature(&conn.get_signature(t).await.unwrap_or_default()),
+        // A monitor whose type cannot be read is still worth naming by handle: the id is what correlates
+        // two threads onto one lock, and that works without the type.
+        Err(_) => "unknown".to_string(),
+    };
+    obj.insert("monitor".to_string(), json!(format!("{lock_type}@0x{:x}", m.monitor)));
+    // The SAME string `get_last_event` puts in its `type` field, not `kind.label()`. The two surfaces
+    // describe one fact, and giving it two spellings — `blocked` in a trace snapshot, `monitor_blocked` in
+    // an event — means a caller who greps for one silently misses the other. Slightly redundant beside the
+    // key; a second vocabulary would be worse.
+    obj.insert("monitor_event".to_string(), json!(monitor_event_type_name(details)));
+    match details {
+        EventKind::MonitorWait { timeout, .. } => {
+            // Named `wait_timeout` and not `timeout`, because it is the argument the caller passed to
+            // `wait(…)` rather than anything that has happened — a `wait(5000)` that returns in 3ms still
+            // reports 5000. A field called `timeout` beside a duration would read as the latter.
+            obj.insert(
+                "wait_timeout".to_string(),
+                json!(if *timeout == 0 {
+                    "none (untimed wait — only a notify ends it)".to_string()
+                } else {
+                    format!("{timeout}ms requested")
+                }),
+            );
+        }
+        EventKind::MonitorWaited { timed_out, .. } => {
+            // The one outcome the wire carries, and the two readings are opposite diagnoses: "nobody
+            // signalled it" against "it was signalled".
+            obj.insert(
+                "wait_ended".to_string(),
+                json!(if *timed_out { "timed out — no notify arrived" } else { "notified" }),
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Add a watchpoint hit's field details to a `get_last_event` entry: the field (as
 /// `Declaring.name`), whether it is static, and its value(s).
 ///
@@ -5837,6 +6440,217 @@ fn render_method_exit_line(
     }
     render_hits(output, me.hits);
     render_trace_cost(output, me.trace, &me.trace_cost);
+}
+
+/// Format one monitor request into the `debug.list_stop_points` output (DUMP-7, #96).
+///
+/// Two things appear here that no other kind's line carries, and both exist because an empty trace buffer
+/// on this kind has more innocent explanations than on any other:
+///
+/// - **whether the pair is complete**, since a duration is measured across two requests and a lone half
+///   silently reports none. It is re-derived from the session rather than trusted from the record's own
+///   `paired` flag, because clearing the partner is what makes the flag wrong.
+/// - **what `min_duration_ms` is suppressing**, since with a threshold set the opening kind records nothing
+///   at all by design. `Hits: 900` beside no snapshots is then the *expected* reading rather than a fault.
+fn render_monitor_line(
+    output: &mut String,
+    mon: &crate::session::MonitorRequestInfo,
+    session: &crate::session::DebugSession,
+    dead: &FilterHealth,
+) {
+    let (pair, opening) = crate::session::MonitorPair::of(mon.kind);
+    let _ = writeln!(
+        output,
+        "  {} [{}] monitor {}{}{}{}{}",
+        stop_point_glyph(mon.enabled, mon.spent, "🔒"),
+        mon.id,
+        mon.kind.label(),
+        if mon.trace { " (trace)" } else { " ⚠️ SUSPENDING" },
+        trace_budget_tag(mon.trace, mon.trace_budget),
+        trace_frames_tag(mon.trace, mon.trace_frames),
+        stop_point_state_suffix(mon.enabled, mon.spent),
+    );
+    // Live, not remembered: `paired` was true when armed and a `clear_stop_point` on the partner is exactly
+    // what invalidates it, so reading the flag here would keep promising a measurement that has gone.
+    let partner_armed = session.monitor_requests.values().any(|m| m.kind == mon.kind.partner());
+    if partner_armed {
+        let _ = writeln!(
+            output,
+            "     {}: measured across this and '{}' — a DEBUGGER measurement, no monitor event carries one",
+            pair.duration_label(),
+            mon.kind.partner().label()
+        );
+    } else {
+        let _ = writeln!(
+            output,
+            "     {}: unavailable — '{}' is not armed, so there is nothing to measure against",
+            pair.duration_label(),
+            mon.kind.partner().label()
+        );
+    }
+    if let Some(min) = mon.min_duration_ms {
+        let _ =
+            writeln!(
+            output,
+            "     min_duration_ms: {min} (a filter on what is RECORDED — the event has already crossed the \
+             wire){}",
+            if opening { " — and this kind records NOTHING while it is set: it only timestamps" } else { "" }
+        );
+    }
+    if let Some(c) = &mon.monitor_class {
+        let _ = writeln!(output, "     Monitor class: {c} (ClassOnly — and its subclasses)");
+    }
+    if let Some(t) = mon.thread_filter {
+        let _ = writeln!(output, "     Thread filter: 0x{t:x}");
+    }
+    output.push_str(&list_trace_exprs(&mon.trace_expr));
+    // No instance filter on this kind — it is refused at arm time (measured inert), so there is never one
+    // to report as dead.
+    let tag = dead_filter_tag(mon.thread_filter, None, dead);
+    if !tag.is_empty() {
+        let _ = writeln!(output, "   {tag}");
+    }
+    render_hits(output, mon.hits);
+    render_trace_cost(output, mon.trace, &mon.trace_cost);
+}
+
+/// Clear one method-exit request (METH-1).
+///
+/// Its own function so `handle_clear_stop_point` stays under the complexity gate as the number of stop-point
+/// kinds grows — five now. The substance is one rule: `Clear` must name the same event kind the request was
+/// armed with (41 for a plain exit, 42 with the return value), because JDWP keys requests by
+/// (eventKind, requestID). Naming the wrong one looks up nothing, reports success, and leaves a
+/// possibly-suspending stop point armed that nothing on this side can find again.
+async fn clear_method_exit_stop(session: &mut crate::session::DebugSession, bp_id: &str) -> String {
+    let Some(me) = session.method_exits.remove(bp_id) else {
+        return format!("Stop point not found: {bp_id}");
+    };
+    note_traced_in_flight(session, me.trace, me.request_id.as_slice());
+    if let Some(req) = me.request_id {
+        let _ = session.connection.clear_method_exit_request(req, me.with_return_value).await;
+    }
+    format!(
+        "✅ Method-exit reporting cleared: {bp_id} ({}{}){}",
+        me.class_pattern,
+        me.method.map_or_else(|| ".*".to_string(), |m| format!(".{m}")),
+        spent_clear_note(me.spent)
+    )
+}
+
+/// Clear one monitor request and say what clearing it did to the *other* half of its pair (DUMP-7, #96).
+///
+/// Its own function rather than another branch in `handle_clear_stop_point`, and not only for the
+/// complexity gate: this is the one kind where removing a stop point silently degrades a **different** one.
+/// A duration is measured across two requests, so clearing either half leaves the survivor reporting events
+/// with no figure — and if the survivor carries a `min_duration_ms`, leaves it unable to record anything at
+/// all. A caller who was not told would read that as the contention having stopped.
+///
+/// JDWP keys requests by (eventKind, requestID) and the four monitor kinds are four separate keys, so the
+/// `Clear` has to name the kind it was armed with or it looks up nothing and leaves a possibly-suspending
+/// request armed with nothing on this side able to find it.
+async fn clear_monitor_request_stop(session: &mut crate::session::DebugSession, bp_id: &str) -> String {
+    let Some(mon) = session.monitor_requests.remove(bp_id) else {
+        return format!("Stop point not found: {bp_id}");
+    };
+    note_traced_in_flight(session, mon.trace, mon.request_id.as_slice());
+    if let Some(req) = mon.request_id {
+        let _ = session.connection.clear_monitor_request(req, mon.kind).await;
+    }
+    // Any bracket this kind had open dies with the request. Left behind, its start would be handed to
+    // whatever is armed on this pair next and reported as a duration reaching back before that stop point
+    // existed.
+    let (pair, _) = crate::session::MonitorPair::of(mon.kind);
+    session.monitor_pending.retain(|k, _| k.pair != pair);
+
+    let survivor = session.monitor_requests.values().find(|m| m.kind == mon.kind.partner());
+    let widowed = survivor.map(|m| (m.id.clone(), m.min_duration_ms));
+    let mut out = format!(
+        "✅ Monitor reporting cleared: {bp_id} ({}){}",
+        mon.kind.label(),
+        spent_clear_note(mon.spent)
+    );
+    if let Some((survivor_id, min)) = widowed {
+        let _ = write!(
+            out,
+            "\n   ⚠  {survivor_id} ('{}') is still armed and has lost its pair, so its snapshots can no \
+             longer carry a duration — a duration is measured across both events.",
+            mon.kind.partner().label()
+        );
+        if let Some(min) = min {
+            let _ = write!(
+                out,
+                "\n   ⚠  It also has min_duration_ms: {min}, which it can no longer evaluate, so it will \
+                 now record NOTHING. Clear it too, or re-arm the pair."
+            );
+        }
+    }
+    out
+}
+
+/// Disable a monitor request: clear its JDWP request, keep its definition (BP-2).
+async fn disable_monitor_request(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+    mon: &crate::session::MonitorRequestInfo,
+) -> Result<String, String> {
+    if let Some(req) = mon.request_id {
+        session
+            .connection
+            .clear_monitor_request(req, mon.kind)
+            .await
+            .map_err(|e| format!("Failed to clear monitor request: {e}"))?;
+    }
+    if let Some(m) = session.monitor_requests.get_mut(id) {
+        m.request_id = None;
+        m.enabled = false;
+    }
+    Ok(format!("monitor {}", mon.kind.label()))
+}
+
+/// Re-arm a disabled monitor request from its stored definition, keeping the same id (BP-3).
+///
+/// `monitor_class` is re-resolved **by name** rather than reusing the type id captured at arming (BP-4): a
+/// reference type id is only valid while that type stays loaded, and the realistic sequence is "disable,
+/// redeploy, re-arm". A class that is gone is reported as that rather than arming a filter against an id
+/// the JVM may since have reissued.
+async fn rearm_monitor_request(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+    mon: &crate::session::MonitorRequestInfo,
+) -> Result<String, String> {
+    let class_filter = match mon.monitor_class.as_deref() {
+        Some(name) => Some(
+            resolve_monitor_class(&mut session.connection, name)
+                .await
+                .map_err(|e| format!("Cannot re-arm {id}: {e}"))?,
+        ),
+        None => None,
+    };
+    let req = session
+        .connection
+        .set_monitor_request(
+            mon.kind,
+            suspend_policy_for(mon.trace),
+            class_filter.filter(|_| mon.kind.class_filter_tests_monitor()),
+            jdwp_client::EventFilters { count: mon.hit_count, thread: mon.thread_filter, instance: None },
+        )
+        .await
+        .map_err(|e| format!("Failed to re-arm monitor request: {e}"))?;
+    if let Some(m) = session.monitor_requests.get_mut(id) {
+        m.request_id = Some(req);
+        m.enabled = true;
+        // FILT-8: a re-arm issues a NEW JDWP request, so whatever the debuggee deleted is no longer the
+        // state of this stop point.
+        m.spent = false;
+        m.trace_budget = refreshed_budget(m.trace_budget);
+        reset_trace_cost(&mut m.trace_cost);
+    }
+    // DUMP-7: any bracket this kind had open belongs to the request that was just replaced. Left in place,
+    // the first event after a re-arm would be measured from before the disable and report the time the stop
+    // point spent DISABLED as time a thread spent blocked — a number that is not wrong by a little.
+    let (pair, _) = crate::session::MonitorPair::of(mon.kind);
+    session.monitor_pending.retain(|k, _| k.pair != pair);
+    Ok(format!("monitor {}", mon.kind.label()))
 }
 
 /// Resolve a frame's class name, using and populating a per-call cache (recursion / same-class
@@ -9536,6 +10350,20 @@ async fn disarm_everything(session: &mut crate::session::DebugSession) {
     for (req, with_value) in mexits {
         let _ = session.connection.clear_method_exit_request(req, with_value).await;
     }
+    // Monitor requests are the other kind `ClearAllBreakpoints` does not touch, and the one whose freeze is
+    // hardest to escape: contention is not a site anyone chose, so a suspending monitor stop re-freezes the
+    // VM on the next acquisition of any hot lock — including one inside the JDK. Resuming without dropping
+    // these would be no rescue at all.
+    let monitors: Vec<(i32, jdwp_client::MonitorKind)> =
+        session.monitor_requests.drain().filter_map(|(_, m)| m.request_id.map(|r| (r, m.kind))).collect();
+    for (req, kind) in monitors {
+        let _ = session.connection.clear_monitor_request(req, kind).await;
+    }
+    // The pairing state belongs to the requests that were just dropped. Left behind it would hand a stale
+    // start to the next monitor stop point armed on this session and report a duration measured from
+    // before it existed.
+    session.monitor_pending.clear();
+    session.monitor_pending_dropped = 0;
 }
 
 /// Drop every armed stop point's standing class-load watch (BP-7, #115).
@@ -9908,11 +10736,29 @@ struct TracedRequest {
     /// be filtered on OUR side because JDWP's `ClassMatch` fires for every method of the class. A hit on
     /// a different method is dropped without recording it and without charging the budget.
     method_filter: Option<String>,
+    /// Only a monitor request has one (DUMP-7, #96) — see [`MonitorTraceSpec`].
+    monitor: Option<MonitorTraceSpec>,
 }
 
-/// Find the traced stop point that a JDWP request id belongs to, across all three kinds.
+/// What a traced **monitor** request needs at hit time, beyond what every kind needs (DUMP-7, #96).
+#[derive(Debug, Clone, Copy)]
+struct MonitorTraceSpec {
+    /// Which of the two brackets this request's kind belongs to, and whether it is the opening half.
+    pair: crate::session::MonitorPair,
+    opening: bool,
+    /// Whether the pair's other half is armed. A duration is measured across the two, so a `false` here
+    /// means this stop point can report that the event happened and nothing about how long it took.
+    paired: bool,
+    /// Only record a closed bracket at least this long. Refused at arm time unless both halves are armed,
+    /// because with one half there is nothing to measure and a threshold would silence the stop point
+    /// completely — an armed logpoint that can never record is exactly the "silence reads as an answer"
+    /// failure this codebase exists to remove.
+    min_duration_ms: Option<u64>,
+}
+
+/// Find the traced stop point that a JDWP request id belongs to, across all five kinds.
 ///
-/// One lookup, three maps — deliberately not a fourth map keyed by request id. Each kind already owns
+/// One lookup, five maps — deliberately not a sixth map keyed by request id. Each kind already owns
 /// its bookkeeping (and its `clear`/`panic` handling), so a parallel index would be a second source of
 /// truth that could outlive an entry it points at. The maps are small enough that scanning is free.
 fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> Option<TracedRequest> {
@@ -9924,6 +10770,7 @@ fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> O
             trace_frames: b.trace_frames,
             trace_max_length: b.trace_max_length,
             method_filter: None,
+            monitor: None,
         });
     }
     if let Some((id, e)) =
@@ -9936,6 +10783,7 @@ fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> O
             trace_frames: e.trace_frames,
             trace_max_length: e.trace_max_length,
             method_filter: None,
+            monitor: None,
         });
     }
     if let Some((id, w)) = session.watchpoints.iter().find(|(_, w)| w.request_id == Some(req_id) && w.trace) {
@@ -9946,6 +10794,7 @@ fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> O
             trace_frames: w.trace_frames,
             trace_max_length: w.trace_max_length,
             method_filter: None,
+            monitor: None,
         });
     }
     if let Some((id, m)) = session.method_exits.iter().find(|(_, m)| m.request_id == Some(req_id) && m.trace)
@@ -9957,9 +10806,143 @@ fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> O
             trace_frames: m.trace_frames,
             trace_max_length: m.trace_max_length,
             method_filter: m.method.clone(),
+            monitor: None,
+        });
+    }
+    if let Some((id, mon)) =
+        session.monitor_requests.iter().find(|(_, m)| m.request_id == Some(req_id) && m.trace)
+    {
+        let (pair, opening) = crate::session::MonitorPair::of(mon.kind);
+        return Some(TracedRequest {
+            id: id.clone(),
+            // DUMP-7 deliberately gives this kind no `condition`, and the reason is not that it was
+            // awkward to plumb. A condition is evaluated on the hit thread, and a thread suspended at a
+            // `monitorenter` is blocked on the very lock in the snapshot — an expression that invokes
+            // anything needing that monitor cannot complete, so the debugger would wedge the thread it is
+            // reporting on. `min_duration_ms` is this kind's filter, and it needs nothing from the
+            // debuggee.
+            condition: None,
+            trace_expr: mon.trace_expr.clone(),
+            trace_frames: mon.trace_frames,
+            trace_max_length: mon.trace_max_length,
+            method_filter: None,
+            monitor: Some(MonitorTraceSpec {
+                pair,
+                opening,
+                paired: mon.paired,
+                min_duration_ms: mon.min_duration_ms,
+            }),
         });
     }
     None
+}
+
+/// What the pairing made of one monitor event (DUMP-7, ADR-0035).
+#[derive(Debug, Clone, Copy)]
+enum MonitorSpan {
+    /// The **opening** half of a bracket: timestamped here, so the closing half can subtract.
+    Opened,
+    /// The **closing** half, carrying the duration the bracket was open — or `None` when no opening half
+    /// was seen for it, which is normal rather than an error: the opening kind may not be armed, the
+    /// bracket may have opened before this stop point did, or the entry may have been evicted.
+    Closed(Option<std::time::Duration>),
+}
+
+/// Timestamp or close this monitor event's bracket, and say which it was.
+///
+/// **This has to live on the session-holding side of the capture** (`record_one_traced_event`), which is
+/// the constraint that shaped the whole feature: `capture_trace` receives a connection and a stop point,
+/// never a session, and the pairing state is per-session by nature. So the duration is computed here and
+/// *injected* into the record the capture produced, rather than being read out of the event like every
+/// other detail.
+fn span_monitor_event(
+    session: &mut crate::session::DebugSession,
+    spec: MonitorTraceSpec,
+    details: &EventKind,
+    now: std::time::Instant,
+) -> Option<MonitorSpan> {
+    let (m, _) = monitor_of(details)?;
+    let key = crate::session::MonitorPairKey { thread: m.thread, monitor: m.monitor, pair: spec.pair };
+    if spec.opening {
+        session.open_monitor_bracket(key, now);
+        return Some(MonitorSpan::Opened);
+    }
+    Some(MonitorSpan::Closed(session.close_monitor_bracket(&key, now)))
+}
+
+/// Whether this monitor hit should be recorded at all, given the caller's `min_duration_ms` (DUMP-7).
+///
+/// **With a threshold set, the opening half stops producing snapshots and becomes pure bookkeeping.** It
+/// cannot satisfy or violate a duration filter — at that instant nothing has elapsed — so recording it
+/// would fill the buffer with precisely the noise the threshold was set to remove, and would spend the
+/// trace budget doing it: at the default 200 a contended lock would exhaust its budget on "started
+/// blocking" lines before a single *long* block was reported. The arming reply says this, because a stop
+/// point that silently records half of what it fires on would otherwise read as a bug.
+///
+/// **A closing half whose duration is unknown is dropped once a threshold is set**, and this was the other
+/// way round until JDK 11 disagreed. The reasoning for keeping it — "a snapshot saying the lock was acquired
+/// with the duration unavailable beats a silence" — is sound with no threshold and wrong with one: a caller
+/// who asked for blocks over 200 ms has said what they want to see, and an unmeasurable bracket may have
+/// lasted 1 ms. Reporting it breaks the only promise the argument makes.
+///
+/// It is not a hypothetical, which is how it was found. The first closing events after arming routinely have
+/// no matching start, because the threads were *already* blocked when the request went in — so a 200 ms
+/// threshold reported a 60 ms lock on the first hit. On a faster JVM the first pair through happened to be
+/// the slow one and the test passed; on Temurin 11.0.32 it was the fast one, every time. Without a threshold
+/// nothing is filtered and such a snapshot is still kept, with its detail saying why there is no figure.
+const fn monitor_hit_is_recordable(spec: MonitorTraceSpec, span: MonitorSpan) -> bool {
+    let Some(min) = spec.min_duration_ms else {
+        return true;
+    };
+    match span {
+        // Nothing has elapsed yet, and nothing ever will on this event.
+        MonitorSpan::Opened | MonitorSpan::Closed(None) => false,
+        MonitorSpan::Closed(Some(d)) => d.as_millis() >= min as u128,
+    }
+}
+
+/// The `blocked_for` / `waited_for` detail a closed bracket adds to its snapshot, and the honest note an
+/// unmeasurable or unpaired one adds instead (DUMP-7, ADR-0035).
+///
+/// **Every wording here says who measured it.** The figure is this server's own, taken between two events
+/// neither of which carries a time, so it includes the capture latency of the opening half (~0.86 ms per
+/// hit before caller frames, TRACE-7) and the event-pump queueing behind it. On a millisecond-scale block
+/// that overhead is a material fraction; on the multi-second blocks a wedged app server is asked about it
+/// is noise. A caller cannot judge which case they are in unless the reply admits whose number it is.
+fn monitor_duration_detail(spec: MonitorTraceSpec, span: MonitorSpan) -> (String, String) {
+    let label = spec.pair.duration_label().to_string();
+    match span {
+        // The opening half. It has no duration by definition, and saying so beats leaving the slot out —
+        // the same reasoning that prints `Hits: 0` rather than omitting the line.
+        MonitorSpan::Opened if spec.paired => (
+            label,
+            "<pending — this is where it started; the matching event carries the measurement>".to_string(),
+        ),
+        MonitorSpan::Opened => (
+            label,
+            format!(
+                "<not measurable — the other half of this pair is not armed. Arm {} as well>",
+                match spec.pair {
+                    crate::session::MonitorPair::Contended => "acquired",
+                    crate::session::MonitorPair::Wait => "waited",
+                }
+            ),
+        ),
+        MonitorSpan::Closed(Some(d)) => (
+            label,
+            format!(
+                "{}ms (measured by the DEBUGGER across both events — no monitor event carries a duration, \
+                 so this includes our own capture latency)",
+                d.as_millis()
+            ),
+        ),
+        MonitorSpan::Closed(None) => (
+            label,
+            "<not measured — no matching start was seen, so this bracket opened before the stop point did, \
+             its opening kind is not armed, or the pending entry was evicted>"
+                .to_string(),
+        ),
+    }
 }
 
 /// Refuse a `thread_id` that is already dead or was never valid on this connection (FILT-2).
@@ -10037,6 +11020,7 @@ async fn dead_filter_threads(session: &mut crate::session::DebugSession) -> Filt
     filters.extend(session.exception_requests.values().filter_map(|e| e.thread_filter));
     filters.extend(session.watchpoints.values().filter_map(|w| w.thread_filter));
     filters.extend(session.method_exits.values().filter_map(|m| m.thread_filter));
+    filters.extend(session.monitor_requests.values().filter_map(|m| m.thread_filter));
     filters.extend(session.pending_breakpoints.iter().filter_map(|p| p.thread_filter));
     filters.extend(session.pattern_sets.values().filter_map(|s| s.thread_filter));
 
@@ -10198,6 +11182,19 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
             me.method.map_or_else(|| ".*".to_string(), |m| format!(".{m}"))
         ));
     }
+    if let Some((id, mon)) = session
+        .monitor_requests
+        .iter()
+        .find(|(_, m)| m.request_id == Some(req_id))
+        .map(|(k, v)| (k.clone(), v.clone()))
+    {
+        let _ = session.connection.clear_monitor_request(req_id, mon.kind).await;
+        if let Some(m) = session.monitor_requests.get_mut(&id) {
+            m.request_id = None;
+            m.enabled = false;
+        }
+        return Some(format!("monitor request {id} ({})", mon.kind.label()));
+    }
     None
 }
 
@@ -10220,6 +11217,9 @@ async fn disable_stop_point(session: &mut crate::session::DebugSession, id: &str
     }
     if let Some(me) = session.method_exits.get(id).cloned() {
         return disable_method_exit(session, id, &me).await;
+    }
+    if let Some(mon) = session.monitor_requests.get(id).cloned() {
+        return disable_monitor_request(session, id, &mon).await;
     }
     Err(format!("Stop point not found: {id}"))
 }
@@ -10327,6 +11327,9 @@ async fn rearm_stop_point(session: &mut crate::session::DebugSession, id: &str) 
     }
     if let Some(me) = session.method_exits.get(id).cloned() {
         return rearm_method_exit(session, id, &me).await;
+    }
+    if let Some(mon) = session.monitor_requests.get(id).cloned() {
+        return rearm_monitor_request(session, id, &mon).await;
     }
     Err(format!("Stop point not found: {id}"))
 }
@@ -10784,7 +11787,20 @@ async fn record_one_traced_event(
     if !wrong_method {
         record_stop_point_hit(session, req_id);
     }
+    // DUMP-7: the bracket is opened or closed BEFORE the recording decision and regardless of it, because
+    // the timestamp is what makes the *next* event measurable — skipping the bookkeeping for a hit we are
+    // not going to record would silently break the duration on the hit we would have.
+    //
+    // Timed at arrival rather than after the capture: the capture is ours (~0.86 ms, TRACE-7), and charging
+    // it to how long a thread was blocked would report our own cost as the debuggee's, which is the same
+    // rule `TraceCost` follows in the other direction.
+    let monitor_span =
+        req.monitor.and_then(|spec| span_monitor_event(session, spec, &details, std::time::Instant::now()));
     let skip = wrong_method
+        || match (req.monitor, monitor_span) {
+            (Some(spec), Some(span)) => !monitor_hit_is_recordable(spec, span),
+            _ => false,
+        }
         || match &req.condition {
             Some(cond) => {
                 let bindings = condition_bindings(&details);
@@ -10810,25 +11826,9 @@ async fn record_one_traced_event(
     // EXC-3: decide whether this hit is a fresh throw or the chain of one already captured, BEFORE the
     // record is filed — the answer picks its seq, whether an earlier rolling record is dropped, and (the
     // load-bearing half) whether the budget is charged at all.
-    let mut kind = crate::session::ThrowKind::First;
-    if let Some(mut rec) = record {
-        session.trace_seq += 1;
-        rec.seq = session.trace_seq;
-        kind = session.classify_throw(req_id, thread, exception_instance(&details), rec.seq);
-        if let crate::session::ThrowKind::Rethrow { fold, supersedes } = kind {
-            rec.rethrow = Some(fold);
-            // The previous latest-sighting of this instance is what this record replaces, so it goes.
-            // Absent when the buffer already evicted it, which needs no repair — the fold's own
-            // `first_seq` still points at the original throw.
-            if let Some(old) = supersedes {
-                session.traces.retain(|r| r.seq != old);
-            }
-        }
-        if session.traces.len() >= crate::session::MAX_TRACES {
-            session.traces.pop_front();
-        }
-        session.traces.push_back(rec);
-    }
+    let kind = record.map_or(crate::session::ThrowKind::First, |rec| {
+        file_trace_record(session, &req, monitor_span, rec, req_id, thread, &details)
+    });
     // TRACE-3: charge the hit against this stop point's budget and disarm it once it runs out, so a
     // hot throw/field can't keep flooding the debuggee. Only a recorded hit is charged, so the
     // "exactly N traces, then it stops" contract holds even when a condition skips some.
@@ -10850,6 +11850,48 @@ async fn record_one_traced_event(
     Some(thread)
 }
 
+/// File one captured snapshot into the ring buffer, and classify it against any rethrow chain in flight.
+///
+/// Split out of [`record_one_traced_event`] because the ORDER inside it is load-bearing three times over and
+/// deserves to be readable on its own: the sequence number is assigned before classification (the classifier
+/// needs it), the rethrow fold is applied before the record is pushed (it is part of the record), and the
+/// superseded record is removed before the eviction check (or the buffer evicts one more than it needed to).
+/// The returned [`ThrowKind`] is what decides whether the caller charges the trace budget at all.
+///
+/// [`ThrowKind`]: crate::session::ThrowKind
+fn file_trace_record(
+    session: &mut crate::session::DebugSession,
+    req: &TracedRequest,
+    monitor_span: Option<MonitorSpan>,
+    mut rec: crate::session::TraceRecord,
+    req_id: i32,
+    thread: u64,
+    details: &EventKind,
+) -> crate::session::ThrowKind {
+    // DUMP-7: the measured duration, injected rather than captured. Appended after `capture_trace`'s own
+    // details because it is the only one no single event could supply — see `span_monitor_event`.
+    if let (Some(spec), Some(span)) = (req.monitor, monitor_span) {
+        rec.detail.push(monitor_duration_detail(spec, span));
+    }
+    session.trace_seq += 1;
+    rec.seq = session.trace_seq;
+    let kind = session.classify_throw(req_id, thread, exception_instance(details), rec.seq);
+    if let crate::session::ThrowKind::Rethrow { fold, supersedes } = kind {
+        rec.rethrow = Some(fold);
+        // The previous latest-sighting of this instance is what this record replaces, so it goes. Absent
+        // when the buffer already evicted it, which needs no repair — the fold's own `first_seq` still
+        // points at the original throw.
+        if let Some(old) = supersedes {
+            session.traces.retain(|r| r.seq != old);
+        }
+    }
+    if session.traces.len() >= crate::session::MAX_TRACES {
+        session.traces.pop_front();
+    }
+    session.traces.push_back(rec);
+    kind
+}
+
 /// Charge one hit against a traced stop point's budget (TRACE-3). When the budget reaches zero, disarm
 /// the request and return a note for `get_traces`; otherwise decrement in place and return `None`. A
 /// stop point with no budget (`None`) is unbounded and is never charged.
@@ -10867,7 +11909,7 @@ async fn charge_trace_budget(session: &mut crate::session::DebugSession, req_id:
 
 /// Record one capture's cost against whichever traced stop point owns `req_id` (TRACE-7).
 ///
-/// Four maps scanned in the same order as [`decrement_trace_budget`], and for the same reason: each kind
+/// Five maps scanned in the same order as [`decrement_trace_budget`], and for the same reason: each kind
 /// owns its own bookkeeping, and a parallel index keyed by request id would be a second source of truth
 /// that could outlive the entry it points at.
 fn record_trace_cost(
@@ -10884,12 +11926,14 @@ fn record_trace_cost(
         w.trace_cost.record(started, took);
     } else if let Some(m) = session.method_exits.values_mut().find(|m| m.request_id == Some(req_id)) {
         m.trace_cost.record(started, took);
+    } else if let Some(m) = session.monitor_requests.values_mut().find(|m| m.request_id == Some(req_id)) {
+        m.trace_cost.record(started, took);
     }
 }
 
 /// Charge one observed hit to whichever stop point owns `req_id` (FILT-10).
 ///
-/// Four maps in the same order as [`decrement_trace_budget`], and for the same reason: each kind owns its
+/// Five maps in the same order as [`decrement_trace_budget`], and for the same reason: each kind owns its
 /// own bookkeeping, and a parallel index keyed by request id would be a second source of truth that could
 /// outlive the entry it points at. Safe against JDWP's recurring request ids for the same reason the
 /// budget is — [`disarm_request`] clears `request_ids` / sets `request_id` to `None`, so a disarmed stop
@@ -10922,6 +11966,10 @@ fn record_stop_point_hit(session: &mut crate::session::DebugSession, req_id: i32
         return;
     }
     if let Some(m) = session.method_exits.values_mut().find(|m| m.request_id == Some(req_id)) {
+        m.hits = m.hits.saturating_add(1);
+        return;
+    }
+    if let Some(m) = session.monitor_requests.values_mut().find(|m| m.request_id == Some(req_id)) {
         m.hits = m.hits.saturating_add(1);
     }
 }
@@ -10978,6 +12026,14 @@ async fn spend_if_counted(session: &mut crate::session::DebugSession, req_id: i3
         m.request_id = None;
         m.enabled = false;
         m.spent = true;
+    } else if let Some(m) = session.monitor_requests.values_mut().find(|m| m.request_id == Some(req_id)) {
+        if m.hit_count.is_none() {
+            return;
+        }
+        traced = m.trace;
+        m.request_id = None;
+        m.enabled = false;
+        m.spent = true;
     }
     // The same in-flight window, on the path FILT-8 added: these siblings are live requests the JVM has
     // not deleted, so a hit already generated by one of them must still be resumed rather than surfaced.
@@ -11008,6 +12064,11 @@ fn decrement_trace_budget(session: &mut crate::session::DebugSession, req_id: i3
         return Some(n);
     }
     if let Some(m) = session.method_exits.values_mut().find(|m| m.request_id == Some(req_id)) {
+        let n = m.trace_budget?.saturating_sub(1);
+        m.trace_budget = Some(n);
+        return Some(n);
+    }
+    if let Some(m) = session.monitor_requests.values_mut().find(|m| m.request_id == Some(req_id)) {
         let n = m.trace_budget?.saturating_sub(1);
         m.trace_budget = Some(n);
         return Some(n);
@@ -11063,7 +12124,7 @@ async fn store_reportable_event(
         // FILT-10: past the method filter, so this hit is this stop point's — counted before the
         // condition for the same reason the traced path counts before its condition. See
         // [`record_stop_point_hit`]. An event that belongs to no stop point (a step, a manual pause, a
-        // VM event) matches none of the four maps and is not counted.
+        // VM event) matches none of the five maps and is not counted.
         if !skip {
             record_stop_point_hit(session, req_id);
         }
@@ -11258,7 +12319,7 @@ async fn notify_suspension(session: &mut crate::session::DebugSession, seq: u64)
     alerter.alert("warning", &serde_json::Value::Object(obj));
 }
 
-/// The caller-facing stop-point id behind a JDWP request id, across all four kinds (BP-3's ids).
+/// The caller-facing stop-point id behind a JDWP request id, across all five kinds (BP-3's ids).
 ///
 /// Pure in-memory lookup over the session's own maps — no JDWP traffic — which is what makes it safe
 /// to call on the hit path while the VM is held.
@@ -11274,6 +12335,9 @@ fn stop_point_id(session: &crate::session::DebugSession, req: i32) -> Option<Str
         })
         .or_else(|| session.watchpoints.iter().find(|(_, w)| w.request_id == hit).map(|(k, _)| k.clone()))
         .or_else(|| session.method_exits.iter().find(|(_, m)| m.request_id == hit).map(|(k, _)| k.clone()))
+        .or_else(|| {
+            session.monitor_requests.iter().find(|(_, m)| m.request_id == hit).map(|(k, _)| k.clone())
+        })
 }
 
 /// How to *get* a suspended thread, named in one place because a dozen refusals need to say it (SAFE-11).
@@ -18119,6 +19183,28 @@ fn event_location(d: &EventKind) -> Option<(u64, Location)> {
         EventKind::FieldAccess { field } | EventKind::FieldModification { field, .. } => {
             Some((field.thread, field.location.clone()))
         }
+        // A monitor event's location is the code that blocked, waited, or resumed — for a `synchronized`
+        // block, the block itself (DUMP-7, #96). Having one is what lets the whole traced-capture path
+        // work on these unchanged: the snapshot reads the blocking frame's locals, and its caller chain is
+        // usually the actual answer to "which request path is wedged on this lock".
+        EventKind::MonitorContendedEnter { monitor }
+        | EventKind::MonitorContendedEntered { monitor }
+        | EventKind::MonitorWait { monitor, .. }
+        | EventKind::MonitorWaited { monitor, .. } => Some((monitor.thread, monitor.location.clone())),
+        _ => None,
+    }
+}
+
+/// The monitor object and thread a monitor event carries, or `None` for any other event.
+///
+/// Kept beside [`event_location`] rather than folded into it because the two answer different questions:
+/// every stop point has a location, and only these four have a lock.
+const fn monitor_of(d: &EventKind) -> Option<(&jdwp_client::events::MonitorEvent, jdwp_client::MonitorKind)> {
+    match d {
+        EventKind::MonitorContendedEnter { monitor } => Some((monitor, jdwp_client::MonitorKind::Blocked)),
+        EventKind::MonitorContendedEntered { monitor } => Some((monitor, jdwp_client::MonitorKind::Acquired)),
+        EventKind::MonitorWait { monitor, .. } => Some((monitor, jdwp_client::MonitorKind::Wait)),
+        EventKind::MonitorWaited { monitor, .. } => Some((monitor, jdwp_client::MonitorKind::Waited)),
         _ => None,
     }
 }
@@ -18138,16 +19224,36 @@ fn event_suspends(es: &jdwp_client::EventSet) -> bool {
                     | EventKind::MethodExit { .. }
                     | EventKind::FieldAccess { .. }
                     | EventKind::FieldModification { .. }
+                    // DUMP-7: a monitor request armed at anything but `None` really does hold the thread,
+                    // and leaving these out would have made a suspending monitor stop the one kind whose
+                    // freeze the watchdog never noticed — on the kind most likely to be armed against a
+                    // shared instance.
+                    | EventKind::MonitorContendedEnter { .. }
+                    | EventKind::MonitorContendedEntered { .. }
+                    | EventKind::MonitorWait { .. }
+                    | EventKind::MonitorWaited { .. }
             )
         })
 }
 
+/// The label a reply gives an event kind.
+///
+/// **The four monitor kinds are named apart rather than lumped as `monitor`** (DUMP-7, #96). Two of them
+/// are the ends of one *block* and two the ends of one *wait*, and a caller reading a snapshot has to know
+/// which — `blocked` and `acquired` on the same lock are the opposite halves of the same fact, and reading
+/// one as the other inverts the diagnosis. The labels are also not the JDWP constant names, because
+/// `MONITOR_CONTENDED_ENTER` and `MONITOR_CONTENDED_ENTERED` differ by two letters and mean opposite
+/// things.
 const fn event_type_name(d: &EventKind) -> &'static str {
     match d {
         EventKind::Breakpoint { .. } => "breakpoint",
         EventKind::Step { .. } => "step",
         EventKind::Exception { .. } => "exception",
         EventKind::MethodExit { .. } => "method_exit",
+        EventKind::MonitorContendedEnter { .. }
+        | EventKind::MonitorContendedEntered { .. }
+        | EventKind::MonitorWait { .. }
+        | EventKind::MonitorWaited { .. } => monitor_event_type_name(d),
         EventKind::VMStart { .. } => "vm_start",
         EventKind::VMDeath => "vm_death",
         EventKind::ThreadStart { .. } => "thread_start",
@@ -18156,6 +19262,22 @@ const fn event_type_name(d: &EventKind) -> &'static str {
         EventKind::FieldAccess { .. } => "field_access",
         EventKind::FieldModification { .. } => "field_modification",
         EventKind::Unknown { .. } => "unknown",
+    }
+}
+
+/// The four monitor labels, kept together (DUMP-7, #96).
+///
+/// Split out of [`event_type_name`] rather than inlined as four more arms, because these four are the ones
+/// whose naming is a decision rather than a transcription — see that function's doc comment. `unknown` is
+/// unreachable for a value the caller has already matched as a monitor kind, and is the honest fallback
+/// rather than a panic in a function on the hit path.
+const fn monitor_event_type_name(d: &EventKind) -> &'static str {
+    match d {
+        EventKind::MonitorContendedEnter { .. } => "monitor_blocked",
+        EventKind::MonitorContendedEntered { .. } => "monitor_acquired",
+        EventKind::MonitorWait { .. } => "monitor_wait",
+        EventKind::MonitorWaited { .. } => "monitor_waited",
+        _ => "unknown",
     }
 }
 
@@ -19531,35 +20653,7 @@ async fn capture_trace(
         // entry point has no caller), not an error, so take whatever came back.
         callers = describe_caller_chain(conn, frames.get(1..).unwrap_or_default()).await;
         if let Some(frame) = frames.first().cloned() {
-            if let Ok(var_table) = conn.get_variable_table(loc.class_id, loc.method_id).await {
-                let ci = loc.index;
-                // Own each in-scope variable's (name, slot) so the names can be moved into `args`
-                // below without cloning.
-                let in_scope: Vec<(String, jdwp_client::stackframe::VariableSlot)> = var_table
-                    .into_iter()
-                    .filter(|v| ci >= v.code_index && ci < v.code_index + u64::from(v.length))
-                    .map(|v| {
-                        let slot = i32::try_from(v.slot).unwrap_or(0);
-                        let sig_byte = v.signature.as_bytes().first().copied().unwrap_or(b'I');
-                        (v.name, jdwp_client::stackframe::VariableSlot { slot, sig_byte })
-                    })
-                    .collect();
-                let slots: Vec<jdwp_client::stackframe::VariableSlot> =
-                    in_scope.iter().map(|(_, s)| *s).collect();
-                if !slots.is_empty() {
-                    if let Ok(vals) = conn.get_frame_values(thread, frame.frame_id, slots).await {
-                        for ((name, _), val) in in_scope.into_iter().zip(vals.iter()) {
-                            let rendered =
-                                render_value(conn, val, None, local_len, ByteRender::default()).await;
-                            args.push(crate::session::TracedValue {
-                                name,
-                                rendered,
-                                object_id: as_object_id(val),
-                            });
-                        }
-                    }
-                }
-            }
+            args = capture_frame_locals(conn, thread, frame.frame_id, loc, local_len).await;
             // TRACE-10: an anonymous inner class's `call()` or `run()` has almost nothing in its
             // variable table — the enclosing method's captured locals are synthetic FIELDS on `this`.
             // Guarded on the JVM's own name shape, so an ordinary class pays no round trips for it.
@@ -19604,6 +20698,10 @@ async fn capture_trace(
     // would be an argument that looks like it worked.
     describe_field_event(conn, details, &mut obj, expr_len).await;
     describe_method_exit_event(conn, details, &mut obj, expr_len).await;
+    // DUMP-7: the lock and the event's own outcome. The measured DURATION is not added here and cannot be
+    // — it is computed across two events by whichever caller holds a session, which this function does not
+    // have. See `record_one_traced_event`, which appends it, and ADR-0035.
+    describe_monitor_event(conn, details, &mut obj).await;
     let detail = obj.into_iter().map(|(k, v)| (k, json_scalar_to_string(&v))).collect();
 
     crate::session::TraceRecord {
@@ -19621,6 +20719,56 @@ async fn capture_trace(
         // Filled in by the caller, which is what owns the chain bookkeeping (EXC-3).
         rethrow: None,
     }
+}
+
+/// Read every local and argument in scope at `loc` off one frame, rendered for a trace snapshot.
+///
+/// Split out of [`capture_trace`] to sit beside [`capture_enclosing_locals`], which is its exact
+/// counterpart: this reads the frame's own variable table, that reads an anonymous class's synthetic
+/// capture FIELDS, and a snapshot of an inner class wants both.
+///
+/// **Rendered with `thread: None`, which is what keeps a capture side-effect free**: no `toString()` runs in
+/// a debuggee nobody agreed to execute code in. That matters most on the kind added last — a thread
+/// suspended at a `monitorenter` is blocked on a lock, and an invocation needing that lock could not
+/// complete (DUMP-7).
+///
+/// Every failure path yields an empty list rather than an error, like the caller chain beside it: a hit that
+/// lost its locals is still worth more than no hit. Only variables whose scope covers the hit's bytecode
+/// index are included — the rest are not merely uninteresting, they hold whatever was last in the slot.
+async fn capture_frame_locals(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread: u64,
+    frame_id: u64,
+    loc: &Location,
+    local_len: usize,
+) -> Vec<crate::session::TracedValue> {
+    let Ok(var_table) = conn.get_variable_table(loc.class_id, loc.method_id).await else {
+        return Vec::new();
+    };
+    let ci = loc.index;
+    // Own each in-scope variable's (name, slot) so the names can be moved into the result without cloning.
+    let in_scope: Vec<(String, jdwp_client::stackframe::VariableSlot)> = var_table
+        .into_iter()
+        .filter(|v| ci >= v.code_index && ci < v.code_index + u64::from(v.length))
+        .map(|v| {
+            let slot = i32::try_from(v.slot).unwrap_or(0);
+            let sig_byte = v.signature.as_bytes().first().copied().unwrap_or(b'I');
+            (v.name, jdwp_client::stackframe::VariableSlot { slot, sig_byte })
+        })
+        .collect();
+    let slots: Vec<jdwp_client::stackframe::VariableSlot> = in_scope.iter().map(|(_, s)| *s).collect();
+    if slots.is_empty() {
+        return Vec::new();
+    }
+    let Ok(vals) = conn.get_frame_values(thread, frame_id, slots).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(in_scope.len());
+    for ((name, _), val) in in_scope.into_iter().zip(vals.iter()) {
+        let rendered = render_value(conn, val, None, local_len, ByteRender::default()).await;
+        out.push(crate::session::TracedValue { name, rendered, object_id: as_object_id(val) });
+    }
+    out
 }
 
 /// Whether a JVM class name names an **anonymous** inner class — `DispHotelSrv$2`, not `Order$Line`.

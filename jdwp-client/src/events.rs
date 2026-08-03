@@ -84,9 +84,56 @@ pub enum EventKind {
         /// JDWP's `valueToBe` — the value the write will store.
         new_value: Value,
     },
+    /// A thread has begun **blocking** on a monitor another thread owns
+    /// (`MONITOR_CONTENDED_ENTER`, 43). The thread is off the pool from here until the matching
+    /// [`MonitorContendedEntered`](Self::MonitorContendedEntered) arrives.
+    MonitorContendedEnter {
+        monitor: MonitorEvent,
+    },
+    /// A thread that was blocking has **acquired** the monitor (`MONITOR_CONTENDED_ENTERED`, 44).
+    ///
+    /// **This event carries no timing of any kind.** How long the thread was blocked — the actual
+    /// question a contention diagnosis asks — is on neither half of the pair, so it can only be had by
+    /// timestamping the `ENTER` on this side and matching it here. See `mcp-server`'s monitor pairing and
+    /// ADR-0035: the resulting figure is a *debugger* measurement and every reply that prints one says so.
+    MonitorContendedEntered {
+        monitor: MonitorEvent,
+    },
+    /// A thread is about to `Object.wait()` (`MONITOR_WAIT`, 45).
+    MonitorWait {
+        monitor: MonitorEvent,
+        /// JDWP's `timeout` — the number of milliseconds the caller **asked** `wait(…)` for, `0` for an
+        /// untimed wait. It is the argument, not a measurement: a `wait(5000)` that returns after 3 ms
+        /// still reports 5000 here.
+        timeout: i64,
+    },
+    /// A thread's `Object.wait()` has returned (`MONITOR_WAITED`, 46).
+    MonitorWaited {
+        monitor: MonitorEvent,
+        /// Whether the wait ended because the timeout expired rather than because of a `notify`. The one
+        /// piece of outcome the wire does carry, and the difference between "nobody signalled it" and
+        /// "it was signalled" — which are opposite diagnoses.
+        timed_out: bool,
+    },
     Unknown {
         kind: u8,
     },
+}
+
+/// Which monitor was contended, by which thread, at what code.
+///
+/// The context all four monitor events carry. They differ only in what (if anything) follows it, so it
+/// lives in one struct, exactly as [`FieldEvent`] does for the two field events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorEvent {
+    /// The thread that blocked, acquired, waited or finished waiting.
+    pub thread: ThreadId,
+    /// The code that was executing, **not** where the monitor's type is declared — for a
+    /// `synchronized` block, the block's own location.
+    pub location: Location,
+    /// The monitor object itself. Arrives as a tagged-objectID and is a **weak** reference like every
+    /// other object id here (ADR-0022), so a pairing keyed on it must not assume it stays readable.
+    pub monitor: ObjectId,
 }
 
 /// Which field was touched, by what code, on which object — the context both field events carry.
@@ -146,15 +193,22 @@ pub fn parse_event_packet(data: &[u8]) -> JdwpResult<EventSet> {
 }
 
 /// Dispatch a single event's kind-specific payload to the matching parser.
+///
+/// The **stop-point** kinds are here — the ones a debugger arms deliberately and that carry a thread and a
+/// location — while the VM's own lifecycle notifications and the monitor family are delegated. Split that
+/// way because the table had grown past the point where one `match` could be read at a glance, and because
+/// those are the two groups whose members share a shape: [`parse_vm_lifecycle_event`]'s carry no location,
+/// and [`parse_monitor_event`]'s all share one prefix.
 fn parse_event_details(kind: u8, buf: &mut &[u8]) -> JdwpResult<EventKind> {
+    if let Some(parsed) = parse_vm_lifecycle_event(kind, buf) {
+        return parsed;
+    }
+    if let Some(parsed) = parse_monitor_event(kind, buf) {
+        return parsed;
+    }
     match kind {
         event_kinds::BREAKPOINT => parse_breakpoint_event(buf),
         event_kinds::SINGLE_STEP => parse_step_event(buf),
-        event_kinds::VM_START => parse_vm_start_event(buf),
-        event_kinds::VM_DEATH => Ok(EventKind::VMDeath),
-        event_kinds::THREAD_START => parse_thread_start_event(buf),
-        event_kinds::THREAD_DEATH => parse_thread_death_event(buf),
-        event_kinds::CLASS_PREPARE => parse_class_prepare_event(buf),
         event_kinds::EXCEPTION => parse_exception_event(buf),
         event_kinds::FIELD_ACCESS => parse_field_access_event(buf),
         event_kinds::FIELD_MODIFICATION => parse_field_modification_event(buf),
@@ -164,6 +218,40 @@ fn parse_event_details(kind: u8, buf: &mut &[u8]) -> JdwpResult<EventKind> {
             warn!("Unsupported event kind: {}", kind);
             Ok(EventKind::Unknown { kind })
         }
+    }
+}
+
+/// The VM's own lifecycle notifications, which arrive whether anything asked for them or not. `None` for
+/// any other kind, so the caller keeps dispatching.
+///
+/// These share a shape: none of them carries a location, which is why `event_location` on the `mcp-server`
+/// side answers `None` for every one of them.
+fn parse_vm_lifecycle_event(kind: u8, buf: &mut &[u8]) -> Option<JdwpResult<EventKind>> {
+    match kind {
+        event_kinds::VM_START => Some(parse_vm_start_event(buf)),
+        event_kinds::VM_DEATH => Some(Ok(EventKind::VMDeath)),
+        event_kinds::THREAD_START => Some(parse_thread_start_event(buf)),
+        event_kinds::THREAD_DEATH => Some(parse_thread_death_event(buf)),
+        event_kinds::CLASS_PREPARE => Some(parse_class_prepare_event(buf)),
+        _ => None,
+    }
+}
+
+/// The four monitor kinds (DUMP-7, #96). `None` for any other kind.
+///
+/// Grouped because they share [`parse_monitor_event_head`] — the tagged-objectID prefix and its trap — and
+/// differ only in a trailing field of a different Rust type each.
+fn parse_monitor_event(kind: u8, buf: &mut &[u8]) -> Option<JdwpResult<EventKind>> {
+    match kind {
+        event_kinds::MONITOR_CONTENDED_ENTER => {
+            Some(parse_monitor_event_head(buf).map(|monitor| EventKind::MonitorContendedEnter { monitor }))
+        }
+        event_kinds::MONITOR_CONTENDED_ENTERED => {
+            Some(parse_monitor_event_head(buf).map(|monitor| EventKind::MonitorContendedEntered { monitor }))
+        }
+        event_kinds::MONITOR_WAIT => Some(parse_monitor_wait_event(buf)),
+        event_kinds::MONITOR_WAITED => Some(parse_monitor_waited_event(buf)),
+        _ => None,
     }
 }
 
@@ -240,6 +328,43 @@ fn parse_field_modification_event(buf: &mut &[u8]) -> JdwpResult<EventKind> {
     let tag = read_u8(buf)?;
     let new_value = Value { tag, data: crate::reader::read_value_by_tag(tag, buf)? };
     Ok(EventKind::FieldModification { field, new_value })
+}
+
+/// Read the prefix all four monitor events share: the thread, the monitor object (a tagged-objectID),
+/// and the location of the code involved.
+///
+/// **Note the field ORDER, which is not the field events' order.** A monitor event puts its object
+/// *before* the location; `parse_field_event_head` above puts the location first. Getting it the other
+/// way round does not fail — a location's leading typeTag byte reads as the object's tag and the whole
+/// remainder shifts, which for [`parse_monitor_wait_event`] means a garbage timeout and inside a
+/// composite means the *next* event desynchronises.
+///
+/// One head parser rather than four copies, and rather than a shape enum: the trap this exists to
+/// contain is entirely in the shared prefix — the tag byte — while the two tails differ in Rust *type*
+/// (`i64` against `bool`), so an enum would only move the match one level out. This is the same split
+/// `parse_field_event_head` uses for the same reason.
+fn parse_monitor_event_head(buf: &mut &[u8]) -> JdwpResult<MonitorEvent> {
+    let thread = read_u64(buf)?;
+    // The monitor is a tagged-objectID: one tag byte (always `L`, an object) and then the id. Dropping
+    // the tag read is the mistake that silently shifts every field after it.
+    let _monitor_tag = read_u8(buf)?;
+    let monitor = read_u64(buf)?;
+    let location = read_location(buf)?;
+    Ok(MonitorEvent { thread, location, monitor })
+}
+
+fn parse_monitor_wait_event(buf: &mut &[u8]) -> JdwpResult<EventKind> {
+    let monitor = parse_monitor_event_head(buf)?;
+    // The timeout the caller passed to `wait(…)`, not how long it waited. Signed, because that is how
+    // JDWP declares it and how `Object.wait(long)` takes it.
+    let timeout = crate::reader::read_i64(buf)?;
+    Ok(EventKind::MonitorWait { monitor, timeout })
+}
+
+fn parse_monitor_waited_event(buf: &mut &[u8]) -> JdwpResult<EventKind> {
+    let monitor = parse_monitor_event_head(buf)?;
+    let timed_out = read_u8(buf)? != 0;
+    Ok(EventKind::MonitorWaited { monitor, timed_out })
 }
 
 /// Parse a `METHOD_EXIT` (kind 41) or `METHOD_EXIT_WITH_RETURN_VALUE` (kind 42) event.
@@ -395,20 +520,104 @@ mod tests {
     }
 
     /// An event kind we don't parse must degrade to `Unknown`, not fail the whole set: the JVM sends
-    /// kinds we never requested (monitor events, frame pops), and dropping the set would lose
+    /// kinds we never requested (frame pops, class unloads), and dropping the set would lose
     /// the events beside it.
     #[test]
     fn an_unhandled_event_kind_becomes_unknown_rather_than_an_error() {
-        // MONITOR_WAIT is a real JDWP kind this client never requests and does not parse — the honest
-        // case, rather than a number the protocol doesn't define.
-        let mut ev = vec![event_kinds::MONITOR_WAIT];
+        // FRAME_POP is a real JDWP kind this client never requests and does not parse — the honest case,
+        // rather than a number the protocol doesn't define. It used to be `MONITOR_WAIT`, which DUMP-7
+        // (#96) decoded: an example chosen for being unhandled has to be re-chosen when it stops being.
+        let mut ev = vec![event_kinds::FRAME_POP];
         ev.extend_from_slice(&1i32.to_be_bytes());
         let set = parse_event_packet(&packet(0, &[ev])).expect("an unhandled kind is not a parse failure");
         assert!(
             matches!(set.events.first().map(|e| &e.details), Some(EventKind::Unknown { kind })
-                if *kind == event_kinds::MONITOR_WAIT),
+                if *kind == event_kinds::FRAME_POP),
             "expected Unknown, got {:?}",
             set.events.first().map(|e| &e.details)
+        );
+    }
+
+    /// A monitor event of any of the four kinds: thread, the monitor as a **tagged**-objectID, location,
+    /// then whichever tail the kind carries.
+    fn monitor_event(kind: u8, monitor: u64, tail: &[u8]) -> Vec<u8> {
+        let mut out = vec![kind];
+        out.extend_from_slice(&11i32.to_be_bytes()); // requestId
+        out.extend_from_slice(&0x7fu64.to_be_bytes()); // thread
+        out.push(crate::reader::value_tags::OBJECT); // the tag byte the head parser must consume
+        out.extend_from_slice(&monitor.to_be_bytes());
+        out.extend_from_slice(&location(0x99, 0xaa, 4));
+        out.extend_from_slice(tail);
+        out
+    }
+
+    /// DUMP-7 (#96): all four kinds decode, and each reports the monitor object rather than reading the
+    /// location's typeTag as part of it.
+    ///
+    /// The two-in-one-packet assertions are the load-bearing ones. Dropping the tagged-objectID's tag
+    /// byte, or reading `MONITOR_WAIT`'s trailing `long` for a kind that does not carry one, both leave a
+    /// single event *looking* fine while shifting everything after it — so the mistake only shows up as a
+    /// second event that fails to parse or arrives with garbage.
+    #[test]
+    fn every_monitor_event_kind_decodes_with_its_own_tail() {
+        let enter = parse_event_packet(&packet(
+            1,
+            &[monitor_event(event_kinds::MONITOR_CONTENDED_ENTER, 0x1234, &[])],
+        ))
+        .expect("well-formed");
+        match enter.events.first().map(|e| &e.details) {
+            Some(EventKind::MonitorContendedEnter { monitor }) => {
+                assert_eq!(monitor.monitor, 0x1234, "the monitor object, not the location's typeTag");
+                assert_eq!(monitor.thread, 0x7f);
+                assert_eq!(monitor.location.method_id, 0xaa);
+            }
+            other => panic!("expected a contended enter, got {other:?}"),
+        }
+
+        // ENTER and ENTERED back to back: the second only parses if the first consumed exactly its own
+        // bytes — the pair a debugger-measured elapsed is computed from, so both halves must survive one
+        // composite.
+        let pair = parse_event_packet(&packet(
+            1,
+            &[
+                monitor_event(event_kinds::MONITOR_CONTENDED_ENTER, 0x1234, &[]),
+                monitor_event(event_kinds::MONITOR_CONTENDED_ENTERED, 0x1234, &[]),
+            ],
+        ))
+        .expect("well-formed");
+        assert_eq!(pair.events.len(), 2, "an enter must consume exactly its own bytes");
+        assert!(
+            matches!(&pair.events[1].details, EventKind::MonitorContendedEntered { monitor } if monitor.monitor == 0x1234),
+            "got {:?}",
+            pair.events[1].details
+        );
+
+        // WAIT's trailing `long` is the requested timeout, and WAITED's is a one-byte flag. A second
+        // event after each is what catches reading the wrong width.
+        let waits = parse_event_packet(&packet(
+            1,
+            &[
+                monitor_event(event_kinds::MONITOR_WAIT, 0x55, &5000i64.to_be_bytes()),
+                monitor_event(event_kinds::MONITOR_WAITED, 0x55, &[1]),
+                monitor_event(event_kinds::MONITOR_WAITED, 0x55, &[0]),
+            ],
+        ))
+        .expect("well-formed");
+        assert_eq!(waits.events.len(), 3, "each tail must be consumed at its own width");
+        assert!(
+            matches!(&waits.events[0].details, EventKind::MonitorWait { timeout: 5000, .. }),
+            "got {:?}",
+            waits.events[0].details
+        );
+        assert!(
+            matches!(&waits.events[1].details, EventKind::MonitorWaited { timed_out: true, .. }),
+            "got {:?}",
+            waits.events[1].details
+        );
+        assert!(
+            matches!(&waits.events[2].details, EventKind::MonitorWaited { timed_out: false, .. }),
+            "a notified wait did not time out, got {:?}",
+            waits.events[2].details
         );
     }
 
@@ -417,7 +626,12 @@ mod tests {
     /// killing the whole debug session instead of reporting a malformed reply.
     #[test]
     fn every_truncation_of_a_packet_errors_instead_of_panicking() {
-        for event in [breakpoint_event(5, 0xabc), field_modification_event(42), method_exit_event(true, 42)] {
+        for event in [
+            breakpoint_event(5, 0xabc),
+            field_modification_event(42),
+            method_exit_event(true, 42),
+            monitor_event(event_kinds::MONITOR_WAIT, 0x55, &5000i64.to_be_bytes()),
+        ] {
             let wire = packet(1, &[event]);
             for keep in 0..wire.len() {
                 let short = &wire[..keep];
