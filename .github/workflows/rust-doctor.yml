@@ -15,6 +15,17 @@ on:
   # Callable so release.yml can gate a tag on this scan. A tag ref matches neither trigger above, so
   # without this the release would be relying on a run that happened on a different ref (REL-1, #34).
   workflow_call:
+    inputs:
+      gate_semver:
+        description: >-
+          Fail the run when the public API has broken without a version that permits it. release.yml passes
+          true; the push/PR triggers leave it false, which reports the same finding without failing (CI-2,
+          #122 — the argument is in scripts/semver-check.sh). An explicit input rather than sniffing
+          github.ref: in a called workflow github.event_name is the CALLER's, so a tag push and a branch
+          push are not distinguishable from inside without guessing.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -195,10 +206,22 @@ jobs:
   # jdwp-mcp is a [[bin]] and contributes nothing) versus what it cannot (the MCP tool surface, which is
   # what callers actually pin, and which only docs/toolkit-contract.md covers).
   #
-  # It gates. release.yml calls this workflow, so a violation blocks a tag — which is the point: the version
-  # number is what the downstream toolkit pins, and it should not be able to claim compatibility the API
-  # does not have. On a release commit every check skips (a major bump permits breaking changes) and the
-  # script says so, so the pass is announced as vacuous instead of counted as verification.
+  # IT GATES ON THE RELEASE PATH ONLY, and that is a change (CI-2, #122). release.yml passes
+  # `gate_semver: true`, so a violation still blocks a tag — which is the point: the version number is what
+  # the downstream toolkit pins, and it should not be able to claim compatibility the API does not have. On
+  # a push to main or a PR the same finding is printed in full, with the bump that would permit it, and the
+  # run concludes green.
+  #
+  # Why: between releases the working version EQUALS the baseline tag, so any break violates the smallest
+  # bump and this job was red for the whole of every cycle — measured as the only failing job in every run
+  # between two consecutive releases. The only way to clear it was to cut the release. `CLAUDE.md` names
+  # that cost where it explains why the AI review workflow was removed rather than repaired: a permanent red
+  # that tested nothing teaches you to ignore red on PRs. scripts/semver-check.sh's header carries the
+  # argument and the rejected alternative (computing the bump the next release would take, and passing on
+  # that — rejected for encoding a guess about a version nobody has chosen).
+  #
+  # On a release commit every check skips (a major bump permits breaking changes) and the script says so, so
+  # the pass is announced as vacuous instead of counted as verification. That is unchanged.
   semver:
     name: Public API vs the last tag
     runs-on: ubuntu-latest
@@ -224,4 +247,11 @@ jobs:
           # the summary. Set explicitly and said out loud because it nearly did not: a local negative test
           # printed "exit=0" while the check had in fact failed, because `$?` after a pipeline is `tee`'s.
           set -o pipefail
-          scripts/semver-check.sh | tee -a "$GITHUB_STEP_SUMMARY"
+          # Spelled out rather than as a `${{ cond && 'a' || 'b' }}` ternary: in that idiom an empty string
+          # is falsy, so the natural `inputs.gate_semver && '' || '--report-only'` silently passes
+          # --report-only in BOTH directions. `inputs` is an empty context on the push/PR triggers, so an
+          # unset value compares unequal to "true" and reports rather than gates — which is the safe way
+          # round for the branch that is not the tag.
+          args=()
+          if [ "${{ inputs.gate_semver }}" != "true" ]; then args+=(--report-only); fi
+          scripts/semver-check.sh "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"

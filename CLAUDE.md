@@ -39,8 +39,14 @@ stay off deliberately and `rust-doctor.yml` says why at each one: `cargo-geiger`
 `unsafe-dependency` rule this repo ignores, `cargo-semver-checks` through *that* pass would compare against
 **bonk-dev's** unrelated `jdwp-client` on crates.io (ours are unpublished) and answer confidently from the
 wrong package — so the check lives in the `semver` job instead, via `scripts/semver-check.sh`, which uses the
-last release **tag** as the baseline: 196 checks run that way against 0 through the pass. It gates, and
-`release.yml` calls this workflow, so a broken public API blocks a tag. Read its verdict rather than the tick:
+last release **tag** as the baseline: 196 checks run that way against 0 through the pass. **It gates on the
+release path only** (CI-2, #122): `release.yml` passes `gate_semver: true`, so a broken public API blocks a tag,
+while a push to `main` or a PR gets the same finding printed — with the bump that would permit it — and
+concludes green. That is a change, and the reason is that the red was routine: between releases the working
+version *equals* the baseline tag, so every break violates the smallest bump and this job was the only failing
+one in every run across two whole cycles. The only way to clear it was to cut the release. A permanent red that
+tested nothing is the same defect as a green tick that means too much, and it is the one this file warns about
+two paragraphs down. Read its verdict rather than the tick:
 on a release commit every check skips, because a bump that permits breaking changes leaves nothing to
 violate, and the script prints "0 checks ran, so this verified nothing" instead of passing quietly. Coverage
 belongs to `coverage.yml`. `--findings` works this out **per tool** from the workflow's install

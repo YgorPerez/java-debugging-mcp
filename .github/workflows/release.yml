@@ -72,6 +72,13 @@ jobs:
     name: Gate (lint)
     needs: version
     uses: ./.github/workflows/rust-doctor.yml
+    # THIS is the ref the semver check gates on (CI-2, #122). On a push to main or a PR the same job reports
+    # a break and concludes green, because between releases the working version equals the baseline tag and
+    # every break violates it — a red for the whole cycle that could only be cleared by cutting the release.
+    # Here the release IS being cut, the version has been chosen, and a public API that outruns it must block
+    # the tag: the version number is what the downstream toolkit pins.
+    with:
+      gate_semver: true
     # security-events: write is rust-doctor.yml's own requirement — it publishes its SARIF to code
     # scanning — and is granted to this job alone. The job that can write to the repository is `release`,
     # and it carries contents: write and nothing else.

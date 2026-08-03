@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Does the public Rust API of this workspace still match the version number attached to it?
 #
-#     scripts/semver-check.sh            # against the latest v* tag that is not HEAD
-#     scripts/semver-check.sh v0.7.0     # against a tag you name
+#     scripts/semver-check.sh                 # against the latest v* tag that is not HEAD
+#     scripts/semver-check.sh v0.7.0          # against a tag you name
+#     scripts/semver-check.sh --report-only   # report a break, do not fail on it
 #
 # ## Why a script and not `cargo semver-checks` in the workflow
 #
@@ -28,6 +29,29 @@
 # silent. This check is not a substitute for the release notes; it is a second, narrower signal that keeps
 # the *version number* honest, which matters because the downstream toolkit pins one.
 #
+# ## Why a break can be REPORTED rather than failed (`--report-only`, CI-2, #122)
+#
+# Between releases the working version equals the baseline tag, so cargo-semver-checks assumes the smallest
+# bump and any break violates it. That is correct and it is also the NORMAL state of `main` for the whole
+# development cycle: measured across two cycles, this job was the only failing one in every run between
+# releases, and the only way to clear it was to cut the release — the one thing you are not doing yet.
+#
+# A red that is routine is the mirror of the defect the rest of this file is built against. `CLAUDE.md`
+# already names the cost, in the section explaining why the AI code-review workflow was REMOVED rather than
+# repaired: "a permanent red that tested nothing costs more than that: it teaches you to ignore red on PRs."
+# It arrives on `pull_request` too, which is where that habit is cheapest to learn.
+#
+# So off a release ref the finding is printed in full — the findings, the versions, and the bump that would
+# permit it — and the run is allowed to conclude green. On the path `release.yml` calls, nothing changes: the
+# exit status is the tag's gate, which is what this check was always for.
+#
+# THE REJECTED ALTERNATIVE was to compute the bump the findings require and pass whenever a plausible NEXT
+# version would permit them. Richer on `main`, and rejected because it encodes an assumption nothing else in
+# this repo makes: no one has decided that the next release is a minor bump, and a green tick resting on that
+# guess would mean more than it should — which is the exact failure `--findings`, the SARIF filter and the
+# "0 checks ran" message below all exist to prevent. Naming the permitting bump in the REPORT costs nothing
+# and claims nothing, so that half of the idea is kept.
+#
 # ## The vacuous pass
 #
 # When the working version is a major step above the baseline — and for 0.x, a minor bump IS a major step —
@@ -45,7 +69,17 @@ if ! command -v cargo-semver-checks >/dev/null 2>&1; then
   exit 1
 fi
 
-BASELINE="${1:-}"
+# `--report-only` in any argument position, so `semver-check.sh v0.7.0 --report-only` reads naturally.
+REPORT_ONLY=0
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --report-only) REPORT_ONLY=1 ;;
+    *) ARGS+=("$arg") ;;
+  esac
+done
+
+BASELINE="${ARGS[0]:-}"
 if [ -z "$BASELINE" ]; then
   # The latest v* tag that is NOT on HEAD. Excluding HEAD's own tag is what makes this work during a
   # release: `release.sh` tags the bump commit, the gate then runs on that tag, and a baseline of "the tag
@@ -96,9 +130,30 @@ if grep -qE "failed to build rustdoc|could not document|running cargo-doc on cra
 fi
 
 if [ "$status" -ne 0 ]; then
+  # The version the working tree declares, and the smallest release that would permit these findings. For
+  # 0.x cargo-semver-checks treats the MINOR as the major component, so 0.14.1 -> 0.15.0 is the permitting
+  # bump and 0.14.2 is not. Stated rather than assumed, because verifying it by hand — bump Cargo.toml, run
+  # the check, watch every check skip, revert — is what this cost every cycle.
+  VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+  PERMITS="$(echo "$VERSION" | awk -F. '{ if ($1 == "0") printf "0.%d.0", $2 + 1; else printf "%d.0.0", $1 + 1 }')"
+
   echo "**The public API broke without a version that allows it.** Either the change is a mistake, or the"
   echo "next release is a bigger bump than planned — and \`docs/toolkit-contract.md\` wants it in the release"
   echo "notes either way. Full output above."
+  echo
+  echo "The working tree declares \`$VERSION\` and the baseline is \`$BASELINE\`, so the smallest bump that"
+  echo "permits these findings is **\`$PERMITS\`** (for 0.x the minor is the major component, so a patch"
+  echo "release would not)."
+
+  if [ "$REPORT_ONLY" -eq 1 ]; then
+    echo
+    echo "**Reported, not failed** (\`--report-only\`). Between releases the working version equals the"
+    echo "baseline tag, so this is the normal state of \`main\` and the only way to clear it is to cut the"
+    echo "release. Failing here every cycle teaches you to ignore red on PRs, which costs more than it"
+    echo "catches — see the header of this script for the argument and the rejected alternative. The gate is"
+    echo "the release path, where this same state still exits non-zero and blocks the tag."
+    exit 0
+  fi
   exit "$status"
 fi
 
