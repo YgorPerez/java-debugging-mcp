@@ -17,6 +17,13 @@ _Avoid_: target, remote, server (the last belongs to the MCP server, which is th
 The `WildFly` instance several people use at once. Not an environment name — the constraint that decides
 every safety default, because freezing it stalls other people's requests.
 
+**Bound head** (of a condition):
+A name a `condition` may use that is not in the frame, because the **hit** carries it rather than the frame:
+`exception` on an exception stop, `newValue` on a field stop (ADR-0034). Reserved, exactly as `this` is, and
+bound by rewriting to the `@0x…` handle when the value is an object. A method-exit hit binds nothing — its
+frame is the returning method's own.
+_Avoid_: variable, magic name, implicit local (it is none of those — it is not in the variable table at all)
+
 **Erased type** / **generic type**:
 The **erased** type is what the JVM runs on and what a plain descriptor carries: `java.util.List`. The
 **generic** type is what the source declared, read from the class file's optional `Signature` attribute:

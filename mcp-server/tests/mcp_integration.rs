@@ -13084,3 +13084,272 @@ fn a_stack_locals_declared_type_appears_only_where_it_adds_something() {
 
     server.panic_reset();
 }
+
+// ---------------------------------------------------------------------------------------------
+// FILT-6 (#83) — a condition on the three stop-point kinds that never had one
+//
+// `CondKindsProbe` throws the same type with two different field values and NO message, which is the
+// shape that makes the exception case expensive: three hits in every four are noise, and the only
+// usable discriminator is a field on the exception INSTANCE. Every test here also proves the negative
+// — that the noise value did NOT select — because a condition that matched everything and a condition
+// that was never evaluated both look like success otherwise.
+// ---------------------------------------------------------------------------------------------
+
+/// A conditional EXCEPTION stop, suspending, asserted against the probe's own stdout.
+///
+/// The condition reads the thrown instance's field through the reserved `exception` head, which is the
+/// piece of FILT-6 that did not exist before: the hit's top frame belongs to the throwing method, so
+/// `this` is the thrower and the exception was unreachable from a condition.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_exception_condition_reads_the_thrown_instances_own_field() {
+    let Some(jdk) = jdk_or_skip("an_exception_condition_reads_the_thrown_instances_own_field") else {
+        return;
+    };
+    // `launch_running`, not `launch`: an exception breakpoint cannot be deferred, so `AppException` has to
+    // have been thrown once before it can be armed. A `tick` line means one whole iteration has run.
+    let mut probe =
+        Probe::launch_running(&jdk, "CondKindsProbe", |l| l.starts_with("tick ")).expect("launch");
+    // The watchdog off: this deliberately leaves the VM suspended at the matching throw.
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    probe.attach(&mut server);
+
+    let armed = server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({
+            "class_pattern": "CondKindsProbe$AppException",
+            "caught": true,
+            "condition": "exception.cdException == 999",
+        }),
+    );
+    assert_contains_all("the conditional exception stop armed", &armed, &["exc_"]);
+    // The listing must show it, or a caller cannot tell a conditional stop from an unconditional one.
+    assert_contains_all(
+        "list_stop_points shows the condition",
+        &server.call("debug.list_stop_points", serde_json::json!({})),
+        &["Condition: exception.cdException == 999"],
+    );
+
+    let hit = server.wait_for_event("\"exception\"", EVENT_TIMEOUT).unwrap_or_else(|| {
+        panic!(
+            "the condition never fired. The probe throws every iteration and one in four carries 999, so \
+             the value certainly came round — a condition that cannot reach the exception instance does not \
+             error, it silently never matches.\n  probe tail: {:?}",
+            probe.output().iter().rev().take(10).collect::<Vec<_>>(),
+        )
+    });
+    assert_contains_all("the matching throw suspended the VM", &hit, &["[suspended] true"]);
+
+    // The throwing frame's own local carries the same value, which also confirms the frame the condition
+    // was evaluated on is the THROWING one. (`swallowed` is the catch parameter and is not assigned yet at
+    // the throw site, so it is deliberately not what this reads.)
+    assert_contains_all(
+        "the frame the condition ran on is the throwing frame",
+        &server.evaluate("cd"),
+        &["(int) 999"],
+    );
+
+    // --- the probe's own account, which is what no reply can fake ---
+    let out = probe.output();
+    let last = out
+        .iter()
+        .rev()
+        .find(|l| l.starts_with("offer ") || l.starts_with("done "))
+        .expect("the probe printed neither line");
+    assert!(
+        last.starts_with("offer "),
+        "the probe got past the throw, so it was never suspended on it — stdout ends at `{last}`"
+    );
+    let i: i64 = last.trim_start_matches("offer ").trim().parse().expect("an offer index");
+    assert_eq!(
+        i % 4,
+        2,
+        "the stop landed on iteration {i}, which is not one of the 999 iterations. A condition that read \
+         the WRONG field, or the thrower instead of the exception, fires on the wrong throw rather than \
+         failing to fire.\n  probe tail: {:?}",
+        out.iter().rev().take(10).collect::<Vec<_>>(),
+    );
+    // And the noise iterations ran to completion, so the condition really did let them go.
+    assert!(
+        out.iter().any(|l| l == "done 0") && out.iter().any(|l| l == "done 1"),
+        "the iterations whose cdException is 1 must have finished — otherwise this stopped on the first \
+         throw whatever the condition said.\n  probe tail: {:?}",
+        out.iter().rev().take(12).collect::<Vec<_>>(),
+    );
+
+    server.panic_reset();
+}
+
+/// A conditional FIELD stop and a conditional METHOD-EXIT stop, both traced — and the budget, which is
+/// the acceptance criterion that a condition-skipped hit is not charged.
+///
+/// Traced rather than suspending because that is the shape the issue is about (filtering a trace on a
+/// shared instance), and because the probe continuing to tick is the only evidence nothing froze.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn conditional_field_and_method_exit_traces_filter_without_charging_the_budget() {
+    let Some(jdk) =
+        jdk_or_skip("conditional_field_and_method_exit_traces_filter_without_charging_the_budget")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "CondKindsProbe").expect("launch");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    // A field stop conditioned on the INCOMING value, which reading the field cannot give you:
+    // FIELD_MODIFICATION is reported before the write lands.
+    let watch = server.call(
+        "debug.set_field_stop",
+        serde_json::json!({
+            "class_name": "CondKindsProbe",
+            "field_name": "total",
+            "on_write": true,
+            "trace": true,
+            "condition": "newValue == 999",
+            "trace_max_hits": 30,
+        }),
+    );
+    assert_contains_all("the conditional field stop armed", &watch, &["watch_"]);
+
+    // A method-exit stop conditioned on a local of the returning frame, negated — so `!` is exercised
+    // end to end and not only in the parser's unit tests.
+    let mexit = server.call(
+        "debug.set_method_exit_stop",
+        serde_json::json!({
+            "class_pattern": "CondKindsProbe",
+            "method": "classify",
+            "trace": true,
+            "condition": "!(cd == 1)",
+            "trace_max_hits": 30,
+        }),
+    );
+    assert_contains_all("the conditional method-exit stop armed", &mexit, &["mexit_"]);
+
+    // Wait for enough iterations that the noise value has been through several times.
+    // `tick_index`, NOT `trailing_tick`: this probe prints `tick N` at the START of the line. Reaching for
+    // the wrong one does not fail usefully — it returns None, the wait can never match, and the test dies
+    // after the full timeout claiming the probe froze while its output plainly shows it ticking.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n >= 9))
+        .expect("the probe never reached its 9th tick");
+
+    let traces = server.call("debug.get_traces", serde_json::json!({}));
+    assert!(
+        traces.contains("999"),
+        "neither conditional trace recorded the value it was armed for:\n{traces}"
+    );
+    // The negative, and the whole point: the noise value must not be in the buffer at all.
+    //
+    // **These needles were checked against a real reply, not guessed.** The first version of this loop
+    // matched `-> (int) 1` where the renderer writes `new=(int) 1`, so it could never fire — and it was
+    // hiding a real defect: the traced path was still reading `condition: None` for all three of the new
+    // kinds, so neither condition was being evaluated at all. A defeat-the-fix run is what surfaced it,
+    // and the lesson is that a negative assertion has to be *seen failing* before it is trusted.
+    for record in traces.lines().filter(|l| l.starts_with('#')) {
+        assert!(
+            !record.contains("new=(int) 1 ") && !record.contains("returned=(int) 1 "),
+            "a condition let a noise hit through. Three hits in four carry the value 1, so a condition \
+             that is not being evaluated records them all:\n  {record}\n{traces}"
+        );
+    }
+    // And the arithmetic, which is the same statement from the other side: far more hits than captures.
+    let listing_now = server.call("debug.list_stop_points", serde_json::json!({}));
+    let hits: Vec<i64> =
+        listing_now.lines().filter_map(|l| l.trim().strip_prefix("Hits: ")?.trim().parse().ok()).collect();
+    let captures: Vec<i64> = listing_now
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("⏱  Trace cost: ")?.split(' ').next()?.parse().ok())
+        .collect();
+    assert!(
+        !hits.is_empty() && hits.iter().zip(&captures).all(|(h, c)| h > c),
+        "every conditional stop point must have been HIT more often than it CAPTURED — equal counts mean \
+         the condition is not filtering. hits={hits:?} captures={captures:?}\n{listing_now}"
+    );
+
+    // THE BUDGET: armed with 3, and the noise hits — far more than 3 by now — must not have spent it.
+    let listing = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert_contains_all(
+        "both conditions are shown in the listing",
+        &listing,
+        &["Condition: newValue == 999", "Condition: !(cd == 1)"],
+    );
+    assert!(
+        !listing.contains("[0 hit(s) left]") && !listing.contains("SPENT"),
+        "a condition-skipped hit was charged to the trace budget. By tick 9 there have been ~7 noise hits \
+         against a budget of 3, so a stop point that charged them would be spent — and 'exactly N traces, \
+         then it stops' would mean something else entirely:\n{listing}"
+    );
+
+    // Nothing froze: the probe is still ticking, which is the only evidence for that. `highest_tick` and
+    // `tick_index` because this probe's tick leads its line — see the note on the wait above.
+    let before = highest_tick(&probe).unwrap_or(0);
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > before + 2)).is_some(),
+        "the probe stopped ticking under two TRACED conditional stop points — a traced stop point must \
+         hold only the hit thread, condition or no condition.\n  probe tail: {:?}",
+        probe.output().iter().rev().take(8).collect::<Vec<_>>(),
+    );
+}
+
+/// A read-only session refuses an INVOKING condition on all four kinds, naming the offending expression.
+///
+/// The refusal already existed for line stops; the other three passed `None` where the condition goes,
+/// because there was nothing to check — not because a condition is exempt. Left alone, extending
+/// conditions to three more kinds would have opened three holes in `read_only` at once.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_read_only_session_refuses_an_invoking_condition_on_every_kind() {
+    let Some(jdk) = jdk_or_skip("a_read_only_session_refuses_an_invoking_condition_on_every_kind") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "CondKindsProbe", |l| l.starts_with("tick ")).expect("launch");
+    let mut server = Server::start().expect("start server");
+    let attached = server.call("debug.attach", serde_json::json!({"port": probe.port, "read_only": true}));
+    assert_contains_all("the read-only session attached", &attached, &["Connected"]);
+
+    let line = probe_line(&probe_source("CondKindsProbe"), "// MEXIT_LOCAL");
+    let cases: [(&str, serde_json::Value); 4] = [
+        (
+            "debug.set_line_stop",
+            serde_json::json!({"class_pattern": "CondKindsProbe", "line": line,
+                               "condition": "classify(1) == 999"}),
+        ),
+        (
+            "debug.set_exception_stop",
+            serde_json::json!({"class_pattern": "CondKindsProbe$AppException", "caught": true,
+                               "condition": "exception.toString() == \"x\""}),
+        ),
+        (
+            "debug.set_field_stop",
+            serde_json::json!({"class_name": "CondKindsProbe", "field_name": "total", "on_write": true,
+                               "condition": "newValue.toString() == \"x\""}),
+        ),
+        (
+            "debug.set_method_exit_stop",
+            serde_json::json!({"class_pattern": "CondKindsProbe", "method": "classify",
+                               "condition": "classify(2) == 1"}),
+        ),
+    ];
+    for (tool, args) in cases {
+        let refused = server.call(tool, args);
+        assert_contains_all(
+            &format!("{tool} must refuse an invoking condition in a read-only session"),
+            &refused,
+            &["Read-only session", "condition", "calls a method"],
+        );
+    }
+
+    // And a NON-invoking condition on the same kinds is fine, so the refusal is about invocation rather
+    // than about conditions.
+    let ok = server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({"class_pattern": "CondKindsProbe$AppException", "caught": true, "trace": true,
+                           "condition": "exception.cdException == 999"}),
+    );
+    assert_contains_all(
+        "a field-comparison condition is allowed read-only, which is what makes the refusal useful",
+        &ok,
+        &["exc_"],
+    );
+}

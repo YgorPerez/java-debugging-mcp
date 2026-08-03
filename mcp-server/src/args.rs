@@ -1016,6 +1016,24 @@ pub struct SetExceptionBreakpointArgs {
     /// running — so `debug.list_stop_points` checks and says when that has happened.
     #[serde(default)]
     pub instance_id: Option<String>,
+    /// Only stop when this boolean expression is true, evaluated on the hit thread's top frame — the same
+    /// grammar `debug.set_line_stop`'s `condition` takes, `!`/`&&`/`||` included (FILT-6, #83).
+    ///
+    /// **The exception instance is reachable as `exception`**, which is the whole point here: this stack's
+    /// `InfoTravelException` is simultaneously the error type and the validation-control-flow type — 812
+    /// `ExceptionEnum` values, 247 of them validation, thrown as ordinary flow — so an unfiltered exception
+    /// trace burns its 200-hit budget on validation noise before a real fault lands. And the discriminator
+    /// cannot be the message: `InfoTravelException(ExceptionEnum)` calls no `super(...)` and never sets it,
+    /// so `getMessage()` is null for 1104 of 3166 constructions. The usable discriminator is the exception's
+    /// own field, so write `exception.cdException != ExceptionEnum.validarRegistro` and invert it with `!`.
+    ///
+    /// A frame local, `this` and a static are all still in scope, as on a line stop.
+    ///
+    /// **Cost, on a SUSPENDING stop point:** the VM is frozen while the condition is evaluated. A traced
+    /// (`trace:true`) stop point holds only the hit thread, which is what makes a condition the cheap way to
+    /// filter an exception trace on a shared instance.
+    #[serde(default)]
+    pub condition: Option<String>,
     /// Logpoint mode: on each throw, snapshot (throw location, thread, in-scope locals, exception
     /// type, catch location) into a ring buffer and resume immediately WITHOUT suspending — the safe
     /// choice on a shared instance, where a suspending exception breakpoint freezes other people's
@@ -1149,6 +1167,19 @@ pub struct SetWatchpointArgs {
     /// running — so `debug.list_stop_points` checks and says when that has happened.
     #[serde(default)]
     pub instance_id: Option<String>,
+    /// Only stop when this boolean expression is true, evaluated on the hit thread's top frame — the same
+    /// grammar `debug.set_line_stop`'s `condition` takes, `!`/`&&`/`||` included (FILT-6, #83).
+    ///
+    /// **The incoming value is reachable as `newValue`** — `newValue > 100`, or
+    /// `newValue.getStatus() == "X"` for a reference field. There is deliberately no `oldValue`: a
+    /// `FIELD_MODIFICATION` event is reported BEFORE the write lands, so at condition time the field still
+    /// holds the old one and its own name reads it. `status != newValue` therefore asks "does this write
+    /// actually change anything", which is usually the question. On an ACCESS watch nothing is being
+    /// written, so `newValue` is unbound there and naming it is an error rather than a silent false.
+    ///
+    /// **Cost, on a SUSPENDING watch:** the VM is frozen while the condition is evaluated.
+    #[serde(default)]
+    pub condition: Option<String>,
     /// Logpoint mode: on each hit, snapshot (mutating location, thread, in-scope locals, the field's
     /// old → new pair) into a ring buffer and resume immediately WITHOUT suspending — the safe choice
     /// on a shared instance. Read snapshots with `debug.get_traces`.
@@ -1294,6 +1325,18 @@ pub struct SetMethodBreakpointArgs {
     /// caller wrote; silently subtracting from it would answer a different question from the one asked.
     #[serde(default)]
     pub exclude_classes: Option<Vec<String>>,
+    /// Only stop when this boolean expression is true, evaluated on the hit thread's top frame — the same
+    /// grammar `debug.set_line_stop`'s `condition` takes, `!`/`&&`/`||` included (FILT-6, #83).
+    ///
+    /// The returned value is NOT bound to a name here: a method-exit hit's frame is the returning method's
+    /// own, so its locals and `this` are all in scope and the value is usually derivable from them. Pair
+    /// this with `with_return_value` when you need to see what it returned.
+    ///
+    /// **Cost, on a SUSPENDING stop point:** the VM is frozen while the condition is evaluated, and a
+    /// method-exit request receives every method of a matching class — so a condition on a broad
+    /// `class_pattern` is evaluated far more often than it fires.
+    #[serde(default)]
+    pub condition: Option<String>,
     /// Logpoint mode: snapshot each return (location, thread, in-scope locals, the returned value) and
     /// resume immediately WITHOUT suspending. **Defaults to true, unlike every other stop point** — a
     /// suspending method exit on a hot method is the fastest way to freeze a shared JVM this tool

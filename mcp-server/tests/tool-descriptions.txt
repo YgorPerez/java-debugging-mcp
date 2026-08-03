@@ -536,7 +536,16 @@ method. Measured working on Temurin 17/21/25 against two instances throwing the 
 this is the one stop-point kind where HotSpot both accepts AND applies the modifier, which is why the other
 kinds refuse it rather than offering it (FILT-9, ADR-0027). THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the
 debuggee collects the object the filter stops matching and the stop point goes quiet, which is
-indistinguishable from the exception never being thrown — debug.list_stop_points checks and says so.
+indistinguishable from the exception never being thrown — debug.list_stop_points checks and says so. PASS
+condition TO FILTER THE THROWS YOU DO NOT WANT (FILT-6), and note what the exception instance is called: it is
+reachable as `exception`, so exception.cdException != 42 reads a field the frame cannot give you — the hit's
+top frame belongs to the THROWING method, so `this` is the thrower. That matters here because a type used for
+validation control flow throws far more often than it fails, and its message is often null (a constructor that
+calls no super(...) never sets one), which leaves the exception's own field as the only usable discriminator.
+`!`, `&&` and `||` all work. A condition-skipped hit is NOT charged to the trace budget, so a budget of N
+still means N matches rather than N throws. On a SUSPENDING exception stop the VM is frozen while the
+condition is evaluated; on a traced one only the hit thread is held, which is what makes this the cheap way to
+filter an exception trace on a shared instance.
 
 ## debug.set_field_stop
 Break when a field is read or written — answers "who mutates this?" for a field that changes behind your back
@@ -577,7 +586,13 @@ HotSpot accepts it anyway and then reports every write, with no error and a repl
 (measured on Temurin 17/21/25). A static field is one copy in the whole JVM, so there is nothing to narrow to;
 watch it unfiltered and use trace_expr or a condition. THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the
 debuggee collects the object the watch goes quiet, which reads as the field never being touched —
-debug.list_stop_points checks and says so.
+debug.list_stop_points checks and says so. PASS condition TO FILTER THE WRITES YOU DO NOT WANT (FILT-6). The
+INCOMING value is reachable as `newValue` — newValue == 999, or newValue.getStatus() for a reference field —
+which reading the field cannot give you, because a FIELD_MODIFICATION event is reported BEFORE the write
+lands. There is deliberately no oldValue: at condition time the field still holds it, so its own name reads
+it, and status != newValue asks whether this write actually changes anything. `!`, `&&` and `||` all work. A
+condition-skipped hit is NOT charged to the trace budget. On a SUSPENDING watch the VM is frozen while the
+condition is evaluated.
 
 ## debug.set_line_stop
 Set a breakpoint at a location (class_pattern + line and/or method). class_pattern takes AN EXACT CLASS, A
@@ -723,7 +738,11 @@ on its own to be sure: FILT-9, ADR-0027). There is no signal of any kind that th
 passing it through would mean a reply saying the stop point is scoped to one object while it reports all 400 —
 which is the exact failure this server is built to refuse. Use a condition instead (evaluated on our side, so
 it works on every kind), or put the stop point on a LINE inside an instance method, where instance_id does
-work.
+work. PASS condition TO FILTER THE RETURNS YOU DO NOT WANT (FILT-6), evaluated on the returning method's own
+frame — so its locals and `this` are in scope. `!`, `&&` and `||` all work, and a condition-skipped hit is NOT
+charged to the trace budget. Two costs worth knowing: on a SUSPENDING request the VM is frozen while the
+condition is evaluated, and this request receives EVERY method of a matching class, so a condition on a broad
+class_pattern is evaluated far more often than it fires — a method filter is the cheaper narrowing.
 
 ## debug.set_value
 Write a value to a local variable, a static field (e.g. ConfigDefaultUtils.dsInfra — flip tenant/infra on a

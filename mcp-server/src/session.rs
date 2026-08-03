@@ -709,6 +709,9 @@ pub struct ExceptionRequestInfo {
     pub class_pattern: String,
     pub caught: bool,
     pub uncaught: bool,
+    /// Optional server-side condition (FILT-6, #83): on hit, evaluate it and let the hit go if it is not
+    /// true. Kept on the record so a disable and re-arm reproduces it, exactly as `hit_count` is.
+    pub condition: Option<String>,
     /// Non-suspending trace mode: armed with `EventThread`, each throw is snapshotted into the trace
     /// ring buffer and the hit thread resumed, so a shared JVM is never frozen (TRACE-2).
     pub trace: bool,
@@ -774,6 +777,9 @@ pub struct WatchpointInfo {
     /// a hit carries all of it, so `get_last_event` resolves them from the event and can still describe
     /// a hit whose watchpoint has already been cleared.
     pub is_static: bool,
+    /// Optional server-side condition (FILT-6, #83): on hit, evaluate it and let the hit go if it is not
+    /// true. Kept on the record so a disable and re-arm reproduces it, exactly as `hit_count` is.
+    pub condition: Option<String>,
     /// Non-suspending trace mode: armed with `EventThread`, each hit is snapshotted (including the
     /// old → new pair) into the trace ring buffer and the thread resumed (TRACE-2).
     pub trace: bool,
@@ -853,6 +859,9 @@ pub struct MethodExitRequestInfo {
     /// Whether this was armed as `METHOD_EXIT_WITH_RETURN_VALUE` (kind 42). Needed to clear it, since
     /// JDWP keys requests by (eventKind, requestID); also says whether a hit can report a value at all.
     pub with_return_value: bool,
+    /// Optional server-side condition (FILT-6, #83): on hit, evaluate it and let the hit go if it is not
+    /// true. Kept on the record so a disable and re-arm reproduces it, exactly as `hit_count` is.
+    pub condition: Option<String>,
     /// Non-suspending trace mode — the default for this kind, and near-mandatory on a shared JVM.
     pub trace: bool,
     /// The trace expressions this stop point records, in the order given (TRACE-11, #93).

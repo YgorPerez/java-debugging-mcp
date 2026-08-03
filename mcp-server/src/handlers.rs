@@ -2660,7 +2660,13 @@ impl RequestHandler {
             .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
-        check_readonly_exprs(session.read_only, None, &crate::args::trace_exprs(a.trace_expr.clone()))?;
+        // FILT-6 (#83): the condition too, now that these three kinds can carry one. It was `None` here
+        // because there was nothing to check, not because a condition is exempt.
+        check_readonly_exprs(
+            session.read_only,
+            a.condition.as_deref(),
+            &crate::args::trace_exprs(a.trace_expr.clone()),
+        )?;
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
         let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
@@ -2738,7 +2744,13 @@ impl RequestHandler {
             .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
-        check_readonly_exprs(session.read_only, None, &crate::args::trace_exprs(a.trace_expr.clone()))?;
+        // FILT-6 (#83): the condition too, now that these three kinds can carry one. It was `None` here
+        // because there was nothing to check, not because a condition is exempt.
+        check_readonly_exprs(
+            session.read_only,
+            a.condition.as_deref(),
+            &crate::args::trace_exprs(a.trace_expr.clone()),
+        )?;
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
         let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
@@ -2828,7 +2840,13 @@ impl RequestHandler {
             .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
-        check_readonly_exprs(session.read_only, None, &crate::args::trace_exprs(a.trace_expr.clone()))?;
+        // FILT-6 (#83): the condition too, now that these three kinds can carry one. It was `None` here
+        // because there was nothing to check, not because a condition is exempt.
+        check_readonly_exprs(
+            session.read_only,
+            a.condition.as_deref(),
+            &crate::args::trace_exprs(a.trace_expr.clone()),
+        )?;
 
         // Kind 42 (with the return value) when the JVM speaks JDWP >= 1.6, else plain kind 41. This is a
         // version check, not a capability bit — there is no `canGetMethodReturnValues` flag to read.
@@ -3945,6 +3963,8 @@ struct WatchSpec<'a> {
     hit_count: Option<i32>,
     /// The object this watch is scoped to (`InstanceOnly`, FILT-9); `None` for an unscoped watch.
     instance_filter: Option<u64>,
+    /// The server-side condition this watch is armed with (FILT-6, #83); `None` for an unconditional one.
+    condition: Option<String>,
 }
 
 /// Arm one kind of field watch and register it, returning its `watch_<kind>_<n> (<kind>)` id label.
@@ -3994,6 +4014,7 @@ async fn arm_one_field_watch(
             enabled: true,
             spent: false,
             hit_count: spec.hit_count,
+            condition: spec.condition.clone(),
             instance_filter: spec.instance_filter,
             hits: 0,
             arm: spec.arm,
@@ -4051,6 +4072,7 @@ async fn arm_field_on_named_class(
         class_name: class_name.to_string(),
         field_name: arm.field_name.to_string(),
         is_static: (field.mod_bits & ACC_STATIC) != 0,
+        condition: a.condition.clone(),
         trace: a.trace,
         trace_expr: arm.trace_expr,
         trace_budget: arm.trace_budget,
@@ -4158,6 +4180,7 @@ async fn arm_field_on_one_class(
         class_name: fqn.to_string(),
         field_name: arm.field_name.to_string(),
         is_static,
+        condition: a.condition.clone(),
         trace: a.trace,
         trace_expr: arm.trace_expr,
         trace_budget: arm.trace_budget,
@@ -4284,6 +4307,7 @@ async fn arm_one_method_exit(
             enabled: true,
             spent: false,
             hit_count: a.hit_count,
+            condition: a.condition.clone(),
             instance_filter: arm.instance_filter,
             hits: 0,
             class_pattern: class_pattern.to_string(),
@@ -4558,6 +4582,7 @@ async fn arm_one_exception(
             enabled: true,
             spent: false,
             hit_count: a.hit_count,
+            condition: a.condition.clone(),
             instance_filter: filters.instance,
             hits: 0,
             ref_type,
@@ -5297,6 +5322,9 @@ fn render_exception_line(
     if let Some(o) = er.instance_filter {
         let _ = writeln!(output, "     Instance filter: @0x{o:x}");
     }
+    if let Some(c) = &er.condition {
+        let _ = writeln!(output, "     Condition: {c}");
+    }
     let tag = dead_filter_tag(er.thread_filter, er.instance_filter, dead);
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
@@ -5762,6 +5790,9 @@ fn render_watchpoint_line(
     if let Some(o) = wp.instance_filter {
         let _ = writeln!(output, "     Instance filter: @0x{o:x}");
     }
+    if let Some(c) = &wp.condition {
+        let _ = writeln!(output, "     Condition: {c}");
+    }
     let tag = dead_filter_tag(wp.thread_filter, wp.instance_filter, dead);
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
@@ -5795,6 +5826,9 @@ fn render_method_exit_line(
     );
     if let Some(t) = me.thread_filter {
         let _ = writeln!(output, "     Thread filter: 0x{t:x}");
+    }
+    if let Some(c) = &me.condition {
+        let _ = writeln!(output, "     Condition: {c}");
     }
     output.push_str(&list_trace_exprs(&me.trace_expr));
     let tag = dead_filter_tag(me.thread_filter, me.instance_filter, dead);
@@ -9897,7 +9931,7 @@ fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> O
     {
         return Some(TracedRequest {
             id: id.clone(),
-            condition: None,
+            condition: e.condition.clone(),
             trace_expr: e.trace_expr.clone(),
             trace_frames: e.trace_frames,
             trace_max_length: e.trace_max_length,
@@ -9907,7 +9941,7 @@ fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> O
     if let Some((id, w)) = session.watchpoints.iter().find(|(_, w)| w.request_id == Some(req_id) && w.trace) {
         return Some(TracedRequest {
             id: id.clone(),
-            condition: None,
+            condition: w.condition.clone(),
             trace_expr: w.trace_expr.clone(),
             trace_frames: w.trace_frames,
             trace_max_length: w.trace_max_length,
@@ -9918,7 +9952,7 @@ fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> O
     {
         return Some(TracedRequest {
             id: id.clone(),
-            condition: None,
+            condition: m.condition.clone(),
             trace_expr: m.trace_expr.clone(),
             trace_frames: m.trace_frames,
             trace_max_length: m.trace_max_length,
@@ -10752,7 +10786,10 @@ async fn record_one_traced_event(
     }
     let skip = wrong_method
         || match &req.condition {
-            Some(cond) => !evaluate_condition_on_thread(&mut session.connection, thread, cond).await,
+            Some(cond) => {
+                let bindings = condition_bindings(&details);
+                !evaluate_condition_on_thread(&mut session.connection, thread, cond, bindings).await
+            }
             None => false,
         };
     // TRACE-7: time the capture and nothing else. The condition evaluation above, the resume below and
@@ -11031,11 +11068,17 @@ async fn store_reportable_event(
             record_stop_point_hit(session, req_id);
         }
         counted_req_id = Some(req_id);
-        let cond =
-            session.breakpoints.values().find(|b| b.owns_request(req_id)).and_then(|b| b.condition.clone());
+        // FILT-6 (#83): all four kinds, not just line stops. One lookup per map because a request id is
+        // unique across them, and the first match is the only match.
+        let cond = suspending_condition(session, req_id);
         if !skip {
             if let Some(cond) = cond {
-                if evaluate_condition_on_thread(&mut session.connection, thread, &cond).await {
+                let bindings = event_set
+                    .events
+                    .iter()
+                    .find(|e| e.request_id == req_id)
+                    .map_or_else(ConditionBindings::default, |e| condition_bindings(&e.details));
+                if evaluate_condition_on_thread(&mut session.connection, thread, &cond, bindings).await {
                     // The condition holds, so this hit is the one the caller armed the stop point for.
                     // It must end in the same observable state a non-conditional hit does — VM suspended,
                     // event buffered, alert pushed — which for an `EventThread` arming means suspending
@@ -15384,6 +15427,9 @@ enum Predicate {
         op: String,
         rhs: PredRhs,
     },
+    /// `!p` (FILT-6, #83). The grammar is one grammar, so `!` works in a `[?pred]` filter for free —
+    /// `orders[?!paid]` is the case that costs nothing to support and would be surprising to refuse.
+    Not(Box<Self>),
     /// A boolean chain evaluated against each element.
     Bool(String),
 }
@@ -15430,6 +15476,9 @@ fn prepare_pred_tree<'a>(
                     out.push(prepare_pred_tree(conn, thread_id, frame, b).await?);
                 }
                 Ok(Predicate::And(out))
+            }
+            BoolTree::Not(inner) => {
+                Ok(Predicate::Not(Box::new(prepare_pred_tree(conn, thread_id, frame, inner).await?)))
             }
             BoolTree::Leaf(leaf) => {
                 let Some((lhs, op, rhs)) = split_comparison(leaf) else {
@@ -15481,6 +15530,7 @@ fn eval_predicate_on<'a>(
                     PredRhs::Lit(lit) => compare_values(conn, &lv, op, lit).await,
                 }
             }
+            Predicate::Not(inner) => eval_predicate_on(conn, thread_id, element, inner).await.map(|b| !b),
             Predicate::Bool(expr) => {
                 let v = resolve_relative(conn, thread_id, None, element, expr).await?;
                 match v.data {
@@ -19761,10 +19811,141 @@ fn format_trace_expr(rec: &crate::session::TraceRecord) -> String {
 
 /// Evaluate a breakpoint condition on a thread's top frame. Returns true to KEEP the VM
 /// suspended (condition true, or it couldn't be evaluated), false to auto-resume.
+/// Values a condition may name that are **not** in the frame (FILT-6, #83).
+///
+/// A condition is evaluated on the hit thread's top frame, which is the right context for a line stop and
+/// not enough for the other three kinds. On an EXCEPTION hit the top frame belongs to the *throwing method*,
+/// so `this` is the thrower and the exception itself is unreachable — and the exception's own field is the
+/// only usable discriminator in the target stack: `InfoTravelException(ExceptionEnum)` calls no `super(...)`
+/// and never sets its message, so `getMessage()` is null for 1104 of 3166 constructions. A condition that
+/// could not read `cdException` could not filter the 247 validation values out of an exception trace, which
+/// is the entire point of the issue.
+///
+/// **The reserved names are heads, exactly as `this` is** — `exception.cdException != 42`, `newValue > 100`.
+/// An OBJECT binding is bound by rewriting the head to its `@0x…` handle, which is already a supported
+/// expression head (TRACE-10) and needs no change to head resolution at all. A PRIMITIVE binding cannot be
+/// a handle, so it is used directly when a comparison side is exactly the bound name — which is the only
+/// way a primitive can be used anyway, since it has no members to chain.
+#[derive(Default, Clone, Copy)]
+struct ConditionBindings<'a> {
+    /// The thrown instance, on an exception stop. Always an object.
+    exception: Option<u64>,
+    /// A field watchpoint's incoming value — the one the write is about to store, which reading the field
+    /// cannot give you: `FIELD_MODIFICATION` is reported *before* the write lands.
+    new_value: Option<&'a jdwp_client::types::Value>,
+}
+
+// There is deliberately no `oldValue` binding, and it is not an omission. `FIELD_MODIFICATION` is reported
+// BEFORE the write lands, so at condition time the field still holds the old value and its own name already
+// reads it: `status != newValue` asks "does this write actually change anything", and `this.total > 100 &&
+// newValue < 0` asks about both. A second reserved name would have cost a round trip per hit to supply
+// something the caller can already say, and in more discoverable words.
+
+impl ConditionBindings<'_> {
+    /// The bound value for a name, if any.
+    fn get(&self, name: &str) -> Option<jdwp_client::types::Value> {
+        match name {
+            "exception" => self.exception.map(value_object),
+            "newValue" => self.new_value.cloned(),
+            _ => None,
+        }
+    }
+
+    /// Every bound name that is an OBJECT, with its handle — the ones a chain can be written through.
+    fn object_heads(&self) -> Vec<(&'static str, u64)> {
+        let mut out = Vec::new();
+        if let Some(id) = self.exception {
+            out.push(("exception", id));
+        }
+        if let Some(jdwp_client::types::ValueData::Object(id)) = self.new_value.map(|v| &v.data) {
+            if *id != 0 {
+                out.push(("newValue", *id));
+            }
+        }
+        out
+    }
+}
+
+/// Rewrite a bound OBJECT head into its `@0x…` handle, so the rest of the chain resolves through machinery
+/// that already exists.
+///
+/// Only where the name is genuinely a **head**: at the start of the expression or after a character that
+/// cannot be part of an identifier, and followed by a `.`. That is what keeps a field called
+/// `exceptionCode` from being rewritten, and quote tracking is what keeps a string literal containing the
+/// word out of it. Both are unit-tested, because a substitution that fired one character too wide would
+/// corrupt a condition rather than fail it.
+fn bind_object_heads(leaf: &str, heads: &[(&'static str, u64)]) -> String {
+    let mut out = String::with_capacity(leaf.len());
+    let bytes = leaf.as_bytes();
+    let mut q = Quoted::default();
+    let mut i = 0usize;
+    while i < leaf.len() {
+        let inside = q.inside();
+        let Some(c) = leaf[i..].chars().next() else { break };
+        // A head starts where the previous character cannot continue an identifier.
+        let boundary = i == 0
+            || !bytes
+                .get(i - 1)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$' || *b == b'.');
+        if !inside && boundary {
+            if let Some((name, id)) = heads
+                .iter()
+                .find(|(name, _)| leaf[i..].starts_with(name) && leaf[i + name.len()..].starts_with('.'))
+            {
+                let _ = write!(out, "@0x{id:x}");
+                for ch in name.chars() {
+                    q.step(ch);
+                }
+                i += name.len();
+                continue;
+            }
+        }
+        q.step(c);
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// The condition on whichever stop point owns `req_id`, across all four kinds (FILT-6, #83).
+///
+/// A request id is unique across the four maps, so the first match is the only one. Before FILT-6 this read
+/// `session.breakpoints` alone, which is why a condition on an exception, field or method-exit stop had
+/// nowhere to be evaluated even once it could be stored.
+fn suspending_condition(session: &crate::session::DebugSession, req_id: i32) -> Option<String> {
+    if let Some(b) = session.breakpoints.values().find(|b| b.owns_request(req_id)) {
+        return b.condition.clone();
+    }
+    if let Some(e) = session.exception_requests.values().find(|e| e.request_id == Some(req_id)) {
+        return e.condition.clone();
+    }
+    if let Some(w) = session.watchpoints.values().find(|w| w.request_id == Some(req_id)) {
+        return w.condition.clone();
+    }
+    session.method_exits.values().find(|m| m.request_id == Some(req_id)).and_then(|m| m.condition.clone())
+}
+
+/// The bindings a hit supplies to its condition, read out of the event itself (FILT-6, #83).
+///
+/// Costs nothing: both values are already in the event this function is handed. A line stop and a
+/// method-exit stop bind nothing, and their conditions behave exactly as they did before.
+const fn condition_bindings(details: &EventKind) -> ConditionBindings<'_> {
+    match details {
+        EventKind::Exception { exception, .. } => {
+            ConditionBindings { exception: Some(*exception), new_value: None }
+        }
+        EventKind::FieldModification { new_value, .. } => {
+            ConditionBindings { exception: None, new_value: Some(new_value) }
+        }
+        _ => ConditionBindings { exception: None, new_value: None },
+    }
+}
+
 async fn evaluate_condition_on_thread(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: u64,
     condition: &str,
+    bindings: ConditionBindings<'_>,
 ) -> bool {
     let frame = match conn.get_frames(thread_id, 0, 1).await {
         Ok(f) => match f.into_iter().next() {
@@ -19773,7 +19954,7 @@ async fn evaluate_condition_on_thread(
         },
         Err(_) => return true,
     };
-    eval_condition(conn, thread_id, &frame, condition).await.unwrap_or(true)
+    eval_condition(conn, thread_id, &frame, condition, bindings).await.unwrap_or(true)
 }
 
 /// Split a boolean expression on a doubled operator (`&&` or `||`, given `op` = `'&'` or `'|'`) at
@@ -19809,6 +19990,12 @@ fn split_bool(s: &str, op: char) -> Vec<String> {
 enum BoolTree {
     Or(Vec<Self>),
     And(Vec<Self>),
+    /// `!x` (FILT-6, #83). Binds tighter than `&&`, which binds tighter than `||`, so `!a && b` is
+    /// `(!a) && b` and never `!(a && b)`.
+    ///
+    /// Boxed rather than a `Vec`: negation takes exactly one operand, and modelling it as a list would let
+    /// `Not(vec![])` exist and mean nothing.
+    Not(Box<Self>),
     Leaf(String),
 }
 
@@ -19824,6 +20011,20 @@ fn parse_bool_tree(s: &str) -> BoolTree {
     let ands = split_bool(s, '&');
     if ands.len() > 1 {
         return BoolTree::And(ands.iter().map(|p| parse_bool_tree(p)).collect());
+    }
+    // `!` LAST, so it binds tighter than both (FILT-6, #83): `!a && b` has already been split on `&&` by
+    // the time we get here, and each side is parsed on its own. `!!a` recurses and is a double negation
+    // rather than a parse error, which costs nothing to allow and is what a reader would expect.
+    //
+    // `!=` is the trap, and the reason this tests the SECOND character: a leaf of `cdException != X` starts
+    // with neither `!` nor anything ambiguous, but `!x != y` would be read as a negation of `x != y` if the
+    // check were only "starts with `!`". Java parses it the same way, so that is correct — what must not
+    // happen is `a != b` being read as `a`, `!`, `= b`, and splitting on the operator is what prevents it:
+    // `split_comparison` sees `!=` whole.
+    if let Some(rest) = s.strip_prefix('!') {
+        if !rest.trim_start().starts_with('=') {
+            return BoolTree::Not(Box::new(parse_bool_tree(rest)));
+        }
     }
     BoolTree::Leaf(s.to_string())
 }
@@ -19896,8 +20097,13 @@ async fn eval_condition(
     thread_id: u64,
     frame: &jdwp_client::thread::Frame,
     condition: &str,
+    bindings: ConditionBindings<'_>,
 ) -> Result<bool, String> {
-    eval_bool_tree_on_frame(conn, thread_id, frame, &parse_bool_tree(condition)).await
+    // Object heads are bound ONCE, before parsing: the handles do not change during one evaluation, and
+    // rewriting the whole condition here means every leaf, on both sides of every operator and inside any
+    // number of parentheses, is bound by the same code.
+    let bound = bind_object_heads(condition, &bindings.object_heads());
+    eval_bool_tree_on_frame(conn, thread_id, frame, &parse_bool_tree(&bound), bindings).await
 }
 
 /// Evaluate a boolean tree against a frame, short-circuiting (EVAL-4): `||` stops at the first true
@@ -19908,12 +20114,13 @@ fn eval_bool_tree_on_frame<'a>(
     thread_id: u64,
     frame: &'a jdwp_client::thread::Frame,
     tree: &'a BoolTree,
+    bindings: ConditionBindings<'a>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>> {
     Box::pin(async move {
         match tree {
             BoolTree::Or(branches) => {
                 for b in branches {
-                    if eval_bool_tree_on_frame(conn, thread_id, frame, b).await? {
+                    if eval_bool_tree_on_frame(conn, thread_id, frame, b, bindings).await? {
                         return Ok(true);
                     }
                 }
@@ -19921,13 +20128,17 @@ fn eval_bool_tree_on_frame<'a>(
             }
             BoolTree::And(branches) => {
                 for b in branches {
-                    if !eval_bool_tree_on_frame(conn, thread_id, frame, b).await? {
+                    if !eval_bool_tree_on_frame(conn, thread_id, frame, b, bindings).await? {
                         return Ok(false);
                     }
                 }
                 Ok(true)
             }
-            BoolTree::Leaf(leaf) => eval_condition_leaf(conn, thread_id, frame, leaf).await,
+            // No short-circuit to preserve and nothing to iterate: one operand, inverted.
+            BoolTree::Not(inner) => {
+                eval_bool_tree_on_frame(conn, thread_id, frame, inner, bindings).await.map(|b| !b)
+            }
+            BoolTree::Leaf(leaf) => eval_condition_leaf(conn, thread_id, frame, leaf, bindings).await,
         }
     })
 }
@@ -19939,9 +20150,20 @@ async fn eval_condition_leaf(
     thread_id: u64,
     frame: &jdwp_client::thread::Frame,
     leaf: &str,
+    bindings: ConditionBindings<'_>,
 ) -> Result<bool, String> {
     if let Some((lhs, op, rhs)) = split_comparison(leaf) {
-        let lv = resolve_expression(conn, Some(thread_id), Some(frame), &lhs).await?;
+        // A bound PRIMITIVE used on its own (`newValue > 100`) — the only way a primitive can be used at
+        // all, since it has no members to chain through, and the one case a handle rewrite cannot cover.
+        let lv = match bindings.get(lhs.trim()) {
+            Some(v) => v,
+            None => resolve_expression(conn, Some(thread_id), Some(frame), &lhs).await?,
+        };
+        if let Some(rv) = bindings.get(rhs.trim()) {
+            // A bound name on the RIGHT: `status != newValue` — the field's own name reads the value the
+            // write is replacing, because the event arrives before the write lands.
+            return compare_resolved(conn, &lv, &op, &rv).await;
+        }
         // A non-literal right-hand side (`other.id`, `this.limit`) is resolved in the same frame and
         // compared value-to-value; literals keep their existing coercion path.
         match parse_lit(rhs.trim())? {
@@ -19952,7 +20174,10 @@ async fn eval_condition_leaf(
             rlit => compare_values(conn, &lv, &op, &rlit).await,
         }
     } else {
-        let v = resolve_expression(conn, Some(thread_id), Some(frame), leaf).await?;
+        let v = match bindings.get(leaf.trim()) {
+            Some(v) => v,
+            None => resolve_expression(conn, Some(thread_id), Some(frame), leaf).await?,
+        };
         match v.data {
             jdwp_client::types::ValueData::Boolean(b) => Ok(b),
             _ => Err("Condition did not evaluate to a boolean".to_string()),
@@ -20211,6 +20436,7 @@ mod tests {
         match t {
             BoolTree::Or(v) => format!("OR({})", v.iter().map(shape).collect::<Vec<_>>().join(", ")),
             BoolTree::And(v) => format!("AND({})", v.iter().map(shape).collect::<Vec<_>>().join(", ")),
+            BoolTree::Not(inner) => format!("NOT({})", shape(inner)),
             BoolTree::Leaf(s) => s.clone(),
         }
     }
@@ -20221,6 +20447,105 @@ mod tests {
         assert_eq!(shape(&parse_bool_tree("a == 1 && b == 2")), "AND(a == 1, b == 2)");
         assert_eq!(shape(&parse_bool_tree("a == 1 || b == 2")), "OR(a == 1, b == 2)");
         assert_eq!(shape(&parse_bool_tree("a == 1 || b == 2 && c == 3")), "OR(a == 1, AND(b == 2, c == 3))");
+    }
+
+    /// FILT-6 (#83): a bound head is rewritten to its handle, and **only** where it is genuinely a head.
+    ///
+    /// A substitution that fired one character too wide would corrupt a condition rather than fail it —
+    /// `exceptionCode == 1` becoming `@0x1fCode == 1` is a parse error about the wrong thing, and inside a
+    /// string literal it would silently change what the condition compares against.
+    #[test]
+    fn a_bound_head_is_rewritten_only_where_it_is_a_head() {
+        let heads = [("exception", 0x1f4c_u64), ("newValue", 0x7a_u64)];
+        assert_eq!(bind_object_heads("exception.cdException == 1", &heads), "@0x1f4c.cdException == 1");
+        assert_eq!(
+            bind_object_heads("a == 1 && exception.cd != 2", &heads),
+            "a == 1 && @0x1f4c.cd != 2",
+            "a head after an operator is still a head"
+        );
+        assert_eq!(bind_object_heads("(exception.cd)", &heads), "(@0x1f4c.cd)");
+        assert_eq!(bind_object_heads("!exception.paid", &heads), "!@0x1f4c.paid");
+        assert_eq!(bind_object_heads("newValue.getStatus() == \"X\"", &heads), "@0x7a.getStatus() == \"X\"");
+
+        // Not a head: part of a longer identifier, or a member of something else.
+        assert_eq!(
+            bind_object_heads("exceptionCode == 1", &heads),
+            "exceptionCode == 1",
+            "a field whose name merely STARTS with the reserved word is not the reserved word"
+        );
+        assert_eq!(
+            bind_object_heads("this.exception.cd == 1", &heads),
+            "this.exception.cd == 1",
+            "a member called `exception` reached through something else is that member, not the binding"
+        );
+        // Not followed by a `.`: nothing to chain, so the direct-value path handles it and no rewrite is
+        // wanted — a bare handle would be compared by identity instead.
+        assert_eq!(bind_object_heads("newValue > 100", &heads), "newValue > 100");
+        // Inside a string literal it is text.
+        assert_eq!(
+            bind_object_heads("msg == \"exception.cd\"", &heads),
+            "msg == \"exception.cd\"",
+            "a string literal containing the reserved word must be left alone"
+        );
+        // Nothing bound: unchanged, which is the line-stop case and must cost nothing.
+        assert_eq!(bind_object_heads("exception.cd == 1", &[]), "exception.cd == 1");
+    }
+
+    /// A binding is used directly when it is a whole comparison side, which is the only way a PRIMITIVE
+    /// can be used — it has no members to chain through.
+    #[test]
+    fn a_primitive_binding_is_reachable_and_an_absent_one_is_not() {
+        let v = value_int(500);
+        let bound = ConditionBindings { exception: None, new_value: Some(&v) };
+        assert!(matches!(
+            bound.get("newValue").map(|v| v.data),
+            Some(jdwp_client::types::ValueData::Int(500))
+        ));
+        assert!(bound.get("exception").is_none(), "an unbound name must not resolve to anything");
+        assert!(bound.get("oldValue").is_none(), "there is deliberately no oldValue — see the type's docs");
+        // A primitive is not an object head, so nothing is rewritten for it.
+        assert!(bound.object_heads().is_empty());
+
+        // An exception IS always an object, so it is always a rewritable head.
+        let exc = ConditionBindings { exception: Some(0x99), new_value: None };
+        assert_eq!(exc.object_heads(), vec![("exception", 0x99_u64)]);
+        // And nothing is bound by default, which is every line stop and every method-exit stop.
+        assert!(ConditionBindings::default().object_heads().is_empty());
+        assert!(ConditionBindings::default().get("exception").is_none());
+    }
+
+    /// FILT-6 (#83): `!` binds tighter than `&&`, which binds tighter than `||`.
+    ///
+    /// The precedence is the point of the test, not the existence of the node: `!a && b` meaning
+    /// `!(a && b)` would silently invert half of every condition it appeared in, which is the kind of wrong
+    /// answer nothing downstream can catch.
+    #[test]
+    fn negation_binds_tighter_than_and_which_binds_tighter_than_or() {
+        assert_eq!(shape(&parse_bool_tree("!flag")), "NOT(flag)");
+        assert_eq!(shape(&parse_bool_tree("!(a == b)")), "NOT(a == b)");
+        assert_eq!(
+            shape(&parse_bool_tree("!a && b")),
+            "AND(NOT(a), b)",
+            "`!a && b` is `(!a) && b`; reading it as `!(a && b)` would invert the whole condition"
+        );
+        assert_eq!(shape(&parse_bool_tree("a || !b && c")), "OR(a, AND(NOT(b), c))");
+        assert_eq!(shape(&parse_bool_tree("!(a && b)")), "NOT(AND(a, b))", "parens still regroup");
+        assert_eq!(shape(&parse_bool_tree("!!a")), "NOT(NOT(a))", "a double negation is not an error");
+        // Whitespace after the `!` is ordinary.
+        assert_eq!(shape(&parse_bool_tree("! flag")), "NOT(flag)");
+    }
+
+    /// The trap in the same character: `!=` must stay one operator.
+    ///
+    /// `cdException != ExceptionEnum.validarRegistro` is the condition the whole issue is about, so a `!`
+    /// check that fired on the `!` of a `!=` would break the motivating case rather than an edge one.
+    #[test]
+    fn a_not_equals_operator_is_never_read_as_a_negation() {
+        assert_eq!(shape(&parse_bool_tree("cdException != 42")), "cdException != 42");
+        assert_eq!(shape(&parse_bool_tree("!= 42")), "!= 42", "a leading `!=` is a leaf, not a negation");
+        // And the two composed: a negation OF a not-equals.
+        assert_eq!(shape(&parse_bool_tree("!(a != b)")), "NOT(a != b)");
+        assert_eq!(shape(&parse_bool_tree("!a != b")), "NOT(a != b)", "as Java parses it");
     }
 
     // Parentheses regroup, overriding the default precedence.
