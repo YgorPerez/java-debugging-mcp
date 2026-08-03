@@ -18003,10 +18003,12 @@ fn render_dump_header(
     a: &crate::args::ThreadDumpArgs,
     caps: Option<&jdwp_client::vm::VmCapabilities>,
     meta: &DumpMeta<'_>,
+    groups: &[Vec<usize>],
 ) -> String {
     let mut out =
         format!("🧵 Thread dump — {}/{} thread(s){}\n", rows.len(), meta.total, dump_filter_note(a));
     out.push_str(&family_order_note(rows.len(), meta.selection));
+    out.push_str(&dump_collapse_note(rows, groups, dump_shortfall(rows.len(), meta).0));
     if meta.already_suspended {
         out.push_str("   VM was already suspended — read as it is, and left suspended.\n");
     }
@@ -18245,6 +18247,209 @@ fn dump_monitor_caveats(
     out
 }
 
+/// How many thread ids a collapsed group names before it stops (DUMP-6).
+///
+/// Enough to pin a few for `debug.get_stack` or a per-thread read, not enough to put the 200 rows back
+/// that the grouping exists to remove.
+const GROUP_IDS_SHOWN: usize = 8;
+
+/// The identity of a collapsed dump entry — see [`dump_group_key`] for why each field is in it.
+#[derive(PartialEq, Eq, Hash)]
+struct DumpGroupKey {
+    status: &'static str,
+    suspended: bool,
+    finished: bool,
+    family: String,
+    frames: Vec<String>,
+    frames_hidden: usize,
+    waiting_on: Option<(String, u64)>,
+    holds: Vec<(String, u64)>,
+    monitor_note: Option<String>,
+}
+
+/// What makes two dump rows the same entry (DUMP-6, #88).
+///
+/// **The stack is not the whole key, and every other part is here because merging over it would destroy a
+/// fact.** `status`, `suspended` and `finished` are independent axes: a thread `running` at a site and one
+/// the debugger is holding there are different answers to "is this wedged". The name family is included so
+/// a group can be *labelled* — and so two different pools at one site stay two rows, which is what a reader
+/// wants, since *which* pool is exhausted is the diagnosis.
+///
+/// **The monitor state is part of the key rather than a reason to refuse grouping**, and that is the answer
+/// to "two threads with identical stacks can hold different locks". They can — and different locks are
+/// different object ids, so those threads land in different groups by construction and no rule is needed.
+/// What is left grouping is threads whose lock state is *identical*, and for those the
+/// `waiting to enter: L ← held by 0x2b "worker-2"` line is as true of the group as of any member.
+///
+/// The first cut excluded any monitor-bearing thread outright, and it was wrong in exactly the case this
+/// feature exists for: a pool parked on one gate is reported by JDWP as N threads contending the **same**
+/// object, so the exclusion suppressed the collapse that was wanted. Caught by the integration test rather
+/// than by reasoning, which is why that test dumps a real pool instead of asserting on constructed rows.
+fn dump_group_key(r: &DumpRow) -> Option<DumpGroupKey> {
+    // Only a real, non-empty stack is groupable. `Unreadable` carries a per-thread reason and `Omitted`
+    // means no stacks were read at all — collapsing either would merge distinct facts, and collapsing
+    // `Omitted` would fold a whole monitors-only dump into one entry.
+    let DumpStack::Frames(frames) = &r.stack else { return None };
+    if frames.is_empty() {
+        return None;
+    }
+    Some(DumpGroupKey {
+        status: r.status,
+        suspended: r.suspended,
+        finished: r.finished,
+        family: thread_name_family(&r.name),
+        frames: frames.clone(),
+        frames_hidden: r.frames_hidden,
+        waiting_on: r.waiting_on.clone(),
+        holds: r.holds.clone(),
+        monitor_note: r.monitor_note.clone(),
+    })
+}
+
+/// Row indices grouped by [`dump_group_key`], each group in the order its first member appeared.
+///
+/// First-appearance order keeps ADR-0013's promise that rows are presented in creation order: a group sits
+/// where its earliest thread sat. Rows that cannot be grouped come back as singletons, so a dump in which
+/// every stack is distinct renders **byte-for-byte** what it did before DUMP-6 — which is the property that
+/// keeps this a presentation change rather than a new reply shape.
+///
+/// Takes `&[DumpRow]` and no connection, which is the structural reason grouping cannot add a round trip.
+fn dump_groups(rows: &[DumpRow]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut seen: std::collections::HashMap<DumpGroupKey, usize> = std::collections::HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        let Some(key) = dump_group_key(r) else {
+            groups.push(vec![i]);
+            continue;
+        };
+        if let Some(existing) = seen.get(&key).and_then(|at| groups.get_mut(*at)) {
+            existing.push(i);
+        } else {
+            seen.insert(key, groups.len());
+            groups.push(vec![i]);
+        }
+    }
+    groups
+}
+
+/// The two reasons a dump is shorter than the JVM, split: `(withheld, vanished)`.
+///
+/// One function because the collapse note and the two footers have to agree about it — and because they
+/// were able to disagree: advising `raise limit` on a dump whose limit never bound is a no-op offered as a
+/// remedy, which is exactly what `rows_lost_to_dying_threads_are_reported_apart_from_rows_the_limit_withheld`
+/// exists to catch. It caught it here.
+fn dump_shortfall(rows_shown: usize, meta: &DumpMeta<'_>) -> (usize, usize) {
+    let hidden = meta.total.saturating_sub(rows_shown);
+    let vanished = meta.vanished.min(hidden);
+    (hidden - vanished, vanished)
+}
+
+/// The header note for a dump that collapsed anything, or empty.
+///
+/// It has to separate collapsed from the three shortfalls the reply already distinguishes — omitted,
+/// budget-truncated and vanished — because all four make a dump look smaller than the JVM and only three
+/// of them mean something is missing. And it has to say what a group's count is a count **of**: the
+/// threads this dump READ. Whether the withheld ones share the stack is not known and cannot be, since
+/// selection happens before any stack is fetched (ADR-0013).
+fn dump_collapse_note(rows: &[DumpRow], groups: &[Vec<usize>], withheld: usize) -> String {
+    let collapsed_groups = groups.iter().filter(|g| g.len() > 1).count();
+    if collapsed_groups == 0 {
+        return String::new();
+    }
+    let collapsed_threads: usize = groups.iter().filter(|g| g.len() > 1).map(Vec::len).sum();
+    format!(
+        "   🧬 {collapsed_threads} of the {} thread(s) below share a stack and are shown as \
+         {collapsed_groups} collapsed entry/entries (×N) — a pool parked at one site is ONE fact, not N \
+         rows.\n      COLLAPSED IS NOT OMITTED, TRUNCATED OR VANISHED: every thread in a group was read \
+         and is counted in the total above. A group's count is over the threads this dump READ, so if a \
+         footer below says more were withheld, whether THOSE share the stack is unknown.{}\n      Threads holding or waiting on a monitor are never collapsed: a lock is a \
+         per-thread fact, and the `held by` correlation is what a deadlock investigation reads.\n",
+        rows.len(),
+        // Only when the limit actually bound. Advising a caller to raise a `limit` of 500 that never came
+        // near the thread count is a no-op dressed as a remedy.
+        if withheld > 0 {
+            " Raise limit to find out."
+        } else {
+            " Nothing was withheld here, so every thread the JVM listed is accounted for above."
+        },
+    )
+}
+
+/// One collapsed group's block: the count, the family, the ids, then the shared stack once.
+fn render_dump_group(
+    out: &mut String,
+    rows: &[DumpRow],
+    group: &[usize],
+    holder: &std::collections::HashMap<u64, (u64, &str)>,
+) {
+    // A group of one IS a thread, and renders exactly as it always has.
+    let Some(r) = group.first().and_then(|i| rows.get(*i)) else { return };
+    if group.len() == 1 {
+        render_dump_row(out, r, holder);
+        return;
+    }
+    let _ = write!(
+        out,
+        "\n×{} \"{}\" [{}]{} — {} thread(s) with an IDENTICAL stack\n",
+        group.len(),
+        thread_name_family(&r.name),
+        r.status,
+        if r.suspended { " debugger-suspended" } else { "" },
+        group.len(),
+    );
+    // The monitor state is part of the group's key, so these lines are as true of the group as of any
+    // member — including the `held by` correlation, which is what a deadlock investigation reads.
+    render_dump_monitors(out, r, holder);
+    let ids: Vec<String> = group
+        .iter()
+        .take(GROUP_IDS_SHOWN)
+        .filter_map(|i| rows.get(*i))
+        .map(|r| format!("0x{:x}", r.id))
+        .collect();
+    let _ = writeln!(
+        out,
+        "   ids: {}{}",
+        ids.join(", "),
+        if group.len() > GROUP_IDS_SHOWN {
+            format!(" … +{} more", group.len() - GROUP_IDS_SHOWN)
+        } else {
+            String::new()
+        },
+    );
+    // The stack, once. Grouping only ever holds `DumpStack::Frames`, non-empty — see `dump_group_key`.
+    if let DumpStack::Frames(frames) = &r.stack {
+        for f in frames {
+            let _ = writeln!(out, "   {f}");
+        }
+    }
+    if r.frames_hidden > 0 {
+        let _ = writeln!(out, "   … {} frame(s) hidden", r.frames_hidden);
+    }
+}
+
+/// The lock lines of one dump entry: what it is blocked entering, what it holds, and any read failure.
+///
+/// Shared by the per-thread row and a collapsed group (DUMP-6), which is sound because the monitor state is
+/// part of what makes a group a group — see [`dump_group_key`]. Threads whose lock state differs are never
+/// in one group, so these lines never speak for a thread they are not true of.
+fn render_dump_monitors(out: &mut String, r: &DumpRow, holder: &std::collections::HashMap<u64, (u64, &str)>) {
+    if let Some((label, oid)) = &r.waiting_on {
+        // The holder is looked up among the rows actually dumped, so a lock held by a thread that was
+        // filtered out or fell past `limit` is shown WITHOUT a holder rather than with a wrong one.
+        let by = holder
+            .get(oid)
+            .map_or_else(String::new, |(htid, hname)| format!(" ← held by 0x{htid:x} \"{hname}\""));
+        let _ = writeln!(out, "   waiting to enter: {label}{by}");
+    }
+    if !r.holds.is_empty() {
+        let labels: Vec<&str> = r.holds.iter().map(|(l, _)| l.as_str()).collect();
+        let _ = writeln!(out, "   holds: {}", labels.join(", "));
+    }
+    if let Some(n) = &r.monitor_note {
+        let _ = writeln!(out, "   ⚠️  {n}");
+    }
+}
+
 /// One thread's block: header, lock lines, then frames (or why there are none).
 ///
 /// The header keeps the two states **visually apart**, because they are independent axes and reading them
@@ -18261,21 +18466,7 @@ fn render_dump_row(out: &mut String, r: &DumpRow, holder: &std::collections::Has
         r.status,
         if r.suspended { " debugger-suspended" } else { "" }
     );
-    if let Some((label, oid)) = &r.waiting_on {
-        // The holder is looked up among the rows actually dumped, so a lock held by a thread that was
-        // filtered out or fell past `limit` is shown WITHOUT a holder rather than with a wrong one.
-        let by = holder
-            .get(oid)
-            .map_or_else(String::new, |(htid, hname)| format!(" ← held by 0x{htid:x} \"{hname}\""));
-        let _ = writeln!(out, "   waiting to enter: {label}{by}");
-    }
-    if !r.holds.is_empty() {
-        let labels: Vec<&str> = r.holds.iter().map(|(l, _)| l.as_str()).collect();
-        let _ = writeln!(out, "   holds: {}", labels.join(", "));
-    }
-    if let Some(n) = &r.monitor_note {
-        let _ = writeln!(out, "   ⚠️  {n}");
-    }
+    render_dump_monitors(out, r, holder);
     match &r.stack {
         DumpStack::Frames(frames) if frames.is_empty() => out.push_str("   (no frames)\n"),
         DumpStack::Frames(frames) => {
@@ -18316,9 +18507,11 @@ fn render_thread_dump(
         }
     }
 
-    let mut out = render_dump_header(rows, a, caps, meta);
-    for r in rows {
-        render_dump_row(&mut out, r, &holder);
+    // DUMP-6 (#88): computed before the header, which has to state what was collapsed.
+    let groups = dump_groups(rows);
+    let mut out = render_dump_header(rows, a, caps, meta, &groups);
+    for g in &groups {
+        render_dump_group(&mut out, rows, g, &holder);
     }
 
     // Every thread the JVM listed and this reply did not show, split by WHY (DUMP-4, #47).
@@ -18331,9 +18524,7 @@ fn render_thread_dump(
     // for the same reason; this is the third cause finally getting its own voice.
     //
     // The two counts still sum to the shortfall, so the arithmetic a caller checks is unchanged.
-    let hidden = meta.total.saturating_sub(rows.len());
-    let vanished = meta.vanished.min(hidden);
-    let withheld = hidden - vanished;
+    let (withheld, vanished) = dump_shortfall(rows.len(), meta);
     if withheld > 0 {
         let _ = writeln!(
             out,
@@ -21108,6 +21299,181 @@ mod tests {
         let (kept, note) = clamp_trace_exprs(asked.clone());
         assert_eq!(kept, asked);
         assert!(note.is_none(), "no clamp, so no note: {note:?}");
+    }
+
+    // ---- DUMP-6 (#88): identical stacks are one entry ----
+    //
+    // 200 threads parked in `socketRead0` beneath one call site is one fact, not 200 rows — and at the
+    // default limit of 40 the dump truncated before a reader could see that the rest matched. Grouping is
+    // PRESENTATION over the rows already collected: it takes `&[DumpRow]` and no connection, which is the
+    // structural reason it cannot add a round trip.
+
+    /// `n` rows in one family, all at the same site.
+    fn pool_rows(n: u64) -> Vec<DumpRow> {
+        (0..n).map(|i| dump_row(i, &format!("default task-{i}"))).collect()
+    }
+
+    #[test]
+    fn identical_stacks_in_one_family_collapse_to_a_single_entry() {
+        let rows = pool_rows(40);
+        let groups = dump_groups(&rows);
+
+        assert_eq!(groups.len(), 1, "40 identical stacks are one entry: {groups:?}");
+        assert_eq!(groups[0].len(), 40);
+    }
+
+    // The complement, and the one that keeps grouping honest: a dump whose stacks all differ must render
+    // byte-for-byte what it did before DUMP-6, which is ADR-0013's stability promise.
+    #[test]
+    fn threads_at_genuinely_different_sites_stay_separate() {
+        let mut rows = pool_rows(3);
+        rows[1].stack = DumpStack::Frames(vec!["#0 Other.run:4".to_string()]);
+        rows[2].stack = DumpStack::Frames(vec!["#0 Svc.save:10".to_string(), "#1 Svc.call:3".to_string()]);
+
+        let groups = dump_groups(&rows);
+        assert_eq!(groups.len(), 3, "three different stacks are three entries: {groups:?}");
+        assert!(groups.iter().all(|g| g.len() == 1));
+        // And nothing is announced, so the reply is unchanged.
+        assert_eq!(dump_collapse_note(&rows, &groups, 0), "");
+    }
+
+    // Two pools at one site stay two rows. Which pool is exhausted IS the diagnosis, so merging them would
+    // throw away the answer while looking tidier.
+    #[test]
+    fn two_name_families_at_the_same_site_are_two_entries() {
+        let mut rows = pool_rows(4);
+        rows[2].name = "http-nio-8080-exec-2".to_string();
+        rows[3].name = "http-nio-8080-exec-9".to_string();
+
+        let groups = dump_groups(&rows);
+        assert_eq!(groups.len(), 2, "one entry per family: {groups:?}");
+        assert!(groups.iter().all(|g| g.len() == 2));
+    }
+
+    // Independent axes. A thread `running` at a site and one the debugger is holding there are different
+    // answers to "is this wedged", so they are not one row.
+    #[test]
+    fn a_different_status_or_suspension_is_a_different_entry() {
+        let mut rows = pool_rows(3);
+        rows[1].status = "running";
+        rows[2].suspended = false;
+
+        assert_eq!(dump_groups(&rows).len(), 3);
+    }
+
+    // The monitor rule, both halves. "Two threads with identical stacks can hold different locks" is true
+    // and needs no exclusion: different locks are different object ids, so those threads key apart.
+    #[test]
+    fn threads_whose_lock_state_differs_are_never_one_entry() {
+        let mut rows = pool_rows(4);
+        rows[1].holds = vec![("Object@0x5".to_string(), 5)];
+        rows[2].waiting_on = Some(("Object@0x9".to_string(), 9));
+        rows[3].monitor_note = Some("monitors unreadable on this thread".to_string());
+
+        let groups = dump_groups(&rows);
+        assert_eq!(groups.len(), 4, "four different lock states are four entries: {groups:?}");
+    }
+
+    // The other half, and the case the feature exists for: a pool parked on ONE gate is reported by JDWP as
+    // N threads contending the SAME object, so identical lock state must still collapse. The first cut
+    // excluded any monitor-bearing thread and suppressed exactly this.
+    #[test]
+    fn a_pool_contending_one_shared_gate_still_collapses() {
+        let mut rows = pool_rows(30);
+        for r in &mut rows {
+            r.status = "wait";
+            r.waiting_on = Some(("java.lang.Object@53".to_string(), 53));
+        }
+
+        let groups = dump_groups(&rows);
+        assert_eq!(groups.len(), 1, "one gate, one entry: {groups:?}");
+        assert_eq!(groups[0].len(), 30);
+    }
+
+    // And the group states the lock once, with the correlation a deadlock investigation reads.
+    #[test]
+    fn a_collapsed_entry_states_the_shared_lock_and_who_holds_it() {
+        let mut rows = pool_rows(5);
+        for r in &mut rows {
+            r.waiting_on = Some(("java.lang.Object@53".to_string(), 53));
+        }
+        let mut holder = std::collections::HashMap::new();
+        holder.insert(53u64, (0x2bu64, "owner-1"));
+
+        let groups = dump_groups(&rows);
+        let mut out = String::new();
+        render_dump_group(&mut out, &rows, &groups[0], &holder);
+
+        assert_eq!(
+            out.matches("waiting to enter: java.lang.Object@53").count(),
+            1,
+            "stated once for the group:\n{out}"
+        );
+        assert!(out.contains("← held by 0x2b \"owner-1\""), "the correlation survives grouping:\n{out}");
+    }
+
+    // `Unreadable` carries a per-thread reason and `Omitted` means no stacks were read at all — folding
+    // either would merge distinct facts, and folding `Omitted` would collapse a whole monitors-only dump
+    // into one entry.
+    #[test]
+    fn unreadable_and_omitted_stacks_are_never_grouped() {
+        let mut rows = pool_rows(4);
+        rows[0].stack = DumpStack::Unreadable("thread is running".to_string());
+        rows[1].stack = DumpStack::Unreadable("thread is running".to_string());
+        rows[2].stack = DumpStack::Omitted;
+        rows[3].stack = DumpStack::Omitted;
+
+        assert_eq!(dump_groups(&rows).len(), 4);
+        // An empty stack is a real answer too, and not one worth collapsing.
+        let empty = vec![
+            DumpRow { stack: DumpStack::Frames(Vec::new()), ..dump_row(1, "a-1") },
+            DumpRow { stack: DumpStack::Frames(Vec::new()), ..dump_row(2, "a-2") },
+        ];
+        assert_eq!(dump_groups(&empty).len(), 2);
+    }
+
+    #[test]
+    fn a_collapsed_entry_names_the_count_the_family_and_some_ids() {
+        let rows = pool_rows(40);
+        let groups = dump_groups(&rows);
+        let mut out = String::new();
+        render_dump_group(&mut out, &rows, &groups[0], &std::collections::HashMap::new());
+
+        assert!(out.contains("×40 \"default task-#\""), "count and family in the header:\n{out}");
+        assert!(out.contains("IDENTICAL stack"), "{out}");
+        assert!(out.contains("ids: 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7 … +32 more"), "{out}");
+        assert_eq!(out.matches("#0 Svc.save:10").count(), 1, "the stack is printed ONCE:\n{out}");
+    }
+
+    // A group of one is a thread, and renders exactly as a thread always has — the property that makes this
+    // a presentation change rather than a new reply shape.
+    #[test]
+    fn a_group_of_one_renders_identically_to_an_ungrouped_row() {
+        let rows = pool_rows(1);
+        let (mut grouped, mut plain) = (String::new(), String::new());
+        render_dump_group(&mut grouped, &rows, &[0], &std::collections::HashMap::new());
+        render_dump_row(&mut plain, &rows[0], &std::collections::HashMap::new());
+
+        assert_eq!(grouped, plain);
+    }
+
+    // Four ways a dump can be shorter than the JVM and only three of them mean something is missing.
+    #[test]
+    fn the_collapse_note_separates_collapsed_from_withheld_and_advises_only_what_helps() {
+        let rows = pool_rows(40);
+        let groups = dump_groups(&rows);
+
+        let truncated = dump_collapse_note(&rows, &groups, 160);
+        assert!(truncated.contains("40 of the 40 thread(s) below share a stack"), "{truncated}");
+        assert!(truncated.contains("NOT OMITTED, TRUNCATED OR VANISHED"), "{truncated}");
+        assert!(truncated.contains("Raise limit to find out"), "the limit bound, so say so:\n{truncated}");
+        assert!(truncated.contains("monitor are never collapsed"), "{truncated}");
+
+        // Nothing withheld: advising `raise limit` would be a no-op dressed as a remedy, which is what
+        // `rows_lost_to_dying_threads_…` catches. It caught exactly this during development.
+        let whole = dump_collapse_note(&rows, &groups, 0);
+        assert!(!whole.contains("Raise limit"), "must not advise a limit that never bound:\n{whole}");
+        assert!(whole.contains("every thread the JVM listed is accounted for"), "{whole}");
     }
 
     // DISC-9: the byte-level difference has to be actionable, and a length change must not read as

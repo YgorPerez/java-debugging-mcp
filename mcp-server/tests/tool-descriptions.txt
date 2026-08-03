@@ -871,8 +871,20 @@ suspended, how many milliseconds it held the VM — bounded by max_suspend_ms (d
 loudly rather than silently and tells you what finishing would have cost at the rate it was running. Those
 figures are measured against the JVM you are attached to, so you never have to judge whether a number measured
 elsewhere applies: a dump of a 306-thread pool with 60-frame stacks costs ~258 packets and ~65ms at the
-defaults, or ~1,625 packets and ~700ms for every thread and every frame. Works in a read-only session (it
-invokes nothing).
+defaults, or ~1,625 packets and ~700ms for every thread and every frame. THREADS WITH AN IDENTICAL STACK
+COLLAPSE INTO ONE ENTRY WITH A COUNT — `×40 "default task-#" [monitor] — 40 thread(s) with an IDENTICAL
+stack`, followed by the ids and the stack ONCE. A pool of 200 parked in socketRead0 beneath one call site is
+one fact, and printing it 200 times used to spend the whole limit hiding it. Two threads are one entry only
+when their name family, status, debugger-suspension, frame list AND lock state all match, so two pools at the
+same site stay two rows (which one is exhausted is the diagnosis) and threads holding or waiting on DIFFERENT
+locks never merge — different locks are different object ids. A collapsed entry states its shared lock once,
+keeping the `← held by` correlation a deadlock investigation reads. COLLAPSED IS NOT OMITTED, TRUNCATED OR
+VANISHED, and the reply keeps all four apart: every thread in a group was read and is counted in the header's
+total, and it costs NO extra packets because grouping happens over rows already collected. But a group's count
+is over the threads this dump READ — selection happens before any stack is fetched, so if the footer says
+threads were withheld, whether THEY share the stack is unknown and only a larger limit can settle it. A dump
+whose stacks are all distinct is byte-for-byte what it was before this existed. Works in a read-only session
+(it invokes nothing).
 
 ## debug.toggle_stop_point
 Silence or re-arm a line breakpoint (bp_…), or a whole wildcard family (bpset_…, which toggles every member

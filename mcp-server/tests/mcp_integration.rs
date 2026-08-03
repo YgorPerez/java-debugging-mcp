@@ -8544,6 +8544,118 @@ fn bytecode_comparison_does_not_cry_stale_on_the_running_build() {
     );
 }
 
+/// DUMP-6 (#88): a pool parked at one site is ONE entry with a count, not N rows.
+///
+/// Pool exhaustion with zero log output is the highest single-incident cost in the target stack — neither
+/// payment service sets any HTTP timeout, all 15 `ClientBuilder.newClient()` sites use Jersey's infinite
+/// defaults, `client.close()` appears zero times — and `thread_dump` is the only instrument that can
+/// explain it. 200 threads in `socketRead0` beneath one call site is one fact, and printing it 200 times
+/// spent the limit hiding the finding.
+///
+/// `ManyThreadsProbe` parks 60 workers three frames deep at one `GATE.wait()`, all named `worker-N`, so
+/// they are one name family with one identical stack — exactly the shape.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_pool_parked_at_one_site_collapses_into_one_counted_entry() {
+    let Some(jdk) = jdk_or_skip("a_pool_parked_at_one_site_collapses_into_one_counted_entry") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "ManyThreadsProbe").expect("launch ManyThreadsProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+    let base = highest_tick(&probe).expect("no tick to count from");
+
+    // Room for the whole JVM, and the budget out of the way, so this test is about the grouping and not
+    // about either of the truncations.
+    let dump = server.call(
+        "debug.thread_dump",
+        serde_json::json!({"suspend": true, "limit": 200, "max_suspend_ms": 120_000}),
+    );
+
+    assert!(
+        dump.contains("×60 \"worker-#\""),
+        "60 identical stacks must be one counted entry, not 60 rows:\n{}",
+        head_of(&dump)
+    );
+    assert_contains_all(
+        "the entry says what it is and which threads it stands for",
+        &dump,
+        &["IDENTICAL stack", "ids: 0x"],
+    );
+    assert_contains_all(
+        "and collapsed is kept apart from the three shortfalls that mean something IS missing",
+        &dump,
+        &["NOT OMITTED, TRUNCATED OR VANISHED", "monitor are never collapsed"],
+    );
+
+    // Criterion 2: `main` is at a different site and keeps its own row. Grouping must not merge the JVM.
+    assert!(dump.contains("\"main\""), "threads at other sites stay separate:\n{}", head_of(&dump));
+
+    // The stack is printed once for the group rather than 60 times, which is the whole saving.
+    assert_eq!(
+        dump.matches("ManyThreadsProbe.level3").count(),
+        1,
+        "the shared stack must appear exactly once:\n{}",
+        head_of(&dump)
+    );
+
+    // Criterion 3, as a packet count rather than a duration. Grouping is presentation over rows already
+    // collected — `dump_groups` takes `&[DumpRow]` and no connection, so it cannot send anything — and the
+    // observable form of that is the same per-thread bound an ungrouped dump has to meet.
+    let (read, total) = dump_thread_counts(&dump).expect("no thread count in the dump header");
+    let packets = dump_packet_cost(&dump).expect("no packet cost in the dump");
+    assert!(read >= 60, "expected the whole pool, got {read}/{total}:\n{}", head_of(&dump));
+    let per_thread = packets / read;
+    assert!(
+        per_thread <= 20,
+        "a grouped dump cost {per_thread} packets per thread ({packets} for {read} threads) — grouping \
+         must add no round trips, and the bound is the one an ungrouped dump already meets"
+    );
+
+    // ADR-0003: the VM really was released, which only the probe's own output can show.
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
+        "the probe stopped ticking after a grouped dump — it was not resumed\n  output: {:?}",
+        probe.output(),
+    );
+}
+
+/// A group's count is over the threads the dump **read**, and the reply has to say so.
+///
+/// Selection happens before any stack is fetched (ADR-0013), so whether the threads the limit withheld
+/// share the stack is not knowable without reading them — which is the cost grouping is not allowed to
+/// add. Saying "×40" while 20 more sit unread would be a count that reads as a population.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_truncated_grouped_dump_says_its_count_is_over_what_it_read() {
+    let Some(jdk) = jdk_or_skip("a_truncated_grouped_dump_says_its_count_is_over_what_it_read") else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "ManyThreadsProbe").expect("launch ManyThreadsProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    // The default limit against 60 workers plus the JVM's own threads: the limit binds.
+    let dump =
+        server.call("debug.thread_dump", serde_json::json!({"suspend": true, "max_suspend_ms": 120_000}));
+
+    let (read, total) = dump_thread_counts(&dump).expect("no thread count in the dump header");
+    assert!(read < total, "this test needs the limit to bind, got {read}/{total}:\n{}", head_of(&dump));
+    assert!(dump.contains('×'), "the workers it did read must still collapse:\n{}", head_of(&dump));
+    assert_contains_all(
+        "the count is scoped to what was read, and the way to widen it is named",
+        &dump,
+        &["over the threads this dump READ", "whether THOSE share the stack is unknown", "Raise limit"],
+    );
+    assert!(
+        dump.contains("more thread(s) (raise limit"),
+        "the withheld footer is still its own separate fact:\n{}",
+        head_of(&dump)
+    );
+}
+
 /// TRACE-11 (#93): two expressions on one traced stop point, so a **disagreement** is one snapshot.
 ///
 /// The issue's own case: the schema a thread is really serving lives in a static `ThreadLocal` whose unset

@@ -201,6 +201,57 @@ withdraw.
 VM frozen while it decides. A listing freezes nothing; the only thing it spends is the caller's own
 latency, linear in a thread count the reply states.
 
+## Amendment (DUMP-6, [#88](https://github.com/YgorPerez/java-debugging-mcp/issues/88)) — grouping composes *downstream* of this decision, and does not change what "fair" means
+
+`debug.thread_dump` now collapses threads with an identical stack into one entry carrying a count. #88 asked
+for a statement of how that composes with the round-robin rather than a change that quietly undoes it, and
+the answer is that the two do not overlap at all:
+
+**Selection is unchanged. Grouping is presentation.** The round-robin decides *which threads to read*, from
+the name and status alone, before a single stack is fetched. Grouping runs afterwards over the rows already
+collected — `dump_groups` takes `&[DumpRow]` and no connection, which is the structural reason it cannot add
+a round trip. `limit` remains a **thread** budget, the header's `N/M` is unchanged, and the shortfall
+arithmetic a caller checks is untouched.
+
+**So a group's count is a count of what was READ, and the reply says so.** That is the honest limit of the
+feature, and it follows directly from step 1 above: whether the threads `limit` withheld share the stack
+cannot be known without reading them, and reading them is the cost grouping is not allowed to add. #88's
+brief asked both for "one group with a count of N rather than truncating at the limit" and for "the packet
+count for a grouped dump is no higher than for an ungrouped one", and those cannot both hold. **The packet
+criterion won**, on the maintainer's call: 40 identical stacks become one entry reading `×40`, the footer
+still reports the threads it withheld, and the collapse note states that whether those match is unknown and
+names raising `limit` as the way to find out — but only when the limit actually bound, because advising a
+`limit` of 500 that never came near the thread count is a no-op dressed as a remedy. `rows_lost_to_dying_…`
+caught that during development, which is the same test that caught the original version of the mistake.
+
+The alternative — making `limit` a *group* budget, reading on until N distinct stacks are found — was
+rejected for the reason this ADR rejects "raise the default limit": it spends an unbounded amount to answer
+a question the caller has not asked yet, and here it spends it **inside `max_suspend_ms`, on a frozen VM**.
+
+**Fairness is unaffected, and gains from it.** Round-robin exists so no single pool can spend every slot.
+Grouping makes each slot a pool *actually spends* cost one line instead of forty, so the rows a fair
+selection produces are readable in the case that motivated both decisions: the 13 wedged `default task-#`
+threads a creation-ordered dump never reached are, once reached, one entry rather than thirteen.
+
+**The four ways a dump can be shorter than the JVM are kept apart**, which is the obligation DUMP-4 (#47)
+took on: `collapsed` (nothing missing), `withheld` by the limit, `unread` because the budget ran out, and
+`vanished` because the threads died mid-read. Only the first is not a shortfall, and it is the one most
+likely to be misread as one.
+
+**Monitors are part of a group's identity rather than a reason to refuse grouping, and the first cut had this
+backwards.** #88 asks what a collapsed group shows for monitors, "since two threads with identical stacks can
+hold different locks". They can — and different locks are different object ids, so those threads key apart
+with no rule needed. Excluding every monitor-bearing thread instead, which is what was written first,
+suppressed exactly the collapse the feature exists for: a pool parked on one gate is reported by JDWP as N
+threads contending the **same** object, so all 60 of `ManyThreadsProbe`'s workers were excluded and the dump
+printed 60 rows anyway. The integration test caught it; reasoning had not, and that is why the test dumps a
+real pool instead of asserting over constructed rows. A group therefore states its shared lock once, `← held
+by` correlation included.
+
+**A dump whose stacks are all distinct is byte-for-byte what it was before**, which keeps this ADR's
+"select fairly, present stably" promise intact: a group of one renders exactly as a thread always did, and
+groups sit at the position of their earliest member, so presentation is still creation order.
+
 ### Rejected here, though the issue allowed it
 
 **Keeping creation order and merely saying the list is not representative.** #51 offered this outcome
