@@ -767,6 +767,13 @@ pub struct SourceArgs {
     /// what the JVM knows.
     #[serde(default)]
     pub source_roots: Option<Vec<String>>,
+    /// Build-output directories, replacing the session's (`debug.attach`, `JDWP_CLASS_ROOTS`), used
+    /// only to check the source window against the bytecode the JVM loaded (DISC-11). Configuring
+    /// them is what enables that check, and it costs one `Method.LineTable` per method of the class;
+    /// pass `[]` to skip it. Nothing is compared without them, and the reply says so rather than
+    /// implying the source matches.
+    #[serde(default)]
+    pub class_roots: Option<Vec<String>>,
 }
 
 /// Arguments for `debug.thread_dump` (DUMP-1).

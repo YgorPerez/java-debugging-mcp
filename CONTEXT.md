@@ -127,6 +127,18 @@ because the remedies differ — one means you are reading the wrong file, the ot
 last week's compile, and only the second is fixable with `debug.reload_class`.
 _Avoid_: "out of date", which does not say which side is behind.
 
+**Unbuilt source**:
+The `.java` on disk being ahead of the `.class` compiled from it — the third position in the chain, and the
+one neither term above reaches. Source drift is *wrong file*; stale bytecode is *the JVM is behind the
+build*; this is *the build is behind the editor*, so you are reading a statement nothing has compiled yet.
+Measured rather than hypothetical: in the target environment the class roots are byte-identical to the
+deployed jars and 2–3 commits behind `src/main/java`, so both checks above report clean while
+`debug.source` renders a later version of the method being debugged (DISC-11, ADR-0029). Two evidences
+reach it and they are of unequal strength — a source file too *short* to hold a line the compiler emitted
+an entry for is a proof, an mtime newer than the `.class` is only a hint, because a checkout moves an mtime
+without changing a byte.
+_Avoid_: "stale source", which inverts which side is behind — the source is the *newest* thing in the chain.
+
 **Class root**:
 Where the package tree starts in the **build output** (`target/classes`), as against a **source root**
 (`src/main/java`), which is where it starts in the sources. A compiled class is looked for at

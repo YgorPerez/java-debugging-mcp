@@ -673,12 +673,26 @@ is looked up at <root>/<package as directories>/<the name the JVM reported>, whi
 (com.example.Order$Line) correctly resolves to its enclosing Order.java. Plain directories only — sources
 inside JARs are not read. The failure modes stay distinct: class not loaded, loaded but compiled with no
 SourceFile attribute (javac -g:none, or a synthetic class), no configured root holds the file, and
-found-but-unreadable each say something different about what to fix. A CLASS NAME CAN RESOLVE TO SEVERAL
-COPIES: if more than one classloader has loaded it, this reads the first and appends a caveat naming every
-copy, because each has its own statics and answering confidently from whichever sorted first is a wrong answer
-rather than one of two readings. Pin a specific copy by suffixing the loader id it printed, as in
-com.example.Utils@0x7f3a1c. A selector that matches nothing is refused rather than quietly answered from
-another copy.
+found-but-unreadable each say something different about what to fix. THE WINDOW IS CHECKED AGAINST THE RUNNING
+BYTECODE WHENEVER A CLASS ROOT IS CONFIGURED (debug.attach {class_roots:[...]}, JDWP_CLASS_ROOTS, or
+class_roots on the call), because source read off disk is confidently wrong in a way nothing else in the reply
+would show: the case this was measured against is a class root byte-identical to the deployed jar and two
+commits BEHIND src/main/java, so the statement you are shown is a later version of the one that is running,
+and the enum or registry you are reading has entries the JVM has never heard of. TWO INDEPENDENT AXES,
+REPORTED SEPARATELY because they have different remedies — the JVM's line tables against your compiled .class
+(fix by redeploying, or debug.reload_class to install it; debug.check_stale has the per-method detail), and
+your .class against the .java being displayed (fix by recompiling). On the second axis a source file too SHORT
+to hold a line the compiler emitted a table entry for is a PROOF, while a .java whose mtime is newer than the
+.class is only a TIMESTAMP and is said as one, because a checkout moves an mtime without changing a byte. A
+build that matches adds NOTHING to the reply. With no class root nothing is compared and the reply says THAT,
+which is not the same as saying it passed. The check costs one Method.LineTable per method of the class, which
+is why a configured class root is what turns it on; pass class_roots:[] to skip it. A translated class
+(JSR-45) gets no length check, because its line numbers are positions in the .jsp rather than in the file on
+disk. A CLASS NAME CAN RESOLVE TO SEVERAL COPIES: if more than one classloader has loaded it, this reads the
+first and appends a caveat naming every copy, because each has its own statics and answering confidently from
+whichever sorted first is a wrong answer rather than one of two readings. Pin a specific copy by suffixing the
+loader id it printed, as in com.example.Utils@0x7f3a1c. A selector that matches nothing is refused rather than
+quietly answered from another copy.
 
 ## debug.step_into
 Stop at the FIRST LINE OF THE METHOD the current line calls — how you get inside a call whose behaviour is the

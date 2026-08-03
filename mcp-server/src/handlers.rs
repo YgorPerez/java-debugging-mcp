@@ -1666,6 +1666,31 @@ impl RequestHandler {
             || session.source_roots.clone(),
             |v| v.iter().map(std::path::PathBuf::from).collect(),
         );
+        let class_roots: Vec<std::path::PathBuf> = a.class_roots.as_ref().map_or_else(
+            || session.class_roots.clone(),
+            |v| v.iter().map(std::path::PathBuf::from).collect(),
+        );
+
+        // Both halves happen before the session is released, because DISC-11's check needs the file that
+        // was actually printed AND the JVM's line tables. Resolving the file again afterwards is how the
+        // two would come to describe different files — see [`LocalSource`].
+        let local = local_source_section(&class_name, &file_name, &roots, &a);
+        let freshness = if let Some(read) = &local.read {
+            source_freshness_section(
+                &mut session.connection,
+                &class_name,
+                type_id,
+                &class_roots,
+                read,
+                smap.is_some(),
+            )
+            .await
+        } else {
+            // No file was read, so there is nothing here to be stale about. Each of the five ways that
+            // happens already explains itself, and a freshness note on top would be answering a
+            // question the caller has not got as far as asking.
+            String::new()
+        };
         drop(session);
 
         let mut output = format!("{class_name} — compiled from {file_name} (reported by the JVM)\n");
@@ -1677,7 +1702,8 @@ impl RequestHandler {
                 truncate(s.trim_end(), 800)
             );
         }
-        output.push_str(&local_source_section(&class_name, &file_name, &roots, &a));
+        output.push_str(&local.section);
+        output.push_str(&freshness);
         Ok(output + loader_note.as_deref().unwrap_or(""))
     }
 
@@ -7623,63 +7649,86 @@ fn line_window(total: usize, line: Option<usize>, context: usize, max_lines: usi
     (centre.saturating_sub(ctx).max(1), centre.saturating_add(ctx).min(total))
 }
 
+/// What the on-disk half of `debug.source` produced, and — when it read a file at all — which one.
+struct LocalSource {
+    /// The rendered section, appended to the JVM's header verbatim.
+    section: String,
+    /// The file that was read and how many lines it has, or `None` for every outcome that read nothing:
+    /// no roots, a refused path, missing, escaped, unreadable. None of those is a freshness answer, and
+    /// DISC-11's check must stay silent on all five rather than reporting on a file it does not have.
+    read: Option<(std::path::PathBuf, usize)>,
+}
+
+impl LocalSource {
+    /// An outcome that explains itself and read no file.
+    fn nothing_read(section: &str) -> Self {
+        Self { section: section.to_string(), read: None }
+    }
+}
+
 /// The on-disk half of `debug.source`: resolve the class under `roots` and render the requested lines.
 ///
 /// Returns text to append to the JVM-reported header rather than a `Result`, because none of the ways
 /// this can come up empty invalidates that header — see [`RequestHandler::handle_source`].
+///
+/// It also returns *which* file it read, for DISC-11's freshness check. That is handed over rather than
+/// resolved a second time: two resolutions are free to land on different roots' copies of the same file,
+/// and a check that then reports a fact about a file the caller never saw is worse than no check.
 fn local_source_section(
     class_name: &str,
     file_name: &str,
     roots: &[std::path::PathBuf],
     a: &crate::args::SourceArgs,
-) -> String {
+) -> LocalSource {
     if roots.is_empty() {
-        return "No source roots are configured, so no file was read. Set them per session with \
-                debug.attach {\"source_roots\":[...]}, or deploy-wide with JDWP_SOURCE_ROOTS (a path \
-                list in this platform's spelling). A root is where the PACKAGE TREE starts — for \
-                com.example.Order that is the directory containing `com`, not the project root.\n"
-            .to_string();
+        return LocalSource::nothing_read(
+            "No source roots are configured, so no file was read. Set them per session with \
+             debug.attach {\"source_roots\":[...]}, or deploy-wide with JDWP_SOURCE_ROOTS (a path \
+             list in this platform's spelling). A root is where the PACKAGE TREE starts — for \
+             com.example.Order that is the directory containing `com`, not the project root.\n",
+        );
     }
     let Some(rel) = source_relative_path(class_name, file_name) else {
-        return format!(
+        return LocalSource::nothing_read(&format!(
             "⚠ Refusing to build a path from the file name the JVM reported ({file_name:?}): it \
              carries a path separator, a drive/stream marker or a `..` segment. That name comes from \
              the debuggee, so a path built from it could point outside every configured root.\n"
-        );
+        ));
     };
     let path = match find_under_roots(roots, &rel) {
         SourceLookup::Found(p) => p,
         SourceLookup::Missing => {
             let searched: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
-            return format!(
+            return LocalSource::nothing_read(&format!(
                 "Not found on disk: no configured root holds {}. Searched {} root(s): {}. Either the \
                  root list is wrong (a root is where the package tree starts) or this class is not in \
                  this checkout — which is itself worth knowing, since the JVM is running it.\n",
                 rel.display(),
                 roots.len(),
                 searched.join(", "),
-            );
+            ));
         }
         SourceLookup::Escaped(p) => {
-            return format!(
+            return LocalSource::nothing_read(&format!(
                 "⚠ Refusing to read {}: it is under a configured root but resolves outside it — a \
                  symlink out of the tree. Nothing was read.\n",
                 p.display(),
-            );
+            ));
         }
     };
 
     let lines: Vec<String> = match std::fs::read_to_string(&path) {
         Ok(text) => text.lines().map(str::to_string).collect(),
         Err(e) => {
-            return format!(
+            return LocalSource::nothing_read(&format!(
                 "Found {} but could not read it: {e}. The path resolved, so this is a local \
                  permission or encoding problem, not a wrong root.\n",
                 path.display(),
-            );
+            ));
         }
     };
-    render_source_body(&path, &lines, a)
+    let section = render_source_body(&path, &lines, a);
+    LocalSource { section, read: Some((path, lines.len())) }
 }
 
 /// Render the selected lines of a resolved file, with the bound stated in the header.
@@ -7729,6 +7778,243 @@ fn render_source_body(path: &std::path::Path, lines: &[String], a: &crate::args:
         );
     }
     out
+}
+
+/// How much newer a `.java` must be than its `.class` before the timestamp is worth mentioning.
+///
+/// Not zero. Filesystems disagree about mtime granularity — FAT rounds to two seconds — and a compile
+/// that reads the source and writes the class within one tick would otherwise report itself as drift.
+const SOURCE_MTIME_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Render a gap between two timestamps at the same coarseness as [`ago`], without its trailing word.
+fn coarse_span(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+/// DISC-11: the ways the source window `debug.source` just printed can be lying about the running code.
+///
+/// **Two independent axes, which is why these are separate fields rather than one verdict.** A class can
+/// be behind on either, both, or neither, and they do not have the same remedy: bytecode that does not
+/// match the build is fixed by a redeploy or `debug.reload_class`, while a source file that does not
+/// match the build is fixed by a compile. Collapsing them would name the wrong one half the time, which
+/// is the failure `debug.check_stale` and `debug.source` already go to some length to keep apart.
+///
+/// Empty means every axis was checked and agreed. That case renders as nothing at all: the issue this
+/// implements is explicit that a matching build must add no noise, because an unsolicited aside on a
+/// correct reply is what teaches a reader to skip the asides.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SourceFreshness {
+    /// A **proof** on the JVM-versus-build axis: the loaded line tables differ from the compiled
+    /// `.class` under the class roots. Says nothing about the source, which may be perfectly current.
+    deployed_drift: Option<String>,
+    /// A **proof** on the build-versus-source axis: the `.java` printed above is too short to be the
+    /// file this bytecode was compiled from, because the JVM's line table names a line it does not have.
+    source_too_short: Option<String>,
+    /// A **hint** on the same axis: the `.java` was written after the `.class`. A timestamp is not a
+    /// proof — a checkout moves an mtime without changing a byte — and the wording says so.
+    source_newer: Option<String>,
+    /// Why nothing was compared. Never set alongside the others: it is the *absence* of an answer, and
+    /// pairing it with a finding would read as a partial pass.
+    cannot_tell: Option<String>,
+}
+
+impl SourceFreshness {
+    /// The check did not run, and this is why. Distinct from a pass, which is the whole point (DISC-11).
+    fn cannot_tell(why: String) -> Self {
+        Self { cannot_tell: Some(why), ..Self::default() }
+    }
+
+    fn is_quiet(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The facts a freshness verdict is decided from, with the filesystem and JDWP taken out.
+///
+/// A struct rather than nine arguments so the decision stays one pure function that a unit test can
+/// drive — the same reason [`compare_line_tables`] is split from the reads that feed it.
+struct FreshnessFacts<'a> {
+    source_path: &'a std::path::Path,
+    source_lines: usize,
+    /// `None` when the filesystem would not report it. The mtime half is then skipped rather than
+    /// guessed at.
+    source_mtime: Option<std::time::SystemTime>,
+    class_path: &'a std::path::Path,
+    class_mtime: Option<std::time::SystemTime>,
+    drift: &'a StaleReport,
+    /// How many methods the drift comparison could actually compare, for the wording.
+    comparable: usize,
+    /// The highest line number anywhere in the JVM's line tables, or `None` when it has none.
+    highest_jvm_line: Option<i32>,
+    /// The class carries a JSR-45 SMAP, so its line numbers are positions in a file this is not — a
+    /// `.jsp`, a template. The length proof is meaningless there and is skipped.
+    translated: bool,
+}
+
+/// Decide DISC-11's verdict. Pure, because a detector that cries stale on a current build is ignored
+/// within a day and this is where that would happen.
+fn source_freshness(f: &FreshnessFacts) -> SourceFreshness {
+    let mut out = SourceFreshness::default();
+
+    if f.drift.is_stale() {
+        out.deployed_drift = Some(format!(
+            "🚨 STALE BYTECODE: the JVM is NOT running the build in {}.\n   {} of {} comparable \
+             method(s) match, {} differ — so the lines above were compiled from something else. \
+             Remedy: redeploy, or debug.reload_class to install your build. debug.check_stale gives \
+             the per-method detail.",
+            f.class_path.display(),
+            f.drift.matched,
+            f.comparable,
+            f.drift.differing.len(),
+        ));
+    }
+
+    // The length proof. A file cannot be missing a line the compiler emitted a table entry for, so this
+    // is decidable without compiling anything — which is what makes it a proof where the mtime is not.
+    if !f.translated {
+        if let Some(high) = f.highest_jvm_line.filter(|h| *h > 0) {
+            if usize::try_from(high).is_ok_and(|h| h > f.source_lines) {
+                out.source_too_short = Some(format!(
+                    "🚨 THE SOURCE ABOVE IS NOT WHAT THIS BYTECODE WAS COMPILED FROM: the JVM's line \
+                     table reaches line {high}, and {} has {} line(s). A file cannot be missing lines \
+                     the compiler emitted from it. Remedy: recompile, or check out the revision that \
+                     is actually deployed.",
+                    f.source_path.display(),
+                    f.source_lines,
+                ));
+            }
+        }
+    }
+
+    // The mtime hint, and only when the proof above did not already fire — it would be the weaker
+    // statement of the same fact, and two warnings about one problem read as two problems.
+    if out.source_too_short.is_none() {
+        if let (Some(src), Some(cls)) = (f.source_mtime, f.class_mtime) {
+            if let Ok(gap) = src.duration_since(cls) {
+                if gap > SOURCE_MTIME_SLACK {
+                    out.source_newer = Some(format!(
+                        "⚠️  SOURCE IS NEWER THAN THE BYTECODE: {} was modified {} after {} was \
+                         written, so the lines above may be ahead of what is running. This is a \
+                         TIMESTAMP, NOT A PROOF — a checkout moves a file's mtime without changing a \
+                         byte of it. If it is real: recompile, then debug.reload_class or redeploy.",
+                        f.source_path.display(),
+                        coarse_span(gap),
+                        f.class_path.display(),
+                    ));
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// The freshness section as it appears under the source window, or empty when every axis agreed.
+fn render_source_freshness(f: &SourceFreshness) -> String {
+    if f.is_quiet() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for line in [f.deployed_drift.as_deref(), f.source_too_short.as_deref(), f.source_newer.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let _ = writeln!(out, "{line}");
+    }
+    if let Some(why) = &f.cannot_tell {
+        let _ = writeln!(out, "ℹ️  Freshness NOT CHECKED, which is not the same as checked and fine: {why}");
+    }
+    out
+}
+
+/// DISC-11: check the source window against the bytecode the JVM actually loaded, on both axes.
+///
+/// **Costs one `Method.LineTable` per method of the class, and only runs when class roots are
+/// configured.** That gate is deliberate and is the cost control: `debug.source` is a tool a caller
+/// reaches for constantly, so the packets are spent only where an operator has said where the build
+/// output is. With no roots the reply says the check could not be made — which the caller needs, because
+/// silence here would otherwise read as a clean bill of health.
+async fn source_freshness_section(
+    conn: &mut jdwp_client::JdwpConnection,
+    class_name: &str,
+    type_id: u64,
+    class_roots: &[std::path::PathBuf],
+    source: &(std::path::PathBuf, usize),
+    translated: bool,
+) -> String {
+    let (source_path, source_lines) = source;
+    if class_roots.is_empty() {
+        return render_source_freshness(&SourceFreshness::cannot_tell(
+            "no class roots are configured, so there is no compiled .class to compare the source \
+             above against. Set them with debug.attach {\"class_roots\":[...]}, JDWP_CLASS_ROOTS, or \
+             pass class_roots here. A class root is where the package tree starts in the BUILD OUTPUT \
+             (target/classes), not src/main/java."
+                .to_string(),
+        ));
+    }
+    let path = match resolve_class_file(class_name, None, class_roots) {
+        Ok(p) => p,
+        // The resolver's message already says which of its cases this is and what to fix; quoting it is
+        // better than a second, vaguer sentence about the same thing.
+        Err(e) => return render_source_freshness(&SourceFreshness::cannot_tell(e)),
+    };
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) => {
+            return render_source_freshness(&SourceFreshness::cannot_tell(format!(
+                "found {} but could not read it: {e}",
+                path.display()
+            )));
+        }
+    };
+    let built = match crate::classfile::parse(&bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            return render_source_freshness(&SourceFreshness::cannot_tell(format!(
+                "could not read {} as a class file: {e}",
+                path.display()
+            )));
+        }
+    };
+    if built.this_class != class_name {
+        return render_source_freshness(&SourceFreshness::cannot_tell(format!(
+            "{} declares {}, not {class_name} — that is a wrong class root rather than drift, so \
+             nothing was compared",
+            path.display(),
+            built.this_class,
+        )));
+    }
+    let running = match read_jvm_line_tables(conn, type_id).await {
+        Ok(r) => r,
+        Err(e) => return render_source_freshness(&SourceFreshness::cannot_tell(e)),
+    };
+
+    let comparable = running.iter().filter(|m| m.comparable).count();
+    let highest_jvm_line = running.iter().flat_map(|m| m.lines.iter().map(|(_, l)| *l)).max();
+    let drift = compare_line_tables(&running, &built.methods);
+    let verdict = source_freshness(&FreshnessFacts {
+        source_path,
+        source_lines: *source_lines,
+        source_mtime: file_mtime(source_path).await,
+        class_path: &path,
+        class_mtime: file_mtime(&path).await,
+        drift: &drift,
+        comparable,
+        highest_jvm_line,
+        translated,
+    });
+    render_source_freshness(&verdict)
+}
+
+/// A file's modification time, or `None` if the filesystem will not say. Not an error: every caller of
+/// this treats an absent mtime as one fewer thing it may claim.
+async fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    tokio::fs::metadata(path).await.ok()?.modified().ok()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -19574,6 +19860,166 @@ mod tests {
         assert_eq!(caveat(&jvm_method(&[(0, 10)], true), vec![built_method("save", &[])]), None);
         // Nothing on either side.
         assert_eq!(caveat(&jvm_method(&[], false), vec![built_method("save", &[])]), None);
+    }
+
+    // ---- DISC-11 (#87): the freshness note under a `debug.source` window ----
+    //
+    // Two axes, and the tests keep them apart on purpose. The issue's own evidence is the reason: in the
+    // environment it was measured in, the class roots were byte-identical to the deployed jars and 2-3
+    // commits BEHIND `src/main/java`, so the JVM-versus-build comparison reports a match and the caller
+    // is still reading the wrong lines. A single verdict would have been silent on exactly that case.
+
+    const FRESH_SRC: &str = "/src/com/acme/OrderService.java";
+    const FRESH_CLS: &str = "/build/com/acme/OrderService.class";
+
+    fn freshness_facts(drift: &StaleReport) -> FreshnessFacts<'_> {
+        FreshnessFacts {
+            source_path: std::path::Path::new(FRESH_SRC),
+            source_lines: 200,
+            source_mtime: None,
+            class_path: std::path::Path::new(FRESH_CLS),
+            class_mtime: None,
+            drift,
+            comparable: 40,
+            highest_jvm_line: Some(180),
+            translated: false,
+        }
+    }
+
+    fn drifting() -> StaleReport {
+        StaleReport {
+            matched: 39,
+            differing: vec!["save(Ljava/lang/String;)I — line 10 became 12".to_string()],
+            ..StaleReport::default()
+        }
+    }
+
+    /// A fixed instant, so nothing here depends on the clock.
+    fn at(secs: u64) -> std::time::SystemTime {
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    // The load-bearing case. The issue makes it an explicit acceptance criterion — "with source and
+    // bytecode in sync, the reply is unchanged from today (no added noise)" — because a warning that
+    // fires on a correct reply is how a reader learns to skip warnings.
+    #[test]
+    fn a_matching_build_and_a_source_that_fits_add_nothing_at_all() {
+        let clean = StaleReport { matched: 40, ..StaleReport::default() };
+        let mut f = freshness_facts(&clean);
+        f.source_mtime = Some(at(1_000));
+        f.class_mtime = Some(at(2_000)); // compiled AFTER the source was last touched: the normal order
+
+        let verdict = source_freshness(&f);
+
+        assert!(verdict.is_quiet(), "a current build must produce no verdict at all: {verdict:?}");
+        assert_eq!(render_source_freshness(&verdict), "", "and must render as nothing");
+    }
+
+    // The proof on the source axis, and the one that needs no compile: the compiler emitted a table entry
+    // for a line this file does not have, so whatever is on disk, it is not what was compiled.
+    #[test]
+    fn a_source_too_short_for_the_line_table_is_a_proof_and_names_the_file() {
+        let clean = StaleReport { matched: 40, ..StaleReport::default() };
+        let mut f = freshness_facts(&clean);
+        f.source_lines = 120;
+        f.highest_jvm_line = Some(180);
+
+        let verdict = source_freshness(&f);
+        let out = verdict.source_too_short.clone().expect("180 > 120 is a proof");
+
+        assert!(out.contains("line 180"), "must quote the line the table reaches:\n{out}");
+        assert!(out.contains("120 line(s)"), "and what the file actually has:\n{out}");
+        assert!(out.contains(FRESH_SRC), "must name the file it is talking about:\n{out}");
+        assert!(verdict.deployed_drift.is_none(), "the build itself matched, and must not be blamed");
+    }
+
+    // A JSR-45 class's line numbers are positions in a `.jsp` or a template, not in the `.java` we
+    // resolved, so the length comparison is meaningless rather than merely uncertain. Getting this wrong
+    // would fire the strongest wording this function has on every translated class.
+    #[test]
+    fn a_translated_class_gets_no_length_proof() {
+        let clean = StaleReport { matched: 40, ..StaleReport::default() };
+        let mut f = freshness_facts(&clean);
+        f.source_lines = 120;
+        f.highest_jvm_line = Some(9_000);
+        f.translated = true;
+
+        assert!(source_freshness(&f).source_too_short.is_none(), "SMAP lines are another file's");
+    }
+
+    #[test]
+    fn a_source_newer_than_the_class_is_reported_as_a_timestamp_not_a_proof() {
+        let clean = StaleReport { matched: 40, ..StaleReport::default() };
+        let mut f = freshness_facts(&clean);
+        f.class_mtime = Some(at(1_000));
+        f.source_mtime = Some(at(8_200)); // two hours later
+
+        let out = source_freshness(&f).source_newer.expect("source written after the class");
+
+        assert!(out.contains("2h 0m"), "must say how far apart they are:\n{out}");
+        assert!(out.contains("NOT A PROOF"), "must not overclaim a timestamp:\n{out}");
+        assert!(out.contains("checkout"), "and must name the false positive it can produce:\n{out}");
+    }
+
+    // Within the slack a compile itself can produce. Firing here would report every freshly built class.
+    #[test]
+    fn a_source_touched_a_moment_before_the_compile_is_not_reported() {
+        let clean = StaleReport { matched: 40, ..StaleReport::default() };
+        let mut f = freshness_facts(&clean);
+        f.class_mtime = Some(at(1_000));
+        f.source_mtime = Some(at(1_001));
+
+        assert!(source_freshness(&f).is_quiet(), "one second is filesystem granularity, not drift");
+    }
+
+    // Two warnings about one fact read as two problems, and the weaker one would be the memorable half.
+    #[test]
+    fn the_length_proof_suppresses_the_weaker_mtime_hint() {
+        let clean = StaleReport { matched: 40, ..StaleReport::default() };
+        let mut f = freshness_facts(&clean);
+        f.source_lines = 120;
+        f.class_mtime = Some(at(1_000));
+        f.source_mtime = Some(at(8_200));
+
+        let verdict = source_freshness(&f);
+
+        assert!(verdict.source_too_short.is_some(), "the proof stands");
+        assert!(verdict.source_newer.is_none(), "and the hint about the same file is redundant");
+    }
+
+    // The two axes are independent and have different remedies — redeploy versus recompile — so a reply
+    // carrying both must say both. This is the case the issue calls out as needing to stay separate.
+    #[test]
+    fn drift_and_a_stale_source_are_reported_as_two_facts_with_two_remedies() {
+        let stale = drifting();
+        let mut f = freshness_facts(&stale);
+        f.source_lines = 120;
+
+        let out = render_source_freshness(&source_freshness(&f));
+
+        assert!(out.contains("STALE BYTECODE"), "the build axis:\n{out}");
+        assert!(out.contains("reload_class"), "whose remedy is installing the build:\n{out}");
+        assert!(out.contains("NOT WHAT THIS BYTECODE WAS COMPILED FROM"), "the source axis:\n{out}");
+        assert!(out.contains("recompile"), "whose remedy is a compile:\n{out}");
+    }
+
+    // The third distinct answer the issue requires: not checked is not the same as checked and fine.
+    #[test]
+    fn a_check_that_could_not_run_says_so_rather_than_passing_quietly() {
+        let out = render_source_freshness(&SourceFreshness::cannot_tell(
+            "no class roots are configured".to_string(),
+        ));
+
+        assert!(out.contains("NOT CHECKED"), "{out}");
+        assert!(out.contains("not the same as checked and fine"), "must refuse to read as a pass:\n{out}");
+        assert!(out.contains("no class roots are configured"), "and must say why:\n{out}");
+    }
+
+    #[test]
+    fn coarse_span_reads_like_a_report_rather_than_a_stopwatch() {
+        assert_eq!(coarse_span(std::time::Duration::from_secs(45)), "45s");
+        assert_eq!(coarse_span(std::time::Duration::from_secs(600)), "10m");
+        assert_eq!(coarse_span(std::time::Duration::from_secs(7_260)), "2h 1m");
     }
 
     // DISC-9: the byte-level difference has to be actionable, and a length change must not read as

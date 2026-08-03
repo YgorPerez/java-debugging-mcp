@@ -8638,6 +8638,151 @@ fn arming_says_nothing_about_drift_when_no_class_root_is_configured() {
     );
 }
 
+/// Call `debug.source` for `SwapProbe` with both kinds of root named explicitly.
+///
+/// Both are passed per-call rather than at attach because the two roots are what each of these tests
+/// varies, and a session default would make it ambiguous which one an assertion is about.
+fn probe_source_window(
+    server: &mut Server,
+    source_root: &std::path::Path,
+    class_root: Option<&std::path::Path>,
+) -> String {
+    let class_roots: Vec<String> = class_root.map(|r| r.display().to_string()).into_iter().collect();
+    server.call(
+        "debug.source",
+        serde_json::json!({
+            "class_name": "SwapProbe",
+            "line": 39,
+            "context": 3,
+            "source_roots": [source_root.display().to_string()],
+            "class_roots": class_roots,
+        }),
+    )
+}
+
+/// DISC-11 (#87): the source window says when it does not match the bytecode the JVM loaded.
+///
+/// The axis this covers is the JVM against the build. `debug.check_stale` answers it when asked, and the
+/// caller this ruins is the one reading code and not suspecting anything — so it is reported here, on the
+/// reply that actually shows them the wrong lines.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_source_window_over_stale_bytecode_says_so() {
+    let Some(jdk) = jdk_or_skip("a_source_window_over_stale_bytecode_says_so") else { return };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    // The JVM runs the checked-in probe; the build on disk has two lines inserted above `answer()`, so
+    // every line number in it moved. The source under `src` matches that build, which keeps this test
+    // about the build-versus-JVM axis alone.
+    let shifted = swap_probe_with_shifted_lines(&jdk);
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let out = probe_source_window(&mut server, &shifted.path().join("src"), Some(shifted.path()));
+
+    assert_contains_all(
+        "the window reports drift it was not asked about, and names both the file and the remedy",
+        &out,
+        &["STALE BYTECODE", "SwapProbe.class", "reload_class", "check_stale"],
+    );
+    // A warning, not a refusal: the lines the caller asked for must still be there.
+    assert!(out.contains("SwapProbe.java"), "the source window itself must survive the warning:\n{out}");
+}
+
+/// The acceptance criterion the issue is most explicit about: **a matching build adds nothing**. An
+/// unsolicited aside that fires on a correct reply is how a reader learns to skip the asides, and this
+/// tool's reply is read on almost every call.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_source_window_over_the_running_build_is_unchanged() {
+    let Some(jdk) = jdk_or_skip("a_source_window_over_the_running_build_is_unchanged") else { return };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    // `compile_probe_variant` refuses a no-op edit, so the change is a comment: it moves no line and
+    // alters no bytecode, and it writes the `.class` after the `.java` — the normal order.
+    let current = tempfile::tempdir().expect("tempdir");
+    jdk.compile_probe_variant("SwapProbe", current.path(), |src| {
+        src.replace("// SWAP_VALUE", "// SWAP_VALUE (control build)")
+    })
+    .expect("recompile the unmodified probe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let out = probe_source_window(&mut server, &current.path().join("src"), Some(current.path()));
+
+    assert!(out.contains("SwapProbe.java"), "the window must still render:\n{out}");
+    for noise in ["STALE", "NOT CHECKED", "NOT WHAT THIS BYTECODE", "SOURCE IS NEWER"] {
+        assert!(!out.contains(noise), "false positive {noise:?} on the running build:\n{out}");
+    }
+}
+
+/// The proof on the other axis, and the one the issue was actually filed about: the build matches the
+/// JVM, and the **source** does not match either. In the environment it was measured in the class roots
+/// were byte-identical to the deployed jars and two commits behind `src/main/java`, so the JVM-versus-
+/// build comparison is clean and the caller is still reading the wrong statement.
+///
+/// A truncated file is the case that can be *proved* without compiling anything: the JVM's line table
+/// names a line the file does not have, and a file cannot be missing lines the compiler emitted from it.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_source_file_too_short_for_the_running_line_table_is_reported() {
+    let Some(jdk) = jdk_or_skip("a_source_file_too_short_for_the_running_line_table_is_reported") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    // A class root holding the very build the JVM is running, so axis one is clean by construction.
+    let matching = tempfile::tempdir().expect("tempdir for the matching build");
+    jdk.compile_probe("SwapProbe", matching.path()).expect("compile the unmodified probe");
+    // A source root holding a SwapProbe.java far too short to be what that build was compiled from.
+    let short = tempfile::tempdir().expect("tempdir for the truncated source");
+    let full = std::fs::read_to_string(probe_source_path("SwapProbe")).expect("read the probe source");
+    let head: Vec<&str> = full.lines().take(8).collect();
+    std::fs::write(short.path().join("SwapProbe.java"), head.join("\n")).expect("write the short source");
+
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let out = probe_source_window(&mut server, short.path(), Some(matching.path()));
+
+    assert_contains_all(
+        "the source axis is reported as a proof, with both numbers",
+        &out,
+        &["NOT WHAT THIS BYTECODE WAS COMPILED FROM", "8 line(s)", "recompile"],
+    );
+    assert!(
+        !out.contains("STALE BYTECODE"),
+        "the deployed build matches the JVM and must not be blamed for the source being wrong:\n{out}"
+    );
+}
+
+/// The third distinct answer the issue requires: with nothing to compare against, the reply says the
+/// check did not run. Silence here would be read as a clean bill of health, and in the target
+/// environment it is the common case — the toolkit configures neither kind of root.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_source_window_with_no_class_root_says_it_could_not_check() {
+    let Some(jdk) = jdk_or_skip("a_source_window_with_no_class_root_says_it_could_not_check") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let probes = probe_source_path("SwapProbe");
+    let probes = probes.parent().expect("examples/probes");
+    let mut server = Server::start().expect("start server");
+    attach_with_class_roots(&mut server, probe.port, None);
+
+    let out = probe_source_window(&mut server, probes, None);
+
+    assert!(out.contains("SwapProbe.java"), "the window must still render:\n{out}");
+    assert_contains_all(
+        "not checked is stated, and is not allowed to read as a pass",
+        &out,
+        &["NOT CHECKED", "not the same as checked and fine", "class_roots"],
+    );
+    assert!(!out.contains("STALE"), "nothing was compared, so nothing may be called stale:\n{out}");
+}
+
 /// SWAP-1 (#58): the headline claim — a Java change reaches a JVM that was never restarted.
 ///
 /// The assertion is over the **debuggee's own stdout**, not over what the server reported about itself.
