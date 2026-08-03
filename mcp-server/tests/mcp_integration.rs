@@ -13517,10 +13517,16 @@ fn a_paired_monitor_snapshot_carries_a_debugger_measured_duration() {
             after.split("ms ").next()?.trim().parse().ok()
         })
         .collect();
+    // >= 10ms, and the probe is what makes that a sound inference rather than a hopeful one: each holder waits
+    // for its contender to report BLOCKED before it starts counting its hold, so a measured block is >= the
+    // 60ms (fast) or 400ms (slow) hold on any runner. Before that, the contender's own 1ms spin could be
+    // descheduled deep into the hold window and block legitimately briefly — CI reported `measured=[8]` on
+    // JDK 11 while five other legs passed, and the old wording here blamed the pairing for it.
     assert!(
         measured.iter().any(|ms| *ms >= 10),
-        "every measured block was under 10ms, so the pairing is matching the wrong events — the probe holds \
-         its locks for 60ms and 400ms. measured={measured:?}"
+        "no measured block reached 10ms. The probe now guarantees >= 60ms by waiting for its contender to be \
+         BLOCKED before timing the hold, so this is a pairing or arithmetic fault rather than runner load. \
+         measured={measured:?}"
     );
 
     let after = highest_tick(&probe).unwrap_or(-1);

@@ -73,6 +73,13 @@ public class MonitorProbe {
      */
     static final long GAP_MS = 20;
 
+    /** Bound on the holder's wait for its contender to queue, so a dead contender cannot wedge the probe. */
+    static final long BLOCK_WAIT_CAP_MS = 5000;
+
+    /** The contender threads, so each holder can wait for ITS contender to be genuinely BLOCKED. */
+    static volatile Thread fastContender;
+    static volatile Thread slowContender;
+
     /** Short enough that the waiter times out repeatedly rather than once a minute. */
     static final long WAIT_TIMEOUT_MS = 40;
 
@@ -97,7 +104,21 @@ public class MonitorProbe {
         }
     }
 
-    /** Own `lock` for `holdMs`, flagging ownership from inside the block so no contender can race ahead. */
+    /**
+     * Own `lock` for `holdMs`, and — the part that makes the measured block deterministic — do not START
+     * counting that hold until the contender is genuinely BLOCKED on the monitor.
+     *
+     * **Asking the JVM rather than guessing, exactly as `ContendedProbe` does, and for a sharper reason.**
+     * The flag handshake alone is not enough: the contender spins on it in 1 ms sleeps, and on a loaded
+     * 4-vCPU runner that spin is descheduled for tens of milliseconds — so it can notice ownership 52 ms
+     * into a 60 ms hold and then block for only 8 ms. That is a *legitimately* short block, not a
+     * mispairing, and it made the duration a function of runner load. CI found it: `measured=[8]` on JDK 11
+     * shard 2/2 while five other legs passed.
+     *
+     * Waiting for `BLOCKED` moves the contender's scheduling delay into the holder's wait, where it costs
+     * nothing, instead of subtracting it from the block being measured. `blocked_for` is now >= `holdMs` by
+     * construction on any runner.
+     */
     static void hold(Object lock, long holdMs, boolean fast) {
         synchronized (lock) {
             if (fast) {
@@ -105,6 +126,7 @@ public class MonitorProbe {
             } else {
                 slowHeld = true;
             }
+            awaitBlocked(fast ? fastContender : slowContender);
             sleep(holdMs);
             if (fast) {
                 fastHeld = false;
@@ -114,6 +136,25 @@ public class MonitorProbe {
         }
         // OUTSIDE the block, and load-bearing — see GAP_MS.
         sleep(GAP_MS);
+    }
+
+    /**
+     * Block until `t` reports `BLOCKED`, i.e. it is queued on a monitor somebody else holds — which, while
+     * this is called from inside a `synchronized` block, can only be ours.
+     *
+     * Capped rather than unbounded: a contender that died would otherwise leave its holder owning the lock
+     * for ever, turning a timing bug into a wedged probe. Past the cap the hold proceeds anyway and that
+     * iteration simply produces a short block, which the tests tolerate because they look for *a* block over
+     * the threshold rather than requiring every one of them.
+     */
+    static void awaitBlocked(Thread t) {
+        if (t == null) {
+            return;
+        }
+        long deadline = System.currentTimeMillis() + BLOCK_WAIT_CAP_MS;
+        while (t.getState() != Thread.State.BLOCKED && System.currentTimeMillis() < deadline) {
+            sleep(1);
+        }
     }
 
     /** Queue on a lock that is demonstrably owned, then acquire it once the holder lets go. */
@@ -159,7 +200,7 @@ public class MonitorProbe {
         }
     }
 
-    static void loopForever(Runnable body, String name) {
+    static Thread loopForever(Runnable body, String name) {
         Thread t = new Thread(() -> {
             while (true) {
                 body.run();
@@ -167,13 +208,17 @@ public class MonitorProbe {
         }, name);
         t.setDaemon(true);
         t.start();
+        return t;
     }
 
     public static void main(String[] args) throws Exception {
+        // Contenders FIRST, so `fastContender` / `slowContender` are set before any holder can reach
+        // `awaitBlocked`. A holder that started first would see null, skip the wait for one iteration, and
+        // produce exactly the short block this ordering exists to prevent.
+        fastContender = loopForever(() -> contend(FAST, true), "fast-contender");
+        slowContender = loopForever(() -> contend(SLOW, false), "slow-contender");
         loopForever(() -> hold(FAST, HOLD_FAST_MS, true), "fast-holder");
-        loopForever(() -> contend(FAST, true), "fast-contender");
         loopForever(() -> hold(SLOW, HOLD_SLOW_MS, false), "slow-holder");
-        loopForever(() -> contend(SLOW, false), "slow-contender");
         loopForever(MonitorProbe::waitOut, "timeout-waiter");
         loopForever(MonitorProbe::waitNotified, "notify-waiter");
         loopForever(() -> notifier(), "notifier");
