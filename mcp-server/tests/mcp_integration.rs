@@ -8531,6 +8531,161 @@ fn bytecode_comparison_does_not_cry_stale_on_the_running_build() {
     );
 }
 
+/// The JVMTI error code out of a `debug.reload_class` refusal — `… SCHEMA_CHANGE_NOT_IMPLEMENTED (64).`
+fn refused_code(reply: &str) -> Option<u16> {
+    let (_, after) = reply.split_once("_NOT_IMPLEMENTED (")?;
+    after.split(')').next()?.parse().ok()
+}
+
+/// One DISC-13 case: an edit to `SwapProbe`, and the refusal codes a structural diff should predict.
+struct ForecastCase {
+    what: &'static str,
+    edit: SourceEdit,
+    /// Every code the forecast must name. The JVM answers with **one** of them — it stops at the first
+    /// restriction it reaches — so agreement means "what the JVM said is among what we predicted".
+    predicted: &'static [u16],
+}
+
+/// DISC-13 (#97): the forecast agrees with the JVM, which is the only way it earns any trust.
+///
+/// The pre-flight is worth more than the attempt because the attempt fails about half the time — of the
+/// 300 most recent `.java`-touching commits in the target repo, 151 were structural and 149 body-only,
+/// and the churn concentrates in the classes where a redefine is most awkward. But a forecast that
+/// disagrees with the JVM is worse than none, so every prediction here is checked against a real
+/// `RedefineClasses`.
+///
+/// All three refusal cases share one probe on purpose: a refused redefinition changes **nothing** (the
+/// command is all-or-nothing), and this test asserts that too by continuing to use the JVM afterwards.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn each_predicted_refusal_matches_the_code_the_jvm_answers() {
+    let Some(jdk) = jdk_or_skip("each_predicted_refusal_matches_the_code_the_jvm_answers") else { return };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let cases = [
+        ForecastCase {
+            what: "an added field",
+            edit: Box::new(|src: String| {
+                src.replace(
+                    "    static int answer() {",
+                    "    static int extra = 7;\n\n    static int answer() {",
+                )
+            }),
+            predicted: &[64],
+        },
+        ForecastCase {
+            what: "an added method",
+            edit: Box::new(|src: String| {
+                src.replace(
+                    "    static int answer() {",
+                    "    static void audit() { }\n\n    static int answer() {",
+                )
+            }),
+            predicted: &[63],
+        },
+        ForecastCase {
+            // Not a "changed method": one member gone, another arrived, so both codes are predicted and
+            // the JVM picks whichever restriction it reaches first.
+            what: "a changed method signature",
+            edit: Box::new(|src: String| {
+                src.replace("    static int answer() {", "    static long answer() {")
+                    .replace("int v = 1; // SWAP_VALUE", "long v = 1; // SWAP_VALUE")
+            }),
+            predicted: &[63, 67],
+        },
+    ];
+
+    for case in cases {
+        let dir = tempfile::tempdir().expect("tempdir for the variant");
+        jdk.compile_probe_variant("SwapProbe", dir.path(), case.edit)
+            .unwrap_or_else(|e| panic!("compile the variant for {}: {e}", case.what));
+        let root = serde_json::json!([dir.path().display().to_string()]);
+
+        let forecast = server
+            .call("debug.check_stale", serde_json::json!({"class_name": "SwapProbe", "class_roots": root}));
+        assert!(
+            forecast.contains("WILL BE REFUSED"),
+            "{} must be forecast as a refusal:\n{forecast}",
+            case.what
+        );
+        for code in case.predicted {
+            assert!(
+                forecast.contains(&format!("({code})")),
+                "{} must predict code {code}:\n{forecast}",
+                case.what
+            );
+        }
+
+        let attempted = server
+            .call("debug.reload_class", serde_json::json!({"class_name": "SwapProbe", "class_roots": root}));
+        let actual = refused_code(&attempted)
+            .unwrap_or_else(|| panic!("{} was not refused by the JVM at all:\n{attempted}", case.what));
+        assert!(
+            case.predicted.contains(&actual),
+            "the JVM answered {actual} for {}, which the forecast did not predict ({:?}). A prediction \
+             that disagrees with the real outcome is the one thing this feature must not do:\n{attempted}",
+            case.what,
+            case.predicted,
+        );
+        // A refusal is all-or-nothing, and the reply now says the caller could have known in advance.
+        assert!(
+            attempted.contains("predictable from the class file"),
+            "a foreseeable refusal must point at the pre-flight:\n{attempted}"
+        );
+    }
+
+    // The probe survived three refused redefinitions, still running the original bytecode.
+    assert_eq!(
+        last_answer(&probe).map(|(answer, _)| answer),
+        Some(1),
+        "three refusals must have changed nothing\n  output: {:?}",
+        probe.output(),
+    );
+}
+
+/// The other half, and the case the forecast must NOT cry refusal on: a body-only edit installs.
+///
+/// The positive verdict is deliberately weaker than the negative — "no structural change detected", not
+/// a promise — so this asserts both that the forecast is clean AND that the swap really works, which is
+/// what makes the wording honest rather than merely cautious.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_body_only_change_is_forecast_clean_and_the_jvm_installs_it() {
+    let Some(jdk) = jdk_or_skip("a_body_only_change_is_forecast_clean_and_the_jvm_installs_it") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let edited = swap_probe_returning(&jdk, 7);
+    let root = serde_json::json!([edited.path().display().to_string()]);
+
+    let forecast =
+        server.call("debug.check_stale", serde_json::json!({"class_name": "SwapProbe", "class_roots": root}));
+    assert_contains_all(
+        "a body-only change is forecast clean, and the wording promises nothing",
+        &forecast,
+        &["NO STRUCTURAL CHANGE DETECTED", "NOT a promise", "dry_run"],
+    );
+    assert!(!forecast.contains("WILL BE REFUSED"), "false refusal on a body-only edit:\n{forecast}");
+
+    let done = server
+        .call("debug.reload_class", serde_json::json!({"class_name": "SwapProbe", "class_roots": root}));
+    assert!(done.contains("Reloaded"), "the JVM must accept a body-only change:\n{done}");
+
+    // The forecast said it would install; the probe's own stdout is what proves it did.
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("answer 7 tick ")).is_some(),
+        "the swap did not take effect\n  output: {:?}",
+        probe.output(),
+    );
+}
+
 /// Compile `SwapProbe` with two lines inserted above `answer()`, which moves every line number in it
 /// without changing the class's shape. The same edit `a_stale_build_is_detected_and_a_current_one_is_not`
 /// uses, because it is the drift `debug.source` cannot see: same class, same file name, older bytecode.

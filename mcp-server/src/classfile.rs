@@ -22,6 +22,11 @@
 /// One method as the class file declares it.
 #[derive(Debug, Clone)]
 pub struct ClassFileMethod {
+    /// The `method_info` access flags, directly comparable with JDWP's `mod_bits` (DISC-13). Kept as the
+    /// raw `u16` rather than decoded flags because the comparison is against another raw flag word, and
+    /// naming the bits would mean deciding here which of them matter — a decision that belongs where the
+    /// forecast is made, with a comment about why.
+    pub access_flags: u16,
     pub name: String,
     /// The JVM descriptor, e.g. `(Ljava/lang/String;)I`. Kept unrendered because it is being *compared*
     /// with what JDWP reports, and JDWP reports descriptors.
@@ -42,12 +47,35 @@ pub struct ClassFileMethod {
     pub code: Vec<u8>,
 }
 
-/// The parts of a `.class` file the staleness check compares.
+/// One field as the class file declares it (DISC-13).
+///
+/// Only the three things `HotSpot`'s redefinition check looks at. A field's *value* is not here and could
+/// not be: a `.class` carries initialisers, not the state of instances that already exist, which is the
+/// whole reason a schema change cannot be hot-swapped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassFileField {
+    pub access_flags: u16,
+    pub name: String,
+    /// The JVM descriptor, e.g. `Ljava/lang/String;`. Unrendered, for the same reason a method's is: it
+    /// is compared against what JDWP reports, and JDWP reports descriptors.
+    pub descriptor: String,
+}
+
+/// The parts of a `.class` file the staleness check and the redefine forecast compare.
 #[derive(Debug, Clone)]
 pub struct ClassFile {
     /// The class this file declares, dotted (`com.example.Order`). Compared against the class being
     /// checked, because a root that resolves to the wrong file is a likelier mistake than drift.
     pub this_class: String,
+    /// Class-level access flags, for `CLASS_MODIFIERS_CHANGE_NOT_IMPLEMENTED` (DISC-13).
+    pub access_flags: u16,
+    /// The direct superclass, dotted, or `None` for `java.lang.Object` — the one class whose
+    /// `super_class` index is 0.
+    pub super_class: Option<String>,
+    /// Directly declared interfaces, dotted, in declaration order. Direct only, which is what JDWP's
+    /// `ReferenceType.Interfaces` also reports, so the two sides are the same question.
+    pub interfaces: Vec<String>,
+    pub fields: Vec<ClassFileField>,
     pub methods: Vec<ClassFileMethod>,
 }
 
@@ -105,7 +133,7 @@ enum Constant {
     Other,
 }
 
-/// Parse the parts of `bytes` that a staleness comparison needs.
+/// Parse the parts of `bytes` that a staleness comparison and a redefine forecast need.
 ///
 /// # Errors
 /// Returns a message naming what could not be read. Every failure is a fact about the file — truncated,
@@ -118,20 +146,49 @@ pub fn parse(bytes: &[u8]) -> Result<ClassFile, String> {
     }
     // Version: read past rather than kept. It is the obvious thing to report, and nothing here acts on
     // it — a file this JVM cannot load is refused by the JVM, with UNSUPPORTED_VERSION, which is a
-    // better answer than one derived from a number we compared ourselves.
+    // better answer than one derived from a number we compared ourselves. DISC-13 does not change that:
+    // it forecasts the refusals a *structural* diff decides, and a version mismatch is not one of them.
     c.skip(4)?; // minor, major
     let pool = parse_constant_pool(&mut c)?;
-
-    let _access_flags = c.u16()?;
-    let this_class = c.u16()?;
-    let _super_class = c.u16()?;
-    let interfaces = c.u16()? as usize;
-    c.skip(interfaces * 2)?;
-
-    skip_members(&mut c)?; // fields
+    let header = parse_header(&mut c, &pool)?;
+    let fields = parse_fields(&mut c, &pool)?;
     let methods = parse_methods(&mut c, &pool)?;
 
-    Ok(ClassFile { this_class: class_name(&pool, this_class)?, methods })
+    Ok(ClassFile {
+        this_class: header.this_class,
+        access_flags: header.access_flags,
+        super_class: header.super_class,
+        interfaces: header.interfaces,
+        fields,
+        methods,
+    })
+}
+
+/// Everything between the constant pool and the field table.
+///
+/// Its own function because [`parse`] reads the file top to bottom and each section's decoding is
+/// independent — and because the four resolutions here are the branchy part, which the whole of `parse`
+/// was carrying before DISC-13 added three of them.
+struct ClassHeader {
+    access_flags: u16,
+    this_class: String,
+    super_class: Option<String>,
+    interfaces: Vec<String>,
+}
+
+fn parse_header(c: &mut Cursor, pool: &[Constant]) -> Result<ClassHeader, String> {
+    let access_flags = c.u16()?;
+    let this_class = class_name(pool, c.u16()?)?;
+    let super_index = c.u16()?;
+    // Index 0 is not a pool entry; it is how `java.lang.Object` says it has no superclass. Resolving it
+    // would report an error about a constant that is absent on purpose.
+    let super_class = if super_index == 0 { None } else { Some(class_name(pool, super_index)?) };
+    let count = c.u16()? as usize;
+    let mut interfaces = Vec::with_capacity(count);
+    for _ in 0..count {
+        interfaces.push(class_name(pool, c.u16()?)?);
+    }
+    Ok(ClassHeader { access_flags, this_class, super_class, interfaces })
 }
 
 fn parse_constant_pool(c: &mut Cursor) -> Result<Vec<Constant>, String> {
@@ -197,20 +254,27 @@ fn read_constant(c: &mut Cursor, tag: u8, at: u16) -> Result<Constant, String> {
     }
 }
 
-/// Skip a `field_info` or `method_info` table wholesale — used for fields, which this comparison does
-/// not read.
-fn skip_members(c: &mut Cursor) -> Result<(), String> {
+/// Read the `field_info` table: flags, name, descriptor, and past every attribute.
+///
+/// The attributes are skipped rather than read. `ConstantValue` is the only one a reader might want, and
+/// it is deliberately not taken: a `static final int` whose initialiser changed is *still* a body change
+/// as far as `HotSpot` is concerned, so reporting it would add a refusal the JVM does not make.
+fn parse_fields(c: &mut Cursor, pool: &[Constant]) -> Result<Vec<ClassFileField>, String> {
     let count = c.u16()?;
+    let mut fields = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        c.skip(6)?; // access_flags, name_index, descriptor_index
+        let access_flags = c.u16()?;
+        let name = utf8(pool, c.u16()?)?;
+        let descriptor = utf8(pool, c.u16()?)?;
         let attrs = c.u16()?;
         for _ in 0..attrs {
             c.skip(2)?; // attribute_name_index
             let len = c.u32()? as usize;
             c.skip(len)?;
         }
+        fields.push(ClassFileField { access_flags, name, descriptor });
     }
-    Ok(())
+    Ok(fields)
 }
 
 fn parse_methods(c: &mut Cursor, pool: &[Constant]) -> Result<Vec<ClassFileMethod>, String> {
@@ -224,7 +288,7 @@ fn parse_methods(c: &mut Cursor, pool: &[Constant]) -> Result<Vec<ClassFileMetho
 
 /// One `method_info`: its name, its descriptor, and whatever its `Code` attribute says about lines.
 fn parse_one_method(c: &mut Cursor, pool: &[Constant]) -> Result<ClassFileMethod, String> {
-    let _access = c.u16()?;
+    let access_flags = c.u16()?;
     let name = utf8(pool, c.u16()?)?;
     let descriptor = utf8(pool, c.u16()?)?;
     let attrs = c.u16()?;
@@ -246,7 +310,7 @@ fn parse_one_method(c: &mut Cursor, pool: &[Constant]) -> Result<ClassFileMethod
             c.skip(len)?;
         }
     }
-    Ok(ClassFileMethod { name, descriptor, lines, has_code, has_line_table, code })
+    Ok(ClassFileMethod { access_flags, name, descriptor, lines, has_code, has_line_table, code })
 }
 
 /// What a `Code` attribute yields to the staleness comparison.

@@ -133,6 +133,30 @@ impl JdwpConnection {
         Ok(ifaces)
     }
 
+    /// `ReferenceType.Modifiers` — the class-level access flags the JVM holds for this type.
+    ///
+    /// The same `u16` the class file's `access_flags` carries, widened to `i32` by the wire format, so it
+    /// is directly comparable with a parsed `.class` — which is what DISC-13 needs it for: `HotSpot`
+    /// refuses a redefinition whose class modifiers changed (`CLASS_MODIFIERS_CHANGE_NOT_IMPLEMENTED`),
+    /// and that is decidable before the attempt.
+    ///
+    /// Not cached. It is one packet, asked once per forecast, and a type's modifiers are the sort of
+    /// thing a redefinition is *about* — a cache here would be a way to answer from before the swap.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    pub async fn get_modifiers(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<i32> {
+        let id = self.next_id();
+        let mut packet =
+            CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::MODIFIERS);
+        packet.data.put_u64(ref_type_id);
+
+        let reply = self.send_command(packet).await?;
+        reply.check_error()?;
+
+        read_i32(&mut reply.data())
+    }
+
     /// Whether `type_id` implements the interface whose JNI signature is `wanted` (e.g.
     /// `"Ljava/lang/Runnable;"`), the way `instanceof` would answer it.
     ///

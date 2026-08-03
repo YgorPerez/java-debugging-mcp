@@ -139,6 +139,26 @@ an entry for is a proof, an mtime newer than the `.class` is only a hint, becaus
 without changing a byte.
 _Avoid_: "stale source", which inverts which side is behind — the source is the *newest* thing in the chain.
 
+**Structural change**:
+An edit `RedefineClasses` can never install, whatever you do to it: a field or method added, removed or
+re-modified, a changed signature, a changed class modifier, a different superclass or interface list.
+`HotSpot` permits **method body changes only**, so this is the dividing line between "hot-reloadable" and
+"needs a restart" — and it is close to a coin flip in practice rather than a rare case (151 of 300 recent
+commits in the target repo). `debug.check_stale` forecasts it before any attempt (DISC-13, ADR-0030).
+Independent of **stale bytecode**: a class can be both behind the build *and* illegal to swap, and the
+remedies differ.
+_Avoid_: "breaking change" (that is about a class's callers, not about what the JVM will accept) and
+"incompatible" (true of the refusal, but it does not say the shape is what made it so).
+
+**Forecast**:
+A verdict reached from a class file rather than from the JVM's answer, and therefore held to a different
+standard depending on which way it points. A predicted **refusal** is stated confidently, because six of
+`HotSpot`'s twelve codes follow from the shapes alone. A predicted **pass** says only "no structural change
+detected" and never promises a swap will land, because the other six — a verifier rejection, an
+`INVALID_TYPESTATE` against instances that already exist, an unreadable class-file version — are invisible
+to it. **A pre-flight that over-promises is worse than none.**
+_Avoid_: "validate" and "check" for the positive direction, both of which imply the answer was settled.
+
 **Class root**:
 Where the package tree starts in the **build output** (`target/classes`), as against a **source root**
 (`src/main/java`), which is where it starts in the sources. A compiled class is looked for at

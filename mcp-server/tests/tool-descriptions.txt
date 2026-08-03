@@ -50,11 +50,32 @@ build, which has code and no line numbers, turning a CANNOT TELL into a real ans
 method, so it is opt-in. The reply always names which evidence it used and whether the two agree; a difference
 in bytecode with matching line tables is called out, together with the one other thing that produces it (a
 build compiled by a different javac, since constant-pool indices live in the operands — same compiler and same
-source is byte-identical). A CLASS NAME CAN RESOLVE TO SEVERAL COPIES: if more than one classloader has loaded
-it, this reads the first and appends a caveat naming every copy, because each has its own statics and
-answering confidently from whichever sorted first is a wrong answer rather than one of two readings. Pin a
-specific copy by suffixing the loader id it printed, as in com.example.Utils@0x7f3a1c. A selector that matches
-nothing is refused rather than quietly answered from another copy.
+source is byte-identical). IT ALSO FORECASTS WHETHER YOUR BUILD COULD BE INSTALLED AT ALL, which is a
+DIFFERENT question from whether the JVM is behind (DISC-13): a class can be both stale and illegal to swap,
+and the two need different remedies — a redeploy fixes the first, only a restart fixes the second. Before
+anything is attempted it compares declared fields, declared methods, their modifiers, the class modifiers, the
+superclass and the interface list against the loaded type, and names every HotSpot restriction the change
+would trip — SCHEMA_CHANGE_NOT_IMPLEMENTED (64) for a field added, removed or re-modified, ADD_METHOD (63),
+DELETE_METHOD (67), METHOD_MODIFIERS_CHANGE (71), CLASS_MODIFIERS_CHANGE (70), HIERARCHY_CHANGE (66). Worth
+having because the answer is close to a coin flip rather than usually yes: across the 300 most recent
+.java-touching commits in the target repository, 151 were structural and 149 body-only, and the churn
+concentrates in the classes where a redefine is most awkward. THE TWO VERDICTS ARE HELD TO DIFFERENT STANDARDS
+ON PURPOSE. A refusal is stated confidently, naming the code and what in your build produces it. A pass says
+only NO STRUCTURAL CHANGE DETECTED and explicitly does NOT promise the swap will succeed, because the refusals
+a static comparison cannot see are a verifier rejection, INVALID_TYPESTATE against instances that already
+exist, and a class-file version this JVM will not read — and canAddMethod / canUnrestrictedlyRedefineClasses
+vary between JVMs. debug.reload_class {dry_run:true} is the authority on what this VM can do, and the swap
+itself is the only proof. A changed method SIGNATURE is reported as both an add and a delete, because that is
+what it is to the JVM: one member gone, another arrived. All predicted refusals are listed rather than just
+one, since the JVM stops at the first restriction it reaches and clearing that can reveal the next. One false
+positive is possible and the reply says so: a member differing only because the two builds came from different
+javac versions — a bridge method, a synthetic accessor — reads here as an added or removed method. Costs about
+six more JDWP packets on top of the per-method line tables. A CLASS NAME CAN RESOLVE TO SEVERAL COPIES: if
+more than one classloader has loaded it, this reads the first and appends a caveat naming every copy, because
+each has its own statics and answering confidently from whichever sorted first is a wrong answer rather than
+one of two readings. Pin a specific copy by suffixing the loader id it printed, as in
+com.example.Utils@0x7f3a1c. A selector that matches nothing is refused rather than quietly answered from
+another copy.
 
 ## debug.clear_stop_point
 Clear a specific breakpoint (bp_…), exception breakpoint (exc_…), watchpoint (watch_…), method-exit request
@@ -419,15 +440,18 @@ class_roots on the call overrides both, and class_file names one file directly. 
 HotSpot accepts METHOD BODY changes only. Add or remove a method or a field, change a signature, a modifier or
 the hierarchy, and the JVM refuses — the reply says which of those you did and that a real redeploy is the
 only route, rather than leaving you to re-try a swap that can never land. A refusal changes nothing:
-redefinition is all-or-nothing. Also reports whether the thread you are stopped on is INSIDE the class,
-because a frame already on the stack keeps running the bytecode it entered with. dry_run:true reports what
-would be shipped and sends nothing. Refused in a read-only session (dry_run still works) — on a shared
-instance this is an unannounced deploy, not a debugger read. A CLASS NAME CAN RESOLVE TO SEVERAL COPIES: if
-more than one classloader has loaded it, this reads the first and appends a caveat naming every copy, because
-each has its own statics and answering confidently from whichever sorted first is a wrong answer rather than
-one of two readings. Pin a specific copy by suffixing the loader id it printed, as in
-com.example.Utils@0x7f3a1c. A selector that matches nothing is refused rather than quietly answered from
-another copy.
+redefinition is all-or-nothing. ASK debug.check_stale FIRST IF YOU WANT TO KNOW BEFORE TRYING: it compares the
+class file's shape against the loaded type and names every one of those restrictions your build would trip,
+before a byte is sent (DISC-13), and a refusal here says when it was one of the six that were foreseeable.
+Also reports whether the thread you are stopped on is INSIDE the class, because a frame already on the stack
+keeps running the bytecode it entered with. dry_run:true reports what would be shipped and sends nothing; it
+does NOT compare shapes, so it is check_stale that answers whether a swap would be refused at all. Refused in
+a read-only session (dry_run still works) — on a shared instance this is an unannounced deploy, not a debugger
+read. A CLASS NAME CAN RESOLVE TO SEVERAL COPIES: if more than one classloader has loaded it, this reads the
+first and appends a caveat naming every copy, because each has its own statics and answering confidently from
+whichever sorted first is a wrong answer rather than one of two readings. Pin a specific copy by suffixing the
+loader id it printed, as in com.example.Utils@0x7f3a1c. A selector that matches nothing is refused rather than
+quietly answered from another copy.
 
 ## debug.resume_thread
 Give back ONE thread that debug.suspend_thread is holding. thread_id is optional when this session holds

@@ -1766,10 +1766,30 @@ impl RequestHandler {
         if a.bytecode {
             report.bytecode = Some(bytecode_report(&mut session.connection, type_id, &built.methods).await?);
         }
+        // DISC-13, and a SEPARATE question from everything above. Staleness asks whether the JVM is
+        // behind your build; this asks whether your build could be installed at all, and the answers are
+        // independent — a class can be both stale and illegal to swap. Unconditional because it is a
+        // handful of packets against the one-per-method the walk above already spent.
+        let forecast = loaded_class_shape(&mut session.connection, type_id)
+            .await
+            .map(|loaded| forecast_redefine(&loaded, &built_class_shape(&built)));
         let packets = session.connection.packets_sent().saturating_sub(before);
         drop(session);
-        Ok(render_stale_report(&class_name, &path, &report, a.limit, packets)
-            + loader_note.as_deref().unwrap_or(""))
+
+        let mut out = render_stale_report(&class_name, &path, &report, a.limit, packets);
+        match forecast {
+            Ok(f) => out.push_str(&render_redefine_forecast(&class_name, &f)),
+            // A JDWP failure reading the class's shape is reported as one, not folded into the staleness
+            // verdict above and not silently dropped: the caller asked one question and got it, and is
+            // owed the news that the second could not be answered.
+            Err(e) => {
+                let _ = writeln!(
+                    out,
+                    "⚠ Redefine forecast unavailable: {e}. The staleness verdict above is unaffected."
+                );
+            }
+        }
+        Ok(out + loader_note.as_deref().unwrap_or(""))
     }
 
     /// DUMP-1: every thread's stack in one call, plus which monitors each thread holds and which one it
@@ -2461,8 +2481,10 @@ impl RequestHandler {
                 "🧪 Dry run — nothing was sent to the JVM.\n   Class: {class_name} (loaded, type id \
                  0x{type_id:x})\n   Would ship: {} ({} bytes)\n   This JVM can HotSwap \
                  (canRedefineClasses=true, canPopFrames={}, canAddMethod={}). HotSpot accepts METHOD BODY \
-                 changes only, and it is the JVM — not this check — that decides: run without dry_run to \
-                 find out.",
+                 changes only. This check does not compare shapes: debug.check_stale reports, before any \
+                 attempt, which structural refusal this build would hit (DISC-13) — and the JVM is still \
+                 the one that decides, since a verifier rejection or INVALID_TYPESTATE is not visible to \
+                 either check.",
                 path.display(),
                 bytes.len(),
                 caps.can_pop_frames,
@@ -6825,12 +6847,369 @@ fn explain_redefine_failure(class_name: &str, path: &std::path::Path, e: &jdwp_c
         }
         _ => "the JVM refused the redefinition.",
     };
+    // The codes a structural diff could have called in advance (DISC-13). Pointing at that from the
+    // failure is the half that changes behaviour: a caller who has just been refused is the one who most
+    // needs to know the question was answerable without the attempt.
+    let foreseeable = matches!(code, 63 | 64 | 66 | 67 | 70 | 71);
     format!(
         "❌ {class_name} was NOT reloaded — the JVM refused the bytes in {}: {name} ({code}).\n   \
          {advice}\n   A redefinition is all-or-nothing, so the JVM is running exactly what it was \
-         running before this call.",
+         running before this call.{}",
         path.display(),
+        if foreseeable {
+            "\n   This one was predictable from the class file: debug.check_stale reports which \
+             structural refusal a build would hit before anything is sent (DISC-13), and it names every \
+             one of them rather than just the first the JVM reached."
+        } else {
+            ""
+        },
     )
+}
+
+/// The class-level modifier bits DISC-13 compares — deliberately not all of them.
+///
+/// `ACC_SUPER` (0x0020) is excluded: every `javac` since 1.1 sets it, `HotSpot` normalises it internally,
+/// and comparing it is a known way to invent a difference that is not one. `ACC_SYNTHETIC` (0x1000) and
+/// `ACC_MODULE` (0x8000) are excluded for the same reason — compiler and JVM bookkeeping rather than
+/// something written in the source. What is left is what a declaration says out loud.
+const CLASS_MODIFIER_MASK: u16 = 0x0001 | 0x0010 | 0x0200 | 0x0400 | 0x2000 | 0x4000;
+
+/// The method modifier bits compared. `public private protected static final synchronized native
+/// abstract` — the ones `explain_redefine_failure`'s code-71 arm names. `ACC_BRIDGE`, `ACC_VARARGS`,
+/// `ACC_STRICT` and `ACC_SYNTHETIC` are left out: a compiler chooses them, so a difference there is more
+/// likely to mean the two builds came from different `javac` versions than that anybody changed a
+/// modifier, and this forecast must not manufacture a refusal.
+const METHOD_MODIFIER_MASK: u16 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x0100 | 0x0400;
+
+/// The field modifier bits compared: `public private protected static final volatile transient`.
+const FIELD_MODIFIER_MASK: u16 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0040 | 0x0080;
+
+/// One declared member, from either side of the forecast, reduced to what `HotSpot`'s check looks at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclaredMember {
+    name: String,
+    descriptor: String,
+    /// Already masked by one of the three constants above, so the comparison cannot accidentally include
+    /// a bit this forecast decided not to trust.
+    modifiers: u16,
+    /// How this member is named in the reply: `save(Ljava/lang/String;)I` for a method, `total: I` for a
+    /// field. Rendered here because the two read differently and the diff below should not have to know
+    /// which kind it is holding.
+    label: String,
+}
+
+impl DeclaredMember {
+    /// Name and descriptor — what makes two declarations the *same* member. A changed descriptor is not a
+    /// changed member, it is one member gone and another arrived, which is why a signature change shows
+    /// up as an add plus a delete and gets both refusals.
+    fn key(&self) -> (&str, &str) {
+        (&self.name, &self.descriptor)
+    }
+
+    fn method(name: String, descriptor: String, mod_bits: u16) -> Self {
+        let label = format!("{name}{descriptor}");
+        Self { name, descriptor, modifiers: mod_bits & METHOD_MODIFIER_MASK, label }
+    }
+
+    fn field(name: String, descriptor: String, mod_bits: u16) -> Self {
+        let label = format!("{name}: {descriptor}");
+        Self { name, descriptor, modifiers: mod_bits & FIELD_MODIFIER_MASK, label }
+    }
+}
+
+/// One side of the forecast: a class's shape, in one spelling, with everything else taken out.
+///
+/// Both sides are normalised into this before anything is decided, for the reason [`MethodLines`] gives
+/// for staleness — the comparison must not be able to tell which side it is looking at, or it will grow a
+/// rule that only holds for one of them.
+struct ClassShape {
+    access_flags: u16,
+    /// Dotted, `None` only for `java.lang.Object`.
+    super_class: Option<String>,
+    /// Dotted, **sorted**, because neither JDWP nor a class file promises an order and a comparison over
+    /// two differently-ordered lists would report a hierarchy change that is not one.
+    interfaces: Vec<String>,
+    fields: Vec<DeclaredMember>,
+    methods: Vec<DeclaredMember>,
+}
+
+/// One refusal a structural diff can predict, named by the code `RedefineClasses` would answer with.
+///
+/// The code is carried rather than just prose so the prediction is checkable against the real outcome —
+/// which is the acceptance criterion that makes this feature worth trusting at all.
+#[derive(Debug, PartialEq, Eq)]
+struct PredictedRefusal {
+    code: u16,
+    name: &'static str,
+    detail: String,
+}
+
+/// DISC-13: what a `RedefineClasses` of the compiled build would hit, decided **before** the attempt.
+///
+/// Empty means no *structural* difference was found. That is deliberately the weaker of the two verdicts:
+/// see [`render_redefine_forecast`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RedefineForecast {
+    refusals: Vec<PredictedRefusal>,
+}
+
+/// The members of `after` that `before` does not have, by name and descriptor, as labels.
+fn members_gained(before: &[DeclaredMember], after: &[DeclaredMember]) -> Vec<String> {
+    after.iter().filter(|m| !before.iter().any(|b| b.key() == m.key())).map(|m| m.label.clone()).collect()
+}
+
+/// Members present on both sides whose (masked) modifiers differ, as `label (0xAAAA -> 0xBBBB)`.
+fn members_remodified(loaded: &[DeclaredMember], built: &[DeclaredMember]) -> Vec<String> {
+    built
+        .iter()
+        .filter_map(|b| {
+            let was = loaded.iter().find(|l| l.key() == b.key())?;
+            (was.modifiers != b.modifiers)
+                .then(|| format!("{} (0x{:04x} -> 0x{:04x})", b.label, was.modifiers, b.modifiers))
+        })
+        .collect()
+}
+
+/// Decide DISC-13's forecast. Pure, and the reason is the acceptance criterion: every prediction here is
+/// checked against what `reload_class` actually does, so this has to be drivable without a JVM.
+fn forecast_redefine(loaded: &ClassShape, built: &ClassShape) -> RedefineForecast {
+    let mut refusals = Vec::new();
+
+    if loaded.access_flags != built.access_flags {
+        refusals.push(PredictedRefusal {
+            code: 70,
+            name: "CLASS_MODIFIERS_CHANGE_NOT_IMPLEMENTED",
+            detail: format!(
+                "the class modifiers changed (0x{:04x} loaded, 0x{:04x} in your build)",
+                loaded.access_flags, built.access_flags,
+            ),
+        });
+    }
+
+    let mut hierarchy = Vec::new();
+    if loaded.super_class != built.super_class {
+        hierarchy.push(format!(
+            "superclass {} -> {}",
+            loaded.super_class.as_deref().unwrap_or("(none)"),
+            built.super_class.as_deref().unwrap_or("(none)"),
+        ));
+    }
+    if loaded.interfaces != built.interfaces {
+        hierarchy.push(format!(
+            "interfaces [{}] -> [{}]",
+            loaded.interfaces.join(", "),
+            built.interfaces.join(", "),
+        ));
+    }
+    if !hierarchy.is_empty() {
+        refusals.push(PredictedRefusal {
+            code: 66,
+            name: "HIERARCHY_CHANGE_NOT_IMPLEMENTED",
+            detail: hierarchy.join("; "),
+        });
+    }
+
+    // Fields are one refusal whichever way they moved: HotSpot cannot re-shape objects that already
+    // exist, so an addition, a removal and a modifier change are all the same SCHEMA_CHANGE to it.
+    let added_fields = members_gained(&loaded.fields, &built.fields);
+    let removed_fields = members_gained(&built.fields, &loaded.fields);
+    let remodified_fields = members_remodified(&loaded.fields, &built.fields);
+    if !added_fields.is_empty() || !removed_fields.is_empty() || !remodified_fields.is_empty() {
+        let mut parts = Vec::new();
+        if !added_fields.is_empty() {
+            parts.push(format!("adds {} field(s): {}", added_fields.len(), added_fields.join(", ")));
+        }
+        if !removed_fields.is_empty() {
+            parts.push(format!("removes {} field(s): {}", removed_fields.len(), removed_fields.join(", ")));
+        }
+        if !remodified_fields.is_empty() {
+            parts.push(format!(
+                "changes {} field modifier(s): {}",
+                remodified_fields.len(),
+                remodified_fields.join(", "),
+            ));
+        }
+        refusals.push(PredictedRefusal {
+            code: 64,
+            name: "SCHEMA_CHANGE_NOT_IMPLEMENTED",
+            detail: parts.join("; "),
+        });
+    }
+
+    // Methods get three distinct codes, so they are three distinct findings.
+    let added = members_gained(&loaded.methods, &built.methods);
+    if !added.is_empty() {
+        refusals.push(PredictedRefusal {
+            code: 63,
+            name: "ADD_METHOD_NOT_IMPLEMENTED",
+            detail: format!("adds {} method(s): {}", added.len(), added.join(", ")),
+        });
+    }
+    let removed = members_gained(&built.methods, &loaded.methods);
+    if !removed.is_empty() {
+        refusals.push(PredictedRefusal {
+            code: 67,
+            name: "DELETE_METHOD_NOT_IMPLEMENTED",
+            detail: format!("removes {} method(s): {}", removed.len(), removed.join(", ")),
+        });
+    }
+    let remodified = members_remodified(&loaded.methods, &built.methods);
+    if !remodified.is_empty() {
+        refusals.push(PredictedRefusal {
+            code: 71,
+            name: "METHOD_MODIFIERS_CHANGE_NOT_IMPLEMENTED",
+            detail: format!("changes {} method modifier(s): {}", remodified.len(), remodified.join(", ")),
+        });
+    }
+
+    RedefineForecast { refusals }
+}
+
+/// Render the forecast, with the two verdicts held to deliberately different standards.
+///
+/// **A refusal is stated confidently; a pass is not.** That asymmetry is the whole design, and it is not
+/// timidity: `HotSpot`'s twelve codes include failures no static comparison can see — a verifier
+/// rejection, `INVALID_TYPESTATE` against instances that already exist — and `canAddMethod` /
+/// `canUnrestrictedlyRedefineClasses` differ between JVMs (both `false` on Temurin 17; see
+/// `docs/heap-query-measurements.md`). So the positive says *no structural change detected* and points at
+/// the authority, rather than promising an install. A pre-flight that over-promises is worse than none.
+fn render_redefine_forecast(class_name: &str, f: &RedefineForecast) -> String {
+    let mut out = String::new();
+    if f.refusals.is_empty() {
+        let _ = writeln!(
+            out,
+            "🔁 Redefine: NO STRUCTURAL CHANGE DETECTED — declared fields, methods, their modifiers, the \
+             class modifiers, the superclass and the interface list all match the loaded {class_name}, so \
+             nothing here trips one of HotSpot's structural refusals.\n   That is NOT a promise the swap \
+             succeeds. The refusals a static comparison cannot see are a verifier rejection, \
+             INVALID_TYPESTATE against instances that already exist, and a class-file version this JVM \
+             will not read — and canAddMethod / canUnrestrictedlyRedefineClasses vary by JVM. \
+             debug.reload_class {{\"dry_run\":true}} is the authority on what this VM can do; the swap \
+             itself is the only proof."
+        );
+        return out;
+    }
+
+    let _ = writeln!(
+        out,
+        "🚨 Redefine WILL BE REFUSED: RedefineClasses cannot install this build into the running \
+         {class_name}. HotSpot permits METHOD BODY changes only, and this build changes the class's \
+         shape:"
+    );
+    for r in &f.refusals {
+        let _ = writeln!(out, "   • {} ({}) — {}", r.name, r.code, r.detail);
+    }
+    let _ = writeln!(
+        out,
+        "   The JVM answers with the FIRST of these it reaches, so clearing one can reveal the next. \
+         Recompiling will not help — a restart or a real redeploy is the route. One caveat on the \
+         other side: a member that differs only because the two builds came from different javac \
+         versions (a bridge method, a synthetic accessor) would read here as an added or removed \
+         method, so check that your class root is a build of the same source tree."
+    );
+    out
+}
+
+/// A class signature (`Lcom/example/Order;`) as the class file's constant pool spells it: dotted.
+///
+/// Goes through [`decode_internal_name`] rather than a bare `replace('/', ".")` so a hidden or
+/// VM-anonymous class keeps the separator the JVM actually assigned it (SIG-1, #46) — otherwise two
+/// spellings of the same lambda-bearing hierarchy would compare unequal and be reported as a change.
+fn dotted_from_signature(signature: &str) -> String {
+    let internal = signature.strip_prefix('L').and_then(|s| s.strip_suffix(';')).unwrap_or(signature);
+    decode_internal_name(internal)
+}
+
+/// The loaded class's shape, read off the JVM (DISC-13).
+///
+/// Six or so packets: fields, methods (already cached by the staleness read), class modifiers, the
+/// superclass and its signature, the interface list and one signature each. Small enough to be
+/// unconditional on `check_stale`, whose line-table walk already costs one packet per method.
+async fn loaded_class_shape(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+) -> Result<ClassShape, String> {
+    let access_flags = conn
+        .get_modifiers(type_id)
+        .await
+        .map_err(|e| format!("Failed to read the loaded class's modifiers: {e}"))?;
+    let super_class = match conn.get_superclass(type_id).await {
+        Ok(Some(id)) => Some(
+            conn.get_signature(id)
+                .await
+                .map(|s| dotted_from_signature(&s))
+                .map_err(|e| format!("Failed to read the loaded superclass's name: {e}"))?,
+        ),
+        Ok(None) => None,
+        Err(e) => return Err(format!("Failed to read the loaded class's superclass: {e}")),
+    };
+    let interface_ids = conn
+        .get_interfaces(type_id)
+        .await
+        .map_err(|e| format!("Failed to read the loaded class's interfaces: {e}"))?;
+    let mut interfaces = Vec::with_capacity(interface_ids.len());
+    for id in interface_ids {
+        interfaces.push(
+            conn.get_signature(id)
+                .await
+                .map(|s| dotted_from_signature(&s))
+                .map_err(|e| format!("Failed to read a loaded interface's name: {e}"))?,
+        );
+    }
+    interfaces.sort();
+    let fields = conn
+        .get_fields(type_id)
+        .await
+        .map_err(|e| format!("Failed to list the loaded class's fields: {e}"))?
+        .into_iter()
+        .map(|f| DeclaredMember::field(f.name, f.signature, mod_bits_u16(f.mod_bits)))
+        .collect();
+    let methods = conn
+        .get_methods(type_id)
+        .await
+        .map_err(|e| format!("Failed to list the loaded class's methods: {e}"))?
+        .into_iter()
+        .map(|m| DeclaredMember::method(m.name, m.signature, mod_bits_u16(m.mod_bits)))
+        .collect();
+
+    // Masked on this side too. Both sides must go through the same mask or the mask itself becomes the
+    // difference — `ACC_SUPER` alone would have made every class report a modifier change.
+    Ok(ClassShape {
+        access_flags: mod_bits_u16(access_flags) & CLASS_MODIFIER_MASK,
+        super_class,
+        interfaces,
+        fields,
+        methods,
+    })
+}
+
+/// JDWP's `i32` modifier word as the `u16` a class file carries.
+///
+/// The wire widens it and the high bits are never set for the flags this compares, so a truncating cast
+/// is exact rather than lossy — but it is written once, here, so no call site has to argue that.
+fn mod_bits_u16(bits: i32) -> u16 {
+    u16::try_from(bits & 0xFFFF).unwrap_or(0)
+}
+
+/// The compiled build's shape, from the parsed `.class`, in the same spelling as the loaded side.
+fn built_class_shape(built: &crate::classfile::ClassFile) -> ClassShape {
+    let mut interfaces = built.interfaces.clone();
+    interfaces.sort();
+    ClassShape {
+        access_flags: built.access_flags & CLASS_MODIFIER_MASK,
+        super_class: built.super_class.clone(),
+        interfaces,
+        fields: built
+            .fields
+            .iter()
+            .map(|f| DeclaredMember::field(f.name.clone(), f.descriptor.clone(), f.access_flags))
+            .collect(),
+        methods: built
+            .methods
+            .iter()
+            .map(|m| DeclaredMember::method(m.name.clone(), m.descriptor.clone(), m.access_flags))
+            .collect(),
+    }
 }
 
 /// Frame indexes on `thread` that are executing `type_id`, innermost first.
@@ -7541,8 +7920,8 @@ fn render_stale_report(
     }
     if report.is_stale() {
         out.push_str(
-            "   Next: debug.reload_class installs the build you just compared against, if the drift is \
-             method bodies only.\n",
+            "   Next: debug.reload_class installs the build you just compared against — if the drift is \
+             method bodies only, which is the separate question the redefine forecast below answers.\n",
         );
     }
     out
@@ -19805,6 +20184,7 @@ mod tests {
 
     fn built_method(name: &str, lines: &[(u64, i32)]) -> crate::classfile::ClassFileMethod {
         crate::classfile::ClassFileMethod {
+            access_flags: 0,
             name: name.to_string(),
             descriptor: "(Ljava/lang/String;)I".to_string(),
             lines: lines.to_vec(),
@@ -20020,6 +20400,196 @@ mod tests {
         assert_eq!(coarse_span(std::time::Duration::from_secs(45)), "45s");
         assert_eq!(coarse_span(std::time::Duration::from_secs(600)), "10m");
         assert_eq!(coarse_span(std::time::Duration::from_secs(7_260)), "2h 1m");
+    }
+
+    // ---- DISC-13 (#97): forecasting which HotSpot refusal a redefinition would hit ----
+    //
+    // The pre-flight is worth more than the attempt because the attempt fails about half the time: of the
+    // 300 most recent `.java`-touching commits in the target repo, 151 were structural and 149 body-only.
+    // Every prediction below is also checked against what `reload_class` really does, in the integration
+    // suite — a forecast that disagrees with the JVM is worse than no forecast.
+
+    /// A shape with one field and one method, as a baseline for the diffs below.
+    fn class_shape(fields: &[(u16, &str, &str)], methods: &[(u16, &str, &str)]) -> ClassShape {
+        ClassShape {
+            access_flags: 0x0001, // public
+            super_class: Some("java.lang.Object".to_string()),
+            interfaces: Vec::new(),
+            fields: fields
+                .iter()
+                .map(|(m, n, d)| DeclaredMember::field((*n).to_string(), (*d).to_string(), *m))
+                .collect(),
+            methods: methods
+                .iter()
+                .map(|(m, n, d)| DeclaredMember::method((*n).to_string(), (*d).to_string(), *m))
+                .collect(),
+        }
+    }
+
+    fn baseline() -> ClassShape {
+        class_shape(&[(0x0002, "total", "I")], &[(0x0001, "save", "(Ljava/lang/String;)I")])
+    }
+
+    /// The codes a forecast predicted, in order.
+    fn codes(f: &RedefineForecast) -> Vec<u16> {
+        f.refusals.iter().map(|r| r.code).collect()
+    }
+
+    // The positive verdict, and the one that must NOT overclaim. HotSpot's twelve codes include failures a
+    // structural diff cannot see, so "no structural change" is the strongest honest wording here.
+    #[test]
+    fn an_unchanged_shape_predicts_no_refusal_and_promises_nothing() {
+        let f = forecast_redefine(&baseline(), &baseline());
+        assert!(f.refusals.is_empty(), "identical shapes are not a refusal: {f:?}");
+
+        let out = render_redefine_forecast("OrderService", &f);
+        assert!(out.contains("NO STRUCTURAL CHANGE DETECTED"), "{out}");
+        assert!(out.contains("NOT a promise"), "must refuse to promise the swap succeeds:\n{out}");
+        assert!(out.contains("dry_run"), "and must point at the authority on the positive case:\n{out}");
+        assert!(!out.contains("WILL BE REFUSED"), "{out}");
+    }
+
+    #[test]
+    fn an_added_field_is_predicted_as_a_schema_change() {
+        let built = class_shape(
+            &[(0x0002, "total", "I"), (0x0002, "discount", "D")],
+            &[(0x0001, "save", "(Ljava/lang/String;)I")],
+        );
+        let f = forecast_redefine(&baseline(), &built);
+
+        assert_eq!(codes(&f), vec![64], "an added field is SCHEMA_CHANGE_NOT_IMPLEMENTED: {f:?}");
+        let out = render_redefine_forecast("OrderService", &f);
+        assert!(out.contains("WILL BE REFUSED"), "{out}");
+        assert!(out.contains("adds 1 field(s): discount: D"), "must name the field:\n{out}");
+        assert!(out.contains("redeploy"), "and the remedy, which is not a recompile:\n{out}");
+    }
+
+    #[test]
+    fn a_removed_field_is_also_a_schema_change() {
+        let f =
+            forecast_redefine(&baseline(), &class_shape(&[], &[(0x0001, "save", "(Ljava/lang/String;)I")]));
+
+        assert_eq!(codes(&f), vec![64]);
+        assert!(
+            render_redefine_forecast("OrderService", &f).contains("removes 1 field(s): total: I"),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn an_added_method_and_a_removed_method_get_their_own_codes() {
+        let added = class_shape(
+            &[(0x0002, "total", "I")],
+            &[(0x0001, "save", "(Ljava/lang/String;)I"), (0x0001, "audit", "()V")],
+        );
+        assert_eq!(codes(&forecast_redefine(&baseline(), &added)), vec![63]);
+
+        let removed = class_shape(&[(0x0002, "total", "I")], &[]);
+        assert_eq!(codes(&forecast_redefine(&baseline(), &removed)), vec![67]);
+    }
+
+    // A changed signature is not a changed method: it is one member gone and another arrived, so it earns
+    // both refusals. Worth asserting because a reader expecting a single "signature changed" code would
+    // otherwise think the forecast had double-counted.
+    #[test]
+    fn a_changed_method_signature_is_reported_as_both_an_add_and_a_delete() {
+        let built = class_shape(&[(0x0002, "total", "I")], &[(0x0001, "save", "(Ljava/lang/String;J)I")]);
+        let f = forecast_redefine(&baseline(), &built);
+
+        assert_eq!(codes(&f), vec![63, 67], "add and delete, not one merged verdict: {f:?}");
+    }
+
+    #[test]
+    fn a_changed_method_modifier_is_predicted_and_the_bits_are_shown() {
+        // public -> public static
+        let built = class_shape(&[(0x0002, "total", "I")], &[(0x0009, "save", "(Ljava/lang/String;)I")]);
+        let f = forecast_redefine(&baseline(), &built);
+
+        assert_eq!(codes(&f), vec![71]);
+        let out = render_redefine_forecast("OrderService", &f);
+        assert!(out.contains("0x0001 -> 0x0009"), "must show what moved:\n{out}");
+    }
+
+    #[test]
+    fn a_changed_class_modifier_and_a_changed_hierarchy_get_their_own_codes() {
+        let mut built = baseline();
+        built.access_flags = 0x0011; // public final
+        assert_eq!(codes(&forecast_redefine(&baseline(), &built)), vec![70]);
+
+        let mut resubclassed = baseline();
+        resubclassed.super_class = Some("com.acme.BaseService".to_string());
+        let f = forecast_redefine(&baseline(), &resubclassed);
+        assert_eq!(codes(&f), vec![66]);
+        assert!(
+            render_redefine_forecast("OrderService", &f)
+                .contains("superclass java.lang.Object -> com.acme.BaseService"),
+            "{f:?}"
+        );
+    }
+
+    // The ordering trap. Neither JDWP nor a class file promises an interface order, so a comparison over
+    // two differently-ordered lists would report a hierarchy change on every class that has two
+    // interfaces — a false refusal, which is the direction that costs the caller a needless restart.
+    #[test]
+    fn interfaces_in_a_different_order_are_not_a_hierarchy_change() {
+        let mut loaded = baseline();
+        loaded.interfaces = vec!["java.io.Serializable".to_string(), "java.lang.Runnable".to_string()];
+        let mut built = baseline();
+        built.interfaces = vec!["java.lang.Runnable".to_string(), "java.io.Serializable".to_string()];
+        built.interfaces.sort();
+        loaded.interfaces.sort();
+
+        assert!(forecast_redefine(&loaded, &built).refusals.is_empty(), "same set, different order");
+    }
+
+    // `ACC_SUPER` is set by every javac and normalised away by HotSpot. Comparing it unmasked would report
+    // a class-modifier change on literally every class, which is the loudest possible false positive.
+    #[test]
+    fn acc_super_is_masked_off_both_sides_rather_than_compared() {
+        let file = crate::classfile::ClassFile {
+            this_class: "com.acme.OrderService".to_string(),
+            access_flags: 0x0021, // ACC_PUBLIC | ACC_SUPER
+            super_class: Some("java.lang.Object".to_string()),
+            interfaces: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+        };
+
+        assert_eq!(built_class_shape(&file).access_flags, 0x0001, "ACC_SUPER must not survive the mask");
+    }
+
+    // Compiler bookkeeping, not a declaration. A bridge method differing only in ACC_BRIDGE between two
+    // javac versions must not read as a modifier change.
+    #[test]
+    fn a_bridge_bit_is_not_a_method_modifier_change() {
+        let built = class_shape(&[(0x0002, "total", "I")], &[(0x0041, "save", "(Ljava/lang/String;)I")]);
+        assert!(forecast_redefine(&baseline(), &built).refusals.is_empty(), "0x0040 is ACC_BRIDGE");
+    }
+
+    #[test]
+    fn a_class_signature_is_dotted_and_a_lambda_keeps_its_assigned_separator() {
+        assert_eq!(dotted_from_signature("Lcom/example/Order;"), "com.example.Order");
+        // SIG-1: the JVM assigned that suffix, and it is not a package boundary.
+        assert_eq!(
+            dotted_from_signature("LSyntheticProbe$$Lambda.0x0000000092040970;"),
+            "SyntheticProbe$$Lambda/0x0000000092040970"
+        );
+    }
+
+    // Several changes at once. The JVM answers with the first it reaches, so reporting only one would
+    // send the caller round the loop again; the wording says as much.
+    #[test]
+    fn every_predicted_refusal_is_reported_not_just_the_first() {
+        let built = class_shape(
+            &[(0x0002, "total", "I"), (0x0002, "discount", "D")],
+            &[(0x0009, "save", "(Ljava/lang/String;)I"), (0x0001, "audit", "()V")],
+        );
+        let f = forecast_redefine(&baseline(), &built);
+
+        assert_eq!(codes(&f), vec![64, 63, 71], "all three, in check order: {f:?}");
+        let out = render_redefine_forecast("OrderService", &f);
+        assert!(out.contains("FIRST of these it reaches"), "must say the JVM stops at one:\n{out}");
+        assert!(out.contains("javac"), "and must caveat the different-compiler false positive:\n{out}");
     }
 
     // DISC-9: the byte-level difference has to be actionable, and a length change must not read as
@@ -20759,6 +21329,7 @@ mod tests {
             comparable: true,
         }];
         let built = vec![crate::classfile::ClassFileMethod {
+            access_flags: 0,
             name: "answer".to_string(),
             descriptor: "()I".to_string(),
             lines: vec![(0, 39), (2, 40)],
@@ -20787,6 +21358,7 @@ mod tests {
             comparable: true,
         }];
         let built = vec![crate::classfile::ClassFileMethod {
+            access_flags: 0,
             name: "answer".to_string(),
             descriptor: "()I".to_string(),
             lines: vec![(0, 41)],
@@ -20815,6 +21387,7 @@ mod tests {
             comparable: true,
         }];
         let built = vec![crate::classfile::ClassFileMethod {
+            access_flags: 0,
             name: "added".to_string(),
             descriptor: "()V".to_string(),
             lines: vec![(0, 5)],
@@ -20843,6 +21416,7 @@ mod tests {
             comparable: false,
         }];
         let built = vec![crate::classfile::ClassFileMethod {
+            access_flags: 0,
             name: "answer".to_string(),
             descriptor: "()I".to_string(),
             lines: Vec::new(),
@@ -20869,6 +21443,7 @@ mod tests {
             comparable: false,
         }];
         let with_lines = vec![crate::classfile::ClassFileMethod {
+            access_flags: 0,
             name: "answer".to_string(),
             descriptor: "()I".to_string(),
             lines: vec![(0, 39)],
