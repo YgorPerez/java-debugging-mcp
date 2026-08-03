@@ -1522,11 +1522,24 @@ pub struct SetMonitorStopArgs {
     /// Only with `trace:true` — an expression evaluated in the blocking/waiting frame and recorded with the
     /// snapshot.
     ///
-    /// **Read the caution, because this kind is the one where invoking can bite.** A thread suspended at a
-    /// `monitorenter` is blocked on the lock in the snapshot, and a method call that needs that same
-    /// monitor cannot complete — the debugger would wedge the thread it is reporting on. Field reads
-    /// (`this.pedido.id`) are safe; a getter that touches shared state under the same lock is not. This is
-    /// also why this kind has no `condition`.
+    /// **An expression that CALLS A METHOD is REFUSED on the opening half of a pair** — `blocked` and
+    /// `wait` — and this used to be a caution rather than a refusal (DUMP-8, #123). Those two are the one
+    /// instant when the hit thread does NOT own the monitor its own snapshot is about: it is queued at a
+    /// `monitorenter`, or it has just released the lock into `Object.wait()`. An invocation needing that
+    /// monitor cannot complete, and JDWP has no way to cancel one — the 2000 ms budget frees the debugger,
+    /// not the debuggee. Measured on Temurin 11.0.32 and 21.0.12: the call finishes when the lock is
+    /// finally released and the JVM **re-suspends that thread at that moment**, 1.2 s after this server had
+    /// resumed it and moved on, and it then stays suspended for ever — nothing clears it, because the
+    /// watchdog resumes a suspended *VM* and the VM is running.
+    ///
+    /// It is refused rather than warned about because a caller cannot always tell: a getter that reads a
+    /// field under `synchronized` looks exactly like one that does not, and the price of being wrong is a
+    /// wedged application thread on a JVM other people are using. The same reasoning is why this kind has
+    /// no `condition` at all (ADR-0035).
+    ///
+    /// **FIELD READS ARE ACCEPTED EVERYWHERE** (`this.pedido.id`, `lock.name`) — they need no monitor. And
+    /// on the CLOSING halves, `acquired` and `waited`, an invoking expression is accepted and works: the
+    /// thread owns the lock by then, so a call needing it re-enters and returns.
     ///
     /// Accepts a LIST as well as a string (TRACE-11), each element evaluated against the same frame into
     /// its own labelled slot.

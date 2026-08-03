@@ -69,7 +69,21 @@ pub enum JdwpError {
     /// classic debugger-invocation deadlock. That is not a protocol failure and not something the caller
     /// did wrong, and it must be reported as itself rather than folded into a generic error, because the
     /// right response is different: render shallowly and move on.
-    #[error("invocation did not return within {0}ms (the debuggee thread may be blocked on a monitor held by another suspended thread)")]
+    ///
+    /// **"Render shallowly and move on" is what WE do, and the message now says what the DEBUGGEE does**
+    /// (DUMP-8, #123), because the two had been allowed to sound like the same thing. Measured on Temurin
+    /// 11.0.32 and 21.0.12 against a lock held 3000 ms past a 2000 ms budget: the call completes when the
+    /// lock is finally released and the JVM **re-suspends the thread at that moment** — 1.2 s after this
+    /// side had given up, resumed the thread and moved on. From then on the thread is suspended for good.
+    /// Nothing here clears it: the watchdog resumes a suspended *VM*, and the VM is running. So the one
+    /// remedy is a caller-issued `debug.continue` (which decrements every thread) or `debug.resume_thread`,
+    /// and a message that did not name it left the reader believing the cost was the two seconds.
+    #[error(
+        "invocation did not return within {0}ms — the debuggee thread is STILL INSIDE THE CALL and JDWP \
+         cannot cancel it (usually a monitor held by another thread). When the call does return the JVM \
+         re-suspends that thread, and nothing here clears that — the watchdog only resumes a suspended VM. \
+         Use debug.continue, or debug.resume_thread on it"
+    )]
     InvokeTimeout(u64),
 
     /// The connection is in read-only mode and something tried to execute code in the debuggee.

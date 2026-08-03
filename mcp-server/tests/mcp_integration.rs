@@ -13423,6 +13423,154 @@ fn monitor_probe_ready(line: &str) -> bool {
     line.starts_with("monitors ready")
 }
 
+fn wedge_probe_ready(line: &str) -> bool {
+    line.starts_with("wedge ready")
+}
+
+/// The `acquisitions` counter off `WedgeProbe`'s tick line — the contender's progress, seen from OUTSIDE
+/// the debugger, which is the standard every non-suspending assertion here is held to.
+fn wedge_acquisitions(probe: &Probe) -> Option<i64> {
+    probe.output().iter().filter_map(|l| l.split("acquisitions=").nth(1)?.trim().parse::<i64>().ok()).max()
+}
+
+/// DUMP-8 (#123): an invoking `trace_expr` is refused on the OPENING half of a pair, and the thing worth
+/// keeping is why the refusal is the fix rather than the fallback.
+///
+/// The hazard is real and was reproduced before anything changed. `MONITOR_CONTENDED_ENTER` fires with the
+/// hit thread queued at a `monitorenter`, so an invocation needing that monitor cannot proceed; the 2000 ms
+/// budget frees the debugger and JDWP cannot cancel the call. Measured on Temurin 11.0.32 and 21.0.12
+/// against `WedgeProbe`, whose lock is held 3000 ms:
+///
+/// ```text
+/// | LOCK.stamp() => <error: invocation did not return within 2000ms …>
+/// debug.list_threads {only_suspended:true}   0/7 … 0/7 … 1/7  0x2 wedge-contender [monitor]  (for ever)
+/// ```
+///
+/// **The 1.2 s gap before that `1/7` is the whole reason this is an arm-time refusal.** It is exactly the
+/// hold that was left: the invocation completes when the lock is released and the JVM re-suspends the
+/// thread *then*, long after the capture path resumed it and moved on. Verifying the resume — reading the
+/// count back and resuming until it clears, ADR-0003's rule — was written first and changed nothing; polled
+/// every 400 ms with and without it the sequence is byte-identical. It was caught only because the negative
+/// test PASSED without the fix, which is ADR-0034 earning its keep, and it is §3.4's lesson again: an
+/// assertion can fire correctly and still prove the wrong thing.
+///
+/// So what is asserted here is the refusal, its precision, and the two things that must still work.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_invoking_trace_expr_is_refused_on_the_half_that_does_not_own_the_lock() {
+    let Some(jdk) = jdk_or_skip("an_invoking_trace_expr_is_refused_on_the_half_that_does_not_own_the_lock")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch_running(&jdk, "WedgeProbe", wedge_probe_ready).expect("launch WedgeProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    let arm = |server: &mut Server, args: serde_json::Value| server.call("debug.set_monitor_stop", args);
+
+    // --- Refused on both opening kinds, and the refusal explains itself ---
+    for (kinds, named) in [(vec!["blocked"], "blocked"), (vec!["wait"], "wait"), (vec!["all"], "blocked")] {
+        let refused = arm(
+            &mut server,
+            serde_json::json!({"kinds": kinds, "trace_expr": "LOCK.stamp()", "trace_max_hits": 1}),
+        );
+        assert_contains_all(
+            &format!("an invoking trace_expr is refused on {named}"),
+            &refused,
+            &["Refused", "CALLS A METHOD", named, "cannot complete", "re-suspends the thread"],
+        );
+        // It must be the argument check talking, not the session lookup — otherwise this test would pass
+        // against a build with no check at all.
+        assert!(
+            !refused.contains("No active debug session"),
+            "refused for the wrong reason for kinds {kinds:?}: {refused}"
+        );
+    }
+
+    // Several expressions: the offending one is named by index, or four expressions leave the caller
+    // guessing which. Same discipline as the read-only refusal.
+    let indexed = arm(
+        &mut server,
+        serde_json::json!({"kinds": ["blocked"], "trace_expr": ["LOCK.name", "LOCK.stamp()"]}),
+    );
+    assert_contains_all("the offending element is named", &indexed, &["trace_expr[1]"]);
+
+    // --- What must still work, so this is not a blanket removal of trace_expr from the kind ---
+    //
+    // A FIELD READ on the same opening half. Asserted against a live hit rather than just an accepted
+    // arming: the refusal is about invocation, and a read that armed but never recorded would be the same
+    // loss by a quieter route.
+    arm(
+        &mut server,
+        serde_json::json!({"kinds": ["blocked"], "trace_expr": "LOCK.name", "trace_max_hits": 1,
+                           "trace_frames": 0}),
+    );
+    let field = server
+        .wait_for_traces("LOCK.name =>", EVENT_TIMEOUT)
+        .expect("a field read on the blocked half never recorded");
+    assert_contains_all("a field read resolves on the blocked half", &field, &["\"wedge\""]);
+
+    // And the debuggee is untouched by all of it: nothing suspended, and the contender still getting
+    // through its synchronized block. The second is the half no reply of ours could fake.
+    let suspended = server.call("debug.list_threads", serde_json::json!({"only_suspended": true}));
+    assert!(suspended.starts_with("0/"), "a traced hit left a thread suspended:\n{suspended}");
+    let before = wedge_acquisitions(&probe).unwrap_or(-1);
+    let advanced = (0..60).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        wedge_acquisitions(&probe).is_some_and(|now| now > before)
+    });
+    assert!(
+        advanced,
+        "the contender never completed another acquisition, so something wedged it. acquisitions was \
+         {before} and is {:?} now",
+        wedge_acquisitions(&probe)
+    );
+
+    server.panic_reset();
+}
+
+/// The `acquired` half carries none of this, and the reason is not visible in the code (DUMP-8, #123).
+///
+/// `MONITOR_CONTENDED_ENTERED` fires when the thread has GOT the lock, so an invocation needing that same
+/// monitor re-enters it — Java monitors are reentrant per thread — and returns immediately. The opening
+/// half is the hazard precisely because it is the one instant in the pair when the thread does not own
+/// what the snapshot is about. Asserted rather than left implicit, so a future change that "fixes" this
+/// half symmetrically has something to fail against.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn the_acquired_half_owns_the_lock_so_the_same_expression_resolves_there() {
+    let Some(jdk) = jdk_or_skip("the_acquired_half_owns_the_lock_so_the_same_expression_resolves_there")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch_running(&jdk, "WedgeProbe", wedge_probe_ready).expect("launch WedgeProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    server.call(
+        "debug.set_monitor_stop",
+        serde_json::json!({"kinds": ["acquired"], "trace_expr": "LOCK.stamp()", "trace_max_hits": 1,
+                           "trace_frames": 0}),
+    );
+    let acquired =
+        server.wait_for_traces("monitor_acquired", EVENT_TIMEOUT).expect("the acquired half never fired");
+    assert_contains_all(
+        "the very expression that stalls on the blocked half returns a value here",
+        &acquired,
+        &["LOCK.stamp() =>", "(int) "],
+    );
+    assert!(
+        !acquired.contains("did not return within"),
+        "the acquired half must not time out — the thread owns the monitor by then:\n{acquired}"
+    );
+    assert!(
+        server.call("debug.list_threads", serde_json::json!({"only_suspended": true})).starts_with("0/"),
+        "nothing may be left suspended by a traced hit"
+    );
+
+    server.panic_reset();
+}
+
 /// All four kinds decode, are captured in trace mode, and the VM is never suspended.
 ///
 /// The four acceptance criteria about decoding and volume land here: each kind is observed, a snapshot names
@@ -13833,6 +13981,13 @@ fn every_monitor_arming_refusal_explains_itself_before_touching_the_debuggee() {
         ),
         // An unknown kind names all four and says they are pairs.
         (serde_json::json!({"kinds": ["entered"]}), vec!["is not a monitor event kind", "PAIRS"]),
+        // DUMP-8 (#123): an invoking expression on the half where the thread does not own the monitor.
+        // Here as well as in the live test because the live one costs a JVM and this costs nothing — and
+        // because the sentence the refusal has to carry is the measured consequence, not the mechanism.
+        (
+            serde_json::json!({"kinds": ["blocked"], "trace_expr": "lock.getStatus()"}),
+            vec!["CALLS A METHOD", "re-suspends the thread", "Read a FIELD instead"],
+        ),
     ];
     for (args, wants) in cases {
         let refused = server.call("debug.set_monitor_stop", args.clone());
