@@ -291,6 +291,17 @@ printing a zero.
 **The two pairs are named apart** (`blocked_for`, `waited_for`) rather than sharing one `elapsed`. Blocking
 is involuntary and a long one is a fault; `wait()` is voluntary and a long one is often a healthy idle worker.
 
+**Whether the thread OWNS the monitor differs per event, and `blocked` is the odd one out.** This is the fact a
+snapshot's own subject makes easy to get wrong, so it is worth stating rather than inferring: at `blocked` the
+thread is *attempting* to enter a monitor another thread holds, so it owns nothing; at `acquired` it has
+entered, so it owns it; at `wait` it owns it, because Java requires holding a monitor to call `wait()` on it.
+`waited` is deliberately left open — the wire says the wait "finished", and whether the monitor has been
+re-acquired by then is not something this project has measured.
+It matters because it decides what may safely be *asked* at a hit. An invocation needing the monitor re-enters
+harmlessly where the thread already owns it, and cannot complete where it does not — and JDWP cannot cancel an
+invocation. So `blocked` is the one event of the four whose natural question (something about the object being
+contended) is also the dangerous one, which is why this kind has no **condition** at all.
+
 **`bracket` was the first candidate and lost on a collision**, which is the same test that chose **unfetched**
 over `unloaded`: *bracket* is **already taken** in this codebase, by the `[…]` of a subscript expression — the
 parser splits on `.` at bracket depth and reports unbalanced brackets. A second meaning 3,000 lines away in the
@@ -303,12 +314,21 @@ A figure this server computed rather than read off the wire, labelled as such wh
 the two must never be printed as though they were the same kind of thing.
 _Avoid_: elapsed; measured (unqualified — the point of the term is *whose* measurement it is)
 
-**Several predate the term** and are not exceptions to it: a traced stop point's mean capture, arrival rate and
-capture share (TRACE-7), and the duration `debug.thread_dump` held the VM (#17). What the term was finally
-needed for is a **monitor pair**'s duration (ADR-0035), because that is the first case where the wire offers a
-*look-alike*: `MONITOR_WAIT` carries a `timeout` field, which is the value the caller passed to `wait(…)` and
-not how long it waited. Printing that as a duration would have been plausible on every reply, which is a worse
-failure than having no figure at all.
+**Several predate the term**: a traced stop point's mean capture, arrival rate and capture share (TRACE-7),
+and the duration `debug.thread_dump` held the VM (#17). What the term was finally needed for is a
+**monitor pair**'s duration (ADR-0035), because that is the first case where the wire offers a *look-alike*:
+`MONITOR_WAIT` carries a `timeout` field, which is the value the caller passed to `wait(…)` and not how long it
+waited. Printing that as a duration would have been plausible on every reply, which is a worse failure than
+having no figure at all.
+
+**The test for whether a figure needs the label is what it DESCRIBES, not who computed it** — and getting that
+backwards is a live risk, because the older figures above do not carry the label and a reader could take them
+for omissions. They are not. `Trace cost` describes *this server's* own cost and says so in its name, so there
+is nothing a caller could mistake it for; it is already unambiguous, and its no-data case is honest in the same
+way ("UNMEASURED rather than free"). A monitor duration is the opposite: it describes something about the
+**debuggee** — how long its thread was blocked — while being computed here, which is the only shape where a
+caller can reasonably read our number as theirs. So the label belongs to figures that cross that line, and
+adding it to a figure that describes us would be noise.
 
 So the label is not modesty about precision, it is a claim about **provenance**. A monitor duration is
 timestamped at the opening event and subtracted at the closing one, which means it includes our own capture
@@ -490,8 +510,8 @@ budget — filters after the event has already crossed the wire.
 **Two caller-facing names use the word for our side anyway**, and that is a stated mismatch rather than drift:
 `class_filter` on `debug.get_traces` selects among records already captured, and `min_duration_ms` is
 *described* as filtering — "what you READ, not what crosses the wire". Both are already-shipped caller surface,
-so the glossary records the gap instead of asserting a purity the schema does not have, exactly as the
-**Stop point** entry does for `bp_`/`breakpoint_id`. The reserved sense of the noun is still the debuggee's.
+so the glossary records the gap instead of asserting a purity the schema does not have, exactly as **Stop
+point** does for `bp_`/`breakpoint_id`. The reserved sense of the noun is still the debuggee's.
 Two hazards, each with its own term: a filter the debuggee accepts and does not apply is **inert**, and a
 filter naming an object or thread the debuggee has collected simply stops matching, which reads as *the code
 never ran*.
