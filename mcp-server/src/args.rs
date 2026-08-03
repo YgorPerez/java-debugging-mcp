@@ -1682,6 +1682,60 @@ mod tests {
         assert!(!a.read_only);
     }
 
+    // TEST-36 (#121): `trace` is the one stop-point default chosen for SAFETY rather than convenience, and
+    // the five arming tools deliberately disagree about it. That disagreement is the thing being pinned:
+    // three default to false because the caller picked the site, and two default to true because the site
+    // picks itself and a suspending hit there freezes a shared JVM.
+    //
+    // It is asserted here, on the structs, rather than left to the integration tests that catch it sideways.
+    // Flipping either `true` today fails two live-JVM tests — the slower after 27 seconds — with a message
+    // about batched arming rather than about a default, which is a 27-second detour to learn that one word
+    // moved. The near-miss that filed this is also the reason it belongs beside the fields: an edit adding a
+    // `condition` argument (FILT-6, #83) detached `#[serde(default = "default_true")]` from the field it
+    // governed and left it on the new one, silently inverting the method-exit default. Nothing named it.
+    #[test]
+    fn the_two_arming_tools_that_default_to_tracing_are_the_two_that_pick_their_own_site() {
+        // Suspending here is the fastest way this server offers to freeze a JVM nobody gave you. A method
+        // exit fires on EVERY return from a matched method, so a hot method is a freeze per call.
+        let mexit: SetMethodBreakpointArgs =
+            serde_json::from_value(serde_json::json!({"class_pattern": "com.example.Order"})).unwrap();
+        assert!(
+            mexit.trace,
+            "set_method_exit_stop traces by default: a suspending exit on a hot method freezes a shared JVM"
+        );
+
+        // Worse again, because contention is not a line anyone chose — it is wherever threads collide,
+        // including inside the JDK's own internals — so there is no class or method to narrow a suspending
+        // arm to. That is also why `trace:false` is refused here without a `thread_id`.
+        let mon: SetMonitorStopArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(
+            mon.trace,
+            "set_monitor_stop traces by default: contention is not a site the caller chose, so a suspending \
+             arm freezes the VM at a location nobody picked"
+        );
+    }
+
+    // The other half of the same statement, and the reason it is a separate test: `false` on these three is
+    // not an oversight to be tidied up into agreement with the two above. The caller named a line, a field or
+    // an exception type, so the hit is where they asked for it and suspending is the ordinary debugging
+    // request. Making these default to true would silently turn every breakpoint into a logpoint.
+    #[test]
+    fn the_three_arming_tools_whose_site_the_caller_names_default_to_suspending() {
+        let line: SetBreakpointArgs =
+            serde_json::from_value(serde_json::json!({"class_pattern": "com.example.Order", "line": 1}))
+                .unwrap();
+        assert!(!line.trace, "set_line_stop suspends by default: the caller named the line");
+
+        let exc: SetExceptionBreakpointArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!exc.trace, "set_exception_stop suspends by default: the caller named the exception");
+
+        let field: SetWatchpointArgs = serde_json::from_value(
+            serde_json::json!({"class_name": "com.example.Order", "field_name": "id"}),
+        )
+        .unwrap();
+        assert!(!field.trace, "set_field_stop suspends by default: the caller named the field");
+    }
+
     // FILT-4: the four arming tools must accept a class argument written either way, because the whole
     // point is that nothing written before it has to change.
     #[test]
