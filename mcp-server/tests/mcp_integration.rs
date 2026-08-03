@@ -13193,7 +13193,12 @@ fn conditional_field_and_method_exit_traces_filter_without_charging_the_budget()
     else {
         return;
     };
-    let mut probe = Probe::launch(&jdk, "CondKindsProbe").expect("launch");
+    // `launch_running`, not `launch`: the first thing this test does is arm a WATCHPOINT, which cannot be
+    // deferred, so the class has to be loaded before the arming — the TEST-17 (#49) race exactly. It lost
+    // that race **deterministically on JDK 11** ("Class 'CondKindsProbe' is not loaded yet"), and passed on
+    // 17, 21 and 25: a slower start does not make a race less likely, it changes the outcome.
+    let mut probe =
+        Probe::launch_running(&jdk, "CondKindsProbe", |l| l.starts_with("tick ")).expect("launch");
     let mut server = Server::start().expect("start server");
     probe.attach(&mut server);
 
