@@ -17,6 +17,17 @@ _Avoid_: target, remote, server (the last belongs to the MCP server, which is th
 The `WildFly` instance several people use at once. Not an environment name — the constraint that decides
 every safety default, because freezing it stalls other people's requests.
 
+**Head** (of an expression):
+The **first** segment of a chain, and the only segment whose meaning is not "a member of the thing before
+me". A head is resolved against the world — a local, `this`, a bare field of the frame's own class, a class
+name for a static, or an `@0x…` object handle — where every segment after it is resolved against the value
+its predecessor produced.
+The word is needed because the difference is a *rule*, not a formatting detail: a handle may only ever be a
+head (`something.@0x1f4c` is meaningless and is refused as such), and a one-segment name resolves through
+Java's own shadowing order where a later segment never does.
+_Avoid_: root, receiver (the receiver is what a segment is resolved *against*, which is the previous
+segment's value — the opposite end), base
+
 **Bound head** (of a condition):
 A name a `condition` may use that is not in the frame, because the **hit** carries it rather than the frame:
 `exception` on an exception stop, `newValue` on a field stop (ADR-0034). Reserved, exactly as `this` is, and
@@ -24,23 +35,30 @@ bound by rewriting to the `@0x…` handle when the value is an object. A method-
 frame is the returning method's own.
 _Avoid_: variable, magic name, implicit local (it is none of those — it is not in the variable table at all)
 
-**Erased type** / **generic type**:
-The **erased** type is what the JVM runs on and what a plain descriptor carries: `java.util.List`. The
-**generic** type is what the source declared, read from the class file's optional `Signature` attribute:
-`List<ReservaHotel>`. Every type string the tool emits is the generic one where the attribute exists and the
-erased one where it does not (ADR-0033) — and the difference is not cosmetic, because the generic type is
-what makes the *next* expression writable without a guess.
-_Avoid_: raw type (a real and different Java concept — a `List` written with no arguments at all, which is
-one of the ways the attribute comes to be absent), reified
+**Generic type**:
+The type as the *source* declared it, read from the class file's optional `Signature` attribute:
+`List<ReservaHotel>`. The counterpart of **erased type** below, and defined against it rather than beside it —
+every type string the tool emits is the generic one where the attribute exists and the erased one where it
+does not (ADR-0033).
+The distinction earns a word because the generic type is what makes the *next* expression writable without a
+guess: on a DTO graph, seeing `List` and having to guess the element type is an error and a retry, where
+`List<ReservaHotel>` composes straight into `lines[0].getSku()`.
+_Avoid_: raw type (a real and different Java concept — see **erased type**, which exists precisely in order
+not to assert it), reified (Java has none), declared type (true but says nothing about the parameters, which
+are the whole point)
 
 **Unfetched** (of a lazy association):
 A Hibernate entity proxy or persistent collection whose row or contents nobody has loaded. A **third
 answer** alongside a value and `null` (ADR-0032): the row very likely exists, and resolving through it is
 what would fetch it — issuing the deferred SELECTs into whatever persistence context the debuggee thread is
 in, or throwing `LazyInitializationException` if the entity is detached.
-_Avoid_: uninitialised (Hibernate's own word, but it reads as "not constructed"), empty (what an unfetched
-collection is mistaken FOR), null (what it is not — see **unbuilt source** for the same distinction about a
-class)
+The word is `unfetched` and not the more obvious `unloaded` for two reasons. **`unloaded` is already taken**,
+by a class the JVM has not loaded — see **loaded** below — so reusing it would collide with a correct existing
+use of the same word in the same glossary. And `fetch` is the domain's own word: `FetchType.LAZY` is the
+annotation on all 1897 of them.
+_Avoid_: unloaded (see above — it means a class here), uninitialised (Hibernate's own word, but it reads as
+"not constructed"), empty (what an unfetched collection is mistaken FOR), null (what it is not — see
+**unbuilt source** for the same distinction about a class)
 
 **Attached** / **launched**:
 Whose JVM it is — the fact every safety default here is derived from. An **attached** debuggee was started by

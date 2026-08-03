@@ -1396,7 +1396,7 @@ impl Probe {
     ///
     /// Every other probe here is in the default package, and that is not laziness — it keeps the file name,
     /// the class name and the main class one string. EVAL-9 (#86) is the case that cannot be: detecting an
-    /// unloaded Hibernate association turns on a fully-qualified type name
+    /// unfetched Hibernate association turns on a fully-qualified type name
     /// (`org.hibernate.proxy.HibernateProxy`), so a probe reproducing the shape must declare a type in that
     /// package — and one `.java` file declares one package, which puts the probe's own class there too.
     ///

@@ -129,16 +129,16 @@ public class LazyProxyProbe {
     }
 
     // The statics a test reads. Held in statics so every one is reachable with nothing suspended.
-    public static Object unloaded = new Order$HibernateProxy$Stub(false);
+    public static Object unfetched = new Order$HibernateProxy$Stub(false);
     public static Object loaded = new Order$HibernateProxy$Stub(true);
-    public static Object unloadedJavassist = new Order$HibernateProxy$Javassist(false);
+    public static Object unfetchedJavassist = new Order$HibernateProxy$Javassist(false);
     public static Object notAProxy = new Order$HibernateProxy$NotReally();
     public static Object plainEntity = new Order(9L, "plain");
 
     public static void main(String[] args) throws Exception {
         // Printed once so a test can prove the shapes are what it thinks before asserting anything.
-        System.out.println("unloaded is " + unloaded.getClass().getName());
-        System.out.println("proxy implements marker: " + (unloaded instanceof HibernateProxy));
+        System.out.println("unfetched is " + unfetched.getClass().getName());
+        System.out.println("proxy implements marker: " + (unfetched instanceof HibernateProxy));
         for (int i = 0; i < 100000; i++) {
             System.out.println("tick " + i); // BP1 — a suspending stop here is what
             // gives the invoking assertions a thread suspended BY AN EVENT, which is the only

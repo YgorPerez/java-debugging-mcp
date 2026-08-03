@@ -638,7 +638,7 @@ pub struct EvaluateArgs {
     /// "… +N more" (default 16).
     #[serde(default = "default_max_children")]
     pub max_children: usize,
-    /// Walk INTO an unloaded Hibernate lazy association instead of reporting it (EVAL-9, #86).
+    /// Walk INTO an unfetched Hibernate lazy association instead of reporting it (EVAL-9, #86).
     ///
     /// **Off by default, and the default is the honest answer.** An uninitialised proxy or persistent
     /// collection is a third outcome alongside "a value" and "null": the row or the collection exists and
@@ -679,7 +679,7 @@ pub struct EvaluateChainArgs {
     /// Maximum length of each link's rendered value.
     #[serde(default = "default_max_result_length")]
     pub max_result_length: usize,
-    /// Walk INTO an unloaded Hibernate lazy association instead of reporting it as a link (EVAL-9, #86).
+    /// Walk INTO an unfetched Hibernate lazy association instead of reporting it as a link (EVAL-9, #86).
     ///
     /// Off by default, and this is the tool where the default matters most: a chain runs to 7 links in the
     /// target stack, so walking in would fire the deferred SELECTs of every lazy association along the way

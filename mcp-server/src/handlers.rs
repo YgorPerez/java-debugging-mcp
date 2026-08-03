@@ -6557,7 +6557,7 @@ fn explain_no_match(names: &[(String, bool)], filter: Option<&str>) -> String {
     let mut note = format!(
         "Nothing matched that spelling — but {} loaded class(es) match it once `/` and `.` are read as \
          the same separator, so this is a spelling difference and NOT a class that is missing or \
-         unloaded. The debuggee has them. Search for one of these instead:\n",
+         unfetched. The debuggee has them. Search for one of these instead:\n",
         under_another_spelling.len(),
     );
     for fqn in &under_another_spelling {
@@ -12381,7 +12381,7 @@ async fn defer_breakpoint(
     // method, which does not exist yet — and it could not be reported to anyone if it failed later,
     // since arming happens on the event pump with no reply to carry a reason. Refusing costs nothing
     // real: `InstanceOnly` matches the event's `this`, so the filter object would have to be an instance
-    // of the class the stop point is in (or a subclass, which cannot load first), and an unloaded class
+    // of the class the stop point is in (or a subclass, which cannot load first), and an unfetched class
     // has none. A handle that parses here is therefore pointing at something else.
     if spec.instance_filter.is_some() {
         return Err(format!(
@@ -15586,7 +15586,7 @@ fn lazy_policy(force_initialize: bool, read_only: bool) -> Result<LazyPolicy, St
     Ok(if force_initialize { LazyPolicy::Initialize } else { LazyPolicy::Report })
 }
 
-// ----- EVAL-9 (#86): an UNLOADED Hibernate lazy value is a third answer -----
+// ----- EVAL-9 (#86): an UNFETCHED Hibernate lazy value is a third answer -----
 //
 // `debug.evaluate_chain` is the right tool for this stack's dominant bug shape, and it INVOKED each link.
 // Against 1897 measured `FetchType.LAZY` associations and zero `EAGER`, that does one of two things, both
@@ -15640,7 +15640,7 @@ enum LazyState {
     /// answer for every non-Hibernate JVM and it must stay byte-identical.
     Loaded,
     /// Uninitialised. Resolving through it would load it.
-    Unloaded(LazyShape),
+    Unfetched(LazyShape),
     /// It IS a Hibernate lazy value and the `initialized` flag could not be read, so this cannot say which
     /// of the two above it is. Reported as a third answer rather than assumed either way: `check_stale`
     /// models the same **cannot tell** (DISC-7), and guessing "loaded" here would fail open into precisely
@@ -15651,7 +15651,7 @@ enum LazyState {
 /// Whether the caller asked for the load.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LazyPolicy {
-    /// Report an unloaded link and resolve nothing through it. The default, and the honest answer.
+    /// Report an unfetched link and resolve nothing through it. The default, and the honest answer.
     Report,
     /// Walk in anyway — `force_initialize: true`. The side effect is the caller's, stated at the argument.
     Initialize,
@@ -15682,7 +15682,7 @@ fn hibernate_candidate(sig: &str) -> Option<LazyShape> {
     sig.starts_with("Lorg/hibernate/collection/").then_some(LazyShape::Collection)
 }
 
-/// Is this object an UNLOADED Hibernate lazy value?
+/// Is this object an UNFETCHED Hibernate lazy value?
 ///
 /// **Invokes nothing.** Type metadata and field reads only, which is the entire safety claim of EVAL-9 and
 /// is asserted directly by a test rather than left as a comment.
@@ -15715,7 +15715,7 @@ async fn hibernate_lazy_state(
             };
             match read_initialized_flag(conn, init_id).await {
                 Ok(true) => LazyState::Loaded,
-                Ok(false) => LazyState::Unloaded(LazyShape::EntityProxy),
+                Ok(false) => LazyState::Unfetched(LazyShape::EntityProxy),
                 Err(why) => LazyState::Unknown(why),
             }
         }
@@ -15733,7 +15733,7 @@ async fn hibernate_lazy_state(
             // A collection carries the flag directly — there is no initialiser object in between.
             match read_initialized_flag(conn, obj_id).await {
                 Ok(true) => LazyState::Loaded,
-                Ok(false) => LazyState::Unloaded(LazyShape::Collection),
+                Ok(false) => LazyState::Unfetched(LazyShape::Collection),
                 Err(why) => LazyState::Unknown(why),
             }
         }
@@ -15781,7 +15781,7 @@ async fn read_initialized_flag(conn: &mut jdwp_client::JdwpConnection, obj_id: u
     }
 }
 
-/// What an unloaded value IS, said once so every place that has to say it says the same thing.
+/// What an unfetched value IS, said once so every place that has to say it says the same thing.
 const fn lazy_link_note(shape: LazyShape) -> &'static str {
     match shape {
         // Kept SHORT: this lands in a chain table where every link is one line, and the reason it matters
@@ -15801,10 +15801,10 @@ const fn lazy_link_kind(shape: LazyShape) -> &'static str {
 
 /// The one-line form for a chain step, where the class name is the only place it appears.
 fn lazy_link_summary(shape: LazyShape, class_name: &str) -> String {
-    format!("⏳ UNLOADED {} ({class_name}) — {}", lazy_link_kind(shape), lazy_link_note(shape))
+    format!("⏳ UNFETCHED {} ({class_name}) — {}", lazy_link_kind(shape), lazy_link_note(shape))
 }
 
-/// The full report that replaces resolving a link through an unloaded lazy association.
+/// The full report that replaces resolving a link through an unfetched lazy association.
 ///
 /// Long on purpose. "Uninitialized proxy" alone reads as a defect in the debugger; what a caller needs is
 /// that this is a third answer, what the alternative would have cost the debuggee, and the way to ask for
@@ -15846,7 +15846,7 @@ fn lazy_unknown_report(why: &str, class_name: &str, member: &str) -> String {
 /// Apply the policy to a receiver before any member of it is resolved.
 ///
 /// This is the seam #86 names, and the live verification is what settled it: BOTH a method call and a
-/// FIELD read on an unloaded proxy are wrong, so the check has to sit above the two — where `evaluate` and
+/// FIELD read on an unfetched proxy are wrong, so the check has to sit above the two — where `evaluate` and
 /// `evaluate_chain` both pass through it.
 async fn check_lazy_receiver(
     conn: &mut jdwp_client::JdwpConnection,
@@ -15875,7 +15875,7 @@ async fn check_lazy_receiver(
     //   deferred SELECT. So every field read is safe, `initialized` included.
     if seg.args.is_none() {
         let safe = match state {
-            LazyState::Unloaded(LazyShape::Collection) => true,
+            LazyState::Unfetched(LazyShape::Collection) => true,
             _ => declares_field(conn, type_id, &seg.name).await,
         };
         if safe {
@@ -15886,7 +15886,7 @@ async fn check_lazy_receiver(
     let class_name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
     match state {
         LazyState::Loaded => Ok(()),
-        LazyState::Unloaded(shape) => Err(lazy_link_report(shape, &class_name, member)),
+        LazyState::Unfetched(shape) => Err(lazy_link_report(shape, &class_name, member)),
         LazyState::Unknown(why) => Err(lazy_unknown_report(&why, &class_name, member)),
     }
 }
@@ -15935,7 +15935,7 @@ async fn resolve_member(
         .await
         .map_err(|e| format!("Failed to resolve object type: {e}"))?;
 
-    // EVAL-9: above the field/method split on purpose. Both are wrong against an unloaded lazy value —
+    // EVAL-9: above the field/method split on purpose. Both are wrong against an unfetched lazy value —
     // the invoke loads it or throws, and the field read silently returns the proxy's own unpopulated copy.
     check_lazy_receiver(conn, obj_id, type_id, seg, lazy).await?;
 
@@ -16313,7 +16313,7 @@ struct ChainStep {
     /// Why the walk stopped at this link, if it did.
     ///
     /// **Three outcomes, not two** (EVAL-9, #86). `null` used to be the only thing that ended a walk; an
-    /// UNLOADED Hibernate lazy association is a third — the row or the collection exists, nobody has
+    /// UNFETCHED Hibernate lazy association is a third — the row or the collection exists, nobody has
     /// fetched it, and it is resolving the next link that would fetch it. Folding that into `null` would
     /// report "this link is null" about an association that is merely unfetched, which is the chain report
     /// blaming a link that is fine.
@@ -16324,10 +16324,10 @@ struct ChainStep {
 enum LinkEnd {
     /// The link resolved to `null` — the original ending.
     Null,
-    /// The link is an unloaded Hibernate lazy association (EVAL-9). Carries the shape because a proxy and
+    /// The link is an unfetched Hibernate lazy association (EVAL-9). Carries the shape because a proxy and
     /// a collection need different sentences: reading the proxy is already wrong, while the collection is
     /// fine to hold and it is the NEXT link that would load it.
-    Unloaded(LazyShape),
+    Unfetched(LazyShape),
     /// It is a Hibernate lazy association and whether it has been fetched could not be read.
     CannotTell,
 }
@@ -16441,7 +16441,7 @@ async fn chain_step(
     // object-to-type lookup is per OBJECT and cannot be cached, where `resolve_member`'s own check is free.
     // Every link with a successor is already checked there, and the one case that is not — a chain that
     // ENDS on the lazy value — is settled once by `mark_trailing_lazy` below. `render_value` renders an
-    // unloaded value as what it is rather than by invoking `toString()`, at no extra cost, because
+    // unfetched value as what it is rather than by invoking `toString()`, at no extra cost, because
     // `render_object` has the type in hand already.
     ChainStep { label, rendered: render_value(conn, v, None, max_len, how).await, end: None }
 }
@@ -16463,7 +16463,7 @@ async fn mark_trailing_lazy(
         return;
     }
     let end = match lazy_state_of(conn, v, lazy).await {
-        Some(LazyState::Unloaded(shape)) => LinkEnd::Unloaded(shape),
+        Some(LazyState::Unfetched(shape)) => LinkEnd::Unfetched(shape),
         Some(LazyState::Unknown(_)) => LinkEnd::CannotTell,
         _ => return,
     };
@@ -16523,9 +16523,9 @@ fn render_expression_chain(expr: &str, walk: &ChainWalk) -> String {
             match s.end {
                 None => "✔",
                 Some(LinkEnd::Null) => "✘",
-                // Its own glyph, because an unloaded association is not a failed link and must not read as
+                // Its own glyph, because an unfetched association is not a failed link and must not read as
                 // one — the walk stopped to avoid a side effect, not because anything went wrong.
-                Some(LinkEnd::Unloaded(_)) => "⏳",
+                Some(LinkEnd::Unfetched(_)) => "⏳",
                 Some(LinkEnd::CannotTell) => "❓",
             },
             s.label,
@@ -16538,17 +16538,17 @@ fn render_expression_chain(expr: &str, walk: &ChainWalk) -> String {
         Some(at) => {
             let step = steps.get(at).map_or("?", |s| s.label.as_str());
             let _ = match steps.get(at).and_then(|s| s.end.as_ref()) {
-                Some(LinkEnd::Unloaded(LazyShape::EntityProxy)) => write!(
+                Some(LinkEnd::Unfetched(LazyShape::EntityProxy)) => write!(
                     out,
-                    "⏳ link {} of {} is an UNLOADED Hibernate proxy: {step} — not null, and not a value. \
+                    "⏳ link {} of {} is an UNFETCHED Hibernate proxy: {step} — not null, and not a value. \
                      The row it stands for may well exist; nobody has fetched it, and this walk stopped \
                      rather than fetch it for you",
                     at + 1,
                     walk.total_links
                 ),
-                Some(LinkEnd::Unloaded(LazyShape::Collection)) => write!(
+                Some(LinkEnd::Unfetched(LazyShape::Collection)) => write!(
                     out,
-                    "⏳ link {} of {} is an UNLOADED Hibernate collection: {step} — the collection exists \
+                    "⏳ link {} of {} is an UNFETCHED Hibernate collection: {step} — the collection exists \
                      and its contents have not been fetched, so it is neither empty nor populated as far \
                      as this can tell. The next link is what would fetch them",
                     at + 1,
@@ -17837,11 +17837,15 @@ async fn render_object(
     if let Some(unboxed) = render_boxed_primitive(conn, id).await {
         return unboxed;
     }
-    // EVAL-9: never `toString()` an unloaded Hibernate lazy value. On a proxy that call IS the load —
+    // EVAL-9: never `toString()` an unfetched Hibernate lazy value. On a proxy that call IS the load —
     // rendering it would perform in the *renderer* exactly the side effect the resolver just refused to
     // perform, and a caller whose chain ended on the proxy would have triggered it by asking what it is.
-    if let LazyState::Unloaded(shape) = hibernate_lazy_state(conn, id, type_id).await {
-        return format!("{name} @0x{id:x} ⏳ UNLOADED {} — {}", lazy_link_kind(shape), lazy_link_note(shape));
+    if let LazyState::Unfetched(shape) = hibernate_lazy_state(conn, id, type_id).await {
+        return format!(
+            "{name} @0x{id:x} ⏳ UNFETCHED {} — {}",
+            lazy_link_kind(shape),
+            lazy_link_note(shape)
+        );
     }
     // best-effort toString() when we have a thread to run it on
     if let Some(tid) = thread_id {

@@ -29,7 +29,7 @@ error at all**, where the invoke at least throws.
 
 ### An unfetched association is a third answer, not a null and not a value
 
-`⏳ UNLOADED` sits alongside "a value" and "`null`". A chain walk stops there and says which of the three it
+`⏳ UNFETCHED` sits alongside "a value" and "`null`". A chain walk stops there and says which of the three it
 is; `ChainStep` carries three endings rather than a `bool`. Folding it into `null` would report "this link is
 null" about a row that very likely exists, which is the chain report blaming the wrong link — the exact
 failure the tool was built to remove. `check_stale` already models a **cannot tell** third answer

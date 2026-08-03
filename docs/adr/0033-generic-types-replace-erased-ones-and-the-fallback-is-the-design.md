@@ -15,7 +15,7 @@ On a DTO graph that is the information a caller needs to compose the **next** ex
 almost pure DTO — 213 model classes, 88 request/response types, 60 more — and `it-common` adds ~105 domain
 `WS*` types plus ~400 per-vertical ones. The workflow was: look at a frame, see a `List`, guess what is in
 it, get an error, retry. The worst case found: `integraWS` holds a
-`Map<Integer, Map<WSIntegradorEnum, LinkedList<WSSessao>>>`, which rendered raw reads as nothing navigable.
+`Map<Integer, Map<WSIntegradorEnum, LinkedList<WSSessao>>>`, which rendered erased reads as nothing navigable.
 
 ## Decision
 
@@ -100,9 +100,9 @@ class had loaded, which passed on JDK 21 and 17 and failed *deterministically* o
 **Generics behind an argument.** No contract event, and no benefit either: the default would stay the
 workflow the issue exists to remove.
 
-**Emit both the generic and the erased name.** Nothing downstream that greps a raw type breaks, at the cost
-of noise on every line of every listing — and the raw name is still one `decode_signature` away for anything
-that needs it.
+**Emit both the generic and the erased name.** Nothing downstream that greps an erased type breaks, at the
+cost of noise on every line of every listing — and the erased name is still one `decode_signature` away for
+anything that needs it.
 
 **Render the raw generic signature verbatim.** Cannot mangle anything because it parses nothing, and hands
 the caller JVM-descriptor syntax to read. Rejected in the issue's own framing.

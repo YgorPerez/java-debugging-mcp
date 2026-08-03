@@ -291,7 +291,7 @@ fn watchpoints_report_field_writes_and_reads() {
         &["has no field 'nope'"],
     );
     assert_contains_all(
-        "unloaded class",
+        "unfetched class",
         &server.call(
             "debug.set_field_stop",
             serde_json::json!({"class_name": "NoSuchClass", "field_name": "x"}),
@@ -6443,7 +6443,7 @@ fn disc2_method_listing(server: &mut Server) -> Vec<String> {
     // rather than pick one — and point at the tool that can tell them apart.
     let missing =
         server.call("debug.list_methods", serde_json::json!({"class_name": "com.example.NoSuchThing"}));
-    assert_contains_all("unloaded class", &missing, &["is not loaded", "debug.list_classes"]);
+    assert_contains_all("unfetched class", &missing, &["is not loaded", "debug.list_classes"]);
 
     vec![m, twice, own, chain, missing]
 }
@@ -6524,7 +6524,7 @@ fn disc5_field_listing(server: &mut Server) -> Vec<String> {
     let own = server.call("debug.list_fields", serde_json::json!({"class_name": "EvalProbe$Subtask"}));
     assert!(own.starts_with("0/0 field(s) on EvalProbe$Subtask"), "{own}");
     assert_contains_all("resolved but empty", &own, &["RESOLVED", "inherited:true"]);
-    assert!(!own.contains("not loaded"), "a class that resolved must never be called unloaded: {own}");
+    assert!(!own.contains("not loaded"), "a class that resolved must never be called unfetched: {own}");
 
     // And the walk, attributing the row to the class that declares it.
     let chain = server.call(
@@ -6537,7 +6537,7 @@ fn disc5_field_listing(server: &mut Server) -> Vec<String> {
     // pick one — the same resolver, and therefore the same answer, as `list_methods` gives.
     let missing =
         server.call("debug.list_fields", serde_json::json!({"class_name": "com.example.NoSuchThing"}));
-    assert_contains_all("unloaded class", &missing, &["is not loaded", "debug.list_classes"]);
+    assert_contains_all("unfetched class", &missing, &["is not loaded", "debug.list_classes"]);
 
     vec![f, item, capped, filtered, own, chain, missing]
 }
@@ -6946,8 +6946,8 @@ fn source_reports_the_compiled_from_file_and_reads_a_window_from_a_root() {
     );
 
     // --- the failure modes stay distinguishable ---
-    let unloaded = server.call("debug.source", serde_json::json!({"class_name": "com.example.NoSuchThing"}));
-    assert_contains_all("unloaded class", &unloaded, &["is not loaded", "debug.list_classes"]);
+    let unfetched = server.call("debug.source", serde_json::json!({"class_name": "com.example.NoSuchThing"}));
+    assert_contains_all("unfetched class", &unfetched, &["is not loaded", "debug.list_classes"]);
 
     // A root that exists but does not hold this class: the JVM's answer must survive the local miss.
     let elsewhere = server.call(
@@ -7072,7 +7072,7 @@ fn source_says_when_a_loaded_class_carries_no_source_file_attribute() {
         &stripped,
         &["NO source file", "-g:none", "debug.list_methods"],
     );
-    // Not the unloaded answer. The class is right there and the attribute is what is missing, so a reply
+    // Not the unfetched answer. The class is right there and the attribute is what is missing, so a reply
     // saying "not loaded" would send someone hunting a classpath problem that does not exist.
     assert!(!stripped.contains("is not loaded"), "ABSENT_INFORMATION is not 'not loaded': {stripped}");
     let methods = server.call("debug.list_methods", serde_json::json!({"class_name": "StrippedProbe"}));
@@ -8140,7 +8140,7 @@ fn a_hidden_class_answers_questions_asked_under_the_name_the_stack_printed() {
     assert!(
         !methods.contains("is not loaded"),
         "DISC-4 (#50): {printed} is the name this tool printed for a frame in the stack it just read — \
-         calling it unloaded is wrong about a class the debugger is looking straight at:\n{methods}"
+         calling it unfetched is wrong about a class the debugger is looking straight at:\n{methods}"
     );
     assert!(
         methods.contains(&format!("method(s) on {printed}")),
@@ -8168,7 +8168,7 @@ fn a_hidden_class_answers_questions_asked_under_the_name_the_stack_printed() {
     assert!(
         !fields.contains("is not loaded"),
         "DISC-5 (#53): {printed} came off the stack this server just printed — a field listing may not \
-         call it unloaded:\n{fields}"
+         call it unfetched:\n{fields}"
     );
     assert!(
         fields.contains(&format!("field(s) on {printed}")),
@@ -12114,7 +12114,7 @@ fn a_stop_point_scoped_to_one_object_ignores_its_twin_and_refuses_where_it_could
         serde_json::json!({"class_pattern": "NoSuchClassHere", "line": 1, "instance_id": x}),
     );
     assert_contains_all(
-        "an unloaded class is refused, because no instance of it can exist",
+        "an unfetched class is refused, because no instance of it can exist",
         &deferred,
         &["not loaded yet", "has none"],
     );
@@ -12662,7 +12662,7 @@ fn float_and_double_literals_reach_the_overload_they_name() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// EVAL-9 (#86) — an UNLOADED Hibernate lazy association is a third answer
+// EVAL-9 (#86) — an UNFETCHED Hibernate lazy association is a third answer
 //
 // The safety claim is that detection invokes NOTHING, so every test here ends by reading the
 // `initialized` flag again: still false means nothing was loaded. Both probes are STRUCTURAL — the
@@ -12677,12 +12677,12 @@ fn float_and_double_literals_reach_the_overload_they_name() {
 const LAZY_PROXY_MAIN: &str = "org.hibernate.proxy.LazyProxyProbe";
 const LAZY_COLLECTION_MAIN: &str = "org.hibernate.collection.spi.LazyCollectionProbe";
 
-/// An unloaded entity proxy is reported rather than walked into — on a method call AND on an inherited
+/// An unfetched entity proxy is reported rather than walked into — on a method call AND on an inherited
 /// field read, which is the case the brief does not name and the one with no error today.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
-fn an_unloaded_proxy_is_reported_instead_of_being_initialised() {
-    let Some(jdk) = jdk_or_skip("an_unloaded_proxy_is_reported_instead_of_being_initialised") else {
+fn an_unfetched_proxy_is_reported_instead_of_being_initialised() {
+    let Some(jdk) = jdk_or_skip("an_unfetched_proxy_is_reported_instead_of_being_initialised") else {
         return;
     };
     let mut probe = Probe::launch_in_package(&jdk, "LazyProxyProbe", LAZY_PROXY_MAIN).expect("launch");
@@ -12693,11 +12693,11 @@ fn an_unloaded_proxy_is_reported_instead_of_being_initialised() {
         .expect("the probe never confirmed its own shape — the stand-in is not what this test assumes");
 
     // A method call through the proxy: the case the issue was filed about.
-    let called = server.evaluate("LazyProxyProbe.unloaded.getRef()");
+    let called = server.evaluate("LazyProxyProbe.unfetched.getRef()");
     assert_contains_all(
-        "a method call through an unloaded proxy is reported, not performed",
+        "a method call through an unfetched proxy is reported, not performed",
         &called,
-        &["UNLOADED Hibernate proxy", "getRef()", "NOT resolved", "force_initialize"],
+        &["UNFETCHED Hibernate proxy", "getRef()", "NOT resolved", "force_initialize"],
     );
     assert!(
         !called.contains("WALKED IN"),
@@ -12706,11 +12706,11 @@ fn an_unloaded_proxy_is_reported_instead_of_being_initialised() {
     );
 
     // An INHERITED field read: silently wrong today, which is worse than the invoke.
-    let field = server.evaluate("LazyProxyProbe.unloaded.id");
+    let field = server.evaluate("LazyProxyProbe.unfetched.id");
     assert_contains_all(
         "an inherited field read is reported too",
         &field,
-        &["UNLOADED Hibernate proxy", ".id"],
+        &["UNFETCHED Hibernate proxy", ".id"],
     );
     assert!(
         !field.contains("= null"),
@@ -12722,15 +12722,15 @@ fn an_unloaded_proxy_is_reported_instead_of_being_initialised() {
     // The proxy's OWN declared field is still readable, and it has to be: it is what the detection reads.
     assert_contains_all(
         "a field the proxy itself declares is its own state and stays readable",
-        &server.evaluate("LazyProxyProbe.unloaded.$$_hibernate_interceptor.initialized"),
+        &server.evaluate("LazyProxyProbe.unfetched.$$_hibernate_interceptor.initialized"),
         &["(boolean) false"],
     );
 
     // The Hibernate 3.x/4.x spelling reaches the same verdict through the other field name.
     assert_contains_all(
         "the Javassist-era `handler` field is found too",
-        &server.evaluate("LazyProxyProbe.unloadedJavassist.getRef()"),
-        &["UNLOADED Hibernate proxy"],
+        &server.evaluate("LazyProxyProbe.unfetchedJavassist.getRef()"),
+        &["UNFETCHED Hibernate proxy"],
     );
 
     // --- and the three things that must be UNAFFECTED ---
@@ -12740,13 +12740,13 @@ fn an_unloaded_proxy_is_reported_instead_of_being_initialised() {
         &["null"],
     );
     assert!(
-        !server.evaluate("LazyProxyProbe.loaded.id").contains("UNLOADED"),
-        "a proxy whose `initialized` is true must not be reported as unloaded"
+        !server.evaluate("LazyProxyProbe.loaded.id").contains("UNFETCHED"),
+        "a proxy whose `initialized` is true must not be reported as unfetched"
     );
     // Named like a proxy, implements nothing: the INTERFACE decides, not the name.
     let not_really = server.evaluate("LazyProxyProbe.notAProxy.id");
     assert!(
-        !not_really.contains("UNLOADED"),
+        !not_really.contains("UNFETCHED"),
         "a class merely NAMED `$HibernateProxy$` is not one. The name is a cost gate; the marker interface \
          is the decision, and conflating them would report an unfetched row for any class named this \
          way:\n{not_really}"
@@ -12761,7 +12761,7 @@ fn an_unloaded_proxy_is_reported_instead_of_being_initialised() {
     // THE SAFETY CLAIM: after all of the above, nothing has been initialised.
     assert_contains_all(
         "detection invoked nothing — the flag is still false",
-        &server.evaluate("LazyProxyProbe.unloaded.$$_hibernate_interceptor.initialized"),
+        &server.evaluate("LazyProxyProbe.unfetched.$$_hibernate_interceptor.initialized"),
         &["(boolean) false"],
     );
 }
@@ -12801,7 +12801,7 @@ fn a_chain_stops_at_an_unfetched_collection_and_says_which_of_three_it_is() {
     assert_contains_all(
         "calling size() on an unfetched collection is reported",
         &sized,
-        &["UNLOADED Hibernate collection", "size()", "NOT resolved"],
+        &["UNFETCHED Hibernate collection", "size()", "NOT resolved"],
     );
     assert!(
         !sized.contains("-1"),
@@ -12815,7 +12815,7 @@ fn a_chain_stops_at_an_unfetched_collection_and_says_which_of_three_it_is() {
     assert_contains_all(
         "a chain ending on the collection names the third outcome",
         &ended,
-        &["⏳", "UNLOADED Hibernate collection", "next link"],
+        &["⏳", "UNFETCHED Hibernate collection", "next link"],
     );
     assert!(
         !ended.contains("no link in this chain is null or unfetched"),
@@ -12842,7 +12842,7 @@ fn a_chain_stops_at_an_unfetched_collection_and_says_which_of_three_it_is() {
         serde_json::json!({"expression": "LazyCollectionProbe.fetched.size()"}),
     );
     assert!(
-        fetched.contains("-1") && !fetched.contains("UNLOADED"),
+        fetched.contains("-1") && !fetched.contains("UNFETCHED"),
         "an INITIALISED collection must behave exactly as before — size() runs:\n{fetched}"
     );
     let not_a_collection = server.call(
@@ -12850,7 +12850,7 @@ fn a_chain_stops_at_an_unfetched_collection_and_says_which_of_three_it_is() {
         serde_json::json!({"expression": "LazyCollectionProbe.notACollection.size()"}),
     );
     assert!(
-        !not_a_collection.contains("UNLOADED"),
+        !not_a_collection.contains("UNFETCHED"),
         "a class in org.hibernate.collection that implements the marker interface is a collection; one \
          that merely lives in the package is not. The package is a cost gate, not the decision:\n\
          {not_a_collection}"
@@ -12880,7 +12880,7 @@ fn force_initialize_walks_in_when_the_caller_asks_for_it() {
     // With the opt-in, the walk happens — and the probe's marker value is the proof that it did.
     let forced = server.call(
         "debug.evaluate",
-        serde_json::json!({"expression": "LazyProxyProbe.unloaded.getRef()", "force_initialize": true}),
+        serde_json::json!({"expression": "LazyProxyProbe.unfetched.getRef()", "force_initialize": true}),
     );
     assert!(
         forced.contains("WALKED IN"),
@@ -12890,7 +12890,7 @@ fn force_initialize_walks_in_when_the_caller_asks_for_it() {
     // The chain tool takes it too, and the two must not disagree.
     let forced_chain = server.call(
         "debug.evaluate_chain",
-        serde_json::json!({"expression": "LazyProxyProbe.unloaded.getRef()", "force_initialize": true}),
+        serde_json::json!({"expression": "LazyProxyProbe.unfetched.getRef()", "force_initialize": true}),
     );
     assert!(
         forced_chain.contains("WALKED IN"),
@@ -12923,7 +12923,7 @@ fn a_read_only_session_refuses_force_initialize_by_name() {
 
     let refused = server.call(
         "debug.evaluate",
-        serde_json::json!({"expression": "LazyProxyProbe.unloaded.getRef()", "force_initialize": true}),
+        serde_json::json!({"expression": "LazyProxyProbe.unfetched.getRef()", "force_initialize": true}),
     );
     assert_contains_all(
         "read-only names force_initialize rather than failing inside the invoke",
@@ -12935,8 +12935,8 @@ fn a_read_only_session_refuses_force_initialize_by_name() {
     // needs no write, which is the reason it is the default.
     assert_contains_all(
         "the report itself needs no write, so read-only still gets it",
-        &server.evaluate("LazyProxyProbe.unloaded.getRef()"),
-        &["UNLOADED Hibernate proxy"],
+        &server.evaluate("LazyProxyProbe.unfetched.getRef()"),
+        &["UNFETCHED Hibernate proxy"],
     );
 }
 

@@ -278,8 +278,8 @@ instance: a static holder, a class you are about to breakpoint into, a vendored 
 cannot show you. Each field is rendered the way Java source spells it (static final java.lang.String INFRA,
 int qty), so static and instance fields are told apart at a glance and the declared type is a name you can
 use. TYPE ARGUMENTS ARE SHOWN WHERE THE CLASS FILE CARRIES THEM (DISC-12): a field declared List<ReservaHotel>
-reads as that rather than as a raw java.util.List, nested and wildcard types included — which is what lets you
-compose lines[0].getSku() from one listing instead of guessing the element type and retrying. A generic
+reads as that rather than as a bare java.util.List, nested and wildcard types included — which is what lets
+you compose lines[0].getSku() from one listing instead of guessing the element type and retrying. A generic
 signature is an OPTIONAL class-file attribute, so a member that has none renders exactly what it always did,
 and a blank type is never printed. Statics are listed FIRST, because those are the ones debug.evaluate can
 read with no instance and no suspended thread. final and volatile are marked too: a final may refuse a
@@ -687,7 +687,7 @@ shared instance. That is the difference from condition, which we evaluate on our
 EVERY hit. REFUSED IN TWO CASES, BOTH BECAUSE THE ALTERNATIVE IS A SILENT LIE: on a STATIC method, which has
 no `this` to match — HotSpot accepts the modifier there and then fires for every hit, with no error and a
 reply claiming the stop point is scoped (measured on Temurin 17/21/25); and on a class that is NOT LOADED yet,
-because a deferred stop point cannot be checked for the first case and no instance of an unloaded class can
+because a deferred stop point cannot be checked for the first case and no instance of an unfetched class can
 exist anyway, so the handle would belong to something else. THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the
 debuggee collects the object the filter simply stops matching and the stop point goes quiet, which is
 indistinguishable from the code never running — debug.list_stop_points checks for that and says so.
