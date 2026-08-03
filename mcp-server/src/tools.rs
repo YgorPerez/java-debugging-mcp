@@ -249,6 +249,7 @@ fn inspection_tools() -> Vec<Tool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     // The client sees one flat list; guard against a group being dropped from `get_tools` or a name
     // appearing twice after a regroup.
@@ -311,10 +312,16 @@ mod tests {
     /// one-line string there is nothing to conflict on — the line is a single hunk and whichever side wins
     /// takes its neighbour's words with it.
     ///
-    /// Nothing caught it. The test above asserts on tool *names*, the schema snapshots on argument shapes, and
-    /// no human reads a 4000-character line in a diff. But these descriptions are the caller's only
+    /// Nothing caught it. The test above asserts on tool *names*, nothing at all asserted on argument shapes,
+    /// and no human reads a 4000-character line in a diff. But these descriptions are the caller's only
     /// documentation, and `docs/toolkit-contract.md` names them as the mitigation for five of the downstream
     /// toolkit's six silent failure modes — so gibberish here is a caller-visible defect, and it shipped.
+    ///
+    /// That middle clause used to read "the schema snapshots on argument shapes", and there were none
+    /// (DOC-8, #120). A sentence over-stating what is verified, inside the explanation written *because*
+    /// "nothing caught it", is the same defect one level up: the next person deciding whether an argument
+    /// change needs a guard reads it and concludes one is already there. `argument_schemas_match_the_committed_snapshot`
+    /// is what makes the claim true now, and it is stated in the past tense here because it was not true then.
     ///
     /// The patterns are the *shapes* that kind of damage leaves rather than a spell-check: a stranded clause
     /// starts with punctuation, a spliced sentence doubles a word or a space, a truncated one ends mid-token.
@@ -411,8 +418,11 @@ mod tests {
     /// wrong in a file where `debug.evaluate` and `Klass.CONSTANT` are ordinary text. Wrapping needs no
     /// heuristic and still makes a corrupted clause a two-line diff.
     ///
-    /// Regenerate with `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp tool_descriptions`, then read the
-    /// diff — that is the whole point of it.
+    /// Regenerate with `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot`, then read the
+    /// diff — that is the whole point of it. The filter is `_snapshot` rather than this test's own name
+    /// because there are two of these now and one command has to rewrite both: a filter naming one of them
+    /// leaves the other failing against a file it was never given the chance to update, which is a
+    /// regeneration path that teaches you to run it twice (DOC-8, #120).
     #[test]
     fn tool_descriptions_match_the_committed_snapshot() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tool-descriptions.txt");
@@ -428,7 +438,7 @@ mod tests {
         let committed = std::fs::read_to_string(&path).unwrap_or_else(|why| {
             panic!(
                 "cannot read the tool-description snapshot at {}: {why}. Create it with \
-                 UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp tool_descriptions",
+                 UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot",
                 path.display()
             )
         });
@@ -450,7 +460,7 @@ mod tests {
             };
             panic!(
                 "a tool description changed without its snapshot being updated.\n\n{first}\n\nIf the change \
-                 was deliberate: UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp tool_descriptions, then \
+                 was deliberate: UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot, then \
                  READ THE DIFF — a caller-visible change behind an unchanged tool name is what \
                  docs/toolkit-contract.md is for. If it was not deliberate, a merge has shredded a \
                  one-line string literal again (DOC-7, #108)."
@@ -463,12 +473,13 @@ mod tests {
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         let mut out = String::from(
             "# Every debug.* tool description, word-wrapped at 110 columns. GENERATED — do not hand-edit:\n\
-             #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp tool_descriptions\n\
+             #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot\n\
              #\n\
              # This file exists so that a change to a tool description has to be READ by somebody. Two merges\n\
              # in the v0.9.0 range interleaved two of these single-line string literals and shipped the\n\
-             # gibberish; nothing failed, because the tests asserted on names and argument shapes and no human\n\
-             # reads a 4000-character line in a diff (DOC-7, #108).\n",
+             # gibberish; nothing failed, because the tests asserted on names and nothing else, and no human\n\
+             # reads a 4000-character line in a diff (DOC-7, #108). Argument schemas are guarded separately,\n\
+             # in argument-schemas.txt, which the same command regenerates (DOC-8, #120).\n",
         );
         for tool in tools {
             out.push_str("\n## ");
@@ -501,5 +512,161 @@ mod tests {
             lines.push(line);
         }
         lines
+    }
+
+    /// The generated argument schemas, as a committed snapshot — the coverage the comment above used to
+    /// claim (DOC-8, #120).
+    ///
+    /// `no_tool_description_carries_the_marks_of_a_bad_merge` said "the schema snapshots on argument shapes"
+    /// as part of its argument for why a *description* snapshot had to exist. There were no schema snapshots.
+    /// The only test over the generated schemas asserted that they GENERATE, so an argument's type, its
+    /// default or its description could change with nothing failing — and the sentence claiming otherwise was
+    /// inside the explanation written *because* "nothing caught it", which is the same defect one level up:
+    /// the next person deciding whether an argument change needs a guard would read it and conclude one was
+    /// already there.
+    ///
+    /// It was not hypothetical. Renaming a term across the caller-facing surface in v0.14.1 changed **five**
+    /// argument descriptions and the description snapshot showed no diff at all, because it renders
+    /// `tool.description` and never touches `input_schema`. Those lines are published: `schemars` turns them
+    /// into the `inputSchema` property descriptions, so a caller reads them, and
+    /// `docs/toolkit-contract.md` names them as a mitigation for the downstream toolkit's silent failure
+    /// modes. 37 tool descriptions were guarded and the 173 argument descriptions behind them were not.
+    ///
+    /// **Generated from `get_tools()`, so it cannot drift.** That is the difference from
+    /// `crate::args::tests::all_schemas_generate`, which is a hand-maintained list of 19 arg structs and has
+    /// already fallen behind the tool surface — `SetMonitorStopArgs`, `EvaluateChainArgs`, `ListClassesArgs`
+    /// and others are not in it. A list of what to check is a second place to forget something; walking the
+    /// advertised tools is not. That test still stands, and this one subsumes its coverage.
+    ///
+    /// The whole property schema is rendered rather than a summary of it, minus the description, so a change
+    /// to a `format`, a `minimum`, an `anyOf` arm or a `$ref` fails as loudly as a changed type does. The
+    /// description follows it word-wrapped, on the same reasoning as the description snapshot: wrapping makes
+    /// a corrupted clause a two-line diff and needs no heuristic.
+    ///
+    /// One honest limit, recorded because the issue weighed it. DOC-7's failure mode was a 4000-character
+    /// single-line literal no human reads in a diff; argument descriptions are ordinary multi-line `///`
+    /// comments and do diff readably, so this is not the same exposure to a bad merge. What it guards is the
+    /// other thing the description snapshot guards — a caller-visible change behind an unchanged tool name
+    /// has to be READ by somebody.
+    ///
+    /// Regenerate with `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot`, the same one
+    /// command that regenerates the description snapshot, then read the diff.
+    #[test]
+    fn argument_schemas_match_the_committed_snapshot() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/argument-schemas.txt");
+        let current = render_argument_schema_snapshot();
+
+        if std::env::var_os("UPDATE_TOOL_DESCRIPTIONS").is_some() {
+            std::fs::write(&path, &current).expect("write the argument-schema snapshot");
+            println!("rewrote {} — read the diff before committing it", path.display());
+            return;
+        }
+
+        let committed = std::fs::read_to_string(&path).unwrap_or_else(|why| {
+            panic!(
+                "cannot read the argument-schema snapshot at {}: {why}. Create it with \
+                 UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot",
+                path.display()
+            )
+        });
+
+        if committed != current {
+            let differing =
+                committed.lines().zip(current.lines()).enumerate().find(|(_, (was, now))| was != now);
+            let first = match differing {
+                Some((n, (was, now))) => {
+                    format!("line {}:\n  committed: {was}\n  current:   {now}", n + 1)
+                }
+                None => format!(
+                    "no differing line, so the length changed: {} committed vs {} current — an argument was \
+                     added or removed, or a description grew past a wrap boundary",
+                    committed.lines().count(),
+                    current.lines().count()
+                ),
+            };
+            panic!(
+                "an argument's type, default or description changed without its snapshot being \
+                 updated.\n\n{first}\n\nIf the change was deliberate: UPDATE_TOOL_DESCRIPTIONS=1 cargo test \
+                 --bin jdwp-mcp _snapshot, then READ THE DIFF — these are published to callers as \
+                 the inputSchema, and a caller-visible change behind an unchanged tool name is what \
+                 docs/toolkit-contract.md is for."
+            );
+        }
+    }
+
+    fn render_argument_schema_snapshot() -> String {
+        let mut tools = get_tools();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Counted rather than described, and put at the top on purpose: an added or removed argument is then
+        // a one-line diff in the header as well as a block further down. `docs/toolkit-contract.md` insists
+        // the downstream audit count ARGUMENTS rather than tools — a tool-level check passes while an
+        // argument is documented nowhere, which is how `force_initialize` went missing.
+        let arg_count: usize = tools
+            .iter()
+            .filter_map(|t| t.input_schema.get("properties").and_then(serde_json::Value::as_object))
+            .map(serde_json::Map::len)
+            .sum();
+        let mut out = format!(
+            "# Every debug.* tool's ARGUMENT schemas, as advertised to callers. GENERATED — do not hand-edit:\n\
+             #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot\n\
+             #\n\
+             # {} tools, {arg_count} arguments.\n\
+             #\n\
+             # Each argument shows its full generated schema minus the description — so a changed type,\n\
+             # default, format, minimum or anyOf arm fails as loudly as a renamed field — then the description\n\
+             # word-wrapped to 110 columns including its 4-space indent. schemars publishes these as the\n\
+             # inputSchema, so they are the caller's documentation for every argument.\n\
+             #\n\
+             # This file exists so that such a change has to be READ by somebody. Five argument descriptions\n\
+             # changed in v0.14.1 and nothing in the suite noticed (DOC-8, #120).\n",
+            tools.len()
+        );
+        for tool in tools {
+            out.push_str("\n## ");
+            out.push_str(&tool.name);
+            out.push('\n');
+
+            let required: Vec<&str> = tool
+                .input_schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .map(|r| r.iter().filter_map(serde_json::Value::as_str).collect())
+                .unwrap_or_default();
+            let props = tool.input_schema.get("properties").and_then(serde_json::Value::as_object);
+
+            match props.filter(|p| !p.is_empty()) {
+                // Said explicitly rather than left blank: "no arguments" and "the schema failed to render"
+                // must not look the same, which is the rule the rest of this server is built on.
+                None => out.push_str("(no arguments)\n"),
+                Some(props) => {
+                    for (name, schema) in props {
+                        let mut shape = schema.clone();
+                        let description = shape
+                            .as_object_mut()
+                            .and_then(|o| o.remove("description"))
+                            .and_then(|d| d.as_str().map(str::to_string));
+                        let req = if required.contains(&name.as_str()) { " REQUIRED" } else { "" };
+                        // `write!` rather than `push_str(&format!(…))`: doctor fails on the latter and
+                        // `cargo clippy` does not, which is ADR-0007 in one line.
+                        let _ = writeln!(out, "- {name}:{req} {shape}");
+                        match description {
+                            // An argument with no description is a real finding, not a formatting gap: the
+                            // downstream toolkit's audit counts arguments, and that is how `force_initialize`
+                            // turned out to be documented nowhere.
+                            None => out.push_str("    (NO DESCRIPTION)\n"),
+                            Some(d) => {
+                                for line in wrap(&d, 106) {
+                                    out.push_str("    ");
+                                    out.push_str(&line);
+                                    out.push('\n');
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 }

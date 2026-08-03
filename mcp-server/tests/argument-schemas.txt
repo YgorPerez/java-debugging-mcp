@@ -1,0 +1,1039 @@
+# Every debug.* tool's ARGUMENT schemas, as advertised to callers. GENERATED — do not hand-edit:
+#     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot
+#
+# 37 tools, 173 arguments.
+#
+# Each argument shows its full generated schema minus the description — so a changed type,
+# default, format, minimum or anyOf arm fails as loudly as a renamed field — then the description
+# word-wrapped to 110 columns including its 4-space indent. schemars publishes these as the
+# inputSchema, so they are the caller's documentation for every argument.
+#
+# This file exists so that such a change has to be READ by somebody. Five argument descriptions
+# changed in v0.14.1 and nothing in the suite noticed (DOC-8, #120).
+
+## debug.attach
+- class_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Directories holding freshly COMPILED classes, e.g. `["/srv/app/target/classes"]` — where
+    `debug.reload_class` reads the bytes it ships to the JVM. Same shape as `source_roots` and a different
+    tree: a class root is where the package tree starts in the *build output* (`target/classes`), not in the
+    sources (`src/main/java`). The file is looked for at `<root>/<package as directories>/<SimpleName>.class`.
+    Given here they replace the `JDWP_CLASS_ROOTS` environment default for this session; omitted, that default
+    applies.
+- host: {"default":"localhost","type":"string"}
+    JVM host (e.g. "localhost").
+- port: {"default":5005,"format":"uint16","maximum":65535,"minimum":0,"type":"integer"}
+    JDWP port (e.g. 5005 or 8787).
+- read_only: {"default":false,"type":"boolean"}
+    Open the session read-only: method invocation, `set_value` and `force_return` are refused, so pointing at
+    a production JVM can't accidentally mutate it. Reads (locals, fields, statics, arrays, `get_stack`,
+    watchpoint/exception reporting) still work; collection expansion and `toString()` rendering fall back to
+    shallow, because they invoke methods in the debuggee. A guard against accident, NOT a security boundary.
+    Also forced on by the `JDWP_READONLY` env var.
+- source_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Directories `debug.source` searches for a class's `.java` file, e.g. `["/srv/app/src/main/java"]`. A root
+    is where the PACKAGE TREE starts, not the project root: the file is looked for at `<root>/<package as
+    directories>/<file the JVM reports>`. Plain directories only — sources inside JARs are not read. Given
+    here they replace the `JDWP_SOURCE_ROOTS` environment default for this session; omitted, that default
+    applies.
+
+## debug.check_stale
+- bytecode: {"default":false,"type":"boolean"}
+    Also compare each method's **bytecode**, not just its line table (DISC-9). Off by default because it
+    doubles the JDWP cost — one `Method.Bytecodes` per method on top of the one `Method.LineTable` — and the
+    line table already catches the edit that hurts most, a moved line. Turn it on for the edit the line table
+    cannot see at all: one that changes a body without moving any line (`<` to `<=`, a changed constant, a
+    swapped operator), which is also the commonest edit in a compile-and-retest loop. It is the only evidence
+    that works on a `-g:none` build, which has code and no line numbers.
+- class_file: {"default":null,"type":["string","null"]}
+    Compare against exactly this `.class` file, bypassing `class_roots`.
+- class_name: REQUIRED {"type":"string"}
+    Fully-qualified class name, e.g. com.example.OrderService. Must already be loaded.
+- class_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Directories to search for this call only, replacing the session's class roots (set at `debug.attach` or by
+    `JDWP_CLASS_ROOTS`).
+- limit: {"default":40,"format":"uint","minimum":0,"type":"integer"}
+    Max drifting methods to name; the rest are reported as a count.
+
+## debug.clear_stop_point
+- breakpoint_id: REQUIRED {"type":"string"}
+    Stop-point ID from `debug.list_stop_points`.
+
+## debug.continue
+(no arguments)
+
+## debug.disconnect
+(no arguments)
+
+## debug.evaluate
+- expand_objects: {"default":false,"type":"boolean"}
+    Expand the result recursively instead of showing one line: walks instance fields, array elements, and the
+    contents of `List`/`Set`/`Map`/`Optional`, with cycle detection. Needs a suspended thread for collections
+    (it invokes `toArray`/`entrySet` in the debuggee).
+- expression: REQUIRED {"type":"string"}
+    Java expression. Heads: a local, `this`, a class (`ConfigDefaultUtils`, or fully qualified), or an
+    **object handle** — `@0x1f4c`, the spelling every reply prints beside an object. Then chain `.field` and
+    `.method(args)` freely, including static members (`ConfigDefaultUtils.getUrl()`). Arguments may be
+    literals (int, `123L`, `1.5`, `2.0f`, `'a'`, true/false, null, `"string"`) or expressions passed by
+    reference — a local, `this.field`, or a nested call (`svc.matches(reserva)`, `foo.handle(this,
+    cfg.getId())`). A handle reaches an object with **no frame and no root to reach it from**, which is what
+    makes a trace snapshot drillable after the fact (TRACE-10). It may only be the first segment. The id is a
+    **weak** reference, so a handle can stop working: the reply says `Vanished: @0x…` and which of the two
+    readings it is, rather than reporting a JDWP error code. Nothing pins objects to keep handles alive —
+    ADR-0022 records why. Subscripts work on arrays, `List` and `Map`: `lines[0]` (index — keeps chaining, so
+    `lines[0].sku` works), `counts["key"]` (map lookup), `lines[2..5]` (half-open slice) and `lines[?qty > 3]`
+    (filter). In a filter the left side is resolved against **each element** — `lines[?status == "OPEN"]`,
+    `lines[?getQty() == 2]` — while the right side may be a literal or an expression read from the frame
+    (`lines[?qty > limit]`). Filtering a `Map` tests its **values** and renders survivors as `key → value`, so
+    you keep the keys you were looking for; a `Map` can't be sliced (no positional order). A slice or filter
+    selects several values, so nothing can be chained after it. `arr.length` works on any array (it reads
+    `ArrayReference.Length`, not a field), and a `byte[]` / `char[]` renders as DECODED TEXT with the encoding
+    named — `byte[73] ISO-8859-1 "<?xml …"` — rather than as a list of numbers. A trailing `#<charset>` picks
+    the encoding: `UTF-8` (the default), `ISO-8859-1` (aliases `latin1`), `US-ASCII` (`ascii`), or `#raw` for
+    the element list when the array really is binary. Punctuation and case in the name are ignored.
+    **`ISO-8859-1` is not exotic on this stack** — `it-common` pins its shared JAXB marshaller to it, so
+    `log.dsRequest#ISO-8859-1` is the reading a supplier envelope usually needs, and octets that do not decode
+    are marked `\xNN` rather than replaced, so a wrong charset looks wrong instead of looking like a supplier
+    bug.
+- force_initialize: {"default":false,"type":"boolean"}
+    Walk INTO an unfetched Hibernate lazy association instead of reporting it (EVAL-9, #86). **Off by default,
+    and the default is the honest answer.** An uninitialised proxy or persistent collection is a third outcome
+    alongside "a value" and "null": the row or the collection exists and nobody has fetched it. Resolving
+    through one issues the SELECTs Hibernate deferred — **into whatever persistence context the debuggee
+    thread is in**, which on a shared instance is someone else's in-flight request whose entity graph you
+    would have changed — or throws `LazyInitializationException` if the entity is detached. Reading a FIELD
+    instead is not the way round it: a proxy's own inherited fields are never populated, so `.id` reads null
+    while the proxy's identity is set. Measured against a real proxy, not assumed. Set this when the load is
+    what you actually want — a JVM that is yours, or a value you cannot get any other way — and know that it
+    is a write to the debuggee, not a read.
+- frame_index: {"default":0,"format":"uint","minimum":0,"type":"integer"}
+    Stack frame index (0 = current frame).
+- max_children: {"default":16,"format":"uint","minimum":0,"type":"integer"}
+    Only with `expand_objects` — max fields per object / elements per collection before "… +N more" (default
+    16).
+- max_depth: {"default":2,"format":"uint","minimum":0,"type":"integer"}
+    Only with `expand_objects` — how many levels to expand (default 2). Deeper costs more JVM round trips; a
+    total node budget caps the work regardless.
+- max_result_length: {"default":2000,"format":"uint","minimum":0,"type":"integer"}
+    Maximum length of the rendered result string (raise for long toString()s).
+- thread_id: {"default":null,"type":["string","null"]}
+    Thread ID (optional; defaults to the last thread that hit a breakpoint).
+
+## debug.evaluate_chain
+- expression: REQUIRED {"type":"string"}
+    The chained Java expression to walk, in exactly the form `debug.evaluate` accepts —
+    `wsReservaCircuito.getCircuitoParametro().getConfigUhList()[0].getSqQuarto()`, including an `@0x…` object
+    handle as the head. A single-link expression is accepted but answers nothing this tool is for: with one
+    link there is no "which one" to find. Takes the same trailing `#<charset>` selector `debug.evaluate` does,
+    applied to every link's rendered value.
+- force_initialize: {"default":false,"type":"boolean"}
+    Walk INTO an unfetched Hibernate lazy association instead of reporting it as a link (EVAL-9, #86). Off by
+    default, and this is the tool where the default matters most: a chain runs to 7 links in the target stack,
+    so walking in would fire the deferred SELECTs of every lazy association along the way — into whatever
+    persistence context the debuggee thread is in. The walk otherwise stops at the unfetched link and says
+    which of the three outcomes it is: a value, `null`, or unfetched. It is a write to the debuggee. See
+    `debug.evaluate`'s copy of this argument for what it costs.
+- frame_index: {"default":0,"format":"uint","minimum":0,"type":"integer"}
+    Stack frame index (0 = current frame).
+- max_result_length: {"default":2000,"format":"uint","minimum":0,"type":"integer"}
+    Maximum length of each link's rendered value.
+- thread_id: {"default":null,"type":["string","null"]}
+    Thread ID (optional; defaults to the last thread that hit a breakpoint).
+
+## debug.force_return
+- thread_id: {"default":null,"type":["string","null"]}
+    Thread id (optional; defaults to last-hit thread). Must be suspended.
+- value: {"default":null,"type":["string","null"]}
+    Return value literal, coerced to the method's declared return type: int, 123L, 1.5, 2.0f, 'a', true/false,
+    null, or "string". Omit (or pass "void") for a void method.
+
+## debug.get_last_event
+- drain: {"default":false,"type":"boolean"}
+    Discard the events returned, so the next call only sees newer ones. Off by default, so repeated calls keep
+    reporting the same latest hit.
+- limit: {"default":1,"format":"uint","minimum":0,"type":"integer"}
+    How many buffered events to return, most recent LAST (default 1 — just the latest). Raise it to catch up
+    when the reply says events are pending, e.g. after a broad exception breakpoint.
+
+## debug.get_stack
+- expand_objects: {"default":false,"type":"boolean"}
+    Expand each local recursively rather than showing objects as `Type (id=…)`. Costs many JVM round trips per
+    frame, so pair it with `max_frames`/`package_filter` to keep the stack narrow.
+- include_variables: {"default":true,"type":"boolean"}
+    Include local variables under each frame (set false for just the call chain).
+- max_children: {"default":16,"format":"uint","minimum":0,"type":"integer"}
+    Only with `expand_objects` — max fields/elements per node (default 16).
+- max_depth: {"default":2,"format":"uint","minimum":0,"type":"integer"}
+    Only with `expand_objects` — levels to expand per local (default 2).
+- max_frames: {"default":20,"format":"uint","minimum":0,"type":"integer"}
+    Maximum number of frames to return.
+- package_filter: {"default":null,"type":["string","null"]}
+    Only show frames whose class name contains this substring (case-insensitive), e.g. your app package
+    'br.com.infotravel'; framework frames collapse into "… N frame(s) hidden". Big token saver on deep JVM
+    stacks.
+- thread_id: {"default":null,"type":["string","null"]}
+    Thread ID (optional; defaults to the last thread that hit a breakpoint/step).
+
+## debug.get_traces
+- bp_id: {"default":null,"type":["string","null"]}
+    Only snapshots from this stop point id (`bp_…` / `exc_…` / `watch_…`) — read "the throws from `exc_4`"
+    without eyeballing everything (TRACE-4).
+- class_filter: {"default":null,"type":["string","null"]}
+    Only snapshots whose class contains this substring (case-insensitive).
+- clear: {"default":false,"type":"boolean"}
+    Clear the trace buffer after returning it.
+- limit: {"default":50,"format":"uint","minimum":0,"type":"integer"}
+    Max snapshots to return, most recent last (default 50).
+- since: {"default":null,"format":"uint64","minimum":0,"type":["integer","null"]}
+    Only snapshots newer than this sequence number, so a poller can ask for just what's new since its last
+    read (the `#seq` shown on each record).
+
+## debug.launch
+- args: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Arguments for the program's own `main(String[])`.
+- class_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Directories holding freshly compiled classes for `debug.reload_class` / `debug.check_stale` — see
+    `debug.attach`.
+- classpath: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Classpath entries, e.g. `["target/classes", "libs/dep.jar"]` — joined with the platform separator.
+    Relative paths resolve against `working_dir`.
+- detach_on_disconnect: {"default":false,"type":"boolean"}
+    Leave the JVM RUNNING when the session disconnects, instead of terminating it. The default is to
+    terminate: this server started the process, so it owns it, and a JVM left behind with an open JDWP port
+    that no session knows about is worse than one that stops when you are done with it. Set this when the
+    point of the run is the program rather than the debugging — but then its lifetime is yours, and nothing
+    here will clean it up.
+- jar: {"default":null,"type":["string","null"]}
+    Executable jar to run (`java -jar <jar>`). Give this **or** `main_class`.
+- java_home: {"default":null,"type":["string","null"]}
+    Which JDK to run: a home directory whose `bin/java` is used. Defaults to `JAVA_HOME`, then to `java` on
+    `PATH`. The reply always names the binary it actually ran, because "which JDK" is exactly the question a
+    version-dependent bug turns on.
+- jvm_args: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Extra JVM arguments, e.g. `["-Xmx512m", "-Dspring.profiles.active=dev"]`. Passed through verbatim, before
+    the main class. The `-agentlib:jdwp=…` argument is added for you and must not be given here.
+- main_class: {"default":null,"type":["string","null"]}
+    Main class to run, e.g. `com.example.Main`. Give this **or** `jar`, not both. Needs `classpath` unless the
+    class is on the default one.
+- port: {"default":0,"format":"uint16","maximum":65535,"minimum":0,"type":"integer"}
+    JDWP port. `0` (the default) picks a free one, which is usually right — the port only matters if something
+    else needs to reach it too.
+- read_only: {"default":false,"type":"boolean"}
+    Open the session read-only, exactly as `debug.attach` does. Rarely what you want on a JVM you started
+    yourself, but `JDWP_READONLY` still applies deployment-wide and cannot be relaxed here (SAFE-3).
+- source_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Directories `debug.source` searches for `.java` files — see `debug.attach`.
+- suspend: {"default":true,"type":"boolean"}
+    Suspend the JVM at startup, before a single line of the program runs — **default true**, and the main
+    reason this tool exists. `suspend=y` is unreachable when you attach to a JVM someone else started: by the
+    time you can connect, static initialisers, framework bootstrapping and anything else that runs once have
+    already run. With this you arm the stop points first and then `debug.continue`. Pass false for a JVM you
+    only want running and attached.
+- working_dir: {"default":null,"type":["string","null"]}
+    Working directory for the JVM. Defaults to this server's own.
+
+## debug.list_classes
+- filter: {"default":null,"type":["string","null"]}
+    Narrow by class name. Matched against the dotted FQN (com.example.Order), never the JNI signature the JVM
+    reports. Three shapes: prefix 'com.example.*', suffix `*.OrderService`, or a bare substring.
+    Case-sensitive, because Java names are.
+- include_arrays: {"default":false,"type":"boolean"}
+    Include array types (java.lang.String[]). Off by default — they are noise when the question is which class
+    to arm a stop point on.
+- limit: {"default":100,"format":"uint","minimum":0,"type":"integer"}
+    Max classes to return; the rest are reported as a hidden count.
+
+## debug.list_fields
+- class_name: REQUIRED {"type":"string"}
+    Fully-qualified class name, e.g. com.example.OrderService. Must already be loaded — find it with
+    `debug.list_classes` if unsure.
+- inherited: {"default":false,"type":"boolean"}
+    Also walk the superclass chain. Off by default: what this type itself declares is the smaller, clearer
+    answer, and Object's contribute noise to every listing.
+- limit: {"default":40,"format":"uint","minimum":0,"type":"integer"}
+    Max fields to return; the rest are reported as a hidden count.
+- name_filter: {"default":null,"type":["string","null"]}
+    Only fields whose name contains this substring (case-insensitive).
+
+## debug.list_instances
+- class_names: REQUIRED {"items":{"type":"string"},"type":"array"}
+    Fully-qualified class names whose live instances to find, e.g.
+    `["br.com.infotravel.service.ApplicationSrv"]`. Each must already be **loaded** — find it with
+    `debug.list_classes`. **Several is nearly free and one is not**: the JVM walks the live heap once for the
+    whole batch (three types measured at 604 ms against 522 ms for one), so ask about everything you want in a
+    single call rather than making several. **Exact type, not subtype-inclusive.** An interface or a base
+    class answers about objects whose runtime class is *exactly* that name, which for a CDI bean is usually
+    its `…_$$_WeldClientProxy` rather than the interface you reached for. Naming both costs nothing extra.
+- counts_only: {"default":false,"type":"boolean"}
+    Report only how many instances each type has, and return no handles. One heap walk for the whole batch
+    instead of one per type, so this is the cheap shape of the question when "does this cache have anything in
+    it" is all you need. It costs the same pause per walk — nothing here is free.
+- max_instances: {"default":10,"format":"int32","type":"integer"}
+    Handles to return per type. `0` means all of them; a negative value is refused. The **count** is reported
+    in full either way, so clamping hides objects, never their number.
+
+## debug.list_methods
+- class_name: REQUIRED {"type":"string"}
+    Fully-qualified class name, e.g. com.example.OrderService. Must already be loaded — find it with
+    `debug.list_classes` if unsure.
+- inherited: {"default":false,"type":"boolean"}
+    Also walk the superclass chain. Off by default: the class's own methods are what was asked for, and
+    Object's contribute noise to every listing.
+- limit: {"default":40,"format":"uint","minimum":0,"type":"integer"}
+    Max methods to return; the rest are reported as a hidden count.
+- name_filter: {"default":null,"type":["string","null"]}
+    Only methods whose name contains this substring (case-insensitive).
+
+## debug.list_sessions
+(no arguments)
+
+## debug.list_stop_points
+(no arguments)
+
+## debug.list_threads
+- limit: {"default":40,"format":"uint","minimum":0,"type":"integer"}
+    Max threads to return; the rest are reported as a hidden count (default 40). **Which 40 you get is a rule,
+    and the reply states it** — the same rule `debug.thread_dump` uses, in the same words (ADR-0013; DUMP-5,
+    #51). One thread from each distinct name with its digits ignored (`task-7` and `task-91` are one family)
+    before a second from any, printed in creation order, with the biggest withheld groups named in the footer.
+    It is **not** the first 40 the JVM listed: `AllThreads` order is *creation* order, and an app server
+    creates its request pool last, so on a loaded `WildFly` the first 40 were measured to contain no
+    application threads at all. Choosing costs one packet per thread NAME — the reply reports the figure —
+    which is why raising `limit` is cheap here and still not the answer.
+- name_filter: {"default":null,"type":["string","null"]}
+    Only threads whose name contains this substring (case-insensitive), e.g. 'Avail' or 'task'.
+- only_suspended: {"default":false,"type":"boolean"}
+    Only threads currently suspended (also appends each thread's run status).
+
+## debug.panic
+(no arguments)
+
+## debug.pause
+(no arguments)
+
+## debug.pop_frame
+- frame: {"default":0,"format":"uint","minimum":0,"type":"integer"}
+    Frame index to pop, as numbered by `debug.get_stack` (0 = innermost). Every frame above it goes too — that
+    is what JDWP does, not a convenience added here.
+- thread_id: {"default":null,"type":["string","null"]}
+    Thread id (optional; defaults to last-hit thread). Must be suspended.
+
+## debug.reload_class
+- class_file: {"default":null,"type":["string","null"]}
+    Read the new bytecode from exactly this `.class` file, bypassing `class_roots`. For a build output that is
+    not laid out as a package tree, or a one-off.
+- class_name: REQUIRED {"type":"string"}
+    Fully-qualified class name, e.g. com.example.OrderService. Must already be LOADED — a class the JVM has
+    never loaded has nothing to redefine, and loading it is the application's job.
+- class_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Directories to search for this call only, replacing the session's class roots (set at `debug.attach` or by
+    `JDWP_CLASS_ROOTS`).
+- dry_run: {"default":false,"type":"boolean"}
+    Report what WOULD be shipped — the resolved file, its size, and whether the JVM can `HotSwap` at all — and
+    send nothing. The safe first call against a shared JVM.
+- thread_id: {"default":null,"type":["string","null"]}
+    Thread to check for frames still running the old bytecode after a successful swap (defaults to the
+    last-hit thread). A redefinition does not touch frames already on the stack, so this is how the reply can
+    tell you that the method you just changed is one of them.
+
+## debug.resume_thread
+- thread_id: {"default":null,"type":["string","null"]}
+    Thread ID to resume. Optional: with one thread held by `debug.suspend_thread` it defaults to that one,
+    which is the case a caller is in almost every time. With several held it is required, and the reply lists
+    them rather than picking.
+
+## debug.set_exception_stop
+- caught: {"default":true,"type":"boolean"}
+    Break on exceptions that ARE caught somewhere up the stack (default true).
+- class_pattern: {"anyOf":[{"$ref":"#/$defs/ClassPatterns"},{"type":"null"}]}
+    Exception class to break on (e.g. "java.lang.NullPointerException" or "br.com.infotravel.ErrorException");
+    its subclasses match too. Omit to break on ALL exceptions — noisy, since the JVM throws/catches internally
+    constantly. The class must already be loaded (trigger it once if unsure). Takes a WILDCARD
+    (`*.ValidationException`, `br.com.infotravel.*` — FILT-3) or a LIST (`["java.lang.IllegalStateException",
+    "*.TimeoutException"]` — FILT-4). Both arm one `exc_…` per resolved class, because a JDWP exception
+    request needs a concrete reference type — there is no `ClassMatch` for this event kind, which is also why
+    none of them can be deferred. So a wildcard here matches only what is LOADED NOW: an exception class the
+    JVM has not needed yet is invisible to it, and unlike a line breakpoint nothing will arm it later.
+    `max_classes` bounds the expansion.
+- condition: {"default":null,"type":["string","null"]}
+    Only stop when this boolean expression is true, evaluated on the hit thread's top frame — the same grammar
+    `debug.set_line_stop`'s `condition` takes, `!`/`&&`/`||` included (FILT-6, #83). **The exception instance
+    is reachable as `exception`**, which is the whole point here: this stack's `InfoTravelException` is
+    simultaneously the error type and the validation-control-flow type — 812 `ExceptionEnum` values, 247 of
+    them validation, thrown as ordinary flow — so an unfiltered exception trace burns its 200-hit budget on
+    validation noise before a real fault lands. And the discriminator cannot be the message:
+    `InfoTravelException(ExceptionEnum)` calls no `super(...)` and never sets it, so `getMessage()` is null
+    for 1104 of 3166 constructions. The usable discriminator is the exception's own field, so write
+    `exception.cdException != ExceptionEnum.validarRegistro` and invert it with `!`. A frame local, `this` and
+    a static are all still in scope, as on a line stop. **Cost, on a SUSPENDING stop point:** the VM is frozen
+    while the condition is evaluated. A traced (`trace:true`) stop point holds only the hit thread, which is
+    what makes a condition the cheap way to filter an exception trace on a shared instance.
+- hit_count: {"default":null,"format":"int32","type":["integer","null"]}
+    Only fire on the Nth occurrence (optional), then never again. JDWP's `Count` modifier, and the semantics
+    surprise people: the stop point fires **once**, on the Nth occurrence, and is then **gone** — deleted by
+    the JVM itself, not by this server. It is not "the first N", which is what `trace_max_hits` provides and
+    what ADR-0002 explains `Count` cannot express. `debug.list_stop_points` reports such a stop point as SPENT
+    rather than as armed. With `trace:true` the two counters compose in the way that reads wrongly:
+    `hit_count: 5` with a `trace_max_hits` of 200 yields **one** snapshot, not 200, because the stop point is
+    spent after its single hit. The arm reply says so rather than echoing both numbers.
+- instance_id: {"default":null,"type":["string","null"]}
+    Scope this stop point to ONE object: only hits whose `this` is that object are reported (JDWP's
+    `InstanceOnly`, FILT-9). Give the `@0x…` handle any reply prints beside an object. **Filters inside the
+    JVM**, unlike a `condition`: an excluded hit costs no packet and no thread suspension, which is what makes
+    "trace `salvar()` on THIS Reserva, not all 400 in flight" cheap on a shared instance rather than the most
+    expensive thing you can arm. The handle is a **weak** reference (ADR-0022). If the debuggee collects the
+    object the filter stops matching and the stop point goes quiet, which is indistinguishable from the code
+    never running — so `debug.list_stop_points` checks and says when that has happened.
+- max_classes: {"default":20,"format":"uint","minimum":0,"type":"integer"}
+    Most loaded classes ONE wildcard pattern may arm (default 20, clamped at 200 — FILT-3). Ignored for an
+    exact class name. The reply says what a full expansion left out rather than truncating quietly.
+- thread_id: {"default":null,"type":["string","null"]}
+    Only report throws on this thread (hex id, e.g. `0x2a`). On a busy app server with hundreds of threads,
+    restricting to your request thread is the single biggest noise reduction — get the id from
+    `debug.list_threads {name_filter}` first, then arm, then trigger (FILT-1).
+- trace: {"default":false,"type":"boolean"}
+    Logpoint mode: on each throw, snapshot (throw location, thread, in-scope locals, exception type, catch
+    location) into a ring buffer and resume immediately WITHOUT suspending — the safe choice on a shared
+    instance, where a suspending exception breakpoint freezes other people's requests. Read snapshots with
+    `debug.get_traces`.
+- trace_expr: {"anyOf":[{"$ref":"#/$defs/TraceExprs"},{"type":"null"}]}
+    Only with `trace:true` — an expression to evaluate in the throwing frame and record alongside the snapshot
+    (e.g. `this.getStatus()`). A trailing `#<charset>` says how to render a `byte[]`/`char[]` this resolves
+    to: `log.dsRequest#ISO-8859-1`, or `#raw` for the element list. It composes here because there is no
+    schema to extend inside an expression string — see `debug.evaluate`'s `expression` for the full list of
+    names. **Accepts a LIST as well as a string** (TRACE-11): `["tenant.getIdentificador()",
+    "sessao.getNmSchema()"]` records both against the same hit, which is the only way to see a *disagreement*
+    between two values. Each element is evaluated in turn against the same frame and gets its own labelled
+    slot, so one that errors leaves the others intact. Bounded — the cost is per hit and multiplies — and a
+    request over the ceiling is clamped with the clamp reported.
+- trace_frames: {"default":3,"format":"uint","minimum":0,"type":"integer"}
+    Only with `trace:true` — how many CALLER frames to record above the throw, so a swallowed exception says
+    **which request path reached the catch**, which is usually the whole question (default 3; 0 for the
+    throwing frame alone, capped at 20). Callers are recorded as `class.method:line` locations only — no
+    locals, no invocation — so this stays safe in a read-only session. Each frame costs JVM round trips on
+    every hit. The measured price of that depth: capture costs ~0.86ms per hit before any callers, and the
+    default 3 frames add ~0.53ms on top (**+62%**), lowering the ceiling from ~1160 to ~720 hits/s. Kept at 3
+    regardless, because the chain is usually the answer rather than context — but `trace_frames: 0` is the
+    cheap mode when the site is hot and you only need that it fired. Loopback measurement against a trivial
+    `WildFly` endpoint (#22); `debug.list_stop_points` reports what the depth you chose is costing on *your*
+    JVM once hits have landed.
+- trace_max_hits: {"default":null,"format":"uint32","minimum":0,"type":["integer","null"]}
+    Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit), so a hot
+    throw site can't flood the debuggee (TRACE-3). **This bound is load-bearing, not a formality.** Capture is
+    serialised through the single JDWP connection and one event pump, so a traced stop point tops out at
+    roughly **720 hits/s** with the default 3 caller frames, or **~1160/s** with `trace_frames: 0`. Past that
+    the debugger — not the application — is the bottleneck, and every further hit queues behind the ones being
+    captured. At the default 200 the exposure is a sub-second blip, which is most of the reason trace mode is
+    safe to leave armed at all. **`0` on a site that fires thousands of times a second turns that blip into
+    sustained throttling**: it is the single setting that removes the protection, so choose it knowingly.
+    Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures move with hardware,
+    the existence of a hits/s ceiling does not. **You do not have to trust those figures**: once the stop
+    point has fired, `debug.list_stop_points` reports the mean capture measured on the JVM you are actually
+    attached to — invert it for this ceiling — plus the rate hits are arriving at and the share of the window
+    spent capturing (TRACE-7).
+- trace_max_length: {"default":null,"format":"uint","minimum":0,"type":["integer","null"]}
+    Only with `trace:true` — raise the per-value length cap on each capture, for a payload that does not fit
+    the frugal defaults: a JSON body, a SOAP envelope, a `+=`-built SQL string. Unset keeps them exactly as
+    they were — **100** characters for each in-scope local, **200** for the `trace_expr` result, the
+    method-exit `returned` value and a watchpoint's old → new pair. Ceiling 4000; a larger request is clamped
+    and the reply says so, and `0` is read as the ceiling rather than as "no limit" (which is what it means on
+    `trace_max_hits`, and cannot mean here). **Truncation happens at CAPTURE time**, which is why this is an
+    arming argument rather than a `debug.get_traces` one: the cut string is what the snapshot stores, so the
+    remainder is gone and no later read can recover it. On a shared instance the workaround — suspend, then
+    `debug.evaluate` with a large `max_result_length` — is precisely the thing trace mode exists to avoid.
+    **The two defaults differ deliberately, and ONE argument raises both.** The locals are context, captured
+    whether you asked for them or not, while `trace_expr` is the payload you named, so it already gets twice
+    the room; both are frugal because a trace may fire hundreds of times into a bounded buffer. One knob
+    rather than two because a caller raising the cap wants the payload and should not have to work out which
+    of two numbers governs the value in front of them. It is still a bound. Buffer memory is roughly this cap
+    × the hits recorded, and `trace_max_hits` defaults to 200 — so 4000 is ~800KB per captured value on one
+    stop point at its default budget, which is where the ceiling comes from.
+- uncaught: {"default":true,"type":"boolean"}
+    Break on exceptions that are NOT caught (propagate out; default true).
+
+## debug.set_field_stop
+- access: {"default":false,"type":"boolean"}
+    Also break on reads (`FIELD_ACCESS`). Noisy on a hot field; off by default.
+- class_name: REQUIRED {"$ref":"#/$defs/ClassPatterns"}
+    Class declaring the field (e.g. `ConfigDefaultUtils` or a fully-qualified
+    `br.com.infotravel.util.ConfigDefaultUtils`). Must already be loaded — a watchpoint needs a concrete field
+    id, so it can't be deferred like a line breakpoint. Takes a WILDCARD (`com.example.*` — FILT-3) or a LIST
+    (FILT-4), arming one watch per matching loaded class that actually HAS the field: a class that matches the
+    pattern but declares no such field is counted and reported, not treated as an error, since that is the
+    expected majority for a broad pattern. `max_classes` bounds the expansion, and a watched field cannot be
+    JIT-optimised — so a wildcard here de-optimises every class it matched, which is the reason to keep it
+    narrow.
+- condition: {"default":null,"type":["string","null"]}
+    Only stop when this boolean expression is true, evaluated on the hit thread's top frame — the same grammar
+    `debug.set_line_stop`'s `condition` takes, `!`/`&&`/`||` included (FILT-6, #83). **The incoming value is
+    reachable as `newValue`** — `newValue > 100`, or `newValue.getStatus() == "X"` for a reference field.
+    There is deliberately no `oldValue`: a `FIELD_MODIFICATION` event is reported BEFORE the write lands, so
+    at condition time the field still holds the old one and its own name reads it. `status != newValue`
+    therefore asks "does this write actually change anything", which is usually the question. On an ACCESS
+    watch nothing is being written, so `newValue` is unbound there and naming it is an error rather than a
+    silent false. **Cost, on a SUSPENDING watch:** the VM is frozen while the condition is evaluated.
+- field_name: REQUIRED {"type":"string"}
+    Field to watch (e.g. `dsInfra`, `empresaId`). Inherited fields are found by walking superclasses; the
+    watch is registered on the class that actually declares it.
+- hit_count: {"default":null,"format":"int32","type":["integer","null"]}
+    Only fire on the Nth occurrence (optional), then never again. JDWP's `Count` modifier, and the semantics
+    surprise people: the stop point fires **once**, on the Nth occurrence, and is then **gone** — deleted by
+    the JVM itself, not by this server. It is not "the first N", which is what `trace_max_hits` provides and
+    what ADR-0002 explains `Count` cannot express. `debug.list_stop_points` reports such a stop point as SPENT
+    rather than as armed. With `trace:true` the two counters compose in the way that reads wrongly:
+    `hit_count: 5` with a `trace_max_hits` of 200 yields **one** snapshot, not 200, because the stop point is
+    spent after its single hit. The arm reply says so rather than echoing both numbers.
+- instance_id: {"default":null,"type":["string","null"]}
+    Scope this stop point to ONE object: only hits whose `this` is that object are reported (JDWP's
+    `InstanceOnly`, FILT-9). Give the `@0x…` handle any reply prints beside an object. **Filters inside the
+    JVM**, unlike a `condition`: an excluded hit costs no packet and no thread suspension, which is what makes
+    "trace `salvar()` on THIS Reserva, not all 400 in flight" cheap on a shared instance rather than the most
+    expensive thing you can arm. The handle is a **weak** reference (ADR-0022). If the debuggee collects the
+    object the filter stops matching and the stop point goes quiet, which is indistinguishable from the code
+    never running — so `debug.list_stop_points` checks and says when that has happened.
+- max_classes: {"default":20,"format":"uint","minimum":0,"type":"integer"}
+    Most loaded classes ONE wildcard pattern may arm (default 20, clamped at 200 — FILT-3). Ignored for an
+    exact class name. Watches de-optimise every class they are armed on, so this cap is doing more work here
+    than for a line breakpoint.
+- modify: {"default":true,"type":"boolean"}
+    Break on writes (`FIELD_MODIFICATION`) — the default, and what answers "who mutates this?".
+- thread_id: {"default":null,"type":["string","null"]}
+    Only report touches from this thread (hex id, e.g. `0x2a`). On a busy app server, restricting to your
+    request thread is the single biggest noise reduction — get the id from `debug.list_threads {name_filter}`
+    first, then arm, then trigger (FILT-1).
+- trace: {"default":false,"type":"boolean"}
+    Logpoint mode: on each hit, snapshot (mutating location, thread, in-scope locals, the field's old → new
+    pair) into a ring buffer and resume immediately WITHOUT suspending — the safe choice on a shared instance.
+    Read snapshots with `debug.get_traces`.
+- trace_expr: {"anyOf":[{"$ref":"#/$defs/TraceExprs"},{"type":"null"}]}
+    Only with `trace:true` — an expression to evaluate in the mutating frame and record alongside the
+    snapshot. A trailing `#<charset>` says how to render a `byte[]`/`char[]` this resolves to:
+    `log.dsRequest#ISO-8859-1`, or `#raw` for the element list. It composes here because there is no schema to
+    extend inside an expression string — see `debug.evaluate`'s `expression` for the full list of names.
+    **Accepts a LIST as well as a string** (TRACE-11): `["tenant.getIdentificador()", "sessao.getNmSchema()"]`
+    records both against the same hit, which is the only way to see a *disagreement* between two values. Each
+    element is evaluated in turn against the same frame and gets its own labelled slot, so one that errors
+    leaves the others intact. Bounded — the cost is per hit and multiplies — and a request over the ceiling is
+    clamped with the clamp reported.
+- trace_frames: {"default":3,"format":"uint","minimum":0,"type":"integer"}
+    Only with `trace:true` — how many CALLER frames to record above the mutating frame, so "who mutates this?"
+    is answered with the path that got there, not just the innermost setter (default 3; 0 for the mutating
+    frame alone, capped at 20). Callers are recorded as `class.method:line` locations only — no locals, no
+    invocation — so this stays safe in a read-only session. Each frame costs JVM round trips on every hit. The
+    measured price of that depth: capture costs ~0.86ms per hit before any callers, and the default 3 frames
+    add ~0.53ms on top (**+62%**), lowering the ceiling from ~1160 to ~720 hits/s. Kept at 3 regardless,
+    because the chain is usually the answer rather than context — but `trace_frames: 0` is the cheap mode when
+    the site is hot and you only need that it fired. Loopback measurement against a trivial `WildFly` endpoint
+    (#22); `debug.list_stop_points` reports what the depth you chose is costing on *your* JVM once hits have
+    landed.
+- trace_max_hits: {"default":null,"format":"uint32","minimum":0,"type":["integer","null"]}
+    Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit), so a hot
+    field can't flood the debuggee (TRACE-3). **This bound is load-bearing, not a formality.** Capture is
+    serialised through the single JDWP connection and one event pump, so a traced stop point tops out at
+    roughly **720 hits/s** with the default 3 caller frames, or **~1160/s** with `trace_frames: 0`. Past that
+    the debugger — not the application — is the bottleneck, and every further hit queues behind the ones being
+    captured. At the default 200 the exposure is a sub-second blip, which is most of the reason trace mode is
+    safe to leave armed at all. **`0` on a site that fires thousands of times a second turns that blip into
+    sustained throttling**: it is the single setting that removes the protection, so choose it knowingly.
+    Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute figures move with hardware,
+    the existence of a hits/s ceiling does not. **You do not have to trust those figures**: once the stop
+    point has fired, `debug.list_stop_points` reports the mean capture measured on the JVM you are actually
+    attached to — invert it for this ceiling — plus the rate hits are arriving at and the share of the window
+    spent capturing (TRACE-7).
+- trace_max_length: {"default":null,"format":"uint","minimum":0,"type":["integer","null"]}
+    Only with `trace:true` — raise the per-value length cap on each capture, for a payload that does not fit
+    the frugal defaults: a JSON body, a SOAP envelope, a `+=`-built SQL string. Unset keeps them exactly as
+    they were — **100** characters for each in-scope local, **200** for the `trace_expr` result, the
+    method-exit `returned` value and a watchpoint's old → new pair. Ceiling 4000; a larger request is clamped
+    and the reply says so, and `0` is read as the ceiling rather than as "no limit" (which is what it means on
+    `trace_max_hits`, and cannot mean here). **Truncation happens at CAPTURE time**, which is why this is an
+    arming argument rather than a `debug.get_traces` one: the cut string is what the snapshot stores, so the
+    remainder is gone and no later read can recover it. On a shared instance the workaround — suspend, then
+    `debug.evaluate` with a large `max_result_length` — is precisely the thing trace mode exists to avoid.
+    **The two defaults differ deliberately, and ONE argument raises both.** The locals are context, captured
+    whether you asked for them or not, while `trace_expr` is the payload you named, so it already gets twice
+    the room; both are frugal because a trace may fire hundreds of times into a bounded buffer. One knob
+    rather than two because a caller raising the cap wants the payload and should not have to work out which
+    of two numbers governs the value in front of them. It is still a bound. Buffer memory is roughly this cap
+    × the hits recorded, and `trace_max_hits` defaults to 200 — so 4000 is ~800KB per captured value on one
+    stop point at its default budget, which is where the ceiling comes from.
+
+## debug.set_line_stop
+- class_pattern: REQUIRED {"$ref":"#/$defs/ClassPatterns"}
+    Where to break: an EXACT class name (`com.example.MyClass`), a WILDCARD matching many loaded classes
+    (`com.example.*`, `*.OrderService`, `*Order*` — FILT-3), or a LIST of either (`["com.example.Order",
+    "com.example.*Repo"]` — FILT-4). The three behave differently, and the difference is worth knowing before
+    you type one: - **Exact** arms one breakpoint. If the class is not loaded yet the breakpoint is *deferred*
+    on a `CLASS_PREPARE` watch and arms itself when the class loads. - **Wildcard** needs `method` and refuses
+    `line` — a line number means a different thing in every class, so it is not portable across a pattern. It
+    arms ONE STOP POINT PER MATCHING LOADED CLASS, each with its own `bp_…` id, and additionally keeps
+    watching: a class matching the pattern that loads later (a generated proxy, a lazily-initialised
+    implementation) is armed too. The whole family is addressable as one `bpset_…` id, so
+    `debug.clear_stop_point`/`debug.toggle_stop_point` can drop or silence it — including the watch for future
+    classes — in one call. Bounded by `max_classes`, and the reply states how many classes it armed, since
+    that count is the one thing a wildcard hides from the caller. - **List** resolves each entry independently
+    by the two rules above. Nothing is aborted by one entry failing: the reply reports every pattern's
+    outcome, because 2-armed-1-deferred-1-refused is the normal result of a batch. A JNI signature
+    (`Lcom/example/MyClass;`) is accepted for an exact class, and dots or slashes work as the separator either
+    way.
+- condition: {"default":null,"type":["string","null"]}
+    Only stop when this boolean expression is true, evaluated in the hit frame. Supports `expr OP expr` (==,
+    !=, <, >, <=, >=) and boolean method chains, e.g. `reserva.getReservaPacote().getReservaHotelList().size()
+    > 0`, `getSgMoeda() == "BRL"`, or `total > Config.LIMITE`. Either side may be a literal or an expression;
+    two Strings compare by content, other objects by identity. **A non-matching hit holds only the thread that
+    hit it — the rest of the JVM keeps running.** That is what makes this argument safe to arm on a hot line
+    on a shared instance, and it is why it is worth preferring over a bare breakpoint there. **The trade,
+    stated because no reply can show it to you:** when the condition DOES hold, the debugger suspends the rest
+    of the VM at that point, and the other threads keep running for the one round trip that takes. So the
+    state you then read is the state a moment *after* the hit, not the state at the instant of it — the hit
+    thread's own frame is exactly as the condition saw it, but anything it points at may have been touched by
+    another thread in between. A stop point with no `condition` does not have this gap, because the JVM
+    freezes everything before it tells us anything. If the escalation fails, `debug.get_last_event` says so
+    explicitly and states whether the application is still running, rather than reporting either half alone.
+- hit_count: {"default":null,"format":"int32","type":["integer","null"]}
+    Only stop on the Nth hit (optional). **It counts hits, not matches, so it does not compose with
+    `condition` the way it reads.** This is JDWP's `Count` modifier and it expires inside the JVM: `hit_count:
+    5` with a condition means "evaluate the condition on the 5th hit", not "the 5th hit where the condition
+    holds" — and if the condition is false on that hit, the stop point is spent and will never fire again. Use
+    one or the other unless you mean exactly that.
+- instance_id: {"default":null,"type":["string","null"]}
+    Scope this stop point to ONE object: only hits whose `this` is that object are reported (JDWP's
+    `InstanceOnly`, FILT-9). Give the `@0x…` handle any reply prints beside an object. **Filters inside the
+    JVM**, unlike a `condition`: an excluded hit costs no packet and no thread suspension, which is what makes
+    "trace `salvar()` on THIS Reserva, not all 400 in flight" cheap on a shared instance rather than the most
+    expensive thing you can arm. The handle is a **weak** reference (ADR-0022). If the debuggee collects the
+    object the filter stops matching and the stop point goes quiet, which is indistinguishable from the code
+    never running — so `debug.list_stop_points` checks and says when that has happened.
+- line: {"default":null,"format":"int32","type":["integer","null"]}
+    Line number (optional if `method` is given). Refused with a wildcard `class_pattern` — see there.
+- max_classes: {"default":20,"format":"uint","minimum":0,"type":"integer"}
+    Most loaded classes ONE wildcard pattern may arm (default 20, clamped at 200 — FILT-3). Only wildcards
+    spend this; an exact class name arms one breakpoint and ignores it. When a pattern matches more classes
+    than this, the reply says how many it left out and how to see them (`debug.list_classes {filter}` with the
+    same pattern), rather than truncating quietly. The cap also applies to classes that load *later*: the
+    family stops arming new ones once it is full, and `debug.list_stop_points` reports that it is.
+- method: {"default":null,"type":["string","null"]}
+    Method name (optional). If given without `line`, breaks at the method's first line.
+- thread_id: {"default":null,"type":["string","null"]}
+    Only stop when this thread (hex id) hits it (optional).
+- trace: {"default":false,"type":"boolean"}
+    Logpoint mode: on hit, snapshot (location, thread, in-scope locals/args, optional `trace_expr`) into a
+    ring buffer and resume immediately WITHOUT suspending — safe on a shared instance where a normal
+    breakpoint could freeze a request thread. Read snapshots with `debug.get_traces`.
+- trace_expr: {"anyOf":[{"$ref":"#/$defs/TraceExprs"},{"type":"null"}]}
+    Only with `trace:true` — an expression to evaluate in the hit frame and record alongside the snapshot
+    (e.g. `reserva.getStatus()`). A trailing `#<charset>` says how to render a `byte[]`/`char[]` this resolves
+    to: `log.dsRequest#ISO-8859-1`, or `#raw` for the element list. It composes here because there is no
+    schema to extend inside an expression string — see `debug.evaluate`'s `expression` for the full list of
+    names. **Accepts a LIST as well as a string** (TRACE-11): `["tenant.getIdentificador()",
+    "sessao.getNmSchema()"]` records both against the same hit, which is the only way to see a *disagreement*
+    between two values. Each element is evaluated in turn against the same frame and gets its own labelled
+    slot, so one that errors leaves the others intact. Bounded — the cost is per hit and multiplies — and a
+    request over the ceiling is clamped with the clamp reported.
+- trace_frames: {"default":3,"format":"uint","minimum":0,"type":"integer"}
+    Only with `trace:true` — how many CALLER frames to record above the hit, so a snapshot says **which path
+    reached it**, not just that it fired (default 3; 0 for the hit frame alone, capped at 20). Callers are
+    recorded as `class.method:line` locations only — no locals, no invocation — so this stays safe in a
+    read-only session. Each frame costs JVM round trips on *every* hit, so keep it small on a hot line and
+    pair it with `trace_max_hits`. The measured price of that depth: capture costs ~0.86ms per hit before any
+    callers, and the default 3 frames add ~0.53ms on top (**+62%**), lowering the ceiling from ~1160 to ~720
+    hits/s. Kept at 3 regardless, because the chain is usually the answer rather than context — but
+    `trace_frames: 0` is the cheap mode when the site is hot and you only need that it fired. Loopback
+    measurement against a trivial `WildFly` endpoint (#22); `debug.list_stop_points` reports what the depth
+    you chose is costing on *your* JVM once hits have landed.
+- trace_max_hits: {"default":null,"format":"uint32","minimum":0,"type":["integer","null"]}
+    Only with `trace:true` — disarm this logpoint automatically after recording this many hits, so a hot line
+    can't flood the debuggee (defaults to 200). Pass 0 for no limit. **This bound is load-bearing, not a
+    formality.** Capture is serialised through the single JDWP connection and one event pump, so a traced stop
+    point tops out at roughly **720 hits/s** with the default 3 caller frames, or **~1160/s** with
+    `trace_frames: 0`. Past that the debugger — not the application — is the bottleneck, and every further hit
+    queues behind the ones being captured. At the default 200 the exposure is a sub-second blip, which is most
+    of the reason trace mode is safe to leave armed at all. **`0` on a site that fires thousands of times a
+    second turns that blip into sustained throttling**: it is the single setting that removes the protection,
+    so choose it knowingly. Loopback measurement against a trivial `WildFly` endpoint (#22) — the absolute
+    figures move with hardware, the existence of a hits/s ceiling does not. **You do not have to trust those
+    figures**: once the stop point has fired, `debug.list_stop_points` reports the mean capture measured on
+    the JVM you are actually attached to — invert it for this ceiling — plus the rate hits are arriving at and
+    the share of the window spent capturing (TRACE-7).
+- trace_max_length: {"default":null,"format":"uint","minimum":0,"type":["integer","null"]}
+    Only with `trace:true` — raise the per-value length cap on each capture, for a payload that does not fit
+    the frugal defaults: a JSON body, a SOAP envelope, a `+=`-built SQL string. Unset keeps them exactly as
+    they were — **100** characters for each in-scope local, **200** for the `trace_expr` result, the
+    method-exit `returned` value and a watchpoint's old → new pair. Ceiling 4000; a larger request is clamped
+    and the reply says so, and `0` is read as the ceiling rather than as "no limit" (which is what it means on
+    `trace_max_hits`, and cannot mean here). **Truncation happens at CAPTURE time**, which is why this is an
+    arming argument rather than a `debug.get_traces` one: the cut string is what the snapshot stores, so the
+    remainder is gone and no later read can recover it. On a shared instance the workaround — suspend, then
+    `debug.evaluate` with a large `max_result_length` — is precisely the thing trace mode exists to avoid.
+    **The two defaults differ deliberately, and ONE argument raises both.** The locals are context, captured
+    whether you asked for them or not, while `trace_expr` is the payload you named, so it already gets twice
+    the room; both are frugal because a trace may fire hundreds of times into a bounded buffer. One knob
+    rather than two because a caller raising the cap wants the payload and should not have to work out which
+    of two numbers governs the value in front of them. It is still a bound. Buffer memory is roughly this cap
+    × the hits recorded, and `trace_max_hits` defaults to 200 — so 4000 is ~800KB per captured value on one
+    stop point at its default budget, which is where the ceiling comes from.
+
+## debug.set_method_exit_stop
+- class_pattern: REQUIRED {"$ref":"#/$defs/ClassPatterns"}
+    Class whose method returns you want to see (e.g. `br.com.infotravel.IntegraSrv`), optionally with a
+    leading/trailing `*`. This is a JDWP `ClassMatch`, so it fires for **every method** of every matching
+    class — give `method` as well unless you really want all of them. Also takes a LIST (`["*.OrderService",
+    "*.PaymentService"]` — FILT-4), arming one `mexit_…` per pattern. Unlike the other stop points a wildcard
+    costs nothing extra here and needs no expansion: the JVM does the matching, so one request covers every
+    class the pattern matches, including classes that load later. That is why this tool had pattern support
+    from the start and the others did not.
+- condition: {"default":null,"type":["string","null"]}
+    Only stop when this boolean expression is true, evaluated on the hit thread's top frame — the same grammar
+    `debug.set_line_stop`'s `condition` takes, `!`/`&&`/`||` included (FILT-6, #83). The returned value is NOT
+    bound to a name here: a method-exit hit's frame is the returning method's own, so its locals and `this`
+    are all in scope and the value is usually derivable from them. Pair this with `with_return_value` when you
+    need to see what it returned. **Cost, on a SUSPENDING stop point:** the VM is frozen while the condition
+    is evaluated, and a method-exit request receives every method of a matching class — so a condition on a
+    broad `class_pattern` is evaluated far more often than it fires.
+- exclude_classes: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Class patterns this request must NOT fire for (STEP-1), as JDWP `ClassExclude` modifiers. What makes a
+    *wildcard* `class_pattern` usable on a framework-heavy JVM. The match is done by the JVM, so a broad
+    pattern sweeps in every proxy and interceptor the container generates, and each unwanted exit costs a real
+    event before this side can discard it by method name. An exclusion stops the event being generated at all.
+    **No default here, unlike the stepping tools.** A method-exit `class_pattern` is something the caller
+    wrote; silently subtracting from it would answer a different question from the one asked.
+- hit_count: {"default":null,"format":"int32","type":["integer","null"]}
+    Only fire on the Nth occurrence (optional), then never again. **Refused together with `method`, and the
+    refusal is the honest answer rather than a missing feature.** JDWP's `Count` modifier, with the same
+    semantics as everywhere else here: the stop point fires once, on the Nth occurrence, and the JVM then
+    deletes the request itself — `debug.list_stop_points` reports it as SPENT rather than as armed. What makes
+    this kind different is *what* the JVM is counting. A method-exit request is a `ClassMatch`, so it fires
+    for **every method** of every matching class, and `method` is applied on this side afterwards. `Count` is
+    applied by the JVM, before that filter can see anything. So `hit_count: 3` with `method: "save"` means
+    "the 3rd exit of any method of this class" — almost always a different method, which this side then drops,
+    leaving a stop point that reported nothing and that the JVM has already deleted. There is no way to make
+    it mean what it reads like: JDWP has no method-name modifier, which is the same absence `method` itself
+    exists to work around. Without `method` it means exactly what it says, and is the way to catch the Nth
+    return out of a class regardless of which method produced it.
+- instance_id: {"default":null,"type":["string","null"]}
+    Scope this stop point to ONE object: only hits whose `this` is that object are reported (JDWP's
+    `InstanceOnly`, FILT-9). Give the `@0x…` handle any reply prints beside an object. **Filters inside the
+    JVM**, unlike a `condition`: an excluded hit costs no packet and no thread suspension, which is what makes
+    "trace `salvar()` on THIS Reserva, not all 400 in flight" cheap on a shared instance rather than the most
+    expensive thing you can arm. The handle is a **weak** reference (ADR-0022). If the debuggee collects the
+    object the filter stops matching and the stop point goes quiet, which is indistinguishable from the code
+    never running — so `debug.list_stop_points` checks and says when that has happened.
+- method: {"default":null,"type":["string","null"]}
+    Only report returns from this method name. Filtered on our side, because JDWP has no method-name modifier
+    — the JVM still reports every method of the class and non-matching exits are dropped here. Overloads all
+    match, since the name is all JDWP gives us to compare.
+- thread_id: {"default":null,"type":["string","null"]}
+    Only report returns on this thread (hex id, e.g. `0x2a`). On a busy app server this is the single biggest
+    noise reduction for this event kind — get the id from `debug.list_threads` or `debug.thread_dump` first.
+- trace: {"default":true,"type":"boolean"}
+    Logpoint mode: snapshot each return (location, thread, in-scope locals, the returned value) and resume
+    immediately WITHOUT suspending. **Defaults to true, unlike every other stop point** — a suspending method
+    exit on a hot method is the fastest way to freeze a shared JVM this tool offers. Setting it false needs a
+    concrete class and a `method`, or it is refused.
+- trace_expr: {"anyOf":[{"$ref":"#/$defs/TraceExprs"},{"type":"null"}]}
+    Only with `trace:true` — an expression evaluated in the returning frame and recorded alongside the
+    snapshot. A trailing `#<charset>` says how to render a `byte[]`/`char[]` this resolves to:
+    `log.dsRequest#ISO-8859-1`, or `#raw` for the element list. It composes here because there is no schema to
+    extend inside an expression string — see `debug.evaluate`'s `expression` for the full list of names.
+    **Accepts a LIST as well as a string** (TRACE-11): `["tenant.getIdentificador()", "sessao.getNmSchema()"]`
+    records both against the same hit, which is the only way to see a *disagreement* between two values. Each
+    element is evaluated in turn against the same frame and gets its own labelled slot, so one that errors
+    leaves the others intact. Bounded — the cost is per hit and multiplies — and a request over the ceiling is
+    clamped with the clamp reported.
+- trace_frames: {"default":3,"format":"uint","minimum":0,"type":"integer"}
+    Only with `trace:true` — how many caller frames to record above the return, as `class.method:line`
+    (default 3; 0 for the returning frame alone, capped at 20). The measured price of that depth: capture
+    costs ~0.86ms per hit before any callers, and the default 3 frames add ~0.53ms on top (**+62%**), lowering
+    the ceiling from ~1160 to ~720 hits/s. Kept at 3 regardless, because the chain is usually the answer
+    rather than context — but `trace_frames: 0` is the cheap mode when the site is hot and you only need that
+    it fired. Loopback measurement against a trivial `WildFly` endpoint (#22); `debug.list_stop_points`
+    reports what the depth you chose is costing on *your* JVM once hits have landed.
+- trace_max_hits: {"default":null,"format":"uint32","minimum":0,"type":["integer","null"]}
+    Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit). Method
+    exits are the noisiest event in JDWP, so this budget matters more here than anywhere else. **This bound is
+    load-bearing, not a formality.** Capture is serialised through the single JDWP connection and one event
+    pump, so a traced stop point tops out at roughly **720 hits/s** with the default 3 caller frames, or
+    **~1160/s** with `trace_frames: 0`. Past that the debugger — not the application — is the bottleneck, and
+    every further hit queues behind the ones being captured. At the default 200 the exposure is a sub-second
+    blip, which is most of the reason trace mode is safe to leave armed at all. **`0` on a site that fires
+    thousands of times a second turns that blip into sustained throttling**: it is the single setting that
+    removes the protection, so choose it knowingly. Loopback measurement against a trivial `WildFly` endpoint
+    (#22) — the absolute figures move with hardware, the existence of a hits/s ceiling does not. **You do not
+    have to trust those figures**: once the stop point has fired, `debug.list_stop_points` reports the mean
+    capture measured on the JVM you are actually attached to — invert it for this ceiling — plus the rate hits
+    are arriving at and the share of the window spent capturing (TRACE-7).
+- trace_max_length: {"default":null,"format":"uint","minimum":0,"type":["integer","null"]}
+    Only with `trace:true` — raise the per-value length cap on each capture, for a payload that does not fit
+    the frugal defaults: a JSON body, a SOAP envelope, a `+=`-built SQL string. Unset keeps them exactly as
+    they were — **100** characters for each in-scope local, **200** for the `trace_expr` result, the
+    method-exit `returned` value and a watchpoint's old → new pair. Ceiling 4000; a larger request is clamped
+    and the reply says so, and `0` is read as the ceiling rather than as "no limit" (which is what it means on
+    `trace_max_hits`, and cannot mean here). **Truncation happens at CAPTURE time**, which is why this is an
+    arming argument rather than a `debug.get_traces` one: the cut string is what the snapshot stores, so the
+    remainder is gone and no later read can recover it. On a shared instance the workaround — suspend, then
+    `debug.evaluate` with a large `max_result_length` — is precisely the thing trace mode exists to avoid.
+    **The two defaults differ deliberately, and ONE argument raises both.** The locals are context, captured
+    whether you asked for them or not, while `trace_expr` is the payload you named, so it already gets twice
+    the room; both are frugal because a trace may fire hundreds of times into a bounded buffer. One knob
+    rather than two because a caller raising the cap wants the payload and should not have to work out which
+    of two numbers governs the value in front of them. It is still a bound. Buffer memory is roughly this cap
+    × the hits recorded, and `trace_max_hits` defaults to 200 — so 4000 is ~800KB per captured value on one
+    stop point at its default budget, which is where the ceiling comes from.
+
+## debug.set_monitor_stop
+- hit_count: {"default":null,"format":"int32","type":["integer","null"]}
+    Only fire on the Nth occurrence (optional), then never again — JDWP's `Count`, with the same semantics as
+    everywhere else here: the JVM reports the Nth event and **deletes the request itself**, so the stop point
+    is then SPENT rather than armed. Not "the first N", which is `trace_max_hits`. Applied per JDWP request,
+    and each armed kind is its own request — so with the default pair, `hit_count: 5` means the 5th `blocked`
+    AND the 5th `acquired`, which are not two halves of the same pair. Combined with `min_duration_ms` it
+    yields nothing at all, and is refused rather than silently producing an armed stop point that can never
+    record.
+- instance_id: {"default":null,"type":["string","null"]}
+    **Accepted and always refused**, and the refusal is the answer rather than a missing feature. It reads
+    like exactly the right thing to want — "only report contention on THIS lock object" — which is why it is
+    declared here instead of left out: an undeclared argument is silently ignored, so a caller would get a
+    reply claiming the stop point was scoped to one lock while it reported every lock in the JVM. JDWP's
+    `InstanceOnly` tests the frame's `this`, not the monitor, and the monitor is a different object from
+    whatever the blocking code is executing on. `HotSpot` **accepts the modifier anyway and then ignores it**:
+    measured on Temurin 11.0.32 against a probe whose every frame is static (so `this` is null and nothing
+    could legitimately match), the request armed cleanly and reported all three of its locks (FILT-9,
+    ADR-0027, ADR-0035). Use `thread_id`, `monitor_class` on the wait pair, or `min_duration_ms`.
+- kinds: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Which of the four monitor events to report. Omitted arms `["blocked", "acquired"]` — the
+    **contended-entry** pair, which is what "requests are hanging on a lock" asks about and the only pairing
+    that yields a blocked-for duration. They are two pairs, not four independent kinds: - `blocked` — a thread
+    began waiting for a lock another thread owns (`MONITOR_CONTENDED_ENTER`). - `acquired` — that thread got
+    the lock (`MONITOR_CONTENDED_ENTERED`). Closes the pair. - `wait` — a thread is entering `Object.wait()`,
+    which RELEASES the lock (`MONITOR_WAIT`). - `waited` — its `wait()` returned, notified or timed out
+    (`MONITOR_WAITED`). Closes the pair. **A duration needs both halves of a pair**, because no monitor event
+    carries one: it is measured on this side, from the opening event to the closing one. One half alone is a
+    legitimate and cheaper arming — it answers "is anything blocking at all" for one request instead of two —
+    and a snapshot from it says the duration was not measurable rather than printing a zero. The two pairs are
+    separate questions and mixing them is usually not what you want. Blocking is involuntary and a long one is
+    a fault; `wait()` is voluntary and a long one is often a healthy idle worker.
+- min_duration_ms: {"default":null,"format":"uint64","minimum":0,"type":["integer","null"]}
+    Only record a completed pair whose measured duration is at least this many milliseconds — the way to ask
+    "show me the blocks that actually hurt" on a lock that is contended thousands of times a second. **This
+    filters what you READ, not what crosses the wire, and the difference is not pedantry.** JDWP has no
+    duration modifier, so by the time this can be applied the event has been generated, has cost the debuggee
+    its notification, and has already arrived here. It shrinks the trace buffer and nothing else. `thread_id`
+    is the filter that actually reduces debuggee cost. **Requires both halves of the pair, and changes what
+    the opening half does.** A duration is known only at the closing event, so with a threshold set the
+    opening event stops producing snapshots and becomes pure timestamping — otherwise a contended lock would
+    spend its whole `trace_max_hits` budget on "started blocking" lines before one long block was reported.
+    `debug.list_stop_points` still counts every hit, so `Hits: 900` with no snapshots means "contended
+    constantly, never for long" — a different finding from `Hits: 0`. **A pair whose duration could not be
+    measured is dropped while this is set**, rather than reported with the figure missing. The routine cause
+    is the first events after arming: those threads were already blocked, so their start was never seen, and
+    reporting them would put a 60 ms lock in a reply that asked for 200 ms. With no threshold they are kept,
+    and their detail says why there is no number.
+- monitor_class: {"default":null,"type":["string","null"]}
+    Only report events whose MONITOR is an instance of this class (or a subclass) — JDWP's `ClassOnly`, also
+    applied inside the JVM. **Accepted only with `wait` / `waited`, and refused on `blocked` / `acquired`.**
+    That asymmetry is the JDWP spec's, not this tool's, and it is measured rather than assumed: on the
+    contended pair `HotSpot` applies the same modifier to the class of the **code that blocked** instead, so a
+    request asking for "only `Hashtable` locks" would silently become "only blocking inside `Hashtable`'s own
+    methods" and the reply would look correct. Measured on Temurin 11.0.32 — a `ClassOnly` naming the lock's
+    type produced 0 events on `blocked` and 74 on `wait`, and one naming the blocking code's class produced 45
+    on `blocked` and 0 on `wait` (DUMP-7, ADR-0035). So it is refused where it does not mean what it reads
+    like, on the same rule that refuses `instance_id` elsewhere. Use `thread_id`, or `min_duration_ms`, to
+    narrow the contended pair.
+- thread_id: {"default":null,"type":["string","null"]}
+    Only report events on this thread (hex id, e.g. `0x2a`) — JDWP's `ThreadOnly`, applied **inside the JVM**,
+    so a non-matching event costs no packet and no capture (FILT-1). The cheap narrowing, and the one to reach
+    for first: on a busy app server every lock in the JDK's own internals is contended constantly, and an
+    unfiltered monitor stop point sees all of it.
+- trace: {"default":true,"type":"boolean"}
+    Logpoint mode: snapshot each event (the lock, the thread, the blocking location, its callers and in-scope
+    locals, and the measured duration on a closing event) and resume immediately WITHOUT suspending.
+    **Defaults to true, and `false` requires a `thread_id`.** A suspending monitor stop is the most dangerous
+    thing this server can arm. Contention is not a line you chose — it is wherever threads happen to collide —
+    so a VM-wide freeze on the next acquisition of a hot lock stops the whole application, and it can fire
+    again the instant you resume. There is no class or method to narrow it to, which is why the only accepted
+    narrowing for `trace:false` is one named thread.
+- trace_expr: {"anyOf":[{"$ref":"#/$defs/TraceExprs"},{"type":"null"}]}
+    Only with `trace:true` — an expression evaluated in the blocking/waiting frame and recorded with the
+    snapshot. **Read the caution, because this kind is the one where invoking can bite.** A thread suspended
+    at a `monitorenter` is blocked on the lock in the snapshot, and a method call that needs that same monitor
+    cannot complete — the debugger would wedge the thread it is reporting on. Field reads (`this.pedido.id`)
+    are safe; a getter that touches shared state under the same lock is not. This is also why this kind has no
+    `condition`. Accepts a LIST as well as a string (TRACE-11), each element evaluated against the same frame
+    into its own labelled slot.
+- trace_frames: {"default":3,"format":"uint","minimum":0,"type":"integer"}
+    Only with `trace:true` — how many CALLER frames to record above the blocking frame (default 3; 0 for the
+    blocking frame alone, capped at 20). Worth the default here more than anywhere: the lock and the blocking
+    line rarely identify the problem on their own, because the same `synchronized` block is entered from every
+    request path. The chain is what says WHICH path is wedged. Callers are recorded as `class.method:line`
+    only — no locals, no invocation.
+- trace_max_hits: {"default":null,"format":"uint32","minimum":0,"type":["integer","null"]}
+    Only with `trace:true` — disarm automatically after this many recorded hits (default 200; 0 = no limit),
+    so a hot lock cannot flood the debuggee. **This bound matters more on this kind than on any other.** An
+    uncontended lock produces nothing at all, but a hot contended one produces two events per acquisition, and
+    contention on a busy app server can be far more frequent than any breakpoint you would choose to set —
+    measured at 434 events in 3 seconds from a seven-thread probe. Capture is serialised at roughly **720
+    hits/s** with the default 3 caller frames, so this is the easiest way yet to reach that ceiling. `0`
+    removes the protection; choose it knowingly. `debug.list_stop_points` reports what the stop point is
+    actually costing on your JVM once events have landed (TRACE-7).
+- trace_max_length: {"default":null,"format":"uint","minimum":0,"type":["integer","null"]}
+    Only with `trace:true` — raise the per-value length cap on each capture (unset keeps 100 characters per
+    in-scope local and 200 for a `trace_expr` result; ceiling 4000, and a larger request is clamped with the
+    clamp reported).
+
+## debug.set_value
+- frame_index: {"default":0,"format":"uint","minimum":0,"type":"integer"}
+    Frame index (default 0). Used for locals and for resolving an instance-field prefix.
+- target: REQUIRED {"type":"string"}
+    What to write. A local variable name (`counter`), a static field (`ConfigDefaultUtils.dsInfra` or a
+    fully-qualified `pkg.Class.field`), an instance field reached from a suspended frame (`this.status`,
+    `reserva.total`), or **one element** of an array, `List` or `Map` (`numbers[0]`, `tags[1]`,
+    `counts["a"]`). A slice or filter target is refused — it names several elements, so there is nothing
+    single to write. Accepts the legacy key `name`.
+- thread_id: {"default":null,"type":["string","null"]}
+    Thread id (optional; defaults to last-hit thread). Needed for locals and instance fields.
+- value: REQUIRED {"type":"string"}
+    Literal: int, 123L, 1.5, 2.0f, 'a', true/false, null, or "string". Coerced to the target's declared type.
+
+## debug.source
+- class_name: REQUIRED {"type":"string"}
+    Fully-qualified class name, e.g. com.example.OrderService, or an inner class com.example.Order$Line. Must
+    already be loaded — find it with `debug.list_classes`.
+- class_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Build-output directories, replacing the session's (`debug.attach`, `JDWP_CLASS_ROOTS`), used only to check
+    the source window against the bytecode the JVM loaded (DISC-11). Configuring them is what enables that
+    check, and it costs one `Method.LineTable` per method of the class; pass `[]` to skip it. Nothing is
+    compared without them, and the reply says so rather than implying the source matches.
+- context: {"default":20,"format":"uint","minimum":0,"type":"integer"}
+    Lines of context either side of `line`.
+- line: {"default":null,"format":"int32","type":["integer","null"]}
+    Centre the reply on this 1-based source line — the one a stack frame, a stop point or a trace snapshot
+    reported. This is the intended way to use the tool: without it (and without `whole_file`) the reply is the
+    JVM's answer only, and no file is read.
+- max_lines: {"default":400,"format":"uint","minimum":0,"type":"integer"}
+    Hard cap on how many source lines one reply may contain. Hitting it truncates loudly — the reply always
+    says which lines of how many it is showing.
+- source_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Directories to search for this call only, replacing the session's roots (set at `debug.attach` or by
+    `JDWP_SOURCE_ROOTS`). Pass `[]` to skip reading any file and get only what the JVM knows.
+- whole_file: {"default":false,"type":"boolean"}
+    Return the whole file rather than a window, still capped by `max_lines`. Off by default, and it overrides
+    `line` when both are given.
+
+## debug.step_into
+- exclude_classes: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Class patterns to step **over** rather than into (STEP-1). **A default set is applied when this is
+    omitted** — see `debug.step_into`'s description for the list and why it is on. Each is JDWP's own pattern
+    form: an exact dotted class name, or one with a single leading or trailing `*` (`java.*`,
+    `*.OrderService`). Pass `[]` to step into everything, which is the behaviour before this argument existed.
+- only_classes: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Class patterns to step **only** within — the inverse of `exclude_classes`, for "keep going until we are
+    back in my package" (`br.com.infotravel.*`). Composes with `exclude_classes`: the JVM applies every
+    modifier, so a class must match one of these AND none of the exclusions. Omitted or empty, nothing is
+    restricted.
+- thread_id: {"default":null,"type":["string","null"]}
+    Thread ID to step (optional; defaults to the last thread that hit a breakpoint).
+
+## debug.step_out
+- exclude_classes: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Class patterns to step **over** rather than into (STEP-1). **A default set is applied when this is
+    omitted** — see `debug.step_into`'s description for the list and why it is on. Each is JDWP's own pattern
+    form: an exact dotted class name, or one with a single leading or trailing `*` (`java.*`,
+    `*.OrderService`). Pass `[]` to step into everything, which is the behaviour before this argument existed.
+- only_classes: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Class patterns to step **only** within — the inverse of `exclude_classes`, for "keep going until we are
+    back in my package" (`br.com.infotravel.*`). Composes with `exclude_classes`: the JVM applies every
+    modifier, so a class must match one of these AND none of the exclusions. Omitted or empty, nothing is
+    restricted.
+- thread_id: {"default":null,"type":["string","null"]}
+    Thread ID to step (optional; defaults to the last thread that hit a breakpoint).
+
+## debug.step_over
+- exclude_classes: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Class patterns to step **over** rather than into (STEP-1). **A default set is applied when this is
+    omitted** — see `debug.step_into`'s description for the list and why it is on. Each is JDWP's own pattern
+    form: an exact dotted class name, or one with a single leading or trailing `*` (`java.*`,
+    `*.OrderService`). Pass `[]` to step into everything, which is the behaviour before this argument existed.
+- only_classes: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Class patterns to step **only** within — the inverse of `exclude_classes`, for "keep going until we are
+    back in my package" (`br.com.infotravel.*`). Composes with `exclude_classes`: the JVM applies every
+    modifier, so a class must match one of these AND none of the exclusions. Omitted or empty, nothing is
+    restricted.
+- thread_id: {"default":null,"type":["string","null"]}
+    Thread ID to step (optional; defaults to the last thread that hit a breakpoint).
+
+## debug.suspend_thread
+- thread_id: REQUIRED {"type":"string"}
+    Thread ID to suspend, as `debug.list_threads` and `debug.thread_dump` print it (`0x7f2c…`).
+
+## debug.thread_dump
+- limit: {"default":40,"format":"uint","minimum":0,"type":"integer"}
+    Max threads to include; the rest are reported as a hidden count (default 40). **Which 40 you get is a
+    rule, and the reply states it.** They are chosen by **name family** — one thread from each distinct thread
+    name with its digits ignored (`default task-7` and `default task-91` are one family, `default I/O-3` is
+    another) before a second from any family, so no single pool can spend every slot. The rows are then
+    printed in creation order, and the truncation footer names the biggest groups it withheld. It is **not**
+    the first 40 the JVM listed. JDWP `AllThreads` order is *creation* order and an app server creates its
+    request pool last, so on a loaded `WildFly` the first 40 were measured to be entirely JVM internals, the
+    service container and Undertow selectors, with **no application threads at all**, while 13 request workers
+    sat 328 frames deep (TEST-8, #24; fixed in DUMP-3, #43, see ADR-0013). Raising `limit` was never the
+    answer to that — it buys more selectors before it reaches the pool. `name_filter` (e.g. `'default task'`)
+    is still the cheapest way to ask about one pool, and it composes: with a single family left, the
+    round-robin *is* creation order and the dump says nothing about it.
+- max_frames: {"default":8,"format":"uint","minimum":0,"type":"integer"}
+    Max frames per thread (default 8 — deliberately narrower than `debug.get_stack`, since this multiplies by
+    the thread count). The deepest frames are the ones dropped. Kept at 8 after measuring a real `WildFly`
+    (TEST-8, #24), where 180 of 264 threads exceeded it and a working request thread showed 8 of ~328 frames.
+    Frame #0 is the innermost, so those 8 are *where the thread actually is*, which is the useful end — and
+    raising the default multiplies by the thread count. For a deep read, narrow with `name_filter` and raise
+    this, rather than widening the default.
+- max_suspend_ms: {"default":2000,"format":"uint64","minimum":0,"type":"integer"}
+    Cap how long the VM may be held **suspended** while collecting, in milliseconds (default 2000; `0` =
+    unbounded). Only meaningful with `suspend:true`. A dump is many round trips by construction, and the VM
+    stays frozen for all of them — so the freeze grows with the thread count and frame depth, and on a remote
+    JVM it is round-trip-latency bound rather than fast. When the budget runs out the dump resumes the VM
+    immediately, returns what it gathered, and **says which threads it did not read** — a truncated dump is
+    never presented as a complete one. Raise it for a deliberately deep dump, or narrow with `name_filter` /
+    `limit` / `max_frames` / `package_filter` instead, which costs nothing.
+- monitors: {"default":true,"type":"boolean"}
+    Include each thread's held monitors and the monitor it is blocked on (default true) — the "who holds the
+    lock this thread is waiting for" half of a deadlock investigation. Skipped automatically, with a note, on
+    a JVM that lacks the capability.
+- monitors_only: {"default":false,"type":"boolean"}
+    Read **only** the lock state — the monitors each thread holds and the one it is blocked entering — and
+    skip the frames entirely (default false). The cheap way to ask "who is blocked on what". Measured against
+    a 60-thread probe: **245 packets and 33ms of suspension, against 770 and 117ms** for the same dump with
+    stacks. The lock state costs a flat ~4 JDWP packets per thread, while each frame read adds ~3 more (method
+    and line; class names are cached across the dump). That saving was predicted to widen against
+    `WildFly`-depth stacks. **It does not** (TEST-8, #24). On a real `WildFly` loaded to 267 threads it cut
+    the full dump from 467ms to 198ms and the default from 144ms to 35ms — 1.6–2.4x, *narrower* than the 3x on
+    probes. On the **same VM idle it was slower**: 114ms against the full dump's 87ms, despite ~40% fewer
+    packets. Monitor reads are per-thread JVM work, not just round trips, so with no deep stacks to skip there
+    is nothing to save and the monitor queries dominate. Ask for this mode because the lock graph is the
+    answer you want — not on the assumption that it is always the cheaper dump. For a deadlock the lock graph
+    *is* the answer and the stacks are only context. The holder of a contended lock is still named. Composes
+    with `name_filter`, `only_suspended` and `limit`. `max_frames` and `package_filter` do nothing here, since
+    no frames are read. Requires `monitors` (the default) — asking for neither locks nor stacks is refused
+    rather than answered with empty rows.
+- name_filter: {"default":null,"type":["string","null"]}
+    Only threads whose name contains this substring (case-insensitive), e.g. 'default task' for `WildFly`'s
+    request pool. The cheapest way to cut the cost of a dump on a JVM with hundreds of threads.
+- only_suspended: {"default":false,"type":"boolean"}
+    Only threads that are already suspended. On a running VM those are the only ones whose stacks can be read
+    at all, so this is the way to get a dump with no unreadable entries in it.
+- package_filter: {"default":null,"type":["string","null"]}
+    Only show frames whose class name contains this substring (case-insensitive), e.g. your app package;
+    framework frames collapse into "… N frame(s) hidden" and cost no lookups. On a `WildFly` stack this is the
+    difference between 8 useful frames and 8 servlet-filter frames.
+- suspend: {"default":false,"type":"boolean"}
+    Suspend the VM for the duration of the dump, then resume it and verify it is running again. Off by
+    default, and that default is the point: JDWP can only read a **suspended** thread's stack and locks, so a
+    dump of a running VM reports every thread as unreadable — but silently pausing a shared instance to make
+    the output look better is exactly the mistake SAFE-4 was about. Pass `true` to say explicitly "freeze it
+    briefly, I accept that". A VM that is *already* suspended is read as it is and left suspended, whatever
+    this is set to.
+
+## debug.toggle_stop_point
+- breakpoint_id: REQUIRED {"type":"string"}
+    Stop-point ID (`bp_…`) from `debug.list_stop_points`.
+- enabled: {"default":null,"type":["boolean","null"]}
+    Desired state: `false` clears the JDWP request but keeps the definition (`condition`, `trace_expr`) so it
+    can be re-armed later; `true` re-arms it. Omit to flip the current state.

@@ -1,10 +1,11 @@
 # Every debug.* tool description, word-wrapped at 110 columns. GENERATED — do not hand-edit:
-#     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp tool_descriptions
+#     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot
 #
 # This file exists so that a change to a tool description has to be READ by somebody. Two merges
 # in the v0.9.0 range interleaved two of these single-line string literals and shipped the
-# gibberish; nothing failed, because the tests asserted on names and argument shapes and no human
-# reads a 4000-character line in a diff (DOC-7, #108).
+# gibberish; nothing failed, because the tests asserted on names and nothing else, and no human
+# reads a 4000-character line in a diff (DOC-7, #108). Argument schemas are guarded separately,
+# in argument-schemas.txt, which the same command regenerates (DOC-8, #120).
 
 ## debug.attach
 Open a debug session against a JVM that is ALREADY RUNNING with -agentlib:jdwp — host + port; nothing is

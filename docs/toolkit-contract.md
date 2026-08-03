@@ -57,11 +57,25 @@ for that reason. Two merges in the v0.9.0 range interleaved `debug.evaluate` and
 descriptions — each is a single ~4000-character string literal, so git had nothing to conflict *on* — and
 shipped `"Anees n thread at all."`, `"invokhing"`, and the `@0x…` object-handle capability **deleted from both
 head lists** with ungrammatical fragments about it stranded at the end. Nothing failed: the tests asserted on
-tool names and argument shapes, and no human reads a 4000-character line in a diff.
+tool names and nothing else, and no human reads a 4000-character line in a diff.
 
-So a description change is now gated two ways, and `mcp-server/tests/tool-descriptions.txt` is the important
-one: a word-wrapped snapshot of all 36 descriptions that a deliberate edit must regenerate. That regeneration
-step **is** the review moment this table asks for — the point at which somebody reads what a caller will read.
+That last sentence used to say the tests asserted on "tool names and argument shapes". They did not, and the
+same over-statement sat in the code comment it was copied from (DOC-8, #120) — which mattered, because a reader
+deciding whether an argument change needed a guard would conclude one was already there. It is true now.
+
+So a description change is gated two ways, and `mcp-server/tests/tool-descriptions.txt` is the important one:
+a word-wrapped snapshot of all 37 descriptions that a deliberate edit must regenerate. That regeneration step
+**is** the review moment this table asks for — the point at which somebody reads what a caller will read.
+
+**`mcp-server/tests/argument-schemas.txt` is the same guard for the row above it** — the one about renaming an
+argument, which is silent too. It is generated from the advertised tool list rather than a hand-kept roster, so
+it covers **37 tools and 173 arguments** by construction: each argument's full schema minus its description
+(type, default, `format`, `minimum`, `anyOf`, whether it is required) followed by the description word-wrapped.
+`schemars` publishes those descriptions as the `inputSchema`, so they are the caller's documentation for every
+argument — the same thing the tool description is one level up, and this file's insistence that an audit count
+**arguments** rather than tools is the reason it exists. It caught nothing before it was written because it did
+not exist: five argument descriptions changed in v0.14.1 and the suite showed no diff at all. Both snapshots
+regenerate with the one command, `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot`.
 
 ## What to do when cutting a release
 
@@ -85,6 +99,8 @@ For each caller-visible change, the release body should name:
 - whether a **tool description** changed, and how — the description is what the toolkit's skills paraphrase, so
   a corrected or expanded one is a caller-visible change even though no name, argument or reply moved. The diff
   to read is `mcp-server/tests/tool-descriptions.txt`, which is why it is committed;
+- whether an **argument's** type, default or description changed — the diff to read is
+  `mcp-server/tests/argument-schemas.txt`, committed for the same reason;
 - for a rename, **both** names — the toolkit's audit greps for old names, and that only works if the release
   says what the old name was.
 
