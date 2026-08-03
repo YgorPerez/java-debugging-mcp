@@ -222,22 +222,23 @@ max_children) — costly, so narrow the stack with max_frames/package_filter fir
 ## debug.get_traces
 Return snapshots captured by non-suspending trace mode — debug.set_line_stop, debug.set_exception_stop or
 debug.set_field_stop with trace:true. Each shows where it fired, its calling chain as `← class.method:line`
-entries (nearest caller first, locations only), the thread, in-scope locals/args, any trace_expr result (a
-trace_expr may carry a trailing #<charset> — e.g. entry.dsRequest#ISO-8859-1 — to decode a byte[] payload, and
-.length works there too), plus the exception type/message/catch site or the field's old → new value. A record
-marked `↻ rethrow of #<seq>` is the escaping end of a rethrow chain; `#<seq>` is the original throw, which is
-the one with the application frame and the cause. Bounded ring buffer (most recent kept). Narrow with bp_id
-(one stop point), class_filter (substring), or since (only records newer than a #seq you already saw, for
-polling). Pass clear:true to empty the buffer after reading. EVERY OBJECT-VALUED ENTRY CARRIES AN @0x… HANDLE,
-which debug.evaluate accepts as an expression head — so a snapshot is a starting point rather than a dead end:
-@0x1f4c.getStatus() reads the same object afterwards, with nothing suspended. The id is a WEAK reference and
-nothing pins it, so a handle whose object has been collected reports `Vanished` rather than a JDWP error; on a
-pool that retires workers that is the ordinary outcome. A hit inside an ANONYMOUS inner class (Outer$2 — a
-Callable or Runnable handed to a pool) also carries a `captured{val$…=…, this$0=…}` group: javac compiles the
-enclosing method's captured locals to synthetic fields that are NOT in the worker method's variable table, so
-this is the only place the submitter's context — which request, which session, which supplier — crosses the
-thread boundary. Read as fields, invoking nothing. Lambdas need no such group and get none; their captures are
-already ordinary parameters.
+entries (nearest caller first, locations only), the thread, in-scope locals/args, every trace_expr result the
+stop point asked for — one per expression, in the order given, so two values captured at the same instant can
+be compared directly (a trace_expr may carry a trailing #<charset> — e.g. entry.dsRequest#ISO-8859-1 — to
+decode a byte[] payload, and .length works there too), plus the exception type/message/catch site or the
+field's old → new value. A record marked `↻ rethrow of #<seq>` is the escaping end of a rethrow chain;
+`#<seq>` is the original throw, which is the one with the application frame and the cause. Bounded ring buffer
+(most recent kept). Narrow with bp_id (one stop point), class_filter (substring), or since (only records newer
+than a #seq you already saw, for polling). Pass clear:true to empty the buffer after reading. EVERY
+OBJECT-VALUED ENTRY CARRIES AN @0x… HANDLE, which debug.evaluate accepts as an expression head — so a snapshot
+is a starting point rather than a dead end: @0x1f4c.getStatus() reads the same object afterwards, with nothing
+suspended. The id is a WEAK reference and nothing pins it, so a handle whose object has been collected reports
+`Vanished` rather than a JDWP error; on a pool that retires workers that is the ordinary outcome. A hit inside
+an ANONYMOUS inner class (Outer$2 — a Callable or Runnable handed to a pool) also carries a `captured{val$…=…,
+this$0=…}` group: javac compiles the enclosing method's captured locals to synthetic fields that are NOT in
+the worker method's variable table, so this is the only place the submitter's context — which request, which
+session, which supplier — crosses the thread boundary. Read as fields, invoking nothing. Lambdas need no such
+group and get none; their captures are already ordinary parameters.
 
 ## debug.launch
 START a JVM under the debugger and attach to it, instead of attaching to one someone else started. Give
@@ -494,28 +495,36 @@ that sustained rather than a blip. A traced throw also records the calling chain
 which is usually the actual question for a swallowed exception: which request path reached the catch. Captured
 values are truncated AT CAPTURE TIME — 100 chars per in-scope local, 200 for the trace_expr result — and the
 cut string is what the buffer stores, so debug.get_traces can never recover the rest; raise both with
-trace_max_length (ceiling 4000). A request above the ceiling is clamped and the reply says so. On a framework
-that rethrows — an EJB interceptor chain, a Spring proxy — one exception instance throws many times, so those
-sightings are FOLDED: the original throw and the point where it escapes are both kept, the layers between
-become a `↻ rethrow of #<seq> (+N collapsed)` note on the escaping record, and a collapsed rethrow does not
-spend trace_max_hits. Without that a budget of 30 was gone on one instance walking WildFly's interceptors, and
-the only informative record was the 9th. debug.list_stop_points reports the cost this request is actually
-incurring once throws have landed. PASS hit_count TO FIRE ONLY ON THE Nth THROW, and read that literally: it
-is JDWP's Count modifier, so the JVM reports the Nth occurrence and then DELETES THE REQUEST ITSELF. The stop
-point fires once and is gone — debug.list_stop_points shows it SPENT rather than armed, debug.clear_stop_point
-on it sends nothing to the debuggee and says so, and debug.toggle_stop_point is what re-arms it with the same
-count. It is NOT "the first N": that is trace_max_hits, counted on this side, and combining the two gives you
-ONE snapshot rather than trace_max_hits of them — the arm reply says so instead of reporting two numbers that
-cannot both apply. The retry loop is what it is for: a supplier consulta retried after a sleep, where the
-SECOND attempt is the interesting one and the first failing is expected. PASS instance_id TO SCOPE THE STOP
-POINT TO THROWS FROM ONE OBJECT — the @0x… handle any reply prints. This is JDWP's InstanceOnly modifier and
-the JVM applies it, so a throw from any other instance costs nothing at all on either side; it matches the
-`this` of the frame that threw, so it only narrows throws from an INSTANCE method. Measured working on Temurin
-17/21/25 against two instances throwing the same type from the same line — this is the one stop-point kind
-where HotSpot both accepts AND applies the modifier, which is why the other kinds refuse it rather than
-offering it (FILT-9, ADR-0027). THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the debuggee collects the object
-the filter stops matching and the stop point goes quiet, which is indistinguishable from the exception never
-being thrown — debug.list_stop_points checks and says so.
+trace_max_length (ceiling 4000). A request above the ceiling is clamped and the reply says so. TRACE_EXPR
+TAKES A LIST AS WELL AS A STRING, and it is how you see a DISAGREEMENT rather than a value:
+["tenant.getIdentificador()", "sessao.getNmSchema()"] records both against the SAME hit, which two stop points
+on the line cannot do — they record into two independently budgeted streams you then have to join by hand.
+Each element is evaluated in turn against the same frame and gets its own numbered slot (Trace expr[0], Trace
+expr[1]), so one that errors leaves the others intact — a chain going null on some hits and not others is the
+normal case. ONE STRING IS UNCHANGED, down to the rendering. Capped at 4 expressions, because each is a full
+resolution inside the capture window and capture is serialised, so they divide the same throughput budget
+trace_max_hits is charged against; over the cap it keeps the first 4 and the reply names what it dropped. On a
+framework that rethrows — an EJB interceptor chain, a Spring proxy — one exception instance throws many times,
+so those sightings are FOLDED: the original throw and the point where it escapes are both kept, the layers
+between become a `↻ rethrow of #<seq> (+N collapsed)` note on the escaping record, and a collapsed rethrow
+does not spend trace_max_hits. Without that a budget of 30 was gone on one instance walking WildFly's
+interceptors, and the only informative record was the 9th. debug.list_stop_points reports the cost this
+request is actually incurring once throws have landed. PASS hit_count TO FIRE ONLY ON THE Nth THROW, and read
+that literally: it is JDWP's Count modifier, so the JVM reports the Nth occurrence and then DELETES THE
+REQUEST ITSELF. The stop point fires once and is gone — debug.list_stop_points shows it SPENT rather than
+armed, debug.clear_stop_point on it sends nothing to the debuggee and says so, and debug.toggle_stop_point is
+what re-arms it with the same count. It is NOT "the first N": that is trace_max_hits, counted on this side,
+and combining the two gives you ONE snapshot rather than trace_max_hits of them — the arm reply says so
+instead of reporting two numbers that cannot both apply. The retry loop is what it is for: a supplier consulta
+retried after a sleep, where the SECOND attempt is the interesting one and the first failing is expected. PASS
+instance_id TO SCOPE THE STOP POINT TO THROWS FROM ONE OBJECT — the @0x… handle any reply prints. This is
+JDWP's InstanceOnly modifier and the JVM applies it, so a throw from any other instance costs nothing at all
+on either side; it matches the `this` of the frame that threw, so it only narrows throws from an INSTANCE
+method. Measured working on Temurin 17/21/25 against two instances throwing the same type from the same line —
+this is the one stop-point kind where HotSpot both accepts AND applies the modifier, which is why the other
+kinds refuse it rather than offering it (FILT-9, ADR-0027). THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the
+debuggee collects the object the filter stops matching and the stop point goes quiet, which is
+indistinguishable from the exception never being thrown — debug.list_stop_points checks and says so.
 
 ## debug.set_field_stop
 Break when a field is read or written — answers "who mutates this?" for a field that changes behind your back
@@ -534,21 +543,29 @@ that got there, not just the innermost setter. Captured values are truncated AT 
 in-scope local, 200 for the old → new pair and the trace_expr result — and the cut string is what the buffer
 stores, so debug.get_traces can never recover the rest; raise all of them with trace_max_length (ceiling
 4000), which is what you need when the watched field holds a payload rather than a flag. A request above the
-ceiling is clamped and the reply says so. debug.list_stop_points reports what the watch is actually costing
-once hits have landed. A watched field can't be JIT-optimised, so clear it when done. PASS hit_count TO FIRE
-ONLY ON THE Nth TOUCH, with JDWP's Count semantics: the JVM reports the Nth write (or read) and then deletes
-the request itself, so the watch fires ONCE and is then SPENT — debug.list_stop_points says so rather than
-listing it as armed, clearing it sends nothing to the debuggee, and debug.toggle_stop_point re-arms it with
-the same count. Not "the first N", which is trace_max_hits; the two together yield one snapshot, and the arm
-reply says so. PASS instance_id TO WATCH ONE OBJECT'S COPY OF THE FIELD — the @0x… handle any reply prints.
-This is JDWP's InstanceOnly modifier, so the JVM does the matching and a write to any other instance's copy
-costs no packet and no snapshot: the way to answer "who is clearing THIS session's total?" on an instance
-where 400 of them are live. REFUSED ON A STATIC FIELD, because a static write has no `this` for the modifier
-to match — and HotSpot accepts it anyway and then reports every write, with no error and a reply claiming the
-watch is scoped (measured on Temurin 17/21/25). A static field is one copy in the whole JVM, so there is
-nothing to narrow to; watch it unfiltered and use trace_expr or a condition. THE HANDLE IS A WEAK REFERENCE
-(ADR-0022): if the debuggee collects the object the watch goes quiet, which reads as the field never being
-touched — debug.list_stop_points checks and says so.
+ceiling is clamped and the reply says so. TRACE_EXPR TAKES A LIST AS WELL AS A STRING, and it is how you see a
+DISAGREEMENT rather than a value: ["tenant.getIdentificador()", "sessao.getNmSchema()"] records both against
+the SAME hit, which two stop points on the line cannot do — they record into two independently budgeted
+streams you then have to join by hand. Each element is evaluated in turn against the same frame and gets its
+own numbered slot (Trace expr[0], Trace expr[1]), so one that errors leaves the others intact — a chain going
+null on some hits and not others is the normal case. ONE STRING IS UNCHANGED, down to the rendering. Capped at
+4 expressions, because each is a full resolution inside the capture window and capture is serialised, so they
+divide the same throughput budget trace_max_hits is charged against; over the cap it keeps the first 4 and the
+reply names what it dropped. debug.list_stop_points reports what the watch is actually costing once hits have
+landed. A watched field can't be JIT-optimised, so clear it when done. PASS hit_count TO FIRE ONLY ON THE Nth
+TOUCH, with JDWP's Count semantics: the JVM reports the Nth write (or read) and then deletes the request
+itself, so the watch fires ONCE and is then SPENT — debug.list_stop_points says so rather than listing it as
+armed, clearing it sends nothing to the debuggee, and debug.toggle_stop_point re-arms it with the same count.
+Not "the first N", which is trace_max_hits; the two together yield one snapshot, and the arm reply says so.
+PASS instance_id TO WATCH ONE OBJECT'S COPY OF THE FIELD — the @0x… handle any reply prints. This is JDWP's
+InstanceOnly modifier, so the JVM does the matching and a write to any other instance's copy costs no packet
+and no snapshot: the way to answer "who is clearing THIS session's total?" on an instance where 400 of them
+are live. REFUSED ON A STATIC FIELD, because a static write has no `this` for the modifier to match — and
+HotSpot accepts it anyway and then reports every write, with no error and a reply claiming the watch is scoped
+(measured on Temurin 17/21/25). A static field is one copy in the whole JVM, so there is nothing to narrow to;
+watch it unfiltered and use trace_expr or a condition. THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the
+debuggee collects the object the watch goes quiet, which reads as the field never being touched —
+debug.list_stop_points checks and says so.
 
 ## debug.set_line_stop
 Set a breakpoint at a location (class_pattern + line and/or method). class_pattern takes AN EXACT CLASS, A
@@ -586,9 +603,17 @@ chain (trace_frames, default 3) as class.method:line, so you can see which path 
 are truncated AT CAPTURE TIME — 100 chars per in-scope local, 200 for the trace_expr result — and the cut
 string is what the buffer stores, so debug.get_traces can never recover the rest; raise both with
 trace_max_length (ceiling 4000) when the thing you are tracing is a JSON body, a SOAP envelope or a built SQL
-string. A request above the ceiling is clamped and the reply says so. debug.list_stop_points then reports what
-this stop point is actually costing on this JVM, so you need not take the ~720 figure on trust. THE
-NON-SUSPENDING PROMISE IS NOT THIS STOP POINT'S TO KEEP, AND THE REPLY NOW SAYS WHEN IT IS BROKEN: a JDWP
+string. A request above the ceiling is clamped and the reply says so. TRACE_EXPR TAKES A LIST AS WELL AS A
+STRING, and it is how you see a DISAGREEMENT rather than a value: ["tenant.getIdentificador()",
+"sessao.getNmSchema()"] records both against the SAME hit, which two stop points on the line cannot do — they
+record into two independently budgeted streams you then have to join by hand. Each element is evaluated in
+turn against the same frame and gets its own numbered slot (Trace expr[0], Trace expr[1]), so one that errors
+leaves the others intact — a chain going null on some hits and not others is the normal case. ONE STRING IS
+UNCHANGED, down to the rendering. Capped at 4 expressions, because each is a full resolution inside the
+capture window and capture is serialised, so they divide the same throughput budget trace_max_hits is charged
+against; over the cap it keeps the first 4 and the reply names what it dropped. debug.list_stop_points then
+reports what this stop point is actually costing on this JVM, so you need not take the ~720 figure on trust.
+THE NON-SUSPENDING PROMISE IS NOT THIS STOP POINT'S TO KEEP, AND THE REPLY NOW SAYS WHEN IT IS BROKEN: a JDWP
 composite carries ONE suspend policy for the whole event set — the strongest any member asked for — so a
 SUSPENDING stop point at the same bytecode location turns every trace:true stop point there into a VM-freezing
 one, on every hit (measured identical on Temurin 17/21/25). Arming either way round is ACCEPTED rather than
@@ -654,9 +679,17 @@ shared JVM, so trace:false is refused unless you name one concrete class AND one
 debug.get_traces (trace) or debug.get_last_event (suspending). The returned value is truncated AT CAPTURE TIME
 at 200 chars (100 for each in-scope local), and the cut string is what the buffer stores, so debug.get_traces
 can never recover the rest — raise both with trace_max_length (ceiling 4000) when the method returns a
-JSON/XML payload rather than a status. A request above the ceiling is clamped and the reply says so. Composes
-with thread_id, trace_max_hits and trace_frames; debug.list_stop_points reports what a traced request is
-actually costing once hits have landed. A JVM below JDWP 1.6 degrades to the return site without the value,
+JSON/XML payload rather than a status. A request above the ceiling is clamped and the reply says so.
+TRACE_EXPR TAKES A LIST AS WELL AS A STRING, and it is how you see a DISAGREEMENT rather than a value:
+["tenant.getIdentificador()", "sessao.getNmSchema()"] records both against the SAME hit, which two stop points
+on the line cannot do — they record into two independently budgeted streams you then have to join by hand.
+Each element is evaluated in turn against the same frame and gets its own numbered slot (Trace expr[0], Trace
+expr[1]), so one that errors leaves the others intact — a chain going null on some hits and not others is the
+normal case. ONE STRING IS UNCHANGED, down to the rendering. Capped at 4 expressions, because each is a full
+resolution inside the capture window and capture is serialised, so they divide the same throughput budget
+trace_max_hits is charged against; over the cap it keeps the first 4 and the reply names what it dropped.
+Composes with thread_id, trace_max_hits and trace_frames; debug.list_stop_points reports what a traced request
+is actually costing once hits have landed. A JVM below JDWP 1.6 degrades to the return site without the value,
 and says so. hit_count IS ACCEPTED ONLY WITHOUT method, AND THE REFUSAL IS THE HONEST ANSWER RATHER THAN A
 MISSING FEATURE. JDWP applies Count to the REQUEST, and this request is a ClassMatch firing for every method
 of the class; `method` is filtered on our side afterwards. So hit_count:3 with method:"save" would ask the JVM

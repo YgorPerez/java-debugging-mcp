@@ -597,8 +597,14 @@ pub struct TraceRecord {
     /// that may fire hundreds of times. It also keeps the whole capture invocation-free, so caller
     /// chains work in a read-only session (SAFE-6) — unlike object expansion.
     pub callers: Vec<String>,
-    /// (expression, rendered result) when the logpoint had a trace expression.
-    pub expr: Option<(String, String)>,
+    /// `(expression, rendered result)` per trace expression, in the order the caller gave them
+    /// (TRACE-11, #93). Empty when the logpoint had none.
+    ///
+    /// A `Vec` rather than a map because the ORDER is the caller's and is what makes the snapshot
+    /// readable — and because two elements may legitimately be the same expression text, which a map
+    /// would silently collapse. An element that failed to evaluate carries its own `<error: …>` in the
+    /// value slot rather than being absent, so a snapshot always has one slot per expression asked for.
+    pub expr: Vec<(String, String)>,
     /// What kind of stop point this came from, and anything specific to it: for an exception, the
     /// type and catch location; for a watchpoint, the field and its old → new pair. Empty for a
     /// plain line logpoint, whose location and args already say everything.
@@ -707,7 +713,9 @@ pub struct ExceptionRequestInfo {
     /// ring buffer and the hit thread resumed, so a shared JVM is never frozen (TRACE-2).
     pub trace: bool,
     /// Optional expression evaluated in the throwing frame and recorded on each trace hit.
-    pub trace_expr: Option<String>,
+    /// The trace expressions this stop point records, in the order given (TRACE-11, #93).
+    /// Empty when it has none; one element is the pre-TRACE-11 case and renders identically.
+    pub trace_expr: Vec<String>,
     /// Remaining trace-hit budget (TRACE-3): each traced hit decrements it, and on reaching zero the
     /// request disarms itself so a hot throw site can't flood. `None` means unbounded.
     pub trace_budget: Option<u32>,
@@ -770,7 +778,9 @@ pub struct WatchpointInfo {
     /// old → new pair) into the trace ring buffer and the thread resumed (TRACE-2).
     pub trace: bool,
     /// Optional expression evaluated in the mutating frame and recorded on each trace hit.
-    pub trace_expr: Option<String>,
+    /// The trace expressions this stop point records, in the order given (TRACE-11, #93).
+    /// Empty when it has none; one element is the pre-TRACE-11 case and renders identically.
+    pub trace_expr: Vec<String>,
     /// Remaining trace-hit budget (TRACE-3): each traced hit decrements it, and on reaching zero the
     /// watch disarms itself so a hot field can't flood the debuggee. `None` means unbounded.
     pub trace_budget: Option<u32>,
@@ -845,7 +855,9 @@ pub struct MethodExitRequestInfo {
     pub with_return_value: bool,
     /// Non-suspending trace mode — the default for this kind, and near-mandatory on a shared JVM.
     pub trace: bool,
-    pub trace_expr: Option<String>,
+    /// The trace expressions this stop point records, in the order given (TRACE-11, #93).
+    /// Empty when it has none; one element is the pre-TRACE-11 case and renders identically.
+    pub trace_expr: Vec<String>,
     pub trace_budget: Option<u32>,
     /// Caller-frame depth for traced hits (TRACE-5).
     pub trace_frames: usize,
@@ -887,7 +899,9 @@ pub struct PendingBreakpoint {
     /// Arm as a non-suspending trace/logpoint (`EventThread` suspend, snapshot, resume).
     pub trace: bool,
     /// Optional expression to evaluate and record on each trace hit.
-    pub trace_expr: Option<String>,
+    /// The trace expressions this stop point records, in the order given (TRACE-11, #93).
+    /// Empty when it has none; one element is the pre-TRACE-11 case and renders identically.
+    pub trace_expr: Vec<String>,
     /// Trace-hit budget carried through to the real breakpoint once the class loads (TRACE-3).
     pub trace_budget: Option<u32>,
     /// Caller-frame depth carried through to the real breakpoint once the class loads (TRACE-5).
@@ -950,7 +964,9 @@ pub struct PatternStopSet {
     pub thread_filter: Option<u64>,
     pub condition: Option<String>,
     pub trace: bool,
-    pub trace_expr: Option<String>,
+    /// The trace expressions this stop point records, in the order given (TRACE-11, #93).
+    /// Empty when it has none; one element is the pre-TRACE-11 case and renders identically.
+    pub trace_expr: Vec<String>,
     pub trace_budget: Option<u32>,
     pub trace_frames: usize,
     /// Per-value length cap for this stop point's captures (TRACE-9), or `None` for the defaults (100
@@ -1139,7 +1155,9 @@ pub struct BreakpointInfo {
     /// Non-suspending trace/logpoint: on hit, snapshot into the ring buffer and resume the thread.
     pub trace: bool,
     /// Optional expression evaluated and recorded on each trace hit.
-    pub trace_expr: Option<String>,
+    /// The trace expressions this stop point records, in the order given (TRACE-11, #93).
+    /// Empty when it has none; one element is the pre-TRACE-11 case and renders identically.
+    pub trace_expr: Vec<String>,
     /// Remaining trace-hit budget (TRACE-3); `None` means unbounded.
     pub trace_budget: Option<u32>,
     /// How many caller frames each traced hit records above the hit frame (TRACE-5). 0 restores the

@@ -178,6 +178,45 @@ pub enum ClassPatterns {
     Many(Vec<String>),
 }
 
+/// A `trace_expr` argument that takes **one** expression or **several** (TRACE-11, #93).
+///
+/// Same shape and the same reasoning as [`ClassPatterns`]: deserialises from a JSON string or an array of
+/// strings, so everything written before TRACE-11 is still valid and still renders byte-for-byte what it
+/// rendered. Several exists because the questions this stack poses are usually about a *disagreement*
+/// between two values, and comparing them needs both in the **same snapshot** — the schema in use against
+/// the session's, the requested payment amount against the gateway's echo, a generated cache key against
+/// the parameters that built it. Two stop points on one line records both (BP-6), but into two
+/// independently budgeted streams that the caller then has to join by hand.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum TraceExprs {
+    /// One expression — how every caller before TRACE-11 spelled it.
+    One(String),
+    /// Several, each evaluated against the same hit frame and recorded in its own labelled slot.
+    Many(Vec<String>),
+}
+
+impl TraceExprs {
+    /// The expressions, in the order given. Blank entries are dropped: a trailing `""` in a JSON array is
+    /// a typo rather than a request to evaluate nothing, and evaluating it would put an error in the
+    /// snapshot for something the caller did not ask about.
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(s) => vec![s],
+            Self::Many(v) => v,
+        }
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+    }
+}
+
+/// The expressions an optional `trace_expr` asked for — empty when it was omitted.
+pub fn trace_exprs(arg: Option<TraceExprs>) -> Vec<String> {
+    arg.map(TraceExprs::into_vec).unwrap_or_default()
+}
+
 impl ClassPatterns {
     /// The patterns: trimmed, blanks dropped, duplicates removed, original order kept.
     ///
@@ -340,8 +379,14 @@ pub struct SetBreakpointArgs {
     /// `log.dsRequest#ISO-8859-1`, or `#raw` for the element list. It composes here because there is no
     /// schema to extend inside an expression string — see `debug.evaluate`'s `expression` for the full
     /// list of names.
+    ///
+    /// **Accepts a LIST as well as a string** (TRACE-11): `["tenant.getIdentificador()",
+    /// "sessao.getNmSchema()"]` records both against the same hit, which is the only way to see a
+    /// *disagreement* between two values. Each element is evaluated in turn against the same frame and
+    /// gets its own labelled slot, so one that errors leaves the others intact. Bounded — the cost is per
+    /// hit and multiplies — and a request over the ceiling is clamped with the clamp reported.
     #[serde(default)]
-    pub trace_expr: Option<String>,
+    pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm this logpoint automatically after recording this many hits, so
     /// a hot line can't flood the debuggee (defaults to 200). Pass 0 for no limit.
     ///
@@ -956,8 +1001,14 @@ pub struct SetExceptionBreakpointArgs {
     /// `log.dsRequest#ISO-8859-1`, or `#raw` for the element list. It composes here because there is no
     /// schema to extend inside an expression string — see `debug.evaluate`'s `expression` for the full
     /// list of names.
+    ///
+    /// **Accepts a LIST as well as a string** (TRACE-11): `["tenant.getIdentificador()",
+    /// "sessao.getNmSchema()"]` records both against the same hit, which is the only way to see a
+    /// *disagreement* between two values. Each element is evaluated in turn against the same frame and
+    /// gets its own labelled slot, so one that errors leaves the others intact. Bounded — the cost is per
+    /// hit and multiplies — and a request over the ceiling is clamped with the clamp reported.
     #[serde(default)]
-    pub trace_expr: Option<String>,
+    pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit),
     /// so a hot throw site can't flood the debuggee (TRACE-3).
     ///
@@ -1082,8 +1133,14 @@ pub struct SetWatchpointArgs {
     /// `log.dsRequest#ISO-8859-1`, or `#raw` for the element list. It composes here because there is no
     /// schema to extend inside an expression string — see `debug.evaluate`'s `expression` for the full
     /// list of names.
+    ///
+    /// **Accepts a LIST as well as a string** (TRACE-11): `["tenant.getIdentificador()",
+    /// "sessao.getNmSchema()"]` records both against the same hit, which is the only way to see a
+    /// *disagreement* between two values. Each element is evaluated in turn against the same frame and
+    /// gets its own labelled slot, so one that errors leaves the others intact. Bounded — the cost is per
+    /// hit and multiplies — and a request over the ceiling is clamped with the clamp reported.
     #[serde(default)]
-    pub trace_expr: Option<String>,
+    pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit),
     /// so a hot field can't flood the debuggee (TRACE-3).
     ///
@@ -1222,8 +1279,14 @@ pub struct SetMethodBreakpointArgs {
     /// `log.dsRequest#ISO-8859-1`, or `#raw` for the element list. It composes here because there is no
     /// schema to extend inside an expression string — see `debug.evaluate`'s `expression` for the full
     /// list of names.
+    ///
+    /// **Accepts a LIST as well as a string** (TRACE-11): `["tenant.getIdentificador()",
+    /// "sessao.getNmSchema()"]` records both against the same hit, which is the only way to see a
+    /// *disagreement* between two values. Each element is evaluated in turn against the same frame and
+    /// gets its own labelled slot, so one that errors leaves the others intact. Bounded — the cost is per
+    /// hit and multiplies — and a request over the ceiling is clamped with the clamp reported.
     #[serde(default)]
-    pub trace_expr: Option<String>,
+    pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit).
     /// Method exits are the noisiest event in JDWP, so this budget matters more here than anywhere else.
     ///

@@ -45,6 +45,7 @@ async fn arm_single_exception_pattern(
     a: &crate::args::SetExceptionBreakpointArgs,
     pattern: Option<&str>,
     filters: StopFilters,
+    trace_exprs: &[String],
     trace_frames: usize,
     trace_max_length: Option<usize>,
     frames_note: Option<&str>,
@@ -56,9 +57,17 @@ async fn arm_single_exception_pattern(
         None => None,
     };
     let class_pattern = pattern.unwrap_or("*").to_string();
-    let exc_id =
-        arm_one_exception(session, a, ref_type, &class_pattern, filters, trace_frames, trace_max_length)
-            .await?;
+    let exc_id = arm_one_exception(
+        session,
+        a,
+        ref_type,
+        &class_pattern,
+        filters,
+        trace_exprs,
+        trace_frames,
+        trace_max_length,
+    )
+    .await?;
     Ok(render_exception_stop_reply(
         a,
         &ExceptionStopReply {
@@ -583,7 +592,10 @@ impl RequestHandler {
         let suspend_policy = suspend_policy_for_line(a.trace, a.condition.is_some());
         let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
         let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
-        let frames_note = merge_clamp_notes(depth_note, length_note);
+        // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
+        // re-deriving it from the argument and each reaching its own answer.
+        let (trace_exprs, expr_note) = clamp_trace_exprs(crate::args::trace_exprs(a.trace_expr.clone()));
+        let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
         // One definition, pointed at each pattern in turn below.
         let base = BreakpointSpec {
@@ -596,7 +608,7 @@ impl RequestHandler {
             instance_filter: parse_instance_filter(a.instance_id.as_deref())?,
             condition: a.condition.clone(),
             trace: a.trace,
-            trace_expr: a.trace_expr.clone(),
+            trace_expr: trace_exprs.clone(),
             trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
             trace_frames,
             trace_max_length,
@@ -608,7 +620,7 @@ impl RequestHandler {
             .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
-        check_readonly_exprs(session.read_only, base.condition.as_deref(), base.trace_expr.as_deref())?;
+        check_readonly_exprs(session.read_only, base.condition.as_deref(), &base.trace_expr)?;
         check_instance_filter_supported(&mut session.connection, base.instance_filter).await?;
         check_thread_filter(&mut session.connection, base.thread_filter).await?;
 
@@ -2634,7 +2646,7 @@ impl RequestHandler {
             .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
-        check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
+        check_readonly_exprs(session.read_only, None, &crate::args::trace_exprs(a.trace_expr.clone()))?;
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
         let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
@@ -2646,7 +2658,10 @@ impl RequestHandler {
         check_thread_filter(&mut session.connection, thread_filter).await?;
         let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
         let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
-        let frames_note = merge_clamp_notes(depth_note, length_note);
+        // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
+        // re-deriving it from the argument and each reaching its own answer.
+        let (trace_exprs, expr_note) = clamp_trace_exprs(crate::args::trace_exprs(a.trace_expr.clone()));
+        let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
 
         // The catch-all and the one named class keep exactly the reply they have always had.
@@ -2656,6 +2671,7 @@ impl RequestHandler {
                 &a,
                 patterns.first().map(String::as_str),
                 StopFilters { thread: thread_filter, instance: instance_filter },
+                &trace_exprs,
                 trace_frames,
                 trace_max_length,
                 frames_note.as_deref(),
@@ -2672,23 +2688,18 @@ impl RequestHandler {
             Vec::new()
         };
         let mut batches = Vec::with_capacity(patterns.len());
+        // Built once rather than per pattern: it is the same for every one of them, which is what the
+        // struct exists to say.
+        let limits = BatchLimits {
+            instance_filter,
+            max_classes,
+            thread_filter,
+            trace_expr: trace_exprs,
+            trace_frames,
+            trace_max_length,
+        };
         for p in &patterns {
-            batches.push(
-                exception_rows_for_pattern(
-                    &mut session,
-                    &a,
-                    p,
-                    &index,
-                    &BatchLimits {
-                        instance_filter,
-                        max_classes,
-                        thread_filter,
-                        trace_frames,
-                        trace_max_length,
-                    },
-                )
-                .await,
-            );
+            batches.push(exception_rows_for_pattern(&mut session, &a, p, &index, &limits).await);
         }
         drop(session);
 
@@ -2713,7 +2724,7 @@ impl RequestHandler {
             .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
-        check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
+        check_readonly_exprs(session.read_only, None, &crate::args::trace_exprs(a.trace_expr.clone()))?;
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
         let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
@@ -2722,10 +2733,19 @@ impl RequestHandler {
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
         let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
         let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
-        let frames_note = merge_clamp_notes(depth_note, length_note);
+        // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
+        // re-deriving it from the argument and each reaching its own answer.
+        let (trace_exprs, expr_note) = clamp_trace_exprs(crate::args::trace_exprs(a.trace_expr.clone()));
+        let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
-        let arm =
-            FieldArm { field_name: &field_name, kinds: &kinds, trace_budget, trace_frames, trace_max_length };
+        let arm = FieldArm {
+            field_name: &field_name,
+            kinds: &kinds,
+            trace_expr: &trace_exprs,
+            trace_budget,
+            trace_frames,
+            trace_max_length,
+        };
 
         // One named class keeps exactly the reply it has always had.
         if let (1, Some(only)) = (classes.len(), classes.first().filter(|c| !is_wildcard(c))) {
@@ -2749,8 +2769,14 @@ impl RequestHandler {
         } else {
             Vec::new()
         };
-        let limits =
-            BatchLimits { instance_filter, max_classes, thread_filter, trace_frames, trace_max_length };
+        let limits = BatchLimits {
+            instance_filter,
+            max_classes,
+            thread_filter,
+            trace_expr: trace_exprs.clone(),
+            trace_frames,
+            trace_max_length,
+        };
         let mut batches = Vec::with_capacity(classes.len());
         for pattern in &classes {
             batches.push(field_rows_for_pattern(&mut session, &a, pattern, &index, &arm, &limits).await);
@@ -2788,7 +2814,7 @@ impl RequestHandler {
             .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
-        check_readonly_exprs(session.read_only, None, a.trace_expr.as_deref())?;
+        check_readonly_exprs(session.read_only, None, &crate::args::trace_exprs(a.trace_expr.clone()))?;
 
         // Kind 42 (with the return value) when the JVM speaks JDWP >= 1.6, else plain kind 41. This is a
         // version check, not a capability bit — there is no `canGetMethodReturnValues` flag to read.
@@ -2801,12 +2827,16 @@ impl RequestHandler {
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
         let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
         let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
-        let frames_note = merge_clamp_notes(depth_note, length_note);
+        // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
+        // re-deriving it from the argument and each reaching its own answer.
+        let (trace_exprs, expr_note) = clamp_trace_exprs(crate::args::trace_exprs(a.trace_expr.clone()));
+        let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
 
         let mexit = MethodExitArm {
             instance_filter,
             with_return_value,
             thread_filter,
+            trace_expr: trace_exprs,
             trace_budget,
             trace_frames,
             trace_max_length,
@@ -3318,6 +3348,70 @@ fn describe_trace_frames(trace: bool, frames: usize, note: Option<&str>, zero_hi
     out
 }
 
+/// The ceiling on how many trace expressions one stop point may carry (TRACE-11, #93).
+///
+/// **Four, and the number is chosen against the cost rather than against taste.** Every expression is a
+/// full resolution — a chain is several JDWP round trips, and one that invokes is more — evaluated inside
+/// the capture window, which is the work a traced hit charges the debuggee. Capture is serialised, so the
+/// measured ~720 hits/s ceiling at default frames is a budget the whole session shares and N expressions
+/// divide it. The cases this feature exists for want two or three: a tenant against a session's schema, a
+/// requested amount against an echoed one, a cache key against the parameters that built it. Four leaves
+/// room for one more without letting a caller quietly quarter the throughput of a hot line.
+const MAX_TRACE_EXPRS: usize = 4;
+
+/// How one trace expression is labelled, given how many the stop point has.
+///
+/// `Trace expr` when there is one — byte-identical to what every reply printed before TRACE-11 — and
+/// `Trace expr[i]` when there are several, so a reply's list and a snapshot's slots can be lined up
+/// instead of matched by position.
+fn trace_expr_label(index: usize, total: usize) -> String {
+    if total <= 1 {
+        "Trace expr".to_string()
+    } else {
+        format!("Trace expr[{index}]")
+    }
+}
+
+/// The `Trace expr:` lines of an ARM reply (leading newline, three-space indent).
+fn describe_trace_exprs(exprs: &[String]) -> String {
+    let mut out = String::new();
+    for (i, e) in exprs.iter().enumerate() {
+        let _ = write!(out, "\n   {}: {e}", trace_expr_label(i, exprs.len()));
+    }
+    out
+}
+
+/// The `Trace expr:` lines of a `debug.list_stop_points` entry (five-space indent, trailing newline).
+fn list_trace_exprs(exprs: &[String]) -> String {
+    let mut out = String::new();
+    for (i, e) in exprs.iter().enumerate() {
+        let _ = writeln!(out, "     {}: {e}", trace_expr_label(i, exprs.len()));
+    }
+    out
+}
+
+/// Clamp a requested list of trace expressions to [`MAX_TRACE_EXPRS`], returning `(exprs, note)`.
+///
+/// Reported rather than silently truncated, the way [`clamp_trace_frames`] reports its clamp: a caller who
+/// asked for six values and reads four would otherwise conclude the two missing ones evaluated to nothing,
+/// which is the opposite of what happened.
+fn clamp_trace_exprs(mut exprs: Vec<String>) -> (Vec<String>, Option<String>) {
+    if exprs.len() <= MAX_TRACE_EXPRS {
+        return (exprs, None);
+    }
+    let asked = exprs.len();
+    let dropped = exprs.split_off(MAX_TRACE_EXPRS).join(", ");
+    (
+        exprs,
+        Some(format!(
+            "trace_expr had {asked} expressions, which exceeds the {MAX_TRACE_EXPRS}-expression cap — \
+             kept the first {MAX_TRACE_EXPRS} and DROPPED: {dropped}. Each one is evaluated inside the \
+             capture window on every hit, and capture is serialised, so they divide the same throughput \
+             budget trace_max_hits is charged against."
+        )),
+    )
+}
+
 /// The trace-mode lines of a `set_line_stop` reply: mode, trace expression, caller depth, and any
 /// clamp notice. Empty for a suspending breakpoint, which has none of them.
 fn describe_trace_mode(spec: &BreakpointSpec, frames_note: Option<&str>) -> String {
@@ -3326,9 +3420,7 @@ fn describe_trace_mode(spec: &BreakpointSpec, frames_note: Option<&str>) -> Stri
         return out;
     }
     out.push_str("\n   Mode: trace (non-suspending) — read hits with debug.get_traces");
-    if let Some(e) = &spec.trace_expr {
-        let _ = write!(out, "\n   Trace expr: {e}");
-    }
+    out.push_str(&describe_trace_exprs(&spec.trace_expr));
     // A line breakpoint never reported its budget at all, bounded or not — so the one stop point most
     // likely to be armed on a hot path was the one that said least about what it would cost (#22).
     out.push_str(&describe_trace_budget(spec.trace, spec.trace_budget));
@@ -3586,16 +3678,26 @@ fn readonly_refusal(action: &str) -> String {
 /// The connection guard would refuse it anyway — but on every hit, deep inside the event pump where the
 /// caller never sees it, and a condition that fails to evaluate keeps the VM suspended. Failing once,
 /// here, is the difference between a clear error and a stop point that quietly doesn't work.
+///
+/// TRACE-11 made `trace_expr` plural, so the refusal names **which** element invokes. A caller who passed
+/// three and got "the `trace_expr` calls a method" would have to bisect to find out which.
 fn check_readonly_exprs(
     read_only: bool,
     condition: Option<&str>,
-    trace_expr: Option<&str>,
+    trace_expr: &[String],
 ) -> Result<(), String> {
     if !read_only {
         return Ok(());
     }
-    for (what, expr) in [("condition", condition), ("trace_expr", trace_expr)] {
-        if let Some(e) = expr.filter(|e| expr_invokes(e)) {
+    let labelled = condition.into_iter().map(|c| ("condition".to_string(), c)).chain(
+        trace_expr.iter().enumerate().map(|(i, e)| {
+            let what =
+                if trace_expr.len() == 1 { "trace_expr".to_string() } else { format!("trace_expr[{i}]") };
+            (what, e.as_str())
+        }),
+    );
+    for (what, e) in labelled {
+        if expr_invokes(e) {
             return Err(format!(
                 "🔒 Read-only session: the {what} `{e}` calls a method, which would have to execute code \
                  in the debuggee on every hit — refused. Use a comparison over fields instead (e.g. \
@@ -3819,7 +3921,7 @@ struct WatchSpec<'a> {
     field_name: String,
     is_static: bool,
     trace: bool,
-    trace_expr: Option<&'a str>,
+    trace_expr: &'a [String],
     trace_budget: Option<u32>,
     trace_frames: usize,
     /// Per-value capture length (TRACE-9), already clamped to `MAX_TRACE_LENGTH`; `None` for the defaults.
@@ -3886,7 +3988,7 @@ async fn arm_one_field_watch(
             field_name: spec.field_name.clone(),
             is_static: spec.is_static,
             trace: spec.trace,
-            trace_expr: spec.trace_expr.map(str::to_string),
+            trace_expr: spec.trace_expr.to_vec(),
             trace_budget: spec.trace_budget,
             trace_frames: spec.trace_frames,
             trace_max_length: spec.trace_max_length,
@@ -3901,6 +4003,8 @@ async fn arm_one_field_watch(
 struct FieldArm<'a> {
     field_name: &'a str,
     kinds: &'a [jdwp_client::WatchKind],
+    /// Already clamped to [`MAX_TRACE_EXPRS`] by the handler (TRACE-11).
+    trace_expr: &'a [String],
     trace_budget: Option<u32>,
     trace_frames: usize,
     trace_max_length: Option<usize>,
@@ -3934,7 +4038,7 @@ async fn arm_field_on_named_class(
         field_name: arm.field_name.to_string(),
         is_static: (field.mod_bits & ACC_STATIC) != 0,
         trace: a.trace,
-        trace_expr: a.trace_expr.as_deref(),
+        trace_expr: arm.trace_expr,
         trace_budget: arm.trace_budget,
         trace_frames: arm.trace_frames,
         trace_max_length: arm.trace_max_length,
@@ -4041,7 +4145,7 @@ async fn arm_field_on_one_class(
         field_name: arm.field_name.to_string(),
         is_static,
         trace: a.trace,
-        trace_expr: a.trace_expr.as_deref(),
+        trace_expr: arm.trace_expr,
         trace_budget: arm.trace_budget,
         trace_frames: arm.trace_frames,
         trace_max_length: arm.trace_max_length,
@@ -4125,6 +4229,8 @@ struct MethodExitArm {
     instance_filter: Option<u64>,
     with_return_value: bool,
     thread_filter: Option<u64>,
+    /// Already clamped to [`MAX_TRACE_EXPRS`] by the handler (TRACE-11).
+    trace_expr: Vec<String>,
     trace_budget: Option<u32>,
     trace_frames: usize,
     trace_max_length: Option<usize>,
@@ -4171,7 +4277,7 @@ async fn arm_one_method_exit(
             method: method.cloned(),
             with_return_value: arm.with_return_value,
             trace: a.trace,
-            trace_expr: a.trace_expr.clone(),
+            trace_expr: arm.trace_expr.clone(),
             trace_budget: arm.trace_budget,
             trace_frames: arm.trace_frames,
             trace_max_length: arm.trace_max_length,
@@ -4234,9 +4340,7 @@ fn describe_method_exit_arm(
     extra.push_str(&describe_trace_budget(a.trace, arm.trace_budget));
     extra.push_str(&describe_trace_frames(a.trace, arm.trace_frames, frames_note, "returning frame only"));
     if a.trace {
-        if let Some(e) = &a.trace_expr {
-            let _ = write!(extra, "\n   Trace expr: {e}");
-        }
+        extra.push_str(&describe_trace_exprs(&arm.trace_expr));
     }
     let mode = if a.trace {
         "\n   Mode: trace (non-suspending) — each return is snapshotted with its value and the thread resumed; read them with debug.get_traces"
@@ -4402,12 +4506,16 @@ async fn resolve_exception_class(
 /// JVM keeps serving while you collect throws. An optional `ThreadOnly` restricts it to one thread
 /// (FILT-1); the trace budget lives on our side (see `try_record_trace`) rather than as a JDWP `Count`,
 /// because `Count` reports only the *Nth* throw, not the first N.
+#[allow(clippy::too_many_arguments)] // same rule as `arm_single_exception_pattern` above: one argument
+                                     // per thing the stored request must carry, and TRACE-11's expression
+                                     // list is the eighth. A bundle here would only move the list.
 async fn arm_one_exception(
     session: &mut crate::session::DebugSession,
     a: &crate::args::SetExceptionBreakpointArgs,
     ref_type: Option<u64>,
     class_pattern: &str,
     filters: StopFilters,
+    trace_exprs: &[String],
     trace_frames: usize,
     trace_max_length: Option<usize>,
 ) -> Result<String, String> {
@@ -4443,7 +4551,7 @@ async fn arm_one_exception(
             caught: a.caught,
             uncaught: a.uncaught,
             trace: a.trace,
-            trace_expr: a.trace_expr.clone(),
+            trace_expr: trace_exprs.to_vec(),
             trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
             trace_frames,
             trace_max_length,
@@ -4460,6 +4568,8 @@ struct BatchLimits {
     instance_filter: Option<u64>,
     max_classes: usize,
     thread_filter: Option<u64>,
+    /// Already clamped to [`MAX_TRACE_EXPRS`] by the handler (TRACE-11).
+    trace_expr: Vec<String>,
     trace_frames: usize,
     trace_max_length: Option<usize>,
 }
@@ -4504,6 +4614,7 @@ async fn exception_rows_for_pattern(
             Some(tid),
             &fqn,
             StopFilters { thread: limits.thread_filter, instance: limits.instance_filter },
+            &limits.trace_expr,
             limits.trace_frames,
             limits.trace_max_length,
         )
@@ -5000,9 +5111,7 @@ fn render_breakpoint_line(
     if let Some(c) = &bp.condition {
         let _ = writeln!(output, "     Condition: {c}");
     }
-    if let Some(e) = &bp.trace_expr {
-        let _ = writeln!(output, "     Trace expr: {e}");
-    }
+    output.push_str(&list_trace_exprs(&bp.trace_expr));
     // DISC-8. Rendered here as well as in the arm reply, because a deferred stop point arms in the event
     // pump where no reply exists — this is the only place its caller can learn the build had drifted.
     if let Some(d) = &bp.drift {
@@ -5073,9 +5182,7 @@ fn render_pattern_set_line(output: &mut String, set: &crate::session::PatternSto
     if let Some(c) = &set.condition {
         let _ = writeln!(output, "     Condition: {c}");
     }
-    if let Some(e) = &set.trace_expr {
-        let _ = writeln!(output, "     Trace expr: {e}");
-    }
+    output.push_str(&list_trace_exprs(&set.trace_expr));
     if !set.members.is_empty() {
         let _ = writeln!(output, "     Members: {}", set.members.join(", "));
     }
@@ -5675,9 +5782,7 @@ fn render_method_exit_line(
     if let Some(t) = me.thread_filter {
         let _ = writeln!(output, "     Thread filter: 0x{t:x}");
     }
-    if let Some(e) = &me.trace_expr {
-        let _ = writeln!(output, "     Trace expr: {e}");
-    }
+    output.push_str(&list_trace_exprs(&me.trace_expr));
     let tag = dead_filter_tag(me.thread_filter, me.instance_filter, dead);
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
@@ -9531,7 +9636,7 @@ struct TracedRequest {
     id: String,
     /// Only line breakpoints can carry one; an exception or field request has no condition.
     condition: Option<String>,
-    trace_expr: Option<String>,
+    trace_expr: Vec<String>,
     /// How many caller frames to record above the hit (TRACE-5).
     trace_frames: usize,
     /// Per-value length cap for this capture (TRACE-9); `None` renders at the defaults.
@@ -11537,7 +11642,7 @@ struct BreakpointSpec {
     thread_filter: Option<u64>,
     condition: Option<String>,
     trace: bool,
-    trace_expr: Option<String>,
+    trace_expr: Vec<String>,
     trace_budget: Option<u32>,
     /// Caller-frame depth for traced hits (TRACE-5), already clamped to `MAX_TRACE_FRAMES`.
     trace_frames: usize,
@@ -18377,7 +18482,7 @@ async fn capture_trace(
     loc: &Location,
     details: &EventKind,
 ) -> crate::session::TraceRecord {
-    let (bp_id, trace_expr, trace_frames) = (&req.id, req.trace_expr.as_deref(), req.trace_frames);
+    let (bp_id, trace_exprs, trace_frames) = (&req.id, req.trace_expr.as_slice(), req.trace_frames);
     // TRACE-9: ONE caller argument, two caps — see `trace_lengths` for why they differ when it is unset,
     // and why an unset call still renders byte-for-byte what it rendered before the argument existed.
     let (local_len, expr_len) = trace_lengths(req.trace_max_length);
@@ -18385,7 +18490,7 @@ async fn capture_trace(
     let mut args: Vec<crate::session::TracedValue> = Vec::new();
     let mut captured: Vec<crate::session::TracedValue> = Vec::new();
     let mut callers: Vec<String> = Vec::new();
-    let mut expr: Option<(String, String)> = None;
+    let mut expr: Vec<(String, String)> = Vec::new();
 
     // The hit frame plus however many callers were asked for, in ONE `Frames` request.
     //
@@ -18444,7 +18549,11 @@ async fn capture_trace(
             if is_anonymous_class(&class) {
                 captured = capture_enclosing_locals(conn, thread, frame.frame_id).await;
             }
-            if let Some(e) = trace_expr {
+            // TRACE-11 (#93): each expression in turn, against the SAME frame, each into its own
+            // slot. One that fails records its error there and the others are untouched — a chain going
+            // null on some hits and not others is the normal case rather than the exception, and it is the
+            // same reasoning that makes a batched arming reply per-pattern instead of one verdict.
+            for e in trace_exprs.iter().cloned() {
                 // The `#<charset>` selector reaches a trace this way, which is the whole reason it is a
                 // suffix on the expression: a stop point's arming call has a schema to extend but its
                 // `trace_expr` does not, and the decode is scoped to the value the caller named rather
@@ -18454,7 +18563,7 @@ async fn capture_trace(
                 // `expr_len` rather than a literal 200: TRACE-9 (#80) made the cap caller-raisable, and a
                 // decoded SOAP envelope is worthless at 200 chars, so the two features are only useful
                 // together.
-                let rendered = match split_charset(e) {
+                let rendered = match split_charset(&e) {
                     Ok((expr_text, bytes)) => {
                         match resolve_expression(conn, Some(thread), Some(&frame), expr_text).await {
                             Ok(v) => render_value(conn, &v, Some(thread), expr_len, bytes).await,
@@ -18463,7 +18572,7 @@ async fn capture_trace(
                     }
                     Err(err) => format!("<error: {err}>"),
                 };
-                expr = Some((e.to_string(), rendered));
+                expr.push((e, rendered));
             }
         }
     }
@@ -18676,10 +18785,13 @@ fn format_trace_captured(rec: &crate::session::TraceRecord) -> String {
 
 /// Format a trace record's optional trace expression as ` | expr => value` (empty when absent).
 fn format_trace_expr(rec: &crate::session::TraceRecord) -> String {
-    match &rec.expr {
-        Some((e, v)) => format!(" | {e} => {v}"),
-        None => String::new(),
+    // One expression renders exactly as it did before TRACE-11, which is what keeps every existing trace
+    // test and every saved transcript reading the same. Several are simply appended in the caller's order.
+    let mut out = String::new();
+    for (e, v) in &rec.expr {
+        let _ = write!(out, " | {e} => {v}");
     }
+    out
 }
 
 // ----- conditional breakpoints -----
@@ -19491,7 +19603,7 @@ mod tests {
             instance_filter: None,
             condition: None,
             trace: true,
-            trace_expr: None,
+            trace_expr: Vec::new(),
             trace_budget: Some(200),
             trace_frames: 3,
             trace_max_length: None,
@@ -19647,7 +19759,7 @@ mod tests {
             args: Vec::new(),
             captured: Vec::new(),
             callers: Vec::new(),
-            expr: None,
+            expr: Vec::new(),
             detail: Vec::new(),
             rethrow: None,
         };
@@ -20346,15 +20458,24 @@ mod tests {
     // and only when it actually invokes — a field comparison must still be allowed.
     #[test]
     fn readonly_refuses_invoking_conditions_at_arm_time() {
-        assert!(check_readonly_exprs(true, Some("order.getTotal() > 1"), None).is_err());
-        assert!(check_readonly_exprs(true, None, Some("this.toString()")).is_err());
+        let none: Vec<String> = Vec::new();
+        let one = |e: &str| vec![e.to_string()];
+        assert!(check_readonly_exprs(true, Some("order.getTotal() > 1"), &none).is_err());
+        assert!(check_readonly_exprs(true, None, &one("this.toString()")).is_err());
         // A comparison over plain fields invokes nothing, so it is fine even read-only.
-        assert!(check_readonly_exprs(true, Some("status == \"OPEN\""), None).is_ok());
+        assert!(check_readonly_exprs(true, Some("status == \"OPEN\""), &none).is_ok());
         // Nothing is restricted when the session is writable.
-        assert!(check_readonly_exprs(false, Some("order.getTotal() > 1"), None).is_ok());
+        assert!(check_readonly_exprs(false, Some("order.getTotal() > 1"), &none).is_ok());
         // The message names which of the two was at fault, so the caller knows what to change.
-        let e = check_readonly_exprs(true, None, Some("x.y()")).unwrap_err();
+        let e = check_readonly_exprs(true, None, &one("x.y()")).unwrap_err();
         assert!(e.contains("trace_expr"), "should name the offending field: {e}");
+        // TRACE-11: with several, it names WHICH element — a caller who passed three would otherwise
+        // have to bisect to find the one that invokes.
+        let e =
+            check_readonly_exprs(true, None, &["a.b".to_string(), "status".to_string(), "x.y()".to_string()])
+                .unwrap_err();
+        assert!(e.contains("trace_expr[2]"), "must name the offending element: {e}");
+        assert!(e.contains("x.y()"), "and quote it: {e}");
     }
 
     // SAFE-6: a read-only refusal from the wire is turned into an actionable explanation; anything
@@ -20886,6 +21007,107 @@ mod tests {
         assert!(out.contains("bp_2 — escalated by bp_1"), "{out}");
         assert!(out.contains("bp_5 — escalated by bp_1, bp_4"), "{out}");
         assert!(out.contains("list_stop_points"), "must point at where the state is visible:\n{out}");
+    }
+
+    // ---- TRACE-11 (#93): several trace expressions on one snapshot ----
+    //
+    // The questions this stack poses are usually about a DISAGREEMENT between two values — the schema a
+    // thread is serving against the session's, a requested payment amount against the gateway's echo — and
+    // seeing one needs both in the same snapshot. The load-bearing constraint is that ONE expression must
+    // keep rendering byte-for-byte what it always did, since every existing trace test asserts against it.
+
+    fn record_with(expr: Vec<(String, String)>) -> crate::session::TraceRecord {
+        crate::session::TraceRecord {
+            seq: 1,
+            bp_id: "bp_1".to_string(),
+            thread: 1,
+            class: "Order".to_string(),
+            method: "save".to_string(),
+            line: Some(39),
+            args: Vec::new(),
+            captured: Vec::new(),
+            callers: Vec::new(),
+            expr,
+            detail: Vec::new(),
+            rethrow: None,
+        }
+    }
+
+    #[test]
+    fn a_single_trace_expression_renders_exactly_as_it_did_before() {
+        let one = record_with(vec![("v".to_string(), "7".to_string())]);
+        assert_eq!(format_trace_expr(&one), " | v => 7");
+        assert_eq!(format_trace_expr(&record_with(Vec::new())), "");
+        // And its label is unnumbered, so the arm reply and the listing read as they always have.
+        assert_eq!(describe_trace_exprs(&["v".to_string()]), "\n   Trace expr: v");
+        assert_eq!(list_trace_exprs(&["v".to_string()]), "     Trace expr: v\n");
+    }
+
+    #[test]
+    fn several_expressions_are_numbered_so_a_reply_and_a_snapshot_can_be_lined_up() {
+        let exprs = ["tenant.getIdentificador()".to_string(), "sessao.getNmSchema()".to_string()];
+
+        let armed = describe_trace_exprs(&exprs);
+        assert!(armed.contains("Trace expr[0]: tenant.getIdentificador()"), "{armed}");
+        assert!(armed.contains("Trace expr[1]: sessao.getNmSchema()"), "{armed}");
+
+        let rendered = format_trace_expr(&record_with(vec![
+            ("tenant.getIdentificador()".to_string(), "\"orinter\"".to_string()),
+            ("sessao.getNmSchema()".to_string(), "\"infotravel\"".to_string()),
+        ]));
+        assert_eq!(
+            rendered, " | tenant.getIdentificador() => \"orinter\" | sessao.getNmSchema() => \"infotravel\"",
+            "both values in one snapshot is the whole point — the disagreement is the finding"
+        );
+    }
+
+    #[test]
+    fn a_string_and_a_one_element_list_are_the_same_request() {
+        let from_string = crate::args::TraceExprs::One("v".to_string()).into_vec();
+        let from_list = crate::args::TraceExprs::Many(vec!["v".to_string()]).into_vec();
+        assert_eq!(from_string, from_list);
+        assert_eq!(from_string, vec!["v".to_string()]);
+    }
+
+    // A trailing `""` in a JSON array is a typo, not a request to evaluate nothing — and evaluating it
+    // would put an `<error: …>` in the snapshot for something the caller never asked about.
+    #[test]
+    fn blank_expressions_are_dropped_rather_than_evaluated() {
+        let asked = crate::args::TraceExprs::Many(vec![
+            " v ".to_string(),
+            String::new(),
+            "   ".to_string(),
+            "w".to_string(),
+        ]);
+        assert_eq!(asked.into_vec(), vec!["v".to_string(), "w".to_string()]);
+    }
+
+    #[test]
+    fn an_omitted_trace_expr_is_no_expressions_at_all() {
+        assert!(crate::args::trace_exprs(None).is_empty());
+    }
+
+    // The cost is per hit and multiplies, so the ceiling is real — and reported, the way `trace_frames`
+    // reports its clamp. Silently keeping four of six would read as two expressions evaluating to nothing.
+    #[test]
+    fn a_list_over_the_ceiling_is_clamped_and_the_drop_is_named() {
+        let asked: Vec<String> = (0..6).map(|i| format!("e{i}")).collect();
+        let (kept, note) = clamp_trace_exprs(asked);
+
+        assert_eq!(kept.len(), MAX_TRACE_EXPRS);
+        assert_eq!(kept.last().map(String::as_str), Some("e3"));
+        let note = note.expect("a clamp must be reported");
+        assert!(note.contains("6 expressions"), "must say what was asked for:\n{note}");
+        assert!(note.contains("DROPPED: e4, e5"), "and name what it dropped:\n{note}");
+        assert!(note.contains("capture window"), "and why there is a cap at all:\n{note}");
+    }
+
+    #[test]
+    fn a_list_at_or_under_the_ceiling_is_not_clamped_and_says_nothing() {
+        let asked: Vec<String> = (0..MAX_TRACE_EXPRS).map(|i| format!("e{i}")).collect();
+        let (kept, note) = clamp_trace_exprs(asked.clone());
+        assert_eq!(kept, asked);
+        assert!(note.is_none(), "no clamp, so no note: {note:?}");
     }
 
     // DISC-9: the byte-level difference has to be actionable, and a length change must not read as

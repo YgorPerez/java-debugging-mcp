@@ -8409,29 +8409,33 @@ fn every_primitive_and_its_array_renders_the_same_as_local_field_and_element() {
     );
 }
 
-/// The tick number out of one `SwapProbe` line (`answer 1 tick 12`), or `None` if it is not one.
+/// The tick number out of a line that prints it AFTER other text — `SwapProbe`'s `answer 1 tick 12`,
+/// `TenantProbe`'s `handled infotravel tick 12`.
 ///
-/// Separate from [`tick_index`] because this probe prints the swapped value *before* the tick, and a
-/// test that cannot read the tick cannot tell "the swap did nothing" from "the JVM never resumed".
-fn swap_tick(line: &str) -> Option<i64> {
+/// Separate from [`tick_index`], which keys on a line *starting* with `tick `, because these probes put
+/// their payload first — and a test that cannot read the tick cannot tell "the change did nothing" from
+/// "the JVM never resumed".
+fn trailing_tick(line: &str) -> Option<i64> {
     let (_, after) = line.split_once(" tick ")?;
     after.split_whitespace().next()?.parse().ok()
 }
 
-/// The highest tick `SwapProbe` has printed. [`highest_tick`]'s counterpart for this probe, and needed
-/// separately because `tick_index` keys on a line *starting* with `tick ` while `SwapProbe` prints the
-/// answer first. Reaching for `highest_tick` here does not pass quietly — it returns `None`, the wait it
-/// feeds can never match, and the test fails after the full timeout complaining that the probe froze while
-/// the output plainly shows it ticking. Costly to read, so: `SwapProbe` uses this one.
-fn swap_probe_tick(probe: &Probe) -> Option<i64> {
-    probe.output().iter().filter_map(|l| swap_tick(l)).max()
+/// The highest tick a probe printing `… tick <n>` has reached. [`highest_tick`]'s counterpart for the
+/// probes whose tick is not at the start of the line.
+///
+/// Needed separately because reaching for `highest_tick` here does not fail loudly in a useful way: it
+/// returns `None`, the wait it feeds can never match, and the test fails after the full timeout claiming
+/// the probe froze while the output plainly shows it ticking. Costly to read, so `SwapProbe` and
+/// `TenantProbe` use this one.
+fn trailing_tick_max(probe: &Probe) -> Option<i64> {
+    probe.output().iter().filter_map(|l| trailing_tick(l)).max()
 }
 
 /// The answer `SwapProbe` last printed, and the tick it printed it on.
 fn last_answer(probe: &Probe) -> Option<(i64, i64)> {
     probe.output().iter().rev().find_map(|l| {
         let answer = l.strip_prefix("answer ")?.split_whitespace().next()?.parse().ok()?;
-        Some((answer, swap_tick(l)?))
+        Some((answer, trailing_tick(l)?))
     })
 }
 
@@ -8540,6 +8544,174 @@ fn bytecode_comparison_does_not_cry_stale_on_the_running_build() {
     );
 }
 
+/// TRACE-11 (#93): two expressions on one traced stop point, so a **disagreement** is one snapshot.
+///
+/// The issue's own case: the schema a thread is really serving lives in a static `ThreadLocal` whose unset
+/// value silently resolves to a default, and the session carries the schema it believes it is using. There
+/// is no correlation id anywhere in the target codebase, so two stop points on the line — which do both
+/// record (BP-6) — leave two independently budgeted streams to join by hand. One stop point with two
+/// expressions answers it directly.
+///
+/// The probe disagrees on two hits in every three rather than always, which is the point of asserting both
+/// outcomes: a probe where the values always differed would pass even if the second expression were
+/// secretly reading the first.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn two_trace_expressions_record_both_values_in_one_snapshot() {
+    let Some(jdk) = jdk_or_skip("two_trace_expressions_record_both_values_in_one_snapshot") else { return };
+    let probe = Probe::launch_running(&jdk, "TenantProbe", |l| l.starts_with("handled "))
+        .expect("launch TenantProbe");
+    let line = probe_line(&probe_source("TenantProbe"), "TRACE_LINE");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "TenantProbe", "line": line, "trace": true,
+            "trace_expr": ["schema", "sessao.getNmSchema()"],
+        }),
+    );
+    assert!(armed.contains("bp_"), "the logpoint must arm: {armed}");
+    assert_contains_all(
+        "the arm reply numbers the expressions, so they can be matched to the snapshot's slots",
+        &armed,
+        &["Trace expr[0]: schema", "Trace expr[1]: sessao.getNmSchema()"],
+    );
+    assert!(!armed.contains("clamped"), "two is well under the cap: {armed}");
+
+    // `infotravel` can only appear in slot 0, and only on a hit where the ThreadLocal was unset — which is
+    // the disagreement this whole feature exists to make visible.
+    let traces = server
+        .wait_for_traces("infotravel", EVENT_TIMEOUT)
+        .expect("the logpoint never recorded a hit whose schema fell through to the default");
+    let disagreeing = traces
+        .lines()
+        .find(|l| l.contains("TenantProbe.handle:") && l.contains("infotravel"))
+        .unwrap_or_else(|| panic!("no hit line carrying the default schema in:\n{traces}"));
+
+    // BOTH slots on the SAME line. This is the assertion the feature is for: one snapshot, two values, and
+    // they do not match — which no pair of separately budgeted streams could have shown without a join.
+    assert!(
+        disagreeing.contains("schema => \"infotravel\""),
+        "slot 0 must carry the local, labelled with its own expression: {disagreeing}"
+    );
+    assert!(
+        disagreeing.contains("sessao.getNmSchema() => \"orinter\""),
+        "slot 1 must carry the getter's result in the same snapshot: {disagreeing}"
+    );
+
+    // And the agreeing hits are recorded too — the stop point is not filtering, it is reporting.
+    let agreeing = traces
+        .lines()
+        .find(|l| l.contains("TenantProbe.handle:") && l.contains("schema => \"orinter\""))
+        .or_else(|| {
+            server
+                .wait_for_traces("schema => \"orinter\"", EVENT_TIMEOUT)
+                .as_deref()
+                .and_then(|t| t.lines().find(|l| l.contains("schema => \"orinter\"")).map(str::to_string))
+                .map(|_| "found")
+        });
+    assert!(agreeing.is_some(), "hits where the two agree must be recorded as well:\n{traces}");
+
+    // TRACE-2's discipline: two evaluations per hit must still resume the thread. Only the probe says so.
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| trailing_tick(l).is_some_and(|n| n > 4)).is_some(),
+        "probe stopped ticking under a two-expression logpoint — a hit left it suspended\n  output: {:?}",
+        probe.output(),
+    );
+}
+
+/// One expression must keep the reply and the rendering it had before TRACE-11, and an element that fails
+/// must not take the others with it.
+///
+/// The second half is the normal case rather than an edge: a chain goes null on some hits and not others,
+/// which is the same reasoning that makes a batched arming reply per-pattern instead of one verdict.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn one_expression_is_unnumbered_and_a_failing_element_keeps_the_others() {
+    let Some(jdk) = jdk_or_skip("one_expression_is_unnumbered_and_a_failing_element_keeps_the_others") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "TenantProbe", |l| l.starts_with("handled "))
+        .expect("launch TenantProbe");
+    let line = probe_line(&probe_source("TenantProbe"), "TRACE_LINE");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // A single string: unnumbered label, and the rendering every earlier trace test asserts against.
+    let single = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "TenantProbe", "line": line, "trace": true, "trace_expr": "schema",
+        }),
+    );
+    assert!(single.contains("Trace expr: schema"), "one expression stays unnumbered: {single}");
+    assert!(!single.contains("Trace expr[0]"), "numbering one of one would be new noise: {single}");
+    let single_bp = single
+        .lines()
+        .find_map(|l| l.strip_prefix("   Stop-point ID: "))
+        .expect("no stop-point id in the reply")
+        .to_string();
+    server.wait_for_traces("schema => ", EVENT_TIMEOUT).expect("the single-expression logpoint never fired");
+    server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": single_bp}));
+
+    // Now three, the middle one naming something that is not in scope at all.
+    let mixed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "TenantProbe", "line": line, "trace": true,
+            "trace_expr": ["schema", "noSuchThing.atAll", "sessao.getNmSchema()"],
+        }),
+    );
+    assert!(mixed.contains("bp_"), "a list containing a bad expression must still arm: {mixed}");
+
+    let traces = server
+        .wait_for_traces("noSuchThing.atAll => ", EVENT_TIMEOUT)
+        .expect("the failing element never got a slot of its own");
+    let hit = traces
+        .lines()
+        .find(|l| l.contains("noSuchThing.atAll => "))
+        .unwrap_or_else(|| panic!("no hit line in:\n{traces}"));
+
+    assert!(hit.contains("noSuchThing.atAll => <error:"), "the failure lands in its own slot: {hit}");
+    assert!(hit.contains("schema => \""), "and the element before it survives: {hit}");
+    assert!(hit.contains("sessao.getNmSchema() => \""), "as does the one after it: {hit}");
+}
+
+/// The ceiling, and that it is reported rather than silently applied. A caller who asked for six values and
+/// read four would otherwise conclude the two missing ones evaluated to nothing.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn too_many_trace_expressions_are_clamped_and_the_reply_names_what_it_dropped() {
+    let Some(jdk) = jdk_or_skip("too_many_trace_expressions_are_clamped_and_the_reply_names_what_it_dropped")
+    else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "TenantProbe", |l| l.starts_with("handled "))
+        .expect("launch TenantProbe");
+    let line = probe_line(&probe_source("TenantProbe"), "TRACE_LINE");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "TenantProbe", "line": line, "trace": true,
+            "trace_expr": ["schema", "i", "sessao", "sessao.getNmSchema()", "schema", "i"],
+        }),
+    );
+
+    assert!(armed.contains("bp_"), "a clamped request still arms: {armed}");
+    assert_contains_all(
+        "the clamp says what was asked, what was kept and what was dropped",
+        &armed,
+        &["6 expressions", "cap", "DROPPED", "capture window"],
+    );
+    assert!(armed.contains("Trace expr[3]"), "four are kept: {armed}");
+    assert!(!armed.contains("Trace expr[4]"), "and the fifth is not listed as armed: {armed}");
+}
+
 /// TRACE-12 (#117): a suspending stop point converts every traced stop point on the same line into a
 /// VM-freezing one, and until this nothing said so.
 ///
@@ -8574,9 +8746,9 @@ fn a_suspending_stop_point_escalates_a_trace_on_the_same_line_and_says_so() {
 
     // The premise: a lone traced stop point really does leave the probe running. Without this the freeze
     // below could be anything.
-    let before = swap_probe_tick(&probe).unwrap_or(0);
+    let before = trailing_tick_max(&probe).unwrap_or(0);
     assert!(
-        probe.wait_for_line(EVENT_TIMEOUT, |l| swap_tick(l).is_some_and(|n| n > before + 2)).is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| trailing_tick(l).is_some_and(|n| n > before + 2)).is_some(),
         "a traced stop point alone must not freeze the probe\n  output: {:?}",
         probe.output(),
     );
@@ -8593,9 +8765,9 @@ fn a_suspending_stop_point_escalates_a_trace_on_the_same_line_and_says_so() {
     // The claim, from the debuggee. `STUCK_CONFIRM` rather than `EVENT_TIMEOUT`: ~20 ticks fit in it, so
     // ruling out progress does not need the full wait — a negative observation costs what the positive
     // would have (TEST-30).
-    let frozen_at = swap_probe_tick(&probe).unwrap_or(0);
+    let frozen_at = trailing_tick_max(&probe).unwrap_or(0);
     let advanced =
-        probe.wait_for_line(STUCK_CONFIRM, |l| swap_tick(l).is_some_and(|n| n > frozen_at + 2)).is_some();
+        probe.wait_for_line(STUCK_CONFIRM, |l| trailing_tick(l).is_some_and(|n| n > frozen_at + 2)).is_some();
     assert!(
         !advanced,
         "the probe kept ticking, so the traced stop point was NOT escalated and this test is no longer \
@@ -8618,7 +8790,7 @@ fn a_suspending_stop_point_escalates_a_trace_on_the_same_line_and_says_so() {
     // Leave the probe running for the harness's reaping.
     server.panic_reset();
     assert!(
-        probe.wait_for_line(EVENT_TIMEOUT, |l| swap_tick(l).is_some_and(|n| n > frozen_at + 2)).is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| trailing_tick(l).is_some_and(|n| n > frozen_at + 2)).is_some(),
         "the probe never recovered after the stop points were cleared\n  output: {:?}",
         probe.output(),
     );
@@ -8697,9 +8869,9 @@ fn two_traced_stop_points_on_one_line_do_not_warn_and_do_not_freeze() {
     assert!(listed.contains("(trace)"), "both must still read as plain traces:\n{listed}");
     assert!(!listed.contains("OVERRIDDEN"), "nothing was overridden:\n{listed}");
 
-    let before = swap_probe_tick(&probe).unwrap_or(0);
+    let before = trailing_tick_max(&probe).unwrap_or(0);
     assert!(
-        probe.wait_for_line(EVENT_TIMEOUT, |l| swap_tick(l).is_some_and(|n| n > before + 2)).is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| trailing_tick(l).is_some_and(|n| n > before + 2)).is_some(),
         "two traced stop points on one line must not freeze the probe\n  output: {:?}",
         probe.output(),
     );
@@ -9331,7 +9503,7 @@ fn a_swap_hotspot_cannot_accept_names_the_edit_and_says_a_redeploy_is_needed() {
         let before = last_answer(&probe).expect("the probe prints an answer");
         assert_eq!(before.0, 1, "a refused swap must leave the old bytecode running: {refusal}");
         assert!(
-            probe.wait_for_line(EVENT_TIMEOUT, |l| swap_tick(l).is_some_and(|t| t > before.1)).is_some(),
+            probe.wait_for_line(EVENT_TIMEOUT, |l| trailing_tick(l).is_some_and(|t| t > before.1)).is_some(),
             "the probe stopped running after a refused swap — a refusal must cost the debuggee nothing"
         );
     }
@@ -9492,7 +9664,7 @@ fn read_only_refuses_a_reload_but_still_answers_a_dry_run() {
     let (answer, tick) = last_answer(&probe).expect("the probe prints an answer");
     assert_eq!(answer, 1, "a refused reload must not have changed anything");
     assert!(
-        probe.wait_for_line(EVENT_TIMEOUT, |l| swap_tick(l).is_some_and(|t| t > tick)).is_some(),
+        probe.wait_for_line(EVENT_TIMEOUT, |l| trailing_tick(l).is_some_and(|t| t > tick)).is_some(),
         "the probe stopped running after a refused reload"
     );
 }
