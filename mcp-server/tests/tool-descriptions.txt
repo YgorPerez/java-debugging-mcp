@@ -790,21 +790,24 @@ reported all three of its locks. THERE IS DELIBERATELY NO condition ON THIS KIND
 rather than an omission: a condition is evaluated on the hit thread, and a thread suspended at a monitorenter
 is blocked on the very lock in the snapshot — an expression that invokes anything needing that monitor cannot
 complete, so the debugger would wedge the thread it is reporting on. min_duration_ms is this kind's filter and
-it needs nothing from the debuggee. AND AN INVOKING trace_expr IS NOW REFUSED ON THE OPENING HALF OF A PAIR —
-blocked and wait — for the same reason, because a caution was not enough: a getter that reads a field under
-synchronized looks exactly like one that does not. Measured on Temurin 11.0.32 and 21.0.12, the cost of being
-wrong is not the two-second budget but a thread suspended for ever: the call completes when the lock is
+it needs nothing from the debuggee. AND AN INVOKING trace_expr IS NOW REFUSED ON blocked FOR THE SAME REASON,
+because a caution was not enough: a getter that reads a field under synchronized looks exactly like one that
+does not. blocked is the ONE of the four kinds where the hit thread does not own the monitor its own snapshot
+names — at acquired it has just entered, at wait it still holds the lock (Java requires that to call wait() at
+all), and at waited it has re-acquired it, all measured rather than assumed. Measured too: the cost of being
+wrong is not the two-second budget but a thread suspended for ever — the call completes when the lock is
 finally released and the JVM re-suspends that thread AT THAT MOMENT, 1.2s after this server gave up and
-resumed it, and nothing clears it — the watchdog resumes a suspended VM and the VM is running. FIELD READS ARE
-ACCEPTED EVERYWHERE, and on the CLOSING halves — acquired and waited — an invoking expression is accepted and
-works, because the thread owns the lock by then and a call needing it re-enters. trace DEFAULTS TO TRUE AND
-trace:false REQUIRES A thread_id. A suspending monitor stop is the most dangerous thing this server can arm —
-every other kind has a line, class, method or field to narrow it to because you chose where it fires, and
-contention gives you nothing to narrow to, so a VM-wide freeze lands on the next acquisition of any hot lock
-and can re-fire the instant you resume. Snapshots also carry the CALLER CHAIN (trace_frames, default 3), which
-is usually the actual answer: the same synchronized block is entered from every request path, so the lock and
-the line rarely identify the problem while the path does. A JVM without canRequestMonitorEvents is told so in
-a sentence that names the fallback, not a bare NOT_IMPLEMENTED.
+resumed it, and nothing clears it, because the watchdog resumes a suspended VM and the VM is running. FIELD
+READS ARE ACCEPTED EVERYWHERE and invoking is accepted on the other three kinds. What no arming check can see
+is an expression naming a DIFFERENT lock, which can stall on any kind — that one is reported by the timeout
+message when it happens. trace DEFAULTS TO TRUE AND trace:false REQUIRES A thread_id. A suspending monitor
+stop is the most dangerous thing this server can arm — every other kind has a line, class, method or field to
+narrow it to because you chose where it fires, and contention gives you nothing to narrow to, so a VM-wide
+freeze lands on the next acquisition of any hot lock and can re-fire the instant you resume. Snapshots also
+carry the CALLER CHAIN (trace_frames, default 3), which is usually the actual answer: the same synchronized
+block is entered from every request path, so the lock and the line rarely identify the problem while the path
+does. A JVM without canRequestMonitorEvents is told so in a sentence that names the fallback, not a bare
+NOT_IMPLEMENTED.
 
 ## debug.set_value
 Write a value to a local variable, a static field (e.g. ConfigDefaultUtils.dsInfra — flip tenant/infra on a

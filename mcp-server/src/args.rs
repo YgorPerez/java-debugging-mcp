@@ -1522,24 +1522,29 @@ pub struct SetMonitorStopArgs {
     /// Only with `trace:true` — an expression evaluated in the blocking/waiting frame and recorded with the
     /// snapshot.
     ///
-    /// **An expression that CALLS A METHOD is REFUSED on the opening half of a pair** — `blocked` and
-    /// `wait` — and this used to be a caution rather than a refusal (DUMP-8, #123). Those two are the one
-    /// instant when the hit thread does NOT own the monitor its own snapshot is about: it is queued at a
-    /// `monitorenter`, or it has just released the lock into `Object.wait()`. An invocation needing that
-    /// monitor cannot complete, and JDWP has no way to cancel one — the 2000 ms budget frees the debugger,
-    /// not the debuggee. Measured on Temurin 11.0.32 and 21.0.12: the call finishes when the lock is
-    /// finally released and the JVM **re-suspends that thread at that moment**, 1.2 s after this server had
-    /// resumed it and moved on, and it then stays suspended for ever — nothing clears it, because the
-    /// watchdog resumes a suspended *VM* and the VM is running.
+    /// **An expression that CALLS A METHOD is REFUSED on `blocked`**, and this used to be a caution rather
+    /// than a refusal (DUMP-8, #123, ADR-0036). `blocked` is the ONE of the four kinds where the hit thread
+    /// does not own the monitor its own snapshot names: it is queued at a `monitorenter`, owning nothing. An
+    /// invocation needing that monitor cannot complete, and JDWP has no way to cancel one — the 2000 ms
+    /// budget frees the debugger, not the debuggee. Measured on Temurin 11.0.32 and 21.0.12: the call
+    /// finishes when the lock is finally released and the JVM **re-suspends that thread at that moment**,
+    /// 1.2 s after this server had resumed it and moved on, and it then stays suspended for ever — nothing
+    /// clears it, because the watchdog resumes a suspended *VM* and the VM is running.
     ///
     /// It is refused rather than warned about because a caller cannot always tell: a getter that reads a
     /// field under `synchronized` looks exactly like one that does not, and the price of being wrong is a
     /// wedged application thread on a JVM other people are using. The same reasoning is why this kind has
     /// no `condition` at all (ADR-0035).
     ///
-    /// **FIELD READS ARE ACCEPTED EVERYWHERE** (`this.pedido.id`, `lock.name`) — they need no monitor. And
-    /// on the CLOSING halves, `acquired` and `waited`, an invoking expression is accepted and works: the
-    /// thread owns the lock by then, so a call needing it re-enters and returns.
+    /// **ACCEPTED ON THE OTHER THREE, measured rather than assumed.** At `acquired` the thread has just
+    /// entered the monitor, at `wait` it still holds it (Java requires holding a monitor to call `wait()` on
+    /// it), and at `waited` it has re-acquired it — so an invocation re-enters and returns. Checked on
+    /// Temurin 21.0.12: the same call answered `(int) 7` on `wait` and `(int) 14` on `waited`. And FIELD
+    /// READS are accepted everywhere (`this.pedido.id`, `lock.name`), because they need no monitor.
+    ///
+    /// What no arm-time check can see is an expression naming a DIFFERENT lock, which can stall on any kind:
+    /// on one `waited` hit the monitor's own accessor returned while another thread's lock timed out on the
+    /// same capture. `JdwpError::InvokeTimeout`'s message is what speaks for that case.
     ///
     /// Accepts a LIST as well as a string (TRACE-11), each element evaluated against the same frame into
     /// its own labelled slot.

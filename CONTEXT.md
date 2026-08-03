@@ -294,13 +294,24 @@ is involuntary and a long one is a fault; `wait()` is voluntary and a long one i
 **Whether the thread OWNS the monitor differs per event, and `blocked` is the odd one out.** This is the fact a
 snapshot's own subject makes easy to get wrong, so it is worth stating rather than inferring: at `blocked` the
 thread is *attempting* to enter a monitor another thread holds, so it owns nothing; at `acquired` it has
-entered, so it owns it; at `wait` it owns it, because Java requires holding a monitor to call `wait()` on it.
-`waited` is deliberately left open — the wire says the wait "finished", and whether the monitor has been
-re-acquired by then is not something this project has measured.
+entered, so it owns it; at `wait` it owns it, because Java requires holding a monitor to call `wait()` on it;
+and at `waited` it has **re-acquired** it — which this entry used to leave open ("not something this project
+has measured") and DUMP-8 measured: an invocation needing the monitor answered promptly there, on Temurin
+21.0.12.
 It matters because it decides what may safely be *asked* at a hit. An invocation needing the monitor re-enters
 harmlessly where the thread already owns it, and cannot complete where it does not — and JDWP cannot cancel an
 invocation. So `blocked` is the one event of the four whose natural question (something about the object being
-contended) is also the dangerous one, which is why this kind has no **condition** at all.
+contended) is also the dangerous one, which is why this kind has no **condition** at all and why an invoking
+**trace_expr** is refused on it and on nothing else (DUMP-8, #123, ADR-0036).
+
+**The rule is ownership, not pair position, and the difference is not academic.** DUMP-8's first cut refused
+`wait` too, on an "opening half of a pair" framing — and this entry is what caught it, because `wait` is an
+opening half whose thread *owns* the lock. The same measurement carried its own control: on one `waited` hit
+an expression naming the reported monitor returned while one naming a **different** lock, held by another
+thread, timed out. So "can this invocation complete" is a question about *which* monitor the expression needs
+and who holds it, and only the first half of that is knowable when a stop point is armed.
+_Avoid_: opening half / closing half as a **safety** distinction (they are a real pair structure and the right
+words for duration, but they do not predict ownership — `wait` is the counter-example)
 
 **`bracket` was the first candidate and lost on a collision**, which is the same test that chose **unfetched**
 over `unloaded`: *bracket* is **already taken** in this codebase, by the `[…]` of a subscript expression — the

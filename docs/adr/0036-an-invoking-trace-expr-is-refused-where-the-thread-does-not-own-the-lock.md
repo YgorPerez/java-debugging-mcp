@@ -1,4 +1,4 @@
-# ADR-0036 — An invoking `trace_expr` is refused on the half of a monitor pair that does not own the lock
+# ADR-0036 — An invoking `trace_expr` is refused where the thread does not own the lock
 
 **Status:** Accepted
 **Date:** 2026-08-03
@@ -8,11 +8,9 @@
 
 ## Context
 
-`debug.set_monitor_stop`'s `trace_expr` is evaluated against the hit frame. For the **opening** half of a
-pair that frame belongs to a thread which does **not** own the monitor named in its own snapshot:
-
-- `MONITOR_CONTENDED_ENTER` (`blocked`) fires as the thread queues at a `monitorenter`;
-- `MONITOR_WAIT` (`wait`) fires as it enters `Object.wait()`, which *releases* the lock.
+`debug.set_monitor_stop`'s `trace_expr` is evaluated against the hit frame. On **`blocked`** — and, it turns
+out, on `blocked` alone — that frame belongs to a thread which does **not** own the monitor named in its own
+snapshot: `MONITOR_CONTENDED_ENTER` fires as the thread queues at a `monitorenter`, owning nothing.
 
 An expression that invokes anything needing that monitor therefore cannot complete, and **JDWP has no way to
 cancel an invocation**. `send_invoke`'s own doc comment has always said so: the budget
@@ -58,12 +56,40 @@ and then, polling `debug.list_threads {only_suspended: true}` every 400 ms:
    monitor, generating another `MONITOR_CONTENDED_ENTER`, so the stop point reports contention *the debugger
    created*, at a location inside the invoked method, and spends `trace_max_hits` on it.
 
+## The measurement that narrowed it, and the near-miss it caught
+
+The first cut of this refusal covered **`wait` as well**, framed as "the opening half of a pair". That framing
+is wrong, and `CONTEXT.md` is what caught it: the glossary already recorded that at `wait` the thread **owns**
+the monitor, because Java requires holding one to call `wait()` on it at all. `MONITOR_WAIT` is generated as
+the thread is *about to* wait, before the release.
+
+Checked rather than conceded, on Temurin 21.0.12 through the released server before the refusal existed, using
+a second lock on `WedgeProbe` that exists for this:
+
+| kind | `WAITED_ON.stamp()` — an invocation needing the reported monitor |
+|---|---|
+| `wait` | `(int) 7` — returns promptly |
+| `waited` | `(int) 14` — returns promptly |
+
+The second row closes a question the glossary had left **explicitly open** ("whether the monitor has been
+re-acquired by then is not something this project has measured"). It has been now: it is re-acquired.
+
+The same capture carried its own control, and it is the sharper half of the finding. On that one `waited` hit,
+`LOCK.stamp()` — a *different* lock, held by another thread — **timed out at 2000 ms** while
+`WAITED_ON.stamp()` returned. So the hazard is **ownership of the monitor being reported on**, not the event
+kind and not "opening versus closing". An expression naming some other lock can stall anywhere, which is the
+general uncancellable-invocation hazard #123 scoped out and which no arm-time check can see.
+
+Note where the trap sat: the frame at a `wait` hit is `java.lang.Object.wait0`, a **native** method with no
+local variable table, so a bare name does not resolve there at all and the first attempt failed with a
+name-resolution error that looks nothing like a stall. Reading that as "it did not work" would have confirmed
+the wrong rule. The qualified form (`WedgeProbe.WAITED_ON.stamp()`) is what answered the question.
+
 ## Decision
 
-**Refuse a `trace_expr` that calls a method when an opening kind (`blocked` or `wait`) is armed**, at arm
-time, before anything reaches the debuggee. Field reads are accepted everywhere. On the closing halves
-(`acquired`, `waited`) an invoking expression is accepted and works, because the thread owns the monitor by
-then and a call needing it re-enters.
+**Refuse a `trace_expr` that calls a method when `blocked` is armed**, at arm time, before anything reaches
+the debuggee. Field reads are accepted everywhere. On `acquired`, `wait` and `waited` an invoking expression
+is accepted and works, because the thread owns the monitor and a call needing it re-enters.
 
 Refused rather than warned about, which is a change from ADR-0035's disposition, because the caller cannot
 reliably tell: a getter that reads a field under `synchronized` looks exactly like one that does not, and the
@@ -98,7 +124,10 @@ uncancellable-invocation hazard out. If it is ever wanted, this ADR is the evide
 ## Consequences
 
 - A caller who wants a getter's value on a contended lock must arm `acquired` instead, which the refusal
-  names. That is a real loss of capability on `blocked`, and it is the price of the guarantee.
+  names. That is a real loss of capability on `blocked`, and it is the price of the guarantee. It is confined
+  to one kind of four rather than two, which the measurement above is what established.
+- **The rule is about ownership, not about pair position**, so `CONTEXT.md`'s ownership-per-event entry is the
+  authority a future change should check against — it is what caught this ADR's own first draft.
 - `debug.set_monitor_stop` now has **six** up-front refusals, more than any other stop point. Five of them
   exist because JDWP does not mean what an argument reads like on this event kind; this one exists because
   the event kind's own timing makes an ordinary capability unsafe.

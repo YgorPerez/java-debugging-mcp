@@ -110,6 +110,29 @@ public class WedgeProbe {
         sleep(GAP_MS);
     }
 
+    /**
+     * The CONTROL for the other opening kind, and it exists because `CONTEXT.md` and a first cut of the
+     * DUMP-8 refusal disagreed about it.
+     *
+     * `MONITOR_WAIT` is generated when a thread is *about to* call `Object.wait()` — so it still OWNS the
+     * monitor at that instant, which is what Java requires to call `wait()` at all. That makes `wait` an
+     * opening half of a pair and yet NOT a hazard: an invocation needing the monitor re-enters. The claim
+     * is only worth as much as a measurement, so this waiter gives one something to fire on.
+     *
+     * A separate lock from `LOCK`, so waiting here cannot perturb the contended pair the other tests watch.
+     */
+    static final Wedge WAITED_ON = new Wedge();
+
+    static void waitOut() {
+        synchronized (WAITED_ON) {
+            try {
+                WAITED_ON.wait(40); // WAIT fires here, still owning the monitor; WAITED when it returns
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
     /** Queue on a demonstrably-owned lock, then acquire it. ENTER fires at the `synchronized`. */
     static void contend() {
         while (!held) {
@@ -134,6 +157,7 @@ public class WedgeProbe {
     public static void main(String[] args) throws Exception {
         contender = loopForever(WedgeProbe::contend, "wedge-contender");
         loopForever(WedgeProbe::hold, "wedge-holder");
+        loopForever(WedgeProbe::waitOut, "wedge-waiter");
 
         // Ask the JVM, don't guess: one completed contended entry means the shape this probe is for has
         // demonstrably happened, so a test arming against it is not waiting on events nothing produces.

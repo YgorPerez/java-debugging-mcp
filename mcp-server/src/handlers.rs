@@ -4625,51 +4625,52 @@ async fn resolve_monitor_class(conn: &mut jdwp_client::JdwpConnection, dotted: &
     })
 }
 
-/// Refuse a `trace_expr` that INVOKES on an OPENING monitor kind (DUMP-8, #123).
+/// Refuse a `trace_expr` that INVOKES on the `blocked` kind (DUMP-8, #123).
 ///
-/// The opening halves — `blocked` and `wait` — are the one instant in a pair when the hit thread does not
-/// own the monitor the snapshot is about. `MONITOR_CONTENDED_ENTER` fires with the thread queued at a
-/// `monitorenter`, and `MONITOR_WAIT` fires as it enters `Object.wait()`, which RELEASES the lock. An
-/// invocation needing that monitor therefore cannot proceed, and JDWP has no way to cancel it —
-/// `send_invoke`'s own doc says so: the budget stops US waiting and the debuggee thread stays where it is.
+/// **`blocked` is the only one of the four where the thread does not own the monitor its own snapshot names**,
+/// and that — not "the opening half of a pair" — is the property that decides this. `MONITOR_CONTENDED_ENTER`
+/// fires with the thread queued at a `monitorenter`, owning nothing. Everywhere else it owns the lock: at
+/// `acquired` it has just entered, at `wait` it still holds it (Java requires holding a monitor to call
+/// `wait()` on it at all), and at `waited` it has re-acquired it. So an invocation needing that monitor
+/// re-enters harmlessly on three kinds and cannot complete on one.
 ///
-/// **What that costs is measured, and it is worse than a slow capture.** Against a probe holding the lock
-/// 3000 ms against the 2000 ms budget, on Temurin 11.0.32 and 21.0.12: the expression records its timeout,
-/// the capture path resumes the hit thread, and then — 1.2 s later, exactly the hold that was left — the
-/// invocation completes and the JVM re-suspends the thread. `debug.list_threads {only_suspended:true}`
-/// names it from that moment on and never stops; the debuggee's own counter never advances again while the
-/// rest of the application keeps running. A stop point whose single promise is that it suspends nothing has
-/// permanently suspended an application thread, and nothing rescues it: the watchdog resumes a suspended
-/// VM and this VM is running.
+/// **The `wait` and `waited` halves of that are measured, not reasoned.** A first cut of this refusal covered
+/// `wait` too, on the "opening half" framing, and `CONTEXT.md` is what caught it — the glossary already said
+/// the thread owns the monitor there. Checked on Temurin 21.0.12 against `WedgeProbe`, whose `WAITED_ON` lock
+/// exists for exactly this: an invoking expression on `wait` returned `(int) 7` and on `waited` returned
+/// `(int) 14`, both promptly. `waited` had been left explicitly open in the glossary ("not something this
+/// project has measured"); it is measured now.
 ///
-/// **So it is refused at arm time rather than repaired at hit time, and that order was forced by
-/// measurement.** Verifying the resume — reading the suspend count back and resuming until it clears, which
-/// is what ADR-0003 asks of every other resume here — was implemented first and does nothing at all: polled
-/// every 400 ms with and without it, the sequence is byte-identical, because the extra suspend arrives
-/// after the capture path has finished and moved on. There is nothing left at hit time to verify.
+/// **What that costs on `blocked` is measured too, and it is worse than a slow capture.** Against a lock held
+/// 3000 ms past the 2000 ms budget, on Temurin 11.0.32 and 21.0.12: the expression records its timeout, the
+/// capture path resumes the hit thread, and then — 1.2 s later, exactly the hold that was left — the
+/// invocation completes and the JVM re-suspends the thread. `debug.list_threads {only_suspended:true}` names
+/// it from that moment on and never stops; the debuggee's own counter never advances again while the rest of
+/// the application keeps running. A stop point whose single promise is that it suspends nothing has
+/// permanently suspended an application thread, and nothing rescues it: the watchdog resumes a suspended VM
+/// and this VM is running.
 ///
-/// **Refused rather than merely warned about**, unlike the sentence the tool description has always
-/// carried, because the caller cannot always know whether a method takes the lock — a getter that reads a
-/// field under `synchronized` looks exactly like one that does not — and the price of being wrong is a
-/// wedged application thread on a JVM other people are using.
+/// **Refused at arm time rather than repaired at hit time, and that order was forced by measurement.**
+/// Verifying the resume — reading the suspend count back and resuming until it clears, which is ADR-0003's
+/// rule and what every other resume here already does — was implemented first and does nothing at all: polled
+/// every 400 ms with and without it, the sequence is byte-identical, because the extra suspend arrives after
+/// the capture path has finished and moved on. There is nothing left at hit time to verify.
 ///
-/// What still works, and it is most of what is wanted: any FIELD read (`this.pedido.id`, `lock.name`), and
-/// every expression on `acquired` / `waited`, where the thread holds the monitor and an invocation
-/// re-enters it. Both are asserted rather than assumed — see
-/// `the_acquired_half_owns_the_lock_so_the_same_expression_resolves_there`.
-fn refuse_invoking_expr_on_an_opening_kind(
+/// **Refused rather than merely warned about**, unlike the sentence the tool description has always carried,
+/// because the caller cannot always know whether a method takes the lock — a getter that reads a field under
+/// `synchronized` looks exactly like one that does not — and the price of being wrong is a wedged application
+/// thread on a JVM other people are using.
+///
+/// **What this does NOT cover, stated because the same run measured it.** An expression naming a DIFFERENT
+/// lock can stall on any kind: on one `waited` hit, `WAITED_ON.stamp()` returned while `LOCK.stamp()` — a lock
+/// another thread was holding — timed out on the same capture. That is the general uncancellable-invocation
+/// hazard, which #123 scoped out and no arm-time check can see; `JdwpError::InvokeTimeout`'s message is what
+/// speaks for it.
+fn refuse_invoking_expr_on_the_unowned_kind(
     trace_exprs: &[String],
     kinds: &[jdwp_client::MonitorKind],
 ) -> Result<(), String> {
-    let opening: Vec<&str> = kinds
-        .iter()
-        .filter_map(|k| match k {
-            jdwp_client::MonitorKind::Blocked => Some("blocked"),
-            jdwp_client::MonitorKind::Wait => Some("wait"),
-            _ => None,
-        })
-        .collect();
-    if opening.is_empty() {
+    if !kinds.contains(&jdwp_client::MonitorKind::Blocked) {
         return Ok(());
     }
     for (i, e) in trace_exprs.iter().enumerate() {
@@ -4680,19 +4681,7 @@ fn refuse_invoking_expr_on_an_opening_kind(
         // expressions allowed, "one of them invokes" is not an actionable sentence.
         let what = if trace_exprs.len() == 1 { "trace_expr".to_string() } else { format!("trace_expr[{i}]") };
         return Err(format!(
-            "🛑 Refused: the {what} `{e}` CALLS A METHOD, and {} {} the half of the pair where the hit \
-             thread does NOT own the monitor in its own snapshot — it is queued at a monitorenter, or it \
-             has just released the lock into Object.wait(). An invocation needing that monitor cannot \
-             complete, and JDWP HAS NO WAY TO CANCEL ONE: the 2000ms budget frees the debugger, not the \
-             debuggee.\n   Measured on Temurin 11.0.32 and 21.0.12 — the call finishes when the lock is \
-             finally released, and the JVM re-suspends the thread at that moment, 1.2s after this server \
-             had already resumed it and moved on. The thread then stays suspended for ever: nothing here \
-             clears it, because the watchdog resumes a suspended VM and the VM is running.\n   Read a \
-             FIELD instead (`{e}` without the call — a field read needs no monitor), or arm the CLOSING \
-             half: on `acquired` and `waited` the thread owns the lock, so an invocation re-enters it and \
-             returns.",
-            if opening.len() == 1 { "the kind" } else { "the kinds" },
-            opening.join(" and "),
+            "🛑 Refused: the {what} `{e}` CALLS A METHOD, and the kind blocked is the ONE of the four where              the hit thread does NOT own the monitor in its own snapshot — it is queued at a monitorenter,              owning nothing. An invocation needing that monitor cannot complete, and JDWP HAS NO WAY TO              CANCEL ONE: the 2000ms budget frees the debugger, not the debuggee.\n   Measured on Temurin              11.0.32 and 21.0.12 — the call finishes when the lock is finally released, and the JVM              re-suspends the thread at that moment, 1.2s after this server had already resumed it and moved              on. The thread then stays suspended for ever: nothing here clears it, because the watchdog              resumes a suspended VM and the VM is running.\n   Read a FIELD instead (`{e}` without the call              — a field read needs no monitor), or arm acquired, wait or waited: on all three the thread owns              the monitor, so an invocation re-enters it and returns (measured, ADR-0036)."
         ));
     }
     Ok(())
@@ -4704,7 +4693,8 @@ fn refuse_invoking_expr_on_an_opening_kind(
 /// Six, which is more than any other stop point, and that is what the kind is like rather than a sign of a
 /// bad argument set: three of them exist because a JDWP modifier does not mean what the argument reads like
 /// on this event (measured, ADR-0035), two because a duration measured across a pair needs the pair, and one
-/// because an invocation on the opening half of a pair cannot be cancelled (DUMP-8, #123).
+/// because on `blocked` — the one kind where the thread does not own the monitor it is reporting on — an
+/// invocation cannot complete and cannot be cancelled (DUMP-8, #123, ADR-0036).
 fn refuse_bad_monitor_arming(
     a: &crate::args::SetMonitorStopArgs,
     kinds: &[jdwp_client::MonitorKind],
@@ -4714,7 +4704,7 @@ fn refuse_bad_monitor_arming(
     refuse_monitor_class_on_contended(a.monitor_class.as_deref(), kinds)?;
     refuse_unpaired_min_duration(a.min_duration_ms, kinds)?;
     refuse_counted_min_duration(a.hit_count, a.min_duration_ms)?;
-    refuse_invoking_expr_on_an_opening_kind(&crate::args::trace_exprs(a.trace_expr.clone()), kinds)
+    refuse_invoking_expr_on_the_unowned_kind(&crate::args::trace_exprs(a.trace_expr.clone()), kinds)
 }
 
 /// Arm every requested kind, **rolling the whole set back** if any of them fails.

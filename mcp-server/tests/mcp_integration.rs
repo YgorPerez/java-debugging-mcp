@@ -13507,16 +13507,16 @@ fn an_invoking_trace_expr_is_refused_on_the_half_that_does_not_own_the_lock() {
 
     let arm = |server: &mut Server, args: serde_json::Value| server.call("debug.set_monitor_stop", args);
 
-    // --- Refused on both opening kinds, and the refusal explains itself ---
-    for (kinds, named) in [(vec!["blocked"], "blocked"), (vec!["wait"], "wait"), (vec!["all"], "blocked")] {
+    // --- Refused wherever `blocked` is armed, including as part of `all` ---
+    for kinds in [vec!["blocked"], vec!["all"], vec!["acquired", "blocked"]] {
         let refused = arm(
             &mut server,
             serde_json::json!({"kinds": kinds, "trace_expr": "LOCK.stamp()", "trace_max_hits": 1}),
         );
         assert_contains_all(
-            &format!("an invoking trace_expr is refused on {named}"),
+            &format!("an invoking trace_expr is refused when blocked is armed as {kinds:?}"),
             &refused,
-            &["Refused", "CALLS A METHOD", named, "cannot complete", "re-suspends the thread"],
+            &["Refused", "CALLS A METHOD", "blocked", "cannot complete", "re-suspends the thread"],
         );
         // It must be the argument check talking, not the session lookup — otherwise this test would pass
         // against a build with no check at all.
@@ -13524,6 +13524,28 @@ fn an_invoking_trace_expr_is_refused_on_the_half_that_does_not_own_the_lock() {
             !refused.contains("No active debug session"),
             "refused for the wrong reason for kinds {kinds:?}: {refused}"
         );
+    }
+
+    // --- NOT refused on the three kinds where the thread owns the monitor ---
+    //
+    // A first cut of this refusal covered `wait` too, on an "opening half of a pair" framing, and CONTEXT.md
+    // is what caught it: the glossary already said the thread owns the monitor at `wait`, because Java
+    // requires holding one to call `wait()` on it at all. Measured on Temurin 21.0.12 through the released
+    // server before the refusal existed — an invoking expression answered `(int) 7` on `wait` and `(int) 14`
+    // on `waited`, the latter closing a question the glossary had left explicitly open.
+    for kinds in [vec!["acquired"], vec!["wait"], vec!["waited"]] {
+        let accepted = arm(
+            &mut server,
+            serde_json::json!({"kinds": kinds, "trace_expr": "LOCK.stamp()",
+                                                "trace_max_hits": 1, "trace_frames": 0}),
+        );
+        assert!(
+            !accepted.contains("Refused"),
+            "an invoking trace_expr must be accepted on {kinds:?}, where the thread owns the monitor: \
+             {accepted}"
+        );
+        server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": "mon_all"}));
+        server.call("debug.panic", serde_json::json!({}));
     }
 
     // Several expressions: the offending one is named by index, or four expressions leave the caller
@@ -14044,6 +14066,19 @@ fn every_monitor_arming_refusal_explains_itself_before_touching_the_debuggee() {
     assert_contains_all(
         "a valid arming reaches the session lookup",
         &no_session,
+        &["No active debug session"],
+    );
+
+    // The same for an INVOKING expression on the three kinds where the thread owns the monitor. This is the
+    // half a symmetric "fix" of DUMP-8 would break, and it is measured: on Temurin 21.0.12 an invoking
+    // expression answered `(int) 7` on `wait` and `(int) 14` on `waited`. Costs no JVM to state here.
+    let owned = server.call(
+        "debug.set_monitor_stop",
+        serde_json::json!({"kinds": ["acquired", "wait", "waited"], "trace_expr": "lock.getStatus()"}),
+    );
+    assert_contains_all(
+        "invoking is accepted where the thread owns the monitor",
+        &owned,
         &["No active debug session"],
     );
 }
