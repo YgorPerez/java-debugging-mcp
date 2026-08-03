@@ -278,41 +278,43 @@ choose — contention happens wherever threads collide, which is why a suspendin
 why there is nothing else to narrow it to.
 _Avoid_: contention breakpoint; lock breakpoint (a "breakpoint" implies a location you picked)
 
-**Monitor bracket**:
+**Monitor pair**:
 The **two** events that delimit one waiting period, and the unit a duration belongs to: `blocked` → `acquired`
-for a contended entry, `wait` → `waited` for an `Object.wait()`. Four event kinds, two brackets.
-_Avoid_: monitor pair (used for the internal type; "bracket" says what the two events *do*)
+for a contended entry, `wait` → `waited` for an `Object.wait()`. Four event kinds, two pairs.
+_Avoid_: monitor bracket (see below), monitor cycle (nothing repeats)
 
-**A duration is a property of the bracket, never of an event**, because no monitor event carries one — see
-**Debugger-measured**. Arming one half is legitimate and cheaper: it answers "is anything blocking at all" for
-one request instead of two, and its snapshots say the duration was not measurable rather than printing a zero.
+**A duration is a property of the pair, never of an event**, because no monitor event carries one — see
+**debugger-measured** below. Arming one half is legitimate and cheaper: it answers "is anything blocking at
+all" for one request instead of two, and its snapshots say the duration was not measurable rather than
+printing a zero.
 
-**The two brackets are named apart** (`blocked_for`, `waited_for`) rather than sharing one `elapsed`. Blocking
+**The two pairs are named apart** (`blocked_for`, `waited_for`) rather than sharing one `elapsed`. Blocking
 is involuntary and a long one is a fault; `wait()` is voluntary and a long one is often a healthy idle worker.
 
+**`bracket` was the first candidate and lost on a collision**, which is the same test that chose **unfetched**
+over `unloaded`: *bracket* is **already taken** in this codebase, by the `[…]` of a subscript expression — the
+parser splits on `.` at bracket depth and reports unbalanced brackets. A second meaning 3,000 lines away in the
+same file is a homonym, not a synonym, so the word is left where it already works. "Open" and "close" still read
+better with it than with *pair*, and that is not enough.
+
 **Debugger-measured**:
-A figure this server computed rather than read off the wire, labelled as such wherever it is printed. So far
-there is exactly one: a monitor bracket's duration, timestamped at the opening event and subtracted at the
-closing one (ADR-0035). It includes our own capture latency (~0.86 ms per hit before caller frames), which is
-noise against a multi-second block and a material fraction of a 5 ms one — so the label is what lets a caller
-judge which case they are in.
+A figure this server computed rather than read off the wire, labelled as such wherever it is printed. A
+**reported** figure is the debuggee's own account — a line number, a returned value, a `timed_out` flag — and
+the two must never be printed as though they were the same kind of thing.
 _Avoid_: elapsed; measured (unqualified — the point of the term is *whose* measurement it is)
 
-**Contrast it with a *reported* figure**, which is every other number in a reply: a line number, a returned
-value, a `timed_out` flag. Those are the debuggee's own account. The distinction matters because JDWP offers a
-figure that looks like the missing one — `MONITOR_WAIT`'s `timeout` — which is the value the caller passed to
-`wait(…)`, not how long it waited. Printing that as a duration would have been plausible on every reply.
+**Several predate the term** and are not exceptions to it: a traced stop point's mean capture, arrival rate and
+capture share (TRACE-7), and the duration `debug.thread_dump` held the VM (#17). What the term was finally
+needed for is a **monitor pair**'s duration (ADR-0035), because that is the first case where the wire offers a
+*look-alike*: `MONITOR_WAIT` carries a `timeout` field, which is the value the caller passed to `wait(…)` and
+not how long it waited. Printing that as a duration would have been plausible on every reply, which is a worse
+failure than having no figure at all.
 
-**Read-side filter**:
-A narrowing this server applies *after* the event has arrived, as opposed to a **filter**, which the debuggee
-applies and which therefore costs nothing when it does not match. A read-side filter reduces what lands in the
-trace buffer and nothing else — the packet has already been generated and has already cost the debuggee its
-notification. `min_duration_ms` is one; so is a **condition**.
-_Avoid_: server-side filter (accurate but ambiguous — this server *is* a server and so is the debuggee's host)
-
-**It is said out loud on every reply that offers one**, because the alternative reads as a cost saving that
-does not exist. The narrowings that do act inside the JVM are the thread filter, `ClassOnly`, `ClassMatch` /
-`ClassExclude`, and the trace-hit budget's disarm.
+So the label is not modesty about precision, it is a claim about **provenance**. A monitor duration is
+timestamped at the opening event and subtracted at the closing one, which means it includes our own capture
+latency (~0.86 ms per hit before caller frames) — noise against the multi-second block a wedged server is
+asked about, a material fraction of a 5 ms one. A caller cannot tell which case they are in unless the reply
+says whose number it is.
 
 **Class-load watch**:
 A request the debugger holds *instead of* a stop point, so a class it cannot arm yet can be armed the moment
@@ -483,8 +485,13 @@ produces no event at all — no packet, no suspension, no work on this side. The
 by stepping) and `Count` (the Nth occurrence only, after which the request is **spent**).
 Worth its own word because it is the only mechanism here that reduces what the debuggee *does* rather than
 what the debugger reports, which is the difference that matters on **the shared 8180**. Everything else —
-a **condition**, a method-name narrowing on a method-exit request, a trace budget — filters after the event
-has already crossed the wire.
+a **condition**, a method-name narrowing on a method-exit request, a monitor stop's `min_duration_ms`, a trace
+budget — filters after the event has already crossed the wire.
+**Two caller-facing names use the word for our side anyway**, and that is a stated mismatch rather than drift:
+`class_filter` on `debug.get_traces` selects among records already captured, and `min_duration_ms` is
+*described* as filtering — "what you READ, not what crosses the wire". Both are already-shipped caller surface,
+so the glossary records the gap instead of asserting a purity the schema does not have, exactly as the
+**Stop point** entry does for `bp_`/`breakpoint_id`. The reserved sense of the noun is still the debuggee's.
 Two hazards, each with its own term: a filter the debuggee accepts and does not apply is **inert**, and a
 filter naming an object or thread the debuggee has collected simply stops matching, which reads as *the code
 never ran*.
@@ -637,9 +644,12 @@ Its own state in the cluster above, because the failure direction is the opposit
 and **vanished** are the debuggee having removed something we still believe in, while this is the debuggee
 keeping something that was never in effect. So the stop point reports *more* than it should rather than
 less, which is the reading no caller checks for.
-Measured on Temurin 17/21/25, `HotSpot` (FILT-9, #101, ADR-0027): an `InstanceOnly` filter is accepted and
-**not applied** on a `METHOD_EXIT` request, on a line stop in a `static` method, and on a watch of a
-`static` field — three shapes, all silent. The consequence is a rule rather than a caveat: **acceptance is
+Measured on Temurin 17/21/25, `HotSpot` (FILT-9, #101, ADR-0027), and on 11.0.32 for the fourth (DUMP-7,
+#96, ADR-0035): an `InstanceOnly` filter is accepted and **not applied** on a `METHOD_EXIT` request, on a line
+stop in a `static` method, on a watch of a `static` field, and on a **monitor stop point** — four shapes, all
+silent. The last was measured with a real object id against a probe whose every frame is `static`, so `this` is
+null and nothing could legitimately have matched; the request armed cleanly and reported all three of its
+locks. The consequence is a rule rather than a caveat: **acceptance is
 not application**, so a filter must be refused up front where it is known to be inert, since neither the
 reply nor the JVM will ever mention it again.
 The rule cuts both ways, and the fourth shape is why it has to be measured per kind rather than reasoned
@@ -647,6 +657,12 @@ about. `METHOD_EXIT` has a `this` and is still inert; `EXCEPTION` also has one a
 probe, two instances throwing the same type from the same line, 26 records and every one of them the
 filtered instance. Neither outcome is predictable from the protocol, the capability bit or the presence of
 a `this`, so each kind is one probe run and the table is the answer.
+**A modifier can also be applied to the wrong SUBJECT, which is not this and has no name yet.** DUMP-7 found
+`ClassOnly` accepted on all four monitor kinds and applied to the *monitor's* class on the wait pair but to the
+*blocking code's* class on the contended pair (ADR-0035) — so the filter works, and narrows something other
+than what the argument names. Deliberately left unnamed on one data point: **inert** earned a word by recurring
+across three shapes, and one instance does not. The remedy is the same either way — refuse it where it would
+mislead — so nothing turns on the missing term until it recurs.
 _Avoid_: unsupported (the debuggee took it — an unsupported modifier is one it *refuses*, which is the
 honest case and needs no word), ignored (true but reads as ours to fix)
 

@@ -4589,7 +4589,7 @@ fn refuse_unpaired_min_duration(
 }
 
 /// Refuse `hit_count` together with `min_duration_ms`: the JVM deletes the request after the Nth event, and
-/// the Nth event of the opening kind is almost never the one that closes a bracket over the threshold.
+/// the Nth event of the opening kind is almost never the one that closes a pair over the threshold.
 ///
 /// The same shape as the method-exit `hit_count` + `method` refusal: `Count` is applied by the JVM, before
 /// anything on this side can see whether the hit was wanted.
@@ -4601,7 +4601,7 @@ fn refuse_counted_min_duration(hit_count: Option<i32>, min_duration_ms: Option<u
         "hit_count and min_duration_ms cannot both be set, and the combination yields nothing rather than \
          something imprecise. hit_count is JDWP's Count: the JVM reports the {n}th event and then DELETES \
          the request, and it applies that per request — so it would spend the count on the {n}th `blocked` \
-         and the {n}th `acquired`, which are not the two halves of one bracket. Both requests would then be \
+         and the {n}th `acquired`, which are not the two halves of one pair. Both requests would then be \
          gone, leaving no closing event to measure against {min}ms.\n   Pick one: min_duration_ms to see \
          every block over a threshold (bounded by trace_max_hits instead), or hit_count to catch the Nth \
          event whatever its duration."
@@ -4748,7 +4748,7 @@ fn describe_monitor_arm(
         }
     );
 
-    // Which brackets can be measured, stated per pair rather than as one verdict: a call arming three kinds
+    // Which durations are available, stated per pair rather than as one verdict: a call arming three kinds
     // has one complete pair and one half, and "a duration is available" would be true and misleading.
     for pair in [crate::session::MonitorPair::Contended, crate::session::MonitorPair::Wait] {
         let members: Vec<jdwp_client::MonitorKind> =
@@ -6556,7 +6556,7 @@ async fn clear_monitor_request_stop(session: &mut crate::session::DebugSession, 
     if let Some(req) = mon.request_id {
         let _ = session.connection.clear_monitor_request(req, mon.kind).await;
     }
-    // Any bracket this kind had open dies with the request. Left behind, its start would be handed to
+    // Any pair this kind had open dies with the request. Left behind, its start would be handed to
     // whatever is armed on this pair next and reported as a duration reaching back before that stop point
     // existed.
     let (pair, _) = crate::session::MonitorPair::of(mon.kind);
@@ -6645,7 +6645,7 @@ async fn rearm_monitor_request(
         m.trace_budget = refreshed_budget(m.trace_budget);
         reset_trace_cost(&mut m.trace_cost);
     }
-    // DUMP-7: any bracket this kind had open belongs to the request that was just replaced. Left in place,
+    // DUMP-7: any pair this kind had open belongs to the request that was just replaced. Left in place,
     // the first event after a re-arm would be measured from before the disable and report the time the stop
     // point spent DISABLED as time a thread spent blocked — a number that is not wrong by a little.
     let (pair, _) = crate::session::MonitorPair::of(mon.kind);
@@ -10743,13 +10743,13 @@ struct TracedRequest {
 /// What a traced **monitor** request needs at hit time, beyond what every kind needs (DUMP-7, #96).
 #[derive(Debug, Clone, Copy)]
 struct MonitorTraceSpec {
-    /// Which of the two brackets this request's kind belongs to, and whether it is the opening half.
+    /// Which of the two pairs this request's kind belongs to, and whether it is the opening half.
     pair: crate::session::MonitorPair,
     opening: bool,
     /// Whether the pair's other half is armed. A duration is measured across the two, so a `false` here
     /// means this stop point can report that the event happened and nothing about how long it took.
     paired: bool,
-    /// Only record a closed bracket at least this long. Refused at arm time unless both halves are armed,
+    /// Only record a closed pair at least this long. Refused at arm time unless both halves are armed,
     /// because with one half there is nothing to measure and a threshold would silence the stop point
     /// completely — an armed logpoint that can never record is exactly the "silence reads as an answer"
     /// failure this codebase exists to remove.
@@ -10840,15 +10840,15 @@ fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> O
 /// What the pairing made of one monitor event (DUMP-7, ADR-0035).
 #[derive(Debug, Clone, Copy)]
 enum MonitorSpan {
-    /// The **opening** half of a bracket: timestamped here, so the closing half can subtract.
+    /// The **opening** half of a pair: timestamped here, so the closing half can subtract.
     Opened,
-    /// The **closing** half, carrying the duration the bracket was open — or `None` when no opening half
+    /// The **closing** half, carrying the duration the pair was open — or `None` when no opening half
     /// was seen for it, which is normal rather than an error: the opening kind may not be armed, the
-    /// bracket may have opened before this stop point did, or the entry may have been evicted.
+    /// pair may have opened before this stop point did, or the entry may have been evicted.
     Closed(Option<std::time::Duration>),
 }
 
-/// Timestamp or close this monitor event's bracket, and say which it was.
+/// Timestamp or close this monitor event's pair, and say which it was.
 ///
 /// **This has to live on the session-holding side of the capture** (`record_one_traced_event`), which is
 /// the constraint that shaped the whole feature: `capture_trace` receives a connection and a stop point,
@@ -10864,10 +10864,10 @@ fn span_monitor_event(
     let (m, _) = monitor_of(details)?;
     let key = crate::session::MonitorPairKey { thread: m.thread, monitor: m.monitor, pair: spec.pair };
     if spec.opening {
-        session.open_monitor_bracket(key, now);
+        session.open_monitor_pair(key, now);
         return Some(MonitorSpan::Opened);
     }
-    Some(MonitorSpan::Closed(session.close_monitor_bracket(&key, now)))
+    Some(MonitorSpan::Closed(session.close_monitor_pair(&key, now)))
 }
 
 /// Whether this monitor hit should be recorded at all, given the caller's `min_duration_ms` (DUMP-7).
@@ -10882,7 +10882,7 @@ fn span_monitor_event(
 /// **A closing half whose duration is unknown is dropped once a threshold is set**, and this was the other
 /// way round until JDK 11 disagreed. The reasoning for keeping it — "a snapshot saying the lock was acquired
 /// with the duration unavailable beats a silence" — is sound with no threshold and wrong with one: a caller
-/// who asked for blocks over 200 ms has said what they want to see, and an unmeasurable bracket may have
+/// who asked for blocks over 200 ms has said what they want to see, and an unmeasurable pair may have
 /// lasted 1 ms. Reporting it breaks the only promise the argument makes.
 ///
 /// It is not a hypothetical, which is how it was found. The first closing events after arming routinely have
@@ -10901,7 +10901,7 @@ const fn monitor_hit_is_recordable(spec: MonitorTraceSpec, span: MonitorSpan) ->
     }
 }
 
-/// The `blocked_for` / `waited_for` detail a closed bracket adds to its snapshot, and the honest note an
+/// The `blocked_for` / `waited_for` detail a closed pair adds to its snapshot, and the honest note an
 /// unmeasurable or unpaired one adds instead (DUMP-7, ADR-0035).
 ///
 /// **Every wording here says who measured it.** The figure is this server's own, taken between two events
@@ -10938,7 +10938,7 @@ fn monitor_duration_detail(spec: MonitorTraceSpec, span: MonitorSpan) -> (String
         ),
         MonitorSpan::Closed(None) => (
             label,
-            "<not measured — no matching start was seen, so this bracket opened before the stop point did, \
+            "<not measured — no matching start was seen, so this pair opened before the stop point did, \
              its opening kind is not armed, or the pending entry was evicted>"
                 .to_string(),
         ),
@@ -11787,7 +11787,7 @@ async fn record_one_traced_event(
     if !wrong_method {
         record_stop_point_hit(session, req_id);
     }
-    // DUMP-7: the bracket is opened or closed BEFORE the recording decision and regardless of it, because
+    // DUMP-7: the pair is opened or closed BEFORE the recording decision and regardless of it, because
     // the timestamp is what makes the *next* event measurable — skipping the bookkeeping for a hit we are
     // not going to record would silently break the duration on the hit we would have.
     //

@@ -1426,9 +1426,9 @@ pub struct SetMonitorStopArgs {
     /// They are two pairs, not four independent kinds:
     ///
     /// - `blocked` — a thread began waiting for a lock another thread owns (`MONITOR_CONTENDED_ENTER`).
-    /// - `acquired` — that thread got the lock (`MONITOR_CONTENDED_ENTERED`). Closes the bracket.
+    /// - `acquired` — that thread got the lock (`MONITOR_CONTENDED_ENTERED`). Closes the pair.
     /// - `wait` — a thread is entering `Object.wait()`, which RELEASES the lock (`MONITOR_WAIT`).
-    /// - `waited` — its `wait()` returned, notified or timed out (`MONITOR_WAITED`). Closes the bracket.
+    /// - `waited` — its `wait()` returned, notified or timed out (`MONITOR_WAITED`). Closes the pair.
     ///
     /// **A duration needs both halves of a pair**, because no monitor event carries one: it is measured on
     /// this side, from the opening event to the closing one. One half alone is a legitimate and cheaper
@@ -1477,7 +1477,7 @@ pub struct SetMonitorStopArgs {
     /// or `min_duration_ms`.
     #[serde(default)]
     pub instance_id: Option<String>,
-    /// Only record a bracket whose measured duration is at least this many milliseconds — the way to ask
+    /// Only record a completed pair whose measured duration is at least this many milliseconds — the way to ask
     /// "show me the blocks that actually hurt" on a lock that is contended thousands of times a second.
     ///
     /// **This filters what you READ, not what crosses the wire, and the difference is not pedantry.**
@@ -1492,7 +1492,7 @@ pub struct SetMonitorStopArgs {
     /// counts every hit, so `Hits: 900` with no snapshots means "contended constantly, never for long" —
     /// a different finding from `Hits: 0`.
     ///
-    /// **A bracket whose duration could not be measured is dropped while this is set**, rather than reported
+    /// **A pair whose duration could not be measured is dropped while this is set**, rather than reported
     /// with the figure missing. The routine cause is the first events after arming: those threads were
     /// already blocked, so their start was never seen, and reporting them would put a 60 ms lock in a reply
     /// that asked for 200 ms. With no threshold they are kept, and their detail says why there is no number.
@@ -1504,7 +1504,7 @@ pub struct SetMonitorStopArgs {
     ///
     /// Applied per JDWP request, and each armed kind is its own request — so with the default pair,
     /// `hit_count: 5` means the 5th `blocked` AND the 5th `acquired`, which are not two halves of the same
-    /// bracket. Combined with `min_duration_ms` it yields nothing at all, and is refused rather than
+    /// pair. Combined with `min_duration_ms` it yields nothing at all, and is refused rather than
     /// silently producing an armed stop point that can never record.
     #[serde(default)]
     pub hit_count: Option<i32>,

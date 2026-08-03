@@ -45,11 +45,11 @@ It has to say so for two reasons that a bare number hides. It includes this serv
 multi-second block a wedged server is asked about and a material fraction of a 5 ms one. And it requires
 **both halves armed** — one half can only report that the event happened.
 
-The two brackets are named apart (`blocked_for`, `waited_for`) rather than sharing one `elapsed`. Blocking is
+The two pairs are named apart (`blocked_for`, `waited_for`) rather than sharing one `elapsed`. Blocking is
 involuntary and a long one is a fault; `Object.wait()` is voluntary and a long one is often a healthy idle
 worker. One label would flatten the distinction the reply exists to draw.
 
-### The bracket is keyed on (thread, monitor, **bracket**)
+### The pair is keyed on (thread, monitor, **which pair**)
 
 `Object.wait()` releases its monitor and re-acquires it on wake, and that re-acquisition can itself be
 contended — so one thread can legitimately have a `Blocked`→`Acquired` and a `Wait`→`Waited` measurement
@@ -68,10 +68,10 @@ Two consequences of it are stated at arming time rather than left to be discover
   compare, so recording it would fill the buffer with the noise the threshold was set to remove — and spend
   the budget doing it. At the default 200 a contended lock would exhaust its budget on "started blocking"
   lines before one long block was reported.
-- **A bracket whose duration could not be measured is dropped.** This started out the other way round, on the
+- **A pair whose duration could not be measured is dropped.** This started out the other way round, on the
   reasoning that "the lock was acquired, duration unavailable" beats a silence. That is right with no
   threshold and wrong with one: a caller who asked for blocks over 200 ms has said what they want, and an
-  unmeasurable bracket may have lasted 1 ms.
+  unmeasurable pair may have lasted 1 ms.
 
 `Hits` is counted **before** the threshold, which is what keeps the resulting silence readable: `Hits: 900`
 beside no snapshots means "contended constantly, never for that long", and `Hits: 0` means nothing contended
@@ -152,7 +152,7 @@ re-derives the pairing from the session rather than trusting the record's own fl
 partner is exactly what makes that flag wrong.
 
 **`panic` clears the pairing state as well as the requests**, and so does a re-arm. Left behind, a stale start
-would be handed to whatever is armed on that bracket next and reported as a duration reaching back before that
+would be handed to whatever is armed on that pair next and reported as a duration reaching back before that
 stop point existed — a number wrong by minutes rather than by milliseconds.
 
 **Two stop-point tallies were under-reporting before this, and now are not.** `debug.list_sessions` and
@@ -163,7 +163,7 @@ see the kind most able to freeze a shared JVM. Fixed for both kinds rather than 
 
 ## What JDK 11 caught, and the lesson
 
-The unmeasurable-bracket decision above was found by running the suite on JDK 11, where it failed
+The unmeasurable-pair decision above was found by running the suite on JDK 11, where it failed
 **deterministically** while passing on 17, 21 and 25. The cause is not a JDK difference at all: the first
 closing events after arming routinely have no matching start, because those threads were *already* blocked
 when the request went in. Whether the first pair through is the fast lock or the slow one is timing, and the

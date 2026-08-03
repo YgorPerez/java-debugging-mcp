@@ -13485,14 +13485,21 @@ fn a_paired_monitor_snapshot_carries_a_debugger_measured_duration() {
         &["mon_blocked_", "mon_acquired_", "blocked_for: measured across both events, BY THIS SERVER"],
     );
 
+    // Polled on the MEASURED wording, not on `blocked_for=`, and the difference is a real race rather than
+    // pedantry: with no threshold set an *unmeasurable* pair is kept (its start predates the arming, because
+    // those threads were already blocked), and it carries a `blocked_for=` too. Waiting on the weaker needle
+    // returned as soon as the first such snapshot landed and then asserted a figure that had not arrived —
+    // which flaked on JDK 11 under full-suite contention and passed everywhere else. `wait_for_traces`'
+    // contract is that the needle must be something only the expected record has.
     let traces = server
-        .wait_for_traces("blocked_for=", EVENT_TIMEOUT)
-        .expect("no snapshot carried a blocked_for at all");
-    assert_contains_all(
-        "the closing snapshot admits the duration is the debugger's own",
-        &traces,
-        &["measured by the DEBUGGER across both events"],
-    );
+        .wait_for_traces("measured by the DEBUGGER across both events", EVENT_TIMEOUT)
+        .unwrap_or_else(|| {
+            panic!(
+                "no snapshot carried a debugger-measured duration. A `blocked_for=` alone is not enough — an \
+                 unmeasurable pair has one too.\n  traces: {}",
+                server.call("debug.get_traces", serde_json::json!({}))
+            )
+        });
     // The opening half says where it started rather than printing a zero, which would read as "it was not
     // blocked at all" — the opposite of the finding.
     assert_contains_all(

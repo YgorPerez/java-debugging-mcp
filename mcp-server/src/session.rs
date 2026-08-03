@@ -492,15 +492,15 @@ impl DebugSession {
         ThrowKind::First
     }
 
-    /// Record that the **opening** half of a monitor bracket has arrived, so the closing half can measure
+    /// Record that the **opening** half of a monitor pair has arrived, so the closing half can measure
     /// the duration (DUMP-7, ADR-0035). Returns the eviction note when the map was full.
     ///
     /// An opening half arriving twice for the same key **overwrites** rather than being ignored. That is
     /// the honest reading: JDWP delivered a second "started blocking" without a matching "acquired", so
-    /// either the first bracket's close was never armed or the event was lost, and measuring the newer
-    /// bracket is right where measuring from a stale start would report a duration that includes work the
+    /// either the first pair's close was never armed or the event was lost, and measuring the newer
+    /// pair is right where measuring from a stale start would report a duration that includes work the
     /// thread was not blocked for.
-    pub fn open_monitor_bracket(&mut self, key: MonitorPairKey, at: std::time::Instant) {
+    pub fn open_monitor_pair(&mut self, key: MonitorPairKey, at: std::time::Instant) {
         // Evict the OLDEST rather than refusing the new one — see `MAX_MONITOR_PENDING` for why this bound
         // behaves opposite to every other one here.
         if self.monitor_pending.len() >= MAX_MONITOR_PENDING && !self.monitor_pending.contains_key(&key) {
@@ -512,14 +512,14 @@ impl DebugSession {
         self.monitor_pending.insert(key, at);
     }
 
-    /// Close a monitor bracket, returning how long it was open — the **debugger-measured** duration, since
+    /// Close a monitor pair, returning how long it was open — the **debugger-measured** duration, since
     /// no monitor event carries one.
     ///
     /// `None` when this closing half has no matching opening half, which is a normal state rather than an
-    /// error and has three innocent causes: the opening kind was never armed, the bracket opened before
+    /// error and has three innocent causes: the opening kind was never armed, the pair opened before
     /// this stop point was, or the entry was evicted. A reply that got `None` must say the duration is
     /// unavailable rather than print a zero, which would read as "it was not blocked at all".
-    pub fn close_monitor_bracket(
+    pub fn close_monitor_pair(
         &mut self,
         key: &MonitorPairKey,
         now: std::time::Instant,
@@ -970,9 +970,9 @@ pub struct MethodExitRequestInfo {
 
 /// Which of the two monitor pairs a measurement belongs to (DUMP-7, #96).
 ///
-/// Two rather than four, because the four event kinds are two *brackets*: a contended entry has a
+/// Two rather than four, because the four event kinds are two *pairs*: a contended entry has a
 /// beginning (`Blocked`) and an end (`Acquired`), and an `Object.wait()` has a beginning (`Wait`) and an
-/// end (`Waited`). A duration is a property of the bracket, not of either event in it.
+/// end (`Waited`). A duration is a property of the pair, not of either event in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MonitorPair {
     /// `MONITOR_CONTENDED_ENTER` → `MONITOR_CONTENDED_ENTERED`: how long a thread was **blocked** on a
@@ -984,7 +984,7 @@ pub enum MonitorPair {
 }
 
 impl MonitorPair {
-    /// Which pair an event kind belongs to, and whether it is the bracket's opening half.
+    /// Which pair an event kind belongs to, and whether it is the pair's opening half.
     #[must_use]
     pub const fn of(kind: jdwp_client::MonitorKind) -> (Self, bool) {
         match kind {
@@ -995,7 +995,7 @@ impl MonitorPair {
         }
     }
 
-    /// How a reply names the duration this pair measures. Not "elapsed" for both: what the two brackets
+    /// How a reply names the duration this pair measures. Not "elapsed" for both: what the two pairs
     /// measure are different enough facts that one label for them would flatten the distinction the
     /// variants exist to keep.
     #[must_use]
@@ -1007,10 +1007,10 @@ impl MonitorPair {
     }
 }
 
-/// What identifies one outstanding monitor measurement: which thread, which monitor, which bracket.
+/// What identifies one outstanding monitor measurement: which thread, which monitor, which pair.
 ///
-/// See [`DebugSession::monitor_pending`] for why the bracket is in the key rather than left out as
-/// redundant — a `wait` re-acquires its monitor on wake, so one thread can have both brackets open on one
+/// See [`DebugSession::monitor_pending`] for why the pair is in the key rather than left out as
+/// redundant — a `wait` re-acquires its monitor on wake, so one thread can have both pairs open on one
 /// object at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MonitorPairKey {
@@ -1069,13 +1069,13 @@ pub struct MonitorRequestInfo {
     /// dotted NAME as well, because re-arming re-resolves by name (BP-4): a reference type id is only
     /// valid while that type stays loaded.
     pub monitor_class: Option<String>,
-    /// Only report a resolved bracket whose measured duration is at least this many milliseconds
+    /// Only report a resolved pair whose measured duration is at least this many milliseconds
     /// (DUMP-7's `min_duration_ms`).
     ///
     /// **A filter on what you READ, not on what crosses the wire**, and the distinction is not pedantry:
     /// JDWP has no duration modifier, so the event has already been generated, has already cost the
     /// debuggee its notification, and has already arrived here before this can be applied. It reduces
-    /// noise in the trace buffer and nothing else. `None` records every bracket.
+    /// noise in the trace buffer and nothing else. `None` records every pair.
     pub min_duration_ms: Option<u64>,
     /// Non-suspending trace mode — the default for this kind, and the only safe shape on a shared JVM.
     pub trace: bool,
