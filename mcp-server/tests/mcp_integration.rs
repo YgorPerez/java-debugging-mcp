@@ -3626,6 +3626,40 @@ fn subscript_writes_and_map_entry_filters() {
     assert_contains_all("Map value written via put()", &set, &["counts[\"a\"] = 9", "put()"]);
     assert_contains_all("and it stuck, boxed", &server.evaluate("order.counts[\"a\"]"), &["(int) 9"]);
 
+    // --- SETF-3 (#119): a bracket inside the KEY is content, and both tools have to agree it is ---
+    //
+    // These are the targets the two scanners disagreed about. `debug.evaluate` read them all, because
+    // expression resolution goes through the forward scanners EVAL-8 (#82) made quote-aware;
+    // `debug.set_value` walked backwards counting brackets with no idea a key could contain one, so the
+    // `]` inside the key inflated the depth and the real opening bracket never brought it back to zero.
+    // The refusal — `Could not find the final subscript` — named the caller's syntax for a limitation in
+    // our own parser, which is the failure mode this repo treats as worse than an error.
+    //
+    // Asserted as a PAIR each time: what `evaluate` resolves, `set_value` writes. That is the property
+    // that drifted, so it is the property under test rather than either tool alone.
+    for (target, before, after) in [
+        ("bracketKeyed[\"]\"]", "(int) 1", "11"),
+        ("bracketKeyed[\"[\"]", "(int) 2", "12"),
+        ("bracketKeyed[\"a[b]c\"]", "(int) 3", "13"),
+        // EVAL-8 made `char` literals legal map keys, so this target became writable-in-principle in the
+        // same change that left this scanner behind.
+        ("charKeyed[']']", "(int) 4", "14"),
+        ("charKeyed['[']", "(int) 5", "15"),
+    ] {
+        assert_contains_all(&format!("evaluate resolves {target}"), &server.evaluate(target), &[before]);
+        let set = write(&mut server, target, after);
+        assert!(
+            !set.contains("Could not find the final subscript"),
+            "set_value must accept the target evaluate just read, {target}:\n{set}"
+        );
+        assert_contains_all(&format!("{target} written via put()"), &set, &["put()"]);
+        assert_contains_all(
+            &format!("and {target} stuck"),
+            &server.evaluate(target),
+            &[&format!("(int) {after}")],
+        );
+    }
+
     // --- The refusals ---
     assert_contains_all(
         "out of bounds",

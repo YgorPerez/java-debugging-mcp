@@ -24,6 +24,24 @@ import java.util.Set;
 
 public class DeepProbe {
 
+    // SETF-3 (#119): keys made of the very characters the target parser splits on. Statics rather than
+    // fields of `Order`, so nothing here changes what `order` expands to or what the frame's locals are —
+    // several tests assert against both. A bare name in a static method of this class resolves to a static
+    // of the declaring class (BareNameProbe covers that rule), so `bracketKeyed["]"]` is a legal target.
+    //
+    // `charKeyed` is keyed by Character because EVAL-8 (#82) added Character's specified hash to the
+    // local-hashing path, which made `counts[']']` a target a caller can reasonably write.
+    static final Map<String, Integer> bracketKeyed = new LinkedHashMap<>();
+    static final Map<Character, Integer> charKeyed = new LinkedHashMap<>();
+
+    static {
+        bracketKeyed.put("]", 1);
+        bracketKeyed.put("[", 2);
+        bracketKeyed.put("a[b]c", 3);
+        charKeyed.put(']', 4);
+        charKeyed.put('[', 5);
+    }
+
     static class Record {
         // Inherited by Order: field collection must walk superclasses, not just the concrete type.
         int recordId = 7;

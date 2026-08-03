@@ -14651,28 +14651,54 @@ fn render_arglit(a: &ArgLit) -> String {
 
 /// Byte offset of the `[` that opens the *final* top-level subscript of `target`, if it ends in one.
 ///
-/// Scanned from the end at bracket depth 0, so a nested subscript inside a predicate
-/// (`orders[?tags[0] == "x"]`) can't be mistaken for the outer one. `parse_expr` has already validated
-/// that the brackets balance.
+/// **Quote-aware, and it is the sixth scanner to become so** (SETF-3, #119). It used to walk backwards
+/// counting `]` against `[` with no idea that a bracket can be *content*: `byId["]"]` inflated the depth
+/// at the `]` inside the key, the real opening bracket never brought it back to zero, and `set_value`
+/// refused with `Could not find the final subscript` — a target `debug.evaluate` reads without complaint,
+/// because expression resolution goes through the forward scanners EVAL-8 (#82) converted. The refusal
+/// named the *subscript* as the thing it could not find, so it read as "this syntax is unsupported" and
+/// sent the caller to rewrite a target that was correct.
+///
+/// So it scans **forwards** now, sharing [`Quoted`] with the other five rather than teaching a reverse
+/// walk about escapes: remember every `[` that opens at depth 0, and answer with the last group — but
+/// only if that group's `]` is where the target ends. That last condition is what keeps a subscript
+/// buried in an argument list (`a.b(x[0])`) from being mistaken for a trailing one, which is the job the
+/// reverse scan's `ends_with(']')` guard used to do.
+///
+/// Nested subscripts inside a predicate (`orders[?tags[0] == "x"]`) are still invisible here: they never
+/// return to depth 0. `parse_expr` has already validated that the brackets balance.
 fn trailing_subscript_start(target: &str) -> Option<usize> {
     let t = target.trim_end();
-    if !t.ends_with(']') {
-        return None;
-    }
     let mut depth = 0i32;
-    for (i, c) in t.char_indices().rev() {
+    let mut q = Quoted::default();
+    let mut open_at: Option<usize> = None;
+    let mut last_group: Option<(usize, usize)> = None;
+    for (i, c) in t.char_indices() {
+        let syntax = !q.inside();
+        q.step(c);
+        if !syntax {
+            continue;
+        }
         match c {
-            ']' => depth += 1,
             '[' => {
-                depth -= 1;
                 if depth == 0 {
-                    return Some(i);
+                    open_at = Some(i);
+                }
+                depth += 1;
+            }
+            ']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+                if depth == 0 {
+                    last_group = open_at.take().map(|s| (s, i + c.len_utf8()));
                 }
             }
             _ => {}
         }
     }
-    None
+    last_group.filter(|&(_, end)| end == t.len()).map(|(start, _)| start)
 }
 
 /// Write one element of an array, a `List`, or a `Map` — the `xs[0] = v` case of `set_value`.
@@ -21718,6 +21744,66 @@ mod tests {
         assert_eq!(shape(&parse_bool_tree("name == \"a || b\"")), "name == \"a || b\"");
         // The `&&` is inside a subscript predicate, so the outer split leaves it alone.
         assert_eq!(shape(&parse_bool_tree("tags[?x && y] == 1")), "tags[?x && y] == 1");
+    }
+
+    /// SETF-3 (#119): `set_value` must accept exactly the subscript targets `debug.evaluate` resolves.
+    ///
+    /// The two tools reach the same syntax through different scanners — `parse_expr` forwards for the
+    /// expression, `trailing_subscript_start` backwards for the write target — and the pair is asserted
+    /// TOGETHER here because that is the thing that drifted apart. A target only one of them accepts is
+    /// the bug: `byId["]"]` parsed and refused, and the refusal blamed the caller's syntax.
+    ///
+    /// Every case below is a bracket that is CONTENT rather than syntax. `counts[']']` is here because
+    /// EVAL-8 (#82) made `char` literals legal map keys, so it is a target a caller can now reasonably
+    /// write, that `evaluate` reads, and that `set_value` used to reject.
+    #[test]
+    fn set_value_and_evaluate_agree_on_every_subscript_target() {
+        // (target, byte offset of the `[` that opens the final subscript)
+        let agreed = [
+            ("byId[\"]\"]", 4),
+            ("byId[\"[\"]", 4),
+            ("byId[\"a[b]c\"]", 4),
+            ("counts[']']", 6),
+            ("counts['[']", 6),
+            // The escape cases: the literal closes where Java says it does, not at the first quote.
+            ("byId[\"a\\\"]b\"]", 4),
+            ("counts['\\'']", 6),
+            // Nothing quoted at all — the shapes that already worked, byte-identically.
+            ("xs[0]", 2),
+            ("grid[0][1]", 7),
+            ("a.b()[0]", 5),
+            ("order.numbers[1]", 13),
+            // A nested subscript inside a predicate never returns to depth 0, so the outer one wins.
+            ("orders[?tags[0] == \"x\"]", 6),
+        ];
+        for (target, open) in agreed {
+            let segs = parse_expr(target).unwrap_or_else(|e| panic!("evaluate rejected {target}: {e}"));
+            assert!(
+                segs.last().is_some_and(|s| !s.subs.is_empty()),
+                "{target} should parse as a subscripted path"
+            );
+            assert_eq!(
+                trailing_subscript_start(target),
+                Some(open),
+                "set_value must find the final subscript in {target}, which evaluate parses"
+            );
+            // And the container it slices off is a prefix `resolve_expression` can be handed.
+            let container = &target[..open];
+            assert!(
+                parse_expr(container).is_ok(),
+                "the container expression {container} carved out of {target} must itself parse"
+            );
+        }
+
+        // The other direction: a `[…]` that does not END the target is not a trailing subscript, so an
+        // argument list carrying one is left alone rather than treated as the write site.
+        for not_trailing in ["a.b(x[0])", "plain", "f(\"]\")", "a.b(x[0]).c"] {
+            assert_eq!(
+                trailing_subscript_start(not_trailing),
+                None,
+                "{not_trailing} does not end in a subscript"
+            );
+        }
     }
 
     // A plain comparison is a single leaf — the common case is unchanged by EVAL-4.
