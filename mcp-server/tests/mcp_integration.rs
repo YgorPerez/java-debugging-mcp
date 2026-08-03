@@ -12430,3 +12430,233 @@ fn two_traced_stop_points_on_one_line_both_record() {
 
     server.panic_reset();
 }
+
+// ---------------------------------------------------------------------------------------------
+// EVAL-8 (#82) — float, double and char literals
+//
+// The literals exist so that a stop point can be armed on the ONE transaction whose amount disagrees,
+// across thousands of clean ones. So every test here asserts against `MoneyProbe`'s own stdout rather
+// than against the debugger's reply: a condition that silently never matches and a condition that is
+// never evaluated both leave every tool reporting success, and the probe prints `offer` before the
+// conditioned line and `charged` after it precisely so that the two are distinguishable.
+// ---------------------------------------------------------------------------------------------
+
+/// How many payments `MoneyProbe` cycles through, and which one of them is the odd one out.
+const MONEY_CYCLE: i64 = 4;
+const MONEY_ODD_INDEX: i64 = 2;
+
+/// The `(int) n` a `debug.evaluate` reply carries, or `None` if it carries something else.
+fn evaluated_int(reply: &str) -> Option<i64> {
+    let rest = reply.split("(int) ").nth(1)?;
+    let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '-')).unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// Arm one suspending `condition` on `MoneyProbe`'s conditioned line and prove it fired on the odd
+/// payment and **only** on it.
+///
+/// Shared by the three literal kinds because the odd payment is odd on all three of its fields at once,
+/// so a condition on any one of them must select the same hit — and disagreement between them would mean
+/// one literal kind is not being compared at all. Three `#[test]`s over one helper rather than one test
+/// looping three times: `shard-plan.py` cannot split a loop, and TEST-35 measured what that costs.
+fn a_money_condition_fires_only_on_the_odd_payment(test: &str, condition: &str) {
+    let Some(jdk) = jdk_or_skip(test) else { return };
+    let mut probe = Probe::launch(&jdk, "MoneyProbe").expect("launch MoneyProbe");
+    // The watchdog off: this test deliberately leaves the VM suspended at the matching hit, and a rescue
+    // would resume it under the assertion that it is stopped.
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    probe.attach(&mut server);
+
+    let line = probe_line(&probe_source("MoneyProbe"), "// BP1");
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "MoneyProbe", "line": line, "condition": condition}),
+    );
+    assert_contains_all(&format!("the condition `{condition}` armed"), &armed, &["bp_"]);
+
+    let hit = server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).unwrap_or_else(|| {
+        panic!(
+            "`{condition}` never fired. The probe cycles all four payments every ~600ms, so the value it \
+             names certainly came round — a condition that parses and then never matches is exactly what \
+             this test exists to catch.\n  probe tail: {:?}",
+            probe.output().iter().rev().take(10).collect::<Vec<_>>(),
+        )
+    });
+    assert_contains_all("the matching hit suspended the VM", &hit, &["[suspended] true"]);
+
+    // Which hit it was, read from the frame the condition matched on.
+    let tick = evaluated_int(&server.evaluate("i")).unwrap_or_else(|| {
+        panic!("could not read the tick off the suspended frame: {}", server.evaluate("i"))
+    });
+    assert_eq!(
+        tick % MONEY_CYCLE,
+        MONEY_ODD_INDEX,
+        "`{condition}` stopped on tick {tick}, which is payment {} of the cycle rather than the odd one \
+         ({MONEY_ODD_INDEX}). A comparison that is wrong about the literal's width or type does not fail \
+         to fire — it fires on the wrong payment.",
+        tick % MONEY_CYCLE,
+    );
+    assert_contains_all(
+        "the amount the condition matched reads back exactly",
+        &server.evaluate("p.vlPagamento"),
+        &["1.005"],
+    );
+
+    // --- and now the probe's own account of it, which is the part no reply can fake ---
+    let offer = format!("offer 1.005 taxa 0.1 moeda U tick {tick}");
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l == offer).unwrap_or_else(|| {
+        panic!(
+            "the probe never printed `{offer}` — the debugger says it stopped on tick {tick} but the probe \
+         did not reach that payment.\n  probe tail: {:?}",
+            probe.output().iter().rev().take(10).collect::<Vec<_>>(),
+        )
+    });
+    let out = probe.output();
+    assert!(
+        !out.iter().any(|l| l == &format!("charged 1.005 tick {tick}")),
+        "the probe printed the line AFTER the conditioned one, so it was never suspended on the hit the \
+         reply claims: `{condition}`\n  probe tail: {:?}",
+        out.iter().rev().take(10).collect::<Vec<_>>(),
+    );
+    // The non-matching hits were released rather than frozen — otherwise "fires only on the match" would
+    // be satisfied by a condition that froze the probe on its very first hit.
+    assert!(
+        out.iter().any(|l| l.starts_with("charged 10.5 "))
+            && out.iter().any(|l| l.starts_with("charged 99.99 ")),
+        "the payments the condition does NOT match must have run to completion. Neither `charged 10.5` \
+         nor `charged 99.99` is in the output, so this stopped on the first hit whatever the condition \
+         said.\n  probe tail: {:?}",
+        out.iter().rev().take(12).collect::<Vec<_>>(),
+    );
+
+    server.panic_reset();
+}
+
+/// The issue's own case: `1.005` is not representable, so this fires only if the debugger's parser rounds
+/// the decimal string to the same f64 `javac` did.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_double_condition_fires_only_on_the_payment_that_matches() {
+    a_money_condition_fires_only_on_the_odd_payment(
+        "a_double_condition_fires_only_on_the_payment_that_matches",
+        "p.vlPagamento == 1.005",
+    );
+}
+
+/// The width test. `0.1f` widens to 0.100000001490116…, `0.1` to 0.100000000000000005…, and the `float`
+/// field holds the former — so a literal that skipped f32 on the way in compares unequal to every value
+/// the field can hold and this condition never fires.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_float_condition_is_exact_against_a_float_field() {
+    a_money_condition_fires_only_on_the_odd_payment(
+        "a_float_condition_is_exact_against_a_float_field",
+        "p.taxa == 0.1f",
+    );
+}
+
+/// A char literal reaches the comparison as a UTF-16 code unit and compares numerically, as Java's own
+/// `==` on a `char` does.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_char_condition_fires_on_the_char_that_matches() {
+    a_money_condition_fires_only_on_the_odd_payment(
+        "a_char_condition_fires_on_the_char_that_matches",
+        "p.moeda == 'U'",
+    );
+}
+
+/// `[?vlPagamento > 99.99]` — and its `>=` twin, because the **pair** is what proves the threshold is
+/// compared strictly rather than after a rounding step. One payment is exactly on it, and a filter built
+/// only from values far from its threshold cannot tell the two apart.
+///
+/// The reply states `N of 4 matched`, which is the assertion: it is the filter's own count of what it
+/// kept, not a substring of the expression it echoes back.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_double_filter_excludes_the_element_exactly_on_the_threshold() {
+    let Some(jdk) = jdk_or_skip("a_double_filter_excludes_the_element_exactly_on_the_threshold") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "MoneyProbe").expect("launch MoneyProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    probe.attach(&mut server);
+
+    // The stop point is setup rather than the thing under test: it is what gives the filter a suspended
+    // frame to resolve `MoneyProbe.pagtos` against.
+    let line = probe_line(&probe_source("MoneyProbe"), "// BP1");
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "MoneyProbe", "line": line}));
+    server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).expect("the setup stop never fired");
+
+    let strict = server.evaluate("MoneyProbe.pagtos[?vlPagamento > 99.99]");
+    assert!(
+        strict.contains("1 of 4 matched") && strict.contains("Pagto[1050.75"),
+        "`> 99.99` must select exactly the one payment above it, and name it:\n{strict}"
+    );
+
+    let inclusive = server.evaluate("MoneyProbe.pagtos[?vlPagamento >= 99.99]");
+    assert!(
+        inclusive.contains("2 of 4 matched") && inclusive.contains("Pagto[99.99"),
+        "`>= 99.99` must additionally select the payment that IS 99.99. If this selects one, the \
+         comparison is not strict on the boundary and a threshold filter is silently wrong; if it selects \
+         four, it is not comparing at all.\n  >  : {strict}\n  >= : {inclusive}"
+    );
+
+    // The other two literal kinds in a predicate, so the filter path is not only exercised for doubles.
+    let by_taxa = server.evaluate("MoneyProbe.pagtos[?taxa > 0.05f]");
+    assert!(
+        by_taxa.contains("1 of 4 matched") && by_taxa.contains("Pagto[1.005"),
+        "a float literal in a predicate must select the one payment whose taxa is higher:\n{by_taxa}"
+    );
+    let by_moeda = server.evaluate("MoneyProbe.pagtos[?moeda == 'U']");
+    assert!(
+        by_moeda.contains("1 of 4 matched") && by_moeda.contains("Pagto[1.005"),
+        "a char literal in a predicate must select the one payment in the other currency:\n{by_moeda}"
+    );
+
+    server.panic_reset();
+}
+
+/// `f(float)` and `f(double)` are different candidates to the JVM, and an implementation that widened
+/// every floating literal to `double` would resolve both to the same one. The probe's return values name
+/// which method actually ran, so the debugger cannot be the only witness.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn float_and_double_literals_reach_the_overload_they_name() {
+    let Some(jdk) = jdk_or_skip("float_and_double_literals_reach_the_overload_they_name") else { return };
+    let mut probe = Probe::launch(&jdk, "MoneyProbe").expect("launch MoneyProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    probe.attach(&mut server);
+
+    // An invoke needs a thread suspended by an event.
+    let line = probe_line(&probe_source("MoneyProbe"), "// BP1");
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "MoneyProbe", "line": line}));
+    server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).expect("the setup stop never fired");
+
+    let as_float = server.evaluate("MoneyProbe.cobrar(2.0f)");
+    assert!(
+        as_float.contains("float:2.0"),
+        "`2.0f` must select cobrar(float) — the probe names the method that ran:\n{as_float}"
+    );
+    let as_double = server.evaluate("MoneyProbe.cobrar(1.5)");
+    assert!(
+        as_double.contains("double:1.5"),
+        "`1.5` must select cobrar(double), the other member of the same pair:\n{as_double}"
+    );
+    // A double parameter reached with a literal, and a char parameter, which need the D and C tags to
+    // survive the coercion path rather than only the comparison one.
+    assert!(server.evaluate("MoneyProbe.taxar(1.5)").contains("taxa:1.5"), "a double argument");
+    assert!(server.evaluate("MoneyProbe.marcar('x')").contains("char:x"), "a char argument");
+
+    // And the write path: a double literal into a double static, echoed by reading it back.
+    let wrote =
+        server.call("debug.set_value", serde_json::json!({"target": "MoneyProbe.cobrado", "value": "2.5"}));
+    assert_contains_all("a double literal writes to a double static", &wrote, &["✅"]);
+    assert!(
+        server.evaluate("MoneyProbe.cobrado").contains("2.5"),
+        "the double written must read back: {}",
+        server.evaluate("MoneyProbe.cobrado")
+    );
+
+    server.panic_reset();
+}

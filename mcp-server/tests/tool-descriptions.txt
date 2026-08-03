@@ -717,16 +717,16 @@ work.
 Write a value to a local variable, a static field (e.g. ConfigDefaultUtils.dsInfra — flip tenant/infra on a
 live JVM without a restart), an instance field (this.status, reserva.total), or one element of an
 array/List/Map (numbers[0], counts["key"] — via ArrayReference.SetValues, List.set or Map.put, reporting the
-value it displaced). Value is either a literal (int, long like 123L, true/false, null, or "string") coerced to
-the target's declared type, OR another live expression whose value is copied by reference (this.cfg =
-other.cfg, reserva.cliente = clienteValido) — a type-incompatible source is refused, naming both types.
-Locals, instance fields and elements need a suspended thread; statics don't. THE CHEAP WAY TO GET ONE is
-debug.suspend_thread with a thread_id, which freezes a single thread and leaves the rest of the JVM serving —
-writing a local that way is measured working, and you need neither debug.pause nor a breakpoint for it. Pass
-frame_index if the thread is parked in a native frame (a sleeping or waiting worker is), since frame 0 then
-has no variable table. ONE EXCEPTION: writing an element of a List or a Map calls set()/put() in the debuggee,
-and an invoke needs a thread suspended BY AN EVENT — an array element does not, and neither does anything else
-here.
+value it displaced). Value is either a literal (int, long like 123L, a double like 1.5, a float like 2.0f, a
+char like 'a', true/false, null, or "string") coerced to the target's declared type, OR another live
+expression whose value is copied by reference (this.cfg = other.cfg, reserva.cliente = clienteValido) — a
+type-incompatible source is refused, naming both types. Locals, instance fields and elements need a suspended
+thread; statics don't. THE CHEAP WAY TO GET ONE is debug.suspend_thread with a thread_id, which freezes a
+single thread and leaves the rest of the JVM serving — writing a local that way is measured working, and you
+need neither debug.pause nor a breakpoint for it. Pass frame_index if the thread is parked in a native frame
+(a sleeping or waiting worker is), since frame 0 then has no variable table. ONE EXCEPTION: writing an element
+of a List or a Map calls set()/put() in the debuggee, and an invoke needs a thread suspended BY AN EVENT — an
+array element does not, and neither does anything else here.
 
 ## debug.source
 What file a loaded class was COMPILED FROM, and — when source roots are configured — the source lines around a

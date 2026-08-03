@@ -319,6 +319,22 @@ pub const fn value_long(v: i64) -> Value {
 pub const fn value_bool(v: bool) -> Value {
     Value { tag: 90, data: ValueData::Boolean(v) }
 }
+/// A `float` argument, tag `F`. Kept distinct from [`value_double`] because the JVM distinguishes them:
+/// `f(float)` and `f(double)` are different overloads, and the tag is what tells them apart.
+#[must_use]
+pub const fn value_float(v: f32) -> Value {
+    Value { tag: 70, data: ValueData::Float(v) }
+}
+#[must_use]
+pub const fn value_double(v: f64) -> Value {
+    Value { tag: 68, data: ValueData::Double(v) }
+}
+/// A `char` argument, tag `C`. The wire carries a UTF-16 code unit, which is what a Java `char` is —
+/// so a literal outside the BMP has no single-`char` spelling and is refused where it is parsed.
+#[must_use]
+pub const fn value_char(v: u16) -> Value {
+    Value { tag: 67, data: ValueData::Char(v) }
+}
 #[must_use]
 pub const fn value_null() -> Value {
     Value { tag: 76, data: ValueData::Object(0) }

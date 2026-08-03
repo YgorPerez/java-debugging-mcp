@@ -2406,7 +2406,7 @@ impl RequestHandler {
             jdwp_client::types::Value { tag: 86, data: jdwp_client::types::ValueData::Void }
         } else if raw.is_empty() {
             return Err(format!(
-                "{}() returns {} — a 'value' is required (int, 123L, true/false, null, or \"string\")",
+                "{}() returns {} — a 'value' is required (int, 123L, 1.5, 2.0f, 'a', true/false, null, or \"string\")",
                 method.name,
                 decode_signature(ret_sig)
             ));
@@ -5991,11 +5991,14 @@ async fn render_stack_frame(
 //   map.get("key").getName()
 // Field access uses ObjectReference.GetValues; method calls use ObjectReference.InvokeMethod,
 // resolving overloads by arity and walking the superclass chain for inherited members.
-// Supported argument literals: int, long (123L), boolean, null, and "string".
+// Supported argument literals: int, long (123L), float (2.0f), double (1.5), char ('a'), boolean, null,
+// and "string".
 // ===================================================================================
 
 use jdwp_client::events::EventKind;
-use jdwp_client::extra::{value_bool, value_int, value_long, value_null, value_object};
+use jdwp_client::extra::{
+    value_bool, value_char, value_double, value_float, value_int, value_long, value_null, value_object,
+};
 use jdwp_client::types::Location;
 
 /// A method-call argument (or the right-hand side of a breakpoint condition). Everything but
@@ -6005,6 +6008,15 @@ use jdwp_client::types::Location;
 enum ArgLit {
     Int(i32),
     Long(i64),
+    /// A `float` literal (`2.0f`), held as an **f32** rather than widened here. That is load-bearing for
+    /// comparison: a `float` field holding `0.1f` widens to `0.100000001490116…` on the f64 scale
+    /// everything is compared on, and `taxa == 0.1f` matches only if the literal took the same trip
+    /// through f32. Storing it as f64 would make an exact comparison against a `float` field fail for
+    /// most decimal values (EVAL-8, #82).
+    Float(f32),
+    Double(f64),
+    /// A `char` literal (`'a'`), held as the UTF-16 code unit a Java `char` is.
+    Char(u16),
     Bool(bool),
     Null,
     Str(String),
@@ -6039,7 +6051,43 @@ fn is_ident(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
-/// Split an expression into `.`-separated segments, ignoring dots inside () or "".
+/// Whether a left-to-right scan is currently inside a `"string"` or a `'c'` literal, so a character
+/// that belongs to a literal is never mistaken for syntax.
+///
+/// **The `'` half arrived with EVAL-8** (#82) and is not decoration: a char literal can carry the very
+/// characters these scanners split on. Before it, `foo(',', x)` split its argument list on the comma
+/// inside the literal, `c == '>'` could split on the `>` inside one, and `'"'` opened a string that
+/// never closed — each producing a parse error about the wrong thing entirely.
+///
+/// Escapes are honoured inside a literal so `'\''` and `'\\'` close where they should.
+#[derive(Default)]
+struct Quoted {
+    in_str: bool,
+    in_char: bool,
+    escaped: bool,
+}
+
+impl Quoted {
+    /// True while the scan is inside a literal. Called **before** [`Self::step`] consumes the character,
+    /// so an opening or closing quote reads as "not syntax" and stays with the literal it delimits.
+    const fn inside(&self) -> bool {
+        self.in_str || self.in_char
+    }
+
+    fn step(&mut self, c: char) {
+        if self.escaped {
+            self.escaped = false;
+            return;
+        }
+        match c {
+            '\\' if self.inside() => self.escaped = true,
+            '"' if !self.in_char => self.in_str = !self.in_str,
+            '\'' if !self.in_str => self.in_char = !self.in_char,
+            _ => {}
+        }
+    }
+}
+
 /// Split an expression on `.`, ignoring dots inside quotes, parentheses, or brackets. Brackets matter
 /// as much as parens: a filter predicate like `[?customer.name == "Ana"]` is full of dots that belong
 /// to the subscript, not to the outer chain.
@@ -6047,31 +6095,29 @@ fn split_segments(e: &str) -> Result<Vec<String>, String> {
     let mut segs = Vec::new();
     let mut cur = String::new();
     let mut depth = 0i32;
-    let mut in_str = false;
+    let mut q = Quoted::default();
     for c in e.chars() {
+        let syntax = !q.inside();
+        q.step(c);
         match c {
-            '"' => {
-                in_str = !in_str;
-                cur.push(c);
-            }
-            '(' | '[' if !in_str => {
+            '(' | '[' if syntax => {
                 depth += 1;
                 cur.push(c);
             }
-            ')' | ']' if !in_str => {
+            ')' | ']' if syntax => {
                 depth -= 1;
                 cur.push(c);
             }
             // A `..` range inside a subscript is at depth > 0, so it can't be mistaken for a chain
             // separator; only a top-level dot splits.
-            '.' if !in_str && depth == 0 => {
+            '.' if syntax && depth == 0 => {
                 segs.push(cur.trim().to_string());
                 cur.clear();
             }
             _ => cur.push(c),
         }
     }
-    if depth != 0 || in_str {
+    if depth != 0 || q.inside() {
         return Err("Unbalanced parentheses, brackets or quotes".to_string());
     }
     if !cur.trim().is_empty() {
@@ -6085,14 +6131,15 @@ fn split_subscripts(raw: &str) -> Result<(String, Vec<String>), String> {
     // The head ends at the first `[` that is outside quotes and outside parentheses — parens can
     // legitimately contain a bracket, as in `foo(bar["k"])`.
     let mut depth = 0i32;
-    let mut in_str = false;
+    let mut q = Quoted::default();
     let mut head_end = raw.len();
     for (i, c) in raw.char_indices() {
+        let syntax = !q.inside();
+        q.step(c);
         match c {
-            '"' => in_str = !in_str,
-            '(' if !in_str => depth += 1,
-            ')' if !in_str => depth -= 1,
-            '[' if !in_str && depth == 0 => {
+            '(' if syntax => depth += 1,
+            ')' if syntax => depth -= 1,
+            '[' if syntax && depth == 0 => {
                 head_end = i;
                 break;
             }
@@ -6107,13 +6154,14 @@ fn split_subscripts(raw: &str) -> Result<(String, Vec<String>), String> {
             return Err(format!("Unexpected text after a subscript: '{rest}'"));
         }
         let mut depth = 0i32;
-        let mut in_str = false;
+        let mut q = Quoted::default();
         let mut close = None;
         for (i, c) in rest.char_indices() {
+            let syntax = !q.inside();
+            q.step(c);
             match c {
-                '"' => in_str = !in_str,
-                '[' if !in_str => depth += 1,
-                ']' if !in_str => {
+                '[' if syntax => depth += 1,
+                ']' if syntax => {
                     depth -= 1;
                     if depth == 0 {
                         close = Some(i);
@@ -6160,6 +6208,110 @@ fn parse_subscript(inner: &str) -> Result<Subscript, String> {
     Ok(Subscript::Index(parse_lit(t)?))
 }
 
+/// Parse a Java floating-point literal, returning the value and whether the `f`/`F` suffix made it a
+/// `float` rather than a `double` (EVAL-8, #82).
+///
+/// **This does its own shape check instead of leaning on Rust's parser**, because Rust's accepts three
+/// families of token Java does not, and each would silently capture something that is not a number:
+/// `inf`, `infinity` and `NaN` — so a local variable named `inf` would stop resolving as an expression
+/// — and a bare `5`, which is an `int` literal here and must stay one. So a token with no `f`/`F`/`d`/`D`
+/// suffix is only floating-point when it carries a `.` or an exponent, and the body must be spelled in
+/// Java's own alphabet for these: digits, a dot, and a signed exponent.
+///
+/// `None` means "not a floating-point literal", which leaves the token to the expression path.
+fn parse_float_lit(t: &str) -> Option<(f64, bool)> {
+    let (body, is_float) = t.strip_suffix('f').or_else(|| t.strip_suffix('F')).map_or_else(
+        || (t.strip_suffix('d').or_else(|| t.strip_suffix('D')).unwrap_or(t), false),
+        |b| (b, true),
+    );
+    let suffixed = body.len() != t.len();
+    let exponent = body.contains('e') || body.contains('E');
+    if !suffixed && !body.contains('.') && !exponent {
+        return None;
+    }
+    if !body.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-')) {
+        return None;
+    }
+    if !body.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    body.parse::<f64>().ok().map(|v| (v, is_float))
+}
+
+/// The escapes a `char` literal may carry, named here so the error message can list exactly what is
+/// understood rather than saying "invalid".
+const CHAR_ESCAPES: &[(char, u16)] = &[
+    ('n', 10),
+    ('t', 9),
+    ('r', 13),
+    ('b', 8),
+    ('f', 12),
+    ('s', 32),
+    ('0', 0),
+    ('\\', 92),
+    ('\'', 39),
+    ('"', 34),
+];
+
+/// Parse the inside of a `char` literal — the part between the quotes — into a UTF-16 code unit.
+///
+/// A Java `char` **is** a UTF-16 code unit, so a character outside the BMP (an emoji, most CJK
+/// extension B) is two `char`s in Java and has no single-`char` spelling. That is refused here by name
+/// rather than truncated to the high surrogate, which would compare unequal to everything and read as a
+/// condition that simply never matches.
+fn parse_char_inner(inner: &str) -> Result<u16, String> {
+    if let Some(esc) = inner.strip_prefix('\\') {
+        if let Some(hex) = esc.strip_prefix('u') {
+            return u16::from_str_radix(hex, 16)
+                .map_err(|_| format!("'\\u{hex}' is not four hex digits — write it as '\\u00e7'"));
+        }
+        let mut chars = esc.chars();
+        let (Some(c), None) = (chars.next(), chars.next()) else {
+            return Err(format!("'\\{esc}' is not one escape — write one of {}", escape_names()));
+        };
+        return CHAR_ESCAPES
+            .iter()
+            .find_map(|(name, v)| (*name == c).then_some(*v))
+            .ok_or_else(|| format!("'\\{c}' is not an escape this understands — try {}", escape_names()));
+    }
+    let mut units = inner.encode_utf16();
+    match (units.next(), units.next()) {
+        (Some(u), None) => Ok(u),
+        (Some(_), Some(_)) => Err(format!(
+            "'{inner}' is two UTF-16 code units, and a Java char holds one — outside the BMP there is \
+             no single-char spelling, so compare the String instead"
+        )),
+        _ => Err("'' is an empty char literal — write a character between the quotes".to_string()),
+    }
+}
+
+/// `\n`, `\t`, … as a readable list for the two error messages above.
+fn escape_names() -> String {
+    let named: Vec<String> = CHAR_ESCAPES.iter().map(|(c, _)| format!("\\{c}")).collect();
+    format!("{}, or \\uXXXX", named.join(", "))
+}
+
+/// The numeric literals, tried in the order Java's own grammar disambiguates them: an `L` suffix makes a
+/// long, a bare integer is an `int` (widening to `long` only when it does not fit one), and **only then**
+/// is a token with a dot, an exponent or an `f`/`d` suffix floating-point. That order is what keeps `5` an
+/// int literal while `5f` and `5.0` are not.
+#[allow(clippy::cast_possible_truncation)]
+fn parse_number_lit(t: &str) -> Option<ArgLit> {
+    if let Some(num) = t.strip_suffix('L').or_else(|| t.strip_suffix('l')) {
+        if let Ok(n) = num.parse::<i64>() {
+            return Some(ArgLit::Long(n));
+        }
+    }
+    if let Ok(n) = t.parse::<i32>() {
+        return Some(ArgLit::Int(n));
+    }
+    if let Ok(n) = t.parse::<i64>() {
+        return Some(ArgLit::Long(n));
+    }
+    let (v, is_float) = parse_float_lit(t)?;
+    Some(if is_float { ArgLit::Float(v as f32) } else { ArgLit::Double(v) })
+}
+
 fn parse_lit(t: &str) -> Result<ArgLit, String> {
     let t = t.trim();
     if t == "null" {
@@ -6174,16 +6326,14 @@ fn parse_lit(t: &str) -> Result<ArgLit, String> {
     if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
         return Ok(ArgLit::Str(t[1..t.len() - 1].to_string()));
     }
-    if let Some(num) = t.strip_suffix('L').or_else(|| t.strip_suffix('l')) {
-        if let Ok(n) = num.parse::<i64>() {
-            return Ok(ArgLit::Long(n));
-        }
+    // A token quoted with `'` was *meant* to be a char literal, so a malformed one gets its own error
+    // rather than falling through to the generic "unsupported argument" — which would be read as "char
+    // literals are not supported" and send the caller looking for the wrong thing.
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        return parse_char_inner(&t[1..t.len() - 1]).map(ArgLit::Char);
     }
-    if let Ok(n) = t.parse::<i32>() {
-        return Ok(ArgLit::Int(n));
-    }
-    if let Ok(n) = t.parse::<i64>() {
-        return Ok(ArgLit::Long(n));
+    if let Some(n) = parse_number_lit(t) {
+        return Ok(n);
     }
     // Not a literal — accept it as a sub-expression if it parses as one (`reserva`, `this.status`,
     // `cfg.getName()`), so callers can pass an existing object by reference. Rejecting here would
@@ -6192,8 +6342,9 @@ fn parse_lit(t: &str) -> Result<ArgLit, String> {
         return Ok(ArgLit::Expr(t.to_string()));
     }
     Err(format!(
-        "Unsupported argument: '{t}' (a literal — int, long like 123L, true/false, null, \"string\" — \
-         or an expression like a local, this.field, or obj.getX())"
+        "Unsupported argument: '{t}' (a literal — int, long like 123L, double like 1.5, float like \
+         2.0f, char like 'a', true/false, null, \"string\" — or an expression like a local, \
+         this.field, or obj.getX())"
     ))
 }
 
@@ -6206,23 +6357,21 @@ fn parse_args(inside: &str) -> Result<Vec<ArgLit>, String> {
     }
     let mut out = Vec::new();
     let mut cur = String::new();
-    let mut in_str = false;
+    let mut q = Quoted::default();
     let mut depth = 0i32;
     for c in s.chars() {
+        let syntax = !q.inside();
+        q.step(c);
         match c {
-            '"' => {
-                in_str = !in_str;
-                cur.push(c);
-            }
-            '(' if !in_str => {
+            '(' if syntax => {
                 depth += 1;
                 cur.push(c);
             }
-            ')' if !in_str => {
+            ')' if syntax => {
                 depth -= 1;
                 cur.push(c);
             }
-            ',' if !in_str && depth == 0 => {
+            ',' if syntax && depth == 0 => {
                 out.push(parse_lit(&cur)?);
                 cur.clear();
             }
@@ -13299,6 +13448,13 @@ fn render_arglit(a: &ArgLit) -> String {
     match a {
         ArgLit::Int(n) => n.to_string(),
         ArgLit::Long(n) => format!("{n}L"),
+        ArgLit::Float(n) => format!("{n}f"),
+        ArgLit::Double(n) => n.to_string(),
+        // Re-quoted rather than printed bare, so the confirmation echoes something that would parse
+        // back — `'a'` reads as a char where `a` would read as a local.
+        ArgLit::Char(n) => {
+            char::from_u32(u32::from(*n)).map_or_else(|| format!("'\\u{n:04x}'"), |c| format!("'{c}'"))
+        }
         ArgLit::Bool(b) => b.to_string(),
         ArgLit::Null => "null".to_string(),
         ArgLit::Str(s) => format!("\"{s}\""),
@@ -13582,6 +13738,9 @@ async fn arglit_to_value(
     Ok(match a {
         ArgLit::Int(n) => value_int(*n),
         ArgLit::Long(n) => value_long(*n),
+        ArgLit::Float(n) => value_float(*n),
+        ArgLit::Double(n) => value_double(*n),
+        ArgLit::Char(n) => value_char(*n),
         ArgLit::Bool(b) => value_bool(*b),
         ArgLit::Null => value_null(),
         ArgLit::Str(s) => {
@@ -14125,6 +14284,8 @@ fn java_hash(key: &ArgLit) -> Option<i32> {
             let lo = i32::try_from(((*n & 0xFFFF_FFFF) ^ 0x8000_0000) - 0x8000_0000).unwrap_or(0);
             hi ^ lo
         }
+        // `Character.hashCode()` is specified as the char value itself.
+        ArgLit::Char(c) => i32::from(*c),
         ArgLit::Bool(b) => {
             if *b {
                 1231
@@ -14132,7 +14293,13 @@ fn java_hash(key: &ArgLit) -> Option<i32> {
                 1237
             }
         }
-        ArgLit::Null | ArgLit::Expr(_) => return None,
+        // `Float`/`Double` are deliberately NOT hashed here even though their hashes are specified too,
+        // because `equals` is where they diverge from `==`: `Double.equals` says `-0.0 != 0.0` and
+        // `NaN == NaN`, the opposite of the comparison operators this same literal means everywhere else
+        // in an expression. Getting that wrong would answer "no such key" for a key that is present,
+        // which is worse than declining — so these fall through to the invoking path, which calls the
+        // debuggee's own `get` and cannot disagree with it.
+        ArgLit::Float(_) | ArgLit::Double(_) | ArgLit::Null | ArgLit::Expr(_) => return None,
     })
 }
 
@@ -14155,6 +14322,9 @@ const fn arglit_kind(key: &ArgLit) -> &'static str {
         ArgLit::Str(_) => "String",
         ArgLit::Int(_) => "int",
         ArgLit::Long(_) => "long",
+        ArgLit::Float(_) => "float",
+        ArgLit::Double(_) => "double",
+        ArgLit::Char(_) => "char",
         ArgLit::Bool(_) => "boolean",
         ArgLit::Null => "null",
         ArgLit::Expr(_) => "expression",
@@ -14191,6 +14361,9 @@ async fn key_matches(
         }
         (ArgLit::Bool(b), "Ljava/lang/Boolean;") => {
             matches!(boxed_data(conn, ids, id).await, Some(ValueData::Boolean(n)) if n == *b)
+        }
+        (ArgLit::Char(c), "Ljava/lang/Character;") => {
+            matches!(boxed_data(conn, ids, id).await, Some(ValueData::Char(n)) if n == *c)
         }
         _ => false,
     }
@@ -17160,7 +17333,80 @@ enum ToStringOutcome {
     Unavailable,
 }
 
-/// Convert a literal string to a Value, coercing int literals to the slot's primitive type.
+/// Why a floating-point literal is not written to an integral target (EVAL-8, #82).
+///
+/// The callers' `tag_compatible` guard would let this through — every numeric tag is compatible with
+/// every other — and the write would land, silently turning `1.5` into `1`. That is the precise hazard
+/// float literals were added to make *expressible*, so it is named here rather than performed.
+fn no_truncating_write(kind: &str, v: f64, sig_byte: u8) -> String {
+    format!(
+        "the {kind} literal {v} cannot be written to a field of Java type '{}' — it would be truncated \
+         rather than rounded, so write the whole number you mean if that is what you intended",
+        char::from(sig_byte)
+    )
+}
+
+/// Coerce an **integer** literal to the declared type of a `set_value` target.
+///
+/// Assigning it to a narrower Java primitive performs Java's own narrowing conversion (`(byte)`,
+/// `(short)`, `(char)`, `(float)`) — a deliberate, possibly-lossy reinterpretation, exactly as `javac`
+/// would compile it.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+const fn int_literal_to_value(n: i32, sig_byte: u8) -> jdwp_client::types::Value {
+    use jdwp_client::types::{Value, ValueData};
+    match sig_byte {
+        b'J' => value_long(n as i64),
+        b'Z' => value_bool(n != 0),
+        b'B' => Value { tag: 66, data: ValueData::Byte(n as i8) },
+        b'S' => Value { tag: 83, data: ValueData::Short(n as i16) },
+        b'C' => Value { tag: 67, data: ValueData::Char(n as u16) },
+        b'F' => value_float(n as f32),
+        b'D' => value_double(n as f64),
+        _ => value_int(n),
+    }
+}
+
+/// Coerce a **floating-point** literal to the declared type of a `set_value` target.
+///
+/// The two widths are converted for real rather than passed through, because the wire carries 4 bytes for
+/// one and 8 for the other and the receiving side reads the FIELD's width: an f32 written into a `double`
+/// field is not a lossy value, it is a malformed packet. An integral target is refused outright — see
+/// [`no_truncating_write`].
+#[allow(clippy::cast_possible_truncation)]
+fn float_literal_to_value(v: f64, is_float: bool, sig_byte: u8) -> Result<jdwp_client::types::Value, String> {
+    match sig_byte {
+        b'F' => Ok(value_float(v as f32)),
+        b'D' => Ok(value_double(v)),
+        b'J' | b'I' | b'S' | b'B' | b'C' => {
+            Err(no_truncating_write(if is_float { "float" } else { "double" }, v, sig_byte))
+        }
+        // A reference or boolean target is left to the caller's `tag_compatible` guard, which refuses it
+        // and names both types. The width still has to be right, or the refusal would name the wrong one.
+        _ if is_float => Ok(value_float(v as f32)),
+        _ => Ok(value_double(v)),
+    }
+}
+
+/// Coerce a **char** literal to the declared type of a `set_value` target. A `char` widens into any wider
+/// numeric type exactly as Java's own does, and narrows to `byte`/`short` the way the int literal above
+/// narrows.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+const fn char_literal_to_value(c: u16, sig_byte: u8) -> jdwp_client::types::Value {
+    use jdwp_client::types::{Value, ValueData};
+    match sig_byte {
+        b'I' => value_int(c as i32),
+        b'J' => value_long(c as i64),
+        b'S' => Value { tag: 83, data: ValueData::Short(c as i16) },
+        b'B' => Value { tag: 66, data: ValueData::Byte(c as i8) },
+        b'F' => value_float(c as f32),
+        b'D' => value_double(c as f64),
+        _ => value_char(c),
+    }
+}
+
+/// Convert a literal string to a Value, coercing it to the slot's declared primitive type. One arm per
+/// literal kind; the coercion table for each of the three numeric kinds is its own function above,
+/// because a flat `match` over both dimensions at once is where this grew past the complexity gate.
 async fn literal_to_value(
     conn: &mut jdwp_client::JdwpConnection,
     s: &str,
@@ -17178,32 +17424,13 @@ async fn literal_to_value(
         // caller's frame, which this coercion path (also used for deferred writes) doesn't have.
         ArgLit::Expr(e) => {
             return Err(format!(
-                "'{e}' is not a literal — set_value takes a literal (int, 123L, true/false, null, \"string\")"
+                "'{e}' is not a literal — set_value takes a literal (int, 123L, 1.5, 2.0f, 'a', true/false, null, \"string\")"
             ))
         }
-        // Assigning an integer literal to a narrower Java primitive performs Java's own
-        // narrowing conversion (`(byte)`, `(short)`, `(char)`, `(float)`) — a deliberate,
-        // possibly-lossy reinterpretation, exactly as `javac` would compile it.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
-        ArgLit::Int(n) => match sig_byte {
-            b'J' => value_long(i64::from(n)),
-            b'Z' => value_bool(n != 0),
-            b'B' => jdwp_client::types::Value { tag: 66, data: jdwp_client::types::ValueData::Byte(n as i8) },
-            b'S' => {
-                jdwp_client::types::Value { tag: 83, data: jdwp_client::types::ValueData::Short(n as i16) }
-            }
-            b'C' => {
-                jdwp_client::types::Value { tag: 67, data: jdwp_client::types::ValueData::Char(n as u16) }
-            }
-            b'F' => {
-                jdwp_client::types::Value { tag: 70, data: jdwp_client::types::ValueData::Float(n as f32) }
-            }
-            b'D' => jdwp_client::types::Value {
-                tag: 68,
-                data: jdwp_client::types::ValueData::Double(f64::from(n)),
-            },
-            _ => value_int(n),
-        },
+        ArgLit::Float(v) => float_literal_to_value(f64::from(v), true, sig_byte)?,
+        ArgLit::Double(v) => float_literal_to_value(v, false, sig_byte)?,
+        ArgLit::Char(c) => char_literal_to_value(c, sig_byte),
+        ArgLit::Int(n) => int_literal_to_value(n, sig_byte),
     })
 }
 
@@ -19093,9 +19320,11 @@ fn strip_enclosing_parens(s: &str) -> &str {
 fn split_comparison(cond: &str) -> Option<(String, String, String)> {
     let ops = ["==", "!=", "<=", ">=", "<", ">"];
     let mut depth = 0i32;
-    let mut in_str = false;
+    let mut q = Quoted::default();
     for (i, c) in cond.char_indices() {
-        if !in_str && depth == 0 && c != '"' && c != '(' && c != ')' {
+        // A char literal can *be* an operator — `c == '>'`, or a leading `'<' == c` — so the quote
+        // tracking has to come before the operator scan, not just around the string case (EVAL-8).
+        if !q.inside() && depth == 0 && c != '"' && c != '\'' && c != '(' && c != ')' {
             for op in &ops {
                 if cond[i..].starts_with(op) {
                     let left = cond[..i].trim().to_string();
@@ -19106,10 +19335,11 @@ fn split_comparison(cond: &str) -> Option<(String, String, String)> {
                 }
             }
         }
+        let syntax = !q.inside();
+        q.step(c);
         match c {
-            '"' => in_str = !in_str,
-            '(' if !in_str => depth += 1,
-            ')' if !in_str => depth -= 1,
+            '(' if syntax => depth += 1,
+            ')' if syntax => depth -= 1,
             _ => {}
         }
     }
@@ -19286,6 +19516,13 @@ fn arglit_as_f64(rlit: &ArgLit) -> Option<f64> {
     match rlit {
         ArgLit::Int(v) => Some(f64::from(*v)),
         ArgLit::Long(v) => Some(*v as f64),
+        // `f64::from` on an f32 is the same widening `value_as_f64` applies to a `float` FIELD, which is
+        // what makes `taxa == 0.1f` exact: both sides went through f32 and land on the same f64.
+        ArgLit::Float(v) => Some(f64::from(*v)),
+        ArgLit::Double(v) => Some(*v),
+        // A char is a number in Java — `c == 'a'` and `c == 97` are the same comparison — and
+        // `value_as_f64` already widens a `char` field the same way.
+        ArgLit::Char(v) => Some(f64::from(*v)),
         _ => None,
     }
 }
@@ -22490,5 +22727,174 @@ mod tests {
         assert_eq!(decode_chars(&[0x0061, 0x00e1]), "aá");
         // A well-formed pair is one character, not two escapes.
         assert_eq!(decode_chars(&[0xd83d, 0xde00]), "😀");
+    }
+
+    // ----- EVAL-8 (#82): float, double and char literals -----
+
+    /// The widths are the point. A `float` literal that widened to f64 on the way in would compare
+    /// unequal to the `float` field it was written for, and `2.0f` would resolve to `f(double)`.
+    #[test]
+    fn a_float_literal_keeps_its_width_and_a_double_keeps_its_rounding() {
+        // Compared as BITS rather than with `==`: it is the stronger assertion (it separates `-0.0` from
+        // `0.0`) and it is exactness that is under test here, not approximate agreement.
+        let double_bits = |t: &str| match parse_lit(t) {
+            Ok(ArgLit::Double(v)) => v.to_bits(),
+            other => panic!("'{t}' must parse as a double literal, got {other:?}"),
+        };
+        let float_bits = |t: &str| match parse_lit(t) {
+            Ok(ArgLit::Float(v)) => v.to_bits(),
+            other => panic!("'{t}' must parse as a float literal, got {other:?}"),
+        };
+        assert_eq!(double_bits("1.5"), 1.5_f64.to_bits());
+        assert_eq!(float_bits("2.0f"), 2.0_f32.to_bits());
+        assert_eq!(float_bits("2.0F"), 2.0_f32.to_bits(), "the suffix is case-insensitive");
+        assert_eq!(double_bits("1.5d"), 1.5_f64.to_bits());
+        assert_eq!(double_bits("-1.5"), (-1.5_f64).to_bits(), "a sign is part of it");
+        assert_eq!(double_bits("1e3"), 1000.0_f64.to_bits(), "an exponent needs no dot");
+        assert_eq!(float_bits("5f"), 5.0_f32.to_bits(), "a suffix needs no dot");
+
+        // The issue's own value: `1.005` is not representable, and this asserts the debugger's parser
+        // lands on the SAME f64 javac does — which is what makes `vlPagamento == 1.005` fire at all.
+        assert_eq!(
+            double_bits("1.005"),
+            1.005_f64.to_bits(),
+            "1.005 must round exactly as the compiler rounds it, or `vlPagamento == 1.005` never fires"
+        );
+
+        // And the float literal must land where a `float` FIELD lands after widening, or an exact
+        // comparison against one can never be true.
+        let Ok(lit) = parse_lit("0.1f") else { panic!("0.1f must parse") };
+        assert_eq!(
+            arglit_as_f64(&lit),
+            value_as_f64(&jdwp_client::types::ValueData::Float(0.1f32)),
+            "a float literal and a float field must widen to the same f64, or `taxa == 0.1f` never fires"
+        );
+        assert_ne!(
+            arglit_as_f64(&lit),
+            Some(0.1f64),
+            "0.1f is NOT 0.1 — if these were equal the literal skipped f32 and the test above is vacuous"
+        );
+    }
+
+    /// `5` is an int and stays one; `inf`, `infinity` and `NaN` are not Java literals at all, though
+    /// Rust's own float parser accepts every one of them. Each would otherwise capture a token that is
+    /// really a local variable name.
+    #[test]
+    fn rusts_extra_float_spellings_are_not_java_literals() {
+        assert!(matches!(parse_lit("5"), Ok(ArgLit::Int(5))), "an integer stays an integer");
+        for token in ["inf", "infinity", "NaN", "nan", "-inf", "-NaN"] {
+            assert!(parse_float_lit(token).is_none(), "Rust reads '{token}' as a number; Java does not");
+        }
+        // The ones that are also valid identifiers stay resolvable as locals, which is what the shape
+        // check protects. `-inf` is not an expression either, so it is simply refused.
+        for token in ["inf", "infinity", "NaN", "nan"] {
+            let got = parse_lit(token);
+            assert!(
+                matches!(got, Ok(ArgLit::Expr(_))),
+                "'{token}' is a local variable name here, not a number: {got:?}"
+            );
+        }
+        // A trailing `d`/`f` on an identifier must not make one either.
+        for token in ["id", "paid", "cfg", "x2f"] {
+            assert!(matches!(parse_lit(token), Ok(ArgLit::Expr(_))), "'{token}' is an expression");
+        }
+        assert!(parse_float_lit("1.5e").is_none(), "an empty exponent is not a literal");
+        assert!(parse_float_lit("0x1F").is_none(), "hex is not supported and must not read as 0x1");
+    }
+
+    /// A char literal parses to the UTF-16 code unit a Java `char` is, escapes included.
+    #[test]
+    fn a_char_literal_parses_to_one_utf16_code_unit() {
+        assert!(matches!(parse_lit("'a'"), Ok(ArgLit::Char(97))));
+        assert!(matches!(parse_lit("'\\n'"), Ok(ArgLit::Char(10))));
+        assert!(matches!(parse_lit("'\\''"), Ok(ArgLit::Char(39))));
+        assert!(matches!(parse_lit("'\\\\'"), Ok(ArgLit::Char(92))));
+        assert!(matches!(parse_lit("'\\u00e7'"), Ok(ArgLit::Char(0x00e7))), "ç by code point");
+        assert!(matches!(parse_lit("'ç'"), Ok(ArgLit::Char(0x00e7))), "and ç written directly");
+        // A char is a number in Java, so it compares on the same scale as one.
+        assert_eq!(arglit_as_f64(&parse_lit("'a'").unwrap()), Some(97.0));
+    }
+
+    /// A token that was *meant* to be a char literal gets an error about the char literal, not the
+    /// generic "unsupported argument" — which reads as "char literals are not supported" and sends the
+    /// caller looking for a feature that is right there.
+    #[test]
+    fn a_malformed_char_literal_says_what_is_wrong_with_it() {
+        let empty = parse_lit("''").expect_err("'' is not a char");
+        assert!(empty.contains("empty char literal"), "{empty}");
+
+        let two = parse_lit("'ab'").expect_err("'ab' is two chars");
+        assert!(two.contains("two UTF-16 code units"), "{two}");
+
+        // Outside the BMP a Java char cannot hold it, and truncating to the high surrogate would compare
+        // unequal to everything — a condition that silently never fires.
+        let emoji = parse_lit("'😀'").expect_err("an astral character is two chars in Java");
+        assert!(emoji.contains("no single-char spelling"), "{emoji}");
+        assert!(emoji.contains("String"), "the error must name the way round it:\n{emoji}");
+
+        let bad = parse_lit("'\\q'").expect_err("\\q is not an escape");
+        assert!(bad.contains("\\n") && bad.contains("\\uXXXX"), "the error must list what IS one:\n{bad}");
+    }
+
+    /// The scanners split on characters a char literal can *contain*, so each of them has to know about
+    /// `'` now. Every case here parsed as something else entirely before EVAL-8.
+    #[test]
+    fn a_char_literal_is_not_split_apart_by_the_scanners() {
+        // A comma inside a char literal is not an argument separator.
+        let args = parse_args("',', 1").expect("a char literal comma must not split the argument list");
+        assert_eq!(args.len(), 2, "got {args:?}");
+        assert!(matches!(args[0], ArgLit::Char(44)));
+
+        // An operator inside a char literal is not the comparison's operator.
+        assert_eq!(
+            split_comparison("c == '>'"),
+            Some(("c".to_string(), "==".to_string(), "'>'".to_string())),
+        );
+        assert_eq!(
+            split_comparison("'<' == c"),
+            Some(("'<'".to_string(), "==".to_string(), "c".to_string())),
+            "a LEADING char literal used to split on its own contents"
+        );
+
+        // A double quote inside a char literal does not open a string that never closes.
+        assert_eq!(split_segments("foo('\"')").expect("balanced"), vec!["foo('\"')".to_string()]);
+        // And a dot inside one is not a chain separator.
+        assert_eq!(split_segments("s.indexOf('.')").expect("balanced"), vec!["s", "indexOf('.')"]);
+        // An apostrophe inside a STRING is still just an apostrophe.
+        assert_eq!(split_segments("a.matches(\"it's\")").expect("balanced"), vec!["a", "matches(\"it's\")"]);
+    }
+
+    /// Writing `1.5` to an `int` field is refused rather than truncated. The callers' `tag_compatible`
+    /// guard would pass it — every numeric tag is compatible with every other — so this refusal is the
+    /// only thing between a caller and a silent `1.5` → `1`.
+    #[test]
+    fn a_floating_literal_is_refused_for_an_integral_field() {
+        let refused = no_truncating_write("double", 1.5, b'I');
+        assert!(refused.contains("1.5"), "the refusal must quote the value:\n{refused}");
+        assert!(refused.contains("'I'"), "and name the field's type:\n{refused}");
+        assert!(refused.contains("truncated"), "and say what would have happened:\n{refused}");
+    }
+
+    /// How the new literals read back in a confirmation, which has to be something that would parse
+    /// again — `a` is a local variable, `'a'` is a char.
+    #[test]
+    fn the_new_literals_echo_back_as_themselves() {
+        assert_eq!(render_arglit(&ArgLit::Double(1.5)), "1.5");
+        assert_eq!(render_arglit(&ArgLit::Float(2.0)), "2f");
+        assert_eq!(render_arglit(&ArgLit::Char(97)), "'a'");
+        assert_eq!(arglit_kind(&ArgLit::Char(97)), "char");
+        assert_eq!(arglit_kind(&ArgLit::Double(1.5)), "double");
+        assert_eq!(arglit_kind(&ArgLit::Float(1.5)), "float");
+    }
+
+    /// A `Character` map key is hashed here (its hash is the char), but `Float`/`Double` keys are
+    /// deliberately declined — `Double.equals` says `-0.0 != 0.0` and `NaN == NaN`, the opposite of the
+    /// operators the same literal means everywhere else, and answering "no such key" for a key that is
+    /// present is worse than paying for the debuggee's own `get`.
+    #[test]
+    fn a_char_map_key_is_hashed_here_and_a_float_one_is_not() {
+        assert_eq!(java_hash(&ArgLit::Char(97)), Some(97));
+        assert_eq!(java_hash(&ArgLit::Double(1.5)), None);
+        assert_eq!(java_hash(&ArgLit::Float(1.5)), None);
     }
 }

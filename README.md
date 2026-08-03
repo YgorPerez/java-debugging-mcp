@@ -702,7 +702,7 @@ instead.
       octets marked rather than replaced, and `array.length` on any array (EVAL-7)
 - [x] **Conditional breakpoints** — `condition` evaluated in the hit frame (`expr OP expr` or boolean chains); auto-resumes when false
 - [x] **Multiple concurrent sessions** — `debug.attach` returns a `session_id`; tools take an optional `session_id` (defaults to current); `debug.list_sessions` finds one you lost
-- [x] **Arguments** in `evaluate` / conditions: literals (int, long `123L`, boolean, null, `"string"`) or expressions
+- [x] **Arguments** in `evaluate` / conditions: literals (int, long `123L`, double `1.5`, float `2.0f`, char `'a'`, boolean, null, `"string"`) or expressions
 - [x] **Field watchpoints** — `FIELD_MODIFICATION` / `FIELD_ACCESS` requests; a write hit reports the
       mutating location and the old → new pair (the old value is read before the pending store commits)
 - [x] **Hot reload** — `RedefineClasses` from a class root, with the twelve refusals mapped onto what to

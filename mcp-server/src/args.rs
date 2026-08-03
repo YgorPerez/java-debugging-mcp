@@ -587,7 +587,7 @@ pub struct EvaluateArgs {
     /// Java expression. Heads: a local, `this`, a class (`ConfigDefaultUtils`, or fully
     /// qualified), or an **object handle** — `@0x1f4c`, the spelling every reply prints beside an
     /// object. Then chain `.field` and `.method(args)` freely, including static members
-    /// (`ConfigDefaultUtils.getUrl()`). Arguments may be literals (int, `123L`, true/false, null,
+    /// (`ConfigDefaultUtils.getUrl()`). Arguments may be literals (int, `123L`, `1.5`, `2.0f`, `'a'`, true/false, null,
     /// `"string"`) or expressions passed by reference — a local, `this.field`, or a nested call
     /// (`svc.matches(reserva)`, `foo.handle(this, cfg.getId())`).
     ///
@@ -932,7 +932,8 @@ pub struct SetValueArgs {
     /// it names several elements, so there is nothing single to write. Accepts the legacy key `name`.
     #[serde(alias = "name")]
     pub target: String,
-    /// Literal: int, 123L, true/false, null, or "string". Coerced to the target's declared type.
+    /// Literal: int, 123L, 1.5, 2.0f, 'a', true/false, null, or "string". Coerced to the target's declared
+    /// type.
     pub value: String,
     /// Thread id (optional; defaults to last-hit thread). Needed for locals and instance fields.
     #[serde(default)]
@@ -1348,7 +1349,7 @@ pub struct SetMethodBreakpointArgs {
 /// Arguments for `debug.force_return`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ForceReturnArgs {
-    /// Return value literal, coerced to the method's declared return type: int, 123L, true/false,
+    /// Return value literal, coerced to the method's declared return type: int, 123L, 1.5, 2.0f, 'a', true/false,
     /// null, or "string". Omit (or pass "void") for a void method.
     #[serde(default)]
     pub value: Option<String>,
