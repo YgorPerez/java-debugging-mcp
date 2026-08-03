@@ -17,6 +17,15 @@ _Avoid_: target, remote, server (the last belongs to the MCP server, which is th
 The `WildFly` instance several people use at once. Not an environment name — the constraint that decides
 every safety default, because freezing it stalls other people's requests.
 
+**Erased type** / **generic type**:
+The **erased** type is what the JVM runs on and what a plain descriptor carries: `java.util.List`. The
+**generic** type is what the source declared, read from the class file's optional `Signature` attribute:
+`List<ReservaHotel>`. Every type string the tool emits is the generic one where the attribute exists and the
+erased one where it does not (ADR-0033) — and the difference is not cosmetic, because the generic type is
+what makes the *next* expression writable without a guess.
+_Avoid_: raw type (a real and different Java concept — a `List` written with no arguments at all, which is
+one of the ways the attribute comes to be absent), reified
+
 **Unfetched** (of a lazy association):
 A Hibernate entity proxy or persistent collection whose row or contents nobody has loaded. A **third
 answer** alongside a value and `null` (ADR-0032): the row very likely exists, and resolving through it is

@@ -4,7 +4,7 @@
 
 use crate::commands::{command_sets, method_commands};
 use crate::connection::JdwpConnection;
-use crate::protocol::{CommandPacket, JdwpResult};
+use crate::protocol::{CommandPacket, JdwpResult, ERR_NOT_IMPLEMENTED};
 use crate::reader::{read_i32, read_string, read_u64};
 use crate::types::{MethodId, ReferenceTypeId, Variable};
 use bytes::BufMut;
@@ -116,8 +116,40 @@ impl JdwpConnection {
         ref_type_id: ReferenceTypeId,
         method_id: MethodId,
     ) -> JdwpResult<Vec<Variable>> {
+        // `VariableTableWithGeneric` rather than `VariableTable` (DISC-12, #95): a local declared
+        // `List<Reserva>` is the commonest place a caller needs the element type, and it is the only place
+        // the *use-site* argument exists — a runtime object's class carries none.
+        //
+        // The fallback matters more here than for methods and fields. This command needs the same debug
+        // information its plain twin does, so `ABSENT_INFORMATION` is an ordinary answer for a `-g:none`
+        // build and is left to the caller exactly as before; `NOT_IMPLEMENTED` is the one that falls back.
+        match self.read_variable_table(ref_type_id, method_id, true).await {
+            Ok(v) => Ok(v),
+            Err(crate::JdwpError::JdwpErrorCode(code, _)) if code == ERR_NOT_IMPLEMENTED => {
+                self.read_variable_table(ref_type_id, method_id, false).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// One read of a method's variable table, with or without the generic signature column.
+    ///
+    /// The generic reply inserts one string per entry between the signature and the length — see
+    /// `read_methods` in `reftype.rs` for why the layout and the command are decided by one flag in one
+    /// function rather than by two loops that have to be kept in step.
+    async fn read_variable_table(
+        &mut self,
+        ref_type_id: ReferenceTypeId,
+        method_id: MethodId,
+        with_generic: bool,
+    ) -> JdwpResult<Vec<Variable>> {
+        let command = if with_generic {
+            method_commands::VARIABLE_TABLE_WITH_GENERIC
+        } else {
+            method_commands::VARIABLE_TABLE
+        };
         let id = self.next_id();
-        let mut packet = CommandPacket::new(id, command_sets::METHOD, method_commands::VARIABLE_TABLE);
+        let mut packet = CommandPacket::new(id, command_sets::METHOD, command);
 
         // Write reference type ID and method ID
         packet.data.put_u64(ref_type_id);
@@ -139,10 +171,12 @@ impl JdwpConnection {
             let code_index = read_u64(&mut data)?;
             let name = read_string(&mut data)?;
             let signature = read_string(&mut data)?;
+            let generic_signature =
+                if with_generic { crate::reader::some_if_present(read_string(&mut data)?) } else { None };
             let length = crate::reader::read_u32(&mut data)?;
             let slot = crate::reader::read_u32(&mut data)?;
 
-            variables.push(Variable { code_index, name, signature, length, slot });
+            variables.push(Variable { code_index, name, signature, generic_signature, length, slot });
         }
 
         Ok(variables)

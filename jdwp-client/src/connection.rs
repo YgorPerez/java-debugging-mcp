@@ -351,7 +351,13 @@ mod tests {
     use super::*;
 
     fn field(name: &str) -> FieldInfo {
-        FieldInfo { field_id: 1, name: name.to_string(), signature: "I".to_string(), mod_bits: 0 }
+        FieldInfo {
+            field_id: 1,
+            name: name.to_string(),
+            signature: "I".to_string(),
+            generic_signature: None,
+            mod_bits: 0,
+        }
     }
 
     // Round-trips every kind the cache holds. Needs no JVM, so it guards the cache's own logic —
@@ -371,7 +377,13 @@ mod tests {
         assert!(c.methods(7).is_none());
         c.put_methods(
             7,
-            &[MethodInfo { method_id: 2, name: "m".to_string(), signature: "()V".to_string(), mod_bits: 0 }],
+            &[MethodInfo {
+                method_id: 2,
+                name: "m".to_string(),
+                signature: "()V".to_string(),
+                generic_signature: None,
+                mod_bits: 0,
+            }],
         );
         assert_eq!(c.methods(7).map(|m| m.len()), Some(1));
 

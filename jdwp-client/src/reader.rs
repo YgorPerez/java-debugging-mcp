@@ -172,6 +172,17 @@ pub fn read_i64(buf: &mut &[u8]) -> JdwpResult<i64> {
     Ok(buf.get_i64())
 }
 
+/// A JDWP string that means "there is none" when it is empty.
+///
+/// The generic-signature commands (DISC-12, #95) answer with an **empty string** for a member whose class
+/// file carries no `Signature` attribute, rather than with an error or an absent field. That is the ordinary
+/// case by a wide margin, and left as `Some("")` it would travel all the way to a caller as a blank type.
+/// Normalising it here means every consumer sees the same `None` the absence deserves.
+#[must_use]
+pub fn some_if_present(s: String) -> Option<String> {
+    (!s.is_empty()).then_some(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

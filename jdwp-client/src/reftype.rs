@@ -5,7 +5,7 @@
 use crate::commands::{command_sets, reference_type_commands};
 use crate::connection::JdwpConnection;
 use crate::protocol::{CommandPacket, JdwpResult, ERR_ABSENT_INFORMATION, ERR_NOT_IMPLEMENTED};
-use crate::reader::{read_i32, read_string, read_u64};
+use crate::reader::{read_i32, read_string, read_u64, some_if_present};
 use crate::types::{FieldId, MethodId, ObjectId, ReferenceTypeId};
 use bytes::BufMut;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,14 @@ pub struct MethodInfo {
     pub method_id: MethodId,
     pub name: String,
     pub signature: String,
+    /// The **generic** signature from the class file's `Signature` attribute, when it carries one
+    /// (DISC-12, #95).
+    ///
+    /// `None` is the ordinary answer, not a degraded one: the attribute is optional, absent for code
+    /// compiled without it and for synthetic members whose types were erased. JDWP's generic commands
+    /// answer with an EMPTY STRING in that case rather than an error, and an empty string is normalised to
+    /// `None` here so that no caller can render a blank type.
+    pub generic_signature: Option<String>,
     pub mod_bits: i32,
 }
 
@@ -25,6 +33,8 @@ pub struct FieldInfo {
     pub field_id: FieldId,
     pub name: String,
     pub signature: String,
+    /// The **generic** signature — see [`MethodInfo::generic_signature`] for what `None` means.
+    pub generic_signature: Option<String>,
     pub mod_bits: i32,
 }
 
@@ -39,19 +49,47 @@ impl JdwpConnection {
         if let Some(hit) = self.types().methods(ref_type_id) {
             return Ok(hit);
         }
-        let id = self.next_id();
-        let mut packet =
-            CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::METHODS);
+        // `MethodsWithGeneric` rather than `Methods` (DISC-12, #95): same cost, one extra string per
+        // entry, and it is the only place a *use-site* type argument can come from. Falls back to the plain
+        // command if a VM does not implement it — the generic variants are JDWP 1.5 and every supported JDK
+        // has them, so the fallback is for a non-HotSpot VM rather than for an old JDK.
+        let methods = match self.read_methods(ref_type_id, true).await {
+            Ok(m) => m,
+            Err(crate::JdwpError::JdwpErrorCode(code, _)) if code == ERR_NOT_IMPLEMENTED => {
+                self.read_methods(ref_type_id, false).await?
+            }
+            Err(e) => return Err(e),
+        };
+        self.types().put_methods(ref_type_id, &methods);
+        Ok(methods)
+    }
 
-        // Write reference type ID (8 bytes)
+    /// One read of a type's declared methods, with or without the generic signature column.
+    ///
+    /// **The two replies have a different layout and cannot share a reader by accident**, which is the
+    /// second risk #95 names: `MethodsWithGeneric` inserts one string per entry between the signature and
+    /// the modifier bits. Reading a generic reply with the plain loop would take the generic signature as
+    /// the mod bits and then desynchronise for every remaining method — so the layout is decided by the
+    /// same flag that chose the command, in one function, rather than by two loops that must be kept in
+    /// step.
+    async fn read_methods(
+        &mut self,
+        ref_type_id: ReferenceTypeId,
+        with_generic: bool,
+    ) -> JdwpResult<Vec<MethodInfo>> {
+        let command = if with_generic {
+            reference_type_commands::METHODS_WITH_GENERIC
+        } else {
+            reference_type_commands::METHODS
+        };
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::REFERENCE_TYPE, command);
         packet.data.put_u64(ref_type_id);
 
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
 
         let mut data = reply.data();
-
-        // Read number of methods
         let methods_count = read_i32(&mut data)?;
         let mut methods = Vec::with_capacity(usize::try_from(methods_count).unwrap_or(0));
 
@@ -59,12 +97,12 @@ impl JdwpConnection {
             let method_id = read_u64(&mut data)?;
             let name = read_string(&mut data)?;
             let signature = read_string(&mut data)?;
+            let generic_signature =
+                if with_generic { some_if_present(read_string(&mut data)?) } else { None };
             let mod_bits = read_i32(&mut data)?;
 
-            methods.push(MethodInfo { method_id, name, signature, mod_bits });
+            methods.push(MethodInfo { method_id, name, signature, generic_signature, mod_bits });
         }
-
-        self.types().put_methods(ref_type_id, &methods);
         Ok(methods)
     }
 
@@ -286,19 +324,38 @@ impl JdwpConnection {
         if let Some(hit) = self.types().fields(ref_type_id) {
             return Ok(hit);
         }
-        let id = self.next_id();
-        let mut packet =
-            CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::FIELDS);
+        // `FieldsWithGeneric`, for the reasons on `get_methods` above.
+        let fields = match self.read_fields(ref_type_id, true).await {
+            Ok(f) => f,
+            Err(crate::JdwpError::JdwpErrorCode(code, _)) if code == ERR_NOT_IMPLEMENTED => {
+                self.read_fields(ref_type_id, false).await?
+            }
+            Err(e) => return Err(e),
+        };
+        self.types().put_fields(ref_type_id, &fields);
+        Ok(fields)
+    }
 
-        // Write reference type ID (8 bytes)
+    /// One read of a type's declared fields, with or without the generic signature column — see
+    /// [`Self::read_methods`] for why the layout and the command are chosen together.
+    async fn read_fields(
+        &mut self,
+        ref_type_id: ReferenceTypeId,
+        with_generic: bool,
+    ) -> JdwpResult<Vec<FieldInfo>> {
+        let command = if with_generic {
+            reference_type_commands::FIELDS_WITH_GENERIC
+        } else {
+            reference_type_commands::FIELDS
+        };
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::REFERENCE_TYPE, command);
         packet.data.put_u64(ref_type_id);
 
         let reply = self.send_command(packet).await?;
         reply.check_error()?;
 
         let mut data = reply.data();
-
-        // Read number of fields
         let fields_count = read_i32(&mut data)?;
         let mut fields = Vec::with_capacity(usize::try_from(fields_count).unwrap_or(0));
 
@@ -306,12 +363,12 @@ impl JdwpConnection {
             let field_id = read_u64(&mut data)?;
             let name = read_string(&mut data)?;
             let signature = read_string(&mut data)?;
+            let generic_signature =
+                if with_generic { some_if_present(read_string(&mut data)?) } else { None };
             let mod_bits = read_i32(&mut data)?;
 
-            fields.push(FieldInfo { field_id, name, signature, mod_bits });
+            fields.push(FieldInfo { field_id, name, signature, generic_signature, mod_bits });
         }
-
-        self.types().put_fields(ref_type_id, &fields);
         Ok(fields)
     }
 

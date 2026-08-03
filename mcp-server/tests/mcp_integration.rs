@@ -12909,6 +12909,14 @@ fn force_initialize_walks_in_when_the_caller_asks_for_it() {
 fn a_read_only_session_refuses_force_initialize_by_name() {
     let Some(jdk) = jdk_or_skip("a_read_only_session_refuses_force_initialize_by_name") else { return };
     let probe = Probe::launch_in_package(&jdk, "LazyProxyProbe", LAZY_PROXY_MAIN).expect("launch");
+    // Wait for the probe's own shape line before asserting, as this test's two siblings do. Accepting a JDWP
+    // connection is NOT the same as the class being loaded, and a static read against a class that has not
+    // loaded yet answers "no loaded class matches" — correct, and it asserts the wrong finding (TEST-17,
+    // #49). Measured rather than theoretical: without this the test passed on JDK 21 and 17 and failed
+    // *deterministically* on JDK 11, which starts more slowly relative to the attach.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("proxy implements marker: true"))
+        .expect("the probe never confirmed its own shape");
     let mut server = Server::start().expect("start server");
     let attached = server.call("debug.attach", serde_json::json!({"port": probe.port, "read_only": true}));
     assert_contains_all("the read-only session attached", &attached, &["Connected"]);
@@ -12930,4 +12938,149 @@ fn a_read_only_session_refuses_force_initialize_by_name() {
         &server.evaluate("LazyProxyProbe.unloaded.getRef()"),
         &["UNLOADED Hibernate proxy"],
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// DISC-12 (#95) — generic type information, and the fallback when there is none
+//
+// The fallback is the whole design risk: a generic signature is an OPTIONAL class-file attribute and
+// the JDWP generic commands answer with an EMPTY STRING when a member has none, so a naive
+// implementation renders a blank type where the raw descriptor used to be right. Every test here
+// asserts the absent case in the same reply as the present one, which is the only way to know the
+// fallback was exercised rather than merely believed.
+// ---------------------------------------------------------------------------------------------
+
+/// `debug.list_fields` — type arguments where the class file has them, and byte-identical output where
+/// it does not.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn list_fields_shows_type_arguments_and_falls_back_where_there_are_none() {
+    let Some(jdk) = jdk_or_skip("list_fields_shows_type_arguments_and_falls_back_where_there_are_none")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch_running(&jdk, "GenericsProbe", |l| l.contains("ready")).expect("launch");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    let listed = server.call("debug.list_fields", serde_json::json!({"class_name": "GenericsProbe"}));
+    assert_contains_all(
+        "every parameterised field renders its type arguments",
+        &listed,
+        &[
+            "java.util.List<java.lang.String> names",
+            "java.util.Map<java.lang.Integer, java.util.List<GenericsProbe$Widget>> byId",
+            // The worst case the issue names: two levels of Map, unreadable raw.
+            "java.util.Map<java.lang.Integer, java.util.Map<java.lang.String, java.util.LinkedList<GenericsProbe$WSSessao>>> sessions",
+            // A wildcard, which the acceptance criteria require not be mangled.
+            "java.util.Map<java.lang.String, ? extends java.lang.Number> bounded",
+            // An ARRAY of a parameterised type, not a parameterised type of an array.
+            "java.util.List<java.lang.String>[] buckets",
+        ],
+    );
+    assert_contains_all(
+        "and a member with NO generic signature renders exactly what it did before DISC-12",
+        &listed,
+        &[
+            "java.util.List rawList",
+            "int rawQty",
+            "java.lang.String rawName",
+            "GenericsProbe$Widget[] rawWidgets",
+            "long[][] rawGrid",
+        ],
+    );
+    // The absence assertion that matters: an empty generic signature must never reach the output.
+    for bad in ["  names", "static  names", "static final  rawQty", "<> "] {
+        assert!(
+            !listed.contains(bad),
+            "a blank type reached the output ('{bad}'), which is what happens when an EMPTY generic \
+             signature is used instead of falling back:\n{listed}"
+        );
+    }
+    // Modifiers still render, and in front of the generic type rather than lost to it.
+    assert!(
+        listed.contains("static java.util.List<java.lang.String> names"),
+        "the modifiers must still lead the declaration:\n{listed}"
+    );
+}
+
+/// `debug.list_methods` — a generic signature supplies the type parameters, the parameter types and the
+/// return type in one parse, and a method with none is unchanged.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn list_methods_shows_type_parameters_and_falls_back_where_there_are_none() {
+    let Some(jdk) = jdk_or_skip("list_methods_shows_type_parameters_and_falls_back_where_there_are_none")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch_running(&jdk, "GenericsProbe", |l| l.contains("ready")).expect("launch");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    let listed = server.call("debug.list_methods", serde_json::json!({"class_name": "GenericsProbe"}));
+    assert_contains_all(
+        "a generic method renders its type parameter, arguments and return",
+        &listed,
+        &[
+            "<T> java.util.List<T> firstOf(java.util.List<T>, java.util.Map<java.lang.String, T>)",
+            // An intersection bound, which only the generic grammar carries.
+            "<T extends java.lang.Number & java.lang.Comparable<T>> T biggest(java.util.List<T>)",
+        ],
+    );
+    assert_contains_all(
+        "and a method with NO generic signature renders exactly what it did before DISC-12",
+        &listed,
+        &["static int twiceRaw(int)"],
+    );
+    assert!(
+        !listed.contains("<> ") && !listed.contains("  twiceRaw"),
+        "no blank type or empty type-parameter list may reach the output:\n{listed}"
+    );
+}
+
+/// `debug.get_stack`'s locals — the declared type appears **only** where it says more than the value
+/// beside it does, so an ordinary local is byte-identical and a `List` finally names its element type.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_stack_locals_declared_type_appears_only_where_it_adds_something() {
+    let Some(jdk) = jdk_or_skip("a_stack_locals_declared_type_appears_only_where_it_adds_something") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "GenericsProbe").expect("launch");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
+    probe.attach(&mut server);
+
+    let line = probe_line(&probe_source("GenericsProbe"), "// BP1");
+    server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "GenericsProbe", "line": line}));
+    server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).expect("the stop never fired");
+
+    let stack = server.call("debug.get_stack", serde_json::json!({"include_variables": true}));
+    assert_contains_all(
+        "a parameterised local names its element type, which the value alone cannot",
+        &stack,
+        &[
+            "java.util.List<GenericsProbe$Widget> lines =",
+            "java.util.Map<java.lang.String, java.util.List<GenericsProbe$Widget>> grouped =",
+        ],
+    );
+    // The other half, in the SAME reply: locals whose declared type says nothing new are untouched.
+    assert_contains_all(
+        "a local with no generic signature keeps the exact line it had before DISC-12",
+        &stack,
+        &["plainCount = (int) ", "plainText = \"unchanged\""],
+    );
+    assert!(
+        !stack.contains("int plainCount") && !stack.contains("java.lang.String plainText"),
+        "an erased type must NOT be printed in front of a local — `get_stack` never showed one, and \
+         printing it everywhere would change every locals line in every reply for no gain:\n{stack}"
+    );
+
+    // And the element type is not decoration: it is what makes the next expression writable without a guess.
+    assert_contains_all(
+        "the type the listing named is the type the value actually holds",
+        &server.evaluate("lines[0].qty"),
+        &["(int) 3"],
+    );
+
+    server.panic_reset();
 }

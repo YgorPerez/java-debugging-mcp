@@ -164,6 +164,14 @@ pub struct Variable {
     pub code_index: u64,
     pub name: String,
     pub signature: String,
+    /// The **generic** signature from the class file's `Signature` attribute, when it carries one
+    /// (DISC-12, #95).
+    ///
+    /// `None` is the ordinary answer, not a degraded one: the attribute is optional, absent for code
+    /// compiled without it and for synthetic members whose types were erased. JDWP's generic commands
+    /// answer with an EMPTY STRING in that case rather than an error, and an empty string is normalised to
+    /// `None` here so that no caller can render a blank type.
+    pub generic_signature: Option<String>,
     pub length: u32,
     pub slot: u32,
 }

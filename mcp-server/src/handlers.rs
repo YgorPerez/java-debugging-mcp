@@ -5832,10 +5832,10 @@ async fn frame_method_info(
     conn: &mut jdwp_client::JdwpConnection,
     location: &Location,
     include_variables: bool,
-) -> (String, Option<i32>, Vec<(String, jdwp_client::stackframe::VariableSlot)>) {
+) -> (String, Option<i32>, Vec<ActiveLocal>) {
     let mut method_name = format!("method@{:x}", location.method_id);
     let mut line: Option<i32> = None;
-    let mut active: Vec<(String, jdwp_client::stackframe::VariableSlot)> = Vec::new();
+    let mut active: Vec<ActiveLocal> = Vec::new();
     if let Ok(methods) = conn.get_methods(location.class_id).await {
         if let Some(method) = methods.iter().find(|m| m.method_id == location.method_id) {
             method_name = method.name.clone();
@@ -5849,7 +5849,12 @@ async fn frame_method_info(
                     {
                         let slot = i32::try_from(v.slot).unwrap_or(0);
                         let sig_byte = v.signature.as_bytes().first().copied().unwrap_or(b'?');
-                        active.push((v.name, jdwp_client::stackframe::VariableSlot { slot, sig_byte }));
+                        let declared = informative_generic_type(&v.signature, v.generic_signature.as_deref());
+                        active.push(ActiveLocal {
+                            name: v.name,
+                            slot: jdwp_client::stackframe::VariableSlot { slot, sig_byte },
+                            declared,
+                        });
                     }
                 }
             }
@@ -5898,7 +5903,7 @@ async fn render_frame_variables(
     output: &mut String,
     target_thread: u64,
     frame: (usize, u64),
-    active: &[(String, jdwp_client::stackframe::VariableSlot)],
+    active: &[ActiveLocal],
     mut deep: Option<(DeepOpts, &mut DeepState)>,
 ) -> Option<String> {
     let (idx, mut frame_id) = frame;
@@ -5908,25 +5913,40 @@ async fn render_frame_variables(
             frame_id = f.frame_id;
         }
     }
-    let slots: Vec<jdwp_client::stackframe::VariableSlot> = active.iter().map(|(_, s)| *s).collect();
+    let slots: Vec<jdwp_client::stackframe::VariableSlot> = active.iter().map(|a| a.slot).collect();
     let Ok(values) = conn.get_frame_values(target_thread, frame_id, slots).await else {
         return None;
     };
     // The exhausted local is remembered as a borrow and only copied on the way out, so the budget check
     // costs nothing on the ordinary path where the budget is never reached.
     let mut exhausted_at = None;
-    for ((name, _), value) in active.iter().zip(values.iter()) {
+    for (local, value) in active.iter().zip(values.iter()) {
         let formatted_value = match &mut deep {
             Some((opts, state)) => render_node(conn, value, Some(target_thread), *opts, state, 0).await,
             None => render_value(conn, value, None, 200, ByteRender::default()).await,
         };
-        let _ = writeln!(output, "     {name} = {formatted_value}");
+        // The declared type goes in front, Java-declaration order, and ONLY when it says more than the
+        // value already does — see `informative_generic_type`. So `i = (int) 3` is unchanged and
+        // `java.util.List<Reserva> lines = java.util.ArrayList @0x5` is the case DISC-12 exists for.
+        let _ = match &local.declared {
+            Some(t) => writeln!(output, "     {t} {} = {formatted_value}", local.name),
+            None => writeln!(output, "     {} = {formatted_value}", local.name),
+        };
         if deep.as_ref().is_some_and(|(_, state)| state.exhausted()) {
-            exhausted_at = Some(name);
+            exhausted_at = Some(&local.name);
             break;
         }
     }
     exhausted_at.cloned()
+}
+
+/// One in-scope local of a frame: what to call it, where to read it, and its DECLARED type when that says
+/// something the value beside it will not (DISC-12, #95).
+struct ActiveLocal {
+    name: String,
+    slot: jdwp_client::stackframe::VariableSlot,
+    /// `Some` only when the generic type differs from the erased one — see `informative_generic_type`.
+    declared: Option<String>,
 }
 
 /// The `debug.get_stack` settings that are fixed for the whole walk.
@@ -6686,7 +6706,10 @@ async fn collect_method_rows(
             if name_filter.is_some_and(|f| !m.name.to_lowercase().contains(f)) {
                 continue;
             }
-            rows.push((std::sync::Arc::clone(&owner), render_method(&m.name, &m.signature, m.mod_bits)));
+            rows.push((
+                std::sync::Arc::clone(&owner),
+                render_method(&m.name, &m.signature, m.generic_signature.as_deref(), m.mod_bits),
+            ));
         }
         if !inherited {
             break;
@@ -6750,7 +6773,7 @@ async fn collect_field_rows(
             rows.push(FieldRow {
                 owner: std::sync::Arc::clone(&owner),
                 is_static: f.mod_bits & ACC_STATIC != 0,
-                rendered: render_field(&f.name, &f.signature, f.mod_bits),
+                rendered: render_field(&f.name, &f.signature, f.generic_signature.as_deref(), f.mod_bits),
                 name: f.name,
             });
         }
@@ -6765,6 +6788,35 @@ async fn collect_field_rows(
     Ok(rows)
 }
 
+/// The type a member should be shown as: its **generic** type when the class file carries one and it
+/// parses, and the plain descriptor otherwise (DISC-12, #95).
+///
+/// One home for the fallback, because the fallback is the whole design risk of #95. A generic signature is
+/// an optional class-file attribute — absent for code compiled without it, absent after erasure in some
+/// synthetic members, absent on arrays of type variables — and JDWP's generic commands answer with an
+/// **empty string** rather than an error in that case. `jdwp-client` normalises the empty string to `None`
+/// and `crate::generics` returns `None` for anything it cannot render, so this can only ever produce a
+/// blank type if `decode_signature` would have.
+///
+/// The consequence worth stating: for a member with no generic signature the answer is **byte-identical to
+/// what it was before DISC-12**, and there is a test that asserts exactly that.
+fn shown_type(signature: &str, generic: Option<&str>) -> String {
+    generic.and_then(crate::generics::render_type).unwrap_or_else(|| decode_signature(signature))
+}
+
+/// The generic type of a local, but **only when it says something the erased type does not** — that is,
+/// when it carries type arguments or a type variable.
+///
+/// `debug.get_stack` shows locals as `name = value` and never showed a declared type at all, so printing
+/// one unconditionally would change every locals line in every reply for no gain: `int i` and
+/// `java.lang.String s` are already obvious from the value beside them. `List<Reserva> lines` is not, and
+/// that is the exact case the issue was filed about — "look at a frame, see a List, and guess what is in
+/// it". So the type appears where it is the answer and nowhere else.
+fn informative_generic_type(signature: &str, generic: Option<&str>) -> Option<String> {
+    let rendered = crate::generics::render_type(generic?)?;
+    (rendered != decode_signature(signature)).then_some(rendered)
+}
+
 /// One field as Java source would spell it: `static final java.lang.String infra`.
 ///
 /// Pure, and takes the fields rather than the client's struct, so a unit test can drive it with a
@@ -6776,7 +6828,7 @@ async fn collect_field_rows(
 /// `debug.set_field_stop` will never fire; `volatile` says something else is writing it. `transient`
 /// and `synthetic` are left off — they say something about serialisation and about the compiler, not
 /// about debugging.
-fn render_field(name: &str, signature: &str, mod_bits: i32) -> String {
+fn render_field(name: &str, signature: &str, generic: Option<&str>, mod_bits: i32) -> String {
     let mut out = String::new();
     if mod_bits & ACC_STATIC != 0 {
         out.push_str("static ");
@@ -6787,7 +6839,7 @@ fn render_field(name: &str, signature: &str, mod_bits: i32) -> String {
     if mod_bits & ACC_VOLATILE != 0 {
         out.push_str("volatile ");
     }
-    let _ = write!(out, "{} {name}", decode_signature(signature));
+    let _ = write!(out, "{} {name}", shown_type(signature, generic));
     out
 }
 
@@ -6985,10 +7037,21 @@ async fn render_instance_report(
 ///
 /// Takes the fields rather than the client's struct so this stays a pure formatting function that a
 /// unit test can drive with a literal descriptor.
-fn render_method(name: &str, signature: &str, mod_bits: i32) -> String {
+fn render_method(name: &str, signature: &str, generic: Option<&str>, mod_bits: i32) -> String {
+    // The generic signature, when there is one, supplies the type parameters, the parameter types and the
+    // return type in one parse. Falling back to the erased descriptor keeps a member with no `Signature`
+    // attribute rendering byte-for-byte what it did before DISC-12.
+    let generic_parts = generic.and_then(crate::generics::render_method);
     // The return descriptor is everything after ')' — the same slice `force_return` takes.
     let ret = signature.rsplit(')').next().unwrap_or("V");
-    let params: Vec<String> = sig_param_types(signature).iter().map(|p| decode_signature(p)).collect();
+    let (type_params, params, ret) = match generic_parts {
+        Some(g) => (g.type_params, g.params, g.ret),
+        None => (
+            Vec::new(),
+            sig_param_types(signature).iter().map(|p| decode_signature(p)).collect(),
+            decode_signature(ret),
+        ),
+    };
 
     let mut out = String::new();
     if mod_bits & ACC_STATIC != 0 {
@@ -7000,7 +7063,10 @@ fn render_method(name: &str, signature: &str, mod_bits: i32) -> String {
     if mod_bits & ACC_NATIVE != 0 {
         out.push_str("native ");
     }
-    let _ = write!(out, "{} {}({})", decode_signature(ret), name, params.join(", "));
+    if !type_params.is_empty() {
+        let _ = write!(out, "<{}> ", type_params.join(", "));
+    }
+    let _ = write!(out, "{ret} {name}({})", params.join(", "));
     out
 }
 
@@ -22610,17 +22676,17 @@ mod tests {
     #[test]
     fn method_rendering_reads_as_java_source() {
         assert_eq!(
-            render_method("matches", "(Ljava/lang/String;I)Z", 0),
+            render_method("matches", "(Ljava/lang/String;I)Z", None, 0),
             "boolean matches(java.lang.String, int)"
         );
-        assert_eq!(render_method("run", "()V", 0), "void run()");
+        assert_eq!(render_method("run", "()V", None, 0), "void run()");
         assert_eq!(
-            render_method("main", "([Ljava/lang/String;)V", ACC_STATIC),
+            render_method("main", "([Ljava/lang/String;)V", None, ACC_STATIC),
             "static void main(java.lang.String[])"
         );
         // Multi-dimensional arrays and the wide primitives, which the descriptor packs tightly.
         assert_eq!(
-            render_method("grid", "([[JD)[Ljava/lang/Object;", 0),
+            render_method("grid", "([[JD)[Ljava/lang/Object;", None, 0),
             "java.lang.Object[] grid(long[][], double)"
         );
     }
@@ -22629,36 +22695,36 @@ mod tests {
     // debug.set_line_stop on them. Flags combine rather than overriding one another.
     #[test]
     fn method_rendering_marks_bodyless_and_static_methods() {
-        assert_eq!(render_method("size", "()I", ACC_ABSTRACT), "abstract int size()");
+        assert_eq!(render_method("size", "()I", None, ACC_ABSTRACT), "abstract int size()");
         assert_eq!(
-            render_method("currentTimeMillis", "()J", ACC_STATIC | ACC_NATIVE),
+            render_method("currentTimeMillis", "()J", None, ACC_STATIC | ACC_NATIVE),
             "static native long currentTimeMillis()"
         );
         // A constructor keeps its JVM spelling — it is what evaluate and a stop point both name.
-        assert_eq!(render_method("<init>", "(I)V", 0), "void <init>(int)");
+        assert_eq!(render_method("<init>", "(I)V", None, 0), "void <init>(int)");
     }
 
     // DISC-5: a field reads as its declaration would, and the type goes through the same decoder the
     // method listing uses — so an array, a primitive and a dotted FQN all come back usable.
     #[test]
     fn field_rendering_reads_as_java_source() {
-        assert_eq!(render_field("qty", "I", 0), "int qty");
-        assert_eq!(render_field("name", "Ljava/lang/String;", 0), "java.lang.String name");
+        assert_eq!(render_field("qty", "I", None, 0), "int qty");
+        assert_eq!(render_field("name", "Ljava/lang/String;", None, 0), "java.lang.String name");
         assert_eq!(
-            render_field("words", "[Ljava/lang/String;", ACC_STATIC),
+            render_field("words", "[Ljava/lang/String;", None, ACC_STATIC),
             "static java.lang.String[] words"
         );
-        assert_eq!(render_field("grid", "[[J", 0), "long[][] grid");
+        assert_eq!(render_field("grid", "[[J", None, 0), "long[][] grid");
     }
 
     // DISC-5: the three modifiers are marked because each changes what a caller can DO with the field,
     // and they combine in Java's own order rather than overriding one another.
     #[test]
     fn field_rendering_marks_static_final_and_volatile() {
-        assert_eq!(render_field("MAX", "I", ACC_STATIC | ACC_FINAL), "static final int MAX");
-        assert_eq!(render_field("running", "Z", ACC_VOLATILE), "volatile boolean running");
+        assert_eq!(render_field("MAX", "I", None, ACC_STATIC | ACC_FINAL), "static final int MAX");
+        assert_eq!(render_field("running", "Z", None, ACC_VOLATILE), "volatile boolean running");
         // Flags this tool does not render must not leak in: 0x0002 is ACC_PRIVATE, 0x1000 ACC_SYNTHETIC.
-        assert_eq!(render_field("this$0", "Lcom/example/Outer;", 0x1002), "com.example.Outer this$0");
+        assert_eq!(render_field("this$0", "Lcom/example/Outer;", None, 0x1002), "com.example.Outer this$0");
     }
 
     // DISC-5: `0/0 field(s)` is a correct answer that reads like a failed lookup, and the three ways to

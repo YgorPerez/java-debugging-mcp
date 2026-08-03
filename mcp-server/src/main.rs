@@ -29,6 +29,7 @@ use tracing::{debug, error, info};
 
 mod args;
 mod classfile;
+mod generics;
 mod handlers;
 mod protocol;
 mod session;
