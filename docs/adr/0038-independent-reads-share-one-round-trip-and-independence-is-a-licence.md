@@ -246,6 +246,59 @@ anything about them, so the walk resolves the filter **first** — which costs n
 class name is read either way — and prefetches only the survivors. **Speculation is the one way this change
 could cost more than the loop it replaces, and it is the property every one of these conversions protects.**
 
+## The third call site: a dump's triage, where a caller-facing model had to be amended
+
+`triage_dump_threads` read a thread's **name** and **status** one at a time, for every thread the VM has — 306
+on a production-shaped instance, and under the suspension. It is now two waves per window of sixteen threads,
+with the name filter between them, because a thread whose name is filtered out never had its status read and
+must not start being read now. `collect_thread_rows` behind `debug.list_threads` has the same shape and the
+same fix.
+
+**Chunked by `INDEPENDENT_READ_WINDOW` rather than handed all 306 ids**, which is the only reason that constant
+is public. A dump's suspension budget is what bounds the freeze and it is checked between threads; nothing can
+interrupt one `read_independently`. Chunking hands the budget back every window and costs it nothing in time —
+a window of sixteen takes about as long as one sequential read — so the budget is checked as often in *time* as
+before, and a sixteenth as often in *threads*.
+
+Measured on a 20-thread dump at a 4ms round trip, through `LatencyRelay`:
+
+```text
+  packets              763  ->  763   (unchanged, as always)
+  held (VM frozen)   3731ms -> 1175ms  (-68%)
+  reported per packet 4.89ms -> 1.54ms
+```
+
+**The freeze is a third of what it was, and that is the payoff #100 says matters most** — more than the latency,
+because a shorter suspension is less time a shared instance is stopped.
+
+### What this cost: `held ≈ packets × (our processing + RTT)` is no longer true
+
+That model is TEST-8's and ADR-0011's, and the dump **reports the per-packet term to callers**. It was exact
+while every packet was awaited on its own. It is now:
+
+```text
+  held ≈ round_trips × RTT + packets × our processing
+```
+
+`latency_added_to_the_wire_shows_up_as_held_time_per_packet` failed on this, at 1.45ms against a floor of
+1.6ms — which is how the amendment was found rather than predicted. Its assertion now divides by round trips
+instead of by packets, which restores the linearity it was written to demonstrate against the denominator that
+actually carries the RTT.
+
+### So a cost line reports both numbers
+
+`Cost: 763 JDWP packet(s) in ~180 round trip(s), 1.54ms each`. Both, because they answer different questions: a
+caller reasoning about a remote instance needs the waits, and a caller comparing releases needs the traffic —
+the packet count stays deterministic and load-independent, which is why it was not replaced. The clause is
+**suppressed when the two are equal**, since printing one number twice as two facts is worse than printing it
+once; seeing the clause is itself the information that something overlapped.
+
+`JdwpConnection::round_trips()` is derived from the window and not observed on the socket — a single read counts
+one, a wave of `n` counts `ceil(n / 16)` — so it is a tight lower bound rather than a measurement, and every
+reply that prints it prints a `~`. This is a caller-visible reply change and `docs/toolkit-contract.md` carries
+it as the "Change what a reply says" row, including the warning that the *smaller* per-packet number is the dump
+getting faster rather than a regression.
+
 ## Consequences
 
 - `issue` / `InFlight` / `read_independently` are public API on an unpublished crate. `scripts/semver-check.sh`

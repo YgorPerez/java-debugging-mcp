@@ -168,15 +168,73 @@ impl JdwpConnection {
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_thread_name(&mut self, thread_id: ThreadId) -> JdwpResult<String> {
-        let id = self.next_id();
-        let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::NAME);
-        packet.data.put_u64(thread_id);
-
+        let packet = self.thread_read_request(thread_id, thread_commands::NAME);
         let reply = self.send_command(packet).await?;
-        reply.check_error()?;
+        Self::decode_thread_name(&reply)
+    }
 
+    /// The name of each of `thread_ids`, read as **independent reads** (PERF-1, #100).
+    ///
+    /// **The widest fan-out in the tool.** A dump's triage asks this of every thread the VM has — 306 on a
+    /// production-shaped instance — and used to ask one at a time, under the suspension. A thread's name is
+    /// nothing to do with any other thread's, so this is a wave.
+    ///
+    /// **Chunk by [`INDEPENDENT_READ_WINDOW`](crate::INDEPENDENT_READ_WINDOW) if you have a deadline to
+    /// honour.** Passing all 306 ids is correct and bounded, but nothing can interrupt the call once it
+    /// starts, and a dump's suspension budget is checked between threads. Chunking hands the budget back
+    /// every window — which costs it nothing in time, because a window of sixteen takes about as long as one
+    /// sequential read.
+    pub async fn read_thread_names_independently(&self, thread_ids: &[ThreadId]) -> Vec<JdwpResult<String>> {
+        let packets =
+            thread_ids.iter().map(|&t| self.thread_read_request(t, thread_commands::NAME)).collect();
+        self.read_independently(packets)
+            .await
+            .into_iter()
+            .map(|reply| reply.and_then(|r| Self::decode_thread_name(&r)))
+            .collect()
+    }
+
+    /// The `(thread_status, suspend_status)` of each of `thread_ids`, read as **independent reads**.
+    ///
+    /// The dump's second per-thread read, and the one that must go out **after** the name filter rather than
+    /// beside it: a thread whose name is filtered out never has its status read on the sequential path, so a
+    /// single wave over both would spend a packet the loop never spent. See `triage_dump_threads`.
+    pub async fn read_thread_statuses_independently(
+        &self,
+        thread_ids: &[ThreadId],
+    ) -> Vec<JdwpResult<(i32, i32)>> {
+        let packets =
+            thread_ids.iter().map(|&t| self.thread_read_request(t, thread_commands::STATUS)).collect();
+        self.read_independently(packets)
+            .await
+            .into_iter()
+            .map(|reply| reply.and_then(|r| Self::decode_thread_status(&r)))
+            .collect()
+    }
+
+    /// The request half of any `ThreadReference` command whose whole payload is the thread id — `Name`,
+    /// `Status`, `SuspendCount` and friends all share that shape.
+    fn thread_read_request(&self, thread_id: ThreadId, command: u8) -> CommandPacket {
+        let id = self.next_id();
+        let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, command);
+        packet.data.put_u64(thread_id);
+        packet
+    }
+
+    /// The decode half of `ThreadReference.Name`, error check included.
+    fn decode_thread_name(reply: &crate::protocol::ReplyPacket) -> JdwpResult<String> {
+        reply.check_error()?;
         let mut data = reply.data();
         read_string(&mut data)
+    }
+
+    /// The decode half of `ThreadReference.Status`, error check included.
+    fn decode_thread_status(reply: &crate::protocol::ReplyPacket) -> JdwpResult<(i32, i32)> {
+        reply.check_error()?;
+        let mut data = reply.data();
+        let thread_status = read_i32(&mut data)?;
+        let suspend_status = read_i32(&mut data)?;
+        Ok((thread_status, suspend_status))
     }
 
     /// Get a thread's (`thread_status`, `suspend_status`) (ThreadReference.Status).
@@ -185,17 +243,9 @@ impl JdwpConnection {
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_thread_status(&mut self, thread_id: ThreadId) -> JdwpResult<(i32, i32)> {
-        let id = self.next_id();
-        let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::STATUS);
-        packet.data.put_u64(thread_id);
-
+        let packet = self.thread_read_request(thread_id, thread_commands::STATUS);
         let reply = self.send_command(packet).await?;
-        reply.check_error()?;
-
-        let mut data = reply.data();
-        let thread_status = read_i32(&mut data)?;
-        let suspend_status = read_i32(&mut data)?;
-        Ok((thread_status, suspend_status))
+        Self::decode_thread_status(&reply)
     }
 
     /// How many times this thread has been suspended (`ThreadReference.SuspendCount`).

@@ -3329,7 +3329,7 @@ fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
     // Attaching THROUGH the relay is the whole point: the debugger is told nothing about it.
     server.attach(relay.port);
 
-    let mut sample = |delay: std::time::Duration| -> (u64, f64) {
+    let mut sample = |delay: std::time::Duration| -> (u64, f64, u32) {
         relay.set_rtt(delay);
         let dump = server.call("debug.thread_dump", workload.clone());
         let packets = dump_packet_cost(&dump).unwrap_or_else(|| {
@@ -3343,7 +3343,12 @@ fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
         let reported = dump_per_packet_ms(&dump).unwrap_or_else(|| {
             panic!("the dump must report its own per-packet cost — the reply was:\n{}", head_of(&dump))
         });
-        (packets, reported)
+        // The denominator the RTT term actually scales with, since PERF-1 (#100). A dump that waved nothing
+        // reports no clause and this is its packet count, which is what the old model assumed for everything.
+        let waits = dump_round_trips(&dump).unwrap_or_else(|| {
+            panic!("the dump must report its round trips — the reply was:\n{}", head_of(&dump))
+        });
+        (packets, reported, waits)
     };
 
     // The first dump on a fresh connection also fills the connection-lifetime method-list cache every
@@ -3366,11 +3371,11 @@ fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
         near.push(sample(std::time::Duration::ZERO));
         far.push(sample(rtt));
     }
-    let fastest = |arm: &[(u64, f64)]| -> (u64, f64) {
+    let fastest = |arm: &[(u64, f64, u32)]| -> (u64, f64, u32) {
         arm.iter().copied().min_by(|a, b| a.1.total_cmp(&b.1)).expect("an arm with no samples")
     };
-    let (near_packets, near_per_packet) = fastest(&near);
-    let (far_packets, far_per_packet) = fastest(&far);
+    let (near_packets, near_per_packet, _) = fastest(&near);
+    let (far_packets, far_per_packet, far_waits) = fastest(&far);
 
     // Same work either way — if the delay changed what was read, the comparison would be meaningless.
     assert!(
@@ -3379,19 +3384,26 @@ fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
          straight through vs {far_packets} with it holding each chunk"
     );
 
-    // Each packet crosses the wire once, so the round trip shows up in the per-packet figure the dump
-    // reports: at least ~half of it even allowing for coalescing, and at most a few times it allowing for
-    // sleep granularity. This is the linearity that makes packet count the lever.
+    // The round trip shows up once per WAIT, which is the amendment PERF-1 (#100) forced on this test and
+    // on ADR-0011's model. It used to divide by packets, because every packet was awaited on its own and
+    // the two numbers were the same; a dump's triage now sends sixteen reads per wait, so dividing by
+    // packets under-reports the RTT by the waving factor and this test failed at 1.45ms against a floor of
+    // 1.6 — measured, and it is what the amendment is drawn from rather than a prediction of it.
+    //
+    // `held ≈ round_trips × RTT + packets × our processing`. The RTT term is isolated by taking the
+    // difference between the arms (which cancels our processing) and dividing by the waits.
     let rtt_ms = rtt.as_secs_f64() * 1000.0;
-    let added = far_per_packet - near_per_packet;
+    let added_total = (far_per_packet - near_per_packet) * f64::from(u32::try_from(far_packets).unwrap_or(1));
+    let added = added_total / f64::from(far_waits.max(1));
     assert!(
         (rtt_ms * 0.4..rtt_ms * 3.0).contains(&added),
-        "a {rtt_ms}ms round trip should show up as roughly that much per packet: the fastest of {ROUNDS} \
-         dumps reported {near_per_packet:.2}ms/packet with the relay passing traffic straight through and \
-         {far_per_packet:.2}ms/packet with it holding each chunk, a difference of {added:.2}ms. If this \
-         is ~0, either the relay is not delaying anything or the dump is not measuring itself — and every \
-         measurement taken through it is worthless.\n  straight through: {near:?}\n  {rtt_ms}ms away: \
-         {far:?}"
+        "a {rtt_ms}ms round trip should show up as roughly that much per ROUND TRIP: the fastest of \
+         {ROUNDS} dumps reported {near_per_packet:.2}ms/packet straight through and {far_per_packet:.2}ms \
+         with the relay holding each chunk, which over {far_packets} packets is {added_total:.0}ms added \
+         across {far_waits} round trip(s) — {added:.2}ms each. If this is ~0, either the relay is not \
+         delaying anything or the dump is not measuring itself, and every measurement taken through it is \
+         worthless. If it is several times the RTT, the dump is waiting more often than it says it \
+         is.\n  straight through: {near:?}\n  {rtt_ms}ms away: {far:?}"
     );
 
     server.panic_reset();
@@ -3630,8 +3642,20 @@ fn dump_packet_cost(dump: &str) -> Option<u64> {
 
 /// The `, 0.42ms each` figure the cost line reports — this connection's observed per-packet price.
 fn dump_per_packet_ms(dump: &str) -> Option<f64> {
-    let at = dump.find("packet(s), ")? + "packet(s), ".len();
-    dump.get(at..)?.split("ms each").next()?.trim().parse().ok()
+    // Read back from `ms each` rather than forward from `packet(s), `, because PERF-1 (#100) put a
+    // round-trip clause between them: `763 JDWP packet(s) in ~180 round trip(s) — …, 1.54ms each`.
+    let end = dump.find("ms each")?;
+    let head = dump.get(..end)?;
+    head.rsplit_once(", ")?.1.trim().parse().ok()
+}
+
+/// A dump's `in ~180 round trip(s)` clause (PERF-1, #100), or the packet count when there is no clause —
+/// which is what "nothing on this path overlapped" looks like, and is the honest fallback rather than zero.
+fn dump_round_trips(dump: &str) -> Option<u32> {
+    match dump.split_once(" in ~") {
+        Some((_, rest)) => rest.split_once(" round trip(s)")?.0.trim().parse().ok(),
+        None => dump_packet_cost(dump).and_then(|c| u32::try_from(c).ok()),
+    }
 }
 
 /// A dump's header lines only — the whole thing is thousands of frames, which no assertion message wants.

@@ -1333,7 +1333,7 @@ impl RequestHandler {
         let total = all.len();
 
         let ThreadListing { rows, selection } =
-            collect_thread_rows(&mut session.connection, &all, limit, name_filter.as_deref(), only_suspended)
+            collect_thread_rows(&session.connection, &all, limit, name_filter.as_deref(), only_suspended)
                 .await;
         let cost = session.connection.packets_sent().saturating_sub(before);
         let wire = wire_from.elapsed();
@@ -1990,6 +1990,8 @@ impl RequestHandler {
         let mut session = session_guard.lock().await;
 
         let before = session.connection.packets_sent();
+        // Started with the packet counter, so the two figures cover exactly the same window (PERF-1, #100).
+        let waits_before = session.connection.round_trips();
         // Same start as the packet counter, so `wire / cost` is a per-packet figure over exactly the
         // packets it counts — including the suspend and resume, which are round trips like any other.
         let wire_from = std::time::Instant::now();
@@ -2065,6 +2067,7 @@ impl RequestHandler {
             }
         }
         let cost = session.connection.packets_sent().saturating_sub(before);
+        let round_trips = session.connection.round_trips().saturating_sub(waits_before);
         let wire = wire_from.elapsed();
         drop(session);
 
@@ -2073,6 +2076,7 @@ impl RequestHandler {
             already_suspended: already,
             resume_note: &resume_note,
             cost,
+            round_trips,
             wire,
             held,
             unread: dump.unread,
@@ -20630,7 +20634,7 @@ struct ThreadListing {
 /// Unlike the dump this holds no suspension, so there is no budget on the pass: the only thing it spends
 /// is the caller's own latency, and it is linear in a number the reply states.
 async fn collect_thread_rows(
-    conn: &mut jdwp_client::JdwpConnection,
+    conn: &jdwp_client::JdwpConnection,
     all: &[u64],
     limit: usize,
     name_filter: Option<&str>,
@@ -20639,30 +20643,35 @@ async fn collect_thread_rows(
     // Every thread that could take a slot, in creation order. The `status` read is skipped unless
     // `only_suspended` asked for it — one packet per thread rather than the dump's two, because a
     // listing shows no status it did not already have to fetch to filter on.
+    // PERF-1 (#100): one wave of names, then — only when `only_suspended` asked for it — one wave of
+    // statuses over the survivors. The same two-waves-with-a-filter-between-them shape as the dump's
+    // triage, and for the same reason: a filtered-out thread never had its status read.
+    //
+    // Not chunked, where the dump's triage is: a listing has no suspension budget to hand back between
+    // windows, because it does not suspend anything.
     let mut candidates: Vec<ThreadRow> = Vec::new();
-    for tid in all {
-        let name = conn.get_thread_name(*tid).await.unwrap_or_default();
-        if let Some(f) = name_filter {
-            if !name.to_lowercase().contains(f) {
-                continue;
+    let visible: Vec<(u64, String)> = all
+        .iter()
+        .copied()
+        .zip(conn.read_thread_names_independently(all).await)
+        .map(|(tid, name)| (tid, name.unwrap_or_default()))
+        .filter(|(_, name)| name_filter.is_none_or(|f| name.to_lowercase().contains(f)))
+        .collect();
+    if only_suspended {
+        let ids: Vec<u64> = visible.iter().map(|&(tid, _)| tid).collect();
+        for ((tid, name), status) in
+            visible.into_iter().zip(conn.read_thread_statuses_independently(&ids).await)
+        {
+            // The read failing is how a thread that died under us announces itself. Skipped rather
+            // than shown as a row of unknowns, exactly as the dump's triage does.
+            let Ok((ts, ss)) = status else { continue };
+            if ss == 0 {
+                continue; // not suspended
             }
+            candidates.push((tid, name, Some(thread_status_name(ts).to_string())));
         }
-        let status = if only_suspended {
-            match conn.get_thread_status(*tid).await {
-                Ok((ts, ss)) => {
-                    if ss == 0 {
-                        continue; // not suspended
-                    }
-                    Some(thread_status_name(ts).to_string())
-                }
-                // The read failing is how a thread that died under us announces itself. Skipped rather
-                // than shown as a row of unknowns, exactly as the dump's triage does.
-                Err(_) => continue,
-            }
-        } else {
-            None
-        };
-        candidates.push((*tid, name, status));
+    } else {
+        candidates.extend(visible.into_iter().map(|(tid, name)| (tid, name, None)));
     }
 
     let eligible = candidates.len();
@@ -20881,7 +20890,7 @@ struct DumpTriage {
 /// indistinguishable from rows `limit` withheld — see `render_thread_dump`'s footer for why that
 /// mattered.
 async fn triage_dump_threads(
-    conn: &mut jdwp_client::JdwpConnection,
+    conn: &jdwp_client::JdwpConnection,
     all: &[u64],
     a: &crate::args::ThreadDumpArgs,
     name_filter: Option<&str>,
@@ -20891,28 +20900,52 @@ async fn triage_dump_threads(
     let triage_deadline = deadline.map(|d| now + d.saturating_duration_since(now) / 2);
     let mut candidates = Vec::new();
     let mut vanished = 0usize;
-    for (seen, tid) in all.iter().enumerate() {
+    // PERF-1 (#100): the two reads per thread go out as two waves per WINDOW of threads, not two round
+    // trips per thread — the widest fan-out in the tool, and it runs while the VM is frozen.
+    //
+    // **Chunked rather than handed the whole list**, because the budget above is what bounds the freeze and
+    // nothing can interrupt one `read_independently`. A window hands it back sixteen threads at a time, and
+    // costs it nothing: a window of sixteen takes about as long as one sequential read, so the budget is
+    // checked as often in TIME as it was before even though it is checked a sixteenth as often in threads.
+    let mut triaged = 0usize;
+    for window in all.chunks(jdwp_client::INDEPENDENT_READ_WINDOW) {
         if triage_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            return DumpTriage { candidates, untriaged: all.len() - seen, vanished };
+            return DumpTriage { candidates, untriaged: all.len() - triaged, vanished };
         }
-        let name = conn.get_thread_name(*tid).await.unwrap_or_default();
-        if name_filter.is_some_and(|f| !name.to_lowercase().contains(f)) {
-            continue;
+        // WAVE 1 — every thread's name. Read for every thread either way, filter or no filter.
+        //
+        // The name filter is applied BETWEEN the waves, which is what keeps the packet count identical: a
+        // thread whose name is filtered out never had its status read, and must not start being read now.
+        let wanted: Vec<(usize, u64, String)> = conn
+            .read_thread_names_independently(window)
+            .await
+            .into_iter()
+            .enumerate()
+            .map(|(at, name)| (triaged + at, window.get(at).copied().unwrap_or(0), name.unwrap_or_default()))
+            .filter(|(_, _, name)| name_filter.is_none_or(|f| name.to_lowercase().contains(f)))
+            .collect();
+        triaged += window.len();
+        let ids: Vec<u64> = wanted.iter().map(|&(_, tid, _)| tid).collect();
+
+        // WAVE 2 — the survivors' statuses.
+        for ((seen, tid, name), status) in
+            wanted.into_iter().zip(conn.read_thread_statuses_independently(&ids).await)
+        {
+            // A thread that can't report its status has almost certainly died; skip it rather than showing
+            // a row of unknowns — but COUNT it, because the reply has to say what became of the difference,
+            // and "the caller's limit" was the wrong answer (DUMP-4, #47).
+            let Ok((ts, ss)) = status else {
+                vanished += 1;
+                continue;
+            };
+            let (status, suspended, finished) = (thread_status_name(ts), ss != 0, ts == THREAD_STATUS_ZOMBIE);
+            // Applied here rather than when the row is built, so the `limit` is spent on threads that are
+            // actually readable instead of on slots that turn out empty.
+            if a.only_suspended && !suspended {
+                continue;
+            }
+            candidates.push(DumpCandidate { seen, tid, name, status, suspended, finished });
         }
-        // A thread that can't report its status has almost certainly died; skip it rather than showing a
-        // row of unknowns — but COUNT it, because the reply has to say what became of the difference, and
-        // "the caller's limit" was the wrong answer (DUMP-4, #47).
-        let Ok((ts, ss)) = conn.get_thread_status(*tid).await else {
-            vanished += 1;
-            continue;
-        };
-        let (status, suspended, finished) = (thread_status_name(ts), ss != 0, ts == THREAD_STATUS_ZOMBIE);
-        // Applied here rather than when the row is built, so the `limit` is spent on threads that are
-        // actually readable instead of on slots that turn out empty.
-        if a.only_suspended && !suspended {
-            continue;
-        }
-        candidates.push(DumpCandidate { seen, tid: *tid, name, status, suspended, finished });
     }
     DumpTriage { candidates, untriaged: 0, vanished }
 }
@@ -20963,9 +20996,18 @@ struct DumpMeta<'a> {
     already_suspended: bool,
     resume_note: &'a str,
     cost: u32,
-    /// Wall time spent on JDWP traffic for this dump — every round trip in `cost`, from the thread list to
-    /// the resume. Divided by `cost` it gives this connection's **observed** per-packet price, which is the
-    /// one environment-specific term in `held ≈ packets × (our processing + RTT)` (TEST-8, ADR-0011).
+    /// Round trips this dump waited for, which stopped being the same number as `cost` when PERF-1 (#100)
+    /// let the triage's two reads per thread go out sixteen at a time.
+    round_trips: u32,
+    /// Wall time spent on JDWP traffic for this dump — from the thread list to the resume. Divided by `cost`
+    /// it gives this connection's observed per-**packet** price.
+    ///
+    /// **The model that price belongs to has been amended.** TEST-8 and ADR-0011 stated
+    /// `held ≈ packets × (our processing + RTT)`, which was exact while every packet was awaited on its own.
+    /// It is now `held ≈ round_trips × RTT + packets × our processing`: the RTT term scales with the waits
+    /// and the processing term with the traffic, and before independent reads those were one term because
+    /// they were one number. Measured on a 20-thread dump at a 4ms round trip: 763 packets and 4.89ms each
+    /// before, the same 763 packets and 1.54ms each after — the packets did not move and the waiting did.
     ///
     /// Reported because it is the number a caller would otherwise have to derive by hand, and the one that
     /// makes a figure measured on loopback inapplicable to their instance. Present even when nothing was
@@ -21361,6 +21403,31 @@ fn per_packet_note(cost: u32, wire: std::time::Duration) -> String {
     }
     let per = wire.as_secs_f64() * 1000.0 / f64::from(cost);
     format!(", {per:.2}ms each (round trip + our own processing)")
+}
+
+/// The `in ~48 round trip(s)` clause on a cost line, and the sentence that stops the packet count from
+/// being read as the wait (PERF-1, #100).
+///
+/// **Both numbers or neither.** Before independent reads, a packet count and a round trip count were the
+/// same number and one figure said everything. They are not any more: the reads a wave covers are sent as
+/// `n` packets and waited on about `n / 16` times, so a caller reasoning about a remote instance needs the
+/// round trips and a caller comparing releases needs the packets. Printing only the first would hide the
+/// improvement; printing only the second would suggest the packet figure still predicts the wait.
+///
+/// The `~` is doing real work: [`round_trips`](jdwp_client::JdwpConnection::round_trips) is derived from the
+/// window rather than observed on the socket, so it is a tight lower bound and says so.
+///
+/// Suppressed when it equals the packet count, which is every path with nothing waved on it — there is no
+/// information in printing the same number twice, and a caller who sees the clause learns that this
+/// particular reply overlapped something.
+fn round_trip_note(cost: u32, round_trips: u32) -> String {
+    if round_trips >= cost || round_trips == 0 {
+        return String::new();
+    }
+    format!(
+        " in ~{round_trips} round trip(s) — independent reads share one, so the packet count above is \
+         what crossed the wire and this is what was waited for"
+    )
 }
 
 /// What a truncated `debug.list_threads` spent, and what the rule it now selects by added (DUMP-5, #51).
@@ -21793,7 +21860,13 @@ fn render_thread_dump(
              later dump will simply not list them."
         );
     }
-    let _ = write!(out, "\nCost: {} JDWP packet(s){}.", meta.cost, per_packet_note(meta.cost, meta.wire));
+    let _ = write!(
+        out,
+        "\nCost: {} JDWP packet(s){}{}.",
+        meta.cost,
+        round_trip_note(meta.cost, meta.round_trips),
+        per_packet_note(meta.cost, meta.wire)
+    );
     out
 }
 
@@ -23664,6 +23737,10 @@ mod tests {
             already_suspended: false,
             resume_note: "",
             cost,
+            // Equal to `cost`, which is what "nothing was waved" looks like — and it keeps the round-trip
+            // clause suppressed, so the render tests that are not about PERF-1 keep the output they were
+            // written against. A test about the clause sets it.
+            round_trips: cost,
             // A round number against the `cost` each test passes, so a per-packet figure in an assertion is
             // arithmetic the reader can check rather than a magic constant.
             wire: std::time::Duration::from_millis(u64::from(cost)),
@@ -24086,6 +24163,35 @@ mod tests {
         );
         assert!(with_frames.contains("frames~\"com.acme\""), "a real frame filter is echoed:\n{with_frames}");
         assert!(!with_frames.contains("had no effect"), "and not disclaimed:\n{with_frames}");
+    }
+
+    /// PERF-1 (#100): the cost line reports round trips **as well as** packets once they differ, and says
+    /// nothing extra when they do not.
+    ///
+    /// Both halves matter. A dump whose triage waved sixteen reads per wait sends the same packets and waits
+    /// a sixteenth as often, so a caller reasoning about a remote instance needs the waits — and one
+    /// comparing releases needs the packets, which is why neither replaces the other. But a path with
+    /// nothing waved must not print the same number twice dressed as two facts: seeing the clause is
+    /// itself the information that something overlapped.
+    #[test]
+    fn a_dump_reports_its_round_trips_only_when_they_differ_from_its_packets() {
+        let mut waved = dump_meta(60, 763);
+        waved.round_trips = 180;
+        let out = render_thread_dump(&[dump_row(0x8, "worker")], &dump_args(json!({})), None, &waved);
+        assert!(out.contains("763 JDWP packet(s) in ~180 round trip(s)"), "both figures:\n{out}");
+        assert!(
+            out.contains("what crossed the wire") && out.contains("what was waited for"),
+            "the clause has to say which number is which, or a caller reads the smaller one as the cost:\n{out}"
+        );
+
+        // Nothing waved: `dump_meta` sets `round_trips == cost`, which is the honest way to say so.
+        let plain =
+            render_thread_dump(&[dump_row(0x8, "worker")], &dump_args(json!({})), None, &dump_meta(60, 763));
+        assert!(
+            !plain.contains("round trip(s)"),
+            "a path that overlapped nothing must not print its packet count twice:\n{plain}"
+        );
+        assert!(plain.contains("763 JDWP packet(s)"), "the packet count is still reported:\n{plain}");
     }
 
     // #17: the held duration is reported whenever this dump owned the freeze, and NOT when it didn't —

@@ -52,6 +52,19 @@ Ordered by how *quietly* it breaks, because that is what decides whether it need
 Six of seven are silent. So the rule is not "avoid breaking them" — it is **say what changed, in the release
 notes, in caller-visible terms**.
 
+**PERF-1 (#100) is the "Change what a reply says" row, and it is the mild version of it.** A dump's cost line
+now reads `Cost: 763 JDWP packet(s) in ~180 round trip(s), 1.54ms each` where it used to read
+`Cost: 763 JDWP packet(s), 4.89ms each`. Nothing was renamed and nothing was removed — a clause was added
+between two things that were already there — so prose quoting the packet count still holds and prose quoting
+the per-packet figure now reads a smaller number for the same work.
+
+That smaller number is the thing to state, because it is easy to read as a regression in reverse: the dump got
+**faster** (the same 763 packets, held 3731ms → 1175ms at a 4ms round trip), and the per-packet price fell
+because packets stopped being waited on one at a time. Anything downstream that quotes "~0.2ms per packet on
+loopback" or reasons that `held ≈ packets × RTT` is now working from the wrong model; the release notes have to
+say `held ≈ round_trips × RTT + packets × our processing`, and that the round trips are the figure to reason
+about on a remote instance. `CONTEXT.md`'s `Packet` entry and ADR-0038 carry the same amendment.
+
 **`debug.run_named_query` (EVAL-11, #124) is the "Add a tool" row being exercised, and that row is silent.**
 The toolkit will install a binary that can run a named JPA query and its skills will not mention it, so
 nobody will call it — the tool is not broken, it is invisible. Two things follow. The release notes have to

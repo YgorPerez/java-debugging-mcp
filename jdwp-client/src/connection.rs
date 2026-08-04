@@ -42,7 +42,12 @@ pub const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 2000;
 /// the trade and it is deliberately on the safe side of it: sixteen-fold is already most of the available
 /// fan-out on the reads PERF-1 names, and the numbers above stop being reassuring well before a window
 /// large enough to matter more.
-const INDEPENDENT_READ_WINDOW: usize = 16;
+///
+/// **Public because a caller with a deadline has to chunk by it.** A dump checks its suspension budget
+/// between threads, and nothing can interrupt one call to `read_independently`; chunking the caller's list
+/// by this hands the budget back every window at no cost in time, since a window takes about as long as one
+/// sequential read. That is the only reason a tuning constant is on the public surface.
+pub const INDEPENDENT_READ_WINDOW: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct JdwpConnection {
@@ -62,6 +67,8 @@ pub struct JdwpConnection {
     /// when the invoked method could never complete. `Arc` for the same reason as `read_only`: the event
     /// pump's clone renders trace snapshots and must obey the same budget.
     invoke_timeout_ms: Arc<AtomicU64>,
+    /// How many round trips this connection has waited for — see [`round_trips`](Self::round_trips).
+    round_trips: Arc<AtomicU32>,
 }
 
 impl JdwpConnection {
@@ -87,6 +94,7 @@ impl JdwpConnection {
             types: Arc::new(TypeCache::default()),
             read_only: Arc::new(AtomicBool::new(false)),
             invoke_timeout_ms: Arc::new(AtomicU64::new(DEFAULT_INVOKE_TIMEOUT_MS)),
+            round_trips: Arc::new(AtomicU32::new(0)),
         })
     }
 
@@ -183,7 +191,26 @@ impl JdwpConnection {
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn send_command(&mut self, packet: CommandPacket) -> JdwpResult<ReplyPacket> {
         debug!("Sending command packet id={}", packet.id);
+        self.round_trips.fetch_add(1, Ordering::SeqCst);
         self.event_loop.send_command(packet).await
+    }
+
+    /// How many round trips this connection has waited for.
+    ///
+    /// **The second cost figure, and PERF-1 (#100) is why there are two.** A packet count says what was put
+    /// on the wire; this says how many times the wire was *waited on*, and until independent reads existed
+    /// the two were the same number. They are not any more: a wave of sixteen reads is sixteen packets and
+    /// about one round trip, so on a remote JVM this is the figure that predicts the wait and the packet
+    /// count is the figure that predicts nothing about it.
+    ///
+    /// **Derived from the window, not observed on the socket, and the difference is worth knowing.** A
+    /// single read counts one. A wave of `n` counts `ceil(n / INDEPENDENT_READ_WINDOW)`, because at most a
+    /// window's worth can be outstanding at once — so `n` reads cannot take fewer sequential batches than
+    /// that, and the sliding window reaches the bound within one. It is therefore a **tight lower bound**
+    /// rather than a measurement, which is why every reply that prints it prints it with a `~`.
+    #[must_use]
+    pub fn round_trips(&self) -> u32 {
+        self.round_trips.load(Ordering::SeqCst)
     }
 
     /// Issue **independent reads** together and return one result per command, in the order given.
@@ -211,6 +238,10 @@ impl JdwpConnection {
     /// [`send_command`](Self::send_command) returns it; the caller still owes it a
     /// [`check_error`](ReplyPacket::check_error).
     pub async fn read_independently(&self, packets: Vec<CommandPacket>) -> Vec<JdwpResult<ReplyPacket>> {
+        // Counted before anything is issued, from the window rather than from the socket — see
+        // [`round_trips`](Self::round_trips) for why that is a bound and not a measurement.
+        let waves = packets.len().div_ceil(INDEPENDENT_READ_WINDOW);
+        self.round_trips.fetch_add(u32::try_from(waves).unwrap_or(u32::MAX), Ordering::SeqCst);
         let mut results: Vec<JdwpResult<ReplyPacket>> = Vec::with_capacity(packets.len());
         // Awaited in issue order, which costs nothing: each reply has its own channel, so a reply that
         // arrives out of order is already sitting there when its turn comes. The window is what bounds
