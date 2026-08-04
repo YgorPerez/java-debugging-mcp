@@ -1328,7 +1328,8 @@ impl RequestHandler {
             // brings here — "which of these did I freeze?" — is per thread, and a count at the bottom
             // of a 40-row listing answers it for none of them.
             let mine = held.get(tid).map_or_else(String::new, |(_, since)| {
-                format!(" ⏸️ SUSPENDED BY YOU ({} ago, debug.resume_thread releases it)", ago(*since))
+                // `ago` already ends in " ago" — this said "0s ago ago" until TEST-43's control printed it.
+                format!(" ⏸️ SUSPENDED BY YOU ({}, debug.resume_thread releases it)", ago(*since))
             });
             let _ = match status {
                 Some(s) => writeln!(output, "0x{tid:x} {name} [{s}]{mine}"),
@@ -1340,7 +1341,7 @@ impl RequestHandler {
         let unshown: Vec<String> = held
             .iter()
             .filter(|(t, _)| !rows.iter().any(|(r, _, _)| r == *t))
-            .map(|(t, (n, since))| format!("0x{t:x} \"{n}\" ({} ago)", ago(*since)))
+            .map(|(t, (n, since))| format!("0x{t:x} \"{n}\" ({})", ago(*since)))
             .collect();
         if !unshown.is_empty() {
             let _ = writeln!(
