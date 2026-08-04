@@ -27,6 +27,38 @@ impl JdwpConnection {
         frame_id: FrameId,
         slots: Vec<VariableSlot>,
     ) -> JdwpResult<Vec<Value>> {
+        let packet = self.frame_values_request(thread_id, frame_id, &slots);
+        let reply = self.send_command(packet).await?;
+        Self::decode_frame_values(&reply)
+    }
+
+    /// The named slots of each `(thread, frame, slots)` read, issued as **independent reads** (PERF-1, #100).
+    ///
+    /// **The licence here is narrower than it looks, and the narrowing is caller-visible.** Reading one
+    /// frame's locals does not disturb another's, so a set of frames on a *suspended* thread is independent.
+    /// But a frame **id** is only valid until a method is invoked on its thread, and JDWP invalidates every
+    /// id on that thread when one is — so a wave built before any invocation is fine, and a wave built
+    /// across invocations reads stale ids. `debug.get_stack` therefore uses this on its shallow path and
+    /// not on the deep one, where rendering a value may invoke `toString()`. See `render_frame_variables`.
+    pub async fn read_frame_values_independently(
+        &self,
+        reads: &[(ThreadId, FrameId, Vec<VariableSlot>)],
+    ) -> Vec<JdwpResult<Vec<Value>>> {
+        let packets = reads.iter().map(|(t, f, slots)| self.frame_values_request(*t, *f, slots)).collect();
+        self.read_independently(packets)
+            .await
+            .into_iter()
+            .map(|reply| reply.and_then(|r| Self::decode_frame_values(&r)))
+            .collect()
+    }
+
+    /// The request half of `StackFrame.GetValues`.
+    fn frame_values_request(
+        &self,
+        thread_id: ThreadId,
+        frame_id: FrameId,
+        slots: &[VariableSlot],
+    ) -> CommandPacket {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::STACK_FRAME, stack_frame_commands::GET_VALUES);
 
@@ -38,12 +70,16 @@ impl JdwpConnection {
         packet.data.put_i32(i32::try_from(slots.len()).unwrap_or(i32::MAX));
 
         // Write each slot
-        for slot in &slots {
+        for slot in slots {
             packet.data.put_i32(slot.slot);
             packet.data.put_u8(slot.sig_byte);
         }
 
-        let reply = self.send_command(packet).await?;
+        packet
+    }
+
+    /// The decode half of `StackFrame.GetValues`, error check included.
+    fn decode_frame_values(reply: &crate::protocol::ReplyPacket) -> JdwpResult<Vec<Value>> {
         reply.check_error()?;
 
         let mut data = reply.data();

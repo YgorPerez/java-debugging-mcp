@@ -36,14 +36,44 @@ impl JdwpConnection {
         ref_type_id: ReferenceTypeId,
         method_id: MethodId,
     ) -> JdwpResult<LineTable> {
+        let packet = self.line_table_request(ref_type_id, method_id);
+        let reply = self.send_command(packet).await?;
+        Self::decode_line_table(&reply)
+    }
+
+    /// A line table for each `(type, method)` pair, read as **independent reads** (PERF-1, #100).
+    ///
+    /// Independent because a method's line table is fixed for the loaded method and naming one method
+    /// tells you nothing you need in order to name another.
+    ///
+    /// **Deduplicate before calling this.** A recursive stack has the same pair many times over, and this
+    /// will read it many times over — the licence is about issuing reads together, not about needing fewer
+    /// of them. `dump_frame_method`'s cache and `stack_method_tables`'s dedupe are where that is decided.
+    pub async fn read_line_tables_independently(
+        &self,
+        pairs: &[(ReferenceTypeId, MethodId)],
+    ) -> Vec<JdwpResult<LineTable>> {
+        let packets = pairs.iter().map(|&(t, m)| self.line_table_request(t, m)).collect();
+        self.read_independently(packets)
+            .await
+            .into_iter()
+            .map(|reply| reply.and_then(|r| Self::decode_line_table(&r)))
+            .collect()
+    }
+
+    /// The request half of `Method.LineTable`. See `reference_type_request` in `object.rs` for why the
+    /// halves are split out rather than duplicated.
+    fn line_table_request(&self, ref_type_id: ReferenceTypeId, method_id: MethodId) -> CommandPacket {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::METHOD, method_commands::LINE_TABLE);
-
         // Write reference type ID and method ID (both 8 bytes)
         packet.data.put_u64(ref_type_id);
         packet.data.put_u64(method_id);
+        packet
+    }
 
-        let reply = self.send_command(packet).await?;
+    /// The decode half of `Method.LineTable`, error check included.
+    fn decode_line_table(reply: &crate::protocol::ReplyPacket) -> JdwpResult<LineTable> {
         reply.check_error()?;
 
         let mut data = reply.data();
@@ -143,6 +173,75 @@ impl JdwpConnection {
         method_id: MethodId,
         with_generic: bool,
     ) -> JdwpResult<Vec<Variable>> {
+        let packet = self.variable_table_request(ref_type_id, method_id, with_generic);
+        let reply = self.send_command(packet).await?;
+        Self::decode_variable_table(&reply, with_generic)
+    }
+
+    /// A variable table for each `(type, method)` pair, read as **independent reads** (PERF-1, #100).
+    ///
+    /// **Two waves, because the fallback is per pair.** `get_variable_table` prefers
+    /// `VariableTableWithGeneric` and falls back to the plain command on `NOT_IMPLEMENTED`; a wave has to
+    /// reproduce that or a JVM without the generic command would lose every variable name at once instead
+    /// of one call at a time. So the generic wave goes out, the pairs that answered `NOT_IMPLEMENTED` are
+    /// collected, and those — usually none — go out as a second wave.
+    ///
+    /// `ABSENT_INFORMATION` is **not** a fallback case and is passed through per pair, exactly as the
+    /// single-read path leaves it: a `-g:none` build has no variable names and that is an answer, not an
+    /// error to retry.
+    ///
+    /// Deduplicate before calling, for the reason
+    /// [`read_line_tables_independently`](Self::read_line_tables_independently) gives.
+    pub async fn read_variable_tables_independently(
+        &self,
+        pairs: &[(ReferenceTypeId, MethodId)],
+    ) -> Vec<JdwpResult<Vec<Variable>>> {
+        let generic = self.variable_table_wave(pairs, true).await;
+
+        // The pairs the JVM refused the generic command for, with where each sits in the answer.
+        let retry: Vec<(usize, (ReferenceTypeId, MethodId))> = generic
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                matches!(r, Err(crate::JdwpError::JdwpErrorCode(code, _)) if *code == ERR_NOT_IMPLEMENTED)
+            })
+            .filter_map(|(at, _)| pairs.get(at).map(|&pair| (at, pair)))
+            .collect();
+        if retry.is_empty() {
+            return generic;
+        }
+
+        let plain_pairs: Vec<(ReferenceTypeId, MethodId)> = retry.iter().map(|&(_, pair)| pair).collect();
+        let mut out = generic;
+        for ((at, _), answer) in retry.into_iter().zip(self.variable_table_wave(&plain_pairs, false).await) {
+            if let Some(slot) = out.get_mut(at) {
+                *slot = answer;
+            }
+        }
+        out
+    }
+
+    /// One wave of variable-table reads, with or without the generic signature column.
+    async fn variable_table_wave(
+        &self,
+        pairs: &[(ReferenceTypeId, MethodId)],
+        with_generic: bool,
+    ) -> Vec<JdwpResult<Vec<Variable>>> {
+        let packets = pairs.iter().map(|&(t, m)| self.variable_table_request(t, m, with_generic)).collect();
+        self.read_independently(packets)
+            .await
+            .into_iter()
+            .map(|reply| reply.and_then(|r| Self::decode_variable_table(&r, with_generic)))
+            .collect()
+    }
+
+    /// The request half of `Method.VariableTable[WithGeneric]`.
+    fn variable_table_request(
+        &self,
+        ref_type_id: ReferenceTypeId,
+        method_id: MethodId,
+        with_generic: bool,
+    ) -> CommandPacket {
         let command = if with_generic {
             method_commands::VARIABLE_TABLE_WITH_GENERIC
         } else {
@@ -154,8 +253,15 @@ impl JdwpConnection {
         // Write reference type ID and method ID
         packet.data.put_u64(ref_type_id);
         packet.data.put_u64(method_id);
+        packet
+    }
 
-        let reply = self.send_command(packet).await?;
+    /// The decode half of `Method.VariableTable[WithGeneric]`, error check included. `with_generic` decides
+    /// the layout for the same reason it decides the command — one flag in one function, never two loops.
+    fn decode_variable_table(
+        reply: &crate::protocol::ReplyPacket,
+        with_generic: bool,
+    ) -> JdwpResult<Vec<Variable>> {
         reply.check_error()?;
 
         let mut data = reply.data();

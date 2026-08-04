@@ -1125,12 +1125,48 @@ impl RequestHandler {
                     DeepState::new(STACK_NODE_BUDGET),
                 )
             }),
+            pre: None,
         };
         if a.expand_objects && read_only {
             let _ = writeln!(output, "🔒 read-only: showing shallow values — expand_objects invokes methods in the debuggee, which is refused here.");
         }
 
         let walk = StackWalk { target_thread, package_filter: package_filter.as_deref(), include_variables };
+
+        // PERF-1 (#100): read every surviving frame's metadata in waves before rendering any of it.
+        //
+        // **Only on the shallow path, and for two separate reasons.** Rendering a value deeply invokes
+        // `toString()` in the debuggee, which invalidates every frame id on the thread — so a wave of frame
+        // reads built up front would be reading stale ids by the second frame. And the deep walk STOPS
+        // when its shared node budget runs out, so a frame's table read up front is a packet the
+        // sequential walk would never have spent on a frame it never reached. Speculation is the one way
+        // this could cost more than the loop it replaces, so it is not done.
+        //
+        // The filter is resolved first, which costs nothing: every frame's class name is read either way,
+        // and resolving them all as one wave is where the third saving comes from.
+        if state.deep.is_none() {
+            let class_ids: Vec<u64> = frames.iter().map(|f| f.location.class_id).collect();
+            // The answers land in `TypeCache`, which is what `resolve_class_name` reads, so this warms the
+            // per-frame lookups rather than replacing them.
+            let _ = session.connection.read_signatures_independently(&class_ids).await;
+            let mut surviving: Vec<(usize, &jdwp_client::thread::Frame)> = Vec::new();
+            for (idx, frame) in frames.iter().enumerate() {
+                let name = resolve_class_name(
+                    &mut session.connection,
+                    frame.location.class_id,
+                    &mut state.class_names,
+                )
+                .await;
+                // Written as the positive test rather than as the render loop's negated one, because the
+                // gate has to be the SAME decision and clippy will not let both be spelled the same way.
+                if package_filter.as_deref().is_none_or(|f| name.to_lowercase().contains(f)) {
+                    surviving.push((idx, frame));
+                }
+            }
+            state.pre = Some(
+                prefetch_stack(&mut session.connection, target_thread, &surviving, include_variables).await,
+            );
+        }
         for (idx, frame) in frames.iter().enumerate() {
             let more =
                 render_stack_frame(&mut session.connection, &mut output, idx, frame, &walk, &mut state).await;
@@ -2725,7 +2761,7 @@ impl RequestHandler {
         let method = if frame.location.method_id == 0 {
             "<obsolete method — the bytecode this frame entered with has been replaced>".to_string()
         } else {
-            frame_method_info(&mut session.connection, &frame.location, false).await.0
+            frame_method_info(&mut session.connection, &frame.location, false, None).await.0
         };
 
         session.connection.pop_frames(thread_id, frame.frame_id).await.map_err(|e| {
@@ -6890,36 +6926,62 @@ async fn resolve_class_name(
     n
 }
 
+/// The variables a method's table says are in scope at bytecode `index`, as slots to read.
+///
+/// Pure, and extracted for that reason: PERF-1 (#100) reads variable tables for a whole stack in one wave
+/// and then asks this question per frame, while the unprefetched path reads one table and asks it once. Two
+/// copies of this filter would be two answers to "what is in scope here", and the scope test — `index`
+/// inside `[code_index, code_index + length)` — is the part that has to be the same in both.
+fn active_locals(var_table: &[jdwp_client::types::Variable], index: u64) -> Vec<ActiveLocal> {
+    var_table
+        .iter()
+        .filter(|v| index >= v.code_index && index < v.code_index + u64::from(v.length))
+        .map(|v| ActiveLocal {
+            slot: jdwp_client::stackframe::VariableSlot {
+                slot: i32::try_from(v.slot).unwrap_or(0),
+                sig_byte: v.signature.as_bytes().first().copied().unwrap_or(b'?'),
+            },
+            declared: informative_generic_type(&v.signature, v.generic_signature.as_deref()),
+            name: v.name.clone(),
+        })
+        .collect()
+}
+
 /// Resolve a frame's method name, source line, and (when requested) the variable slots in scope at
 /// its bytecode index. Shared per-frame lookups for `debug.get_stack`.
+///
+/// `pre` is what the walk read for every frame up front (PERF-1, #100). When it holds this frame's method,
+/// the two per-frame round trips — its line table and its variable table — are already paid; when it does
+/// not, this reads them itself, which is the deep path and the reason both routes still exist. Either way
+/// the answer comes out of [`line_at`] and [`active_locals`], so the prefetched and unprefetched paths
+/// cannot disagree about what a table means.
 async fn frame_method_info(
     conn: &mut jdwp_client::JdwpConnection,
     location: &Location,
     include_variables: bool,
+    pre: Option<&StackPrefetch>,
 ) -> (String, Option<i32>, Vec<ActiveLocal>) {
     let mut method_name = format!("method@{:x}", location.method_id);
     let mut line: Option<i32> = None;
     let mut active: Vec<ActiveLocal> = Vec::new();
+    let key = (location.class_id, location.method_id);
     if let Ok(methods) = conn.get_methods(location.class_id).await {
         if let Some(method) = methods.iter().find(|m| m.method_id == location.method_id) {
             method_name = method.name.clone();
-            line = source_line(conn, location.class_id, location.method_id, location.index).await;
+            line = match pre.and_then(|p| p.lines.get(&key)) {
+                Some(table) => table.as_ref().and_then(|lt| line_at(lt, location.index)),
+                None => source_line(conn, location.class_id, location.method_id, location.index).await,
+            };
             if include_variables {
-                if let Ok(var_table) = conn.get_variable_table(location.class_id, location.method_id).await {
-                    let ci = location.index;
-                    for v in var_table
-                        .into_iter()
-                        .filter(|v| ci >= v.code_index && ci < v.code_index + u64::from(v.length))
-                    {
-                        let slot = i32::try_from(v.slot).unwrap_or(0);
-                        let sig_byte = v.signature.as_bytes().first().copied().unwrap_or(b'?');
-                        let declared = informative_generic_type(&v.signature, v.generic_signature.as_deref());
-                        active.push(ActiveLocal {
-                            name: v.name,
-                            slot: jdwp_client::stackframe::VariableSlot { slot, sig_byte },
-                            declared,
-                        });
-                    }
+                // Borrowed from the prefetch when it has this method, read when it does not — and the read
+                // has to be owned, so the two arms meet at a slice rather than at a `Vec`.
+                let read = match pre.and_then(|p| p.vars.get(&key)) {
+                    Some(_) => None,
+                    None => conn.get_variable_table(location.class_id, location.method_id).await.ok(),
+                };
+                if let Some(table) = pre.and_then(|p| p.vars.get(&key)).map(Vec::as_slice).or(read.as_deref())
+                {
+                    active = active_locals(table, location.index);
                 }
             }
         }
@@ -6969,6 +7031,7 @@ async fn render_frame_variables(
     frame: (usize, u64),
     active: &[ActiveLocal],
     mut deep: Option<(DeepOpts, &mut DeepState)>,
+    prefetched: Option<&[jdwp_client::types::Value]>,
 ) -> Option<String> {
     let (idx, mut frame_id) = frame;
     if deep.is_some() && idx > 0 {
@@ -6977,9 +7040,13 @@ async fn render_frame_variables(
             frame_id = f.frame_id;
         }
     }
-    let slots: Vec<jdwp_client::stackframe::VariableSlot> = active.iter().map(|a| a.slot).collect();
-    let Ok(values) = conn.get_frame_values(target_thread, frame_id, slots).await else {
-        return None;
+    // Wave three, when the walk ran one (PERF-1, #100). It never does on the deep path, which is the path
+    // the frame-id re-read above exists for — and those two facts are the same fact.
+    let values = if let Some(values) = prefetched {
+        values.to_vec()
+    } else {
+        let slots: Vec<jdwp_client::stackframe::VariableSlot> = active.iter().map(|a| a.slot).collect();
+        conn.get_frame_values(target_thread, frame_id, slots).await.ok()?
     };
     // The exhausted local is remembered as a borrow and only copied on the way out, so the budget check
     // costs nothing on the ordinary path where the budget is never reached.
@@ -7029,6 +7096,111 @@ struct StackWalkState {
     hidden: usize,
     /// The deep-expansion options and the ONE node budget shared by every frame (see `STACK_NODE_BUDGET`).
     deep: Option<(DeepOpts, DeepState)>,
+    /// What the walk read for every surviving frame before rendering any of them, or `None` on the deep
+    /// path — see [`prefetch_stack`] and the comment where this is built for why the deep path has none.
+    pre: Option<StackPrefetch>,
+}
+
+/// What a stack walk read for its whole stack before rendering any of it (PERF-1, #100).
+///
+/// Every entry is keyed by what the read is *about* rather than by frame, which is where the second saving
+/// comes from: a recursive stack names the same `(class, method)` in frame after frame, and the walk used to
+/// read that method's line table and variable table **once per frame**. The dump has had a line-table cache
+/// for this since TEST-8 (#24) — 300 workers 60 frames deep asked ~19,000 times for ~60 distinct tables —
+/// and `get_stack` never got one. So this lowers the packet count as well as the round trips, and the two
+/// savings are independent of each other.
+///
+/// Held for one call, deliberately, on ADR-0011's argument: a class redefinition can change a line table,
+/// so a table outliving the walk that read it would be a table describing code that is no longer running.
+#[derive(Default)]
+struct StackPrefetch {
+    /// Line table per `(class, method)`. `None` records a method that HAS none — native, abstract, or a
+    /// `-g:none` build — because a refusal has to be remembered too or the frame re-asks.
+    lines: std::collections::HashMap<(u64, u64), Option<jdwp_client::method::LineTable>>,
+    /// Variable table per `(class, method)`. Absent means "not prefetched"; present-and-empty means the
+    /// method genuinely has no variables in its table.
+    vars: std::collections::HashMap<(u64, u64), Vec<jdwp_client::types::Variable>>,
+    /// The locals of each frame that had any, by frame index. Wave three, and the only entry here keyed by
+    /// frame rather than by method: two frames in the same method hold different values.
+    values: std::collections::HashMap<usize, Vec<jdwp_client::types::Value>>,
+}
+
+/// Read a whole stack's per-frame metadata in waves, before any of it is rendered.
+///
+/// **`frames` must already be filtered to the ones that will be rendered.** Nothing here is speculative and
+/// that is the property being protected: a `package_filter` collapses frames without reading anything about
+/// them, so prefetching a hidden frame's line table would spend a packet the sequential walk never spent.
+/// The caller resolves the filter first — which costs nothing extra, because every frame's class name is
+/// read either way — and passes only the survivors.
+///
+/// Three waves and not one, because the second and third are not independent of the first:
+///
+/// 1. the class **signatures**, since the names decide the filter and every frame needs one;
+/// 2. the **line tables** and **variable tables**, one per distinct `(class, method)`;
+/// 3. the **frame values**, which need the slots wave two produced — the dependency that makes this three
+///    waves rather than one, and the same shape as the row projection's two.
+async fn prefetch_stack(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    frames: &[(usize, &jdwp_client::thread::Frame)],
+    include_variables: bool,
+) -> StackPrefetch {
+    let mut pre = StackPrefetch::default();
+    // Deduplicated: `read_line_tables_independently` reads what it is given, and a recursive stack would
+    // otherwise have it read one method's table sixty times in one wave instead of sixty times in sixty.
+    let mut pairs: Vec<(u64, u64)> = Vec::new();
+    for (_, f) in frames {
+        let key = (f.location.class_id, f.location.method_id);
+        if !pairs.contains(&key) {
+            pairs.push(key);
+        }
+    }
+
+    for (&key, table) in pairs.iter().zip(conn.read_line_tables_independently(&pairs).await) {
+        pre.lines.insert(key, table.ok());
+    }
+    if !include_variables {
+        return pre;
+    }
+    for (&key, table) in pairs.iter().zip(conn.read_variable_tables_independently(&pairs).await) {
+        // Only a success is recorded. An `ABSENT_INFORMATION` frame has to fall through to the
+        // unprefetched read rather than be remembered as "no variables", or a `-g:none` build and a
+        // failed read would print the same thing — and one of them is worth a round trip to confirm.
+        if let Ok(table) = table {
+            pre.vars.insert(key, table);
+        }
+    }
+
+    // WAVE 3. Built only for the frames the render loop will actually read values for, which is why
+    // `get_methods` is consulted here too: it decides whether that loop looks at a frame's locals at all,
+    // it is a `TypeCache` hit for every frame after the first of its class, and asking it now rather than
+    // guessing is what keeps this from spending a packet the sequential walk would not have spent.
+    let mut reads: Vec<(u64, u64, Vec<jdwp_client::stackframe::VariableSlot>)> = Vec::new();
+    let mut at: Vec<usize> = Vec::new();
+    for &(idx, frame) in frames {
+        let key = (frame.location.class_id, frame.location.method_id);
+        let Some(table) = pre.vars.get(&key) else { continue };
+        let known_method = conn
+            .get_methods(frame.location.class_id)
+            .await
+            .is_ok_and(|ms| ms.iter().any(|m| m.method_id == frame.location.method_id));
+        if !known_method {
+            continue;
+        }
+        let slots: Vec<jdwp_client::stackframe::VariableSlot> =
+            active_locals(table, frame.location.index).iter().map(|a| a.slot).collect();
+        if slots.is_empty() {
+            continue;
+        }
+        reads.push((thread_id, frame.frame_id, slots));
+        at.push(idx);
+    }
+    for (idx, values) in at.into_iter().zip(conn.read_frame_values_independently(&reads).await) {
+        if let Ok(values) = values {
+            pre.values.insert(idx, values);
+        }
+    }
+    pre
 }
 
 /// Render one frame of a `debug.get_stack` reply. Returns `false` when the walk should stop.
@@ -7053,8 +7225,10 @@ async fn render_stack_frame(
     }
     flush_hidden(output, &mut state.hidden);
 
-    // Method name + source line, and the variable slots live at this bytecode index.
-    let (method_name, line, active) = frame_method_info(conn, &frame.location, walk.include_variables).await;
+    // Method name + source line, and the variable slots live at this bytecode index. Both per-frame reads
+    // are already paid when the walk prefetched them (PERF-1, #100).
+    let (method_name, line, active) =
+        frame_method_info(conn, &frame.location, walk.include_variables, state.pre.as_ref()).await;
 
     let _ = match line {
         Some(l) => writeln!(output, "#{idx} {class_name}.{method_name}:{l}"),
@@ -7071,6 +7245,7 @@ async fn render_stack_frame(
         (idx, frame.frame_id),
         &active,
         state.deep.as_mut().map(|(opts, st)| (*opts, st)),
+        state.pre.as_ref().and_then(|p| p.values.get(&idx)).map(Vec::as_slice),
     )
     .await;
     let Some(local) = stopped_at else { return true };
@@ -11324,7 +11499,7 @@ async fn method_name_matches(
     let Some(want) = filter else {
         return true;
     };
-    let (method, _, _) = frame_method_info(conn, loc, false).await;
+    let (method, _, _) = frame_method_info(conn, loc, false, None).await;
     method == want
 }
 
@@ -21975,7 +22150,7 @@ async fn describe_caller_chain(
     let mut out = Vec::with_capacity(frames.len());
     for f in frames {
         let class = resolve_class_name(conn, f.location.class_id, &mut class_names).await;
-        let (method, line, _) = frame_method_info(conn, &f.location, false).await;
+        let (method, line, _) = frame_method_info(conn, &f.location, false, None).await;
         out.push(line.map_or_else(|| format!("{class}.{method}"), |l| format!("{class}.{method}:{l}")));
     }
     out

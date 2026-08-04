@@ -3397,6 +3397,210 @@ fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
     server.panic_reset();
 }
 
+/// PERF-1 (#100), the deterministic half: a warm stack walk reads each **method's** tables once, not each
+/// **frame's**.
+///
+/// A packet count is the house metric because it does not move with machine load, and this is the assertion
+/// the round-trip one cannot make. `StackWaveProbe` is 66 frames of **one** recursive method plus a handful
+/// of others, so the correct answer is a handful of line tables and variable tables — and the walk used to
+/// ask 66 times for each.
+///
+/// Measured, warm, by recording the session and counting the second walk's commands:
+///
+/// ```text
+///                                 before   after
+///   Method.LineTable                  66       6
+///   Method.VariableTableWithGeneric   66       7
+///   StackFrame.GetValues              63      63
+///   ObjectReference.ReferenceType     12      12
+///   total                            209      90
+/// ```
+///
+/// `GetValues` is unchanged and must stay so: it is one read per frame either way, and PERF-1 changes when
+/// they are issued rather than how many there are. The twelve `ReferenceType` reads are `render_value`
+/// resolving each object local's type (PERF-2, #129), also unchanged.
+///
+/// The **second** walk is the one measured. The first fills `TypeCache` with signatures and method lists, so
+/// counting it would count the cache filling and hide whether the tables were deduplicated at all.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_warm_stack_walk_reads_each_methods_tables_once() {
+    /// `Method.LineTable` and `Method.VariableTableWithGeneric`, the two reads that were per frame.
+    const LINE_TABLE: (u8, u8) = (6, 1);
+    const VARIABLE_TABLE: (u8, u8) = (6, 5);
+    /// `ThreadReference.Frames`, which starts a walk and is how the second one is found in the tape.
+    const FRAMES: (u8, u8) = (11, 6);
+
+    let Some(jdk) = jdk_or_skip("a_warm_stack_walk_reads_each_methods_tables_once") else { return };
+    let probe = Probe::launch(&jdk, "StackWaveProbe").expect("launch StackWaveProbe");
+    probe
+        .wait_for_line(std::time::Duration::from_secs(60), |l| l.starts_with("tick "))
+        .expect("StackWaveProbe never started ticking");
+
+    let recorder = common::cassette::CassetteRecorder::start(probe.port).expect("start recorder");
+    let mut server = Server::start().expect("start server");
+    server.attach(recorder.port);
+
+    let src = probe_source("StackWaveProbe");
+    let line = probe_line(&src, "GATE.wait(200); // suspended here for the life of the probe");
+    let armed = server
+        .call("debug.set_line_stop", serde_json::json!({"class_pattern": "StackWaveProbe", "line": line}));
+    assert!(!armed.contains("Refused"), "the stop point was refused: {armed}");
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("never suspended in park(); probe output: {:?}", probe.output()));
+
+    let workload = serde_json::json!({"include_variables": true, "max_frames": 80});
+    let warm = server.call("debug.get_stack", workload.clone());
+    assert!(
+        warm.matches("StackWaveProbe.down").count() >= 55 && warm.contains("doubled"),
+        "the walk must read the whole chain and its locals, or there is nothing to count:\n{}",
+        head_of(&warm)
+    );
+    server.call("debug.get_stack", workload);
+    // The recorder writes its tape when the debugger hangs up, and a tape missing the last exchanges does
+    // not fail when it is written — it fails much later, as a miss in an unrelated test.
+    server.call("debug.disconnect", serde_json::json!({}));
+
+    let tape = recorder.finish("a warm get_stack over StackWaveProbe");
+    let exchanges = tape.exchanges();
+    let second = exchanges
+        .iter()
+        .rposition(|e| (e.set, e.command) == FRAMES)
+        .expect("no ThreadReference.Frames in the tape — did the walk read any frames at all?");
+    let walk = exchanges.get(second..).unwrap_or_default();
+    let count = |what: (u8, u8)| walk.iter().filter(|e| (e.set, e.command) == what).count();
+    let (lines, vars, total) = (count(LINE_TABLE), count(VARIABLE_TABLE), walk.len());
+
+    // The probe's chain is one method, so a per-method read is a handful and a per-frame read is dozens.
+    // Asserted well below the frame count and above the measured 6 and 7, so this catches the regression
+    // without pinning the exact number of frames the JVM puts below `down`.
+    assert!(
+        lines <= 20 && vars <= 20,
+        "a warm walk asked for {lines} line table(s) and {vars} variable table(s) over a 66-frame chain of \
+         ONE recursive method. Measured after PERF-1: 6 and 7, one per distinct (class, method). Measured \
+         before it: 66 and 66, one per frame. Numbers near the frame count mean the deduplication is \
+         gone.\n  {total} commands in the walk"
+    );
+    assert!(
+        total <= 130,
+        "a warm walk cost {total} commands; it measured 90 after PERF-1 and 209 before. A number near 209 \
+         means the per-method tables are being read per frame again ({lines} line, {vars} variable)."
+    );
+
+    // Not resumed: the debugger has already disconnected, which is what let the tape be written.
+}
+
+/// PERF-1 (#100): a deep stack's per-frame metadata costs a bounded number of round trips, not three per
+/// frame.
+///
+/// The companion to `a_warm_stack_walk_reads_each_methods_tables_once`, which asserts the deterministic half.
+/// This one asserts the wire, because the two savings show up differently: deduplication removes packets and
+/// waving removes waiting, and only a clock can see the second.
+///
+/// Measured on `StackWaveProbe`'s 66 frames, warm, before and after:
+///
+/// | | commands | round trips |
+/// |---|---|---|
+/// | before | 209 | **227.1** |
+/// | after | 90 | **28.1** |
+///
+/// 8.1x on the wire. The instrument is the whole call rather than a marginal cost, because unlike a row
+/// projection there is nothing fixed to subtract: `added / RTT` **is** the round trip count, which makes the
+/// assertion readable as what it is.
+///
+/// **What the remaining 28 are made of, from the command census rather than from arithmetic:** one
+/// `AllThreads`, one `Frames`, one wave of 6 line tables, one wave of 7 variable tables, four waves of 63
+/// frame reads — and **12 `ObjectReference.ReferenceType` reads, one at a time**, which is `render_value`
+/// resolving the type of each object local (PERF-2, #129). Those twelve are the largest single remaining
+/// item and they are not this call site's to fix.
+///
+/// The threshold is 80: 2.8x above the reading and 2.8x below the serialised one, which puts it in the
+/// middle of the two hypotheses in the ratio a wall clock on a contended runner can carry. A threshold at
+/// the reading would fail on noise; one near 227 would not reject anything.
+///
+/// **Primitive locals only, which is what makes this measure the three reads.** Rendering a `String` local
+/// costs a `StringReference.Value` and an object local an `ObjectReference.ReferenceType`, per local, per
+/// frame (PERF-2, #129) — so a probe with one `String` in scope would measure the renderer instead. The
+/// probe's header says the same thing from the other side.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_deep_stacks_per_frame_metadata_costs_a_bounded_number_of_round_trips() {
+    /// Samples per arm, as in `latency_added_to_the_wire_shows_up_as_held_time_per_packet`.
+    const ROUNDS: usize = 3;
+    /// Above the probe's 61 frames, so the walk is the whole chain and not `max_frames`' default of 8.
+    const MAX_FRAMES: usize = 80;
+
+    let Some(jdk) = jdk_or_skip("a_deep_stacks_per_frame_metadata_costs_a_bounded_number_of_round_trips")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "StackWaveProbe").expect("launch StackWaveProbe");
+    probe
+        .wait_for_line(std::time::Duration::from_secs(60), |l| l.starts_with("tick "))
+        .expect("StackWaveProbe never started ticking");
+
+    let rtt = std::time::Duration::from_millis(8);
+    let relay = LatencyRelay::start(probe.port, std::time::Duration::ZERO).expect("start relay");
+    let mut server = Server::start().expect("start server");
+    server.attach(relay.port);
+
+    // The bottom of the chain, so the whole stack is on it when the thread suspends.
+    let src = probe_source("StackWaveProbe");
+    let line = probe_line(&src, "GATE.wait(200); // suspended here for the life of the probe");
+    let armed = server
+        .call("debug.set_line_stop", serde_json::json!({"class_pattern": "StackWaveProbe", "line": line}));
+    assert!(!armed.contains("Refused"), "the stop point was refused: {armed}");
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("never suspended in park(); probe output: {:?}", probe.output()));
+
+    let workload = serde_json::json!({"include_variables": true, "max_frames": MAX_FRAMES});
+    let mut sample = |delay: std::time::Duration| -> f64 {
+        relay.set_rtt(delay);
+        let started = std::time::Instant::now();
+        let stack = server.call("debug.get_stack", workload.clone());
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        // The reply has to be the whole stack WITH locals, or a cheap wrong answer would score best.
+        assert!(
+            stack.matches("StackWaveProbe.down").count() >= 55 && stack.contains("doubled"),
+            "the walk must read the whole chain and its locals for its duration to mean anything — got:\n{}",
+            head_of(&stack)
+        );
+        elapsed
+    };
+
+    // Discarded: the first walk fills `TypeCache` with the class signature and method list, which every
+    // walk after it reuses. Comparing a cold call against a warm one would measure the cache, not the wire.
+    sample(std::time::Duration::ZERO);
+
+    let mut near = Vec::with_capacity(ROUNDS);
+    let mut far = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        near.push(sample(std::time::Duration::ZERO));
+        far.push(sample(rtt));
+    }
+    let fastest = |arm: &[f64]| arm.iter().copied().fold(f64::MAX, f64::min);
+    let rtt_ms = rtt.as_secs_f64() * 1000.0;
+    let round_trips = (fastest(&far) - fastest(&near)) / rtt_ms;
+
+    eprintln!(
+        "PERF-1: a {MAX_FRAMES}-frame walk with locals costs {round_trips:.1} round trips \
+         ({:.1}ms straight through, {:.1}ms at {rtt_ms}ms RTT). Before: 227.1.",
+        fastest(&near),
+        fastest(&far)
+    );
+    assert!(
+        round_trips < 80.0,
+        "a walk of the probe's 66 frames cost {round_trips:.1} round trips. Reading each frame's line \
+         table, variable table and values one at a time measured 227.1 — 66 of each of the first two for \
+         the SAME method — and reading them deduplicated and in waves measured 28.1. This landed nearer \
+         the first (PERF-1, #100).\n  straight through: {near:?}\n  {rtt_ms}ms away: {far:?}"
+    );
+
+    server.panic_reset();
+}
+
 /// `(threads read, threads total)` from a dump's `🧵 Thread dump — 40/306 thread(s)` header.
 fn dump_thread_counts(dump: &str) -> Option<(u64, u64)> {
     let at = dump.find("dump — ")? + "dump — ".len();

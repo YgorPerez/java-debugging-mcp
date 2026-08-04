@@ -92,12 +92,17 @@ available fan-out on the reads #100 names.
 
 ### What it buys is round trips, and the glossary's `Packet` entry now has to say so
 
-The same commands are still sent, each still taking one id from the same counter, so `packets_sent()` and
+The primitive sends the same commands, each still taking one id from the same counter, so `packets_sent()` and
 every packet-bound test in `mcp_integration.rs` are unaffected **by construction** — asserted anyway, in
-`a_wave_costs_exactly_one_packet_per_read`, because the accounting is easy to break invisibly. What changes
-is that `n` reads cost about one round trip instead of `n`, and that a suspension under which those reads
-happen is shorter by the difference. On loopback the difference is nearly nothing; this exists for a remote
-JVM.
+`a_wave_costs_exactly_one_packet_per_read`, because the accounting is easy to break invisibly. What changes is
+that `n` reads cost about one round trip instead of `n`, and that a suspension under which those reads happen
+is shorter by the difference. On loopback the difference is nearly nothing; this exists for a remote JVM.
+
+**A conversion may still lower the packet count, and one did.** Deduplication is a separate saving that a wave
+makes obvious rather than causes: gathering a stack's reads into one list is what exposed that the same
+`(class, method)` was being asked about sixty-six times, so the stack-walk conversion below removes 119
+commands as well as 199 round trips. Nothing here ever *raises* the count — that is the invariant, and
+speculation is the only thing that could break it.
 
 `CONTEXT.md`'s `Packet` entry justified packets-as-cost-unit by **equating them with round trips**. That
 equation is severed the moment a call site is converted, so the entry was left alone by the commit that added
@@ -192,6 +197,54 @@ backwards" describes nothing. This was found by running the negative control —
 watch the test fail — and reading the output: it passed. The wave tests now demand a literal `WITHHELD = 8`,
 a number they hold the implementation to rather than read off it, and the peer asserts loudly if the window
 is ever lowered below it instead of deadlocking.
+
+## The second call site: a stack walk, where deduplication mattered more than waving
+
+`debug.get_stack --include_variables` made **three reads per frame** — the method's line table, the method's
+variable table, and the frame's values. It is licensed as three waves, in that order, because the third needs
+the slots the second produces.
+
+**The bigger finding was not the waving.** The first two reads are keyed by `(class, method)` and the walk was
+making them per *frame*. `debug.thread_dump` has cached line tables that way since TEST-8 (#24) — 300 workers
+60 frames deep asked ~19,000 times for ~60 distinct tables — and `get_stack` never got the same treatment. So
+this commit removes packets as well as waiting, and the two savings are independent of each other.
+
+Measured on `StackWaveProbe` (66 frames of one recursive method, primitive locals only), warm, by recording
+the session and counting the second walk:
+
+```text
+                                before   after
+  Method.LineTable                  66       6
+  Method.VariableTableWithGeneric   66       7
+  StackFrame.GetValues              63      63
+  ObjectReference.ReferenceType     12      12
+  total commands                   209      90
+  round trips (8ms RTT)          227.1    28.1
+```
+
+`GetValues` is unchanged and must stay so: one read per frame either way, issued four waves instead of
+sixty-three times. **The twelve `ObjectReference.ReferenceType` reads are the largest single remaining item**,
+and they are `render_value` resolving each object local's type one at a time — PERF-2 (#129) again, found by
+census rather than by arithmetic.
+
+Two tests, because the two savings are visible to different instruments:
+`a_warm_stack_walk_reads_each_methods_tables_once` counts commands through the cassette recorder, which is
+deterministic and load-independent as the house metric requires;
+`a_deep_stacks_per_frame_metadata_costs_a_bounded_number_of_round_trips` times the wire, which is the only way
+to see the waving at all.
+
+### The prefetch is refused on the deep path, for two reasons that are both real
+
+`expand_objects` renders values by invoking `toString()` in the debuggee, and **JDWP invalidates every frame id
+on a thread when a method is invoked on it** — `render_frame_variables` already re-reads the frame id per frame
+because of this. A wave of frame reads built before the walk starts would be reading stale ids by the second
+frame. Separately, the deep walk **stops** when its shared node budget runs out, so a table read up front is a
+packet the sequential walk would never have spent on a frame it never reached.
+
+That second reason is the one that also decides the filter. A `package_filter` collapses frames without reading
+anything about them, so the walk resolves the filter **first** — which costs nothing, because every frame's
+class name is read either way — and prefetches only the survivors. **Speculation is the one way this change
+could cost more than the loop it replaces, and it is the property every one of these conversions protects.**
 
 ## Consequences
 

@@ -28,16 +28,73 @@ impl JdwpConnection {
         if let Some(hit) = self.types().signature(ref_type_id) {
             return Ok(hit);
         }
+        let packet = self.signature_request(ref_type_id);
+        let reply = self.send_command(packet).await?;
+        let sig = Self::decode_signature_reply(&reply)?;
+        self.types().put_signature(ref_type_id, &sig);
+        Ok(sig)
+    }
+
+    /// The signature of each of `ref_type_ids`, read as **independent reads** (PERF-1, #100).
+    ///
+    /// **Cache-aware, and that is the whole of its packet story.** `get_signature` is the most frequently
+    /// asked question in the tool precisely because it is nearly always a `TypeCache` hit, so a wave that
+    /// asked the JVM for every id would turn free lookups into packets — the one way this could cost more
+    /// than the loop it replaces. Only the misses are waved; every answer, hit or miss, comes back in its
+    /// own position, and the misses are written back to the cache exactly as the single read writes them.
+    ///
+    /// Independent because a loaded type's signature never changes and no id's answer is needed to ask
+    /// about another.
+    pub async fn read_signatures_independently(
+        &self,
+        ref_type_ids: &[ReferenceTypeId],
+    ) -> Vec<JdwpResult<String>> {
+        // Positions that are not already known, deduplicated — the same type appears in many frames of a
+        // stack, and asking twice in one wave is asking twice.
+        let mut wanted: Vec<ReferenceTypeId> = Vec::new();
+        for &id in ref_type_ids {
+            if self.types().signature(id).is_none() && !wanted.contains(&id) {
+                wanted.push(id);
+            }
+        }
+        if !wanted.is_empty() {
+            let packets = wanted.iter().map(|&id| self.signature_request(id)).collect();
+            for (&type_id, reply) in wanted.iter().zip(self.read_independently(packets).await) {
+                if let Ok(sig) = reply.and_then(|r| Self::decode_signature_reply(&r)) {
+                    self.types().put_signature(type_id, &sig);
+                }
+            }
+        }
+        // Read back through the cache, so a hit and a freshly-waved answer are the same answer and there is
+        // one place that decides what "unknown" looks like.
+        ref_type_ids
+            .iter()
+            .map(|&id| {
+                self.types().signature(id).ok_or_else(|| {
+                    crate::protocol::JdwpError::Protocol(format!(
+                        "the signature of type {id} could not be read"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    /// The request half of `ReferenceType.Signature`.
+    fn signature_request(&self, ref_type_id: ReferenceTypeId) -> CommandPacket {
         let id = self.next_id();
         let mut packet =
             CommandPacket::new(id, command_sets::REFERENCE_TYPE, reference_type_commands::SIGNATURE);
         packet.data.put_u64(ref_type_id);
-        let reply = self.send_command(packet).await?;
+        packet
+    }
+
+    /// The decode half of `ReferenceType.Signature`, error check included. It deliberately does **not**
+    /// populate the cache: the wave writes back per id and the single read writes back for one, and a
+    /// decoder that also wrote would make which of them did it ambiguous.
+    fn decode_signature_reply(reply: &crate::protocol::ReplyPacket) -> JdwpResult<String> {
         reply.check_error()?;
         let mut data = reply.data();
-        let sig = read_string(&mut data)?;
-        self.types().put_signature(ref_type_id, &sig);
-        Ok(sig)
+        read_string(&mut data)
     }
 
     /// ClassType.Superclass — direct superclass of a class (None for java.lang.Object).
