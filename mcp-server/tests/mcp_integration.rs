@@ -13659,10 +13659,30 @@ fn an_invoking_trace_expr_is_refused_on_the_half_that_does_not_own_the_lock() {
     // requires holding one to call `wait()` on it at all. Measured on Temurin 21.0.12 through the released
     // server before the refusal existed — an invoking expression answered `(int) 7` on `wait` and `(int) 14`
     // on `waited`, the latter closing a question the glossary had left explicitly open.
-    for kinds in [vec!["acquired"], vec!["wait"], vec!["waited"]] {
+    // TWO THINGS ABOUT THE EXPRESSION ARE LOAD-BEARING, and this loop used to get both wrong — it armed a
+    // bare `LOCK.stamp()` on all three kinds and asserted only that the arming was not refused, which passes
+    // against a build where the invocation never happens at all.
+    //
+    //  - IT MUST NAME THE MONITOR THE EVENT REPORTS ON. ADR-0036's own control is a `LOCK.stamp()` on a
+    //    `waited` hit timing out at 2000 ms while `WAITED_ON.stamp()` returned, so the hazard is ownership
+    //    of the *reported* monitor and not the event kind. Re-measured on Temurin 21.0.12: qualified
+    //    `WedgeProbe.LOCK.stamp()` on `wait` still times out and leaves the waiter suspended for the rest of
+    //    the run. Arming that here would be arming the very hazard the refusal exists to prevent.
+    //  - IT MUST BE QUALIFIED. The frame at a wait hit is the native `java.lang.Object.wait0` with no local
+    //    variable table, so a bare `LOCK` does not resolve there at all — and that failure looks nothing
+    //    like a stall. ADR-0036 records that reading it as "it did not work" would have confirmed the wrong
+    //    rule; a test that cannot tell the two apart is the same mistake with a green tick on it.
+    for (kinds, expr) in [
+        (vec!["acquired"], "WedgeProbe.LOCK.stamp()"),
+        (vec!["wait"], "WedgeProbe.WAITED_ON.stamp()"),
+        (vec!["waited"], "WedgeProbe.WAITED_ON.stamp()"),
+    ] {
+        // Emptied first, so `wait_for_traces` below cannot be satisfied by a record an earlier kind left
+        // behind — which is exactly how the weaker version of this loop stayed green.
+        server.call("debug.get_traces", serde_json::json!({"clear": true}));
         let accepted = arm(
             &mut server,
-            serde_json::json!({"kinds": kinds, "trace_expr": "LOCK.stamp()",
+            serde_json::json!({"kinds": kinds, "trace_expr": expr,
                                                 "trace_max_hits": 1, "trace_frames": 0}),
         );
         assert!(
@@ -13670,7 +13690,44 @@ fn an_invoking_trace_expr_is_refused_on_the_half_that_does_not_own_the_lock() {
             "an invoking trace_expr must be accepted on {kinds:?}, where the thread owns the monitor: \
              {accepted}"
         );
-        server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": "mon_all"}));
+        // Accepted is not the claim; RETURNING A VALUE is. Three outcomes must not read alike here — a value,
+        // the 2000 ms timeout, and a name that never resolved — so the assertion is on the rendered `(int)`
+        // and the other two are excluded by name.
+        let recorded = server.wait_for_traces(expr, EVENT_TIMEOUT).unwrap_or_else(|| {
+            panic!(
+                "no snapshot for an invoking {expr} on {kinds:?}, so the ADR-0036 claim that it returns \
+                 there is untested. probe output: {:?}",
+                probe.output()
+            )
+        });
+        // THE RECORD FOR THIS EXPRESSION, not the buffer. `debug.get_traces` returns the whole ring, and the
+        // earlier iteration's `(int) N` is still in it — so asserting on the buffer passed against the bare
+        // `LOCK.stamp()` this loop used to arm, matching a value another kind had produced. Measured, not
+        // guessed: reverting the expression while asserting on the buffer left the test green.
+        let line = recorded
+            .lines()
+            .find(|l| l.contains(expr))
+            .unwrap_or_else(|| panic!("no line for {expr} in:\n{recorded}"));
+        assert!(
+            line.contains("(int) "),
+            "an invoking trace_expr must RETURN A VALUE on {kinds:?}, where the thread owns the reported \
+             monitor — accepted-but-never-invoked is what this used to assert. Got: {line}"
+        );
+        assert!(
+            !line.contains("did not return within"),
+            "the invocation STALLED on {kinds:?}, where the thread owns the reported monitor — that is the \
+             hazard this kind is supposed to be free of: {line}"
+        );
+        // Cleared by the id the arming actually returned. The hardcoded `mon_all` this used to pass matched
+        // nothing for these kinds (they arm `mon_acquired_N` / `mon_wait_N` / `mon_waited_N`), so the clear
+        // was a silent no-op and `debug.panic` below was doing all the work.
+        let id = accepted
+            .split_whitespace()
+            .find(|t| t.starts_with("mon_"))
+            .unwrap_or_else(|| panic!("no mon_ id in the arm reply for {kinds:?}: {accepted}"))
+            .to_string();
+        let cleared = server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": id}));
+        assert!(cleared.contains("cleared"), "clearing {kinds:?} did not report a clear: {cleared}");
         server.call("debug.panic", serde_json::json!({}));
     }
 
