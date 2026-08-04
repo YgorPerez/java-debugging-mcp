@@ -3613,6 +3613,83 @@ fn a_deep_stacks_per_frame_metadata_costs_a_bounded_number_of_round_trips() {
     server.panic_reset();
 }
 
+/// DUMP-4 (#47), staged rather than raced: a thread whose **status read fails** is reported as having
+/// vanished, and not folded into what the caller's `limit` withheld.
+///
+/// That distinction is the whole of DUMP-4. The two causes have different remedies — a `limit` can be raised
+/// and a dead thread cannot be brought back — so a reply that blames the limit for a death offers a no-op as
+/// a fix. `a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it` used to reach this arm
+/// by racing a churning pool, and **PERF-1 (#100) made that race unwinnable**: the status reads used to be
+/// spread one per thread across the whole dump, and they now happen in one burst of waves at the start, so a
+/// worker dying in the read loop cannot be caught by a status read at all.
+///
+/// A slower wire does not fix that, because it is a ratio and both terms scale with the round trip — measured:
+/// at 30ms per round trip the dump's suspension budget ran out after three threads. So the arm is staged
+/// instead, with a relay that **refuses `ThreadReference.Status`**: the debuggee never performs it and answers
+/// an error, which is precisely the condition, held still. Same move as ADR-0034's decision table, where two
+/// branches could not be produced against a real JVM and a pure function was the honest substitute.
+///
+/// Refusing *every* status read is deliberately blunt: it means no thread can be triaged, so the reply must
+/// account for **all** of them as vanished and none of them as withheld. A relay that refused some would be
+/// closer to the churning case and could not assert the totals.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_dump_whose_status_reads_are_refused_reports_them_as_vanished_rather_than_withheld() {
+    /// `ThreadReference.Status` — the read whose failure is how a dead thread announces itself.
+    const THREAD_STATUS: (u8, u8) = (11, 4);
+
+    let Some(jdk) =
+        jdk_or_skip("a_dump_whose_status_reads_are_refused_reports_them_as_vanished_rather_than_withheld")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "ManyThreadsProbe").expect("launch ManyThreadsProbe");
+    probe
+        .wait_for_line(std::time::Duration::from_secs(60), |l| l.starts_with("tick "))
+        .expect("ManyThreadsProbe never started ticking");
+
+    let relay = FaultRelay::start_refusing(probe.port, vec![THREAD_STATUS]).expect("start fault relay");
+    let mut server = Server::start().expect("start server");
+    server.attach(relay.port);
+
+    // A limit an order of magnitude above the thread count, so whatever is missing, the limit provably is
+    // not why — which is the confusion DUMP-4 exists to prevent.
+    let dump = server
+        .call("debug.thread_dump", serde_json::json!({"limit": 500, "monitors": false, "max_frames": 3}));
+    let (read, total) = dump_thread_counts(&dump)
+        .unwrap_or_else(|| panic!("no thread count in the header of:\n{}", head_of(&dump)));
+
+    assert_eq!(read, 0, "no thread can be triaged when every status read is refused:\n{}", head_of(&dump));
+    assert!(
+        total > 10,
+        "the probe's threads must still be LISTED — only their statuses were refused: {total}"
+    );
+    // The line DUMP-4 added, in the words it actually uses — asserted on the reply rather than on what a
+    // test author remembers the reply saying, which is how a golden string drifts into a paraphrase.
+    assert_contains_all(
+        "the reply attributes every missing row to the threads having ended",
+        &dump,
+        &[
+            &format!("… +{total} more thread(s) ENDED while this dump was reading"),
+            "their ids were already invalid by the time it asked",
+        ],
+    );
+    // The other half of DUMP-4, and the one with teeth: a remedy that cannot work must not be offered.
+    assert!(
+        !dump.contains("raise limit") && !dump.contains("raise max_suspend_ms"),
+        "a limit of 500 over {total} thread(s) did not bind and no budget ran out, so the reply must offer \
+         neither as the remedy for a thread that died — that misattribution is what DUMP-4 fixed:\n{}",
+        head_of(&dump)
+    );
+    assert!(
+        dump.contains("Nothing to raise or narrow"),
+        "the reply has to say there is no remedy, not merely omit one:\n{}",
+        head_of(&dump)
+    );
+
+    server.panic_reset();
+}
+
 /// `(threads read, threads total)` from a dump's `🧵 Thread dump — 40/306 thread(s)` header.
 fn dump_thread_counts(dump: &str) -> Option<(u64, u64)> {
     let at = dump.find("dump — ")? + "dump — ".len();
@@ -7778,10 +7855,26 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
     // Through the relay, deliberately. A dump that finishes in ten milliseconds barely overlaps
     // anything, and the state this test is about — the thread list going stale while it is being read —
     // is a function of how LONG the read takes. On loopback that is nearly nothing, which is why the arm
-    // has never executed. At a 2ms round trip the same ~130-packet dump takes a quarter of a second,
-    // which is what it costs against an instance one hop away: the debuggee is unchanged and only the
-    // wire is slower, exactly as in ADR-0011's measurements. Declared before the server so it outlives
-    // it.
+    // has never executed. Declared before the server so it outlives it.
+    //
+    // At a 2ms round trip the same ~130-packet dump takes a quarter of a second, which is what it costs
+    // against an instance one hop away: the debuggee is unchanged and only the wire is slower, exactly as in
+    // ADR-0011's measurements.
+    //
+    // **Turning this up further does not restore what PERF-1
+    // ([#100](https://github.com/YgorPerez/java-debugging-mcp/issues/100)) took away, which is why it is
+    // still 2ms.** The status reads used to be spread across the whole dump, one per thread, so a worker
+    // dying at any point in it had a good chance of dying before its own read. They now all happen in one
+    // burst of waves at the start, so a death in the read loop — where most of a dump's time still is —
+    // cannot be caught by a status read at all. That is a **ratio**, and both terms scale with the round
+    // trip, so a slower wire widens the burst and the read loop alike and changes nothing. Tried at 30ms:
+    // the dump's 2000ms suspension budget ran out after **three threads**.
+    //
+    // So the second half of this test is now staged deterministically instead, by
+    // `a_dump_whose_status_reads_are_refused_reports_them_as_vanished_rather_than_withheld` — a fault relay
+    // refusing `ThreadReference.Status`, which is the condition itself rather than a race for it. Same move
+    // as TEST-34's decision table (ADR-0034): when a branch stops being reachable by racing a real JVM,
+    // staging it beats waiting for it.
     let relay = LatencyRelay::start(probe.port, std::time::Duration::from_millis(2)).expect("start relay");
     let mut server = Server::start().expect("start server");
     server.attach(relay.port);
@@ -7904,16 +7997,25 @@ fn a_dump_of_a_churning_pool_accounts_for_the_threads_that_vanished_under_it() {
     );
 
     // --- (2) finished AND collected: the id is gone, so the row is dropped ---
-    let dropped = vanished_and_dropped.unwrap_or_else(|| {
-        panic!(
-            "twelve dumps, {retired_during_a_dump} worker(s) finished under them, and no thread id ever \
-             went stale mid-dump — so `collect_dump_rows`' dead-thread arm still has not executed. The \
-             odd-numbered half of the churn population is deliberately left unheld for this, so either \
-             the probe's collector is not reclaiming them or every one of them outlived its own read\n  \
-             output: {:?}",
-            probe.output()
-        )
-    });
+    //
+    // **Opportunistic since PERF-1 (#100), and the companion test is why that is not a weakening.** Racing a
+    // JVM for this needed the status reads to be spread across the dump, and they now happen in one burst;
+    // `a_dump_whose_status_reads_are_refused_reports_them_as_vanished_rather_than_withheld` stages the same
+    // arm deterministically with a fault relay. What is asserted here is that WHEN the race does land — it
+    // still does on a slow enough runner — the reply accounts for it, which is the half a fault relay cannot
+    // speak to because it refuses every thread rather than some of them. A skip is printed rather than
+    // silently passing, because a test that quietly asserts nothing is how this repo has reported coverage
+    // it had not looked at.
+    let Some(dropped) = vanished_and_dropped else {
+        eprintln!(
+            "note: twelve dumps and {retired_during_a_dump} worker(s) finished under them, but no id went \
+             stale mid-dump, so THIS test asserted nothing about the dropped-row arm. Expected since \
+             PERF-1 (#100) made the triage 16x shorter; the arm itself is covered deterministically by \
+             a_dump_whose_status_reads_are_refused_reports_them_as_vanished_rather_than_withheld."
+        );
+        server.panic_reset();
+        return;
+    };
     let (read, total) = dump_thread_counts(&dropped).expect("counts");
     let missing = total - read;
     // Not silently dropped: the difference is stated, and it is the arithmetic the header promised.
