@@ -299,6 +299,36 @@ reply that prints it prints a `~`. This is a caller-visible reply change and `do
 it as the "Change what a reply says" row, including the warning that the *smaller* per-packet number is the dump
 getting faster rather than a regression.
 
+## The fourth call site was measured and deliberately not converted
+
+#100 lists "per-object field reads in `expand_objects`" as its second conversion. A census of a warm
+`debug.get_stack --expand_objects` walk over `DeepProbe` — 240 commands — says it is the wrong target:
+
+```text
+  ObjectReference.ReferenceType   119   50%
+  ObjectReference.GetValues        37   15%
+  ObjectReference.InvokeMethod     32   13%
+  StringReference.Value            29   12%
+  ArrayReference.Length/GetValues  20    8%
+```
+
+**The field reads #100 names are 15% of it.** Half of the walk is `render_node` resolving each value's type
+and an eighth is reading each string — PERF-2 (#129) — and an eighth is invocations, which are not
+independent reads at all: an `InvokeMethod` runs arbitrary debuggee code and JDWP invalidates every frame id
+on the thread when it does.
+
+**And the 15% cannot be waved without giving up the invariant.** The deep walk decrements a shared node
+budget *per node as it renders*, so how many children of a level get rendered is not known until they have
+been. Prefetching a level's reads therefore reads for children the budget may never reach — the speculation
+every other conversion here refuses. The alternative is to *reserve* budget breadth-first before the wave,
+which changes **which nodes appear in the output** when the budget binds, and that is caller-visible.
+
+So this one is left, and #129 is extended to cover it rather than a fourth conversion being forced: once a
+wave-aware `render_value` exists, it is the mechanism that carries these 37 reads too, and it has to solve the
+budget question anyway. Converting 37 of 240 commands at the cost of the invariant, while the 148 that
+dominate stay serialised, is the trade this ADR would have had to argue for — and the census is why it does
+not.
+
 ## Consequences
 
 - `issue` / `InFlight` / `read_independently` are public API on an unpublished crate. `scripts/semver-check.sh`
