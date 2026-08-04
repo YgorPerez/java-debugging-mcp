@@ -65,6 +65,25 @@ loopback" or reasons that `held ≈ packets × RTT` is now working from the wron
 say `held ≈ round_trips × RTT + packets × our processing`, and that the round trips are the figure to reason
 about on a remote instance. `CONTEXT.md`'s `Packet` entry and ADR-0038 carry the same amendment.
 
+**PERF-2 (#129) is the same row again, and the same mild version — on a different tool.** A *truncated*
+`debug.list_threads` reply's cost line now reads
+`💸 Cost: 268 JDWP packet(s) in ~17 round trip(s), 0.42ms each …` where it used to read
+`💸 Cost: 268 JDWP packet(s), 0.42ms each …`. Same shape of change as PERF-1's, same reason it is mild — a
+clause added between two things already there — and the same thing to state: the per-packet figure falls for
+the same work, because the names and statuses PERF-1 waved stopped being waited on one at a time.
+
+Two differences from PERF-1's row worth naming. The clause **suppresses itself when the two numbers are
+equal**, so a listing short enough to have waved nothing reads exactly as it did before and a downstream
+example quoting one may or may not show the clause depending on the pool it was captured against — the clause
+appearing *is* the information that something overlapped. And it is on the **truncated** reply only, because
+that is the only shape that ever printed a cost line.
+
+Nothing else in PERF-2 changed a reply. The renderer got substantially cheaper — a `Reserva` row costs
+13.47ms of wire time where it cost 79.19ms before PERF-1, and a deep `debug.get_stack --expand_objects` walk
+sends a quarter fewer commands — and every one of those replies is byte-identical. That is the point of it:
+`debug.evaluate`, `debug.get_stack` and `debug.run_named_query` cost less and say the same thing, so the
+release notes owe the speed but no caller has anything to re-read.
+
 **`debug.run_named_query` (EVAL-11, #124) is the "Add a tool" row being exercised, and that row is silent.**
 The toolkit will install a binary that can run a named JPA query and its skills will not mention it, so
 nobody will call it — the tool is not broken, it is invisible. Two things follow. The release notes have to

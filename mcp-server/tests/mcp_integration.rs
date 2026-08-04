@@ -15526,6 +15526,24 @@ fn a_committed_projection_costs_no_more_packets_per_row_than_reading_one_at_a_ti
 
     // Printed on a pass as well as a failure, on the same principle as the runner's `JDK in use:` line.
     eprintln!("PERF-2: a `Reserva` row costs {per_row} command(s).{breakdown}");
+
+    // #129's first added criterion: **`ObjectReference.InvokeMethod` is never waved.** It is not an
+    // independent read — it runs arbitrary debuggee code, and JDWP invalidates every frame id on the thread
+    // when it does. Asserted from the wire rather than from the type: `ValueReads` has no arm that could plan
+    // one, but a *future* prefetch could, and this is the assertion that would notice. The query's own
+    // invocations are fixed cost and cancel in the marginal count, so a non-zero figure here is the
+    // projection invoking something per row — which is also what `JpaProbe.associationTouches` measures from
+    // the debuggee's side, and this is the same claim from ours.
+    let invocations = wide.get(&(9, 6)).copied().unwrap_or(0) - narrow.get(&(9, 6)).copied().unwrap_or(0);
+    assert_eq!(
+        invocations,
+        0,
+        "the projection invoked something {} time(s) per row. `ObjectReference.InvokeMethod` must never be \
+         waved and must never be reached from this path at all: it runs debuggee code, which is the side \
+         effect `debug.run_named_query` promises not to have, and it invalidates every frame id on the \
+         thread.{breakdown}",
+        invocations / extra
+    );
     // The control first: a marginal count of zero would mean the two arms read the same traffic, which
     // means the row count did nothing and the ceiling below would pass on a measurement of nothing.
     assert!(

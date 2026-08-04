@@ -1326,8 +1326,10 @@ impl RequestHandler {
         let limit = a.limit.max(1);
 
         // Counted from before the thread list, so the cost line below covers every packet this call
-        // spent — including the names it read only in order to choose (DUMP-5, #51).
+        // spent — including the names it read only in order to choose (DUMP-5, #51). Round trips over the
+        // same window, because the two numbers are only comparable if they measure the same call (#129).
         let before = session.connection.packets_sent();
+        let waits_before = session.connection.round_trips();
         let wire_from = std::time::Instant::now();
         let all =
             session.connection.get_all_threads().await.map_err(|e| format!("Failed to get threads: {e}"))?;
@@ -1337,6 +1339,7 @@ impl RequestHandler {
             collect_thread_rows(&session.connection, &all, limit, name_filter.as_deref(), only_suspended)
                 .await;
         let cost = session.connection.packets_sent().saturating_sub(before);
+        let round_trips = session.connection.round_trips().saturating_sub(waits_before);
         let wire = wire_from.elapsed();
         // SAFE-11: an invisible suspension is the kind that gets forgotten, and this listing is where a
         // caller looks to find out what the JVM is doing. Read from session state, so it costs **zero**
@@ -1395,7 +1398,13 @@ impl RequestHandler {
             );
             // Only on a truncated listing, because that is the only shape that paid anything extra: a
             // listing that showed every thread read exactly the names it printed.
-            output.push_str(&list_cost_note(cost, wire, shown, name_filter.is_some() || only_suspended));
+            output.push_str(&list_cost_note(
+                cost,
+                round_trips,
+                wire,
+                shown,
+                name_filter.is_some() || only_suspended,
+            ));
         }
 
         Ok(output)
@@ -21565,7 +21574,19 @@ fn round_trip_note(cost: u32, round_trips: u32) -> String {
 /// **Offered only when it is true.** A listing narrowed by `name_filter` or `only_suspended` already had
 /// to read every name to apply the filter, so selection added nothing to it and claiming a saving would be
 /// inventing one.
-fn list_cost_note(cost: u32, wire: std::time::Duration, shown: usize, filtering: bool) -> String {
+///
+/// **The round-trip clause is here for the same reason the packet count is** (PERF-2, #129). PERF-1 made
+/// `collect_thread_rows` read every thread's name and status in waves, so on this path a packet count stopped
+/// being a proxy for what a caller waits for — and this reply, whose entire subject is what the call cost,
+/// went on reporting only the traffic. The clause is [`round_trip_note`]'s and suppresses itself when the two
+/// numbers are equal, so a listing short enough to have waved nothing reads exactly as it did before.
+fn list_cost_note(
+    cost: u32,
+    round_trips: u32,
+    wire: std::time::Duration,
+    shown: usize,
+    filtering: bool,
+) -> String {
     let comparison = if filtering {
         " — one per thread NAME. A filtered listing always read every name to apply the filter, so \
          choosing by family costs it nothing extra."
@@ -21578,7 +21599,11 @@ fn list_cost_note(cost: u32, wire: std::time::Duration, shown: usize, filtering:
             shown + 1
         )
     };
-    format!("💸 Cost: {cost} JDWP packet(s){}{comparison}\n", per_packet_note(cost, wire))
+    format!(
+        "💸 Cost: {cost} JDWP packet(s){}{}{comparison}\n",
+        round_trip_note(cost, round_trips),
+        per_packet_note(cost, wire)
+    )
 }
 
 /// What the threads a truncated dump never reached would have cost, extrapolated from the ones it did
@@ -23992,7 +24017,7 @@ mod tests {
     #[test]
     fn a_truncated_listing_reports_what_choosing_by_family_cost_it() {
         let wire = std::time::Duration::from_millis(112);
-        let note = list_cost_note(268, wire, 40, false);
+        let note = list_cost_note(268, 17, wire, 40, false);
         assert!(note.contains("268 JDWP packet(s)"), "the number it actually spent: {note}");
         assert!(note.contains("0.42ms each"), "priced on THIS connection, not on loopback: {note}");
         // The counterfactual is arithmetic, not an estimate: the loop this replaced read one name per row
@@ -24002,12 +24027,22 @@ mod tests {
 
         // A filtered listing always read every name to apply the filter, so selection added nothing to
         // it. Offering the same saving here would be inventing one.
-        let filtered = list_cost_note(268, wire, 40, true);
+        let filtered = list_cost_note(268, 17, wire, 40, true);
         assert!(filtered.contains("costs it nothing extra"), "{filtered}");
         assert!(!filtered.contains("would have cost"), "no counterfactual where none applies: {filtered}");
 
         // One packet is not a mean, and the dump suppresses the per-packet figure for the same reason.
-        assert!(!list_cost_note(1, wire, 0, false).contains("ms each"));
+        assert!(!list_cost_note(1, 1, wire, 0, false).contains("ms each"));
+
+        // PERF-2 (#129): the waves PERF-1 put under this listing are what a caller waits for, and this reply
+        // is the one whose whole subject is what the call cost. Both numbers, as the dump reports them.
+        assert!(note.contains("268 JDWP packet(s) in ~17 round trip(s)"), "both figures: {note}");
+        // And suppressed when they are equal, which is every listing short enough to have waved nothing:
+        // printing one number twice as two facts is worse than printing it once, and seeing the clause is
+        // itself the information that something overlapped.
+        let serialised = list_cost_note(268, 268, wire, 40, false);
+        assert!(serialised.contains("268 JDWP packet(s)"), "the traffic is still reported: {serialised}");
+        assert!(!serialised.contains("round trip(s)"), "nothing overlapped, so no clause: {serialised}");
     }
 
     // "227 more" answers "is this short?"; naming the groups answers "short of WHAT?", which is the
