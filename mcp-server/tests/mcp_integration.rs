@@ -6205,15 +6205,56 @@ fn suspending_twice_then_resuming_once_says_the_thread_is_still_suspended() {
     );
 
     // The probe agrees with the reply, which is the point — a tool that admits it failed is only useful
-    // if the admission is true.
+    // if the admission is true. The probe's stdout stays the primary witness and the suspended listing does
+    // NOT replace it: `debug.suspend_thread` reports success whether it froze one thread, all of them or
+    // none, and so does any other reply of ours.
+    //
+    // TEST-43 (#128). This used to OR two `wait_for_line`s that ran IN SEQUENCE, each bounded by
+    // `EVENT_TIMEOUT` — so the failing path cost ~50 s, which made this the slowest test in the run whenever
+    // it failed, against a 2.99 s entry in `timings.tsv`. Both workers are now watched inside ONE window.
+    //
+    // The window is still `EVENT_TIMEOUT` rather than something derived from the 120 ms tick interval, and
+    // that is deliberate: shortening the PASS condition on a box that starves a probe JVM would convert a
+    // rare flake into a frequent one, and nobody has measured how long these workers actually go quiet under
+    // 40 threads on 4 cores. What is fast instead is detecting the BUG — the listing is read each pass, and a
+    // second suspended thread fails immediately rather than after the window.
+    let bases: Vec<(&str, i64)> =
+        ["worker-a", "worker-b"].iter().map(|w| (*w, highest_worker_tick(&probe, w).unwrap_or(-1))).collect();
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
     let mut others_moved = false;
-    for who in ["worker-a", "worker-b"] {
-        let base = highest_worker_tick(&probe, who).unwrap_or(-1);
-        others_moved |= probe
-            .wait_for_line(EVENT_TIMEOUT, |l| worker_tick(l, who).is_some_and(|n| n > base + 1))
-            .is_some();
+    let mut listing = String::new();
+    while !others_moved {
+        others_moved =
+            bases.iter().any(|(who, base)| highest_worker_tick(&probe, who).is_some_and(|n| n > base + 1));
+        if others_moved {
+            break;
+        }
+        // The one reading that separates "we froze more than we said" from "this JVM got no CPU". SAFE-11's
+        // claim is that exactly ONE thread is held, so a second name here is the bug itself and there is no
+        // reason to keep waiting for it.
+        listing = server.call("debug.list_threads", serde_json::json!({"only_suspended": true}));
+        assert!(
+            listing.starts_with("0/") || listing.starts_with("1/"),
+            "the debugger is holding more than the one thread it was asked to, which is SAFE-11's headline \
+             claim breaking — and the other workers' silence is a consequence rather than the finding:\n  \
+             {listing}"
+        );
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    assert!(others_moved, "the other workers stopped too, so this froze more than one thread");
+    assert!(
+        others_moved,
+        "neither worker-a nor worker-b advanced two ticks in {EVENT_TIMEOUT:?}. What that does NOT establish \
+         is a VM-wide freeze: the suspended listing below says exactly one thread is held, so the debugger \
+         held only what it was asked to and these two stopped for some other reason — a starved probe JVM \
+         and a dead one both look like this. The tick numbers and the tail decide which, and they are here \
+         rather than left to a second sighting. Ticks at the start were {bases:?}, the probe has printed {} \
+         line(s) in all.\n  suspended: {listing}\n  probe's last 8 lines: {:?}",
+        probe.output().len(),
+        probe.output().iter().rev().take(8).collect::<Vec<_>>(),
+    );
     assert_eq!(
         highest_worker_tick(&probe, "worker-c").unwrap_or(-1),
         frozen,
