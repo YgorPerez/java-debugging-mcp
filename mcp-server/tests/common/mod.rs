@@ -2236,6 +2236,31 @@ impl Server {
         None
     }
 
+    /// Poll `debug.list_threads {only_suspended: true}` until nothing is suspended, returning the last
+    /// reply seen if the bound runs out.
+    ///
+    /// A **single** read cannot tell a thread stranded for the life of the JVM from one caught inside a
+    /// capture window, and those need opposite responses (TEST-41, #126). The boundary is exact rather
+    /// than theoretical: [`Self::wait_for_traces`] returns as soon as a record is *readable*, and the
+    /// capture path files the record **before** it resumes the hit thread — so a read taken the moment
+    /// `wait_for_traces` returns lands precisely where the two readings are indistinguishable.
+    ///
+    /// Reads once before consulting the deadline, so a caller passing a very short bound still gets the
+    /// one-shot behaviour rather than no read at all.
+    pub fn wait_for_no_suspended(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let reply = self.call("debug.list_threads", serde_json::json!({"only_suspended": true}));
+            if reply.starts_with("0/") {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(reply);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Poll `debug.get_last_event` until it reports something containing `needle`.
     ///
     /// `get_last_event` keeps returning the previous hit until a new one lands, so `needle` must be

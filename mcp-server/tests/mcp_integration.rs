@@ -13598,6 +13598,18 @@ fn wedge_waits(probe: &Probe) -> Option<i64> {
         .max()
 }
 
+/// How long to keep watching for a suspension left by a traced hit to clear before calling the thread
+/// stranded (TEST-41, #126).
+///
+/// A bound on observing an **absence**, so it is sized off the positive it rules out rather than off
+/// [`EVENT_TIMEOUT`] — the same argument as [`STUCK_CONFIRM`] and as `CLAUDE.md`'s TEST-30 note. The
+/// positive here is a trace capture completing and resuming its thread: a handful of JDWP round trips on a
+/// loopback connection, which this suite's own `⏱  Trace cost:` line reports in **milliseconds**. 3 s is
+/// therefore a margin of two to three orders of magnitude, and a thread still held after it is not one
+/// that is mid-capture. `EVENT_TIMEOUT`'s 25 s is sized for a JVM that has to *do* something first, which
+/// is the opposite situation — and spending it here would trade a fast, legible failure for a slow one.
+const TRACE_RESUME_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// DUMP-8 (#123): an invoking `trace_expr` is refused on the OPENING half of a pair, and the thing worth
 /// keeping is why the refusal is the fix rather than the fallback.
 ///
@@ -13754,23 +13766,45 @@ fn an_invoking_trace_expr_is_refused_on_the_half_that_does_not_own_the_lock() {
         .expect("a field read on the blocked half never recorded");
     assert_contains_all("a field read resolves on the blocked half", &field, &["\"wedge\""]);
 
-    // And the debuggee is untouched by all of it: nothing suspended, and the contender still getting
-    // through its synchronized block. The second is the half no reply of ours could fake.
-    let suspended = server.call("debug.list_threads", serde_json::json!({"only_suspended": true}));
-    assert!(suspended.starts_with("0/"), "a traced hit left a thread suspended:\n{suspended}");
-    let before = wedge_acquisitions(&probe).unwrap_or(-1);
+    // And the debuggee is untouched by all of it.
+    assert_wedge_untouched(&mut server, &probe);
+
+    server.panic_reset();
+}
+
+/// The DUMP-7/8 sections' standing promise, asserted from OUTSIDE the debugger: a traced hit left nothing
+/// suspended, and the contender is still getting through its synchronized block.
+///
+/// The second half is the one no reply of ours could fake, which is why it reads the probe's own counter
+/// rather than a thread listing.
+fn assert_wedge_untouched(server: &mut Server, probe: &Probe) {
+    // Polled rather than read once (TEST-41, #126). `wait_for_traces` returns as soon as a record is
+    // readable and the capture path files the record BEFORE it resumes the hit thread, so a single read
+    // taken the moment it returns lands exactly on the boundary between "stranded for the life of the
+    // JVM" — the hazard trace mode exists to prevent — and "caught mid-capture", which is not a defect at
+    // all. Both failed with the same message, which claimed the first, so a sighting could not be acted on.
+    if let Err(still) = server.wait_for_no_suspended(TRACE_RESUME_WINDOW) {
+        panic!(
+            "a traced hit left a thread STILL suspended after {TRACE_RESUME_WINDOW:?}, which is long past \
+             a capture — so this is a stranded thread rather than one caught mid-capture. The waiter's own \
+             counter, from outside the debugger, says waits={:?}:\n{still}",
+            wedge_waits(probe)
+        );
+    }
+    // The baseline is kept as an `Option` rather than defaulted, so "the probe never reported an
+    // acquisition at all" cannot be dressed up as a reading of -1 — TEST-40 (#125) was exactly that
+    // mistake, on this same pair of counters.
+    let before = wedge_acquisitions(probe);
     let advanced = (0..60).any(|_| {
         std::thread::sleep(std::time::Duration::from_millis(150));
-        wedge_acquisitions(&probe).is_some_and(|now| now > before)
+        wedge_acquisitions(probe) > before
     });
     assert!(
         advanced,
         "the contender never completed another acquisition, so something wedged it. acquisitions was \
-         {before} and is {:?} now",
-        wedge_acquisitions(&probe)
+         {before:?} and is {:?} now",
+        wedge_acquisitions(probe)
     );
-
-    server.panic_reset();
 }
 
 /// The `acquired` half carries none of this, and the reason is not visible in the code (DUMP-8, #123).
