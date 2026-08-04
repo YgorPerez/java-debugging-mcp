@@ -357,6 +357,37 @@ been. Prefetching a level's reads therefore reads for children the budget may ne
 every other conversion here refuses. The alternative is to *reserve* budget breadth-first before the wave,
 which changes **which nodes appear in the output** when the budget binds, and that is caller-visible.
 
+### Amended by #129: that two-way choice was recorded against a number nobody had measured
+
+The second option's entire cost is the phrase *"when the budget binds"*, and how often that is went unmeasured
+here. It has now been measured, on `DeepProbe`'s graph, JDK 17.0.20 and 21.0.12 alike:
+
+```text
+  debug.evaluate    order        max_depth 1,2,3,4,6   19..113 lines    never binds
+  debug.evaluate    order.many   max_depth 2,3,4       19 lines         never binds
+  debug.get_stack   4 frames     max_depth 1           64 lines         does not bind
+  debug.get_stack   4 frames     max_depth 2           454 lines        does not bind
+  debug.get_stack   4 frames     max_depth 3           1216 lines       BINDS
+  debug.get_stack   4 frames     max_depth 4           1619 lines       BINDS
+```
+
+`debug.evaluate` never reaches its 400 nodes at **any** depth — the render saturates at depth 3 and stops
+growing, cycles and collections included. `debug.get_stack` reaches its 1000 only from depth 3, where the reply
+is already past the size `STACK_NODE_BUDGET`'s own doc comment calls "a reply no caller wants in full".
+
+**So the budget binds only where the tool is already telling the caller to narrow**, and a third option follows
+that neither this ADR nor #129 considered: prefetch a level **while the budget provably cannot bind**, and
+decline otherwise. Soundness is arithmetic rather than judgement — at a level of `n` children whose subtrees can
+each consume at most `S`, children `1..k` are all certain to render when `budget >= (k-1)*S + k`, and `S` is
+bounded by `child_limit` and the depth remaining. Such a prefetch is **not speculative** and **changes no
+reply**: it converts the walk on every workload anyone runs, and switches itself off exactly where the
+caller-visible arm would have had a cost.
+
+`the_deep_node_budget_does_not_bind_on_a_usable_reply` pins the premise, so this reasoning fails rather than
+rots if `DeepProbe` grows or either budget changes. **The conversion itself is not done here**: it is a second
+call site with a soundness argument of its own, and "convert one call site" is #100's instruction as much as its
+first half is.
+
 So this one is left, and #129 is extended to cover it rather than a fourth conversion being forced: once a
 wave-aware `render_value` exists, it is the mechanism that carries these 37 reads too, and it has to solve the
 budget question anyway. Converting 37 of 240 commands at the cost of the invariant, while the 148 that

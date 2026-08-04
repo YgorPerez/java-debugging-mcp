@@ -15577,6 +15577,115 @@ fn a_committed_projection_costs_no_more_packets_per_row_than_reading_one_at_a_ti
     );
 }
 
+/// PERF-2 (#129): the deep walk's node budget does not bind on any workload whose reply is a usable size.
+///
+/// **This exists because a decision was recorded against a number nobody had measured.** ADR-0038 and #129
+/// both frame the deep walk's remaining reads as a two-way choice: either prefetch only what the budget has
+/// committed to (which needs a commitment that does not exist, since `state.budget` is decremented per node
+/// *as it renders*) or reserve budget breadth-first before the wave (which changes **which nodes appear** when
+/// the budget binds, and is therefore caller-visible). The second option's whole cost is the phrase "when the
+/// budget binds" — and how often that is was never measured.
+///
+/// Measured on `DeepProbe`'s graph, JDK 17.0.20, reading the exhaustion notice out of the reply:
+///
+/// ```text
+///   debug.evaluate    order        max_depth 1,2,3,4,6   19..113 lines    never binds
+///   debug.evaluate    order.many   max_depth 2,3,4       19 lines         never binds
+///   debug.get_stack   4 frames     max_depth 1           64 lines         does not bind
+///   debug.get_stack   4 frames     max_depth 2           454 lines        does not bind
+///   debug.get_stack   4 frames     max_depth 3           1216 lines       BINDS
+///   debug.get_stack   4 frames     max_depth 4           1619 lines       BINDS
+/// ```
+///
+/// `debug.evaluate` never reaches its 400 nodes on this graph at **any** depth — the render saturates at
+/// depth 3 and stops growing, cycles and collections included. `debug.get_stack` reaches its 1000 only from
+/// depth 3, where the reply is past the size `STACK_NODE_BUDGET`'s own doc comment calls "already a reply no
+/// caller wants in full".
+///
+/// **So the budget binds only where the tool is already telling you to narrow.** That does not resolve the
+/// question by itself, but it moves it: a prefetch that is legal *while the budget provably cannot bind* would
+/// convert the deep walk on every workload anyone actually runs, with no change to any reply, and would decline
+/// exactly where the caller-visible arm would have had a cost. Recorded here so that reasoning rests on a
+/// measurement, and so it fails if the premise changes.
+///
+/// The assertions are the two ends and not the table: that a `debug.evaluate` deep render never exhausts, and
+/// that `get_stack` at depth 2 does not either. Both are premises something may be built on. The depth-3
+/// binding is *printed* rather than asserted — it is the JVM's graph and the reply size that decide it, and
+/// pinning it would be pinning `DeepProbe`.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn the_deep_node_budget_does_not_bind_on_a_usable_reply() {
+    let Some(jdk) = jdk_or_skip("the_deep_node_budget_does_not_bind_on_a_usable_reply") else { return };
+    let mut probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+    let line = probe_line(&probe_source("DeepProbe"), "// BP1");
+    let armed =
+        server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
+    assert!(!armed.contains("Refused"), "the stop point was refused: {armed}");
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in DeepProbe.inspect never fired");
+
+    let bound = |reply: &str| reply.contains("budget exhausted") || reply.contains("node budget");
+
+    // `debug.evaluate`, every depth including well past where the graph stops growing.
+    for depth in [1_usize, 2, 3, 4, 6] {
+        let reply = server.call(
+            "debug.evaluate",
+            serde_json::json!({"expression": "order", "expand_objects": true, "max_depth": depth}),
+        );
+        // The control: a render that expanded nothing would not exhaust either, and would pass vacuously.
+        assert!(
+            reply.contains("customer = ") || depth == 0,
+            "max_depth={depth} expanded nothing, so the absence of an exhaustion notice means nothing:\n{}",
+            head_of(&reply)
+        );
+        assert!(
+            !bound(&reply),
+            "a deep `debug.evaluate` at max_depth={depth} exhausted its {} node budget on DeepProbe's graph. \
+             It measured 113 lines and no exhaustion at every depth from 1 to 6. Something has grown the \
+             graph or lowered the budget, and #129's reasoning about when the budget binds rests on this \
+             NOT happening.\n{}",
+            "400",
+            head_of(&reply)
+        );
+    }
+
+    // `get_stack`, at the depths whose replies are a size a caller reads. Depth 3+ does bind and is printed.
+    for depth in [1_usize, 2] {
+        let reply = server.call(
+            "debug.get_stack",
+            serde_json::json!({"expand_objects": true, "max_depth": depth, "max_frames": 4}),
+        );
+        assert!(
+            reply.contains("order = "),
+            "get_stack at max_depth={depth} expanded no locals, so this proves nothing:\n{}",
+            head_of(&reply)
+        );
+        assert!(
+            !bound(&reply),
+            "`debug.get_stack --expand_objects` at max_depth={depth} over 4 frames exhausted its 1000 node \
+             budget. Measured: 64 lines at depth 1 and 454 at depth 2, neither exhausting; depth 3 is where \
+             it starts, at 1216 lines.\n{}",
+            head_of(&reply)
+        );
+    }
+    for depth in [3_usize, 4] {
+        let reply = server.call(
+            "debug.get_stack",
+            serde_json::json!({"expand_objects": true, "max_depth": depth, "max_frames": 4}),
+        );
+        eprintln!(
+            "PERF-2: get_stack --expand_objects max_depth={depth} over 4 frames — {} lines, budget bound: {}",
+            reply.lines().count(),
+            bound(&reply)
+        );
+    }
+
+    server.panic_reset();
+}
+
 /// One reading of the marginal wire cost of a `debug.run_named_query` row: the same query at two row counts,
 /// differenced and divided, then differenced again across two round trip times.
 ///
