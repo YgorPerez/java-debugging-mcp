@@ -14099,7 +14099,19 @@ fn a_flooding_monitor_stop_disarms_itself_on_its_budget_and_says_so() {
     let mut server = Server::start().expect("start server");
     probe.attach(&mut server);
 
-    let before = highest_tick(&probe).unwrap_or(-1);
+    // THE PREMISE OF THE FINAL ASSERTION, ESTABLISHED RATHER THAN HOPED FOR (#125). `monitor_probe_ready`
+    // waits for `monitors ready`, and its own doc explains why it is not `tick ` — correct for arming, but it
+    // means readiness fires BEFORE the first tick line exists, so `before` was the `unwrap_or(-1)` default on
+    // every single run. `after > before` then only means "kept ticking" if `before` was a real number: when a
+    // flooding stop point on a starved 4-vCPU runner delayed main's first `println` past the budget disarm,
+    // `after` was -1 as well, `-1 > -1` failed, and the message blamed the probe for STOPPING when it had
+    // never started. Two of three CI attempts on JDK 11 shard 1/2, and 3/3 green locally — a gentler box, as
+    // CLAUDE.md warns.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some())
+        .expect("MonitorProbe never printed a tick, so there was never a witness to keep");
+    let before = highest_tick(&probe)
+        .expect("a tick line was seen but did not parse, which means tick_index and the probe disagree");
     server.call(
         "debug.set_monitor_stop",
         serde_json::json!({"kinds": ["wait"], "trace_max_hits": 5, "trace_frames": 0}),
@@ -14120,11 +14132,16 @@ fn a_flooding_monitor_stop_disarms_itself_on_its_budget_and_says_so() {
 
     // A disarm is not a freeze: the whole point of the TRACE-8 in-flight handling is that events the JVM
     // had already generated are dropped and resumed rather than surfaced as suspending hits.
-    let after = highest_tick(&probe).unwrap_or(-1);
+    // Polled rather than read once: the claim is that the probe is STILL ticking, and one read taken the
+    // instant the budget note appears can land between two of its 150 ms ticks. A bounded wait for the next
+    // tick is the same observation without the coin flip — and it still fails, in the same time, if the
+    // probe is genuinely frozen.
+    let advanced = probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > before));
     assert!(
-        after > before,
+        advanced.is_some(),
         "the probe stopped ticking after the budget disarm, so an in-flight monitor event was surfaced as a \
-         suspending hit. before={before} after={after}\n  probe tail: {:?}",
+         suspending hit. It WAS ticking before it (tick {before}), so this is a stop and not a slow \
+         start.\n  probe tail: {:?}",
         probe.output().iter().rev().take(8).collect::<Vec<_>>(),
     );
 
