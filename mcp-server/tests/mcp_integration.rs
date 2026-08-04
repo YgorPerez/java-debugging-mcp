@@ -2405,6 +2405,21 @@ fn stop_id(reply: &str, prefix: &str) -> Option<String> {
     (!digits.is_empty()).then(|| format!("{prefix}{digits}"))
 }
 
+/// The `thread=0x…` id off the first trace snapshot whose line contains `at`.
+///
+/// A recorded hit is a stronger source for a thread id than `debug.list_threads` is, and the difference
+/// is the whole of TEST-42 (#127): a listing proves only that the thread EXISTED when the listing was
+/// taken, while a snapshot proves the thread ran the code the test is about. On a pool that sheds load and
+/// retires idle workers those are very different claims.
+fn traced_thread(traces: &str, at: &str) -> Option<String> {
+    let line = traces.lines().find(|l| l.contains(at))?;
+    let start = line.find("thread=")? + "thread=".len();
+    let rest = line.get(start..)?;
+    let end = rest.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(rest.len());
+    let id = rest.get(..end)?;
+    (id.starts_with("0x") && id.len() > 2).then(|| id.to_string())
+}
+
 /// The `⏱  Trace cost:` line belonging to one stop point in a `debug.list_stop_points` listing.
 ///
 /// Rows start at two spaces plus a glyph and their detail lines are indented further, so a row's details
@@ -2691,14 +2706,37 @@ fn a_filter_pinned_to_a_retired_thread_reports_itself_as_dead() {
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
-    let threads =
-        server.call("debug.list_threads", serde_json::json!({"name_filter": "pool-worker", "limit": 400}));
-    let target = threads
-        .lines()
-        .find(|l| l.trim_start().starts_with("0x") && l.contains("pool-worker"))
-        .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("no pool worker id in:\n{threads}"))
-        .to_string();
+    // The target comes from a HIT, not from a thread listing (TEST-42, #127). This used to take the first
+    // `pool-worker` out of `debug.list_threads` and then wait `EVENT_TIMEOUT` for *that* worker to throw —
+    // which the pool does not guarantee: `PoolProbe` sheds load when its queue is full and lets an idle
+    // worker die on the keep-alive, both deliberate and both in its own header. So the chosen worker might
+    // take no further work, the wait timed out about 1 run in 24, and its message ("never fired while its
+    // thread was alive") blamed the filter for the test's own choice of thread. Arming unfiltered inverts
+    // it: whichever worker throws first is by construction one that runs `doWork`.
+    let scout = server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({
+            "class_pattern": "PoolProbe$PoolException",
+            // One hit is all that is needed, and `doWork` throws on every task of a 100-task batch — an
+            // unbounded unfiltered trace would capture hundreds of hits a second to no purpose.
+            "trace": true, "trace_max_hits": 1,
+        }),
+    );
+    let Some(scout_id) = stop_id(&scout, "exc_") else { panic!("the unfiltered arm failed: {scout}") };
+    let observed = server.wait_for_traces("PoolProbe.doWork", EVENT_TIMEOUT).unwrap_or_else(|| {
+        panic!(
+            "no pool worker threw at all, so the probe is not producing exceptions — a SETUP failure, \
+             which says nothing about the pinned filter\n  output: {:?}",
+            probe.output()
+        )
+    });
+    let target = traced_thread(&observed, "PoolProbe.doWork")
+        .unwrap_or_else(|| panic!("a recorded hit carried no thread= id:\n{observed}"));
+
+    // Clear the scout and its snapshots, so everything the buffer says from here on is the pinned filter's
+    // doing and the emptiness asserted below is the filter's silence rather than the scout's.
+    server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": scout_id}));
+    server.call("debug.get_traces", serde_json::json!({"clear": true}));
 
     let armed = server.call(
         "debug.set_exception_stop",
@@ -2707,11 +2745,15 @@ fn a_filter_pinned_to_a_retired_thread_reports_itself_as_dead() {
             "trace": true, "trace_max_hits": 0, "thread_id": target,
         }),
     );
-    assert!(armed.contains("exc_"), "filtered arm failed: {armed}");
-    // It works to begin with — otherwise the assertions below would pass for the wrong reason.
-    server
-        .wait_for_traces("PoolProbe.doWork", EVENT_TIMEOUT)
-        .unwrap_or_else(|| panic!("the filtered stop point never fired while its thread was alive"));
+    // This assertion is what the removed `wait_for_traces` was really establishing. The old wait proved the
+    // pinned thread was alive by watching it throw again; arming against a *dead* id is refused naming the
+    // stale thread (asserted at the end of this test), so a successful arm proves the same liveness — and
+    // proves it without depending on the pool scheduling that worker a second time.
+    assert!(
+        armed.contains("exc_"),
+        "the pinned arm was refused, so the worker retired between its hit and this arm — a SETUP failure, \
+         not the filter's: {armed}"
+    );
 
     // Retire the whole pool, so the filter's thread stops existing.
     probe.send_line("quiesce").expect("send quiesce");
