@@ -652,6 +652,20 @@ turns out to be final is the one left standing.
 _Avoid_: dedupe, deduplicate (see above); collapse on its own (this codebase already collapses hidden
 frames, disarm notes and thread-name families, and those are three other mechanisms)
 
+**`sighting` acquired a second sense outside the code, and it is left there on the `snapshot` test.** In this
+entry a sighting is one throw of one exception instance at one site. In the issue tracker, in commit bodies and
+in soak reports it means **one observed failure of a flaky test** — and the distinction that sense carries is
+load-bearing rather than casual: a sighting is *not* a reproduction, so a flake can have many sightings and
+still not be reproducible on demand, which is the whole state #118, #71, #64, #56 and #45 are in after forty
+full-suite runs. #126's brief turns on it too, distinguishing "make the next sighting legible" from "explain
+this one".
+The two are close enough to look like one word used loosely — both are "one observation of a recurring
+thing" — which is exactly why it is written down. What keeps it cheap is the same measurement the `snapshot`
+note rests on: **no reply and no tool description uses the second sense.** Every caller-facing use of the word
+— `debug.set_exception_stop`'s description and the fold rendering — is the rethrow one, so a caller can only
+ever meet this entry's sense. The flake sense stays in the tracker and in git history, where its subject is
+never an exception.
+
 **Link**:
 One step of a chained expression — `.getConfigUhList()`, `[0]`, `.getSqQuarto()`. The unit
 `debug.evaluate_chain` reports in, and the thing named when a chain goes null.
@@ -967,6 +981,27 @@ Its counterpart is under **tick**, and TEST-39 cost a flake for want of it: anno
 bargain, and what a probe announces has to be *read* rather than inferred from the fact that it spoke.
 _Avoid_: "the probe is alive" — a live thread that no longer executes the code under test is exactly the
 case that misled three investigations.
+Its other counterpart is **separated** below: a witness only helps if the assertion that reads it says which
+part of the evidence failed.
+
+**Separated** (of an assertion):
+A failing assertion whose message names **which** of its candidate causes fired, rather than one it could not
+have established.
+**It earns a name because in a debugger every observation has at least three candidate causes that present
+identically** — the product is wrong, the **probe** stopped, or the test raced — so a message that picks one is
+right by luck. Three fixes here are the same fix: #118's was split into *class never prepared* / *prepared but
+the arm did not land* / *armed and never hit*; TEST-40's (#125) into *never ticked* / *ticked then stopped*,
+which had been blaming a probe for stopping when it had never started, because its "before" reading was a
+default on every run since the test was written; and #126 asks for *stranded* against *transient*. Each cost a
+flake investigation for want of the distinction, and one of them cost two.
+**It is not ADR-0034's rule, and the two are complementary.** That rule — *a negative assertion has to be seen
+failing before it is trusted* — establishes that an assertion **can** fire. This asks what its firing then
+*means*: an assertion can be seen failing, fire correctly, and still name the wrong cause. Worth knowing where
+that rule lives, because nothing in the ADR titles points at it: it is in **ADR-0034**, whose subject is
+conditions naming what a hit carries, recorded as a lesson from the implementation rather than as the decision.
+_Avoid_: "a clear error message" (says nothing about causes), "specific" (a message can be specific and
+confidently wrong, which is the failure mode rather than the fix), flaky (a property of a test's outcome, not
+of what its message can establish)
 
 **Running** (of a probe):
 Having executed code — as opposed to **listening**, which is all a successful attach proves. The JDWP agent
