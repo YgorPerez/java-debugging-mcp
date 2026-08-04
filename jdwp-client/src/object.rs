@@ -5,7 +5,7 @@
 use crate::commands::{command_sets, object_reference_commands};
 use crate::connection::JdwpConnection;
 use crate::eval::write_untagged_value;
-use crate::protocol::{CommandPacket, JdwpResult};
+use crate::protocol::{CommandPacket, JdwpResult, ReplyPacket};
 use crate::reader::{read_i32, read_u64, read_u8, read_value_by_tag};
 use crate::types::{FieldId, ObjectId, ReferenceTypeId, Value};
 use bytes::BufMut;
@@ -30,22 +30,53 @@ impl JdwpConnection {
     /// # Errors
     /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_object_reference_type(&mut self, object_id: ObjectId) -> JdwpResult<ReferenceTypeId> {
+        let packet = self.reference_type_request(object_id);
+        let reply = self.send_command(packet).await?;
+        Self::decode_reference_type(&reply)
+    }
+
+    /// The reference type of each of `object_ids`, read as **independent reads** (PERF-1, #100).
+    ///
+    /// The licence is real here and worth naming: an object's class is fixed for the object's life, and
+    /// asking about one object tells you nothing you need in order to ask about another. So this is a wave.
+    ///
+    /// Positional and total — `result[i]` answers `object_ids[i]`, and one failure does not touch the rest.
+    /// A collected object answers `INVALID_OBJECT` in its own slot, which is exactly what it does on the
+    /// sequential path.
+    pub async fn read_reference_types_independently(
+        &self,
+        object_ids: &[ObjectId],
+    ) -> Vec<JdwpResult<ReferenceTypeId>> {
+        let packets = object_ids.iter().map(|&id| self.reference_type_request(id)).collect();
+        self.read_independently(packets)
+            .await
+            .into_iter()
+            .map(|reply| reply.and_then(|r| Self::decode_reference_type(&r)))
+            .collect()
+    }
+
+    /// The request half of `ObjectReference.ReferenceType`.
+    ///
+    /// Split out, with [`decode_reference_type`](Self::decode_reference_type), so the wave form and the
+    /// single form cannot drift: **one encoder and one decoder, two schedulers.** A pipelined path that
+    /// built its own packet would be a second implementation of the same command, and the first thing to
+    /// diverge would be a fallback or a bounds check that only one of them had.
+    fn reference_type_request(&self, object_id: ObjectId) -> CommandPacket {
         let id = self.next_id();
         let mut packet =
             CommandPacket::new(id, command_sets::OBJECT_REFERENCE, object_reference_commands::REFERENCE_TYPE);
-
         packet.data.put_u64(object_id);
+        packet
+    }
 
-        let reply = self.send_command(packet).await?;
+    /// The decode half of `ObjectReference.ReferenceType`, error check included — so a wave and a single
+    /// read agree about what counts as a failure and not only about how to parse a success.
+    fn decode_reference_type(reply: &ReplyPacket) -> JdwpResult<ReferenceTypeId> {
         reply.check_error()?;
-
         let mut data = reply.data();
-
         // Read type tag (byte) and class ID (objectID)
         let _type_tag = read_u8(&mut data)?;
-        let reference_type_id = read_u64(&mut data)?;
-
-        Ok(reference_type_id)
+        read_u64(&mut data)
     }
 
     /// Whether the object behind an id has been garbage collected
@@ -107,6 +138,37 @@ impl JdwpConnection {
         object_id: ObjectId,
         field_ids: Vec<FieldId>,
     ) -> JdwpResult<Vec<Value>> {
+        let packet = self.object_values_request(object_id, &field_ids);
+        let reply = self.send_command(packet).await?;
+        Self::decode_object_values(&reply)
+    }
+
+    /// One object's fields per entry of `reads`, all read as **independent reads** (PERF-1, #100).
+    ///
+    /// Independent because each read names its own object and its own field ids, and a field read changes
+    /// nothing. **What is not independent is how `reads` was built**: the field ids for an object come from
+    /// its type, and the type comes from a read of its own. That prior read cannot join this wave — see
+    /// `project_query_rows` in the server, where the two waves are deliberately two.
+    ///
+    /// Positional and total, like [`read_reference_types_independently`](Self::read_reference_types_independently).
+    pub async fn read_object_values_independently(
+        &self,
+        reads: &[(ObjectId, Vec<FieldId>)],
+    ) -> Vec<JdwpResult<Vec<Value>>> {
+        let packets = reads
+            .iter()
+            .map(|(object_id, field_ids)| self.object_values_request(*object_id, field_ids))
+            .collect();
+        self.read_independently(packets)
+            .await
+            .into_iter()
+            .map(|reply| reply.and_then(|r| Self::decode_object_values(&r)))
+            .collect()
+    }
+
+    /// The request half of `ObjectReference.GetValues`. See
+    /// [`reference_type_request`](Self::reference_type_request) for why it is split out.
+    fn object_values_request(&self, object_id: ObjectId, field_ids: &[FieldId]) -> CommandPacket {
         let id = self.next_id();
         let mut packet =
             CommandPacket::new(id, command_sets::OBJECT_REFERENCE, object_reference_commands::GET_VALUES);
@@ -118,11 +180,15 @@ impl JdwpConnection {
         packet.data.put_i32(i32::try_from(field_ids.len()).unwrap_or(i32::MAX));
 
         // Write each field ID
-        for field_id in &field_ids {
+        for field_id in field_ids {
             packet.data.put_u64(*field_id);
         }
 
-        let reply = self.send_command(packet).await?;
+        packet
+    }
+
+    /// The decode half of `ObjectReference.GetValues`, error check included.
+    fn decode_object_values(reply: &ReplyPacket) -> JdwpResult<Vec<Value>> {
         reply.check_error()?;
 
         let mut data = reply.data();

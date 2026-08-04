@@ -99,10 +99,13 @@ is that `n` reads cost about one round trip instead of `n`, and that a suspensio
 happen is shorter by the difference. On loopback the difference is nearly nothing; this exists for a remote
 JVM.
 
-`CONTEXT.md`'s `Packet` entry justifies packets-as-cost-unit by equating them with round trips. That equation
-is severed the moment a call site is converted, and the entry is to be sharpened in **that** commit rather
-than this one — a glossary should describe the tree as it is, and while everything is still serialised the
-entry is accurate.
+`CONTEXT.md`'s `Packet` entry justified packets-as-cost-unit by **equating them with round trips**. That
+equation is severed the moment a call site is converted, so the entry was left alone by the commit that added
+the primitive and sharpened by the one that first made the two numbers diverge — a glossary should describe
+the tree as it is, and while everything was still serialised the entry was accurate. It now says the packet
+figure is an upper bound on what a caller waits for rather than a proxy for it, and the cost lines still
+report packets: deterministic, load-independent, and comparable between releases, which is why they were not
+changed to report round trips instead.
 
 ### Independence is established per call site, and nothing here can check it
 
@@ -112,9 +115,64 @@ before a frame is read at all; a frame's variable *names* must be known before i
 a watchpoint's **old value** is only readable while the pending store has not yet committed, so that read
 cannot be moved out of its window.
 
-This ADR therefore licenses **no call site**. The primitive lands with its correlation tests and nothing
-converted, which is #100's own instruction (*"convert one call site, with a measured before/after"* and *"do
-not convert everything in one change"* are the same instruction) and is independently reviewable.
+The primitive therefore landed with its correlation tests and **no call site converted at all**, which is
+#100's own instruction (*"convert one call site, with a measured before/after"* and *"do not convert
+everything in one change"* are the same instruction) and was independently reviewable. One call site is
+licensed below.
+
+Every licensed read is named `read_*_independently`, so `grep -r _independently` lists the whole licensed
+surface. That is deliberate: a licence nobody can enumerate is one that spreads.
+
+## The first call site, and what measuring it actually found
+
+`project_query_rows` — the row projection behind `debug.run_named_query` (EVAL-11, ADR-0037) — reads each
+row's runtime type and then each row's fields. **Two waves, and the boundary between them is the licence
+being refused**: a row's field ids come from its type, so its values read cannot be issued until its type
+read has answered. The two waves could be collapsed into one, which would look like a further optimisation
+and would be wrong.
+
+`a_heterogeneous_result_reads_each_rows_fields_off_its_own_type` asserts the refusal rather than trusting it,
+against a probe query whose rows alternate two types that share no field. **That merged wave was built and
+run rather than reasoned about**, and it produced:
+
+```text
+  [1] JpaProbe$Reserva @0x12 <fields unreadable>
+```
+
+Two failures in one line. `<fields unreadable>` is `INVALID_FIELDID` reported honestly — the JVM does reject
+a foreign field id, which was worth confirming. But the row is *also* labelled `Reserva` when it is an
+`Itens`: a caller is told the wrong type with nothing indicating anything went wrong. The silent half is the
+reason the assertion is on the positive property (`skus=`, a field of one type and of nothing else) and not
+only on the absence of the error string.
+
+### The measurement, and why the honest number is two numbers
+
+Through `LatencyRelay` at a fixed 8ms RTT, dial-don't-restart, arms alternated, each scored on its fastest
+sample (TEST-13, #38). The instrument is a **marginal** cost: the same query timed at 2 rows and at 50, the
+difference divided by 48, then the same again at two round trip times and subtracted — which removes the
+query's fixed cost and our own per-packet cost, leaving what the wire charges per row.
+
+| rows of | before (sequential) | after (independent reads) | |
+|---|---|---|---|
+| `Bare` — a `long` and a `double` | **17.67 ms/row** | **1.78 ms/row** | 9.9x |
+| `Reserva` — the realistic entity | **79.19 ms/row** | **63.18 ms/row** | 1.25x |
+
+Both were measured. **Quoting only the first would be the mistake #100 warns about**, and quoting only the
+second would hide that the primitive does what it claims.
+
+The `Bare` row costs exactly its own two reads, so 17.67ms is the serialised `2 × RTT` (16ms predicted) and
+1.78ms is the waved `2 × RTT / 16` (1.0ms predicted). The gap between 1.0 and 1.78 is the window's edges and
+the per-wave fixed cost; it is quoted rather than rounded down to the prediction.
+
+The `Reserva` row costs about **eight** round trips, and this change converted two of them. The other six are
+`render_value` reading each `String` field with a `StringReference.Value` and each association with an
+`ObjectReference.ReferenceType` — per field, per row, still serialised, and not this call site's to fix:
+`render_value` is shared by every tool that prints a value. So the tool improved by a fifth, the primitive by
+ten-fold, and the difference between those two numbers is a **follow-up**, not a disappointment.
+
+That is also why the assertion in the measurement test is against `Bare`: a threshold set on the `Reserva`
+figure would be a number between 63 and 79 with no meaning of its own, and would move the moment anything
+else about rendering a row changed.
 
 ## What the tests hold it to, and the control that rewrote one of them
 
@@ -140,15 +198,19 @@ is ever lowered below it instead of deadlocking.
 - `issue` / `InFlight` / `read_independently` are public API on an unpublished crate. `scripts/semver-check.sh`
   compares against the last release tag; additions are not breaking, and relaxing `send_command` to `&self`
   later would not be either.
-- The next commit converts one call site and measures it through `LatencyRelay` with the dial-don't-restart
-  method (TEST-13, #38). The relay charges coalesced traffic once, which is exactly what a wave produces, so
-  that reading is to be reported with its caveat rather than quoted at its best.
-- A dependent sequence being demonstrably *not* converted — #100's fourth criterion — is asserted with the
-  conversion, since there is nothing dependent on this path yet to assert it against.
-- `debug.run_named_query` (EVAL-11, ADR-0037) is the strongest candidate for that first conversion: it reads
-  each row with one `ObjectReference.GetValues` but pays type and signature lookups **per row**, so a wide
-  result set is round-trip bound in precisely the shape #100 describes, on a real caller-facing operation
-  rather than a synthetic benchmark.
+- The relay charges coalesced traffic once, which is exactly what a wave produces, so every figure above is
+  a **lower bound on the real saving** and was read with that in mind: the assertion is set at one whole
+  round trip per row, which a serialised path could not reach even with the flattery.
+- `CONTEXT.md`'s `Packet` entry is amended in the same commit as the conversion, because that is the commit
+  where the packet count and the round trip count stop being the same number. The cost lines still report
+  packets — deterministic, comparable between releases — but on a converted path a packet figure is now an
+  upper bound on what a caller waits for rather than a proxy for it.
+- **The remaining per-row cost of `debug.run_named_query` is a follow-up**: six of a `Reserva` row's eight
+  round trips are `render_value` reading a `String` or an association, per field, per row. Converting those
+  means giving `render_value` a wave-aware form, which is a change to a function every tool shares and
+  therefore its own piece of work rather than a widening of this one.
+- No tool description changed, and no reply changed, so `docs/toolkit-contract.md` needs nothing beyond the
+  release note. `Bare` and `Reserva.mixedTypes` are additions to a test probe, not to the tool surface.
 
 ## Alternatives considered
 

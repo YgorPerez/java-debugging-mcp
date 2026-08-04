@@ -130,6 +130,29 @@ public class JpaProbe {
         }
     }
 
+    /**
+     * An entity of primitives only, for measuring what a row's own two reads cost (PERF-1, #100).
+     *
+     * `Reserva` is the realistic row and the wrong instrument. Rendering one costs far more than the two
+     * reads a row needs — its `String` fields are each a `StringReference.Value` round trip and its
+     * association is another `ObjectReference.ReferenceType` — so a measurement over `Reserva` is dominated
+     * by reads PERF-1 has not converted, and moved by only a fifth when the two it did convert were waved.
+     * Measured: 79.19ms of wire time per row before, 63.18ms after, at an 8ms round trip.
+     *
+     * With nothing but a `long` and a `double`, a row costs exactly `ReferenceType` + `GetValues` and
+     * nothing else, so the difference between reading those one at a time and reading them as independent
+     * reads is the whole of the per-row cost rather than a fifth of it.
+     */
+    public static class Bare {
+        long id;
+        double valor;
+
+        Bare(long id, double valor) {
+            this.id = id;
+            this.valor = valor;
+        }
+    }
+
     /** The entity. Plain fields, because the projection reads fields and calls no getter. */
     public static class Reserva {
         Long id;
@@ -158,9 +181,14 @@ public class JpaProbe {
 
     // ----- the query engine: enough of one to make the over-match real -----
 
-    /** One `@NamedQuery`, as a filter over the table plus the parameters bound so far. */
+    /**
+     * One `@NamedQuery`, as a filter over the table plus the parameters bound so far.
+     *
+     * The raw `List` return is deliberate and is what `Reserva.mixedTypes` needs: a real provider can hand
+     * back rows of more than one type, and the tool has to read each row's fields off the row's OWN type.
+     */
     interface NamedQuery {
-        List<Reserva> run(List<Reserva> table, Map<Object, Object> params);
+        List run(List<Reserva> table, Map<Object, Object> params);
     }
 
     /**
@@ -209,6 +237,33 @@ public class JpaProbe {
                 }
             }
             return hits;
+        });
+
+        // A result set of MORE THAN ONE TYPE, which is what makes the per-row type read a dependency rather
+        // than a convenience (PERF-1, #100). The tool reads every row's type in one wave and every row's
+        // fields in a second, and the second cannot be folded into the first: a `Reserva`'s field ids mean
+        // nothing to an `Itens`, so a values read issued before its own type read came back would ask the
+        // JVM for the wrong fields. This query makes that visible in a reply instead of arguable in a
+        // review — the rows alternate, and `Itens` has no field `codigo` for the wrong wave to find.
+        TEXTS.put("Reserva.mixedTypes", "select r, r.itens from Reserva r");
+        QUERIES.put("Reserva.mixedTypes", (table, params) -> {
+            List rows = new ArrayList();
+            for (Reserva r : table) {
+                rows.add(r);
+                rows.add(r.itens);
+            }
+            return rows;
+        });
+
+        // Rows of primitives only, so a per-row measurement is not swamped by what rendering a `String`
+        // or an association costs. See `Bare`.
+        TEXTS.put("Bare.all", "select b from Bare b");
+        QUERIES.put("Bare.all", (table, params) -> {
+            List rows = new ArrayList();
+            for (Reserva r : table) {
+                rows.add(new Bare(r.id, r.valor));
+            }
+            return rows;
         });
 
         // A query that throws when RUN rather than when looked up. The two failures need different
@@ -282,9 +337,9 @@ public class JpaProbe {
             if (flushMode == FlushModeType.AUTO) {
                 flushes++;
             }
-            List<Reserva> hits = body.run(table, params);
+            List hits = body.run(table, params);
             if (maxResults >= 0 && hits.size() > maxResults) {
-                hits = new ArrayList<>(hits.subList(0, maxResults));
+                hits = new ArrayList(hits.subList(0, maxResults));
             }
             lastResultSize = hits.size();
             return hits;

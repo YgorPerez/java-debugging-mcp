@@ -243,9 +243,21 @@ replaces the code behind it, which is exactly why ADR-0011 refuses to cache line
 
 **Packet**:
 One JDWP message, and **the unit this server reports its own cost in** — a dump is "~8 packets per thread",
-`list_threads` is "one packet per thread name". Packets rather than bytes or milliseconds because the cost
-that matters is round trips against a JVM someone else is using, and that is what a caller can reason about
-before making a call.
+`list_threads` is "one packet per thread name". Packets rather than bytes or milliseconds because a packet
+count is deterministic and independent of machine load, where a duration is neither, and because it is what a
+caller can reason about before making a call.
+
+**It is no longer the same number as the round trips**, and this entry used to say it was. PERF-1
+([#100](https://github.com/YgorPerez/java-debugging-mcp/issues/100)) sends the same packets and waits for them
+together, so on any path using **independent reads** the packet count is unchanged while the round trips are
+divided by up to the window of sixteen. Measured on a `debug.run_named_query` row: 17.67ms of wire time per
+row before, 1.78ms after, at the same packet count (ADR-0038). So a reported figure still says exactly what
+the server *sent* — which is what makes it comparable between releases, and why the cost lines were not
+changed to report round trips instead — but on a converted path it is now an **upper bound** on what the
+caller waits for rather than a proxy for it.
+_Avoid_: using "packets" and "round trips" as if they were interchangeable, which is what this paragraph
+exists to stop; a claim about *waiting* has to name a duration or a round trip count, and a claim about *cost
+on the wire* is the packet count.
 
 **Framing**:
 JDWP messages are length-prefixed with **no delimiter between them**, so the reader's position is only

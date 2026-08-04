@@ -17776,13 +17776,10 @@ const ACC_SYNTHETIC: i32 = 0x1000;
 /// A nested object therefore renders as its type plus an `@0x…` handle, which is a starting point rather
 /// than a dead end: `debug.evaluate "@0x1f4c.getItens()"` reads it afterwards, deliberately, with the
 /// caller having chosen to pay for the load.
-async fn project_query_row(conn: &mut jdwp_client::JdwpConnection, obj_id: u64, max_len: usize) -> String {
-    let Ok(type_id) = conn.get_object_reference_type(obj_id).await else {
-        return format!("@0x{obj_id:x} <type unreadable>");
-    };
-    let type_name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
-    let short = type_name.rsplit('.').next().unwrap_or(&type_name).to_string();
-
+async fn project_query_row_fields(
+    conn: &mut jdwp_client::JdwpConnection,
+    type_id: u64,
+) -> Vec<jdwp_client::reftype::FieldInfo> {
     // Declared fields, then inherited ones — a JPA entity commonly keeps its id on a mapped superclass, so
     // stopping at the runtime type would hide the one column that identifies the row. Bounded like every
     // other superclass walk in this file.
@@ -17810,14 +17807,119 @@ async fn project_query_row(conn: &mut jdwp_client::JdwpConnection, obj_id: u64, 
         }
         current = conn.get_superclass(tid).await.unwrap_or(None);
     }
+    fields
+}
+
+/// What one row's two reads produced, carried from the type wave to the values wave and then to rendering.
+///
+/// The `None`s are the two failure renderings, kept as absences rather than as strings so the rendering
+/// stays in one place: a row whose type would not read, and a row whose fields would not.
+struct ProjectedRow {
+    /// Index into the caller's `rows`, because the object rows are a subsequence of them.
+    at: usize,
+    obj_id: u64,
+    /// The runtime type's short name, and the fields to show — its *shape*, in the sense `TypeCache`
+    /// already uses. `None` when the type read failed.
+    shape: Option<(String, Vec<jdwp_client::reftype::FieldInfo>)>,
+    /// Position of this row's read in the values wave, when it made one.
+    values_at: Option<usize>,
+}
+
+/// Project every row of a `debug.run_named_query` result, reading the rows' types and then their fields as
+/// **two waves of independent reads** (PERF-1, #100).
+///
+/// **Two waves and not one, which is the whole shape of the thing.** A row's field ids come from its type,
+/// so its values read cannot be issued until its type read has answered — that dependency is per row and it
+/// is real. What *is* independent is every row's type read from every other row's, and every row's field
+/// read from every other row's. So this is `CONTEXT.md`'s **independent reads** licence granted twice and
+/// refused once, in one function, and `a_wide_result_set_is_read_in_waves_not_row_by_row` asserts the
+/// refusal rather than trusting it.
+///
+/// **The packet count is unchanged**: the same `ReferenceType` per row, the same `GetValues` per row, and
+/// the same per-type field walk — served from `TypeCache` after the first row of each type, which is why it
+/// sits between the waves and costs nothing on a homogeneous result. What changes is that a wide result set
+/// costs about two round trips instead of two per row.
+async fn project_query_rows(
+    conn: &mut jdwp_client::JdwpConnection,
+    rows: &[jdwp_client::types::Value],
+    max_len: usize,
+) -> Vec<String> {
+    // A JPA *projection* query — the word's own meaning, `select r.codigo, r.status from …` — returns
+    // scalars or an Object[] rather than entities, so a non-object row is normal here and is rendered as
+    // itself, needing no reads at all.
+    let object_ids: Vec<u64> = rows.iter().filter_map(as_object_id).collect();
+
+    // WAVE 1 — every row's runtime type.
+    let types = conn.read_reference_types_independently(&object_ids).await;
+
+    // BETWEEN the waves, and part of neither. Once per distinct type: a homogeneous result set is one
+    // type, and every row after the first is a cache hit.
+    // The distinct types are gathered before the walk rather than deduplicated inside it, because the walk
+    // awaits and a `HashMap` entry cannot be held across that. A linear `contains` over one or two types is
+    // not worth a second map.
+    let mut distinct: Vec<u64> = Vec::new();
+    for type_id in types.iter().filter_map(|t| t.as_ref().ok()).copied() {
+        if !distinct.contains(&type_id) {
+            distinct.push(type_id);
+        }
+    }
+    let mut per_type: std::collections::HashMap<u64, (String, Vec<jdwp_client::reftype::FieldInfo>)> =
+        std::collections::HashMap::new();
+    for type_id in distinct {
+        let type_name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+        let short = type_name.rsplit('.').next().unwrap_or(&type_name).to_string();
+        per_type.insert(type_id, (short, project_query_row_fields(conn, type_id).await));
+    }
+
+    let mut plans: Vec<ProjectedRow> = Vec::with_capacity(object_ids.len());
+    let mut reads: Vec<(u64, Vec<u64>)> = Vec::new();
+    let mut resolved = types.into_iter();
+    for (at, row) in rows.iter().enumerate() {
+        let Some(obj_id) = as_object_id(row) else { continue };
+        let shape = resolved.next().and_then(Result::ok).and_then(|type_id| per_type.get(&type_id).cloned());
+        // A row with no readable fields makes no values read, so the wave carries only rows that need it
+        // and the positional correspondence is `values_at` rather than the row index.
+        let values_at = shape.as_ref().filter(|(_, f)| !f.is_empty()).map(|(_, fields)| {
+            let shown = fields.len().min(QUERY_ROW_FIELD_CAP);
+            reads.push((obj_id, fields.iter().take(shown).map(|f| f.field_id).collect()));
+            reads.len() - 1
+        });
+        plans.push(ProjectedRow { at, obj_id, shape, values_at });
+    }
+
+    // WAVE 2 — each row's field values, each with its own type's field ids.
+    let values = conn.read_object_values_independently(&reads).await;
+
+    let mut projected: Vec<String> = Vec::with_capacity(rows.len());
+    for (at, row) in rows.iter().enumerate() {
+        let Some(plan) = plans.iter().find(|p| p.at == at) else {
+            projected.push(render_value(conn, row, None, max_len, ByteRender::default()).await);
+            continue;
+        };
+        let read = plan.values_at.and_then(|i| values.get(i));
+        projected.push(render_query_row(conn, plan, read, max_len).await);
+    }
+    projected
+}
+
+/// Render one object row from what the two waves returned, including both ways they can fail.
+async fn render_query_row(
+    conn: &mut jdwp_client::JdwpConnection,
+    plan: &ProjectedRow,
+    read: Option<&jdwp_client::JdwpResult<Vec<jdwp_client::types::Value>>>,
+    max_len: usize,
+) -> String {
+    let obj_id = plan.obj_id;
+    let Some((short, fields)) = plan.shape.as_ref() else {
+        return format!("@0x{obj_id:x} <type unreadable>");
+    };
     if fields.is_empty() {
         return format!("{short} @0x{obj_id:x} {{}}");
     }
-    let shown = fields.len().min(QUERY_ROW_FIELD_CAP);
-    let ids: Vec<u64> = fields.iter().take(shown).map(|f| f.field_id).collect();
-    let Ok(values) = conn.get_object_values(obj_id, ids).await else {
+    let Some(Ok(values)) = read else {
         return format!("{short} @0x{obj_id:x} <fields unreadable>");
     };
+    let shown = fields.len().min(QUERY_ROW_FIELD_CAP);
     let mut out = format!("{short} @0x{obj_id:x} {{");
     for (i, (f, v)) in fields.iter().take(shown).zip(values.iter()).enumerate() {
         if i > 0 {
@@ -17895,16 +17997,7 @@ async fn run_and_project(
         None => None,
     };
 
-    let mut projected: Vec<String> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        projected.push(match as_object_id(row) {
-            Some(id) => project_query_row(conn, id, a.max_result_length).await,
-            // A JPA *projection* query — the word's own meaning, `select r.codigo, r.status from …` —
-            // returns scalars or an Object[] rather than entities, so a non-object row is normal here and is
-            // rendered as itself.
-            None => render_value(conn, row, None, a.max_result_length, ByteRender::default()).await,
-        });
-    }
+    let projected = project_query_rows(conn, &rows, a.max_result_length).await;
     Ok(QueryRun { total, projected, query_text })
 }
 
