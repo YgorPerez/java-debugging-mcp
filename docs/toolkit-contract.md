@@ -52,6 +52,16 @@ Ordered by how *quietly* it breaks, because that is what decides whether it need
 Six of seven are silent. So the rule is not "avoid breaking them" — it is **say what changed, in the release
 notes, in caller-visible terms**.
 
+**`debug.run_named_query` (EVAL-11, #124) is the "Add a tool" row being exercised, and that row is silent.**
+The toolkit will install a binary that can run a named JPA query and its skills will not mention it, so
+nobody will call it — the tool is not broken, it is invisible. Two things follow. The release notes have to
+name it in caller-visible terms, including the parts a caller has to know before using it: it INVOKES so it
+needs an event-suspended thread and a read-only session refuses it, it suppresses the query's flush and says
+what that costs in accuracy, and with no `EntityManager` in the frame it refuses with a two-step rather than
+searching the heap. And `jdwp-trace`'s swallowed-exception playbook is the skill this belongs in downstream —
+"a motor call returns null" is on its trigger list and "the query matched the whole table" is the same bug
+seen one layer down.
+
 The description row is the one that arrived by accident rather than by decision, and it is worth reading twice
 for that reason. Two merges in the v0.9.0 range interleaved `debug.evaluate` and `debug.evaluate_chain`'s
 descriptions — each is a single ~4000-character string literal, so git had nothing to conflict *on* — and
@@ -64,12 +74,12 @@ same over-statement sat in the code comment it was copied from (DOC-8, #120) —
 deciding whether an argument change needed a guard would conclude one was already there. It is true now.
 
 So a description change is gated two ways, and `mcp-server/tests/tool-descriptions.txt` is the important one:
-a word-wrapped snapshot of all 37 descriptions that a deliberate edit must regenerate. That regeneration step
+a word-wrapped snapshot of all 38 descriptions that a deliberate edit must regenerate. That regeneration step
 **is** the review moment this table asks for — the point at which somebody reads what a caller will read.
 
 **`mcp-server/tests/argument-schemas.txt` is the same guard for the row above it** — the one about renaming an
 argument, which is silent too. It is generated from the advertised tool list rather than a hand-kept roster, so
-it covers **37 tools and 173 arguments** by construction: each argument's full schema minus its description
+it covers **38 tools and 184 arguments** by construction: each argument's full schema minus its description
 (type, default, `format`, `minimum`, `anyOf`, whether it is required) followed by the description word-wrapped.
 `schemars` publishes those descriptions as the `inputSchema`, so they are the caller's documentation for every
 argument — the same thing the tool description is one level up, and this file's insistence that an audit count

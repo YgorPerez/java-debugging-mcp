@@ -485,6 +485,62 @@ when it applies. Frame ids and values read from the thread are stale the moment 
 resume the VM: debug.continue does that, debug.panic clears everything, and the watchdog does it for you if
 you walk away.
 
+## debug.run_named_query
+Run a NAMED JPA QUERY through the application's own EntityManager and report the row count plus a bounded,
+INVOKE-FREE read of each row. The question this answers is whether a query returns what its author believes,
+and the shape it was built for is a lookup whose parameters are all OPTIONAL and null-guarded — WHERE (:codigo
+is null or r.codigo = :codigo) AND (:status is null or r.status = :status) — which matches the ENTIRE TABLE
+when both arrive null, so a call meant to find one row returns thousands and the caller takes the first.
+Rebuilding that predicate in a SQL client cannot reproduce it: you lose the persistence context, the parameter
+binding and, on a multi-tenant setup, the resolved tenant. IT INVOKES, so it needs a thread suspended BY AN
+EVENT (a stop point, not debug.pause and not debug.suspend_thread), and a read_only session REFUSES IT
+OUTRIGHT — correctly, because the query also reaches the DATABASE, which no guard here can undo. IT DOES NOT
+FLUSH, AND THAT TOOK WORK. JPA's default flush mode is AUTO, under which the provider pushes every pending
+change in the persistence context to the database BEFORE answering a query — so merely asking would write, and
+on a shared instance it would commit somebody else's half-finished work. This sets FlushModeType.COMMIT on the
+Query it created, which suppresses that for this query alone and touches neither the EntityManager nor anyone
+else's. THE TRADE IS IN EVERY REPLY: with the flush suppressed the rows do NOT reflect uncommitted changes in
+that persistence context, so a row just saved and not committed will not be found. allow_flush:true is how you
+ask for the other reading, and it is a write. THE COUNT IS THE TRUE ONE AND THE PER-ROW READ IS BOUNDED —
+different knobs, because the over-match case needs the real number. max_rows caps what is RENDERED and never
+the count. max_fetch caps what the DEBUGGEE BUILDS (setMaxResults), which is the cost worth knowing about: a
+query matching a whole table constructs every one of those entities in its heap before this tool sees any of
+them — and with max_fetch in force the reported count becomes a FLOOR rather than a total, which the reply
+says where the number is. THE ROWS ARE READ, NEVER INVOKED. Each row is read by its FIELDS
+(ObjectReference.GetValues), walking the superclass chain so a mapped-superclass id still shows, and nothing
+is called on it — so no getter runs and NOTHING IS FETCHED. That is not achievable by bounding a depth: a
+shallow render calls toString(), which on a JPA entity routinely names its associations, and a deep one
+invokes toArray()/entrySet() on a collection field — the first level is already the hazard. A nested object
+shows as its type plus an @0x… handle, which debug.evaluate accepts as an expression head — @0x1f4c.getItens()
+fetches it deliberately, when you have chosen to pay for it. FINDING THE ENTITY MANAGER: pass entity_manager
+to skip discovery (a local, this.em, a static field, or an @0x… handle). Otherwise the SUSPENDED FRAME is
+searched — `this`'s fields first, then the in-scope locals and arguments — matching on the INTERFACE each
+object implements (jakarta.persistence.EntityManager or javax.persistence.EntityManager, both supported since
+the target stack straddles the split) rather than on a type name, because a container-managed bean's runtime
+type is a proxy nobody can predict. That costs a handful of packets, suspends nothing and invokes nothing.
+THERE IS NO HEAP FALLBACK, and the reason is measured rather than assumed: ReferenceType.Instances answers
+about an object's EXACT runtime class, so asking it for the EntityManager INTERFACE returns 0 however many
+beans are alive, and JDWP has no command for "which classes implement this interface". When the frame has
+none, the reply refuses and names the two-step precisely — debug.list_instances on the CONCRETE implementation
+class (org.hibernate.internal.SessionImpl, a container wrapper like
+org.jboss.as.jpa.container.TransactionScopedEntityManager, or whatever debug.list_classes shows for your
+provider), then its @0x… handle as entity_manager. AN UNKNOWN QUERY NAME IS ITS OWN ANSWER, not a generic
+evaluation failure — but it CANNOT be answered with a list of the names that exist, because EntityManager
+publishes no method that enumerates them. The reply says the provider rejected the name and where such names
+are declared (@NamedQuery, @NamedQueries, orm.xml's <named-query>), and notes that the entity prefix is part
+of the name. PARAMETERS bind by name (parameters) or by 1-based position (positional_parameters, JPQL's ?1),
+one form or the other and never both. THE REPLY NAMES THE JAVA TYPE EACH ONE WAS BOUND AS, because that is the
+silent hazard: JPA binds by object and compares with equals, so a Long id column given an Integer matches
+NOTHING with no exception and no warning — an empty result that reads like a fact about the data. Whole
+numbers therefore bind as Long, and parameter_expressions takes the full debug.evaluate grammar for anything
+JSON cannot spell (an exact Integer, 42L, 2.0f, 'a', an enum constant read as a static field, an @0x… handle,
+or a value out of the frame). A collection parameter — IN (:names) — is REFUSED rather than stringified,
+pointing at parameter_expressions to name a List that already exists. THE QUERY TEXT is reported best-effort
+via getQueryString(), which is Hibernate's rather than JPA's, so its absence is normal and said plainly. It is
+the JPQL AS WRITTEN and never the generated SQL — no published API reaches that — and the reply labels it so,
+because calling it the SQL would be a small lie about the one line a caller would act on. Ad-hoc JPQL strings
+are out of scope.
+
 ## debug.set_exception_stop
 Break when an exception is thrown. Give class_pattern (e.g. java.lang.NullPointerException or a custom
 ErrorException) to target one type + its subclasses — ideal for silent-catch bugs where a swallowed exception

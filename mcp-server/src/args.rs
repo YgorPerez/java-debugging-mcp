@@ -812,6 +812,116 @@ pub struct ListInstancesArgs {
     pub counts_only: bool,
 }
 
+/// Rows RENDERED, not rows fetched. Deliberately small and deliberately not the same knob as
+/// `max_fetch`, because the two bound different things and #124's whole point is a query that returns
+/// thousands: the **count** is always the true one, so clamping the rendering hides rows but never their
+/// number. 20 is enough to see the shape of what came back and recognise that it is too much.
+const fn default_max_query_rows() -> usize {
+    20
+}
+
+/// Arguments for `debug.run_named_query` (EVAL-11).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunNamedQueryArgs {
+    /// The `@NamedQuery` name, exactly as declared — e.g. `Reserva.findByCodigoAndStatus`. This is the
+    /// string `EntityManager.createNamedQuery` is given, so it is the JPA name and not a class, a method
+    /// or a table.
+    ///
+    /// **A name that does not exist cannot be answered with a list of the ones that do**, and that is a
+    /// fact about JPA rather than a gap here: `EntityManager` publishes no way to enumerate its named
+    /// queries, so the provider's `IllegalArgumentException` is all there is. The reply says the name was
+    /// rejected by the provider and where such names are declared (`@NamedQuery`, `orm.xml`), instead of
+    /// guessing at a spelling.
+    pub query_name: String,
+    /// Named parameters, as ordinary JSON — `{"codigo": "R-7", "status": null}`.
+    ///
+    /// **The reply names the Java type every parameter was bound as**, because a silent type mismatch is
+    /// this argument's one real hazard and no exception is thrown for it: JPA binds by object, and a
+    /// query comparing against a `Long` id given an `Integer` matches nothing at all while looking like a
+    /// legitimate empty result. The mapping is JSON null → `null`, a string → `String`, `true`/`false` →
+    /// `Boolean`, a number with a fraction → `Double`, and a whole number → **`Long`** (not `Integer` —
+    /// an entity id is a `Long` far more often, and the reply shows the choice so it can be corrected).
+    ///
+    /// For anything JSON cannot express — an exact `Integer`, an enum constant, an object handle, a value
+    /// read out of the suspended frame — use `parameter_expressions` instead.
+    #[serde(default)]
+    pub parameters: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// Positional parameters in order, as ordinary JSON — `["R-7", null]`. **1-based when bound**, which
+    /// is JPQL's own numbering (`?1` is the first), so the first element becomes parameter 1.
+    ///
+    /// Same JSON-to-Java mapping, and the same reporting of it, as `parameters`. A query uses one form or
+    /// the other; giving both is refused rather than merged.
+    #[serde(default)]
+    pub positional_parameters: Option<Vec<serde_json::Value>>,
+    /// Parameters whose value is an **expression** rather than a JSON literal, keyed by name or by
+    /// decimal position — `{"codigo": "this.codigo", "1": "@0x1f4c", "tipo": "Status.CONFIRMADA"}`.
+    ///
+    /// The expression grammar is `debug.evaluate`'s, unchanged, so this is the escape hatch for every
+    /// value the JSON mapping cannot spell: an exact `Integer` (`5`), a `long` (`42L`), a `float`
+    /// (`2.0f`), a `char` (`'a'`), an enum constant read as a static field, an object handle from a trace
+    /// snapshot, or a value taken from the frame you are suspended in.
+    ///
+    /// A key given here **and** in `parameters` / `positional_parameters` is refused rather than one
+    /// silently winning.
+    #[serde(default)]
+    pub parameter_expressions: Option<std::collections::BTreeMap<String, String>>,
+    /// The `EntityManager` to run the query on, as an expression — a local, `this.em`, a static field, or
+    /// an `@0x…` handle. Given, this **skips discovery entirely**, which is the cheap and unambiguous way
+    /// to ask when you already know where the bean is.
+    ///
+    /// Omitted, the bean is looked for in two places in this order, and the reply always says which route
+    /// answered and what it cost: the suspended frame first (`this` and the locals — a handful of packets
+    /// and no pause), then a **live-heap walk** for objects implementing `jakarta.persistence.EntityManager`
+    /// or `javax.persistence.EntityManager`, which holds every application thread for the length of the
+    /// walk exactly as `debug.list_instances` does and reports its own measured cost.
+    #[serde(default)]
+    pub entity_manager: Option<String>,
+    /// How many rows to RENDER. The row **count** is always the true one, so this hides rows and never
+    /// their number — which is the distinction the over-matching query this tool exists for turns on.
+    #[serde(default = "default_max_query_rows")]
+    pub max_rows: usize,
+    /// Cap what the DEBUGGEE materialises, via `Query.setMaxResults`.
+    ///
+    /// **Off by default, and the default is the honest one.** Unset, the query runs as written and the
+    /// count that comes back is the true size of the result — which is the only way to demonstrate an
+    /// over-match, and is the reason this argument is not simply `max_rows`. The cost is real and belongs
+    /// to the debuggee: a query matching a whole table builds every one of those entities in its heap
+    /// before this tool sees any of them.
+    ///
+    /// Set it when that cost is the thing you are avoiding, and read the reply carefully: with a cap in
+    /// force the count is a **floor**, not a total, and it says so rather than reporting a capped number
+    /// as if it were the answer.
+    #[serde(default)]
+    pub max_fetch: Option<usize>,
+    /// Maximum length of each rendered value in the per-row read.
+    #[serde(default = "default_max_result_length")]
+    pub max_result_length: usize,
+    /// Let the query FLUSH the persistence context, instead of suppressing it.
+    ///
+    /// **Off by default, and off is what makes this tool a read.** JPA's default flush mode is
+    /// `FlushModeType.AUTO`, under which the provider pushes every pending change in the persistence
+    /// context to the database *before* answering a query — so on a shared instance, asking this question
+    /// would commit somebody else's half-finished work as a side effect of your looking. The tool sets
+    /// `FlushModeType.COMMIT` on the query it created, which suppresses that for this query alone and
+    /// touches neither the `EntityManager` nor anyone else's.
+    ///
+    /// The trade is stated in every reply rather than hidden: with the flush suppressed, the rows do
+    /// **not** reflect uncommitted changes sitting in that persistence context, so a row you just saved
+    /// and have not committed will not be found. Turn this on when that is exactly the question — "did my
+    /// save reach the context?" — and know that it is a write to the debuggee and to its database, which
+    /// is why a read-only session refuses it.
+    #[serde(default)]
+    pub allow_flush: bool,
+    /// Thread ID (optional; defaults to the last thread that hit a breakpoint). Must be a thread
+    /// suspended **by an event**, because running the query invokes methods.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Stack frame index (0 = current frame) — which frame the free discovery route scans, and which
+    /// frame `parameter_expressions` resolve against.
+    #[serde(default)]
+    pub frame_index: usize,
+}
+
 /// Arguments for `debug.source` (DISC-3).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SourceArgs {

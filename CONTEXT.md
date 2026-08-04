@@ -60,6 +60,29 @@ _Avoid_: unloaded (see above — it means a class here), uninitialised (Hibernat
 "not constructed"), empty (what an unfetched collection is mistaken FOR), null (what it is not — see
 **unbuilt source** for the same distinction about a class)
 
+**Invoke-free** (of a read):
+A read that runs **no code in the debuggee** — it asks the JVM for state and never calls a method on the
+object it is reading.
+**It earns a name because three hazards found separately here are the same hazard, and being invoke-free
+rules out all three at once**: it cannot **fetch** an **unfetched** association (ADR-0032), it cannot consume
+a single-pass stream the way evaluating `readEntity` does (see **Read-only**), and it cannot wedge on a
+monitor the hit thread does not own (ADR-0036). A trace **snapshot**'s locals, an anonymous class's captured
+locals, a chain walk's links and a query row's fields are all read this way, by the same means — no thread is
+supplied to render with, so there is nothing to run a method on. The name arrived late: each of those sites had
+already reasoned its way to the same rule separately, and the chain walk's own note gets to the monitor
+consequence unprompted.
+**`shallow` is not this word, and reading it as this word is the trap.** A shallow render calls `toString()`
+whenever it has a thread; a deep one walks fields. So the shallow/deep axis is close to the *inverse* of this
+one, which is why "read-only falls back to shallow" and "use `expand_objects`, which invokes nothing" are
+both true and read like a contradiction. Depth is not the question — whether a thread was supplied is.
+**Bounding the depth cannot substitute for it**, because on a JPA entity the first level is already the
+hazard: its own `toString()` routinely names its associations.
+_Avoid_: shallow (means depth here, and points the wrong way — see above), projection (JPA's own word for
+selecting a subset of columns, `select r.codigo, r.status`; using it for this would suggest a tool rewrites
+the query it was asked to run), side-effect free (true, and says nothing about what makes it so), fetch-free
+(names one of the three consequences as if it were the property), read-only (a session mode, and a read-only
+session still invokes on this path — see **Read-only**)
+
 **Attached** / **launched**:
 Whose JVM it is — the fact every safety default here is derived from. An **attached** debuggee was started by
 somebody else and is *presumed* shared, so suspending it may be stalling a request nobody told you about,
@@ -886,6 +909,15 @@ running program, so it satisfied that phrasing while being the one change nothin
 exceptions are different in kind and both matter: hot reload is a change this tool makes and reports, while a
 destructive read is a change the *debuggee's own API* makes because it was asked a legal question, which no
 guard here can predict
+**A JPA query is the case where the destructive read CAN be prevented, which is why it is not just another
+example** (EVAL-11, #124). JPA's default flush mode is `AUTO`, under which the provider pushes every pending
+change in the persistence context to the **database** before answering a query — so asking would commit
+somebody else's half-finished work. `debug.run_named_query` sets `FlushModeType.COMMIT` on the `Query` it
+created, which suppresses that for one query and touches neither the `EntityManager` nor anyone else's, and
+it **refuses to run at all** when it cannot (a bean implementing neither JPA API, an unloaded
+`FlushModeType`) unless `allow_flush:true` says the write is wanted. The difference from the single-pass
+stream above is the remedy: nothing can stop `readEntity` consuming a body, while this needed one setter and
+a reply that states the cost of having used it — the rows no longer reflect uncommitted changes
 
 **Outstanding redefinition**:
 A class a session hot-reloaded and cannot restore. Its own term because every other mutation here ends when

@@ -14082,3 +14082,370 @@ fn every_monitor_arming_refusal_explains_itself_before_touching_the_debuggee() {
         &["No active debug session"],
     );
 }
+
+/// EVAL-11 (#124): every `debug.run_named_query` refusal that can be settled from the arguments alone is,
+/// and none of them costs a JVM.
+///
+/// The reason this test exists separately from the live one is the reason its sibling above does: a caller
+/// who has given contradictory arguments should learn that from the reply, not from a JPA exception thrown
+/// three invocations deep with a message about something else. Each case asserts the refusal reached the
+/// *argument* check rather than the session lookup, so the test cannot pass against a build with no checks.
+#[test]
+fn every_named_query_refusal_explains_itself_before_touching_the_debuggee() {
+    let mut server = Server::start().expect("start server");
+
+    let cases: Vec<(serde_json::Value, Vec<&str>)> = vec![
+        // A missing or blank name. The tool's whole input is a name, so this is the first thing to settle.
+        (serde_json::json!({"query_name": "   "}), vec!["query_name is required", "Nothing was sent"]),
+        // Both binding forms. A JPQL query declares names or positions, never both, so merging them would
+        // send a parameter the query cannot have.
+        (
+            serde_json::json!({"query_name": "R.f", "parameters": {"a": 1},
+                               "positional_parameters": [1]}),
+            vec!["not both", "one form or the other", "Nothing was sent"],
+        ),
+        // The same key twice, once as a value and once as an expression. Letting one win silently is how a
+        // query answers a question the caller did not ask.
+        (
+            serde_json::json!({"query_name": "R.f", "parameters": {"codigo": "R-7"},
+                               "parameter_expressions": {"codigo": "this.codigo"}}),
+            vec!["was given twice", "silently letting one win"],
+        ),
+        // A collection parameter is refused rather than stringified: `IN (:names)` needs a Java collection,
+        // and binding the JSON text of a list would return zero rows and look like an answer.
+        (
+            serde_json::json!({"query_name": "R.f", "parameters": {"codigos": ["A", "B"]}}),
+            vec!["is a JSON array", "IN (:names)", "parameter_expressions"],
+        ),
+        (
+            serde_json::json!({"query_name": "R.f", "parameters": {"where": {"a": 1}}}),
+            vec!["is a JSON object", "only scalars map to a Java value"],
+        ),
+        // JPQL positions are 1-based, so 0 is not a position at all.
+        (
+            serde_json::json!({"query_name": "R.f", "parameter_expressions": {"0": "x"}}),
+            vec!["not a valid position", "1-based"],
+        ),
+        (
+            serde_json::json!({"query_name": "R.f", "parameter_expressions": {"codigo": "  "}}),
+            vec!["is empty", "or drop the entry"],
+        ),
+        // `setMaxResults(0)` is legal JPA and useless here: it reports 0 rows whatever the query matches,
+        // which is the one answer this tool must never give by accident.
+        (
+            serde_json::json!({"query_name": "R.f", "max_fetch": 0}),
+            vec!["asks the provider for no rows at all", "TRUE count", "max_rows"],
+        ),
+    ];
+    for (args, wants) in cases {
+        let refused = server.call("debug.run_named_query", args.clone());
+        assert_contains_all(&format!("refusal for {args}"), &refused, &wants);
+        assert!(
+            !refused.contains("No active debug session"),
+            "refused for the wrong reason (no session) for {args}: {refused}"
+        );
+    }
+
+    // And a well-formed call gets past the argument checks, so the refusals are not simply "always no".
+    let no_session =
+        server.call("debug.run_named_query", serde_json::json!({"query_name": "Reserva.findByCodigo"}));
+    assert_contains_all("a valid call reaches the session lookup", &no_session, &["No active debug session"]);
+}
+
+/// EVAL-11 (#124): a named JPA query runs against a live `EntityManager`, and all four of the issue's
+/// acceptance criteria are checked against the probe's OWN counters rather than against our reply.
+///
+/// The two that matter most cannot be proved by reading the reply at all, which is why `JpaProbe` carries
+/// counters for them:
+///
+///  - **it does not flush.** Every query in the probe starts at JPA's default `FlushModeType.AUTO`, and
+///    `getResultList()` increments `flushes` when it is still AUTO when the query runs. `flushes == 0`
+///    afterwards is the only evidence that `FlushModeType.COMMIT` was actually set — a reply saying "flush
+///    suppressed" proves nothing about whether it was.
+///  - **it initialises nothing.** `Itens.toString()` and every getter on the row increments
+///    `associationTouches` and returns a `WALKED IN` sentinel no correct reply could contain.
+///    `associationTouches == 0` is what makes "fields were read, never invoked" a measurement.
+///
+/// The over-match is the shape #124 was filed about: the same query, once with both optional parameters
+/// null and once with one bound, so 1000-versus-1 is a contrast rather than a number with nothing to compare
+/// it to. `TABLE_ROWS` is read off the probe so the assertion cannot drift from what it builds.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_named_query_reports_its_over_match_without_flushing_or_initialising_anything() {
+    let Some(jdk) =
+        jdk_or_skip("a_named_query_reports_its_over_match_without_flushing_or_initialising_anything")
+    else {
+        return;
+    };
+    // `launch_in_package`, for the same reason EVAL-9's probe needs it: discovery turns on the
+    // fully-qualified `jakarta.persistence.EntityManager`, so the stand-in has to be in that package and one
+    // `.java` declares one package.
+    let probe =
+        Probe::launch_in_package(&jdk, "JpaProbe", "jakarta.persistence.JpaProbe").expect("launch JpaProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    // A SUSPENDING stop point in the frame that holds the bean as a parameter: it gives the free discovery
+    // route something to find AND a thread suspended BY AN EVENT, which is the only kind JDWP will invoke on.
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "jakarta.persistence.JpaProbe", "method": "workWithEm"}),
+    );
+    assert!(!armed.contains("Refused"), "the stop point was refused: {armed}");
+    server
+        .wait_for_event("workWithEm", EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("never suspended in workWithEm; probe output: {:?}", probe.output()));
+
+    // --- (1) the over-match: both optional parameters null matches the whole table ---
+    let over = server.call(
+        "debug.run_named_query",
+        serde_json::json!({"query_name": "Reserva.findByCodigoAndStatus",
+                           "parameters": {"codigo": null, "status": null}, "max_rows": 2}),
+    );
+    let rows = probe_table_rows(&mut server);
+    assert_contains_all(
+        "the over-match reports the full count",
+        &over,
+        &[
+            &format!("{rows} row(s)"),
+            // The route is part of the answer: one costs nothing and the other does not exist.
+            "found in frame 0 as local `em`",
+            "jakarta.persistence",
+            "codigo = null (null)",
+        ],
+    );
+    // Bounded rendering, and the bound hides rows without hiding their number.
+    assert_contains_all("the projection is bounded", &over, &["Rows 1-2 of", "more (raise max_rows)"]);
+
+    // --- (3) rendering initialised nothing: the sentinel is absent AND the counter never moved ---
+    assert!(!over.contains("WALKED IN"), "the projection invoked toString() on a row's association: {over}");
+    assert_contains_all("a nested object is a handle, not a walk-in", &over, &["itens=", "Itens @0x"]);
+
+    // --- (2) one parameter bound: the contrast that makes the over-match mean something ---
+    let one = server.call(
+        "debug.run_named_query",
+        serde_json::json!({"query_name": "Reserva.findByCodigoAndStatus",
+                           "parameters": {"codigo": "R-7", "status": null}, "max_rows": 2}),
+    );
+    assert_contains_all(
+        "binding one parameter narrows to one row",
+        &one,
+        &["— 1 row(s)", "codigo = \"R-7\" (String)", "codigo=\"R-7\""],
+    );
+
+    // --- the probe's own counters, which is the half no reply of ours could fake ---
+    let flushes = server
+        .call("debug.evaluate", serde_json::json!({"expression": "jakarta.persistence.JpaProbe.flushes"}));
+    assert!(
+        flushes.contains("= (int) 0"),
+        "a query FLUSHED the persistence context — under JPA's default AUTO that is a write to the \
+         database performed by asking a question. Expected 0: {flushes}"
+    );
+    let touches = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "jakarta.persistence.JpaProbe.associationTouches"}),
+    );
+    assert!(
+        touches.contains("= (int) 0"),
+        "something invoked a method on a row or its association, so the projection initialised state it \
+         promised not to. Expected 0: {touches}"
+    );
+
+    // POSITIVE CONTROL, and without it the two zeros above are worth nothing: a counter that CANNOT move
+    // reads as a passing assertion for ever. This walks in deliberately — `@0x….getCodigo()` on a row the
+    // projection just rendered — and the counter must follow. Same discipline as ADR-0034's: an assertion
+    // can fire correctly and still prove the wrong thing.
+    let row_handle = first_row_handle(&one);
+    let walked =
+        server.call("debug.evaluate", serde_json::json!({"expression": format!("{row_handle}.getCodigo()")}));
+    assert!(
+        walked.contains("R-7"),
+        "the deliberate walk-in did not reach the row, so the control proves nothing: {walked}"
+    );
+    let after = server.call(
+        "debug.evaluate",
+        serde_json::json!({"expression": "jakarta.persistence.JpaProbe.associationTouches"}),
+    );
+    assert!(
+        !after.contains("= (int) 0"),
+        "invoking a getter on a row did NOT move associationTouches, so the counter is dead and the \
+         'initialised nothing' assertion above was vacuous: {after}"
+    );
+
+    server.panic_reset();
+}
+
+/// The `@0x…` handle of the first projected row in a `debug.run_named_query` reply.
+///
+/// Taken from the reply rather than from a second heap query on purpose: the claim being tested is that the
+/// projection hands back a usable handle, so the handle under test has to be the one it printed.
+fn first_row_handle(reply: &str) -> String {
+    reply
+        .lines()
+        .find(|l| l.trim_start().starts_with("[0] "))
+        .and_then(|l| l.split_whitespace().find(|t| t.starts_with("@0x")))
+        .map_or_else(|| panic!("no [0] row with an @0x handle in the reply:\n{reply}"), str::to_string)
+}
+
+/// The probe's table size, read off its own startup line so the over-match assertion cannot drift from the
+/// number of rows it actually builds.
+fn probe_table_rows(server: &mut Server) -> i64 {
+    let read = server
+        .call("debug.evaluate", serde_json::json!({"expression": "jakarta.persistence.JpaProbe.TABLE_ROWS"}));
+    read.rsplit_once(") ")
+        .and_then(|(_, n)| n.trim().parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("could not read TABLE_ROWS off the probe: {read}"))
+}
+
+/// EVAL-11 (#124), the other half of the live surface: a POSITIONAL bind, an unknown name, and a query that
+/// throws while running.
+///
+/// A second test rather than a longer first one, on TEST-35's lesson: `shard-plan.py` splits by test, so a
+/// long body is a floor under every shard count and two 3-second tests schedule better than one 6-second
+/// one. They share no state — each launches its own probe — so nothing is lost by the split.
+///
+/// The three legs are grouped because they are all about a reply being the RIGHT one rather than merely
+/// non-empty: the positional query has to read back *its own* JPQL (the probe returns a per-query string
+/// precisely so that reading the wrong one would show), an unknown name has to be distinguishable from a
+/// query that blew up, and a query that blew up must not borrow the unknown-name message.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_named_query_binds_by_position_and_keeps_its_two_failures_apart() {
+    let Some(jdk) = jdk_or_skip("a_named_query_binds_by_position_and_keeps_its_two_failures_apart") else {
+        return;
+    };
+    let probe =
+        Probe::launch_in_package(&jdk, "JpaProbe", "jakarta.persistence.JpaProbe").expect("launch JpaProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "jakarta.persistence.JpaProbe", "method": "workWithEm"}),
+    );
+    server
+        .wait_for_event("workWithEm", EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("never suspended in workWithEm; probe output: {:?}", probe.output()));
+
+    // The same predicate bound POSITIONALLY, 1-based as JPQL's `?1` is, and reporting ITS OWN query text —
+    // the probe returns a per-query string precisely so that reading the wrong one back would show here.
+    let positional = server.call(
+        "debug.run_named_query",
+        serde_json::json!({"query_name": "Reserva.findByCodigoPositional",
+                           "positional_parameters": ["R-7"], "max_rows": 2}),
+    );
+    assert_contains_all(
+        "a positional bind is 1-based and reads back its own JPQL",
+        &positional,
+        &["— 1 row(s)", "?1 = \"R-7\" (String)", "?1 is null or r.codigo = ?1"],
+    );
+
+    // --- (4) an unknown name is its own answer, and does not pretend it could list the real ones ---
+    let unknown =
+        server.call("debug.run_named_query", serde_json::json!({"query_name": "Reserva.doesNotExist"}));
+    assert_contains_all(
+        "an unknown query name says so",
+        &unknown,
+        &[
+            "No named query 'Reserva.doesNotExist'",
+            "IllegalArgumentException",
+            "CANNOT be listed",
+            "@NamedQuery",
+        ],
+    );
+    // A query that throws when RUN is a different diagnosis and must not borrow that message.
+    let broken = server.call("debug.run_named_query", serde_json::json!({"query_name": "Reserva.broken"}));
+    assert!(
+        !broken.contains("No named query"),
+        "a query that threw while RUNNING was reported as a name that does not exist: {broken}"
+    );
+
+    server.panic_reset();
+}
+
+/// EVAL-11 (#124): with no `EntityManager` in the frame, the refusal names the two-step instead of reaching
+/// for a heap walk that could not work.
+///
+/// **The measurement behind it is the point.** `ReferenceType.Instances` answers about an object's EXACT
+/// runtime class, so asking it for `jakarta.persistence.EntityManager` returns 0 however many beans are
+/// alive — measured against this very probe: the interface answers **0 live instances** while the concrete
+/// `JpaProbe$ProbeEntityManager` answers **1**. JDWP publishes no "which classes implement this interface"
+/// command, so there is nothing to walk and no honest fallback to build. A refusal that names
+/// `debug.list_instances` and `entity_manager` is worth more than a guessed list of provider class names,
+/// which is the trap `LazyProxyProbe` documents at length.
+///
+/// `workWithoutEm` is static and holds no bean, and the probe keeps its `EntityManager` in a static field of
+/// a *different* class — so `this` is absent, no local names it, and the free route genuinely has nothing.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_named_query_with_no_bean_in_the_frame_names_the_two_step_instead_of_guessing() {
+    let Some(jdk) =
+        jdk_or_skip("a_named_query_with_no_bean_in_the_frame_names_the_two_step_instead_of_guessing")
+    else {
+        return;
+    };
+    let probe =
+        Probe::launch_in_package(&jdk, "JpaProbe", "jakarta.persistence.JpaProbe").expect("launch JpaProbe");
+    let mut server = Server::start().expect("start server");
+    server.attach(probe.port);
+
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "jakarta.persistence.JpaProbe", "method": "workWithoutEm"}),
+    );
+    server
+        .wait_for_event("workWithoutEm", EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("never suspended in workWithoutEm; probe output: {:?}", probe.output()));
+
+    let refused = server
+        .call("debug.run_named_query", serde_json::json!({"query_name": "Reserva.findByCodigoAndStatus"}));
+    assert_contains_all(
+        "the refusal names the route out",
+        &refused,
+        &[
+            "No EntityManager was found in this frame",
+            "EXACT runtime class",
+            "debug.list_instances",
+            "entity_manager",
+        ],
+    );
+
+    // The interface really does answer 0 while the concrete class answers 1 — asserted here rather than
+    // taken on trust, because the whole refusal above rests on it and a future JVM could change it.
+    let by_interface = server.call(
+        "debug.list_instances",
+        serde_json::json!({"class_names": ["jakarta.persistence.EntityManager"]}),
+    );
+    assert!(
+        by_interface.contains("0 live instance(s)"),
+        "the EntityManager INTERFACE reported instances, which would mean a heap route is possible after \
+         all and this refusal is now the wrong answer: {by_interface}"
+    );
+    let by_class = server.call(
+        "debug.list_instances",
+        serde_json::json!({"class_names": ["jakarta.persistence.JpaProbe$ProbeEntityManager"]}),
+    );
+    assert!(
+        by_class.contains("1 live instance(s)"),
+        "the concrete implementation reported no instances, so the control for the measurement above did \
+         not hold: {by_class}"
+    );
+
+    // And the handle it printed is what makes the two-step work — the refusal is a route, not a dead end.
+    let handle = by_class
+        .split_whitespace()
+        .find(|t| t.starts_with("@0x"))
+        .unwrap_or_else(|| panic!("no @0x handle in the listing: {by_class}"))
+        .to_string();
+    let ran = server.call(
+        "debug.run_named_query",
+        serde_json::json!({"query_name": "Reserva.findByCodigoAndStatus",
+                           "entity_manager": handle, "max_rows": 1}),
+    );
+    assert_contains_all(
+        "the handle the refusal pointed at works",
+        &ran,
+        &["row(s)", &format!("given as `{handle}`")],
+    );
+
+    server.panic_reset();
+}

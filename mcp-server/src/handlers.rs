@@ -359,6 +359,7 @@ impl RequestHandler {
             // DECLARES, with no suspended thread and no cost to anyone else. This one asks what is
             // ALIVE, and stops the world to find out.
             "debug.list_instances" => self.handle_list_instances(args).await,
+            "debug.run_named_query" => self.handle_run_named_query(args).await,
             _ => return None,
         })
     }
@@ -1646,6 +1647,103 @@ impl RequestHandler {
         }
         drop(session);
         Ok(report)
+    }
+
+    /// EVAL-11 (#124): run a named JPA query through the application's own `EntityManager` and report the
+    /// row count plus a bounded, invoke-free read of each row.
+    ///
+    /// **The question it exists for is whether a query returns what its author believes**, and the shape it
+    /// was filed about is a lookup whose parameters are all optional and null-guarded — `(:codigo is null or
+    /// r.codigo = :codigo)` — which matches the entire table when they arrive null, so a call meant to find
+    /// one row returns thousands and the caller takes the first. Answering that outside the debugger means
+    /// rebuilding the predicate in SQL, which loses the persistence context, the binding and the resolved
+    /// tenant, and therefore cannot reproduce the bug.
+    ///
+    /// **Three costs, all of them the caller's to accept and all of them stated in the reply.** It INVOKES,
+    /// so it needs a thread suspended by an event and a read-only session refuses it outright. It runs the
+    /// query as written, so a query that over-matches builds every one of those entities in the debuggee's
+    /// heap — which is the price of the true count, and `max_fetch` is how to decline it. And under JPA's
+    /// default flush mode it would WRITE: see [`suppress_query_flush`], which is why the reply says what it
+    /// suppressed and what that costs in accuracy.
+    ///
+    /// Each row is read **invoke-free** ([`project_query_row`]), which is the only way to keep the promise
+    /// that reading the result does not fetch the associations it came back with.
+    async fn handle_run_named_query(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::RunNamedQueryArgs = crate::args::parse(&args)?;
+        let query_name = a.query_name.trim().to_string();
+        if query_name.is_empty() {
+            return Err("query_name is required — the `@NamedQuery` name exactly as declared, e.g. \
+                        'Reserva.findByCodigoAndStatus'. Nothing was sent."
+                .to_string());
+        }
+        if a.max_fetch == Some(0) {
+            return Err(
+                "max_fetch:0 asks the provider for no rows at all (setMaxResults(0)), which reports \
+                        0 and proves nothing about the query. Leave it unset for the TRUE count, or use \
+                        max_rows to bound what is rendered. Nothing was sent."
+                    .to_string(),
+            );
+        }
+        // Every parameter ambiguity is settled here, before the debuggee is touched.
+        let plan = plan_query_parameters(&a)?;
+
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+        if session.read_only {
+            return Err("🔒 read-only: running a named query INVOKES methods in the debuggee — \
+                        createNamedQuery, setParameter, getResultList — and this session refuses \
+                        invocation (SAFE-6). That is the correct answer rather than an obstacle: the query \
+                        would also reach the DATABASE, which no guard here can undo. Nothing was sent."
+                .to_string());
+        }
+        let thread_id = crate::args::parse_thread_id(a.thread_id.as_deref()).or(session.last_thread);
+        let conn = &mut session.connection;
+        let tid = thread_id.ok_or_else(|| {
+            format!("Running a named query needs a suspended thread, and {HOW_TO_SUSPEND_FOR_AN_INVOKE}")
+        })?;
+        let frame = match conn.get_frames(tid, 0, -1).await {
+            Ok(frames) if !frames.is_empty() => {
+                frames.get(a.frame_index).cloned().or_else(|| frames.first().cloned())
+            }
+            _ => None,
+        };
+
+        let em = find_entity_manager(conn, tid, frame.as_ref(), a.frame_index, a.entity_manager.as_deref())
+            .await?;
+
+        let (q_obj, q_type, bound) =
+            open_named_query(conn, tid, frame.as_ref(), &em, &query_name, &plan).await?;
+
+        // --- the write this tool must not perform ---
+        let flush_note =
+            suppress_query_flush(conn, tid, frame.as_ref(), q_obj, q_type, em.api, a.allow_flush).await?;
+
+        // --- an optional cap on what the debuggee builds ---
+        if let Some(cap) = a.max_fetch {
+            let n = i32::try_from(cap).unwrap_or(i32::MAX);
+            invoke_named(conn, tid, q_obj, q_type, "setMaxResults", vec![value_int(n)]).await.map_err(
+                |e| {
+                    format!(
+                        "max_fetch was given but setMaxResults({n}) failed: {e}. Drop max_fetch to run the \
+                     query as written. Nothing was run."
+                    )
+                },
+            )?;
+        }
+
+        let ran = run_and_project(conn, tid, q_obj, q_type, &a).await?;
+
+        drop(session);
+
+        Ok(render_named_query_reply(&NamedQueryReply {
+            query_name: &query_name,
+            em: &em,
+            bound: &bound,
+            flush_note: flush_note.as_deref(),
+            run: &ran,
+            args: &a,
+        }))
     }
 
     /// DISC-3: what file a loaded class was compiled from, and — when source roots are configured —
@@ -17162,6 +17260,795 @@ async fn invoke_result(
         return Err(format!("{name}() threw {tn}"));
     }
     Ok(ret)
+}
+
+// ----- EVAL-11 (#124): running a named JPA query on the live JVM -----
+
+/// The two spellings of the JPA API, newest first, with the JNI signature of `EntityManager` in each.
+///
+/// Both are live: `jakarta.persistence` from Jakarta EE 9 (Hibernate 6, `WildFly` 27+), `javax.persistence`
+/// for everything before it — and the target stack straddles the split, so guessing one would refuse to
+/// recognise half the deployments. Which one a bean implements also decides where `FlushModeType` lives,
+/// which is why this is a pair rather than a list of interfaces to test.
+const JPA_ENTITY_MANAGER: [(&str, &str); 2] = [
+    ("jakarta.persistence", "Ljakarta/persistence/EntityManager;"),
+    ("javax.persistence", "Ljavax/persistence/EntityManager;"),
+];
+
+/// Which JPA API package a type implements `EntityManager` from, or `None` for a type that implements
+/// neither.
+///
+/// `implements_interface` walks the whole lattice (superclasses and transitive superinterfaces) and reads
+/// through the type cache, so asking about both spellings costs almost nothing after the first.
+async fn jpa_api_of(conn: &mut jdwp_client::JdwpConnection, type_id: u64) -> Option<&'static str> {
+    for (api, sig) in JPA_ENTITY_MANAGER {
+        if conn.implements_interface(type_id, sig).await.unwrap_or(false) {
+            return Some(api);
+        }
+    }
+    None
+}
+
+/// An `EntityManager` the query will run on, and how it was found — the second half being part of the
+/// answer rather than a detail, since one route costs nothing and the other did not exist.
+struct FoundEm {
+    obj_id: u64,
+    type_id: u64,
+    type_name: String,
+    /// Which JPA API it implements `EntityManager` from. `None` means neither, which is permitted for an
+    /// explicitly-given object and is what makes the flush guarantee unkeepable — see
+    /// [`suppress_query_flush`].
+    api: Option<&'static str>,
+    /// How to describe the route in the reply, e.g. "given as `this.em`" or "found in frame 0 as local
+    /// `em`".
+    how: String,
+}
+
+/// Why there is no heap fallback, said once and pointed at from the refusal.
+///
+/// **Measured, not assumed** (Temurin 11.0.32, `JpaProbe`): `ReferenceType.Instances` on
+/// `jakarta.persistence.EntityManager` answers **0 live instances** while the same walk on the concrete
+/// `JpaProbe$ProbeEntityManager` answers **1**. `debug.list_instances`' own description already says this —
+/// exact runtime type, not subtype-inclusive — and JDWP publishes no "which classes implement this
+/// interface" command, so there is nothing to walk. Enumerating every loaded class and asking each one was
+/// considered and rejected: it is roughly two packets per loaded class, which is fast against a probe and
+/// unknown against a 20,000-class application server over a real wire, and a tool here does not ship a cost
+/// it cannot state.
+///
+/// So the two-step is the caller's, and this names it precisely rather than guessing at implementation
+/// class names — the trap `LazyProxyProbe` documents at length about guessed Hibernate internals.
+const NO_HEAP_ROUTE_TO_AN_ENTITY_MANAGER: &str =
+    "No EntityManager was found in this frame, and there is no heap route to one. JDWP's \
+     ReferenceType.Instances answers about an object's EXACT runtime class, so asking it for \
+     jakarta.persistence.EntityManager returns 0 however many beans are alive (measured), and JDWP has no \
+     command for \"which classes implement this interface\". Two ways forward, both one call: pass \
+     entity_manager with an expression that reaches the bean from this frame (a local, this.em, a static \
+     field), or run debug.list_instances on the CONCRETE implementation class — \
+     org.hibernate.internal.SessionImpl, a container wrapper like \
+     org.jboss.as.jpa.container.TransactionScopedEntityManager, or whatever debug.list_classes shows for \
+     your provider — and pass the @0x… handle it prints as entity_manager.";
+
+/// Find the `EntityManager` to run on: the caller's expression if given, otherwise this frame.
+///
+/// **Frame only, and deliberately.** `this` first, then the frame's in-scope locals and arguments, each
+/// checked by the interface it implements rather than by its name — a container-managed bean's runtime type
+/// is a proxy nobody can predict, so the type name is the one thing not worth matching on. Costs a handful
+/// of packets, suspends nothing, and invokes nothing. When it finds nothing it refuses with
+/// [`NO_HEAP_ROUTE_TO_AN_ENTITY_MANAGER`] rather than reaching for a heap walk that cannot work.
+async fn find_entity_manager(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    frame: Option<&jdwp_client::thread::Frame>,
+    frame_index: usize,
+    given: Option<&str>,
+) -> Result<FoundEm, String> {
+    if let Some(expr) = given {
+        let value = resolve_expression(conn, Some(thread_id), frame, expr)
+            .await
+            .map_err(|e| format!("entity_manager '{expr}' did not resolve: {e}"))?;
+        let obj_id = as_object_id(&value).ok_or_else(|| {
+            format!(
+                "entity_manager '{expr}' resolved to null or to a primitive, so there is no bean to run a \
+                 query on."
+            )
+        })?;
+        let type_id = conn
+            .get_object_reference_type(obj_id)
+            .await
+            .map_err(|e| format!("Failed to read the type of entity_manager '{expr}': {e}"))?;
+        let type_name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+        let api = jpa_api_of(conn, type_id).await;
+        return Ok(FoundEm { obj_id, type_id, type_name, api, how: format!("given as `{expr}`") });
+    }
+
+    let frame = frame.ok_or(NO_HEAP_ROUTE_TO_AN_ENTITY_MANAGER)?;
+
+    // `this` first: on a DAO or a repository the bean is an instance field of the very object whose method
+    // you are suspended in, which is both the commonest case and the cheapest to reach.
+    if let Ok(this_id) = conn.get_this_object(thread_id, frame.frame_id).await {
+        if this_id != 0 {
+            if let Some(found) = em_in_object_fields(conn, this_id, frame_index).await {
+                return Ok(found);
+            }
+        }
+    }
+
+    // Then the frame's own locals and arguments. Only variables whose scope covers the current bytecode
+    // index, for the reason `capture_frame_locals` gives: the rest hold whatever was last in the slot.
+    if let Ok(var_table) = conn.get_variable_table(frame.location.class_id, frame.location.method_id).await {
+        let ci = frame.location.index;
+        let in_scope: Vec<(String, jdwp_client::stackframe::VariableSlot)> = var_table
+            .into_iter()
+            .filter(|v| ci >= v.code_index && ci < v.code_index + u64::from(v.length))
+            // Reference-typed only. A slot holding an `int` cannot be a bean, and asking the JVM for its
+            // runtime type would be a packet spent to learn that.
+            .filter(|v| v.signature.starts_with('L'))
+            .map(|v| {
+                let slot = i32::try_from(v.slot).unwrap_or(0);
+                let sig_byte = v.signature.as_bytes().first().copied().unwrap_or(b'L');
+                (v.name, jdwp_client::stackframe::VariableSlot { slot, sig_byte })
+            })
+            .collect();
+        let slots: Vec<jdwp_client::stackframe::VariableSlot> = in_scope.iter().map(|(_, s)| *s).collect();
+        if !slots.is_empty() {
+            if let Ok(vals) = conn.get_frame_values(thread_id, frame.frame_id, slots).await {
+                for ((name, _), val) in in_scope.iter().zip(vals.iter()) {
+                    let Some(obj_id) = as_object_id(val) else { continue };
+                    let Ok(type_id) = conn.get_object_reference_type(obj_id).await else { continue };
+                    if let Some(api) = jpa_api_of(conn, type_id).await {
+                        let type_name =
+                            decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+                        return Ok(FoundEm {
+                            obj_id,
+                            type_id,
+                            type_name,
+                            api: Some(api),
+                            how: format!("found in frame {frame_index} as local `{name}`"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Err(NO_HEAP_ROUTE_TO_AN_ENTITY_MANAGER.to_string())
+}
+
+/// Look for an `EntityManager` among one object's instance fields — the `this.em` shape, without the
+/// caller having had to name it.
+///
+/// Declared fields only. A bean injected into a superclass is reachable by naming it in `entity_manager`,
+/// and walking the whole chain here would spend packets on framework base classes on every call.
+async fn em_in_object_fields(
+    conn: &mut jdwp_client::JdwpConnection,
+    this_id: u64,
+    frame_index: usize,
+) -> Option<FoundEm> {
+    let this_type = this_id_type(conn, this_id).await?;
+    let fields = conn.get_fields(this_type).await.ok()?;
+    let wanted: Vec<jdwp_client::reftype::FieldInfo> =
+        fields.into_iter().filter(|f| f.mod_bits & ACC_STATIC == 0 && f.signature.starts_with('L')).collect();
+    if wanted.is_empty() {
+        return None;
+    }
+    let ids: Vec<u64> = wanted.iter().map(|f| f.field_id).collect();
+    let values = conn.get_object_values(this_id, ids).await.ok()?;
+    for (f, v) in wanted.iter().zip(values.iter()) {
+        let Some(obj_id) = as_object_id(v) else { continue };
+        let Ok(type_id) = conn.get_object_reference_type(obj_id).await else { continue };
+        if let Some(api) = jpa_api_of(conn, type_id).await {
+            let type_name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+            return Some(FoundEm {
+                obj_id,
+                type_id,
+                type_name,
+                api: Some(api),
+                how: format!("found in frame {frame_index} as `this.{}`", f.name),
+            });
+        }
+    }
+    None
+}
+
+/// The runtime type of an object, as an `Option` so the field scan can `?` on it.
+async fn this_id_type(conn: &mut jdwp_client::JdwpConnection, obj_id: u64) -> Option<u64> {
+    conn.get_object_reference_type(obj_id).await.ok()
+}
+
+/// Invoke `name(args)` on one object, resolving the overload against the argument values.
+///
+/// The same three steps `invoke_segment_method` takes for an expression segment — pick the overload, box
+/// any primitive the chosen overload declares as a reference, unwrap a thrown exception into an error — for
+/// a call this tool makes itself rather than one the caller wrote.
+async fn invoke_named(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    obj_id: u64,
+    type_id: u64,
+    name: &str,
+    args: Vec<jdwp_client::types::Value>,
+) -> Result<jdwp_client::types::Value, String> {
+    let (decl, m) = find_method_for_args(conn, type_id, name, &args, Some(false))
+        .await?
+        .ok_or_else(|| format!("No method '{name}' on the object accepts {} argument(s)", args.len()))?;
+    let args = coerce_args(conn, thread_id, &m.signature, args).await?;
+    let (ret, exc) = conn
+        .invoke_method(obj_id, thread_id, decl, m.method_id, args)
+        .await
+        .map_err(|e| format!("invoke {name}() failed: {e}{}", invoke_hint(&e)))?;
+    invoke_result(conn, name, ret, exc).await
+}
+
+/// How a query parameter is keyed — JPQL allows either, and a query uses one or the other.
+///
+/// Borrowed from the arguments rather than owned: a plan lives entirely inside one
+/// `handle_run_named_query` call, which holds the parsed arguments for longer, so cloning every name and
+/// value into it would be copying strings to hand them straight back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParamKey<'a> {
+    Named(&'a str),
+    /// 1-based, which is JPQL's own numbering (`?1` is the first).
+    Position(i32),
+}
+
+impl ParamKey<'_> {
+    /// How it reads back in a message, in the spelling the caller used.
+    fn label(&self) -> String {
+        match *self {
+            Self::Named(n) => n.to_string(),
+            Self::Position(p) => format!("?{p}"),
+        }
+    }
+}
+
+/// Where one parameter's value comes from. The two are kept apart to the last moment because they fail
+/// differently: a JSON scalar cannot fail to convert, and an expression can fail to resolve.
+enum ParamSource<'a> {
+    Json(&'a serde_json::Value),
+    Expression(&'a str),
+}
+
+struct QueryParam<'a> {
+    key: ParamKey<'a>,
+    source: ParamSource<'a>,
+}
+
+/// Turn the three parameter arguments into one ordered binding plan, refusing every ambiguity **before**
+/// the debuggee is touched.
+///
+/// Every refusal here is an argument-level one, in the style
+/// `every_monitor_arming_refusal_explains_itself_before_touching_the_debuggee` established: a caller who
+/// gave contradictory arguments learns that from the reply, not from a JPA exception thrown three
+/// invocations deep with a message about something else.
+fn plan_query_parameters(a: &crate::args::RunNamedQueryArgs) -> Result<Vec<QueryParam<'_>>, String> {
+    if a.parameters.is_some() && a.positional_parameters.is_some() {
+        return Err("Give `parameters` (named) or `positional_parameters` (ordered), not both — a JPQL \
+                    query uses one form or the other, and binding a name to a query that declares \
+                    positions fails in the provider with a message about neither. Nothing was sent."
+            .to_string());
+    }
+    let mut plan: Vec<QueryParam> = Vec::new();
+
+    if let Some(named) = &a.parameters {
+        for (name, value) in named {
+            let key = ParamKey::Named(name.as_str());
+            reject_non_scalar(&key, value)?;
+            plan.push(QueryParam { key, source: ParamSource::Json(value) });
+        }
+    }
+    if let Some(ordered) = &a.positional_parameters {
+        for (i, value) in ordered.iter().enumerate() {
+            // 1-based on the wire because that is what JPQL means by `?1`; the reply prints the same
+            // number, so an off-by-one is visible rather than silent.
+            let key = ParamKey::Position(i32::try_from(i + 1).unwrap_or(i32::MAX));
+            reject_non_scalar(&key, value)?;
+            plan.push(QueryParam { key, source: ParamSource::Json(value) });
+        }
+    }
+    if let Some(exprs) = &a.parameter_expressions {
+        for (key, expr) in exprs {
+            // An all-digits key is a position, anything else is a name. Unambiguous because JPQL forbids a
+            // parameter name starting with a digit, so no legal name can be read as a position.
+            let parsed = match key.parse::<i32>() {
+                Ok(p) if p >= 1 => ParamKey::Position(p),
+                Ok(p) => {
+                    return Err(format!(
+                        "parameter_expressions key '{p}' is not a valid position — JPQL positions are \
+                         1-based, so the first parameter is 1 and there is no 0 or negative one."
+                    ));
+                }
+                Err(_) => ParamKey::Named(key.as_str()),
+            };
+            if plan.iter().any(|p| p.key == parsed) {
+                return Err(format!(
+                    "Parameter '{}' was given twice — once as a value and once in \
+                     parameter_expressions. Nothing was sent, because silently letting one win is how a \
+                     query returns a confident answer to a question you did not ask.",
+                    parsed.label()
+                ));
+            }
+            if expr.trim().is_empty() {
+                return Err(format!(
+                    "parameter_expressions['{}'] is empty — give an expression \
+                     (`this.codigo`, `@0x1f4c`, `42L`, `Status.CONFIRMADA`) or drop the entry.",
+                    parsed.label()
+                ));
+            }
+            plan.push(QueryParam { key: parsed, source: ParamSource::Expression(expr) });
+        }
+    }
+    Ok(plan)
+}
+
+/// Refuse an array or an object as a parameter value, naming the one argument that can express it.
+///
+/// Not silently stringified and not flattened: a JPQL `IN (:codigos)` binding really does take a
+/// collection, and building one in the debuggee is a different feature from binding a scalar. Saying so is
+/// better than binding the JSON text of a list and returning zero rows.
+fn reject_non_scalar(key: &ParamKey, value: &serde_json::Value) -> Result<(), String> {
+    if value.is_array() || value.is_object() {
+        return Err(format!(
+            "Parameter '{}' is a JSON {}, and only scalars map to a Java value here (null, a string, a \
+             boolean, a number). A collection parameter — JPQL's `IN (:names)` — needs a Java collection \
+             built in the debuggee, which this tool does not do: reach one with parameter_expressions \
+             instead, naming a List that already exists in the frame.",
+            key.label(),
+            if value.is_array() { "array" } else { "object" }
+        ));
+    }
+    Ok(())
+}
+
+/// One JSON scalar as a JDWP value, plus the Java type it was bound as.
+///
+/// **The type is returned so the reply can print it**, and that is the point rather than decoration: JPA
+/// binds by object and compares with `equals`, so a query whose `id` column is a `Long` given an `Integer`
+/// matches nothing at all — no exception, no warning, just an empty result that reads like a fact about the
+/// data. A whole number therefore becomes a `Long` (an entity id far more often than not) and the reply
+/// says so, which is what lets a caller notice and reach for `parameter_expressions` instead.
+async fn json_param_to_value(
+    conn: &mut jdwp_client::JdwpConnection,
+    value: &serde_json::Value,
+) -> Result<(jdwp_client::types::Value, &'static str), String> {
+    Ok(match value {
+        serde_json::Value::Null => (value_null(), "null"),
+        serde_json::Value::Bool(b) => (value_bool(*b), "Boolean"),
+        serde_json::Value::String(s) => {
+            let id = conn
+                .create_string(s)
+                .await
+                .map_err(|e| format!("Failed to create the String for a parameter: {e}"))?;
+            (value_object(id), "String")
+        }
+        serde_json::Value::Number(n) => match n.as_i64() {
+            // Integral: a Long, for the reason above.
+            Some(i) => (value_long(i), "Long"),
+            // Fractional, or too large for an i64 — either way a double is the only faithful reading, and
+            // `as_f64` is what serde_json guarantees for the rest.
+            None => (
+                value_double(n.as_f64().ok_or_else(|| {
+                    format!("Parameter value {n} is a number this server cannot represent")
+                })?),
+                "Double",
+            ),
+        },
+        // Arrays and objects are refused in `reject_non_scalar` before anything reaches here.
+        other => return Err(format!("Unsupported parameter value: {other}")),
+    })
+}
+
+/// Suppress the flush this query would otherwise perform, and report what was done.
+///
+/// **This is the whole read-only story of the tool.** JPA's default is `FlushModeType.AUTO`, under which the
+/// provider pushes every pending change in the persistence context to the database *before* answering a
+/// query — so on a shared instance, asking a question commits somebody else's half-finished work. Setting
+/// `COMMIT` on the `Query` object this tool just created suppresses that for this query alone and touches
+/// neither the `EntityManager` nor anybody else's.
+///
+/// `Ok(None)` means the caller opted into the flush with `allow_flush`. `Err` means the guarantee could not
+/// be kept — the bean implements neither JPA API so there is no `FlushModeType` to name, or the enum is not
+/// loaded, or the provider's `Query` has no `setFlushMode`. **Refused rather than proceeding quietly**: a
+/// reply that omitted the note would read as a read, and the caller can still ask for it explicitly.
+async fn suppress_query_flush(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread_id: u64,
+    frame: Option<&jdwp_client::thread::Frame>,
+    query_obj: u64,
+    query_type: u64,
+    api: Option<&'static str>,
+    allow_flush: bool,
+) -> Result<Option<String>, String> {
+    if allow_flush {
+        return Ok(None);
+    }
+    let api = api.ok_or_else(|| {
+        "Cannot suppress the flush: the object given as entity_manager implements neither \
+         jakarta.persistence.EntityManager nor javax.persistence.EntityManager, so there is no \
+         FlushModeType to name. Under JPA's default (AUTO) running the query would push pending changes to \
+         the DATABASE — a write performed by asking a question, which on a shared instance is somebody \
+         else's uncommitted work. Pass an object that implements one of those interfaces, or set \
+         allow_flush:true to accept the write. Nothing was run."
+            .to_string()
+    })?;
+    let expr = format!("{api}.FlushModeType.COMMIT");
+    let mode = resolve_expression(conn, Some(thread_id), frame, &expr).await.map_err(|e| {
+        format!(
+            "Cannot suppress the flush: reading {expr} failed ({e}). Under JPA's default (AUTO) the query \
+             would flush pending changes to the database before answering. Set allow_flush:true to accept \
+             that, or run this where {api}.FlushModeType is loaded. Nothing was run."
+        )
+    })?;
+    invoke_named(conn, thread_id, query_obj, query_type, "setFlushMode", vec![mode]).await.map_err(|e| {
+        format!(
+            "Cannot suppress the flush: setFlushMode({expr}) failed ({e}). Set allow_flush:true to accept \
+             the write, or use a provider Query that implements it. Nothing was run."
+        )
+    })?;
+    Ok(Some(
+        "🔒 flush suppressed — FlushModeType.COMMIT set on THIS query only, so nothing was written. The \
+         trade: the rows below do NOT reflect uncommitted changes in this persistence context, so \
+         something saved and not committed will not be found. Pass allow_flush:true when that is the \
+         question."
+            .to_string(),
+    ))
+}
+
+/// How many fields one projected row shows before `… +N more`.
+///
+/// Fixed rather than an argument, and small: the read exists to show a row's identity and the columns
+/// the query filtered on, not to serialise an entity. A caller who wants a whole object has
+/// `debug.evaluate` and the `@0x…` handle printed beside every row.
+const QUERY_ROW_FIELD_CAP: usize = 12;
+
+/// `ACC_SYNTHETIC`. A synthetic field is the compiler's, not the entity's — `this$0` on an inner-class
+/// entity, or a provider's injected `$$_hibernate_tracker` — and showing it in a row read is noise
+/// that pushes real columns past the cap.
+const ACC_SYNTHETIC: i32 = 0x1000;
+
+/// One row as a bounded, **invoke-free** field read (`CONTEXT.md`).
+///
+/// This is #124's third acceptance criterion, and the reason it is bespoke rather than a call to
+/// `render_value_deep`. Reading fields costs `ObjectReference.GetValues` and runs no debuggee code, so an
+/// unfetched lazy association is left exactly as it was found. Both alternatives walk in, by different
+/// routes: a *shallow* render calls `toString()`, which on a JPA entity routinely names its associations,
+/// and the *deep* one invokes `toArray()`/`entrySet()` on a collection field and falls back to `toString()`
+/// at its depth limit. So bounding the depth cannot substitute for not invoking — the first level is
+/// already the hazard.
+///
+/// A nested object therefore renders as its type plus an `@0x…` handle, which is a starting point rather
+/// than a dead end: `debug.evaluate "@0x1f4c.getItens()"` reads it afterwards, deliberately, with the
+/// caller having chosen to pay for the load.
+async fn project_query_row(conn: &mut jdwp_client::JdwpConnection, obj_id: u64, max_len: usize) -> String {
+    let Ok(type_id) = conn.get_object_reference_type(obj_id).await else {
+        return format!("@0x{obj_id:x} <type unreadable>");
+    };
+    let type_name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
+    let short = type_name.rsplit('.').next().unwrap_or(&type_name).to_string();
+
+    // Declared fields, then inherited ones — a JPA entity commonly keeps its id on a mapped superclass, so
+    // stopping at the runtime type would hide the one column that identifies the row. Bounded like every
+    // other superclass walk in this file.
+    let mut fields: Vec<jdwp_client::reftype::FieldInfo> = Vec::new();
+    let mut current = Some(type_id);
+    let mut guard = 0;
+    while let Some(tid) = current {
+        guard += 1;
+        if guard > 20 {
+            break;
+        }
+        if let Ok(declared) = conn.get_fields(tid).await {
+            // Collected before extending rather than chained: the second filter reads `fields` while
+            // `extend` holds it mutably. A superclass may redeclare a name; the most-derived one was seen
+            // first and wins, as Java's own field hiding would have it.
+            let fresh: Vec<jdwp_client::reftype::FieldInfo> = declared
+                .into_iter()
+                .filter(|f| f.mod_bits & (ACC_STATIC | ACC_SYNTHETIC) == 0)
+                .filter(|f| !fields.iter().any(|k| k.name == f.name))
+                .collect();
+            fields.extend(fresh);
+        }
+        if fields.len() > QUERY_ROW_FIELD_CAP {
+            break;
+        }
+        current = conn.get_superclass(tid).await.unwrap_or(None);
+    }
+    if fields.is_empty() {
+        return format!("{short} @0x{obj_id:x} {{}}");
+    }
+    let shown = fields.len().min(QUERY_ROW_FIELD_CAP);
+    let ids: Vec<u64> = fields.iter().take(shown).map(|f| f.field_id).collect();
+    let Ok(values) = conn.get_object_values(obj_id, ids).await else {
+        return format!("{short} @0x{obj_id:x} <fields unreadable>");
+    };
+    let mut out = format!("{short} @0x{obj_id:x} {{");
+    for (i, (f, v)) in fields.iter().take(shown).zip(values.iter()).enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        // `None` for the thread is the load-bearing argument: it is what stops `render_value` reaching for
+        // `toString()`, which is where a lazy association would have been fetched.
+        let rendered = render_value(conn, v, None, max_len, ByteRender::default()).await;
+        let _ = write!(out, " {}={rendered}", f.name);
+    }
+    if fields.len() > shown {
+        let _ = write!(out, ", … +{} more field(s)", fields.len() - shown);
+    }
+    out.push_str(" }");
+    out
+}
+
+/// What running the query produced: the true row count, the bounded per-row reads, and the query text if
+/// provider would give it up.
+struct QueryRun {
+    /// The size of the result the provider returned. With `max_fetch` in force this is a floor, which is
+    /// the caller's to know and [`render_named_query_reply`] says where the number is.
+    total: i32,
+    projected: Vec<String>,
+    /// `getQueryString()`, when the `Query` implementation has it. `None` is the ordinary answer, not a
+    /// failure — it is Hibernate's method, not JPA's.
+    query_text: Option<String>,
+}
+
+/// Run the query and read back what it returned, projecting each row without invoking anything on it.
+///
+/// Split from the handler alongside [`open_named_query`]: between them they hold every round trip this tool
+/// makes after discovery, which leaves the handler as the sequence of decisions it should be.
+async fn run_and_project(
+    conn: &mut jdwp_client::JdwpConnection,
+    tid: u64,
+    q_obj: u64,
+    q_type: u64,
+    a: &crate::args::RunNamedQueryArgs,
+) -> Result<QueryRun, String> {
+    // --- run it ---
+    let list = invoke_named(conn, tid, q_obj, q_type, "getResultList", vec![]).await?;
+    let list_id =
+        as_object_id(&list).ok_or_else(|| "getResultList() returned null rather than a List.".to_string())?;
+    let list_type = conn
+        .get_object_reference_type(list_id)
+        .await
+        .map_err(|e| format!("Failed to read the type of the result List: {e}"))?;
+    // One `toArray()` gives both the count and the elements; `size()` plus `get(i)` per row would be a
+    // round trip per row against a possibly-shared JVM. The List already holds every entity, so this
+    // allocates an array of references and nothing more.
+    let arr = as_object_id(&invoke_named(conn, tid, list_id, list_type, "toArray", vec![]).await?)
+        .ok_or_else(|| "toArray() on the result List returned nothing usable.".to_string())?;
+    let total = conn
+        .get_array_length(arr)
+        .await
+        .map_err(|e| format!("Failed to read the size of the result: {e}"))?;
+    let want = i32::try_from(a.max_rows).unwrap_or(i32::MAX);
+    let take = total.min(want).max(0);
+    let rows = if take == 0 {
+        Vec::new()
+    } else {
+        conn.get_array_values(arr, 0, take)
+            .await
+            .map_err(|e| format!("Failed to read the result rows: {e}"))?
+    };
+
+    // The query text, best effort. `getQueryString()` is Hibernate's (`org.hibernate.query.Query`), not
+    // JPA's — the spec publishes no way to read a query back — so its absence is normal and reported
+    // rather than treated as a failure. And it is the JPQL, never the SQL.
+    let query_text =
+        invoke_no_arg(conn, q_obj, q_type, tid, "getQueryString").await.filter(|v| as_object_id(v).is_some());
+    let query_text = match query_text {
+        Some(v) => Some(render_value(conn, &v, None, a.max_result_length, ByteRender::default()).await),
+        None => None,
+    };
+
+    let mut projected: Vec<String> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        projected.push(match as_object_id(row) {
+            Some(id) => project_query_row(conn, id, a.max_result_length).await,
+            // A JPA *projection* query — the word's own meaning, `select r.codigo, r.status from …` —
+            // returns scalars or an Object[] rather than entities, so a non-object row is normal here and is
+            // rendered as itself.
+            None => render_value(conn, row, None, a.max_result_length, ByteRender::default()).await,
+        });
+    }
+    Ok(QueryRun { total, projected, query_text })
+}
+
+/// Look the named query up and bind every parameter to it, returning the `Query` object, its type, and a
+/// rendering of what was bound.
+///
+/// Split out of the handler because it is the half with the branching — an unknown name, a parameter that
+/// will not resolve, a provider that hands back a different `Query` — while the handler's remaining job is a
+/// straight sequence. The reply's parameter list is built here for the same reason it is built at all: a
+/// silent type mismatch is this tool's one unreportable failure, so the type each value was bound as has to
+/// come back with it.
+async fn open_named_query(
+    conn: &mut jdwp_client::JdwpConnection,
+    tid: u64,
+    frame: Option<&jdwp_client::thread::Frame>,
+    em: &FoundEm,
+    query_name: &str,
+    plan: &[QueryParam<'_>],
+) -> Result<(u64, u64, Vec<String>), String> {
+    // --- createNamedQuery, whose one distinguishable failure is a name that does not exist ---
+    let name_id = conn
+        .create_string(query_name)
+        .await
+        .map_err(|e| format!("Failed to create the String for the query name: {e}"))?;
+    let query =
+        invoke_named(conn, tid, em.obj_id, em.type_id, "createNamedQuery", vec![value_object(name_id)])
+            .await
+            .map_err(|e| explain_named_query_lookup(query_name, &e))?;
+    let mut q_obj = as_object_id(&query).ok_or_else(|| {
+        format!(
+            "createNamedQuery(\"{query_name}\") returned null, which no JPA provider should do — the \
+             spec says it throws IllegalArgumentException for an unknown name. Nothing was run."
+        )
+    })?;
+    let mut q_type = conn
+        .get_object_reference_type(q_obj)
+        .await
+        .map_err(|e| format!("Failed to read the type of the Query object: {e}"))?;
+
+    // --- bind the parameters, following the fluent return ---
+    let mut bound: Vec<String> = Vec::new();
+    for p in plan {
+        let (value, as_type) = match &p.source {
+            ParamSource::Json(v) => json_param_to_value(conn, v).await?,
+            ParamSource::Expression(expr) => {
+                let v = resolve_expression(conn, Some(tid), frame, expr).await.map_err(|e| {
+                    format!("parameter '{}' — expression '{expr}' did not resolve: {e}", p.key.label())
+                })?;
+                (v, "expression")
+            }
+        };
+        let rendered = render_value(conn, &value, None, 80, ByteRender::default()).await;
+        let key_arg = match p.key {
+            ParamKey::Named(n) => {
+                let id = conn
+                    .create_string(n)
+                    .await
+                    .map_err(|e| format!("Failed to create the String for parameter '{n}': {e}"))?;
+                value_object(id)
+            }
+            ParamKey::Position(pos) => value_int(pos),
+        };
+        let ret = invoke_named(conn, tid, q_obj, q_type, "setParameter", vec![key_arg, value])
+            .await
+            .map_err(|e| {
+                format!(
+                    "Binding parameter '{}' failed: {e}. A provider rejects a parameter the query does \
+                     not declare, so check the name against the query rather than the entity.",
+                    p.key.label()
+                )
+            })?;
+        // JPA's setters are fluent and normally return `this`, but the spec only promises a `Query` —
+        // so follow what came back rather than assuming identity, and re-read its type only if the
+        // object actually changed.
+        if let Some(next) = as_object_id(&ret) {
+            if next != q_obj {
+                q_obj = next;
+                q_type = conn
+                    .get_object_reference_type(q_obj)
+                    .await
+                    .map_err(|e| format!("Failed to read the type of the rebound Query: {e}"))?;
+            }
+        }
+        bound.push(format!("{} = {rendered} ({as_type})", p.key.label()));
+    }
+    Ok((q_obj, q_type, bound))
+}
+
+/// Turn `createNamedQuery`'s failure into #124's second acceptance criterion: a name that does not exist
+/// says so, rather than arriving as a generic evaluation failure.
+///
+/// **And it does not offer a list of the names that do exist**, because there is none to offer. `EntityManager`
+/// publishes no way to enumerate its named queries — a provider builds that registry from `@NamedQuery` and
+/// `orm.xml` at bootstrap and keeps it to itself — so the honest reply names where such queries are declared
+/// instead of guessing at a spelling. Silence about the alternatives beats an invented suggestion.
+fn explain_named_query_lookup(query_name: &str, err: &str) -> String {
+    if err.contains("IllegalArgumentException") {
+        return format!(
+            "No named query '{query_name}': the provider rejected the name with \
+             IllegalArgumentException, which is what JPA specifies for a query it has never heard of. \
+             Nothing was run and nothing was written.\n\
+             The known names CANNOT be listed — EntityManager has no method that enumerates them, so this \
+             is the whole of what the JVM will say. Check the spelling against where they are declared: a \
+             `@NamedQuery(name = \"…\")` on the entity, a `<named-query>` in orm.xml, or an \
+             `@NamedQueries` block. The name usually carries the entity as a prefix \
+             ('Reserva.findByCodigo'), and that prefix is part of it."
+        );
+    }
+    format!("createNamedQuery(\"{query_name}\") failed: {err}")
+}
+
+/// Assemble the reply. Separated from the handler because the handler's job is the sequence of invocations
+/// and this is a page of `writeln!`, and because every line here is a claim that has to stay true.
+/// Everything one reply is assembled from, bundled so the renderer takes one argument rather than eight.
+struct NamedQueryReply<'a> {
+    query_name: &'a str,
+    em: &'a FoundEm,
+    bound: &'a [String],
+    flush_note: Option<&'a str>,
+    run: &'a QueryRun,
+    args: &'a crate::args::RunNamedQueryArgs,
+}
+
+fn render_named_query_reply(r: &NamedQueryReply<'_>) -> String {
+    let NamedQueryReply { query_name, em, bound, flush_note, run, args: a } = *r;
+    let QueryRun { total, projected, query_text } = run;
+    let (total, query_text) = (*total, query_text.as_deref());
+    let mut out = String::new();
+    // The count leads, because it is the answer to the question this tool exists for.
+    let _ = writeln!(out, "🗄️  {query_name} — {total} row(s)");
+    let _ = writeln!(out, "EntityManager: {} @0x{:x} ({})", em.type_name, em.obj_id, em.how);
+    if let Some(api) = em.api {
+        let _ = writeln!(out, "JPA API: {api}");
+    }
+    if bound.is_empty() {
+        let _ = writeln!(out, "Parameters: none bound");
+    } else {
+        let _ = writeln!(out, "Parameters: {}", bound.join(", "));
+    }
+    if let Some(text) = query_text {
+        // Named as JPQL rather than SQL on purpose: `getQueryString()` returns the query as written, and
+        // the SQL a provider generates from it is not reachable through any published API. Calling this
+        // "the SQL" would be the reply telling a small lie about the one thing a caller would act on.
+        let _ = writeln!(out, "JPQL (as written, NOT the generated SQL): {text}");
+    } else {
+        let _ = writeln!(
+            out,
+            "JPQL: not available — this Query has no getQueryString(), which is Hibernate's rather than \
+             JPA's. The spec publishes no way to read a query back."
+        );
+    }
+    if let Some(note) = flush_note {
+        let _ = writeln!(out, "{note}");
+    } else {
+        let _ = writeln!(
+            out,
+            "⚠️  allow_flush:true — the query was allowed to FLUSH, so pending changes in this persistence \
+             context were pushed to the database before it answered. That is a write, and on a shared \
+             instance it was somebody else's uncommitted work."
+        );
+    }
+    if let Some(cap) = a.max_fetch {
+        // The one place a number in this reply is not what it looks like, so it is said where the number is.
+        let _ = writeln!(
+            out,
+            "⚠️  max_fetch:{cap} was in force (setMaxResults), so {total} is a FLOOR and not the total — the \
+             query may match more. Drop max_fetch for the true count, at the cost of the debuggee building \
+             every matching entity."
+        );
+    }
+    if projected.is_empty() {
+        let _ = writeln!(
+            out,
+            "{}",
+            if total == 0 {
+                "No rows matched."
+            } else {
+                "Rows: none rendered (max_rows is 0); the count above is still the true one."
+            }
+        );
+        return out;
+    }
+    let _ = writeln!(out, "Rows 1-{} of {total}:", projected.len());
+    for (i, row) in projected.iter().enumerate() {
+        let _ = writeln!(out, "  [{i}] {row}");
+    }
+    if total > i32::try_from(projected.len()).unwrap_or(i32::MAX) {
+        let _ = writeln!(
+            out,
+            "  … +{} more (raise max_rows)",
+            total - i32::try_from(projected.len()).unwrap_or(0)
+        );
+    }
+    // Said once, at the end, because it is what makes a bounded read a starting point rather than a
+    // dead end — and because getting here deliberately invoked nothing.
+    let _ = writeln!(
+        out,
+        "Fields were READ, never invoked: no getter ran and nothing was fetched, so a nested object shows \
+         as its type and an @0x… handle. debug.evaluate takes those handles — @0x1f4c.getItens() fetches it \
+         deliberately, and says so."
+    );
+    out
 }
 
 /// Read `seg` as a field access on `obj_id` (of `type_id`), returning the field's value.
