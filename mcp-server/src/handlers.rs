@@ -18098,7 +18098,15 @@ async fn project_query_rows(
             committed.extend(got.iter().take(shown));
         }
     }
-    let prefetched = ValueReads::committed(conn, &committed).await;
+    let mut prefetched = ValueReads::committed(conn, &committed).await;
+    // WAVE 4 — the `value` field of every committed value that turned out to be a boxed primitive.
+    //
+    // **After wave 3 and not with it, which is the licence being refused a second time.** Whether this read
+    // happens is decided by the *answer* to the type read, and which field to ask for is decided by the type
+    // as well — so it cannot join the wave that resolves the types. Given the type it is unconditional, which
+    // is what keeps it non-speculative: `render_resolved_object` hands every non-array object to
+    // `render_boxed_primitive`, and that reads `value` for every name in `BOXED_PRIMITIVES` and no other.
+    commit_boxed_values(conn, &mut prefetched, &committed).await;
 
     let mut projected: Vec<String> = Vec::with_capacity(rows.len());
     for (at, row) in rows.iter().enumerate() {
@@ -18111,6 +18119,44 @@ async fn project_query_rows(
         projected.push(render_query_row(conn, &prefetched, plan, read, max_len).await);
     }
     projected
+}
+
+/// Plan and issue the boxed-primitive half of a projection's prefetch (PERF-2, #129).
+///
+/// **The plan is read off the same function the render uses.** For each committed value it asks
+/// [`boxed_value_field`] — the one place that decides "is this a boxed primitive, and which field holds its
+/// payload" — so the wave cannot come to disagree with what the renderer then does. A planner with its own
+/// copy of that rule is how a prefetch starts reading something nobody renders.
+///
+/// Everything it needs is already in hand or already cached: the type comes from the wave just issued, and
+/// the signature and the field walk are `TypeCache` reads. So planning this costs **no packets** and the wave
+/// costs exactly what the sequential path would have spent on the same values.
+async fn commit_boxed_values(
+    conn: &mut jdwp_client::JdwpConnection,
+    prefetched: &mut ValueReads,
+    committed: &[&jdwp_client::types::Value],
+) {
+    let mut reads: Vec<(u64, Vec<u64>)> = Vec::new();
+    let mut planned: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for value in committed {
+        // An array is handed to the array branch before it ever reaches the boxed check, so it is not a
+        // candidate however its type is named.
+        let Some(id) = as_object_id(value).filter(|_| value.tag != 91) else { continue };
+        if !planned.insert(id) {
+            continue;
+        }
+        // `known_type` and NOT `reference_type`: a planner must not be able to turn "what do I already know"
+        // into a packet. The first version of this asked `reference_type`, which falls through to a live read,
+        // so every committed `String` — whose first read was its contents, not its type — became an
+        // `ObjectReference.ReferenceType` that nothing rendered. A `Reserva` row went from 6 commands to 7
+        // with no gain in wire time, and the packet census is what caught it.
+        let Some(type_id) = prefetched.known_type(id) else { continue };
+        let sig = conn.get_signature(type_id).await.unwrap_or_default();
+        if let Some(field_id) = boxed_value_field(conn, type_id, &decode_signature(&sig)).await {
+            reads.push((id, vec![field_id]));
+        }
+    }
+    prefetched.committed_boxed(conn, &reads).await;
 }
 
 /// Render one object row from what the waves returned, including both ways they can fail.
@@ -19838,7 +19884,14 @@ async fn render_node(
 
     // A boxed primitive is a leaf, whatever the depth: expanding it would turn a `List<Integer>`
     // into twenty `java.lang.Integer { value = (int) n }` blocks instead of twenty numbers.
-    if let Some(unboxed) = render_boxed_primitive(conn, id, type_id, &name).await {
+    //
+    // `ValueReads::none()` at all three of this function's uses of it: **the deep walk commits to nothing**,
+    // because `state.budget` is decremented per node as it renders, so how many of a level's children will
+    // be rendered is not known until they have been. Prefetching for a level would read for children the
+    // budget may never reach, which is `CONTEXT.md`'s **speculative read** and the invariant every one of
+    // these conversions protects. Resolving it needs a decision about what a budget-bound reply contains,
+    // which is caller-visible — ADR-0038 and #129.
+    if let Some(unboxed) = render_boxed_primitive(conn, &ValueReads::none(), id, type_id, &name).await {
         return unboxed;
     }
 
@@ -19847,6 +19900,7 @@ async fn render_node(
     if depth >= opts.depth_limit {
         return render_resolved_object(
             conn,
+            &ValueReads::none(),
             id,
             type_id,
             &sig,
@@ -19918,6 +19972,7 @@ async fn render_fields_deep(
         let sig = conn.get_signature(type_id).await.unwrap_or_default();
         return render_resolved_object(
             conn,
+            &ValueReads::none(),
             id,
             type_id,
             &sig,
@@ -20241,18 +20296,36 @@ const BOXED_PRIMITIVES: [&str; 8] = [
 /// read `ObjectReference.ReferenceType` itself, and every caller reads it too a line or two away — so
 /// **every rendered object cost that command twice** (PERF-2, #129). An object id is a weak reference so
 /// the answer cannot be cached across renders (ADR-0022); the fix is not to ask twice within one.
+///
+/// The `value` read comes from `reads` when the caller committed to it — a second wave, because it is the
+/// type's *answer* that decides whether this read happens at all (see `ValueReads::committed_boxed`). The
+/// field id is resolved here either way: it is per type and served from `TypeCache`, so it costs no packet
+/// on a hit and it is what the miss path needs.
 async fn render_boxed_primitive(
     conn: &mut jdwp_client::JdwpConnection,
+    reads: &ValueReads,
     id: u64,
     type_id: u64,
     name: &str,
 ) -> Option<String> {
+    let field_id = boxed_value_field(conn, type_id, name).await?;
+    let v = reads.boxed_value(conn, id, field_id).await?;
+    v.data.format_primitive()
+}
+
+/// The `value` field of a boxed primitive type, or `None` if this is not one.
+///
+/// Split out of [`render_boxed_primitive`] because the **planner** needs exactly this and nothing else:
+/// `project_query_rows` has to know, before it waves anything, which committed values will read a `value`
+/// field and which field id each will ask for. One answer to that question, used by the planner and by the
+/// renderer, so the wave cannot come to disagree with what the render does — the same rule `object.rs`'s
+/// `reference_type_request` states for the wire.
+async fn boxed_value_field(conn: &mut jdwp_client::JdwpConnection, type_id: u64, name: &str) -> Option<u64> {
     if !BOXED_PRIMITIVES.contains(&name) {
         return None;
     }
     let (_, f) = find_field_info(conn, type_id, "value", Some(false)).await.ok()??;
-    let v = conn.get_object_values(id, vec![f.field_id]).await.ok()?.into_iter().next()?;
-    v.data.format_primitive()
+    Some(f.field_id)
 }
 
 /// The type name of a live object, or a placeholder if it can't be read.
@@ -20305,7 +20378,7 @@ async fn render_object(
             return format!("\"{}\"", truncate(&s, max_len));
         }
     }
-    render_resolved_object(conn, id, type_id, &sig, &name, tag, thread_id, max_len, how).await
+    render_resolved_object(conn, reads, id, type_id, &sig, &name, tag, thread_id, max_len, how).await
 }
 
 /// The tail of [`render_object`], for a caller that has already resolved the object's type: everything
@@ -20317,6 +20390,7 @@ async fn render_object(
 #[allow(clippy::too_many_arguments)] // the tail of one render step, and it needs its caller's context
 async fn render_resolved_object(
     conn: &mut jdwp_client::JdwpConnection,
+    reads: &ValueReads,
     id: u64,
     type_id: u64,
     sig: &str,
@@ -20339,7 +20413,7 @@ async fn render_resolved_object(
     // A boxed primitive reads better as the value it holds than as `java.lang.Integer "2"`, and this
     // needs no thread — unlike the toString() below. (render_node checks this too, so a boxed value
     // stays a leaf there regardless of depth rather than being expanded into a `value` field.)
-    if let Some(unboxed) = render_boxed_primitive(conn, id, type_id, name).await {
+    if let Some(unboxed) = render_boxed_primitive(conn, reads, id, type_id, name).await {
         return unboxed;
     }
     // EVAL-9: never `toString()` an unfetched Hibernate lazy value. On a proxy that call IS the load —

@@ -394,19 +394,34 @@ not.
     before PERF-1                                    79.19 ms/row
     after PERF-1 (this ADR)                          63.18
     after #129's deduplication half                  46.68
-    after #129's prefetch                            13.47
+    after #129's first-read wave                     13.47
+    after #129's boxed-primitive wave                 5.36
   ```
+
+  **14.8x overall, and 0.67 of a round trip per row** — a row of a realistic entity costs less than one wait,
+  where it cost eight before any of this.
 
   **The packet count fell rather than held**, which this ADR's invariant permits and predicts: `Reserva.status`
   holds the same interned `String` in every row, so fifty rows name one object, and gathering the reads into
   one set is what made that visible — the same finding as the stack walk above, from the same mechanism. A row
   costs 6 commands where reading one value at a time cost 7.
 
-  **What is left is one serialised read per row and it is a third licence, not an unconverted fourth call
-  site.** `render_boxed_primitive` reads the `value` field of the boxed `Long id`, and that read is decided by
-  the *answer* to the type read: the type has to come back before the field id can be resolved and the field
-  id before the value can be read. That is this ADR's own refusal — "a row's field ids come from its type, so
-  its values read cannot be issued until its type read has answered" — one level further down.
+  **The last step establishes this ADR's refusal a second time rather than extending the first wave.**
+  `render_boxed_primitive` reads the `value` field of the boxed `Long id`, and that read is decided by the
+  *answer* to the type read: the type has to come back before the field id can be resolved and the field id
+  before the value can be read. That is this ADR's own sentence — "a row's field ids come from its type, so its
+  values read cannot be issued until its type read has answered" — one level further down, and it is why the
+  boxed reads are a fourth wave behind the third and not folded into it. Given the type the read is
+  unconditional, which is what keeps it non-speculative.
+
+  **And the fourth wave is where the invariant was actually broken, briefly, by the planner rather than by the
+  wave.** Deciding *which* values need a boxed read meant asking what type each committed value had, and the
+  first version asked the renderer's accessor — which falls through to a live read on a miss. Every committed
+  `String`, whose first read was its contents and not its type, therefore picked up an
+  `ObjectReference.ReferenceType` that nothing rendered: 7 commands per row instead of 6, with the wire time
+  unmoved. **A clock could not see it and the command census could.** `ValueReads::known_type` exists so a
+  planner cannot turn "what do I already know" into a packet, and it is the second time in this ADR's history
+  that the thing worth writing down was found by counting commands rather than by timing them.
 - No tool description changed, and no reply changed, so `docs/toolkit-contract.md` needs nothing beyond the
   release note. `Bare` and `Reserva.mixedTypes` are additions to a test probe, not to the tool surface.
 

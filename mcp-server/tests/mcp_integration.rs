@@ -15360,23 +15360,24 @@ fn a_wide_result_set_costs_a_bounded_number_of_round_trips_per_row() {
 ///   before PERF-1                                       79.19 ms/row
 ///   after PERF-1 (two of eight round trips waved)        63.18
 ///   after #129's deduplication half                      46.68
-///   after #129's prefetch (this)                         13.47
+///   after #129's first-read wave                         13.47
+///   after #129's boxed-primitive wave (this)              5.36
 /// ```
 ///
-/// **What the remaining 13.47ms is, from the census rather than from arithmetic.** It is about 1.7 round
-/// trips, and its companion test names them: `ObjectReference.GetValues` costs **2 per row**, one for the
-/// row's own fields (waved) and one inside `render_boxed_primitive` reading the `value` field of the boxed
-/// `Long id` — serialised, one per row, and the only per-row read left on this path. Prefetching it is a
-/// **third** read kind with a dependency the other two do not have: the type has to answer before the field
-/// id can be resolved and the field id before the value can be read, which is `CONTEXT.md`'s **independent
-/// reads** licence needing to be established again rather than extended. So it is a follow-up, deliberately,
-/// on the same grounds ADR-0038 left this whole path to #129.
+/// **14.8x overall, and 0.67 of a round trip per row.** A row of a realistic entity now costs less than one
+/// wait, where it cost eight before any of this.
 ///
-/// **The threshold is three round trips per row**, which is 1.8x above the 13.47 reading and 1.9x below the
-/// 46.68 the unconverted path spends on the same tree. Tighter above than the `Bare` assertion's margin, and
-/// for a reason worth knowing: the two hypotheses here are closer together, because one serialised read per
-/// row legitimately remains. If this fails just above the threshold, read the companion census first — a
-/// packet count that did not move means this is the clock and not the code.
+/// The last step is the one worth reading twice. `Reserva.id` is a `Long`, so rendering it reads the `value`
+/// field off the box — and that read is **not a first read**: whether to make it is decided by the answer to
+/// the type read, and which field to ask for is decided by the type as well. So it is a second wave behind
+/// the first, which is `CONTEXT.md`'s **independent reads** licence established again rather than extended —
+/// the same refusal `project_query_rows` already makes twice, one dependency further along. What made it
+/// worth doing anyway is that *given* the type the read is unconditional, so it stays non-speculative.
+///
+/// **The threshold is two round trips per row**: 3.0x above the 5.36 reading and 2.9x below the 5.8 round
+/// trips per row the unconverted path spends on this same tree. Both margins wide, and symmetric, which is
+/// the shape `latency_added_to_the_wire_shows_up_as_held_time_per_packet` uses. If this fails, read the
+/// companion census first — a packet count that did not move means this is the clock and not the code.
 ///
 /// **Not a threshold between the before and after figures.** ADR-0038 says why it refused to put one there:
 /// a number between 63 and 79 has no meaning of its own and moves the moment anything else about rendering a
@@ -15390,7 +15391,7 @@ fn a_wide_result_set_costs_a_bounded_number_of_round_trips_per_row() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_realistic_rows_string_and_association_reads_share_a_round_trip() {
     /// Round trips a row may cost. See the doc above for both margins.
-    const CEILING_IN_ROUND_TRIPS: f64 = 3.0;
+    const CEILING_IN_ROUND_TRIPS: f64 = 2.0;
 
     let Some(jdk) = jdk_or_skip("a_realistic_rows_string_and_association_reads_share_a_round_trip") else {
         return;
@@ -15400,7 +15401,7 @@ fn a_realistic_rows_string_and_association_reads_share_a_round_trip() {
     let wire_per_row = far_per_row - near_per_row;
     eprintln!(
         "PERF-2: a `Reserva` row costs {wire_per_row:.2}ms of wire time at a {rtt_ms}ms round trip \
-         ({near_per_row:.2}ms/row straight through, {far_per_row:.2}ms/row away). Measured at 13.47ms when \
+         ({near_per_row:.2}ms/row straight through, {far_per_row:.2}ms/row away). Measured at 5.36ms when \
          this landed, 46.68ms reading one value at a time, 79.19ms before PERF-1."
     );
     assert!(
@@ -15408,9 +15409,9 @@ fn a_realistic_rows_string_and_association_reads_share_a_round_trip() {
         "each extra `Reserva` row cost {wire_per_row:.2}ms of WIRE time at a {rtt_ms}ms round trip, which is \
          {:.1} round trips against {CEILING_IN_ROUND_TRIPS:.0} permitted. A row's two `String`s and its two \
          object fields are four reads: read one at a time they cost about {:.0}ms per row, which is what \
-         this measured before the projection committed its values to a wave. One serialised read per row is \
-         expected and accounted for — `render_boxed_primitive` reading the boxed `Long`. Several are not: \
-         either `project_query_rows` has stopped committing, or `render_value_committed` has stopped reading \
+         this measured before the projection committed its values to a wave. No serialised per-row read is \
+         expected any more: the boxed `Long`'s `value` was the last one and it is waved too. So this is \
+         either `project_query_rows` no longer committing, or `render_value_committed` no longer reading \
          from what it committed (PERF-2, #129).\n  per row straight through: {near_per_row:.2}ms\n  per row \
          {rtt_ms}ms away: {far_per_row:.2}ms\n  Check the packet census companion first: if it still reads 6 \
          commands per row, this is the clock.",
@@ -15443,23 +15444,37 @@ fn a_realistic_rows_string_and_association_reads_share_a_round_trip() {
 ///   per row                              7       6
 /// ```
 ///
+/// Identical on JDK 11.0.32, 17.0.20 and 21.0.12, which is why the ceiling can be the reading. Contrast
+/// `a_warm_stack_walk_reads_each_methods_tables_once`, whose census is JDK-locked and whose assertions are
+/// therefore ranges.
+///
+/// **This test earned its keep before it ever guarded a regression.** The boxed-primitive wave's first
+/// version asked `ValueReads::reference_type` while planning, which falls through to a live read on a miss —
+/// so every committed `String`, whose first read was its contents rather than its type, picked up an
+/// `ObjectReference.ReferenceType` that nothing rendered. A row went to **7** commands with its wire time
+/// unmoved, and only a command count could see it: the timing companion was perfectly happy. `known_type`
+/// exists because of that, and a planner now cannot turn "what do I already know" into a packet.
+///
 /// **The saving is deduplication, not waving**, and it is the same finding ADR-0038 reports from the stack
 /// walk: gathering a set of reads into one list is what makes a duplicate visible. `status` holds the same
 /// interned `String` in every row, so fifty rows name one object — the serialised path read it fifty times
 /// because there is nothing between it and the wire, and the wave reads it once. Waving changes *when*
 /// packets are sent and never how many; this row happens to have both savings in it.
 ///
-/// The bound is 8 per row, above the 7 the unconverted path spent and well below the 12 that a prefetch
-/// ignoring the projection's `take(shown)` cap would reach. **A prefetch that speculates fails here, not in
-/// the timing test**, which would happily report a fast reply that cost more traffic than it needed to.
+/// **The bound is the reading**, 6, and not the 7 the unconverted path spent: there is no reason to leave room
+/// for a number this change improved on, and the one regression that has actually happened here landed on 7.
+/// A prefetch ignoring the projection's `take(shown)` field cap would reach 12. **A prefetch that speculates
+/// fails here, not in the timing test**, which would happily report a fast reply that cost more traffic than
+/// it needed to.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_committed_projection_costs_no_more_packets_per_row_than_reading_one_at_a_time() {
     /// Rows in the narrow arm and the wide arm. The gap is what every count is divided by.
     const NARROW: usize = 2;
     const WIDE: usize = 50;
-    /// Commands a row may cost. Seven is what the unconverted path spent; six is the reading.
-    const PER_ROW_CEILING: i64 = 8;
+    /// Commands a row may cost — the reading itself, on all three of CI's JDKs. Seven is what reading one
+    /// value at a time cost, and also what the boxed wave cost while its planner was speculating.
+    const PER_ROW_CEILING: i64 = 6;
 
     let Some(jdk) =
         jdk_or_skip("a_committed_projection_costs_no_more_packets_per_row_than_reading_one_at_a_time")
@@ -15553,10 +15568,12 @@ fn a_committed_projection_costs_no_more_packets_per_row_than_reading_one_at_a_ti
     );
     assert!(
         per_row <= PER_ROW_CEILING,
-        "a `Reserva` row cost {per_row} commands, against {PER_ROW_CEILING} permitted and 6 measured. \
-         Reading one value at a time cost 7. A number above that is a prefetch reading values the renderer \
-         does not render — most likely one that ignores the projection's own `take(shown)` field cap, which \
-         is what keeps the commitment exact (PERF-2, #129).{breakdown}"
+        "a `Reserva` row cost {per_row} commands, against {PER_ROW_CEILING} measured on JDK 11, 17 and 21 \
+         alike. Reading one value at a time cost 7. Anything above the ceiling is a prefetch reading values \
+         the renderer does not render: a planner that consults `reference_type` instead of `known_type` and \
+         so reads a type nothing wanted (this happened, and cost exactly one per `String` field), or one \
+         that ignores the projection's own `take(shown)` field cap, which is what keeps the commitment \
+         exact (PERF-2, #129).{breakdown}"
     );
 }
 

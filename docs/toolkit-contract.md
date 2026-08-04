@@ -79,8 +79,9 @@ appearing *is* the information that something overlapped. And it is on the **tru
 that is the only shape that ever printed a cost line.
 
 Nothing else in PERF-2 changed a reply. The renderer got substantially cheaper — a `Reserva` row costs
-13.47ms of wire time where it cost 79.19ms before PERF-1, and a deep `debug.get_stack --expand_objects` walk
-sends a quarter fewer commands — and every one of those replies is byte-identical. That is the point of it:
+**5.36ms** of wire time where it cost 79.19ms before PERF-1, a 14.8x cut to under one round trip per row, and a
+deep `debug.get_stack --expand_objects` walk sends a quarter fewer commands — and every one of those replies is
+byte-identical. That is the point of it:
 `debug.evaluate`, `debug.get_stack` and `debug.run_named_query` cost less and say the same thing, so the
 release notes owe the speed but no caller has anything to re-read.
 

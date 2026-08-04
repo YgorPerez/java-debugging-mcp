@@ -68,6 +68,12 @@ pub struct ValueReads {
     strings: HashMap<u64, Option<String>>,
     /// `ObjectReference.ReferenceType` per object id, with the same treatment of failure.
     types: HashMap<u64, Option<u64>>,
+    /// A boxed primitive's `value` field, per object id, with the same treatment of failure.
+    ///
+    /// Filled by a **second** wave and not the first, because this read is not a first read: it exists only
+    /// for an object whose type says it is a `java.lang.Integer` and friends, so the type's reply has to be
+    /// in hand before it can even be planned. See [`ValueReads::committed_boxed`].
+    boxed: HashMap<u64, Option<Value>>,
 }
 
 impl ValueReads {
@@ -135,6 +141,66 @@ impl ValueReads {
             return prefetched.clone();
         }
         conn.get_string_value(id).await.ok()
+    }
+
+    /// Wave the `value` field of every committed value whose type turned out to be a boxed primitive.
+    ///
+    /// **A second wave, and the boundary between it and the first is the licence being refused** — the same
+    /// shape `project_query_rows` already has twice over and ADR-0038 spends a section on. A boxed
+    /// primitive's payload read is not a *first* read: whether to make it at all is decided by the answer to
+    /// the type read, and which field to ask for is decided by the type too. So it cannot join the first
+    /// wave, and collapsing the two would look like a further optimisation and be wrong.
+    ///
+    /// Given the type, though, the read is **unconditional**: `render_resolved_object` hands every
+    /// non-array object to `render_boxed_primitive`, which reads `value` for every name in
+    /// `BOXED_PRIMITIVES` and for no other. So this is as non-speculative as the first wave, one dependency
+    /// further along, and it costs exactly the packets the sequential path spends.
+    ///
+    /// `reads` pairs an object id with the field ids to read from it, which is
+    /// `read_object_values_independently`'s own shape. Resolving those ids is the caller's job because it is
+    /// per *type* rather than per object and is served from `TypeCache`: doing it here would mean either
+    /// duplicating the superclass walk or holding a reference to the renderer's field lookup, and neither
+    /// buys anything a wave of already-resolved ids does not.
+    pub async fn committed_boxed(&mut self, conn: &JdwpConnection, reads: &[(u64, Vec<u64>)]) {
+        if reads.is_empty() {
+            return;
+        }
+        let got = conn.read_object_values_independently(reads).await;
+        for ((id, _), outcome) in reads.iter().zip(got) {
+            // One field was asked for, so one value comes back; anything else is a reply that did not
+            // answer the request and is recorded as a failure rather than guessed at.
+            self.boxed.insert(*id, outcome.ok().and_then(|values| values.into_iter().next()));
+        }
+    }
+
+    /// The type this pass has **already read** for `id`, if it read one. Sends nothing, ever.
+    ///
+    /// This exists because [`reference_type`](Self::reference_type) does not: it falls through to a single
+    /// read on a miss, which is right for a renderer and wrong for a planner. A planner asks *what do I
+    /// already know* in order to decide what to read next, and if that question can turn into a packet then
+    /// planning a wave costs traffic the sequential path never spent.
+    ///
+    /// **That is not hypothetical — it is what the first version of `commit_boxed_values` did.** It asked
+    /// `reference_type` for every committed value, including the `String`s, whose first read was their
+    /// contents and whose type therefore was not in the map. Each one became an
+    /// `ObjectReference.ReferenceType` that nothing rendered: a `Reserva` row went from 6 commands to **7**
+    /// while its wire time did not move, and `a_committed_projection_costs_no_more_packets_per_row_than_
+    /// reading_one_at_a_time` is what noticed. A speculative read is cheap to introduce by accident and
+    /// invisible to a clock, which is the whole reason that test counts commands.
+    pub fn known_type(&self, id: u64) -> Option<u64> {
+        self.types.get(&id).copied().flatten()
+    }
+
+    /// A boxed primitive's `value` field. `None` is "not readable".
+    ///
+    /// `field_id` is only used on a miss. Passing it on a hit costs nothing — resolving it is a `TypeCache`
+    /// read, not a packet — and it keeps this accessor the same shape as the two above, which answer or read
+    /// without the caller having to know which happened.
+    pub async fn boxed_value(&self, conn: &mut JdwpConnection, id: u64, field_id: u64) -> Option<Value> {
+        if let Some(prefetched) = self.boxed.get(&id) {
+            return prefetched.clone();
+        }
+        conn.get_object_values(id, vec![field_id]).await.ok()?.into_iter().next()
     }
 
     /// An object's runtime type. `None` is "not readable" — a collected object, or an id this JVM has no
