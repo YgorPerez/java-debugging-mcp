@@ -34,6 +34,7 @@ mod handlers;
 mod protocol;
 mod session;
 mod tools;
+mod value_reads;
 
 use handlers::RequestHandler;
 use protocol::{

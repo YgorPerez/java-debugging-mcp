@@ -9,6 +9,7 @@ use crate::protocol::{
 };
 use crate::session::SessionManager;
 use crate::tools;
+use crate::value_reads::ValueReads;
 use serde_json::json;
 use std::fmt::Write as _;
 use tracing::{debug, info, warn};
@@ -18069,21 +18070,44 @@ async fn project_query_rows(
     // WAVE 2 — each row's field values, each with its own type's field ids.
     let values = conn.read_object_values_independently(&reads).await;
 
+    // WAVE 3 — the first read that rendering each of those values will make (PERF-2, #129).
+    //
+    // **Committed, exactly**: the list below is built the same way `render_query_row` builds its render
+    // loop — `take(shown)` over the values a row actually got — so every value handed to the wave is a
+    // value that will be rendered, and `first_read` waves only the read the serialised renderer would have
+    // issued unconditionally. That is what makes this cost no packet rather than merely few packets.
+    //
+    // **And nothing is invoked**, which is the licence's second precondition: every render below passes
+    // `thread_id: None`, which is what stops `render_value` reaching for `toString()`. So no debuggee code
+    // runs between this wave and the renders that read from it, and a prefetched value cannot be describing
+    // an object that has since been collected.
+    let mut committed: Vec<&jdwp_client::types::Value> = Vec::new();
+    for plan in &plans {
+        let Some((_, fields)) = plan.shape.as_ref() else { continue };
+        let shown = fields.len().min(QUERY_ROW_FIELD_CAP);
+        if let Some(Ok(got)) = plan.values_at.and_then(|i| values.get(i)) {
+            committed.extend(got.iter().take(shown));
+        }
+    }
+    let prefetched = ValueReads::committed(conn, &committed).await;
+
     let mut projected: Vec<String> = Vec::with_capacity(rows.len());
     for (at, row) in rows.iter().enumerate() {
         let Some(plan) = plans.iter().find(|p| p.at == at) else {
+            // A non-object row is rendered as itself and reads nothing, so it was never committed.
             projected.push(render_value(conn, row, None, max_len, ByteRender::default()).await);
             continue;
         };
         let read = plan.values_at.and_then(|i| values.get(i));
-        projected.push(render_query_row(conn, plan, read, max_len).await);
+        projected.push(render_query_row(conn, &prefetched, plan, read, max_len).await);
     }
     projected
 }
 
-/// Render one object row from what the two waves returned, including both ways they can fail.
+/// Render one object row from what the waves returned, including both ways they can fail.
 async fn render_query_row(
     conn: &mut jdwp_client::JdwpConnection,
+    prefetched: &ValueReads,
     plan: &ProjectedRow,
     read: Option<&jdwp_client::JdwpResult<Vec<jdwp_client::types::Value>>>,
     max_len: usize,
@@ -18104,9 +18128,12 @@ async fn render_query_row(
         if i > 0 {
             out.push(',');
         }
-        // `None` for the thread is the load-bearing argument: it is what stops `render_value` reaching for
-        // `toString()`, which is where a lazy association would have been fetched.
-        let rendered = render_value(conn, v, None, max_len, ByteRender::default()).await;
+        // `None` for the thread is the load-bearing argument twice over: it is what stops `render_value`
+        // reaching for `toString()`, which is where a lazy association would have been fetched — and it is
+        // the second precondition on the prefetch this renders from, since an invocation here would put
+        // debuggee code between `project_query_rows`' wave and this read of it.
+        let rendered =
+            render_value_committed(conn, prefetched, v, None, max_len, ByteRender::default()).await;
         let _ = write!(out, " {}={rendered}", f.name);
     }
     if fields.len() > shown {
@@ -19619,8 +19646,30 @@ async fn render_one(
 /// Render a value for display. Strings show contents; a `byte[]`/`char[]` shows decoded text (EVAL-7);
 /// other arrays show their elements; objects show their type name (and, when `thread_id` is Some, a
 /// best-effort `toString()`).
+///
+/// Reads one value's reads one at a time. A caller with many values it has **committed** to rendering wants
+/// [`render_value_committed`] instead, which takes a prefetched [`ValueReads`] and can serve those reads from
+/// one wave (PERF-2, #129).
 async fn render_value(
     conn: &mut jdwp_client::JdwpConnection,
+    value: &jdwp_client::types::Value,
+    thread_id: Option<u64>,
+    max_len: usize,
+    how: ByteRender,
+) -> String {
+    render_value_committed(conn, &ValueReads::none(), value, thread_id, max_len, how).await
+}
+
+/// [`render_value`] for a caller holding reads it prefetched for values it has committed to rendering.
+///
+/// **The name is the licence.** `grep -rn "_committed" mcp-server/src/` lists every place this server claims
+/// the two preconditions in `value_reads`' header — that every value passed *will* be rendered, and that no
+/// `ObjectReference.InvokeMethod` sits between the wave and the render. Neither is checkable here, and a
+/// prefetch is the one shape of PERF-2 that can add packets, so the grant is enumerable by design in the way
+/// `read_*_independently` is under it.
+async fn render_value_committed(
+    conn: &mut jdwp_client::JdwpConnection,
+    reads: &ValueReads,
     value: &jdwp_client::types::Value,
     thread_id: Option<u64>,
     max_len: usize,
@@ -19629,7 +19678,7 @@ async fn render_value(
     use jdwp_client::types::ValueData;
     match &value.data {
         ValueData::Object(0) => "null".to_string(),
-        ValueData::Object(id) => render_object(conn, *id, value.tag, thread_id, max_len, how).await,
+        ValueData::Object(id) => render_object(conn, reads, *id, value.tag, thread_id, max_len, how).await,
         // `ValueData::format_primitive` declines only a reference, and both reference shapes are matched
         // above — so the fallback is unreachable rather than a rendering anyone should see.
         other => other.format_primitive().unwrap_or_else(|| "(?)".to_string()),
@@ -20206,13 +20255,23 @@ async fn type_name_of(conn: &mut jdwp_client::JdwpConnection, id: u64) -> String
 }
 
 /// Render an object value: strings show contents; a `byte[]`/`char[]` shows decoded text; other arrays
-/// show their elements; other objects show their type name (and, when `thread_id` is Some, a
-/// best-effort `toString()`).
+/// show their elements; other objects show their type name (and, when `thread_id` is Some, a best-effort
+/// `toString()`).
 ///
-/// This is the half that **resolves** the object's type; [`render_resolved_object`] is the half that
-/// needs it. A caller that has the type already calls that one directly.
+/// This is the half that **resolves** the object's type; [`render_resolved_object`] is the half that needs
+/// it. A caller holding the type already calls that one directly.
+///
+/// `reads` is where the two reads below come from — prefetched by a caller that committed to rendering
+/// these values ([`render_value_committed`]), or `ValueReads::none()` for the one-value-at-a-time path.
+///
+/// **The two reads below are the two this function issues unconditionally**, which is the whole reason a wave
+/// of them costs nothing extra: `ValueReads::first_read` is a description of these first two statements, and
+/// the pair has to stay in step. A string's contents are read whatever happens; anything else has its type
+/// read whatever happens.
+#[allow(clippy::too_many_arguments)] // one render step, and it needs its caller's context
 async fn render_object(
     conn: &mut jdwp_client::JdwpConnection,
+    reads: &ValueReads,
     id: u64,
     tag: u8,
     thread_id: Option<u64>,
@@ -20220,17 +20279,20 @@ async fn render_object(
     how: ByteRender,
 ) -> String {
     if tag == 115 {
-        if let Ok(s) = conn.get_string_value(id).await {
+        if let Some(s) = reads.string_contents(conn, id).await {
             return format!("\"{}\"", truncate(&s, max_len));
         }
     }
-    let Ok(type_id) = conn.get_object_reference_type(id).await else {
+    let Some(type_id) = reads.reference_type(conn, id).await else {
         return format!("(object) @0x{id:x}");
     };
     let sig = conn.get_signature(type_id).await.unwrap_or_default();
     let name = decode_signature(&sig);
     if name == "java.lang.String" {
-        if let Ok(s) = conn.get_string_value(id).await {
+        // Not planned by `first_read` and not prefetchable: a value tagged as an ordinary object that turns
+        // out to be a `String` is only discovered *after* the type read, so this one falls through to a
+        // single read exactly as it always did.
+        if let Some(s) = reads.string_contents(conn, id).await {
             return format!("\"{}\"", truncate(&s, max_len));
         }
     }

@@ -15312,6 +15312,257 @@ fn a_heterogeneous_result_reads_each_rows_fields_off_its_own_type() {
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_wide_result_set_costs_a_bounded_number_of_round_trips_per_row() {
+    let Some(jdk) = jdk_or_skip("a_wide_result_set_costs_a_bounded_number_of_round_trips_per_row") else {
+        return;
+    };
+    let (near_per_row, far_per_row, _, rtt_ms) = marginal_wire_cost_per_row(&jdk, "Bare.all");
+    let wire_per_row = far_per_row - near_per_row;
+    // Printed whether it passes or not, on the same principle as the runner's `JDK in use:` line: the next
+    // person to touch this wants the reading, and instrumenting a passing test to get it is how a
+    // measurement gets estimated instead.
+    eprintln!(
+        "PERF-1: a `Bare` row costs {wire_per_row:.2}ms of wire time at a {rtt_ms}ms round trip \
+         ({near_per_row:.2}ms/row straight through, {far_per_row:.2}ms/row away). Serialised: {:.0}ms.",
+        rtt_ms * 2.0
+    );
+    assert!(
+        wire_per_row < rtt_ms,
+        "each extra row cost {wire_per_row:.2}ms of WIRE time at a {rtt_ms}ms round trip. A row is two \
+         reads — its type and its fields — so reading them one at a time and awaiting each costs {:.0}ms \
+         per row, and reading each as an independent read costs about {:.1}ms. This landed at or above one \
+         whole round trip per row, which is the serialised shape (PERF-1, #100).\n  per row straight \
+         through: {near_per_row:.2}ms\n  per row {rtt_ms}ms away: {far_per_row:.2}ms",
+        rtt_ms * 2.0,
+        rtt_ms * 2.0 / 16.0
+    );
+}
+
+/// PERF-2 (#129): a `Reserva` row's `String` and association reads cost about a round trip **between them**,
+/// not one each.
+///
+/// The companion to `a_wide_result_set_costs_a_bounded_number_of_round_trips_per_row`, and the other half of
+/// why `JpaProbe` carries two entities. `Bare` is a `long` and a `double`, so a row costs exactly its own two
+/// reads and it measures the **primitive**. `Reserva` is a boxed `Long`, two `String`s, a `double` and an
+/// association, so a row costs what the **renderer** spends on it — which is what this issue is about, and
+/// which is why ADR-0038 could only report it as a follow-up. Choosing the wrong one of the two is how a
+/// PERF-1 measurement read 63ms/row and looked like a failure for an hour.
+///
+/// Reading a row used to be eight round trips: two for its type and its fields, which PERF-1 waved, and six
+/// for `render_value` reading each `String` with a `StringReference.Value` and each object with an
+/// `ObjectReference.ReferenceType`, per field, per row, awaited each time. The projection now commits to
+/// every value it is about to render and waves their first reads, so those become one wave per kind across
+/// the whole result set.
+///
+/// Measured through `LatencyRelay` at a fixed 8ms round trip, dial-don't-restart, arms alternated, each
+/// scored on its fastest sample (TEST-13, #38) — marginal wire cost per row:
+///
+/// ```text
+///   before PERF-1                                       79.19 ms/row
+///   after PERF-1 (two of eight round trips waved)        63.18
+///   after #129's deduplication half                      46.68
+///   after #129's prefetch (this)                         13.47
+/// ```
+///
+/// **What the remaining 13.47ms is, from the census rather than from arithmetic.** It is about 1.7 round
+/// trips, and its companion test names them: `ObjectReference.GetValues` costs **2 per row**, one for the
+/// row's own fields (waved) and one inside `render_boxed_primitive` reading the `value` field of the boxed
+/// `Long id` — serialised, one per row, and the only per-row read left on this path. Prefetching it is a
+/// **third** read kind with a dependency the other two do not have: the type has to answer before the field
+/// id can be resolved and the field id before the value can be read, which is `CONTEXT.md`'s **independent
+/// reads** licence needing to be established again rather than extended. So it is a follow-up, deliberately,
+/// on the same grounds ADR-0038 left this whole path to #129.
+///
+/// **The threshold is three round trips per row**, which is 1.8x above the 13.47 reading and 1.9x below the
+/// 46.68 the unconverted path spends on the same tree. Tighter above than the `Bare` assertion's margin, and
+/// for a reason worth knowing: the two hypotheses here are closer together, because one serialised read per
+/// row legitimately remains. If this fails just above the threshold, read the companion census first — a
+/// packet count that did not move means this is the clock and not the code.
+///
+/// **Not a threshold between the before and after figures.** ADR-0038 says why it refused to put one there:
+/// a number between 63 and 79 has no meaning of its own and moves the moment anything else about rendering a
+/// row changes. The figures belong in the commit body and in the ADR; the assertion belongs on the shape.
+///
+/// The relay charges coalesced traffic once, so a wave that leaves in one `write` is charged one delay rather
+/// than sixteen — which flatters exactly the arm under test. Six serialised reads per row could not come in
+/// under three round trips per row however generously they were charged, which is what makes the threshold
+/// honest about the side it favours.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_realistic_rows_string_and_association_reads_share_a_round_trip() {
+    /// Round trips a row may cost. See the doc above for both margins.
+    const CEILING_IN_ROUND_TRIPS: f64 = 3.0;
+
+    let Some(jdk) = jdk_or_skip("a_realistic_rows_string_and_association_reads_share_a_round_trip") else {
+        return;
+    };
+    let (near_per_row, far_per_row, _, rtt_ms) =
+        marginal_wire_cost_per_row(&jdk, "Reserva.findByCodigoAndStatus");
+    let wire_per_row = far_per_row - near_per_row;
+    eprintln!(
+        "PERF-2: a `Reserva` row costs {wire_per_row:.2}ms of wire time at a {rtt_ms}ms round trip \
+         ({near_per_row:.2}ms/row straight through, {far_per_row:.2}ms/row away). Measured at 13.47ms when \
+         this landed, 46.68ms reading one value at a time, 79.19ms before PERF-1."
+    );
+    assert!(
+        wire_per_row < rtt_ms * CEILING_IN_ROUND_TRIPS,
+        "each extra `Reserva` row cost {wire_per_row:.2}ms of WIRE time at a {rtt_ms}ms round trip, which is \
+         {:.1} round trips against {CEILING_IN_ROUND_TRIPS:.0} permitted. A row's two `String`s and its two \
+         object fields are four reads: read one at a time they cost about {:.0}ms per row, which is what \
+         this measured before the projection committed its values to a wave. One serialised read per row is \
+         expected and accounted for — `render_boxed_primitive` reading the boxed `Long`. Several are not: \
+         either `project_query_rows` has stopped committing, or `render_value_committed` has stopped reading \
+         from what it committed (PERF-2, #129).\n  per row straight through: {near_per_row:.2}ms\n  per row \
+         {rtt_ms}ms away: {far_per_row:.2}ms\n  Check the packet census companion first: if it still reads 6 \
+         commands per row, this is the clock.",
+        wire_per_row / rtt_ms,
+        rtt_ms * 6.0
+    );
+}
+
+/// PERF-2 (#129), the deterministic half: committing a projection's values to a wave does not cost a packet
+/// per row, and here it **saves** one.
+///
+/// The companion to `a_realistic_rows_string_and_association_reads_share_a_round_trip`, which times the wire.
+/// A prefetch is the one shape of this work that can *add* packets, so the packet count is the risk and a
+/// wall clock is the wrong instrument for it — this one counts commands off a recorded session, which is
+/// deterministic and load-independent as the house metric requires.
+///
+/// **Marginal, not total.** The same query at two row counts, differenced and divided by the extra rows, so
+/// every fixed cost — the handshake, the query's own invocations, each type's `TypeCache` fill — cancels and
+/// what is left is what a row costs. That is the same arithmetic the timing companion uses, for the same
+/// reason.
+///
+/// Measured on `Reserva.findByCodigoAndStatus`, whose row is a boxed `Long`, two `String`s, a `double` and an
+/// association:
+///
+/// ```text
+///                                   before   after
+///   ObjectReference.ReferenceType        3       3     row's own type, the Long's, the association's
+///   ObjectReference.GetValues            2       2     row's fields, then the Long's `value`
+///   StringReference.Value                2       1     codigo per row; status is interned and shared
+///   per row                              7       6
+/// ```
+///
+/// **The saving is deduplication, not waving**, and it is the same finding ADR-0038 reports from the stack
+/// walk: gathering a set of reads into one list is what makes a duplicate visible. `status` holds the same
+/// interned `String` in every row, so fifty rows name one object — the serialised path read it fifty times
+/// because there is nothing between it and the wire, and the wave reads it once. Waving changes *when*
+/// packets are sent and never how many; this row happens to have both savings in it.
+///
+/// The bound is 8 per row, above the 7 the unconverted path spent and well below the 12 that a prefetch
+/// ignoring the projection's `take(shown)` cap would reach. **A prefetch that speculates fails here, not in
+/// the timing test**, which would happily report a fast reply that cost more traffic than it needed to.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_committed_projection_costs_no_more_packets_per_row_than_reading_one_at_a_time() {
+    /// Rows in the narrow arm and the wide arm. The gap is what every count is divided by.
+    const NARROW: usize = 2;
+    const WIDE: usize = 50;
+    /// Commands a row may cost. Seven is what the unconverted path spent; six is the reading.
+    const PER_ROW_CEILING: i64 = 8;
+
+    let Some(jdk) =
+        jdk_or_skip("a_committed_projection_costs_no_more_packets_per_row_than_reading_one_at_a_time")
+    else {
+        return;
+    };
+
+    let census = |rows: usize| -> std::collections::HashMap<(u8, u8), i64> {
+        let probe = Probe::launch_in_package(&jdk, "JpaProbe", "jakarta.persistence.JpaProbe")
+            .expect("launch JpaProbe");
+        let recorder = common::cassette::CassetteRecorder::start(probe.port).expect("start recorder");
+        let mut server = Server::start().expect("start server");
+        server.attach(recorder.port);
+        let armed = server.call(
+            "debug.set_line_stop",
+            serde_json::json!({"class_pattern": "jakarta.persistence.JpaProbe", "method": "workWithEm"}),
+        );
+        assert!(!armed.contains("Refused"), "the stop point was refused: {armed}");
+        server
+            .wait_for_event("workWithEm", EVENT_TIMEOUT)
+            .unwrap_or_else(|| panic!("never suspended in workWithEm; probe output: {:?}", probe.output()));
+        let reply = server.call(
+            "debug.run_named_query",
+            serde_json::json!({"query_name": "Reserva.findByCodigoAndStatus", "max_rows": rows}),
+        );
+        assert!(
+            reply.contains("codigo=") && reply.contains("itens="),
+            "the projection has to render the String and the association for their reads to be counted:\n{}",
+            head_of(&reply)
+        );
+        // The recorder writes its tape on hang-up, and a tape missing its last exchanges does not fail here.
+        server.call("debug.disconnect", serde_json::json!({}));
+        let tape = recorder.finish("a Reserva projection");
+        let mut hist: std::collections::HashMap<(u8, u8), i64> = std::collections::HashMap::new();
+        for e in tape.exchanges() {
+            *hist.entry((e.set, e.command)).or_default() += 1;
+        }
+        hist
+    };
+
+    let narrow = census(NARROW);
+    let wide = census(WIDE);
+    let extra = i64::try_from(WIDE - NARROW).unwrap_or(1);
+
+    let mut kinds: Vec<(u8, u8)> = wide.keys().copied().collect();
+    kinds.sort_unstable();
+    let mut per_row = 0_i64;
+    let mut breakdown = String::new();
+    for kind in kinds {
+        let delta = wide.get(&kind).copied().unwrap_or(0) - narrow.get(&kind).copied().unwrap_or(0);
+        if delta == 0 {
+            continue;
+        }
+        per_row += delta / extra;
+        let _ = std::fmt::Write::write_fmt(
+            &mut breakdown,
+            format_args!(
+                "\n  {:<40} {:>3} per row",
+                common::cassette::command_name(kind.0, kind.1),
+                delta / extra
+            ),
+        );
+    }
+
+    // Printed on a pass as well as a failure, on the same principle as the runner's `JDK in use:` line.
+    eprintln!("PERF-2: a `Reserva` row costs {per_row} command(s).{breakdown}");
+    // The control first: a marginal count of zero would mean the two arms read the same traffic, which
+    // means the row count did nothing and the ceiling below would pass on a measurement of nothing.
+    assert!(
+        per_row >= 3,
+        "the wide arm sent only {per_row} more command(s) per row than the narrow one, so `max_rows` is not \
+         changing what gets read and this test is measuring nothing.{breakdown}"
+    );
+    assert!(
+        per_row <= PER_ROW_CEILING,
+        "a `Reserva` row cost {per_row} commands, against {PER_ROW_CEILING} permitted and 6 measured. \
+         Reading one value at a time cost 7. A number above that is a prefetch reading values the renderer \
+         does not render — most likely one that ignores the projection's own `take(shown)` field cap, which \
+         is what keeps the commitment exact (PERF-2, #129).{breakdown}"
+    );
+}
+
+/// One reading of the marginal wire cost of a `debug.run_named_query` row: the same query at two row counts,
+/// differenced and divided, then differenced again across two round trip times.
+///
+/// **Extracted so two queries can share one instrument** (PERF-2, #129). `Bare.all` measures the reads under
+/// test and `Reserva.findByCodigoAndStatus` measures the renderer, and the whole point of having both is that
+/// they are the *same* measurement of two different row shapes — a second copy of ninety lines of timing code
+/// would have diverged at the first fix to either.
+///
+/// Returns `(near_per_row, far_per_row, fixed_added, rtt_ms)`: straight through, at the round trip, how much
+/// turning the wire up moved the query's fixed cost, and the round trip it was turned up to. The caller
+/// asserts; this only measures.
+///
+/// The method is TEST-13's ([#38](https://github.com/YgorPerez/java-debugging-mcp/issues/38)): one relay, one
+/// attach, the round trip dialled up and down under a live connection, arms alternated, each scored on its
+/// fastest sample. Two attaches put a JVM handshake and several seconds between the readings, and on a box
+/// running the rest of this suite that difference stopped meaning the wire.
+///
+/// The relay charges coalesced traffic once, so a wave that leaves in one `write` is charged one delay rather
+/// than sixteen — which flatters exactly the arm under test. Every threshold set on a number from here has to
+/// be one a serialised path could not reach *even with the flattery*.
+fn marginal_wire_cost_per_row(jdk: &Jdk, query_name: &str) -> (f64, f64, f64, f64) {
     /// Samples per arm. Three is enough for one spike to be outvoted, as in
     /// `latency_added_to_the_wire_shows_up_as_held_time_per_packet`.
     const ROUNDS: usize = 3;
@@ -15321,11 +15572,8 @@ fn a_wide_result_set_costs_a_bounded_number_of_round_trips_per_row() {
     /// exercised rather than a single wave that happens to fit.
     const WIDE: usize = 50;
 
-    let Some(jdk) = jdk_or_skip("a_wide_result_set_costs_a_bounded_number_of_round_trips_per_row") else {
-        return;
-    };
     let probe =
-        Probe::launch_in_package(&jdk, "JpaProbe", "jakarta.persistence.JpaProbe").expect("launch JpaProbe");
+        Probe::launch_in_package(jdk, "JpaProbe", "jakarta.persistence.JpaProbe").expect("launch JpaProbe");
 
     let rtt = std::time::Duration::from_millis(8);
     // Attached through the relay rather than directly, so `probe` is never handed the server — which is
@@ -15348,7 +15596,7 @@ fn a_wide_result_set_costs_a_bounded_number_of_round_trips_per_row() {
         relay.set_rtt(delay);
         let started = std::time::Instant::now();
         let reply = server
-            .call("debug.run_named_query", serde_json::json!({"query_name": "Bare.all", "max_rows": rows}));
+            .call("debug.run_named_query", serde_json::json!({"query_name": query_name, "max_rows": rows}));
         let elapsed = started.elapsed().as_secs_f64() * 1000.0;
         assert!(
             reply.contains("row(s)") && !reply.contains("Refused"),
@@ -15388,38 +15636,18 @@ fn a_wide_result_set_costs_a_bounded_number_of_round_trips_per_row() {
         far.iter().copied().min_by(|a, b| a.0.total_cmp(&b.0)).expect("an arm with no samples");
     let rtt_ms = rtt.as_secs_f64() * 1000.0;
 
-    // The guard that has to come first: if the relay is not actually delaying anything, every number below
-    // is a measurement of nothing that will happily pass. The NARROW query pays the fixed cost — dozens of
-    // round trips — so turning the wire up must move it by many multiples of one RTT.
+    // The guard that has to come first: if the relay is not actually delaying anything, every number the
+    // caller computes is a measurement of nothing that will happily pass. The NARROW query pays the fixed
+    // cost — dozens of round trips — so turning the wire up must move it by many multiples of one RTT.
     assert!(
         fixed_added > rtt_ms * 3.0,
-        "turning the round trip up to {rtt_ms}ms only added {fixed_added:.1}ms to the fixed cost of the \
-         query, which is a few dozen round trips. The relay is not delaying the traffic, so the per-row \
-         figures below measure nothing.\n  near: {near:?}\n  far: {far:?}"
-    );
-
-    let wire_per_row = far_per_row - near_per_row;
-    // Printed whether it passes or not, on the same principle as the runner's `JDK in use:` line: the next
-    // person to touch this wants the reading, and instrumenting a passing test to get it is how a
-    // measurement gets estimated instead.
-    eprintln!(
-        "PERF-1: a row costs {wire_per_row:.2}ms of wire time at a {rtt_ms}ms round trip \
-         ({near_per_row:.2}ms/row straight through, {far_per_row:.2}ms/row away). Serialised: {:.0}ms.",
-        rtt_ms * 2.0
-    );
-    assert!(
-        wire_per_row < rtt_ms,
-        "each extra row cost {wire_per_row:.2}ms of WIRE time at a {rtt_ms}ms round trip. A row is two \
-         reads — its type and its fields — so reading them one at a time and awaiting each costs {:.0}ms \
-         per row, and reading each as an independent read costs about {:.1}ms. This landed at or above one \
-         whole round trip per row, which is the serialised shape (PERF-1, #100).\n  per row straight \
-         through: {near_per_row:.2}ms\n  per row {rtt_ms}ms away: {far_per_row:.2}ms\n  near: {near:?}\n  \
-         far: {far:?}",
-        rtt_ms * 2.0,
-        rtt_ms * 2.0 / 16.0
+        "turning the round trip up to {rtt_ms}ms only added {fixed_added:.1}ms to the fixed cost of \
+         `{query_name}`, which is a few dozen round trips. The relay is not delaying the traffic, so the \
+         per-row figures measure nothing.\n  near: {near:?}\n  far: {far:?}"
     );
 
     server.panic_reset();
+    (near_per_row, far_per_row, fixed_added, rtt_ms)
 }
 
 /// The `@0x…` handle of the first projected row in a `debug.run_named_query` reply.

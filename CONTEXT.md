@@ -346,6 +346,38 @@ alone rather than converted.
 _Avoid_: prefetch (describes *when* a read happens, not whether it may be wasted — a prefetch for something
 already known to be needed is not speculative, and most of the ones here are not)
 
+**Committed values**:
+The values a caller has established *will* be rendered, before any of their reads are issued.
+
+**This is what a prefetch needs in order not to be a speculative read**, and it is the reason the entry above
+can reject the word *prefetch* rather than the practice. A read is speculative because of what the *caller*
+does not yet know, so the fix is on the caller's side: establish the set first, then read for it. PERF-2
+([#129](https://github.com/YgorPerez/java-debugging-mcp/issues/129)) grants it at one call site — the row
+projection has every row's field values in hand, applies its own field cap, and only then waves the reads
+those exact values need.
+
+**Committing bounds the set; it does not choose the reads.** What may be waved for a committed value is its
+*first* read — the one the renderer issues before it has decided anything, unconditionally. A second read that
+the first read's answer decides (a boxed primitive's `value`, once its type says it is one) is a different
+licence and has to be established separately, because between the two there is a reply the caller has to see.
+
+**A commitment is only as good as its window.** Committing says the value will be rendered; it does not say
+the object will still be there when it is. An `InvokeMethod` between the wave and the render runs arbitrary
+debuggee code, so a value read before it and printed after it can describe an object that has since been
+collected — which is why the grant also requires that nothing be invoked in between, and why every converted
+path so far renders with no thread to invoke on.
+
+Distinguish from **a store committing**, in the `independent reads` entry above: there it is the debuggee's
+write landing in memory, and the subject is the JVM. Here a *caller* commits **to** rendering something, and
+the subject is this server. Same word, different sense, and worth stating because both senses are about
+timing.
+
+_Avoid_: reserved (taken by the other resolution of the budget question — *reserving* budget breadth-first is
+the caller-visible alternative to committing, so the two words name opposite answers); planned (says a
+decision was made and nothing about it being binding, which is the entire content of this term); pinned
+(means keeping an object alive against collection, which is `DisableCollection` and is exactly what ADR-0022
+refuses to do)
+
 ### Stop points
 
 **Stop point**:

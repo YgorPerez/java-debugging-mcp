@@ -379,6 +379,34 @@ not.
   round trips are `render_value` reading a `String` or an association, per field, per row. Converting those
   means giving `render_value` a wave-aware form, which is a change to a function every tool shares and
   therefore its own piece of work rather than a widening of this one.
+
+  **Done, in PERF-2 (#129), and the wave-aware form turned out not to be a change to `render_value` at all.**
+  Its reads are per value and it is *called* per value, so the wave sits above it: a caller that has
+  **committed** to rendering `n` values waves their first reads and hands the results down, and `render_value`
+  asks that instead of asking the connection. `CONTEXT.md`'s **committed values** is the new term and it is
+  defined against **speculative read** rather than beside it — committing is what makes a prefetch
+  non-speculative, which is why this needed a term and not just a mechanism.
+
+  The measured arc for a `Reserva` row, one instrument throughout — the same marginal wire cost this ADR
+  reports, now shared by two tests instead of copied into a second:
+
+  ```text
+    before PERF-1                                    79.19 ms/row
+    after PERF-1 (this ADR)                          63.18
+    after #129's deduplication half                  46.68
+    after #129's prefetch                            13.47
+  ```
+
+  **The packet count fell rather than held**, which this ADR's invariant permits and predicts: `Reserva.status`
+  holds the same interned `String` in every row, so fifty rows name one object, and gathering the reads into
+  one set is what made that visible — the same finding as the stack walk above, from the same mechanism. A row
+  costs 6 commands where reading one value at a time cost 7.
+
+  **What is left is one serialised read per row and it is a third licence, not an unconverted fourth call
+  site.** `render_boxed_primitive` reads the `value` field of the boxed `Long id`, and that read is decided by
+  the *answer* to the type read: the type has to come back before the field id can be resolved and the field
+  id before the value can be read. That is this ADR's own refusal — "a row's field ids come from its type, so
+  its values read cannot be issued until its type read has answered" — one level further down.
 - No tool description changed, and no reply changed, so `docs/toolkit-contract.md` needs nothing beyond the
   release note. `Bare` and `Reserva.mixedTypes` are additions to a test probe, not to the tool surface.
 
