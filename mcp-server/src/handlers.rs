@@ -4681,7 +4681,7 @@ fn refuse_invoking_expr_on_the_unowned_kind(
         // expressions allowed, "one of them invokes" is not an actionable sentence.
         let what = if trace_exprs.len() == 1 { "trace_expr".to_string() } else { format!("trace_expr[{i}]") };
         return Err(format!(
-            "🛑 Refused: the {what} `{e}` CALLS A METHOD, and the kind blocked is the ONE of the four where              the hit thread does NOT own the monitor in its own snapshot — it is queued at a monitorenter,              owning nothing. An invocation needing that monitor cannot complete, and JDWP HAS NO WAY TO              CANCEL ONE: the 2000ms budget frees the debugger, not the debuggee.\n   Measured on Temurin              11.0.32 and 21.0.12 — the call finishes when the lock is finally released, and the JVM              re-suspends the thread at that moment, 1.2s after this server had already resumed it and moved              on. The thread then stays suspended for ever: nothing here clears it, because the watchdog              resumes a suspended VM and the VM is running.\n   Read a FIELD instead (`{e}` without the call              — a field read needs no monitor), or arm acquired, wait or waited: on all three the thread owns              the monitor, so an invocation re-enters it and returns (measured, ADR-0036)."
+ "🛑 Refused: the {what} `{e}` CALLS A METHOD, and the kind blocked is the ONE of the four where the hit thread does NOT own the monitor in its own snapshot — it is queued at a monitorenter, owning nothing. An invocation needing that monitor cannot complete, and JDWP HAS NO WAY TO CANCEL ONE: the 2000ms budget frees the debugger, not the debuggee.\n   Measured on Temurin 11.0.32 and 21.0.12 — the call finishes when the lock is finally released, and the JVM re-suspends the thread at that moment, 1.2s after this server had already resumed it and moved on. The thread then stays suspended for ever: nothing here clears it, because the watchdog resumes a suspended VM and the VM is running.\n   Read a FIELD instead — `lock.name` and `this.pedido.id` need no monitor and are accepted here — or arm acquired, wait or waited: on all three the thread owns the monitor, so an invocation re-enters it and returns (measured, ADR-0036)."
         ));
     }
     Ok(())
@@ -13514,7 +13514,7 @@ async fn defer_breakpoint(
     // has none. A handle that parses here is therefore pointing at something else.
     if spec.instance_filter.is_some() {
         return Err(format!(
-            "instance_id cannot be used on a stop point for '{}', which is not loaded yet. An              InstanceOnly filter matches the hit's `this`, so the object would have to be an instance of              that class — and a class the JVM has not loaded has none, so the handle you passed belongs              to something else. Arm the stop point without it, then re-arm with instance_id once the              class has loaded and debug.list_instances can give you a handle that means what you want.",
+ "instance_id cannot be used on a stop point for '{}', which is not loaded yet. An InstanceOnly filter matches the hit's `this`, so the object would have to be an instance of that class — and a class the JVM has not loaded has none, so the handle you passed belongs to something else. Arm the stop point without it, then re-arm with instance_id once the class has loaded and debug.list_instances can give you a handle that means what you want.",
             spec.class_pattern,
         ));
     }
@@ -19010,7 +19010,7 @@ async fn render_object(
             // caller had no way to know the VM had just been frozen for the whole budget (EVAL-5).
             ToStringOutcome::TimedOut(ms) => {
                 return format!(
-                    "{name} @0x{id:x} ⚠️ toString() did not return within {ms}ms — value not rendered.                      JDWP cannot cancel an invocation, so that thread is STILL executing it and its frames                      are unreadable until it finishes or you debug.continue. Use expand_objects:true                      instead, which reads fields and invokes nothing."
+ "{name} @0x{id:x} ⚠️ toString() did not return within {ms}ms — value not rendered. JDWP cannot cancel an invocation, so that thread is STILL executing it and its frames are unreadable until it finishes or you debug.continue. Use expand_objects:true instead, which reads fields and invokes nothing."
                 );
             }
             ToStringOutcome::Unavailable => {}
@@ -23081,6 +23081,102 @@ mod tests {
 
     // SAFE-6: a read-only refusal from the wire is turned into an actionable explanation; anything
     // else passes through untouched.
+    /// No caller-facing message carries a run of spaces from its own source indentation.
+    ///
+    /// The same defect DOC-7 (#108) found in tool descriptions, one level over and invisible to that
+    /// guard: `no_tool_description_carries_the_marks_of_a_bad_merge` scans `tool.description` and nothing
+    /// else, so the refusals and warnings built with `format!` here — which are just as caller-facing —
+    /// had no check at all. Three had already shipped with the defect when this was written, from three
+    /// different commits, which is what makes it a class rather than a typo.
+    ///
+    /// The mechanism is always the same. A long message is written as a multi-line string literal, the
+    /// `\` continuation that should swallow the newline *and* the following indentation goes missing on
+    /// one line, and ~14 spaces are baked into the middle of a sentence. It compiles, it reads correctly
+    /// in the source, and the caller gets `…the kind blocked is the ONE of the four where              the
+    /// hit thread…`. Nobody reads a 500-character literal in a diff closely enough to see it.
+    ///
+    /// Scanned against this file's own source rather than against rendered output, because these strings
+    /// are reached through dozens of code paths and most need a live JVM to produce. A run following a
+    /// `\n` is the deliberate reply indent every multi-line reply here uses and is skipped.
+    #[test]
+    fn no_caller_facing_message_has_source_indentation_baked_into_it() {
+        let src = include_str!("handlers.rs");
+        let mut complaints: Vec<String> = Vec::new();
+
+        for (n, line) in src.lines().enumerate() {
+            // String literals only. A `//` comment or a `///` doc line is prose for a reader of the
+            // source, where an aligned run is ordinary formatting rather than a defect.
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let mut in_str = false;
+            let mut escaped = false;
+            let mut run = 0usize;
+            let mut after_newline_escape = false;
+            let mut prev_nonspace: Option<char> = None;
+            for (i, c) in line.char_indices() {
+                if escaped {
+                    // `\n` opens a deliberate indent; any other escape does not.
+                    after_newline_escape = c == 'n';
+                    escaped = false;
+                    run = 0;
+                    continue;
+                }
+                match c {
+                    '\\' if in_str => escaped = true,
+                    '"' => {
+                        in_str = !in_str;
+                        run = 0;
+                        // Entering a literal is a line start for indentation purposes: `"   Mode: {}"`
+                        // and `indent_lines(&tail, "     ")` both supply the reply indent at the front
+                        // of the string rather than after a `\n`, and both are deliberate.
+                        after_newline_escape = true;
+                    }
+                    ' ' if in_str => {
+                        run += 1;
+                        // A run straight after a `{…}` placeholder is a deliberate separator —
+                        // `"{pattern}   [{}] — …"` lines a reply's columns up. The defect this looks for
+                        // is always between two words of prose, so it never follows one.
+                        if run >= 3 && !after_newline_escape && prev_nonspace != Some('}') {
+                            let from = i.saturating_sub(45);
+                            let to = (i + 25).min(line.len());
+                            complaints.push(format!(
+                                "line {}: …{}…",
+                                n + 1,
+                                &line[char_boundary(line, from)..char_boundary(line, to)]
+                            ));
+                            // One complaint per run, and per line is enough to find it.
+                            break;
+                        }
+                    }
+                    _ if in_str => {
+                        run = 0;
+                        after_newline_escape = false;
+                        prev_nonspace = Some(c);
+                    }
+                    _ => run = 0,
+                }
+            }
+        }
+
+        assert!(
+            complaints.is_empty(),
+            "a caller-facing message has its own source indentation inside it — a `\\` line continuation \
+             went missing, and the reader gets a sentence with a 14-space hole in it (DOC-7's defect, \
+             outside the tool descriptions that guard covers):\n  {}",
+            complaints.join("\n  ")
+        );
+    }
+
+    /// `&str` slicing panics on a non-char-boundary index, and these messages are full of em dashes.
+    fn char_boundary(s: &str, mut at: usize) -> usize {
+        while at > 0 && !s.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
     #[test]
     fn readonly_errors_are_explained_and_others_are_not() {
         let explained = explain_readonly(
