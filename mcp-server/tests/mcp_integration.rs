@@ -3572,8 +3572,20 @@ fn events_are_buffered_so_a_second_hit_doesnt_erase_the_first() {
     // one, and a *count* is not a diagnosis — three events existed and nothing said what the third was.
     // The whole buffer is read here (no `drain`, so it changes nothing) purely so the failure names it.
     let buffered = server.call("debug.get_last_event", serde_json::json!({"limit": 10}));
+    // And a census by kind, because the buffer alone still leaves the reader counting. Which KIND doubled
+    // is the issue's first acceptance criterion, and the two candidates need opposite responses: a second
+    // `breakpoint` means the stop point at BP2 — never cleared before the step, on a line inside a
+    // 100000-iteration loop — fired twice, so the test's staging is what is wrong; a second `step` means
+    // one `debug.step_over` produced two events, which would be the buffer's or the stepper's doing.
+    let census = |kind: &str| buffered.matches(&format!("\"event\":\"{kind}\"")).count();
     assert_contains_all(
-        &format!("newest event, and the backlog is announced\nthe whole buffer was:\n{buffered}"),
+        &format!(
+            "newest event, and the backlog is announced\nthe buffer holds {} breakpoint and {} step \
+             event(s), of {} in all — this test stages exactly one of each\nthe whole buffer was:\n{buffered}",
+            census("breakpoint"),
+            census("step"),
+            buffered.matches("\"event\":\"").count(),
+        ),
         &latest,
         &["\"event\":\"step\"", "[pending] 1 older event"],
     );
