@@ -23,6 +23,14 @@ pub const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 2000;
 
 /// How many commands [`JdwpConnection::read_independently`] may leave unanswered at once (PERF-1, #100).
 ///
+/// **Named for [`InFlight`] rather than for a window, and it was `INDEPENDENT_READ_WINDOW` first.** Every
+/// other "… window" in this codebase is a span of TIME — a capture window, a suspension window, an
+/// observation window, the escalation window, the window in which a watchpoint's old value is still readable
+/// — and this is a count of concurrent commands. Two axes on one word, in a `pub` constant, is the collision
+/// `batch` already cost this project once (see the **independent reads** entry's `_Avoid_`). Renamed while
+/// nothing was pinned to it: it went public unreleased, and `CONTEXT.md`'s own VOCAB-1 passage is that the
+/// window for doing this cheaply does not reopen.
+///
 /// **It is a safety bound before it is a tuning knob, and the thing it makes impossible is a deadlock.**
 /// The cycle to rule out: the event loop blocks writing a command because the JVM has stopped reading;
 /// the JVM has stopped reading because it is blocked writing replies; it is blocked writing because our
@@ -47,7 +55,7 @@ pub const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 2000;
 /// between threads, and nothing can interrupt one call to `read_independently`; chunking the caller's list
 /// by this hands the budget back every window at no cost in time, since a window takes about as long as one
 /// sequential read. That is the only reason a tuning constant is on the public surface.
-pub const INDEPENDENT_READ_WINDOW: usize = 16;
+pub const MAX_READS_IN_FLIGHT: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct JdwpConnection {
@@ -204,7 +212,7 @@ impl JdwpConnection {
     /// count is the figure that predicts nothing about it.
     ///
     /// **Derived from the window, not observed on the socket, and the difference is worth knowing.** A
-    /// single read counts one. A wave of `n` counts `ceil(n / INDEPENDENT_READ_WINDOW)`, because at most a
+    /// single read counts one. A wave of `n` counts `ceil(n / MAX_READS_IN_FLIGHT)`, because at most a
     /// window's worth can be outstanding at once — so `n` reads cannot take fewer sequential batches than
     /// that, and the sliding window reaches the bound within one. It is therefore a **tight lower bound**
     /// rather than a measurement, which is why every reply that prints it prints it with a `~`.
@@ -240,16 +248,16 @@ impl JdwpConnection {
     pub async fn read_independently(&self, packets: Vec<CommandPacket>) -> Vec<JdwpResult<ReplyPacket>> {
         // Counted before anything is issued, from the window rather than from the socket — see
         // [`round_trips`](Self::round_trips) for why that is a bound and not a measurement.
-        let waves = packets.len().div_ceil(INDEPENDENT_READ_WINDOW);
+        let waves = packets.len().div_ceil(MAX_READS_IN_FLIGHT);
         self.round_trips.fetch_add(u32::try_from(waves).unwrap_or(u32::MAX), Ordering::SeqCst);
         let mut results: Vec<JdwpResult<ReplyPacket>> = Vec::with_capacity(packets.len());
         // Awaited in issue order, which costs nothing: each reply has its own channel, so a reply that
         // arrives out of order is already sitting there when its turn comes. The window is what bounds
         // how far ahead of `results` this may run.
-        let mut window: VecDeque<InFlight> = VecDeque::with_capacity(INDEPENDENT_READ_WINDOW);
+        let mut window: VecDeque<InFlight> = VecDeque::with_capacity(MAX_READS_IN_FLIGHT);
 
         for packet in packets {
-            if window.len() >= INDEPENDENT_READ_WINDOW {
+            if window.len() >= MAX_READS_IN_FLIGHT {
                 if let Some(oldest) = window.pop_front() {
                     results.push(oldest.reply().await);
                 }
@@ -651,7 +659,7 @@ mod tests {
 
     /// How many commands these tests require to be outstanding at once.
     ///
-    /// **A literal, and not [`INDEPENDENT_READ_WINDOW`], because the negative control failed.** Written
+    /// **A literal, and not [`MAX_READS_IN_FLIGHT`], because the negative control failed.** Written
     /// first as "one window's worth", which reads like the strongest possible demand and is the weakest:
     /// a peer that withholds a window's worth is satisfied by a window of *one*, and with one command
     /// outstanding "the replies arrive backwards" describes nothing at all. Setting the window to 1 to
@@ -667,7 +675,7 @@ mod tests {
     /// satisfied by the serialised path at all**: it does not merely fail to exercise concurrency, it
     /// withholds every answer until the concurrency is real. That is what makes these tests a control on
     /// the primitive and not only on the routing table — and it is why `withhold` must never exceed
-    /// [`INDEPENDENT_READ_WINDOW`], which is the most the client will leave outstanding.
+    /// [`MAX_READS_IN_FLIGHT`], which is the most the client will leave outstanding.
     ///
     /// The tail matters as much as the wave. It is what lets a test send more reads than the window
     /// holds, and what lets one ask the connection a plain question *afterwards* — the assertion that
@@ -678,9 +686,9 @@ mod tests {
     /// ADR-0034's decision table met in another form — so the payload has to name its request too.
     async fn wave_peer(withhold: usize, answers: Answers, fail_nth: Option<usize>) -> u16 {
         assert!(
-            withhold <= INDEPENDENT_READ_WINDOW,
+            withhold <= MAX_READS_IN_FLIGHT,
             "a peer withholding more than the client's window would deadlock rather than fail; \
-             lowering INDEPENDENT_READ_WINDOW below {withhold} needs this test rethought, not retimed"
+             lowering MAX_READS_IN_FLIGHT below {withhold} needs this test rethought, not retimed"
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a loopback port");
         let port = listener.local_addr().expect("read back the bound port").port();
@@ -761,7 +769,7 @@ mod tests {
     /// PERF-1 (#100), the first acceptance criterion: every reply matched to **its own** request, under a
     /// reply stream deliberately reversed.
     ///
-    /// The wave is deliberately **larger** than [`INDEPENDENT_READ_WINDOW`], so the sliding window's
+    /// The wave is deliberately **larger** than [`MAX_READS_IN_FLIGHT`], so the sliding window's
     /// pop-oldest path is exercised rather than only the case where everything fits. The peer withholds
     /// exactly one window's worth and answers those backwards; the four beyond it cannot be outstanding
     /// at the same time as the first sixteen, and are served by the peer's tail as the window slides.
@@ -769,7 +777,7 @@ mod tests {
     async fn every_reply_is_matched_to_its_own_request_when_they_arrive_backwards() {
         let port = wave_peer(WITHHELD, Answers::Backwards, None).await;
         let conn = JdwpConnection::connect("127.0.0.1", port).await.expect("handshake with the peer");
-        let packets = wave(&conn, INDEPENDENT_READ_WINDOW + 4);
+        let packets = wave(&conn, MAX_READS_IN_FLIGHT + 4);
         let ids: Vec<u32> = packets.iter().map(|p| p.id).collect();
 
         let replies = tokio::time::timeout(WAVE_BUDGET, conn.read_independently(packets))

@@ -43,7 +43,7 @@ pub mod thread;
 pub mod types;
 pub mod vm;
 
-pub use connection::{JdwpConnection, INDEPENDENT_READ_WINDOW};
+pub use connection::{JdwpConnection, MAX_READS_IN_FLIGHT};
 pub use eventloop::{spawn_event_loop, EventLoopHandle};
 pub use eventrequest::{EventFilters, MonitorKind, SuspendPolicy, WatchKind};
 pub use events::EventSet;

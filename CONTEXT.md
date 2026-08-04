@@ -247,17 +247,32 @@ One JDWP message, and **the unit this server reports its own cost in** — a dum
 count is deterministic and independent of machine load, where a duration is neither, and because it is what a
 caller can reason about before making a call.
 
-**It is no longer the same number as the round trips**, and this entry used to say it was. PERF-1
-([#100](https://github.com/YgorPerez/java-debugging-mcp/issues/100)) sends the same packets and waits for them
-together, so on any path using **independent reads** the packet count is unchanged while the round trips are
-divided by up to the window of sixteen. Measured on a `debug.run_named_query` row: 17.67ms of wire time per
-row before, 1.78ms after, at the same packet count (ADR-0038). So a reported figure still says exactly what
-the server *sent* — which is what makes it comparable between releases, and why the cost lines were not
-changed to report round trips instead — but on a converted path it is now an **upper bound** on what the
-caller waits for rather than a proxy for it.
+**It is no longer the same number as the round trips**, and this entry used to say it was — it justified
+packets-as-cost-unit by equating them. On any path using **independent reads** the packet count is unchanged
+while the waits are divided by up to the cap on concurrent reads (ADR-0038), so a reported packet figure is
+now an **upper bound** on what a caller waits for rather than a proxy for it. What it still says exactly is
+what the server *sent*, which is why the cost lines kept it and gained the other number beside it.
 _Avoid_: using "packets" and "round trips" as if they were interchangeable, which is what this paragraph
-exists to stop; a claim about *waiting* has to name a duration or a round trip count, and a claim about *cost
-on the wire* is the packet count.
+exists to stop — see **round trip** for which claim belongs in which unit.
+
+**Round trip**:
+One wait for the debuggee to answer. The unit a caller's **latency** is measured in, where a **packet** is the
+unit its **traffic** is measured in.
+
+**Two units exist because they stopped being one number.** Until **independent reads**, every packet was
+awaited on its own, so a packet count answered both questions and the glossary needed only the one word. It
+now answers only the second: a set of independent reads crosses the wire as many packets and is waited on
+about once. A reply that prints a duration or a freeze is describing round trips; a reply that prints a cost
+is describing packets; and a claim about one made in the units of the other is the error this pair of entries
+exists to prevent.
+
+**A reported round trip count is derived rather than observed**, from the cap on how many reads may be
+outstanding at once — so it is a tight lower bound on the waits, not a measurement of them, and every reply
+that prints one prints it with a `~`. A packet count has no such caveat, which is the other reason the cost
+lines still lead with it: it is deterministic and comparable between releases where this is neither.
+
+_Avoid_: hop (a network term for something else entirely — a round trip here may cross several); latency
+(the property, not the unit; a round trip is what you count, latency is what one costs)
 
 **Framing**:
 JDWP messages are length-prefixed with **no delimiter between them**, so the reader's position is only
@@ -292,6 +307,44 @@ has to be *proven* rather than assumed); batched (taken, and by something close 
 **batch** is many class patterns given to one arming call, and it also has partial failure as a normal
 outcome — and it implies one combined request answered by one reply, which JDWP has no such thing as);
 concurrent (true of the mechanism and silent about the property that makes it safe)
+
+**Wave**:
+A set of **independent reads** issued together and awaited together.
+
+**Where independent reads is the licence, this is the mechanism** — and the two are separate entries because
+the licence is the part that has to be established and the mechanism is the part that cannot check it.
+Anything may be issued as a wave; only an independent set may *correctly* be.
+
+**Every reply is awaited, including after one has failed.** A wave is not an all-or-nothing request: it has
+no combined reply, its results answer its reads one for one, and a failure is one of those answers rather
+than the end of the set. That follows from the wire rather than from taste — the commands are already sent
+and JDWP has no way to recall one, so abandoning the wait would abandon only the answer while the debuggee
+does the work regardless.
+
+**A wave is bounded, so a large set of reads is several waves rather than one.** The bound is what keeps the
+mechanism from becoming a way to have unlimited work outstanding, and it means the saving is bounded too: a
+fan-out wider than the bound is divided by it, not eliminated.
+
+_Avoid_: batch (taken — see the `_Avoid_` above); pipeline (same objection as above); burst (describes the
+traffic's shape on the wire and says nothing about the reads being independent or the replies being awaited)
+
+**Speculative read**:
+A read issued for something that may turn out never to have been needed.
+
+**The one thing that can make a wave cost more than the loop it replaces**, and therefore the invariant every
+conversion to a wave is held to. Gathering a fan-out's reads into one set invites reading for *every*
+candidate, and the candidates that get discarded are pure loss — measured in **packets**, which is the unit
+that is supposed to be unchanged by any of this. A wave that saves round trips by spending packets has moved
+the cost rather than removed it, and has done so in the unit a caller's cost line reports.
+
+**It has two shapes here, and both are decided by something the reads cannot see.** A filter may discard a
+frame or a row before anything about it is read, so the filter is resolved first and only survivors are read
+for. And a budget may stop a walk part way, so how many of a level's children will be read is not known until
+they have been — which is why one fan-out was measured, found to be a fifth of its own call site, and left
+alone rather than converted.
+
+_Avoid_: prefetch (describes *when* a read happens, not whether it may be wasted — a prefetch for something
+already known to be needed is not speculative, and most of the ones here are not)
 
 ### Stop points
 

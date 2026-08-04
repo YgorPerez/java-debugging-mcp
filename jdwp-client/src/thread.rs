@@ -179,7 +179,7 @@ impl JdwpConnection {
     /// production-shaped instance — and used to ask one at a time, under the suspension. A thread's name is
     /// nothing to do with any other thread's, so this is a wave.
     ///
-    /// **Chunk by [`INDEPENDENT_READ_WINDOW`](crate::INDEPENDENT_READ_WINDOW) if you have a deadline to
+    /// **Chunk by [`MAX_READS_IN_FLIGHT`](crate::MAX_READS_IN_FLIGHT) if you have a deadline to
     /// honour.** Passing all 306 ids is correct and bounded, but nothing can interrupt the call once it
     /// starts, and a dump's suspension budget is checked between threads. Chunking hands the budget back
     /// every window — which costs it nothing in time, because a window of sixteen takes about as long as one

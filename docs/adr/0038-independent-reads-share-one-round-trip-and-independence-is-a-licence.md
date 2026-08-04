@@ -73,7 +73,7 @@ listening. That safety is ADR-0018's, not this ADR's.
 
 ### The window is a safety bound before it is a tuning knob
 
-`INDEPENDENT_READ_WINDOW = 16` caps how many commands may be unanswered at once, and a caller passing a
+`MAX_READS_IN_FLIGHT = 16` caps how many commands may be unanswered at once, and a caller passing a
 thousand packets is bounded by the window rather than by their list.
 
 The cycle it rules out is a genuine deadlock, and every arrow in it is real: the event loop blocks writing a
@@ -254,7 +254,7 @@ with the name filter between them, because a thread whose name is filtered out n
 must not start being read now. `collect_thread_rows` behind `debug.list_threads` has the same shape and the
 same fix.
 
-**Chunked by `INDEPENDENT_READ_WINDOW` rather than handed all 306 ids**, which is the only reason that constant
+**Chunked by `MAX_READS_IN_FLIGHT` rather than handed all 306 ids**, which is the only reason that constant
 is public. A dump's suspension budget is what bounds the freeze and it is checked between threads; nothing can
 interrupt one `read_independently`. Chunking hands the budget back every window and costs it nothing in time —
 a window of sixteen takes about as long as one sequential read — so the budget is checked as often in *time* as

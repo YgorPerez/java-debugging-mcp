@@ -20908,7 +20908,7 @@ async fn triage_dump_threads(
     // costs it nothing: a window of sixteen takes about as long as one sequential read, so the budget is
     // checked as often in TIME as it was before even though it is checked a sixteenth as often in threads.
     let mut triaged = 0usize;
-    for window in all.chunks(jdwp_client::INDEPENDENT_READ_WINDOW) {
+    for window in all.chunks(jdwp_client::MAX_READS_IN_FLIGHT) {
         if triage_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return DumpTriage { candidates, untriaged: all.len() - triaged, vanished };
         }
