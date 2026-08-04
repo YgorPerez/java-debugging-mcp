@@ -947,6 +947,22 @@ pub enum EventFault {
     /// policy across JVMs is exactly the kind of accidental dependency this suite keeps getting bitten by;
     /// naming the kind makes the target the *event* rather than its position in a stream nobody controls.
     DuplicateKind { kind: u8, times: usize },
+    /// HOLD the first `times` composite events **whose first event is of `kind`** for `ms` before
+    /// forwarding them, unchanged.
+    ///
+    /// **This is the fault-injection point TEST-31 (#114) said did not exist**, and it exists because a
+    /// window between "the JVM generated a hit and suspended the thread for it" and "the debugger got
+    /// round to the composite" cannot be hit by a timing coincidence: it is sub-millisecond, and forty
+    /// rounds of arming-then-panicking landed inside it zero times. Holding the packet makes the window
+    /// as wide as the test needs and lands a command squarely inside it, every run.
+    ///
+    /// Only the debuggee→debugger direction stalls. [`wire_framed`] pumps each direction on its own
+    /// thread, so commands the test issues while an event is held travel to the JVM and are answered
+    /// normally — which is the whole point: the debugger acts on a VM it believes has told it everything.
+    ///
+    /// Nothing is reordered or rewritten, so what the debugger eventually parses is byte-for-byte what the
+    /// JVM sent. The only lie is *when*, which is also the only lie a slow debugger tells itself.
+    DelayKind { kind: u8, ms: u64, times: usize },
 }
 
 /// JDWP `eventKind` values, for [`EventFault::DuplicateKind`].
@@ -1065,6 +1081,19 @@ impl FaultRelay {
                     // unless a policy asks for them: faulting them blindly breaks the event pump rather
                     // than testing it.
                     FromDebuggee::Event(pkt) => {
+                        // Held, not rewritten: the packet the debugger eventually parses is byte-for-byte
+                        // the JVM's. Sleeping here stalls only this direction — `wire_framed` pumps the
+                        // outbound one on its own thread — so a command issued meanwhile still reaches the
+                        // JVM and is answered, which is exactly the state being staged.
+                        if let Some(EventFault::DelayKind { kind, ms, times }) = on_events {
+                            if duplicated.load(std::sync::atomic::Ordering::Relaxed) < times
+                                && composite_event_kind(pkt) == Some(kind)
+                            {
+                                duplicated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                std::thread::sleep(Duration::from_millis(ms));
+                            }
+                            return None;
+                        }
                         let Some(EventFault::DuplicateKind { kind, times }) = on_events else {
                             return None;
                         };

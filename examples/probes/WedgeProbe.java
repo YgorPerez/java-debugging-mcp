@@ -32,6 +32,17 @@ public class WedgeProbe {
     static final AtomicInteger acquisitions = new AtomicInteger();
 
     /**
+     * Waits the WAITER has completed — the same evidence `acquisitions` gives for the contender, for the
+     * other thread. It exists because the waiter is the thread a disowned traced hit freezes, and this
+     * suite holds every non-suspending claim to a witness the debugger cannot fake.
+     *
+     * **Printed BEFORE `acquisitions=` on purpose.** `wedge_acquisitions` parses the tail of
+     * `acquisitions=` and trims, so `acquisitions` has to stay last on the line or every existing DUMP-8
+     * assertion starts failing to parse a number it used to read.
+     */
+    static final AtomicInteger waits = new AtomicInteger();
+
+    /**
      * The lock, and the trap on it.
      *
      * `stamp()` is `synchronized`, so calling it requires the monitor. On the `blocked` half of a
@@ -131,6 +142,10 @@ public class WedgeProbe {
                 Thread.currentThread().interrupt();
             }
         }
+        // Counted AFTER the synchronized block, so an increment means the whole wait-and-reacquire cycle
+        // completed. A thread frozen by a disowned traced hit stops advancing this and nothing else here
+        // would show it.
+        waits.incrementAndGet();
     }
 
     /** Queue on a demonstrably-owned lock, then acquire it. ENTER fires at the `synchronized`. */
@@ -164,10 +179,10 @@ public class WedgeProbe {
         while (acquisitions.get() < 1) {
             sleep(10);
         }
-        System.out.println("wedge ready acquisitions=" + acquisitions.get());
+        System.out.println("wedge ready waits=" + waits.get() + " acquisitions=" + acquisitions.get());
 
         for (int i = 0; i < 100000; i++) {
-            System.out.println("tick " + i + " acquisitions=" + acquisitions.get());
+            System.out.println("tick " + i + " waits=" + waits.get() + " acquisitions=" + acquisitions.get());
             Thread.sleep(150);
         }
     }

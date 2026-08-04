@@ -10944,6 +10944,119 @@ fn clearing_a_traced_stop_point_repeatedly_leaves_the_probe_running() {
     server.panic_reset();
 }
 
+/// `MONITOR_WAIT`, JDWP event kind 45 — named here so [`EventFault::DelayKind`] can target the one
+/// composite this test needs held, rather than whichever event happens to arrive first. `DuplicateKind`'s
+/// own doc records the CI failure that taught this suite not to be positional about event kinds.
+const EVENT_KIND_MONITOR_WAIT: u8 = 45;
+
+/// TRACE-8 (#72) on the third path that clears traced requests: `debug.panic`. **A characterisation test,
+/// not a bug reproduction** — and the distinction is the most useful thing in it.
+///
+/// The ledger that stops a traced hit's thread being stranded is `note_disarmed_traced`. TRACE-8 reached it
+/// from `disarm_request`; TEST-31 (#114) found `clear_stop_point` never calls that and added
+/// `note_traced_in_flight`. `disarm_everything` — panic's clearing half — bypassed both, so a traced hit the
+/// JVM had already generated arrives disowned by `try_record_trace`, which returns without resuming it.
+///
+/// **This test opens that window on purpose and proves the thread survives anyway.** `EventFault::DelayKind`
+/// holds the composite for 2500 ms while the panic runs, and `relay.duplicated()` is asserted to be 1 so a
+/// green run cannot mean "the window never opened". With `note_every_traced_request_in_flight` removed from
+/// `disarm_everything` the waiter *still* keeps advancing: `handle_panic` calls `resume_and_verify` right
+/// after the drain, and a VM-wide resume decrements every thread's suspend count — including one nothing was
+/// tracking. So the rescue happens, by side effect, from a call made for another reason.
+///
+/// That is worth pinning down rather than leaving implicit. What this test now guards is the *coupling*: if
+/// panic ever stops issuing a VM-wide resume, or issues it conditionally, the disowned hit has nothing left
+/// to save it and this test is where that shows up.
+///
+/// **Unlike TEST-31's guard, the window here is genuinely staged.** #114's test says in its own doc that it
+/// cannot land inside it, because the gap between "the JVM generated the hit and suspended the thread" and
+/// "the debugger dequeued the composite" is sub-millisecond — measured here as **0 hits in 40 rounds** of
+/// arm-then-panic against the real binary. Holding the packet makes the window as wide as the test asks. Only
+/// the debuggee→debugger direction stalls, so the panic still reaches the JVM and is answered normally.
+///
+/// **What this does NOT explain**, said plainly because the test was written while chasing it: a 24-run soak
+/// failed `an_invoking_trace_expr_is_refused_on_the_half_that_does_not_own_the_lock` with `1/8 wedge-waiter
+/// [running]`. That sighting is real and its cause is still unknown. This test rules out one candidate
+/// mechanism; it does not close that issue.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn panic_resumes_a_traced_hit_it_disowned_instead_of_freezing_the_thread() {
+    let Some(jdk) = jdk_or_skip("panic_resumes_a_traced_hit_it_disowned_instead_of_freezing_the_thread")
+    else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "WedgeProbe", wedge_probe_ready).expect("launch WedgeProbe");
+    // The relay sits between the server and the probe and holds the FIRST monitor-wait composite. 2500 ms
+    // is not tuned to anything delicate: it only has to outlast the panic below, and the assertion waits
+    // for it to elapse rather than racing it.
+    let relay = FaultRelay::start_with_events(
+        probe.port,
+        vec![],
+        Some(EventFault::DelayKind { kind: EVENT_KIND_MONITOR_WAIT, ms: 2500, times: 1 }),
+    )
+    .expect("start the fault relay");
+    let mut server = Server::start().expect("start server");
+    server.attach(relay.port);
+
+    // A FIELD READ, not an invocation. DUMP-8's hazard is an invoking `trace_expr` on a monitor it does not
+    // own, and this test must not be able to fail for that reason — what is under test is the disowning,
+    // so the expression has to be one that always resolves cheaply.
+    let armed = server.call(
+        "debug.set_monitor_stop",
+        serde_json::json!({"kinds": ["wait"], "trace": true, "trace_expr": "WAITED_ON.name",
+                           "trace_max_hits": 50, "trace_frames": 0}),
+    );
+    assert!(!armed.contains("Refused"), "the traced monitor stop point was refused: {armed}");
+
+    // `waitOut` runs every ~40 ms plus the loop gap, so a hit is generated almost at once — and the relay
+    // is now holding its composite with the waiter suspended by the JVM. Waiting for the probe's own
+    // counter to move first would be waiting for the thing this test is about to freeze.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    // The relay counts what it held. Without this the test could pass having staged NOTHING — a green run
+    // that proves the fix works against a window it never opened, which is the failure mode ADR-0034 and
+    // this suite's own history keep pointing at.
+    assert_eq!(
+        relay.duplicated(),
+        1,
+        "the relay never held a monitor-wait composite, so the window was never opened and this test \
+         proves nothing"
+    );
+    let waits_before = wedge_waits(&probe).unwrap_or(-1);
+
+    // Panic INSIDE the window. It drains the monitor request without the JVM having told the debugger about
+    // the hit, and resumes only what it tracks — which does not include an `EventThread` suspension.
+    let panicked = server.call("debug.panic", serde_json::json!({}));
+    assert!(
+        panicked.contains("Panic"),
+        "panic did not report itself, so this test never staged what it claims: {panicked}"
+    );
+
+    // Let the held composite arrive and be processed, plus a margin for the disowned-hit resume.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // The debugger's own account first, then the probe's — which is the half no reply of ours could fake.
+    let suspended = server.call("debug.list_threads", serde_json::json!({"only_suspended": true}));
+    assert!(
+        suspended.starts_with("0/"),
+        "panic disowned a traced hit and left its thread suspended:\n{suspended}\n  probe output tail: \
+         {:?}",
+        probe.output().iter().rev().take(3).collect::<Vec<_>>(),
+    );
+    let advanced = (0..40).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        wedge_waits(&probe).is_some_and(|now| now > waits_before)
+    });
+    assert!(
+        advanced,
+        "the waiter never completed another wait, so it is frozen. waits was {waits_before} and is {:?} \
+         now; nothing else would have rescued it — a traced hit's suspension is neither the VM-wide depth \
+         nor a counted per-thread hold, so the watchdog has no reason to look",
+        wedge_waits(&probe),
+    );
+
+    server.panic_reset();
+}
+
 /// FILT-8 (#99): a `hit_count` stop point fires on the Nth occurrence, ONCE, and is then **spent** —
 /// deleted by the JVM, not by us — and everything downstream has to say so.
 ///
@@ -13470,6 +13583,19 @@ fn wedge_probe_ready(line: &str) -> bool {
 /// the debugger, which is the standard every non-suspending assertion here is held to.
 fn wedge_acquisitions(probe: &Probe) -> Option<i64> {
     probe.output().iter().filter_map(|l| l.split("acquisitions=").nth(1)?.trim().parse::<i64>().ok()).max()
+}
+
+/// The `waits` counter off `WedgeProbe`'s tick line — the WAITER's progress, which is the thread a disowned
+/// traced hit strands. `wedge_acquisitions` covers the contender and cannot see this one at all.
+///
+/// Split on whitespace rather than trimmed to the end of the line, because `waits=` is deliberately printed
+/// *before* `acquisitions=` — see the probe's own note on why that order is load-bearing.
+fn wedge_waits(probe: &Probe) -> Option<i64> {
+    probe
+        .output()
+        .iter()
+        .filter_map(|l| l.split("waits=").nth(1)?.split_whitespace().next()?.parse::<i64>().ok())
+        .max()
 }
 
 /// DUMP-8 (#123): an invoking `trace_expr` is refused on the OPENING half of a pair, and the thing worth

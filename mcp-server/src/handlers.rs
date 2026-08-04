@@ -5641,6 +5641,58 @@ fn note_traced_in_flight(session: &mut crate::session::DebugSession, traced: boo
     }
 }
 
+/// Note **every** traced request this session owns as in-flight, for `debug.panic` — the third path that
+/// clears traced requests without this bookkeeping, closed for symmetry rather than for a proven freeze.
+///
+/// The ledger that keeps a traced hit's thread from being stranded is `note_disarmed_traced`. TRACE-8 (#72)
+/// reached it from [`disarm_request`]; TEST-31 (#114) found `clear_stop_point` never calls that and added
+/// [`note_traced_in_flight`]. [`disarm_everything`] bypassed **both**: it drains every request collection
+/// and clears the JDWP requests directly, so a traced hit the JVM had already generated arrives to find
+/// `find_traced_request` missing and `was_traced_and_disarmed` false, and `try_record_trace` disowns it as
+/// "not ours" — returning without resuming the thread.
+///
+/// **What is NOT claimed, because it was measured and is not true: this was never observed to freeze a
+/// thread.** `panic_resumes_a_traced_hit_it_disowned_instead_of_freezing_the_thread` stages the window
+/// deliberately — the relay holds the composite, asserted, while the panic runs — and the waiter keeps
+/// advancing *with this call removed*. The reason is `handle_panic`'s own next step: `resume_and_verify`
+/// issues a VM-wide resume, which decrements every thread's suspend count and so happens to cover a
+/// suspension nothing here was tracking. That is a rescue by side effect, from a call made for another
+/// reason, and it is the whole argument for this one: the disown path becomes self-sufficient instead of
+/// depending on what its caller does afterwards. It costs a handful of `i32`s.
+///
+/// **It is also not the cause of the flake that led here.** A 24-run soak failed
+/// `an_invoking_trace_expr_is_refused_on_the_half_that_does_not_own_the_lock` with `1/8 wedge-waiter
+/// [running]` — a thread held by the debugger while the JVM's own status said runnable — and that sighting
+/// remains unexplained. This call was written while chasing it and is kept on its own merits; nothing here
+/// should be read as having diagnosed that failure.
+///
+/// A `PatternStopSet`'s own class-prepare watch is deliberately absent: its members are `BREAKPOINT`
+/// requests, which `session.breakpoints` already covers, and a `CLASS_PREPARE` hit is resumed by
+/// `try_arm_deferred_breakpoints` rather than by the trace path, so it was never at risk here.
+fn note_every_traced_request_in_flight(session: &mut crate::session::DebugSession) {
+    // Collected before any noting, because `note_disarmed_traced` needs `&mut session` while these are
+    // borrowed. Cheap: this is a handful of i32s per stop point, not a walk of anything.
+    let mut traced: Vec<i32> = Vec::new();
+    for bp in session.breakpoints.values().filter(|b| b.trace) {
+        traced.extend(bp.request_ids.iter().copied());
+    }
+    for er in session.exception_requests.values().filter(|e| e.trace) {
+        traced.extend(er.request_id);
+    }
+    for wp in session.watchpoints.values().filter(|w| w.trace) {
+        traced.extend(wp.request_id);
+    }
+    for me in session.method_exits.values().filter(|m| m.trace) {
+        traced.extend(me.request_id);
+    }
+    for mon in session.monitor_requests.values().filter(|m| m.trace) {
+        traced.extend(mon.request_id);
+    }
+    for req in traced {
+        session.note_disarmed_traced(req);
+    }
+}
+
 /// The clause `clear_stop_point` appends when the stop point it just dropped was already **spent**
 /// (FILT-8) — its `hit_count` had fired and the JVM deleted the request itself.
 ///
@@ -10474,6 +10526,11 @@ async fn try_arm_deferred_breakpoints(
 /// exception requests, field watches, method exits — survives it, and each survives it *differently*
 /// enough to be worth its own sentence.
 async fn disarm_everything(session: &mut crate::session::DebugSession) {
+    // FIRST, and before a single request is cleared: a traced hit the JVM has already generated must still
+    // be resumed rather than surfaced as a suspending event. `note_every_traced_request_in_flight` records
+    // what this does and does NOT fix — the VM-wide resume below already covers the case by side effect,
+    // which is exactly why the disown path should not have to rely on it.
+    note_every_traced_request_in_flight(session);
     let _ = session.connection.clear_all_breakpoints().await;
     clear_standing_rearm_watches(session).await;
     session.breakpoints.clear();
