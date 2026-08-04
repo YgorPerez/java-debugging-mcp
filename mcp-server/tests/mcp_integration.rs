@@ -763,11 +763,12 @@ fn launch_suspends_before_the_first_instruction_and_disconnect_terminates_it() {
     );
 
     // Releasing the VM is what runs the static initialiser, and the deferred breakpoint has to arm in time
-    // to catch it.
-    server.call("debug.continue", serde_json::json!({}));
+    // to catch it. The reply is kept because two of the readings below turn on it: a resume that did not
+    // take leaves every thread suspended, which is a different failure from anything about class loading.
+    let resumed = server.call("debug.continue", serde_json::json!({}));
     let hit = server
         .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
-        .unwrap_or_else(|| diagnose_clinit_miss(&mut server, &set, &launched));
+        .unwrap_or_else(|| diagnose_clinit_miss(&mut server, &set, &launched, &resumed));
     assert_contains_all(
         "the hit is inside <clinit>, which attaching could never have reached",
         &hit,
@@ -872,7 +873,7 @@ fn find_id(reply: &str, prefix: &str) -> Option<String> {
 /// A function rather than a closure at the call site only because the readings outgrew
 /// `clippy::too_many_lines` there. It ENDS the launched JVM to get at its stdout, so it is a failure path
 /// and nothing else may call it.
-fn diagnose_clinit_miss(server: &mut Server, set: &str, launched: &str) -> String {
+fn diagnose_clinit_miss(server: &mut Server, set: &str, launched: &str, resumed: &str) -> String {
     // TEST-34 (#118). This message used to say `suspend=y did not hold the JVM`, and printed a listing
     // underneath that exonerated it in the same breath: the breakpoint DEFERRED — asserted twenty lines
     // above, and nothing can defer unless the JVM was held before its class loaded. So `suspend=y` is
@@ -884,6 +885,15 @@ fn diagnose_clinit_miss(server: &mut Server, set: &str, launched: &str) -> Strin
     // captured stdout (`end_launched_jvm` — while it is alive, nothing else does), and ending a JVM we
     // are about to abandon costs nothing.
     let listing = server.call("debug.list_stop_points", serde_json::json!({}));
+    // Read BEFORE the disconnect, which ends the JVM this asks about.
+    //
+    // This is what splits "the class never prepared" in two, and the split comes from the source rather than
+    // from a sighting: `try_arm_deferred_breakpoints` arms and only THEN calls `resume_thread`, and every
+    // `set_class_prepare` call site passes `SuspendPolicy::EventThread`. So if the JVM generated a
+    // CLASS_PREPARE, it is holding the preparing thread waiting for a resume that only the arm's completion
+    // sends. `debug.continue` cleared the launch suspend and no stop point has hit — that being the failure —
+    // so a suspended thread here can only be that hold.
+    let held = server.call("debug.list_threads", serde_json::json!({"only_suspended": true}));
     let farewell = server.call("debug.disconnect", serde_json::json!({}));
     let deferred = listing.contains("waiting for class load");
     let clinit_ran = farewell.contains("clinit ");
@@ -898,16 +908,63 @@ fn diagnose_clinit_miss(server: &mut Server, set: &str, launched: &str) -> Strin
     // rewritten to remove, one level down.
     let bp = stop_id(set, "bp_");
     let listed = bp.as_ref().is_some_and(|id| listing.contains(&format!("[{id}]")));
-    let reading = match (listed, deferred, clinit_ran, hits) {
+    let (n_held, n_total) = held_counts(&held);
+    let reading = clinit_reading(listed, deferred, clinit_ran, hits, &held);
+    panic!(
+        "the breakpoint inside the static initialiser never fired within {EVENT_TIMEOUT:?}. \
+         `suspend=y` is NOT the suspect — the stop point deferred, which only a held JVM allows.\n  \
+         READING: {reading}\n  hits seen: {hits}, still deferred: {deferred}, <clinit> printed: \
+         {clinit_ran}, listed as {bp:?}: {listed}, threads held: {n_held:?} of {n_total:?}\n  \
+         launch reply: {launched}\n  debug.continue said: {resumed}\n  stop points: {listing}\n  \
+         suspended before the disconnect: {held}\n  \
+         the probe's own output, via disconnect: {farewell}"
+    )
+}
+
+/// Which of the six readings a missed `<clinit>` breakpoint is, from facts already gathered.
+///
+/// Pure, and separate from [`diagnose_clinit_miss`] for the reason ADR-0034 exists: **two of these branches
+/// cannot be staged against a real JVM at all.** A relay cannot sit in front of a JVM `debug.launch` started,
+/// so nothing can delay its `CLASS_PREPARE` or stop it loading its own main class on demand — which is
+/// precisely why #118 has never been diagnosed. A decision table nobody has exercised is worth as much as the
+/// `suspend=y` sentence it replaced, so `the_clinit_readings_are_distinguishable` below drives every branch
+/// off captured reply text instead.
+fn clinit_reading(listed: bool, deferred: bool, clinit_ran: bool, hits: u32, held: &str) -> &'static str {
+    // `N/M thread(s) suspended-only` — BOTH numbers matter, and getting this wrong was the first draft of
+    // this split. "Something is suspended" does not mean the JVM is holding a preparing thread: `suspend=y`
+    // holds every thread too, so a `debug.continue` that did not take looks identical at the boolean level.
+    // The count separates them, because a CLASS_PREPARE hold under `EventThread` is ONE thread and a launch
+    // suspension that was never cleared is all of them.
+    let (n_held, n_total) = held_counts(held);
+    let none_held = n_held == Some(0);
+    let all_held = n_held.is_some() && n_held == n_total;
+    match (listed, deferred, clinit_ran, hits) {
         (false, ..) => {
             "THE STOP POINT IS NOT IN THE LISTING AT ALL, so `still deferred: false` and `hits seen: 0` \
              below are the absence of a row rather than readings off one. Something cleared or disowned \
              it; none of the arming readings apply and the listing is the thing to look at."
         }
+        (_, true, false, _) if all_held => {
+            "THE VM IS STILL HELD, so nothing downstream of the resume is implicated at all. Every thread \
+             is suspended and `debug.continue`'s own reply is below — a launch suspension that was never \
+             cleared holds all of them, which is what distinguishes this from the one-thread hold a \
+             CLASS_PREPARE takes. Read `debug.continue`'s reply first; if it claimed success, this is a \
+             resume-honesty failure and not a class-loading one."
+        }
+        (_, true, false, _) if !none_held => {
+            "THE CLASS PREPARED AND WE NEVER HEARD ABOUT IT. The stop point is still `waiting for class \
+             load` and `<clinit>` never printed — but SOME BUT NOT ALL threads are suspended, and after a \
+             debug.continue that took, the only thing here that holds one thread is the JVM parking the \
+             preparing thread for a CLASS_PREPARE it has already generated: `EventThread` policy, and \
+             `try_arm_deferred_breakpoints` resumes it only after the arm. So the class prepared, the event \
+             did not reach us, and the thread is waiting on a resume that never came. That is the EVENT \
+             PUMP — not the resume, and not the arming. `THE CLASS NEVER PREPARED` used to claim this case."
+        }
         (_, true, false, _) => {
-            "THE CLASS NEVER PREPARED. The stop point is still `waiting for class load` and the probe \
-             never printed from `<clinit>`, so the JVM did not get as far as loading StartupProbe. The \
-             resume is the suspect, not the arming."
+            "THE CLASS NEVER PREPARED. The stop point is still `waiting for class load`, the probe never \
+             printed from `<clinit>`, and NOTHING is suspended — so the JVM is not parked on a \
+             CLASS_PREPARE either and it simply did not get as far as loading StartupProbe. The resume is \
+             the suspect, not the arming."
         }
         (_, true, true, _) => {
             "THE CLASS PREPARED AND THE DEFERRED ARM DID NOT LAND. The probe's own stdout shows \
@@ -925,14 +982,62 @@ fn diagnose_clinit_miss(server: &mut Server, set: &str, launched: &str) -> Strin
             "ARMED AND HIT, BUT NO EVENT ARRIVED. Hits are non-zero, so the arming chain is not the \
              problem at all: the event did not reach the buffer within EVENT_TIMEOUT."
         }
-    };
-    panic!(
-        "the breakpoint inside the static initialiser never fired within {EVENT_TIMEOUT:?}. \
-         `suspend=y` is NOT the suspect — the stop point deferred, which only a held JVM allows.\n  \
-         READING: {reading}\n  hits seen: {hits}, still deferred: {deferred}, <clinit> printed: \
-         {clinit_ran}, listed as {bp:?}: {listed}\n  launch reply: {launched}\n  stop points: \
-         {listing}\n  the probe's own output, via disconnect: {farewell}"
-    )
+    }
+}
+
+/// The `N` and `M` of a `debug.list_threads {only_suspended: true}` reply's leading `N/M`.
+fn held_counts(held: &str) -> (Option<u32>, Option<u32>) {
+    let mut nums = held.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty());
+    (nums.next().and_then(|s| s.parse::<u32>().ok()), nums.next().and_then(|s| s.parse::<u32>().ok()))
+}
+
+/// Every reading of a missed `<clinit>` breakpoint is reachable, and no two inputs give the same one
+/// (TEST-34, #118).
+///
+/// **Not `#[ignore]`d, and it needs no JDK**, which is the point. ADR-0034 asks that an assertion be seen
+/// firing before it is trusted, and this decision table cannot satisfy that against a live JVM: a relay
+/// cannot sit in front of a JVM `debug.launch` started, so its `CLASS_PREPARE` cannot be delayed and it
+/// cannot be stopped from loading its own main class. Two branches are therefore unreachable on demand — and
+/// #118 being undiagnosed for four sessions IS that unreachability. So the table is driven off captured
+/// reply text, which is the strongest available form of "seen firing" here.
+///
+/// The `held` strings are real `debug.list_threads {only_suspended: true}` replies, shape included: a
+/// launch-time hold reports every thread, and a `CLASS_PREPARE` hold under `EventThread` reports one.
+#[test]
+fn the_clinit_readings_are_distinguishable() {
+    const NONE: &str = "0/8 thread(s) suspended-only:";
+    const ONE: &str = "1/8 thread(s) suspended-only:\n0x1 main [running] ⏸️ SUSPENDED BY YOU (0s, …)";
+    const ALL: &str = "8/8 thread(s) suspended-only:\n0x1 main [running]";
+
+    // (listed, deferred, <clinit> ran, hits, suspended reply) -> the phrase that must lead the reading
+    let cases = [
+        (false, false, false, 0, NONE, "NOT IN THE LISTING"),
+        (true, true, false, 0, ALL, "THE VM IS STILL HELD"),
+        (true, true, false, 0, ONE, "PREPARED AND WE NEVER HEARD ABOUT IT"),
+        (true, true, false, 0, NONE, "THE CLASS NEVER PREPARED"),
+        (true, true, true, 0, NONE, "THE DEFERRED ARM DID NOT LAND"),
+        (true, false, true, 0, NONE, "ARMED, NEVER HIT"),
+        (true, false, true, 3, NONE, "ARMED AND HIT, BUT NO EVENT ARRIVED"),
+    ];
+    let mut seen: Vec<&str> = Vec::new();
+    for (listed, deferred, clinit_ran, hits, held, expected) in cases {
+        let got = clinit_reading(listed, deferred, clinit_ran, hits, held);
+        assert!(
+            got.contains(expected),
+            "({listed}, {deferred}, {clinit_ran}, {hits}) with {held:?} must read {expected:?}, got: {got}"
+        );
+        // Distinct, not merely non-empty. Two inputs landing on one reading is the defect this whole
+        // table exists to remove, and it would otherwise pass the assertion above.
+        assert!(!seen.contains(&got), "two different states produced the same reading: {got}");
+        seen.push(got);
+    }
+
+    // The three `held` shapes are what the split turns on, so the parse gets its own check: a boolean
+    // "something is suspended" cannot tell the launch hold from the class-prepare hold, and the first draft
+    // of this split could not either.
+    assert_eq!(held_counts(NONE), (Some(0), Some(8)));
+    assert_eq!(held_counts(ONE), (Some(1), Some(8)));
+    assert_eq!(held_counts(ALL), (Some(8), Some(8)));
 }
 
 /// TEST-1: `force_return` must change what the CALLER receives, not merely report success. Proven by
