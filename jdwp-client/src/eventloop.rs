@@ -75,29 +75,36 @@ impl EventLoopHandle {
     /// Returns a [`JdwpError`] if the event loop has shut down or the reply is lost before it arrives.
     /// Both cases name the reason the loop stopped when it recorded one.
     pub async fn send_command(&self, packet: CommandPacket) -> JdwpResult<ReplyPacket> {
+        self.issue(packet).await?.reply().await
+    }
+
+    /// Hand a command to the loop and return as soon as it is queued — **without** waiting for its reply.
+    ///
+    /// This is the half of [`send_command`](Self::send_command) that PERF-1
+    /// ([#100](https://github.com/YgorPerez/java-debugging-mcp/issues/100)) needed, and adding it changes
+    /// nothing underneath: the loop already writes a command and returns without awaiting its answer, and
+    /// already correlates replies by packet id. The serialisation was in the *shape of the only way to
+    /// ask* — one call that issued and awaited — not in the transport. See [`InFlight`].
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the event loop has shut down before the command could be queued. Note
+    /// what this does **not** promise: the command has been handed over, not written. It is written when
+    /// the loop next reaches `handle_outgoing_command`, and a write failure is reported to
+    /// [`InFlight::reply`] rather than here.
+    pub async fn issue(&self, packet: CommandPacket) -> JdwpResult<InFlight> {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let id = packet.id;
 
         let request = CommandRequest { packet, reply_tx };
 
         self.command_tx.send(request).await.map_err(|_| self.lost("the command was never sent"))?;
 
-        reply_rx.await.map_err(|_| self.lost("the command was sent and its reply was dropped"))?
+        Ok(InFlight { id, reply_rx, shutdown: Arc::clone(&self.shutdown) })
     }
 
-    /// The error for a command that will never be answered, naming the reason the loop stopped.
-    ///
-    /// Both ways a command dies arrive here — one whose reply channel was dropped as the loop exited,
-    /// and one sent after it had already gone — because both are the same fact about the debuggee and
-    /// deserve the same words. `what` says how far this one got, since "sent" and "never sent" differ.
-    ///
-    /// The `None` arm should be unreachable: `event_loop_task` records its cause before anything it owns
-    /// can drop. It is worded as the anomaly it would be rather than as a plausible-looking default,
-    /// because a reassuring message on an impossible branch is how the original defect read.
+    /// See [`lost`].
     fn lost(&self, what: &str) -> JdwpError {
-        self.shutdown.get().map_or_else(
-            || JdwpError::Protocol(format!("the event loop stopped without recording a reason, and {what}")),
-            |cause| JdwpError::ConnectionClosed(cause.clone()),
-        )
+        lost(&self.shutdown, what)
     }
 
     /// Try to receive an event (non-blocking)
@@ -111,6 +118,66 @@ impl EventLoopHandle {
         let mut rx = self.event_rx.lock().await;
         rx.recv().await
     }
+}
+
+/// A command that has been handed to the loop and not yet answered.
+///
+/// **Issue order is write order, and neither is completion order.** The loop dequeues commands FIFO and
+/// writes them in that order, so a command issued first reaches the JVM first. Nothing says the JVM
+/// answers in that order — JDWP's own words are that the protocol *"is asynchronous; multiple command
+/// packets may be sent before the first reply packet is received"*, matched by an id that *"must be
+/// unique among all outstanding commands sent from one source"*. So this type carries its [`id`](Self::id):
+/// correlation is the claim being made, and ADR-0038 asserts it rather than assuming it.
+///
+/// **Dropping one is safe, and that is a property of ADR-0018 rather than of this type.** Abandoning the
+/// wait does not abandon the command: the JVM still answers it, the reader task still consumes the whole
+/// packet, and `route_reply` finds the pending entry and discards the reply because nobody is listening.
+/// Framing cannot be lost that way, because framing does not live on this side of the channel. What
+/// dropping *does* cost is the work the JVM already did, which is why nothing here abandons a sibling on
+/// the strength of another's failure — see [`JdwpConnection::read_independently`](
+/// crate::JdwpConnection::read_independently).
+#[must_use = "an issued command is on its way to the debuggee; dropping this discards its reply"]
+pub struct InFlight {
+    id: u32,
+    reply_rx: oneshot::Receiver<JdwpResult<ReplyPacket>>,
+    /// A clone of the loop's shutdown cell, so a reply that never arrives can be explained by the same
+    /// mechanism [`EventLoopHandle::lost`] uses — including after the handle that issued it is gone.
+    shutdown: Arc<std::sync::OnceLock<String>>,
+}
+
+impl InFlight {
+    /// The packet id this command was sent with, and the id its reply must carry.
+    #[must_use]
+    pub const fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Wait for this command's reply.
+    ///
+    /// # Errors
+    /// Returns a [`JdwpError`] if the reply is lost before it arrives — a write failure, a lapsed
+    /// `REPLY_TIMEOUT`, or the loop shutting down — naming the reason the loop stopped when it
+    /// recorded one.
+    pub async fn reply(self) -> JdwpResult<ReplyPacket> {
+        let Self { reply_rx, shutdown, .. } = self;
+        reply_rx.await.map_err(|_| lost(&shutdown, "the command was sent and its reply was dropped"))?
+    }
+}
+
+/// The error for a command that will never be answered, naming the reason the loop stopped.
+///
+/// Both ways a command dies arrive here — one whose reply channel was dropped as the loop exited,
+/// and one sent after it had already gone — because both are the same fact about the debuggee and
+/// deserve the same words. `what` says how far this one got, since "sent" and "never sent" differ.
+///
+/// The `None` arm should be unreachable: `event_loop_task` records its cause before anything it owns
+/// can drop. It is worded as the anomaly it would be rather than as a plausible-looking default,
+/// because a reassuring message on an impossible branch is how the original defect read.
+fn lost(shutdown: &std::sync::OnceLock<String>, what: &str) -> JdwpError {
+    shutdown.get().map_or_else(
+        || JdwpError::Protocol(format!("the event loop stopped without recording a reason, and {what}")),
+        |cause| JdwpError::ConnectionClosed(cause.clone()),
+    )
 }
 
 /// Start the event loop task

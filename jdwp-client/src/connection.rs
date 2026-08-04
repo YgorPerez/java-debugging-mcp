@@ -2,12 +2,12 @@
 //
 // Handles TCP connection, handshake, and event loop startup
 
-use crate::eventloop::{spawn_event_loop, EventLoopHandle};
+use crate::eventloop::{spawn_event_loop, EventLoopHandle, InFlight};
 use crate::events::EventSet;
 use crate::protocol::{CommandPacket, JdwpError, JdwpResult, ReplyPacket, JDWP_HANDSHAKE};
 use crate::reftype::{FieldInfo, MethodInfo};
 use crate::types::{ClassId, ReferenceTypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,6 +20,29 @@ use tracing::{debug, info, warn};
 /// alternative measured 30-40s against a real `WildFly` before the event loop's generic reply timeout gave
 /// up. Deliberately far below that timeout so an invocation is bounded by *this* budget, not by it.
 pub const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 2000;
+
+/// How many commands [`JdwpConnection::read_independently`] may leave unanswered at once (PERF-1, #100).
+///
+/// **It is a safety bound before it is a tuning knob, and the thing it makes impossible is a deadlock.**
+/// The cycle to rule out: the event loop blocks writing a command because the JVM has stopped reading;
+/// the JVM has stopped reading because it is blocked writing replies; it is blocked writing because our
+/// receive buffer is full and the reader task is parked on a full [`PACKET_CHANNEL_DEPTH`](
+/// crate::eventloop) channel; and the reader is parked because the loop — blocked in that write — is not
+/// draining it. Every arrow there is real. What breaks it is that the loop can only block in a write once
+/// the *send* buffer fills, and a JDWP command is 11-43 bytes: sixteen of them is under a kilobyte
+/// against a send buffer of at least sixteen. A window of one thousand — which a caller expanding a
+/// thousand-element collection would otherwise ask for — is a different conversation.
+///
+/// It is also the memory bound on buffered replies, which is the other reason it is not the caller's
+/// list length: a reply may be up to `MAX_PACKET_SIZE`, so the window is the ceiling on how much of the
+/// debuggee's heap can be sitting in oneshot channels at once. Sixteen small reads is nothing; sixteen
+/// `AllClasses` replies would be 160MB, and nothing converted to this path reads anything of that shape.
+///
+/// **Sixteen also caps the win**, since `n` reads cost `ceil(n / 16)` round trips rather than one. That is
+/// the trade and it is deliberately on the safe side of it: sixteen-fold is already most of the available
+/// fan-out on the reads PERF-1 names, and the numbers above stop being reassuring well before a window
+/// large enough to matter more.
+const INDEPENDENT_READ_WINDOW: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct JdwpConnection {
@@ -161,6 +184,65 @@ impl JdwpConnection {
     pub async fn send_command(&mut self, packet: CommandPacket) -> JdwpResult<ReplyPacket> {
         debug!("Sending command packet id={}", packet.id);
         self.event_loop.send_command(packet).await
+    }
+
+    /// Issue **independent reads** together and return one result per command, in the order given.
+    ///
+    /// The term is `CONTEXT.md`'s and it names a *licence*, not a mechanism: these commands' requests must
+    /// not depend on each other's replies. That is a property of the sequence and has to be established at
+    /// the call site — nothing here can check it, and this doc comment is not permission. ADR-0038 records
+    /// what the licence rests on; three real sequences in this server do **not** have it.
+    ///
+    /// **What it buys is round trips, not packets.** Every command still gets its own id from the same
+    /// counter, so [`packets_sent`](Self::packets_sent) is unchanged and the packet-bound tests are
+    /// unaffected by construction. What changes is that `n` reads cost about one round trip instead of
+    /// `n`, and — where the reads happen under a suspension — the suspension is shorter by the difference.
+    /// On loopback that difference is nearly nothing; it is a remote JVM this exists for.
+    ///
+    /// **Every reply is awaited, including after one has failed.** There is no first-error-wins arm and
+    /// that is deliberate: the commands are already on the wire and JDWP has no way to recall one, so
+    /// abandoning the wait would abandon only the *answer* while the JVM did the work anyway. A caller
+    /// wanting to stop at the first failure can do that to the returned `Vec` at no cost to the wire. A
+    /// failed command therefore cannot desynchronise its siblings — see
+    /// [`InFlight`](crate::eventloop::InFlight) for why it cannot desynchronise the stream either.
+    ///
+    /// Results are positional: `result[i]` answers `packets[i]`, whether it succeeded, failed at the JVM,
+    /// or was never written. An error reply is `Ok` here and carries its error code, exactly as
+    /// [`send_command`](Self::send_command) returns it; the caller still owes it a
+    /// [`check_error`](ReplyPacket::check_error).
+    pub async fn read_independently(&self, packets: Vec<CommandPacket>) -> Vec<JdwpResult<ReplyPacket>> {
+        let mut results: Vec<JdwpResult<ReplyPacket>> = Vec::with_capacity(packets.len());
+        // Awaited in issue order, which costs nothing: each reply has its own channel, so a reply that
+        // arrives out of order is already sitting there when its turn comes. The window is what bounds
+        // how far ahead of `results` this may run.
+        let mut window: VecDeque<InFlight> = VecDeque::with_capacity(INDEPENDENT_READ_WINDOW);
+
+        for packet in packets {
+            if window.len() >= INDEPENDENT_READ_WINDOW {
+                if let Some(oldest) = window.pop_front() {
+                    results.push(oldest.reply().await);
+                }
+            }
+            match self.event_loop.issue(packet).await {
+                Ok(in_flight) => window.push_back(in_flight),
+                // The loop is gone, so nothing after this will be issued either — but the window still
+                // holds commands that were, and they are owed their answers. Draining it before pushing
+                // the error is what keeps `results[i]` answering `packets[i]`: every command ahead of
+                // this one in the list is also ahead of it in the window.
+                Err(e) => {
+                    while let Some(in_flight) = window.pop_front() {
+                        results.push(in_flight.reply().await);
+                    }
+                    results.push(Err(e));
+                }
+            }
+        }
+
+        while let Some(in_flight) = window.pop_front() {
+            results.push(in_flight.reply().await);
+        }
+
+        results
     }
 
     /// Try to receive an event without blocking.
@@ -349,6 +431,7 @@ impl TypeCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{HEADER_SIZE, REPLY_FLAG};
 
     fn field(name: &str) -> FieldInfo {
         FieldInfo {
@@ -518,6 +601,236 @@ mod tests {
             "a writable connection must get past the guard and wait for the peer's reply"
         );
         assert_eq!(b.packets_sent(), before + 1, "it waited without having sent anything");
+    }
+
+    /// Which way round [`wave_peer`] answers a wave it has already read in full.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Answers {
+        InOrder,
+        Backwards,
+    }
+
+    /// `INVALID_OBJECT`, the failure a per-object field read wave actually meets: one element of the
+    /// collection was collected between the read that found it and the read that asked about it.
+    const INVALID_OBJECT: u16 = 20;
+
+    /// Long enough that a working wave is never near it, short enough that a serialised one is reported
+    /// rather than waited on. See [`wave_peer`] for why a hang is the failure mode to guard against.
+    const WAVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// How many commands these tests require to be outstanding at once.
+    ///
+    /// **A literal, and not [`INDEPENDENT_READ_WINDOW`], because the negative control failed.** Written
+    /// first as "one window's worth", which reads like the strongest possible demand and is the weakest:
+    /// a peer that withholds a window's worth is satisfied by a window of *one*, and with one command
+    /// outstanding "the replies arrive backwards" describes nothing at all. Setting the window to 1 to
+    /// watch the correlation test fail is how that was found — it passed. Eight is a number the wave tests
+    /// hold the implementation to, rather than a number they read off it.
+    const WITHHELD: usize = 8;
+
+    /// A JDWP peer that reads the first `withhold` commands **before answering any of them**, answers
+    /// those in the order asked for, and then serves anything further one at a time.
+    ///
+    /// Withholding is the instrument rather than a convenience. A client that awaited each reply before
+    /// sending the next command could never get past its first command here, so this peer **cannot be
+    /// satisfied by the serialised path at all**: it does not merely fail to exercise concurrency, it
+    /// withholds every answer until the concurrency is real. That is what makes these tests a control on
+    /// the primitive and not only on the routing table — and it is why `withhold` must never exceed
+    /// [`INDEPENDENT_READ_WINDOW`], which is the most the client will leave outstanding.
+    ///
+    /// The tail matters as much as the wave. It is what lets a test send more reads than the window
+    /// holds, and what lets one ask the connection a plain question *afterwards* — the assertion that
+    /// framing survived.
+    ///
+    /// Each reply's payload is its own packet id, four times over. Asserting on the id alone would pass a
+    /// routing table that delivered the right envelope with the wrong letter in it — the conflation
+    /// ADR-0034's decision table met in another form — so the payload has to name its request too.
+    async fn wave_peer(withhold: usize, answers: Answers, fail_nth: Option<usize>) -> u16 {
+        assert!(
+            withhold <= INDEPENDENT_READ_WINDOW,
+            "a peer withholding more than the client's window would deadlock rather than fail; \
+             lowering INDEPENDENT_READ_WINDOW below {withhold} needs this test rethought, not retimed"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a loopback port");
+        let port = listener.local_addr().expect("read back the bound port").port();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else { return };
+            let mut hs = vec![0u8; JDWP_HANDSHAKE.len()];
+            if socket.read_exact(&mut hs).await.is_err() {
+                return;
+            }
+            let _ = socket.write_all(JDWP_HANDSHAKE).await;
+            let _ = socket.flush().await;
+
+            let mut ids = Vec::with_capacity(withhold);
+            for _ in 0..withhold {
+                match read_command_id(&mut socket).await {
+                    Some(id) => ids.push(id),
+                    None => return,
+                }
+            }
+
+            let mut order: Vec<usize> = (0..ids.len()).collect();
+            if answers == Answers::Backwards {
+                order.reverse();
+            }
+            for nth in order {
+                if answer(&mut socket, ids[nth], fail_nth == Some(nth)).await.is_none() {
+                    return;
+                }
+            }
+
+            // The tail: everything after the withheld wave, answered as it arrives.
+            while let Some(id) = read_command_id(&mut socket).await {
+                if answer(&mut socket, id, false).await.is_none() {
+                    return;
+                }
+            }
+        });
+        port
+    }
+
+    /// Read one whole JDWP command and return its packet id, or `None` once the socket is done.
+    async fn read_command_id(socket: &mut tokio::net::TcpStream) -> Option<u32> {
+        let mut header = [0u8; HEADER_SIZE];
+        socket.read_exact(&mut header).await.ok()?;
+        let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let id = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+        // Consumed in full, or the next header would be read out of this command's body — the same
+        // alignment rule the client side lives by (ADR-0018).
+        let mut rest = vec![0u8; length.saturating_sub(HEADER_SIZE)];
+        if !rest.is_empty() {
+            socket.read_exact(&mut rest).await.ok()?;
+        }
+        Some(id)
+    }
+
+    /// Answer one command: its own id as the payload, or [`INVALID_OBJECT`] and no payload — which is
+    /// what a real JVM sends for a failure.
+    async fn answer(socket: &mut tokio::net::TcpStream, id: u32, fail: bool) -> Option<()> {
+        let error: u16 = if fail { INVALID_OBJECT } else { 0 };
+        let payload = if fail { Vec::new() } else { id.to_be_bytes().repeat(4) };
+        let total = u32::try_from(HEADER_SIZE + payload.len()).unwrap_or(u32::MAX);
+        let mut reply = Vec::with_capacity(HEADER_SIZE + payload.len());
+        reply.extend_from_slice(&total.to_be_bytes());
+        reply.extend_from_slice(&id.to_be_bytes());
+        reply.push(REPLY_FLAG);
+        reply.extend_from_slice(&error.to_be_bytes());
+        reply.extend_from_slice(&payload);
+        socket.write_all(&reply).await.ok()?;
+        socket.flush().await.ok()
+    }
+
+    /// The commands a wave test issues. Command set and command are arbitrary — this peer answers by id
+    /// and never looks at either — but they are a real read pair so nothing here implies a write.
+    fn wave(conn: &JdwpConnection, n: usize) -> Vec<CommandPacket> {
+        (0..n).map(|_| CommandPacket::new(conn.next_id(), 9, 1)).collect()
+    }
+
+    /// PERF-1 (#100), the first acceptance criterion: every reply matched to **its own** request, under a
+    /// reply stream deliberately reversed.
+    ///
+    /// The wave is deliberately **larger** than [`INDEPENDENT_READ_WINDOW`], so the sliding window's
+    /// pop-oldest path is exercised rather than only the case where everything fits. The peer withholds
+    /// exactly one window's worth and answers those backwards; the four beyond it cannot be outstanding
+    /// at the same time as the first sixteen, and are served by the peer's tail as the window slides.
+    #[tokio::test]
+    async fn every_reply_is_matched_to_its_own_request_when_they_arrive_backwards() {
+        let port = wave_peer(WITHHELD, Answers::Backwards, None).await;
+        let conn = JdwpConnection::connect("127.0.0.1", port).await.expect("handshake with the peer");
+        let packets = wave(&conn, INDEPENDENT_READ_WINDOW + 4);
+        let ids: Vec<u32> = packets.iter().map(|p| p.id).collect();
+
+        let replies = tokio::time::timeout(WAVE_BUDGET, conn.read_independently(packets))
+            .await
+            .expect("a wave the peer answers in full must not need the whole budget");
+
+        assert_eq!(replies.len(), ids.len(), "one result per command, always");
+        for (nth, (reply, id)) in replies.into_iter().zip(ids).enumerate() {
+            let reply = reply.unwrap_or_else(|e| panic!("command {nth} (id {id}) was not answered: {e:?}"));
+            assert_eq!(reply.id, id, "result {nth} carries the wrong reply");
+            assert_eq!(
+                reply.data(),
+                &id.to_be_bytes().repeat(4)[..],
+                "result {nth} carries the right id with another request's payload, which is the \
+                 conflation the id alone cannot catch"
+            );
+        }
+    }
+
+    /// PERF-1 (#100), the error-path criterion: one command failing inside a wave must not touch its
+    /// siblings, and must not touch the stream.
+    ///
+    /// Two assertions, and the second is the one that matters. A JDWP error reply is a normal packet, so
+    /// the siblings arriving intact is nearly free; the risk being tested is that the *stream* survives,
+    /// which is asserted by continuing to use the connection afterwards. If a wave could desynchronise
+    /// framing, this last read is where it would surface — and framing failure ends the session, so
+    /// there would be nothing ambiguous about it (ADR-0018).
+    #[tokio::test]
+    async fn a_failure_inside_a_wave_leaves_its_siblings_and_the_stream_intact() {
+        let wave_size = WITHHELD;
+        let failing = 2;
+        let port = wave_peer(wave_size, Answers::Backwards, Some(failing)).await;
+        let conn = JdwpConnection::connect("127.0.0.1", port).await.expect("handshake with the peer");
+        let packets = wave(&conn, wave_size);
+        let ids: Vec<u32> = packets.iter().map(|p| p.id).collect();
+
+        let replies = tokio::time::timeout(WAVE_BUDGET, conn.read_independently(packets))
+            .await
+            .expect("a failing command must not stall the wave it is in");
+
+        assert_eq!(replies.len(), wave_size, "one result per command, including the failing one");
+        for (nth, (reply, id)) in replies.into_iter().zip(&ids).enumerate() {
+            let reply = reply.unwrap_or_else(|e| panic!("command {nth} was not answered at all: {e:?}"));
+            assert_eq!(reply.id, *id, "result {nth} carries the wrong reply");
+            if nth == failing {
+                let err = reply.check_error().expect_err("the failing command must report its failure");
+                assert!(
+                    matches!(err, JdwpError::JdwpErrorCode(code, _) if code == INVALID_OBJECT),
+                    "the JVM's own error code is the diagnosis and must survive the wave: {err:?}"
+                );
+            } else {
+                reply.check_error().unwrap_or_else(|e| {
+                    panic!("command {nth} was collateral damage from command {failing}'s failure: {e:?}")
+                });
+            }
+        }
+
+        // The stream, after all that.
+        let mut after = conn.clone();
+        let probe = CommandPacket::new(after.next_id(), 9, 1);
+        let id = probe.id;
+        let reply = tokio::time::timeout(WAVE_BUDGET, after.send_command(probe))
+            .await
+            .expect("the connection must still answer after a wave containing a failure")
+            .expect("a desynchronised stream is a dead session, not a slow one");
+        assert_eq!(reply.id, id, "the reply after the wave belongs to the command after the wave");
+        assert_eq!(reply.data(), &id.to_be_bytes().repeat(4)[..], "framing survived the wave");
+    }
+
+    /// The wave is the same number of packets as the loop it replaces, which is what keeps every
+    /// packet-count bound test in `mcp_integration.rs` meaningful (PERF-1's third criterion).
+    ///
+    /// Asserted here rather than trusted from the implementation because the accounting is easy to break
+    /// invisibly: ids come from the caller, so anything that retried, split, or padded a command would
+    /// move this number while every other test in the file still passed.
+    #[tokio::test]
+    async fn a_wave_costs_exactly_one_packet_per_read() {
+        let port = wave_peer(4, Answers::InOrder, None).await;
+        let conn = JdwpConnection::connect("127.0.0.1", port).await.expect("handshake with the peer");
+        let before = conn.packets_sent();
+
+        let replies = tokio::time::timeout(WAVE_BUDGET, conn.read_independently(wave(&conn, 4)))
+            .await
+            .expect("four reads answered in order must not need the whole budget");
+
+        assert_eq!(replies.len(), 4);
+        assert_eq!(
+            conn.packets_sent() - before,
+            4,
+            "PERF-1 buys round trips, not packets — a different packet count here would invalidate \
+             every bound asserted in mcp_integration.rs"
+        );
     }
 
     /// The flag is shared with every clone, including the event pump's — the property ADR-0001 relies on
