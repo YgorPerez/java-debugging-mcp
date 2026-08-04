@@ -36,9 +36,9 @@ use common::{
 #[allow(clippy::too_many_lines)]
 fn evaluate_static_methods_and_object_arguments() {
     let Some(jdk) = jdk_or_skip("evaluate_static_methods_and_object_arguments") else { return };
-    let probe = Probe::launch(&jdk, "EvalProbe").expect("launch EvalProbe");
+    let mut probe = Probe::launch(&jdk, "EvalProbe").expect("launch EvalProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let source = probe_source("EvalProbe");
     let line = probe_line(&source, "// BP1");
@@ -192,10 +192,10 @@ fn watchpoints_report_field_writes_and_reads() {
     // used to poll the port on a 100ms tick, which handed every test ~50ms of slack it never asked for,
     // and TEST-20 (#55) removed that when it stopped dialling the port. The dependency was always here;
     // only the accident that hid it is gone. Saying it out loud is #49's fix, one test further on.
-    let probe =
+    let mut probe =
         Probe::launch_running(&jdk, "WatchProbe", |l| tick_index(l).is_some()).expect("launch WatchProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // --- Static field, modification. bumpCounter() does `counter = counter + 1`, so the pair must be
     // one apart — which only holds if the old value is read before the pending store commits.
@@ -318,7 +318,7 @@ fn deferred_breakpoint_arms_when_its_class_loads() {
     let Some(jdk) = jdk_or_skip("deferred_breakpoint_arms_when_its_class_loads") else { return };
     let mut probe = Probe::launch(&jdk, "DeferredProbe").expect("launch DeferredProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The probe idles until told to load, so LateWorker is genuinely absent right now. Setting the
     // breakpoint before the cue is the whole point of the test.
@@ -400,7 +400,7 @@ fn a_wildcard_family_arms_every_match_grows_with_class_loading_and_clears_as_one
     };
     let mut probe = Probe::launch(&jdk, "FamilyProbe").expect("launch FamilyProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     // FamilyAlpha/Beta/NoMethod are constructed before this line is printed, so they are genuinely loaded
     // when we arm — and FamilyGamma genuinely is not.
     probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("ready")).expect("probe never printed ready");
@@ -524,7 +524,7 @@ fn a_full_family_parks_its_class_load_watch_and_takes_it_back_when_a_member_is_c
     };
     let mut probe = Probe::launch(&jdk, "FamilyProbe").expect("launch FamilyProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("ready")).expect("probe never printed ready");
 
     // `max_classes: 1` against a pattern with two loaded targets: the family fills up as it arms, so it is
@@ -639,9 +639,9 @@ fn batched_and_wildcard_arming_works_for_exception_field_and_method_exit_stops()
     else {
         return;
     };
-    let probe = Probe::launch(&jdk, "FamilyProbe").expect("launch FamilyProbe");
+    let mut probe = Probe::launch(&jdk, "FamilyProbe").expect("launch FamilyProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("ready")).expect("probe never printed ready");
 
     // Exception stops, as a list of two classes the JVM has certainly loaded.
@@ -966,9 +966,9 @@ fn diagnose_clinit_miss(server: &mut Server, set: &str, launched: &str) -> Strin
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn force_return_changes_what_the_caller_receives() {
     let Some(jdk) = jdk_or_skip("force_return_changes_what_the_caller_receives") else { return };
-    let probe = Probe::launch(&jdk, "ForceProbe").expect("launch ForceProbe");
+    let mut probe = Probe::launch(&jdk, "ForceProbe").expect("launch ForceProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let source = probe_source("ForceProbe");
 
@@ -1046,9 +1046,9 @@ fn deep_expansion_walks_objects_collections_and_survives_cycles() {
     let Some(jdk) = jdk_or_skip("deep_expansion_walks_objects_collections_and_survives_cycles") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let line = probe_line(&probe_source("DeepProbe"), "// BP1");
     server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
@@ -1154,9 +1154,9 @@ fn deep_expansion_walks_objects_collections_and_survives_cycles() {
 #[allow(clippy::too_many_lines)]
 fn collection_subscripts_index_slice_and_filter() {
     let Some(jdk) = jdk_or_skip("collection_subscripts_index_slice_and_filter") else { return };
-    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let line = probe_line(&probe_source("DeepProbe"), "// BP1");
     server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
@@ -1364,10 +1364,10 @@ fn collection_reads_walk_the_layout_with_no_suspended_thread() {
     // The first question here is about static fields, and a static field of a class that has not
     // initialised yet answers "not loaded" *correctly* — so wait for the probe to be RUNNING rather
     // than merely listening (TEST-17).
-    let probe = Probe::launch_running(&jdk, "CollectionProbe", |l| l.starts_with("inspect "))
+    let mut probe = Probe::launch_running(&jdk, "CollectionProbe", |l| l.starts_with("inspect "))
         .expect("launch CollectionProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The premise, asserted rather than assumed: no stop point was armed and nothing is suspended.
     let before = server.call("debug.list_threads", serde_json::json!({"only_suspended": true, "limit": 200}));
@@ -1477,9 +1477,9 @@ fn collection_reads_walk_the_layout_with_no_suspended_thread() {
 #[allow(clippy::too_many_lines)]
 fn structural_and_invoking_collection_reads_agree() {
     let Some(jdk) = jdk_or_skip("structural_and_invoking_collection_reads_agree") else { return };
-    let probe = Probe::launch(&jdk, "CollectionProbe").expect("launch CollectionProbe");
+    let mut probe = Probe::launch(&jdk, "CollectionProbe").expect("launch CollectionProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // A suspended thread, so that the INVOKING half of every comparison is reachable at all.
     let line = probe_line(&probe_source("CollectionProbe"), "// BP1");
@@ -1563,9 +1563,9 @@ fn structural_and_invoking_collection_reads_agree() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn roadmap_metrics_inspection_criteria() {
     let Some(jdk) = jdk_or_skip("roadmap_metrics_inspection_criteria") else { return };
-    let probe = Probe::launch(&jdk, "MetricsProbe").expect("launch MetricsProbe");
+    let mut probe = Probe::launch(&jdk, "MetricsProbe").expect("launch MetricsProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let line = probe_line(&probe_source("MetricsProbe"), "// BP1");
     server.call(
@@ -1664,9 +1664,9 @@ fn traced_exception_breakpoints_record_throws_without_suspending() {
     let Some(jdk) = jdk_or_skip("traced_exception_breakpoints_record_throws_without_suspending") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
+    let mut probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // An exception request needs a concrete ref type, so the class must already be loaded — one tick
     // means integrate() has thrown at least once, which is what loads it.
@@ -1744,9 +1744,9 @@ fn an_exception_snapshot_carries_the_jvms_own_message() {
     let Some(jdk) = jdk_or_skip("an_exception_snapshot_carries_the_jvms_own_message") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "ExcMsgProbe").expect("launch ExcMsgProbe");
+    let mut probe = Probe::launch(&jdk, "ExcMsgProbe").expect("launch ExcMsgProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // An exception request needs a concrete ref type, so both throwing paths must have run once.
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
@@ -1817,9 +1817,9 @@ fn a_rethrow_chain_collapses_instead_of_spending_the_trace_budget() {
     let Some(jdk) = jdk_or_skip("a_rethrow_chain_collapses_instead_of_spending_the_trace_budget") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "RethrowProbe").expect("launch RethrowProbe");
+    let mut probe = Probe::launch(&jdk, "RethrowProbe").expect("launch RethrowProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The exception request needs a concrete ref type, so one full throw/rethrow cycle must have run.
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
@@ -1910,9 +1910,9 @@ fn a_traced_stop_point_that_disarms_mid_chain_leaves_nothing_suspended() {
     let Some(jdk) = jdk_or_skip("a_traced_stop_point_that_disarms_mid_chain_leaves_nothing_suspended") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "RethrowProbe").expect("launch RethrowProbe");
+    let mut probe = Probe::launch(&jdk, "RethrowProbe").expect("launch RethrowProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let base = highest_tick(&probe).expect("no tick to count from");
 
@@ -1951,7 +1951,7 @@ fn traced_watchpoints_record_writes_without_suspending() {
     let Some(jdk) = jdk_or_skip("traced_watchpoints_record_writes_without_suspending") else { return };
     let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start().expect("start server");
-    // `probe.attach(&mut server)` rather than `server.attach(probe.port)`: this is one of the two tests
+    // `probe.attach(&mut server)` rather than `probe.attach(&mut server)`: this is one of the two tests
     // that has been seen failing at attach with `Connection refused` (TEST-21, #56), and the difference
     // is what the failure says — the probe's own log and whether anything is listening on the port.
     probe.attach(&mut server);
@@ -2015,9 +2015,9 @@ fn traced_watchpoints_record_writes_without_suspending() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn traced_hits_record_which_caller_reached_them() {
     let Some(jdk) = jdk_or_skip("traced_hits_record_which_caller_reached_them") else { return };
-    let probe = Probe::launch(&jdk, "CallerProbe").expect("launch CallerProbe");
+    let mut probe = Probe::launch(&jdk, "CallerProbe").expect("launch CallerProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let base = highest_tick(&probe).expect("no tick to count from");
@@ -2104,9 +2104,9 @@ fn trace_frames_zero_keeps_the_one_frame_snapshot_and_the_cap_is_reported() {
     else {
         return;
     };
-    let probe = Probe::launch(&jdk, "CallerProbe").expect("launch CallerProbe");
+    let mut probe = Probe::launch(&jdk, "CallerProbe").expect("launch CallerProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let src = probe_source("CallerProbe");
@@ -2175,9 +2175,9 @@ fn a_raised_trace_max_length_captures_a_payload_the_default_cuts() {
     let Some(jdk) = jdk_or_skip("a_raised_trace_max_length_captures_a_payload_the_default_cuts") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "PayloadProbe").expect("launch PayloadProbe");
+    let mut probe = Probe::launch(&jdk, "PayloadProbe").expect("launch PayloadProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The probe's own account of what it is holding. Everything below is asserted against these.
     let announced = probe
@@ -2299,9 +2299,9 @@ fn a_raised_trace_max_length_captures_a_payload_the_default_cuts() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_traced_stop_point_reports_its_observed_capture_cost() {
     let Some(jdk) = jdk_or_skip("a_traced_stop_point_reports_its_observed_capture_cost") else { return };
-    let probe = Probe::launch(&jdk, "CallerProbe").expect("launch CallerProbe");
+    let mut probe = Probe::launch(&jdk, "CallerProbe").expect("launch CallerProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
@@ -2472,9 +2472,9 @@ fn number_before(line: &str, suffix: &str) -> Option<f64> {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn thread_dump_shows_stacks_and_the_deadlock_cycle() {
     let Some(jdk) = jdk_or_skip("thread_dump_shows_stacks_and_the_deadlock_cycle") else { return };
-    let probe = Probe::launch(&jdk, "DeadlockProbe").expect("launch DeadlockProbe");
+    let mut probe = Probe::launch(&jdk, "DeadlockProbe").expect("launch DeadlockProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // `armed=2` means both threads hold their first lock and are reaching for the second, so the cycle
     // has formed. Dumping before that would race the deadlock into existence.
@@ -2559,9 +2559,9 @@ fn a_monitors_only_dump_finds_the_cycle_for_a_fraction_of_the_packets() {
     let Some(jdk) = jdk_or_skip("a_monitors_only_dump_finds_the_cycle_for_a_fraction_of_the_packets") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "DeadlockProbe").expect("launch DeadlockProbe");
+    let mut probe = Probe::launch(&jdk, "DeadlockProbe").expect("launch DeadlockProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe
         .wait_for_line(EVENT_TIMEOUT, |l| l.contains("armed=2"))
@@ -2652,9 +2652,9 @@ fn a_monitors_only_dump_finds_the_cycle_for_a_fraction_of_the_packets() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_tostring_that_never_returns_is_bounded_and_reported() {
     let Some(jdk) = jdk_or_skip("a_tostring_that_never_returns_is_bounded_and_reported") else { return };
-    let probe = Probe::launch(&jdk, "SlowToStringProbe").expect("launch SlowToStringProbe");
+    let mut probe = Probe::launch(&jdk, "SlowToStringProbe").expect("launch SlowToStringProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let line = probe_line(&probe_source("SlowToStringProbe"), "// BP1");
     server
@@ -2725,7 +2725,7 @@ fn a_filter_pinned_to_a_retired_thread_reports_itself_as_dead() {
     };
     let mut probe = Probe::launch(&jdk, "PoolProbe").expect("launch PoolProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
@@ -2835,9 +2835,9 @@ fn a_thread_filter_holds_against_a_real_pool_of_reused_threads() {
     let Some(jdk) = jdk_or_skip("a_thread_filter_holds_against_a_real_pool_of_reused_threads") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "PoolProbe").expect("launch PoolProbe");
+    let mut probe = Probe::launch(&jdk, "PoolProbe").expect("launch PoolProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // TEST-39: wait for the pool the premise below needs, rather than for A heartbeat.
     //
@@ -2936,9 +2936,9 @@ fn a_dump_reports_how_long_it_held_the_vm_and_a_budget_bounds_it() {
     let Some(jdk) = jdk_or_skip("a_dump_reports_how_long_it_held_the_vm_and_a_budget_bounds_it") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "ManyThreadsProbe").expect("launch ManyThreadsProbe");
+    let mut probe = Probe::launch(&jdk, "ManyThreadsProbe").expect("launch ManyThreadsProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let base = highest_tick(&probe).expect("no tick to count from");
@@ -3010,9 +3010,9 @@ fn a_production_shaped_dump_costs_a_bounded_number_of_packets_per_thread() {
     else {
         return;
     };
-    let probe = Probe::launch(&jdk, "PoolShapeProbe").expect("launch PoolShapeProbe");
+    let mut probe = Probe::launch(&jdk, "PoolShapeProbe").expect("launch PoolShapeProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     // The workers descend 60 frames before parking; the tick line is printed only after all 300 are down.
     probe
         .wait_for_line(std::time::Duration::from_secs(60), |l| l.starts_with("tick "))
@@ -3086,9 +3086,9 @@ fn a_production_shaped_dump_costs_a_bounded_number_of_packets_per_thread() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_heterogeneous_pool_pays_only_for_its_distinct_frames() {
     let Some(jdk) = jdk_or_skip("a_heterogeneous_pool_pays_only_for_its_distinct_frames") else { return };
-    let probe = Probe::launch(&jdk, "MixedPoolProbe").expect("launch MixedPoolProbe");
+    let mut probe = Probe::launch(&jdk, "MixedPoolProbe").expect("launch MixedPoolProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe
         .wait_for_line(std::time::Duration::from_secs(60), |l| l.starts_with("tick "))
         .expect("MixedPoolProbe never finished starting its pool");
@@ -3135,9 +3135,9 @@ fn a_heterogeneous_pool_pays_only_for_its_distinct_frames() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_deep_dump_resolves_each_frames_own_source_line() {
     let Some(jdk) = jdk_or_skip("a_deep_dump_resolves_each_frames_own_source_line") else { return };
-    let probe = Probe::launch(&jdk, "PoolShapeProbe").expect("launch PoolShapeProbe");
+    let mut probe = Probe::launch(&jdk, "PoolShapeProbe").expect("launch PoolShapeProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe
         .wait_for_line(std::time::Duration::from_secs(60), |l| l.starts_with("tick "))
         .expect("PoolShapeProbe never finished starting its pool");
@@ -3338,9 +3338,9 @@ fn thread_dump_works_read_only_and_never_suspends_on_its_own() {
     let Some(jdk) = jdk_or_skip("thread_dump_works_read_only_and_never_suspends_on_its_own") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "DeadlockProbe").expect("launch DeadlockProbe");
+    let mut probe = Probe::launch(&jdk, "DeadlockProbe").expect("launch DeadlockProbe");
     let mut server = Server::start_with_env(&[("JDWP_READONLY", "1")]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("armed=2")).expect("probe never armed");
     let base = highest_tick(&probe).expect("no tick to count from");
 
@@ -3383,9 +3383,9 @@ fn thread_dump_works_read_only_and_never_suspends_on_its_own() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn method_exit_reports_the_value_each_return_produced() {
     let Some(jdk) = jdk_or_skip("method_exit_reports_the_value_each_return_produced") else { return };
-    let probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
+    let mut probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let base = highest_tick(&probe).expect("no tick to count from");
@@ -3482,9 +3482,9 @@ fn a_broad_suspending_method_exit_is_refused_and_panic_clears_the_rest() {
     let Some(jdk) = jdk_or_skip("a_broad_suspending_method_exit_is_refused_and_panic_clears_the_rest") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
+    let mut probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let base = highest_tick(&probe).expect("no tick to count from");
 
@@ -3552,9 +3552,9 @@ fn a_broad_suspending_method_exit_is_refused_and_panic_clears_the_rest() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn events_are_buffered_so_a_second_hit_doesnt_erase_the_first() {
     let Some(jdk) = jdk_or_skip("events_are_buffered_so_a_second_hit_doesnt_erase_the_first") else { return };
-    let probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
+    let mut probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // A breakpoint then a step: two suspending events in a row, the second arriving before anything
     // has read the first. Single-threaded and deterministic, unlike racing two threads at one line.
@@ -3624,9 +3624,9 @@ fn events_are_buffered_so_a_second_hit_doesnt_erase_the_first() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn get_stack_node_budget_bounds_the_whole_call() {
     let Some(jdk) = jdk_or_skip("get_stack_node_budget_bounds_the_whole_call") else { return };
-    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let line = probe_line(&probe_source("DeepProbe"), "// BP1");
     server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
@@ -3693,9 +3693,9 @@ fn get_stack_node_budget_bounds_the_whole_call() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn subscript_writes_and_map_entry_filters() {
     let Some(jdk) = jdk_or_skip("subscript_writes_and_map_entry_filters") else { return };
-    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let line = probe_line(&probe_source("DeepProbe"), "// BP1");
     server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
@@ -4008,9 +4008,9 @@ fn session_id_from(attach_reply: &str) -> Option<String> {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn deep_expansion_stays_within_its_packet_budget() {
     let Some(jdk) = jdk_or_skip("deep_expansion_stays_within_its_packet_budget") else { return };
-    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let line = probe_line(&probe_source("DeepProbe"), "// BP1");
     server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
@@ -4125,9 +4125,9 @@ fn count_trace_records(traces: &str) -> usize {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn watchdog_auto_resumes_and_disarms_the_offending_breakpoint() {
     let Some(jdk) = jdk_or_skip("watchdog_auto_resumes_and_disarms_the_offending_breakpoint") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "1")]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
@@ -4182,9 +4182,9 @@ fn watchdog_auto_resumes_and_disarms_the_offending_breakpoint() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_watchdog_note_is_not_replayed_next_to_a_newer_hit() {
     let Some(jdk) = jdk_or_skip("a_watchdog_note_is_not_replayed_next_to_a_newer_hit") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "1")]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
     let src = probe_source("WatchProbe");
@@ -4243,9 +4243,9 @@ fn a_watchdog_note_is_not_replayed_next_to_a_newer_hit() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn watchdog_zero_disables_the_auto_resume() {
     let Some(jdk) = jdk_or_skip("watchdog_zero_disables_the_auto_resume") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
@@ -4274,9 +4274,9 @@ fn watchdog_zero_disables_the_auto_resume() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn watchdog_clears_a_pending_single_step() {
     let Some(jdk) = jdk_or_skip("watchdog_clears_a_pending_single_step") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "1")]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
@@ -4307,11 +4307,11 @@ fn watchdog_clears_a_pending_single_step() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn disconnect_resumes_and_clears_instead_of_freezing() {
     let Some(jdk) = jdk_or_skip("disconnect_resumes_and_clears_instead_of_freezing") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     // Watchdog disabled, so ONLY the disconnect can rescue the VM — otherwise the watchdog could be
     // what resumes it and the test would pass without disconnect doing its job.
     let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
-    let attach = server.attach(probe.port);
+    let attach = probe.attach(&mut server);
     let sid = session_id_from(&attach).expect("no session id");
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
@@ -4342,9 +4342,9 @@ fn disconnect_resumes_and_clears_instead_of_freezing() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn trace_budget_disarms_and_get_traces_filters() {
     let Some(jdk) = jdk_or_skip("trace_budget_disarms_and_get_traces_filters") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let base = highest_tick(&probe).expect("no tick to count from");
@@ -4424,9 +4424,9 @@ fn trace_budget_disarms_and_get_traces_filters() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn thread_filter_reports_only_the_chosen_thread() {
     let Some(jdk) = jdk_or_skip("thread_filter_reports_only_the_chosen_thread") else { return };
-    let probe = Probe::launch(&jdk, "ThreadProbe").expect("launch ThreadProbe");
+    let mut probe = Probe::launch(&jdk, "ThreadProbe").expect("launch ThreadProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // Both threads must be running (so both are throwing, and the exception class is loaded) before we
     // can read their ids or arm a filter.
@@ -4488,9 +4488,9 @@ fn thread_filter_reports_only_the_chosen_thread() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn boolean_operators_in_predicates_and_conditions() {
     let Some(jdk) = jdk_or_skip("boolean_operators_in_predicates_and_conditions") else { return };
-    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let line = probe_line(&probe_source("DeepProbe"), "// BP1");
     server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
@@ -4918,9 +4918,9 @@ fn assert_failed_escalation_is_honest(jdk: &Jdk, fault: SuspendFault) {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn toggle_stop_point_disables_and_rearms() {
     let Some(jdk) = jdk_or_skip("toggle_stop_point_disables_and_rearms") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
@@ -4997,9 +4997,9 @@ fn toggle_stop_point_disables_and_rearms() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn watchdog_rescues_a_manual_pause() {
     let Some(jdk) = jdk_or_skip("watchdog_rescues_a_manual_pause") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "1")]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
@@ -5038,12 +5038,12 @@ fn watchdog_rescues_a_manual_pause() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn watchdog_disarms_even_after_the_events_were_drained() {
     let Some(jdk) = jdk_or_skip("watchdog_disarms_even_after_the_events_were_drained") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     // 5s, not 1s: the drain has to land BEFORE the watchdog fires, or the watchdog reads the event it
     // was always going to read and the test proves nothing. (Measured: with 1s it passed even against
     // the old `events.back()` derivation, because the resume raced ahead of the drain.)
     let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "5")]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
@@ -5096,9 +5096,9 @@ fn watchdog_disarms_even_after_the_events_were_drained() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn read_only_blocks_every_invocation_path() {
     let Some(jdk) = jdk_or_skip("read_only_blocks_every_invocation_path") else { return };
-    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
     let mut server = Server::start_with_env(&[("JDWP_READONLY", "1")]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let line = probe_line(&probe_source("DeepProbe"), "// BP1");
     server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
@@ -5185,9 +5185,9 @@ fn read_only_blocks_every_invocation_path() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn toggling_a_deferred_breakpoint_explains_itself() {
     let Some(jdk) = jdk_or_skip("toggling_a_deferred_breakpoint_explains_itself") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // A class the probe will never load, so the breakpoint stays deferred.
     let set = server.call(
@@ -5225,9 +5225,9 @@ fn toggling_a_deferred_breakpoint_explains_itself() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn set_value_copies_a_live_reference_and_refuses_a_mismatch() {
     let Some(jdk) = jdk_or_skip("set_value_copies_a_live_reference_and_refuses_a_mismatch") else { return };
-    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let line = probe_line(&probe_source("DeepProbe"), "// BP1");
     server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
@@ -5262,9 +5262,9 @@ fn set_value_copies_a_live_reference_and_refuses_a_mismatch() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn read_only_refuses_mutation_but_allows_reads() {
     let Some(jdk) = jdk_or_skip("read_only_refuses_mutation_but_allows_reads") else { return };
-    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
     let mut server = Server::start_with_env(&[("JDWP_READONLY", "1")]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     assert_contains_all(
         "read-only is flagged in list_sessions",
@@ -5318,10 +5318,10 @@ fn read_only_refuses_mutation_but_allows_reads() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn pause_is_idempotent_and_continue_clears_any_suspend_depth() {
     let Some(jdk) = jdk_or_skip("pause_is_idempotent_and_continue_clears_any_suspend_depth") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     // Watchdog off: this test is about the tools' own resume arithmetic, not the rescue.
     let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "0")]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
     server.call("debug.pause", serde_json::json!({}));
@@ -5347,9 +5347,9 @@ fn pause_is_idempotent_and_continue_clears_any_suspend_depth() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn pausing_at_a_breakpoint_keeps_the_disarm_target() {
     let Some(jdk) = jdk_or_skip("pausing_at_a_breakpoint_keeps_the_disarm_target") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "5")]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
     let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
@@ -5393,9 +5393,9 @@ fn pausing_at_a_breakpoint_keeps_the_disarm_target() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn rearming_reresolves_by_name_and_reports_a_missing_class() {
     let Some(jdk) = jdk_or_skip("rearming_reresolves_by_name_and_reports_a_missing_class") else { return };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
     // A traced watchpoint, so nothing freezes while we toggle it.
@@ -6340,9 +6340,9 @@ fn panic_releases_a_per_thread_suspend_and_names_it() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn rearming_survives_a_classloader_reload() {
     let Some(jdk) = jdk_or_skip("rearming_survives_a_classloader_reload") else { return };
-    let probe = Probe::launch(&jdk, "ReloadProbe").expect("launch ReloadProbe");
+    let mut probe = Probe::launch(&jdk, "ReloadProbe").expect("launch ReloadProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // Wait until Worker exists at all (it is compiled and loaded at runtime).
     probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick ")).expect("probe never ticked");
@@ -6417,9 +6417,9 @@ fn rearming_survives_a_classloader_reload() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn list_classes_finds_loaded_types_and_bounds_the_answer() {
     let Some(jdk) = jdk_or_skip("list_classes_finds_loaded_types_and_bounds_the_answer") else { return };
-    let probe = eval_probe_running(&jdk);
+    let mut probe = eval_probe_running(&jdk);
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // Substring match finds the probe and its nested classes.
     let mine = server.call("debug.list_classes", serde_json::json!({"filter": "EvalProbe"}));
@@ -6467,9 +6467,9 @@ fn list_classes_finds_loaded_types_and_bounds_the_answer() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn list_methods_renders_java_signatures_and_marks_static() {
     let Some(jdk) = jdk_or_skip("list_methods_renders_java_signatures_and_marks_static") else { return };
-    let probe = eval_probe_running(&jdk);
+    let mut probe = eval_probe_running(&jdk);
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     disc2_method_listing(&mut server);
 }
 
@@ -6508,13 +6508,13 @@ fn a_probe_that_has_not_run_yet_reads_as_a_race_rather_than_an_unloaded_class() 
         return;
     };
     // Long enough to attach and ask a question inside the window, short enough not to pad the suite.
-    let probe = Probe::launch_delayed(&jdk, "EvalProbe", std::time::Duration::from_secs(8))
+    let mut probe = Probe::launch_delayed(&jdk, "EvalProbe", std::time::Duration::from_secs(8))
         .expect("launch EvalProbe");
 
     // The trap in three lines: attaching succeeds against a debuggee that has run no code at all, and the
     // discovery tool then answers correctly and uselessly. This is what the three tests were asserting on.
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     let too_early = server.call("debug.list_classes", serde_json::json!({"filter": "EvalProbe"}));
     assert!(too_early.starts_with("0/0 "), "EvalProbe cannot be loaded this early: {too_early}");
     assert!(
@@ -6604,9 +6604,9 @@ fn disc2_method_listing(server: &mut Server) -> Vec<String> {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn list_fields_renders_java_declarations_and_marks_static() {
     let Some(jdk) = jdk_or_skip("list_fields_renders_java_declarations_and_marks_static") else { return };
-    let probe = eval_probe_running(&jdk);
+    let mut probe = eval_probe_running(&jdk);
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     disc5_field_listing(&mut server);
 }
 
@@ -7028,13 +7028,13 @@ fn source_reports_the_compiled_from_file_and_reads_a_window_from_a_root() {
     else {
         return;
     };
-    let probe = eval_probe_running(&jdk);
+    let mut probe = eval_probe_running(&jdk);
     // `examples/probes` is a source root of exactly the shape the tool expects: EvalProbe is in the
     // default package, so its file sits directly in the root with no package directories between.
     let root = probe_source_path("EvalProbe").parent().expect("probe source has a parent").to_path_buf();
     let root_str = root.to_string_lossy().into_owned();
     let mut server = Server::start_with_env(&[("JDWP_SOURCE_ROOTS", &root_str)]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let source = probe_source("EvalProbe");
     let total = source.lines().count();
@@ -7204,7 +7204,7 @@ fn source_says_when_a_loaded_class_carries_no_source_file_attribute() {
     let Some(jdk) = jdk_or_skip("source_says_when_a_loaded_class_carries_no_source_file_attribute") else {
         return;
     };
-    let probe = Probe::launch_stripped(&jdk, "StrippedProbe").expect("launch StrippedProbe");
+    let mut probe = Probe::launch_stripped(&jdk, "StrippedProbe").expect("launch StrippedProbe");
     // Wait for it to actually be RUNNING, not merely accepting a JDWP connection. The agent listens
     // before the main class is loaded, and this test's entire premise is the difference between "loaded
     // but stripped" and "not loaded" — so racing the class load turns the assertion into a coin flip that
@@ -7213,7 +7213,7 @@ fn source_says_when_a_loaded_class_carries_no_source_file_attribute() {
     // is the same one, and so is the failure text (TEST-17, #49).
     probe.wait_until_running(EVENT_TIMEOUT, |l| tick_index(l).is_some()).unwrap_or_else(|e| panic!("{e}"));
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let stripped =
         server.call("debug.source", serde_json::json!({"class_name": "StrippedProbe", "source_roots": []}));
@@ -7276,13 +7276,13 @@ fn source_reports_the_smap_when_the_class_was_translated_from_another_file() {
     else {
         return;
     };
-    let probe = Probe::launch_with_smap(&jdk, "SmapProbe").expect("launch SmapProbe");
+    let mut probe = Probe::launch_with_smap(&jdk, "SmapProbe").expect("launch SmapProbe");
     // Same race as the stripped probe above: the agent listens before the classes are loaded. Waiting for
     // a tick settles both at once — the heartbeat prints `Neighbour.touched`, so a tick proves the control
     // class is loaded too, and the control is the whole reason a passing SMAP assertion means anything.
     probe.wait_until_running(EVENT_TIMEOUT, |l| tick_index(l).is_some()).unwrap_or_else(|e| panic!("{e}"));
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // Needs no local file: the SMAP travels in the class, so this half answers on a box holding no
     // source at all — which is the half that matters when the question is what the deployed thing is.
@@ -7645,9 +7645,9 @@ fn a_default_dump_and_a_default_listing_reach_a_pool_the_debuggee_started_last()
     else {
         return;
     };
-    let probe = Probe::launch(&jdk, "ChurnProbe").expect("launch ChurnProbe");
+    let mut probe = Probe::launch(&jdk, "ChurnProbe").expect("launch ChurnProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // A full generation must have turned over first — the stable eight are started only after all 48
     // churn slots have been staggered, so a dump taken before that would be a dump of half a probe.
@@ -7884,9 +7884,9 @@ fn a_contended_lock_names_its_real_holder_out_of_four() {
     const PROBE_LOCK: &str = "ContendedProbe$Lock";
 
     let Some(jdk) = jdk_or_skip("a_contended_lock_names_its_real_holder_out_of_four") else { return };
-    let probe = Probe::launch(&jdk, "ContendedProbe").expect("launch ContendedProbe");
+    let mut probe = Probe::launch(&jdk, "ContendedProbe").expect("launch ContendedProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The probe polls every waiter's own `getState()` and only says `armed` once all 48 report BLOCKED,
     // so this is the JVM's answer rather than a sleep long enough to look like one.
@@ -8044,9 +8044,9 @@ fn frame_line<'a>(stack: &'a str, needle: &str) -> Option<&'a str> {
 #[allow(clippy::too_many_lines)]
 fn synthetic_frames_render_with_names_a_reader_can_act_on() {
     let Some(jdk) = jdk_or_skip("synthetic_frames_render_with_names_a_reader_can_act_on") else { return };
-    let probe = Probe::launch(&jdk, "SyntheticProbe").expect("launch SyntheticProbe");
+    let mut probe = Probe::launch(&jdk, "SyntheticProbe").expect("launch SyntheticProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // `parked` means the whole chain is on the worker's stack — main polls the worker's own `getState()`
     // for it, so this is not a sleep dressed up as a barrier.
@@ -8250,9 +8250,9 @@ fn a_hidden_class_answers_questions_asked_under_the_name_the_stack_printed() {
     else {
         return;
     };
-    let probe = Probe::launch(&jdk, "SyntheticProbe").expect("launch SyntheticProbe");
+    let mut probe = Probe::launch(&jdk, "SyntheticProbe").expect("launch SyntheticProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // Same barrier as the SIG-1 test above, and for the same reason: `parked` means the whole chain is on
     // the worker's stack, and both waits must happen before the pause freezes the thread that prints them.
@@ -8418,9 +8418,9 @@ fn every_primitive_and_its_array_renders_the_same_as_local_field_and_element() {
     else {
         return;
     };
-    let probe = Probe::launch(&jdk, "PrimitiveProbe").expect("launch PrimitiveProbe");
+    let mut probe = Probe::launch(&jdk, "PrimitiveProbe").expect("launch PrimitiveProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let source = probe_source("PrimitiveProbe");
     let line = probe_line(&source, "// BP1");
@@ -8621,10 +8621,10 @@ fn bytecode_catches_a_same_line_edit_that_the_line_table_calls_clean() {
     let Some(jdk) = jdk_or_skip("bytecode_catches_a_same_line_edit_that_the_line_table_calls_clean") else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The JVM is running `v = 1`; the build on disk says `v = 2`. Nothing else differs.
     let edited = swap_probe_returning(&jdk, 2);
@@ -8664,10 +8664,10 @@ fn bytecode_comparison_does_not_cry_stale_on_the_running_build() {
     let Some(jdk) = jdk_or_skip("bytecode_comparison_does_not_cry_stale_on_the_running_build") else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The running source, recompiled by the same javac. A comment-only edit moves no line and changes no
     // byte, so both evidences must come back clean.
@@ -8710,9 +8710,9 @@ fn a_pool_parked_at_one_site_collapses_into_one_counted_entry() {
     let Some(jdk) = jdk_or_skip("a_pool_parked_at_one_site_collapses_into_one_counted_entry") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "ManyThreadsProbe").expect("launch ManyThreadsProbe");
+    let mut probe = Probe::launch(&jdk, "ManyThreadsProbe").expect("launch ManyThreadsProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
     let base = highest_tick(&probe).expect("no tick to count from");
 
@@ -8782,9 +8782,9 @@ fn a_truncated_grouped_dump_says_its_count_is_over_what_it_read() {
     let Some(jdk) = jdk_or_skip("a_truncated_grouped_dump_says_its_count_is_over_what_it_read") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "ManyThreadsProbe").expect("launch ManyThreadsProbe");
+    let mut probe = Probe::launch(&jdk, "ManyThreadsProbe").expect("launch ManyThreadsProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
 
     // The default limit against 60 workers plus the JVM's own threads: the limit binds.
@@ -8821,11 +8821,11 @@ fn a_truncated_grouped_dump_says_its_count_is_over_what_it_read() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn two_trace_expressions_record_both_values_in_one_snapshot() {
     let Some(jdk) = jdk_or_skip("two_trace_expressions_record_both_values_in_one_snapshot") else { return };
-    let probe = Probe::launch_running(&jdk, "TenantProbe", |l| l.starts_with("handled "))
+    let mut probe = Probe::launch_running(&jdk, "TenantProbe", |l| l.starts_with("handled "))
         .expect("launch TenantProbe");
     let line = probe_line(&probe_source("TenantProbe"), "TRACE_LINE");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let armed = server.call(
         "debug.set_line_stop",
@@ -8895,11 +8895,11 @@ fn one_expression_is_unnumbered_and_a_failing_element_keeps_the_others() {
     let Some(jdk) = jdk_or_skip("one_expression_is_unnumbered_and_a_failing_element_keeps_the_others") else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "TenantProbe", |l| l.starts_with("handled "))
+    let mut probe = Probe::launch_running(&jdk, "TenantProbe", |l| l.starts_with("handled "))
         .expect("launch TenantProbe");
     let line = probe_line(&probe_source("TenantProbe"), "TRACE_LINE");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // A single string: unnumbered label, and the rendering every earlier trace test asserts against.
     let single = server.call(
@@ -8950,11 +8950,11 @@ fn too_many_trace_expressions_are_clamped_and_the_reply_names_what_it_dropped() 
     else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "TenantProbe", |l| l.starts_with("handled "))
+    let mut probe = Probe::launch_running(&jdk, "TenantProbe", |l| l.starts_with("handled "))
         .expect("launch TenantProbe");
     let line = probe_line(&probe_source("TenantProbe"), "TRACE_LINE");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let armed = server.call(
         "debug.set_line_stop",
@@ -8991,10 +8991,10 @@ fn a_suspending_stop_point_escalates_a_trace_on_the_same_line_and_says_so() {
     else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let traced = server.call(
         "debug.set_line_stop",
@@ -9071,10 +9071,10 @@ fn arming_a_trace_onto_an_already_suspending_line_warns_it_will_not_be_cheap() {
     else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let suspending =
         server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "SwapProbe", "line": 39}));
@@ -9113,10 +9113,10 @@ fn two_traced_stop_points_on_one_line_do_not_warn_and_do_not_freeze() {
     let Some(jdk) = jdk_or_skip("two_traced_stop_points_on_one_line_do_not_warn_and_do_not_freeze") else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let args = serde_json::json!({"class_pattern": "SwapProbe", "line": 39, "trace": true});
     let first = server.call("debug.set_line_stop", args.clone());
@@ -9169,10 +9169,10 @@ struct ForecastCase {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn each_predicted_refusal_matches_the_code_the_jvm_answers() {
     let Some(jdk) = jdk_or_skip("each_predicted_refusal_matches_the_code_the_jvm_answers") else { return };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let cases = [
         ForecastCase {
@@ -9266,10 +9266,10 @@ fn a_body_only_change_is_forecast_clean_and_the_jvm_installs_it() {
     let Some(jdk) = jdk_or_skip("a_body_only_change_is_forecast_clean_and_the_jvm_installs_it") else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let edited = swap_probe_returning(&jdk, 7);
     let root = serde_json::json!([edited.path().display().to_string()]);
@@ -9433,14 +9433,14 @@ fn probe_source_window(
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_source_window_over_stale_bytecode_says_so() {
     let Some(jdk) = jdk_or_skip("a_source_window_over_stale_bytecode_says_so") else { return };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     // The JVM runs the checked-in probe; the build on disk has two lines inserted above `answer()`, so
     // every line number in it moved. The source under `src` matches that build, which keeps this test
     // about the build-versus-JVM axis alone.
     let shifted = swap_probe_with_shifted_lines(&jdk);
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let out = probe_source_window(&mut server, &shifted.path().join("src"), Some(shifted.path()));
 
@@ -9460,7 +9460,7 @@ fn a_source_window_over_stale_bytecode_says_so() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_source_window_over_the_running_build_is_unchanged() {
     let Some(jdk) = jdk_or_skip("a_source_window_over_the_running_build_is_unchanged") else { return };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     // `compile_probe_variant` refuses a no-op edit, so the change is a comment: it moves no line and
     // alters no bytecode, and it writes the `.class` after the `.java` — the normal order.
@@ -9470,7 +9470,7 @@ fn a_source_window_over_the_running_build_is_unchanged() {
     })
     .expect("recompile the unmodified probe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let out = probe_source_window(&mut server, &current.path().join("src"), Some(current.path()));
 
@@ -9493,7 +9493,7 @@ fn a_source_file_too_short_for_the_running_line_table_is_reported() {
     let Some(jdk) = jdk_or_skip("a_source_file_too_short_for_the_running_line_table_is_reported") else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     // A class root holding the very build the JVM is running, so axis one is clean by construction.
     let matching = tempfile::tempdir().expect("tempdir for the matching build");
@@ -9505,7 +9505,7 @@ fn a_source_file_too_short_for_the_running_line_table_is_reported() {
     std::fs::write(short.path().join("SwapProbe.java"), head.join("\n")).expect("write the short source");
 
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let out = probe_source_window(&mut server, short.path(), Some(matching.path()));
 
@@ -9562,10 +9562,10 @@ fn a_source_window_with_no_class_root_says_it_could_not_check() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_hot_reload_changes_what_a_running_jvm_prints() {
     let Some(jdk) = jdk_or_skip("a_hot_reload_changes_what_a_running_jvm_prints") else { return };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let classes = swap_probe_returning(&jdk, 2);
     let root = classes.path().display().to_string();
@@ -9623,10 +9623,10 @@ fn a_reloaded_class_is_reported_as_outstanding_when_the_session_ends() {
     let Some(jdk) = jdk_or_skip("a_reloaded_class_is_reported_as_outstanding_when_the_session_ends") else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let classes = swap_probe_returning(&jdk, 2);
     let root = classes.path().display().to_string();
@@ -9681,10 +9681,10 @@ fn a_session_that_reloaded_nothing_mentions_no_residue_on_disconnect() {
     let Some(jdk) = jdk_or_skip("a_session_that_reloaded_nothing_mentions_no_residue_on_disconnect") else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let disconnected = server.call("debug.disconnect", serde_json::json!({}));
 
@@ -9711,10 +9711,10 @@ fn a_swap_hotspot_cannot_accept_names_the_edit_and_says_a_redeploy_is_needed() {
     else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // (what the edit does, how to make it, what the reply must say)
     let cases: [(&str, SourceEdit, &str); 3] = [
@@ -9804,10 +9804,10 @@ fn a_reload_of_the_method_you_are_stopped_in_takes_effect_when_the_frame_is_popp
     else {
         return;
     };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let line = probe_line(&probe_source("SwapProbe"), "// SWAP_VALUE");
     server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "SwapProbe", "line": line}));
@@ -9892,10 +9892,10 @@ fn a_reload_of_the_method_you_are_stopped_in_takes_effect_when_the_frame_is_popp
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn read_only_refuses_a_reload_but_still_answers_a_dry_run() {
     let Some(jdk) = jdk_or_skip("read_only_refuses_a_reload_but_still_answers_a_dry_run") else { return };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start_with_env(&[("JDWP_READONLY", "1")]).expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let classes = swap_probe_returning(&jdk, 4);
     let root = classes.path().display().to_string();
@@ -9945,10 +9945,10 @@ fn read_only_refuses_a_reload_but_still_answers_a_dry_run() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_stale_build_is_detected_and_a_current_one_is_not() {
     let Some(jdk) = jdk_or_skip("a_stale_build_is_detected_and_a_current_one_is_not") else { return };
-    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+    let mut probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
         .expect("launch SwapProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The control: the very source the running JVM was built from, compiled again. Anything but "match"
     // here is a false positive, and a false positive is what kills a detector.
@@ -10048,9 +10048,9 @@ fn a_stale_build_is_detected_and_a_current_one_is_not() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_class_with_no_debug_info_cannot_be_checked_and_says_so() {
     let Some(jdk) = jdk_or_skip("a_class_with_no_debug_info_cannot_be_checked_and_says_so") else { return };
-    let probe = Probe::launch_stripped(&jdk, "StrippedProbe").expect("launch StrippedProbe");
+    let mut probe = Probe::launch_stripped(&jdk, "StrippedProbe").expect("launch StrippedProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // Compiled with -g here, deliberately: the JVM side has no line tables (the probe is launched
     // `-g:none`), so this is the *asymmetric* case — a build that could be compared against and a
@@ -10404,9 +10404,9 @@ fn a_severed_connection_is_reported_as_one_while_the_debuggee_lives_on() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn evaluate_chain_names_the_link_that_went_null() {
     let Some(jdk) = jdk_or_skip("evaluate_chain_names_the_link_that_went_null") else { return };
-    let probe = Probe::launch(&jdk, "ChainProbe").expect("launch ChainProbe");
+    let mut probe = Probe::launch(&jdk, "ChainProbe").expect("launch ChainProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let line = probe_line(&probe_source("ChainProbe"), "// BP_CHAIN");
     server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "ChainProbe", "line": line}));
@@ -10471,9 +10471,9 @@ fn evaluate_chain_names_the_link_that_went_null() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn a_finally_line_arms_every_copy_javac_emitted() {
     let Some(jdk) = jdk_or_skip("a_finally_line_arms_every_copy_javac_emitted") else { return };
-    let probe = Probe::launch(&jdk, "FinallyProbe").expect("launch FinallyProbe");
+    let mut probe = Probe::launch(&jdk, "FinallyProbe").expect("launch FinallyProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The class must already be LOADED, or the arm legitimately defers and returns a different reply.
     // A class loads on first use, so one `finally` line means `call()` has run and `FinallyProbe` is in
@@ -10567,9 +10567,9 @@ fn a_multi_location_stop_point_charges_its_budget_once_per_hit() {
     let Some(jdk) = jdk_or_skip("a_multi_location_stop_point_charges_its_budget_once_per_hit") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "FinallyProbe").expect("launch FinallyProbe");
+    let mut probe = Probe::launch(&jdk, "FinallyProbe").expect("launch FinallyProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The class must already be LOADED, or the arm legitimately defers and returns a different reply.
     // A class loads on first use, so one `finally` line means `call()` has run and `FinallyProbe` is in
@@ -10648,9 +10648,9 @@ fn a_listing_says_how_many_times_each_stop_point_has_fired() {
     let Some(jdk) = jdk_or_skip("a_listing_says_how_many_times_each_stop_point_has_fired") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "FinallyProbe").expect("launch FinallyProbe");
+    let mut probe = Probe::launch(&jdk, "FinallyProbe").expect("launch FinallyProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The class must already be LOADED, or the arm legitimately defers and returns a different reply.
     probe
@@ -10811,9 +10811,9 @@ fn an_enum_constant_and_a_static_field_work_as_call_arguments() {
     let Some(jdk) = jdk_or_skip("an_enum_constant_and_a_static_field_work_as_call_arguments") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "EnumArgProbe").expect("launch EnumArgProbe");
+    let mut probe = Probe::launch(&jdk, "EnumArgProbe").expect("launch EnumArgProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // A suspended frame, because invoking anything needs a thread suspended BY AN EVENT.
     let line = probe_line(&probe_source("EnumArgProbe"), "// BP1");
@@ -10882,9 +10882,9 @@ fn step_into_skips_the_jdk_by_default_and_steps_into_it_when_asked() {
     let Some(jdk) = jdk_or_skip("step_into_skips_the_jdk_by_default_and_steps_into_it_when_asked") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "StepFilterProbe").expect("launch StepFilterProbe");
+    let mut probe = Probe::launch(&jdk, "StepFilterProbe").expect("launch StepFilterProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe
         .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 1 "))
@@ -10973,9 +10973,9 @@ fn clearing_a_traced_stop_point_repeatedly_leaves_the_probe_running() {
     let Some(jdk) = jdk_or_skip("clearing_a_traced_stop_point_repeatedly_leaves_the_probe_running") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe
         .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some())
         .expect("probe never ticked, so it was never a witness");
@@ -11163,9 +11163,9 @@ fn a_counted_stop_point_fires_on_the_nth_hit_and_is_then_spent() {
     // The JVM answers JDWP for 8s before the probe's first instruction, so the arm happens with nothing
     // executed and the count starts from zero occurrences.
     let probe = Probe::launch_delayed(&jdk, "FinallyProbe", std::time::Duration::from_secs(8));
-    let probe = probe.expect("launch FinallyProbe delayed");
+    let mut probe = probe.expect("launch FinallyProbe delayed");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let src = probe_source("FinallyProbe");
     let line = probe_line(&src, "// BP2");
@@ -11243,9 +11243,9 @@ fn an_exception_stop_takes_a_hit_count_and_says_what_it_buys() {
     let Some(jdk) = jdk_or_skip("an_exception_stop_takes_a_hit_count_and_says_what_it_buys") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
+    let mut probe = Probe::launch(&jdk, "ExcProbe").expect("launch ExcProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // An exception request needs a concrete reference type, so the class must be loaded: no deferring.
     probe
@@ -11313,9 +11313,9 @@ fn a_method_exit_tally_counts_the_asked_for_method_only() {
     let Some(jdk) = jdk_or_skip("a_method_exit_tally_counts_the_asked_for_method_only") else {
         return;
     };
-    let probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
+    let mut probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // Loaded before arming, and the probe's own `calls=` counter is the witness that `classify` really
     // ran more than six times by the end.
@@ -11370,10 +11370,10 @@ fn byte_arrays_render_as_text_under_the_charset_the_caller_names() {
     };
     // `launch_running`, not `launch`: a class loads on first use, so reading loaded state before the
     // probe has executed anything gets a correct "not loaded" and asserts a wrong finding (TEST-17, #49).
-    let probe =
+    let mut probe =
         Probe::launch_running(&jdk, "BytesProbe", |l| l.starts_with("tick ")).expect("launch BytesProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // --- the charset, both ways round, on the two payloads actually in circulation ---
     //
@@ -11520,9 +11520,9 @@ fn byte_arrays_render_as_text_under_the_charset_the_caller_names() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn an_exact_class_name_arms_every_classloaders_copy() {
     let Some(jdk) = jdk_or_skip("an_exact_class_name_arms_every_classloaders_copy") else { return };
-    let probe = Probe::launch(&jdk, "TwinLoaderProbe").expect("launch TwinLoaderProbe");
+    let mut probe = Probe::launch(&jdk, "TwinLoaderProbe").expect("launch TwinLoaderProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The probe's own sanity line first. Without it a green test could mean the JVM collapsed the two
     // loaders into one type, in which case there is no multiplicity to arm and nothing was proven.
@@ -11649,7 +11649,7 @@ fn a_stop_point_armed_before_a_redeploy_arms_the_new_classloaders_copy_too() {
     };
     let mut probe = Probe::launch(&jdk, "RedeployProbe").expect("launch RedeployProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     probe.wait_for_line(EVENT_TIMEOUT, |l| l == "deployed v1").expect("probe never deployed v1");
     probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("ran v1:")).expect("v1's copy never ran");
@@ -11741,9 +11741,9 @@ fn a_member_on_only_one_classloaders_copy_resolves_and_the_reply_names_the_copy(
     else {
         return;
     };
-    let probe = Probe::launch(&jdk, "TwinMemberProbe").expect("launch TwinMemberProbe");
+    let mut probe = Probe::launch(&jdk, "TwinMemberProbe").expect("launch TwinMemberProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // The probe's own three premises, stated by the JVM rather than assumed by the test: the name loaded
     // twice, and each copy is missing the other's member. Without these a green run could mean the loaders
@@ -11830,10 +11830,10 @@ fn a_trace_expr_decodes_a_byte_array_and_reads_its_length_without_suspending() {
     else {
         return;
     };
-    let probe =
+    let mut probe =
         Probe::launch_running(&jdk, "BytesProbe", |l| l.starts_with("tick ")).expect("launch BytesProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     let base = highest_tick(&probe).expect("no tick to count from");
 
     let source = probe_source("BytesProbe");
@@ -11914,9 +11914,9 @@ fn a_heap_query_answers_by_exact_type_and_reports_the_pause_it_imposed() {
     };
     // `launch_running`: the ballast takes a moment to allocate and nothing is asked about a class that
     // has not been instantiated yet.
-    let probe = Probe::launch_running(&jdk, "HeapProbe", |l| l.starts_with("ready")).expect("launch");
+    let mut probe = Probe::launch_running(&jdk, "HeapProbe", |l| l.starts_with("ready")).expect("launch");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // A quiet stretch first, so the pause below is measured against this probe on this box rather than
     // against the 50ms the probe intends to sleep for.
@@ -12046,9 +12046,9 @@ fn a_snapshot_inside_an_anonymous_class_shows_the_enclosing_captures() {
     };
     // `launch_running`, not `launch`: the anonymous class does not exist until the warmup task has run
     // it, and arming before that would legitimately DEFER and prove nothing (TEST-17, #49).
-    let probe = Probe::launch_running(&jdk, "CapturedProbe", |l| l.starts_with("ready")).expect("launch");
+    let mut probe = Probe::launch_running(&jdk, "CapturedProbe", |l| l.starts_with("ready")).expect("launch");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let base = highest_tick(&probe).unwrap_or(-1);
     let src = probe_source("CapturedProbe");
@@ -12123,7 +12123,7 @@ fn an_object_handle_outlives_its_snapshot_and_reports_when_it_has_not() {
     };
     let mut probe = Probe::launch_running(&jdk, "CapturedProbe", |l| l.starts_with("ready")).expect("launch");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     let src = probe_source("CapturedProbe");
     server.call(
@@ -12239,10 +12239,10 @@ fn a_stop_point_scoped_to_one_object_ignores_its_twin_and_refuses_where_it_could
     else {
         return;
     };
-    let probe =
+    let mut probe =
         Probe::launch_running(&jdk, "InstProbe", |l| l.starts_with("ready")).expect("launch InstProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // `Boom` has to be loaded before an exception request can pin a ref type to it, and both instances
     // have to have run for the twin comparison to mean anything.
@@ -12420,7 +12420,7 @@ fn an_armed_instance_filter_pins_its_object_and_reports_it_once_that_is_released
     let mut probe =
         Probe::launch_running(&jdk, "InstProbe", |l| l.starts_with("ready")).expect("launch InstProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe
         .wait_for_line(EVENT_TIMEOUT, |l| l.contains("work Y 2"))
         .unwrap_or_else(|| panic!("the probe never worked twice\n  output: {:?}", probe.output()));
@@ -12529,10 +12529,10 @@ fn a_bare_name_resolves_against_the_frames_own_class_in_the_java_order() {
     let Some(jdk) = jdk_or_skip("a_bare_name_resolves_against_the_frames_own_class_in_the_java_order") else {
         return;
     };
-    let probe =
+    let mut probe =
         Probe::launch_running(&jdk, "BareNameProbe", |l| l.starts_with("ready")).expect("launch probe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe
         .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 2"))
         .unwrap_or_else(|| panic!("the probe never ticked twice\n  output: {:?}", probe.output()));
@@ -12632,10 +12632,10 @@ fn a_bare_name_resolves_against_the_frames_own_class_in_the_java_order() {
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn two_traced_stop_points_on_one_line_both_record() {
     let Some(jdk) = jdk_or_skip("two_traced_stop_points_on_one_line_both_record") else { return };
-    let probe =
+    let mut probe =
         Probe::launch_running(&jdk, "BareNameProbe", |l| l.starts_with("ready")).expect("launch probe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 2")).expect("probe never ticked");
 
     let line = probe_line(&probe_source("BareNameProbe"), "// BP4");
@@ -14491,10 +14491,10 @@ fn a_named_query_reports_its_over_match_without_flushing_or_initialising_anythin
     // `launch_in_package`, for the same reason EVAL-9's probe needs it: discovery turns on the
     // fully-qualified `jakarta.persistence.EntityManager`, so the stand-in has to be in that package and one
     // `.java` declares one package.
-    let probe =
+    let mut probe =
         Probe::launch_in_package(&jdk, "JpaProbe", "jakarta.persistence.JpaProbe").expect("launch JpaProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     // A SUSPENDING stop point in the frame that holds the bean as a parameter: it gives the free discovery
     // route something to find AND a thread suspended BY AN EVENT, which is the only kind JDWP will invoke on.
@@ -14625,10 +14625,10 @@ fn a_named_query_binds_by_position_and_keeps_its_two_failures_apart() {
     let Some(jdk) = jdk_or_skip("a_named_query_binds_by_position_and_keeps_its_two_failures_apart") else {
         return;
     };
-    let probe =
+    let mut probe =
         Probe::launch_in_package(&jdk, "JpaProbe", "jakarta.persistence.JpaProbe").expect("launch JpaProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
     server.call(
         "debug.set_line_stop",
         serde_json::json!({"class_pattern": "jakarta.persistence.JpaProbe", "method": "workWithEm"}),
@@ -14694,10 +14694,10 @@ fn a_named_query_with_no_bean_in_the_frame_names_the_two_step_instead_of_guessin
     else {
         return;
     };
-    let probe =
+    let mut probe =
         Probe::launch_in_package(&jdk, "JpaProbe", "jakarta.persistence.JpaProbe").expect("launch JpaProbe");
     let mut server = Server::start().expect("start server");
-    server.attach(probe.port);
+    probe.attach(&mut server);
 
     server.call(
         "debug.set_line_stop",
