@@ -222,6 +222,15 @@ the session and counting the second walk:
   round trips (8ms RTT)          227.1    28.1
 ```
 
+**Amended by PERF-2 (#129): this census is a JDK-21 reading and did not say so.** It reproduces on JDK 21
+exactly as printed and on neither of CI's other two JDKs — 11 and 17 read 5 line tables, 6 variable tables,
+62 frame reads and **2** `ReferenceType` for 77 commands, because `StackWaveProbe` has primitive locals of
+its own and the object locals being resolved are in the JVM's own frames below `down`. #129's deduplication
+half then halved the `ReferenceType` row on every JDK — 12 to 6 on 21, 2 to 1 on 11 and 17 — so the totals
+are 84 and 76. Every number in this ADR was taken on one JDK; that this one is version-locked was found by
+re-measuring rather than predicted, and `a_warm_stack_walk_reads_each_methods_tables_once` now carries the
+full matrix.
+
 `GetValues` is unchanged and must stay so: one read per frame either way, issued four waves instead of
 sixty-three times. **The twelve `ObjectReference.ReferenceType` reads are the largest single remaining item**,
 and they are `render_value` resolving each object local's type one at a time — PERF-2 (#129) again, found by
@@ -316,6 +325,31 @@ getting faster rather than a regression.
 and an eighth is reading each string — PERF-2 (#129) — and an eighth is invocations, which are not
 independent reads at all: an `InvokeMethod` runs arbitrary debuggee code and JDWP invalidates every frame id
 on the thread when it does.
+
+**Amended by #129: half of that half was not "resolving each value's type" at all.** It was the *same*
+object asked twice inside one render step — `render_boxed_primitive` read `ObjectReference.ReferenceType` to
+decide the object was not a boxed primitive and its caller read the same type again a line or two later, on
+both the shallow and the deep path. An object id is a weak reference so the answer cannot be cached across
+renders (ADR-0022); it did not need to be asked twice within one. #129 resolves the type once and passes it
+down, and re-censused on the same probe at `max_depth 3` — a larger walk than the 240 above, and the
+before/after are the same workload on the same JVM:
+
+```text
+                                   before   after
+  ObjectReference.ReferenceType      1701     873
+  ObjectReference.InvokeMethod        586     586
+  StringReference.Value               437     437
+  ObjectReference.GetValues           349     349
+  ArrayReference.Length/GetValues     279     279
+  total commands                     3357    2529
+```
+
+Nothing but the type reads moved, and the replies are byte-identical: a quarter of a deep walk removed by a
+read that never needed sending. `ObjectReference.ReferenceType` is still the largest item, so #129's premise
+survives — its share of the walk is 34% rather than 50%. The 240-command table above is left exactly as it
+was measured; it was true of the tree that produced it. `a_rendered_object_is_asked_for_its_type_once`
+asserts the invariant going forward, and it asserts *adjacency* rather than a count, because rendering the
+same object from two frames legitimately reads its type twice.
 
 **And the 15% cannot be waved without giving up the invariant.** The deep walk decrements a shared node
 budget *per node as it renders*, so how many children of a level get rendered is not known until they have

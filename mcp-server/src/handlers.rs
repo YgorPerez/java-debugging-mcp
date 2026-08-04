@@ -19756,24 +19756,17 @@ async fn render_node(
         return format!("↩ {name} @0x{id:x} (cycle)");
     }
 
-    // A boxed primitive is a leaf, whatever the depth: expanding it would turn a `List<Integer>`
-    // into twenty `java.lang.Integer { value = (int) n }` blocks instead of twenty numbers.
-    if let Some(unboxed) = render_boxed_primitive(conn, id).await {
-        return unboxed;
-    }
-
-    // At the depth limit, stop expanding but still say as much as one line can — toString() is the
-    // most informative summary available, so this is where it earns its keep.
-    if depth >= opts.depth_limit {
-        return render_object(conn, id, value.tag, thread_id, opts.text_len, opts.bytes).await;
-    }
-
-    // Strings and arrays already have good shallow renderings; strings are terminal, arrays recurse.
+    // A string is terminal and reads as itself, so it is answered *before* the type is resolved: a
+    // `StringReference.Value` that succeeds makes the type read unnecessary rather than merely
+    // redundant. This used to sit below the boxed-primitive check, which read the type to decide that a
+    // `java.lang.String` is not a boxed primitive (PERF-2, #129).
     if value.tag == 115 {
         if let Ok(s) = conn.get_string_value(id).await {
             return format!("\"{}\"", truncate(&s, opts.text_len));
         }
     }
+    // The object's type, read ONCE for this node. Every step below takes it as an argument rather than
+    // resolving it again from the id — which is the whole of #129's dedup half.
     let Ok(type_id) = conn.get_object_reference_type(id).await else {
         return format!("(object) @0x{id:x}");
     };
@@ -19783,6 +19776,29 @@ async fn render_node(
         if let Ok(s) = conn.get_string_value(id).await {
             return format!("\"{}\"", truncate(&s, opts.text_len));
         }
+    }
+
+    // A boxed primitive is a leaf, whatever the depth: expanding it would turn a `List<Integer>`
+    // into twenty `java.lang.Integer { value = (int) n }` blocks instead of twenty numbers.
+    if let Some(unboxed) = render_boxed_primitive(conn, id, type_id, &name).await {
+        return unboxed;
+    }
+
+    // At the depth limit, stop expanding but still say as much as one line can — toString() is the
+    // most informative summary available, so this is where it earns its keep.
+    if depth >= opts.depth_limit {
+        return render_resolved_object(
+            conn,
+            id,
+            type_id,
+            &sig,
+            &name,
+            value.tag,
+            thread_id,
+            opts.text_len,
+            opts.bytes,
+        )
+        .await;
     }
 
     state.path.push(id);
@@ -19838,8 +19854,22 @@ async fn render_fields_deep(
 ) -> String {
     let fields = collect_instance_fields(conn, type_id).await;
     if fields.is_empty() {
-        // Nothing to expand — a one-liner beats an empty brace block.
-        return render_object(conn, id, 76, thread_id, opts.text_len, opts.bytes).await;
+        // Nothing to expand — a one-liner beats an empty brace block. The type is already resolved, so
+        // this takes the resolved tail; `render_object` would read `ReferenceType` again (#129). The
+        // signature is a `TypeCache` hit and costs no packet.
+        let sig = conn.get_signature(type_id).await.unwrap_or_default();
+        return render_resolved_object(
+            conn,
+            id,
+            type_id,
+            &sig,
+            name,
+            76,
+            thread_id,
+            opts.text_len,
+            opts.bytes,
+        )
+        .await;
     }
     let shown = fields.len().min(opts.child_limit);
     let ids: Vec<u64> = fields.iter().take(shown).map(|f| f.field_id).collect();
@@ -20148,10 +20178,18 @@ const BOXED_PRIMITIVES: [&str; 8] = [
 
 /// If `id` is a boxed primitive, render the primitive it holds. `None` for anything else, or if the
 /// `value` field can't be read (in which case the caller renders it as an ordinary object).
-async fn render_boxed_primitive(conn: &mut jdwp_client::JdwpConnection, id: u64) -> Option<String> {
-    let type_id = conn.get_object_reference_type(id).await.ok()?;
-    let name = decode_signature(&conn.get_signature(type_id).await.unwrap_or_default());
-    if !BOXED_PRIMITIVES.contains(&name.as_str()) {
+///
+/// Takes its caller's already-resolved `type_id` and `name` rather than reading them again. It used to
+/// read `ObjectReference.ReferenceType` itself, and every caller reads it too a line or two away — so
+/// **every rendered object cost that command twice** (PERF-2, #129). An object id is a weak reference so
+/// the answer cannot be cached across renders (ADR-0022); the fix is not to ask twice within one.
+async fn render_boxed_primitive(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    type_id: u64,
+    name: &str,
+) -> Option<String> {
+    if !BOXED_PRIMITIVES.contains(&name) {
         return None;
     }
     let (_, f) = find_field_info(conn, type_id, "value", Some(false)).await.ok()??;
@@ -20170,6 +20208,9 @@ async fn type_name_of(conn: &mut jdwp_client::JdwpConnection, id: u64) -> String
 /// Render an object value: strings show contents; a `byte[]`/`char[]` shows decoded text; other arrays
 /// show their elements; other objects show their type name (and, when `thread_id` is Some, a
 /// best-effort `toString()`).
+///
+/// This is the half that **resolves** the object's type; [`render_resolved_object`] is the half that
+/// needs it. A caller that has the type already calls that one directly.
 async fn render_object(
     conn: &mut jdwp_client::JdwpConnection,
     id: u64,
@@ -20193,20 +20234,41 @@ async fn render_object(
             return format!("\"{}\"", truncate(&s, max_len));
         }
     }
+    render_resolved_object(conn, id, type_id, &sig, &name, tag, thread_id, max_len, how).await
+}
+
+/// The tail of [`render_object`], for a caller that has already resolved the object's type: everything
+/// that *needs* the `type_id` and nothing that *reads* it.
+///
+/// Split out for PERF-2 (#129). The deep renderer resolves the type itself and then called
+/// `render_object`, which read `ObjectReference.ReferenceType` for the same object again — and
+/// `ObjectReference.ReferenceType` is half of every command a deep walk sends.
+#[allow(clippy::too_many_arguments)] // the tail of one render step, and it needs its caller's context
+async fn render_resolved_object(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    type_id: u64,
+    sig: &str,
+    name: &str,
+    tag: u8,
+    thread_id: Option<u64>,
+    max_len: usize,
+    how: ByteRender,
+) -> String {
     // Array contents. A `byte[]`/`char[]` reads as text ahead of the generic case (EVAL-7): these are
     // the arrays whose elements are not the answer.
     if tag == 91 {
-        if let Some(rendered) = render_text_array(conn, id, &sig, max_len, how).await {
+        if let Some(rendered) = render_text_array(conn, id, sig, max_len, how).await {
             return rendered;
         }
-        if let Some(rendered) = render_array(conn, id, &name, how).await {
+        if let Some(rendered) = render_array(conn, id, name, how).await {
             return rendered;
         }
     }
     // A boxed primitive reads better as the value it holds than as `java.lang.Integer "2"`, and this
     // needs no thread — unlike the toString() below. (render_node checks this too, so a boxed value
     // stays a leaf there regardless of depth rather than being expanded into a `value` field.)
-    if let Some(unboxed) = render_boxed_primitive(conn, id).await {
+    if let Some(unboxed) = render_boxed_primitive(conn, id, type_id, name).await {
         return unboxed;
     }
     // EVAL-9: never `toString()` an unfetched Hibernate lazy value. On a proxy that call IS the load —
@@ -20221,7 +20283,7 @@ async fn render_object(
     }
     // best-effort toString() when we have a thread to run it on
     if let Some(tid) = thread_id {
-        match render_via_tostring(conn, id, type_id, tid, &name, max_len).await {
+        match render_via_tostring(conn, id, type_id, tid, name, max_len).await {
             ToStringOutcome::Rendered(rendered) => return rendered,
             // Say so. Before this the reply was byte-identical to the free shallow render below, so a
             // caller had no way to know the VM had just been frozen for the whole budget (EVAL-5).

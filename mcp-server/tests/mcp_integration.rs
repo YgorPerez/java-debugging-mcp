@@ -3417,20 +3417,32 @@ fn latency_added_to_the_wire_shows_up_as_held_time_per_packet() {
 /// of others, so the correct answer is a handful of line tables and variable tables — and the walk used to
 /// ask 66 times for each.
 ///
-/// Measured, warm, by recording the session and counting the second walk's commands:
+/// Measured, warm, by recording the session and counting the second walk's commands — **on JDK 21**, which
+/// this did not say and which turns out to decide every row. Re-measured under PERF-2 (#129) on all three of
+/// CI's JDKs, and JDK 11 and 17 agree with each other and not with 21:
 ///
 /// ```text
-///                                 before   after
-///   Method.LineTable                  66       6
-///   Method.VariableTableWithGeneric   66       7
-///   StackFrame.GetValues              63      63
-///   ObjectReference.ReferenceType     12      12
-///   total                            209      90
+///                                 JDK 21                      JDK 11 & 17
+///                                 PERF-1   after #129         after #129
+///   Method.LineTable                   6            6                  5
+///   Method.VariableTableWithGeneric    7            7                  6
+///   StackFrame.GetValues              63           63                 62
+///   ObjectReference.ReferenceType     12            6                  1
+///   total                             90           84                 76
 /// ```
 ///
+/// (Before PERF-1, on JDK 21: 66 line tables, 66 variable tables, 209 commands.)
+///
 /// `GetValues` is unchanged and must stay so: it is one read per frame either way, and PERF-1 changes when
-/// they are issued rather than how many there are. The twelve `ReferenceType` reads are `render_value`
-/// resolving each object local's type (PERF-2, #129), also unchanged.
+/// they are issued rather than how many there are. The `ReferenceType` reads are `render_value` resolving
+/// each object local's type (PERF-2, #129), and #129's deduplication half **halves** them: half of every
+/// such read was one object asked twice inside one render step, which
+/// `a_rendered_object_is_asked_for_its_type_once` now forbids.
+///
+/// **The 12-against-2 spread across JDKs is not this walk's doing.** `StackWaveProbe` has primitive locals
+/// on purpose, so the object locals being resolved live in the JVM's *own* frames below `down` — how many
+/// there are is the JDK's business. Which is why the assertions below are ranges and not these numbers, and
+/// why a census quoted from this file has to say which JDK produced it.
 ///
 /// The **second** walk is the one measured. The first fills `TypeCache` with signatures and method lists, so
 /// counting it would count the cache filling and hide whether the tables were deduplicated at all.
@@ -3496,8 +3508,125 @@ fn a_warm_stack_walk_reads_each_methods_tables_once() {
     );
     assert!(
         total <= 130,
-        "a warm walk cost {total} commands; it measured 90 after PERF-1 and 209 before. A number near 209 \
-         means the per-method tables are being read per frame again ({lines} line, {vars} variable)."
+        "a warm walk cost {total} commands; it measured 84 on JDK 21 and 76 on 11/17 after #129, 90 after \
+         PERF-1, and 209 before it. A number near 209 means the per-method tables are being read per frame \
+         again ({lines} line, {vars} variable)."
+    );
+
+    // Not resumed: the debugger has already disconnected, which is what let the tape be written.
+}
+
+/// PERF-2 (#129), the deduplication half: an object is asked for its type **once** per render step.
+///
+/// `ObjectReference.ReferenceType` is half of every command a deep walk sends, and half of *those* were
+/// one object asked twice, microseconds apart: `render_boxed_primitive` read the type to decide the object
+/// was not a boxed primitive, and its caller read the same type again a line or two later. An object id is
+/// a **weak** reference so the answer cannot be cached across renders (ADR-0022, `TypeCache`) — the fix is
+/// not to ask twice *within* one render, which is why the type is now resolved once and passed down.
+///
+/// Measured warm on `DeepProbe`, `debug.get_stack --expand_objects --max_depth 3`, JDK 17.0.20:
+///
+/// ```text
+///                                   before   after
+///   ObjectReference.ReferenceType     1701     873
+///   ObjectReference.InvokeMethod       586     586
+///   StringReference.Value              437     437
+///   ObjectReference.GetValues          349     349
+///   ArrayReference.Length/GetValues     279     279
+///   total commands                    3357    2529
+/// ```
+///
+/// Nothing but the type reads moved, which is what a deduplication is supposed to look like: a quarter of
+/// the whole walk removed, and the reply byte-identical. One *shallow* render of one object went from six
+/// commands to five (`StackFrame.GetValues`, `ReferenceType`, `InvokeMethod`, `StringReference.Value`).
+///
+/// **The assertion is deliberately not a count.** A walk may legitimately read the same object's type
+/// twice — the same object reachable from two frames is rendered twice, and there is no cache to serve the
+/// second read, correctly. What the defect actually was is two reads of one id with **no other packet
+/// between them**, which is one render step asking twice and nothing else. That is what this asserts, so
+/// it cannot go stale as the probe's graph or the JDK's frame count changes.
+///
+/// Warm, and counted from the last `ThreadReference.Frames`, because a cold walk sends
+/// `ReferenceType.Signature` *between* the two duplicated reads and the adjacency would not be visible.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_rendered_object_is_asked_for_its_type_once() {
+    /// `ObjectReference.ReferenceType`, whose request is exactly the 8-byte object id.
+    const REFERENCE_TYPE: (u8, u8) = (9, 1);
+    /// `ThreadReference.Frames`, which starts a walk and is how the second one is found in the tape.
+    const FRAMES: (u8, u8) = (11, 6);
+
+    let Some(jdk) = jdk_or_skip("a_rendered_object_is_asked_for_its_type_once") else { return };
+    let probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let recorder = common::cassette::CassetteRecorder::start(probe.port).expect("start recorder");
+    let mut server = Server::start().expect("start server");
+    server.attach(recorder.port);
+
+    let line = probe_line(&probe_source("DeepProbe"), "// BP1");
+    let armed =
+        server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "DeepProbe", "line": line}));
+    assert!(!armed.contains("Refused"), "the stop point was refused: {armed}");
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("breakpoint in DeepProbe.inspect never fired");
+
+    let workload = serde_json::json!({
+        "expand_objects": true, "max_depth": 3, "max_frames": 1, "package_filter": "DeepProbe"
+    });
+    let warm = server.call("debug.get_stack", workload.clone());
+    assert!(
+        warm.contains("order = ") && warm.contains("name = \"Ana\""),
+        "the walk expanded nothing, so there are no type reads to judge:\n{}",
+        head_of(&warm)
+    );
+    server.call("debug.get_stack", workload);
+    // The recorder writes its tape when the debugger hangs up, and a tape missing the last exchanges does
+    // not fail when it is written — it fails much later, as a miss in an unrelated test.
+    server.call("debug.disconnect", serde_json::json!({}));
+
+    let tape = recorder.finish("a warm deep get_stack over DeepProbe");
+    let exchanges = tape.exchanges();
+    let second = exchanges
+        .iter()
+        .rposition(|e| (e.set, e.command) == FRAMES)
+        .expect("no ThreadReference.Frames in the tape — did the walk read any frames at all?");
+    let walk = exchanges.get(second..).unwrap_or_default();
+
+    let mut previous: Option<u64> = None;
+    let mut types = 0_usize;
+    let mut repeats: Vec<u64> = Vec::new();
+    for e in walk {
+        if (e.set, e.command) != REFERENCE_TYPE {
+            // Any other packet ends a render step's run of type reads, so it clears the comparison.
+            previous = None;
+            continue;
+        }
+        types += 1;
+        let id = u64::from_be_bytes(e.request.get(..8).and_then(|b| b.try_into().ok()).unwrap_or_default());
+        if previous == Some(id) {
+            repeats.push(id);
+        }
+        previous = Some(id);
+    }
+
+    // The control: this test's assertion passes trivially on a walk that read no types at all, which is
+    // the failure mode every check in this suite is written against. Measured at 873.
+    assert!(
+        types >= 100,
+        "only {types} type read(s) in a {} command walk over DeepProbe's graph — the walk is not \
+         exercising the renderer, so the assertion below would pass by finding nothing",
+        walk.len()
+    );
+    assert!(
+        repeats.is_empty(),
+        "{} object(s) were asked for their type twice with no other packet in between, which is one \
+         render step resolving the same object twice: {:x?}. Before #129 that was every rendered object \
+         — `render_boxed_primitive` read `ObjectReference.ReferenceType` and so did its caller. The type \
+         is resolved once now and passed down; something has started reading it from an id again.\n  \
+         {types} type read(s) in {} commands",
+        repeats.len(),
+        repeats.iter().take(5).collect::<Vec<_>>(),
+        walk.len()
     );
 
     // Not resumed: the debugger has already disconnected, which is what let the tape be written.
@@ -3526,6 +3655,12 @@ fn a_warm_stack_walk_reads_each_methods_tables_once() {
 /// frame reads — and **12 `ObjectReference.ReferenceType` reads, one at a time**, which is `render_value`
 /// resolving the type of each object local (PERF-2, #129). Those twelve are the largest single remaining
 /// item and they are not this call site's to fix.
+///
+/// **#129's deduplication half took those twelve to six** (JDK 21; one on JDK 11 and 17 — see
+/// `a_warm_stack_walk_reads_each_methods_tables_once` for why the JDK decides it), so the decomposition is
+/// now 22 rather than 28. That six-round-trip difference is arithmetic on the same instrument and is
+/// labelled as such: the **28.1 above is a reading**, taken before #129, and nothing here re-measured it.
+/// The threshold is unaffected — it was never near either number.
 ///
 /// The threshold is 80: 2.8x above the reading and 2.8x below the serialised one, which puts it in the
 /// middle of the two hypotheses in the ratio a wall clock on a contended runner can carry. A threshold at
@@ -15159,6 +15294,11 @@ fn a_heterogeneous_result_reads_each_rows_fields_off_its_own_type() {
 /// recorded in ADR-0038; it is not a measurement of the primitive, because seven of those eight round trips
 /// per row are reads nothing has converted yet. `Bare` has a `long` and a `double` and no other cost, so
 /// here the two reads *are* the per-row cost.
+///
+/// **Both `Reserva` figures predate PERF-2 (#129)** and its deduplication half moves them, because the
+/// association's `ObjectReference.ReferenceType` was being read twice per row and is now read once. Neither
+/// has been re-measured: #129's own acceptance criterion is to re-run *this* instrument against
+/// `Reserva.findByCodigoAndStatus`, and that belongs with the prefetch rather than the dedup.
 ///
 /// **The two readings are taken the way TEST-13 ([#38](https://github.com/YgorPerez/java-debugging-mcp/issues/38))
 /// established**: one relay, one attach, the round trip dialled up and down under a live connection, arms
