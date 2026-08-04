@@ -255,6 +255,32 @@ on — usually the middle of a real reply — as a length. So a lost byte does n
 the session (ADR-0018).
 _Avoid_: resync, recover (there is nothing to resync *to*; the instinct this term exists to correct)
 
+**Independent reads**:
+Reads whose requests do not depend on each other's replies, and which may therefore be in flight together.
+
+**A property of the reads, not of the code that issues them** — which is why it is defined here rather than
+waiting for anything to exploit it. Every read this server makes is already independent or dependent today;
+what PERF-1 ([#100](https://github.com/YgorPerez/java-debugging-mcp/issues/100)) proposes is to *act* on the
+distinction, and the term exists so that proposal has something to be precise against.
+
+**It names a licence, and the licence is per call site rather than per kind of read.** That is the whole
+weight of it: independence has to be *established* for a particular sequence, never assumed from the shape of
+the commands. Three real sequences are dependent, and each fails for its own reason — a suspend must land
+before a frame is read at all; a frame's variable names must be known before its values mean anything; and a
+watchpoint's **old value** is only readable while the pending store has not yet committed, so that read
+cannot be moved out of its window. A term that made independence sound like a property of *reading* rather
+than of a *sequence* would quietly license all three.
+
+What it buys is **round trips**, not **packets** — the same commands are still sent, so it is not a cheaper
+read but a shorter wait, and a shorter **suspension window** wherever the reads happen under one.
+
+_Avoid_: pipelined (borrowed from HTTP, where it promises replies come back IN ORDER — JDWP correlates a
+reply to its request by packet id and they may arrive in any order, so the word asserts the one thing that
+has to be *proven* rather than assumed); batched (taken, and by something close enough to confuse: a
+**batch** is many class patterns given to one arming call, and it also has partial failure as a normal
+outcome — and it implies one combined request answered by one reply, which JDWP has no such thing as);
+concurrent (true of the mechanism and silent about the property that makes it safe)
+
 ### Stop points
 
 **Stop point**:
