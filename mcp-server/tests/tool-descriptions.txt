@@ -570,39 +570,44 @@ TAKES A LIST AS WELL AS A STRING, and it is how you see a DISAGREEMENT rather th
 on the line cannot do — they record into two independently budgeted streams you then have to join by hand.
 Each element is evaluated in turn against the same frame and gets its own numbered slot (Trace expr[0], Trace
 expr[1]), so one that errors leaves the others intact — a chain going null on some hits and not others is the
-normal case. ONE STRING IS UNCHANGED, down to the rendering. Capped at 4 expressions, because each is a full
-resolution inside the capture window and capture is serialised, so they divide the same throughput budget
-trace_max_hits is charged against; over the cap it keeps the first 4 and the reply names what it dropped. On a
-framework that rethrows — an EJB interceptor chain, a Spring proxy — one exception instance throws many times,
-so those sightings are FOLDED: the original throw and the point where it escapes are both kept, the layers
-between become a `↻ rethrow of #<seq> (+N collapsed)` note on the escaping record, and a collapsed rethrow
-does not spend trace_max_hits. Without that a budget of 30 was gone on one instance walking WildFly's
-interceptors, and the only informative record was the 9th. debug.list_stop_points reports the cost this
-request is actually incurring once throws have landed. PASS hit_count TO FIRE ONLY ON THE Nth THROW, and read
-that literally: it is JDWP's Count modifier, so the JVM reports the Nth occurrence and then DELETES THE
-REQUEST ITSELF. The stop point fires once and is gone — debug.list_stop_points shows it SPENT rather than
-armed, debug.clear_stop_point on it sends nothing to the debuggee and says so, and debug.toggle_stop_point is
-what re-arms it with the same count. It is NOT "the first N": that is trace_max_hits, counted on this side,
-and combining the two gives you ONE snapshot rather than trace_max_hits of them — the arm reply says so
-instead of reporting two numbers that cannot both apply. The retry loop is what it is for: a supplier consulta
-retried after a sleep, where the SECOND attempt is the interesting one and the first failing is expected. PASS
-instance_id TO SCOPE THE STOP POINT TO THROWS FROM ONE OBJECT — the @0x… handle any reply prints. This is
-JDWP's InstanceOnly modifier and the JVM applies it, so a throw from any other instance costs nothing at all
-on either side; it matches the `this` of the frame that threw, so it only narrows throws from an INSTANCE
-method. Measured working on Temurin 17/21/25 against two instances throwing the same type from the same line —
-this is the one stop-point kind where HotSpot both accepts AND applies the modifier, which is why the other
-kinds refuse it rather than offering it (FILT-9, ADR-0027). THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the
-debuggee collects the object the filter stops matching and the stop point goes quiet, which is
-indistinguishable from the exception never being thrown — debug.list_stop_points checks and says so. PASS
-condition TO FILTER THE THROWS YOU DO NOT WANT (FILT-6), and note what the exception instance is called: it is
-reachable as `exception`, so exception.cdException != 42 reads a field the frame cannot give you — the hit's
-top frame belongs to the THROWING method, so `this` is the thrower. That matters here because a type used for
-validation control flow throws far more often than it fails, and its message is often null (a constructor that
-calls no super(...) never sets one), which leaves the exception's own field as the only usable discriminator.
-`!`, `&&` and `||` all work. A condition-skipped hit is NOT charged to the trace budget, so a budget of N
-still means N matches rather than N throws. On a SUSPENDING exception stop the VM is frozen while the
-condition is evaluated; on a traced one only the hit thread is held, which is what makes this the cheap way to
-filter an exception trace on a shared instance.
+normal case. ONE STRING IS UNCHANGED, down to the rendering. AN ELEMENT MAY ALSO COMPARE (TRACE-13):
+"pagtoFormaRQ == pagtoForma" records true or false, with the operators and the semantics condition accepts —
+==, !=, <, <=, >, >=, joined with && / ||, identity for two references and content for two Strings. That
+belongs here rather than only in condition because "are these two the same instance?" is a question about ONE
+INSTANT: a condition can merely filter on it, and two separate expressions leave you comparing @0x… handles by
+eye, which stops being possible as soon as either side is an expression rather than a local. Capped at 4
+expressions, because each is a full resolution inside the capture window and capture is serialised, so they
+divide the same throughput budget trace_max_hits is charged against; over the cap it keeps the first 4 and the
+reply names what it dropped. On a framework that rethrows — an EJB interceptor chain, a Spring proxy — one
+exception instance throws many times, so those sightings are FOLDED: the original throw and the point where it
+escapes are both kept, the layers between become a `↻ rethrow of #<seq> (+N collapsed)` note on the escaping
+record, and a collapsed rethrow does not spend trace_max_hits. Without that a budget of 30 was gone on one
+instance walking WildFly's interceptors, and the only informative record was the 9th. debug.list_stop_points
+reports the cost this request is actually incurring once throws have landed. PASS hit_count TO FIRE ONLY ON
+THE Nth THROW, and read that literally: it is JDWP's Count modifier, so the JVM reports the Nth occurrence and
+then DELETES THE REQUEST ITSELF. The stop point fires once and is gone — debug.list_stop_points shows it SPENT
+rather than armed, debug.clear_stop_point on it sends nothing to the debuggee and says so, and
+debug.toggle_stop_point is what re-arms it with the same count. It is NOT "the first N": that is
+trace_max_hits, counted on this side, and combining the two gives you ONE snapshot rather than trace_max_hits
+of them — the arm reply says so instead of reporting two numbers that cannot both apply. The retry loop is
+what it is for: a supplier consulta retried after a sleep, where the SECOND attempt is the interesting one and
+the first failing is expected. PASS instance_id TO SCOPE THE STOP POINT TO THROWS FROM ONE OBJECT — the @0x…
+handle any reply prints. This is JDWP's InstanceOnly modifier and the JVM applies it, so a throw from any
+other instance costs nothing at all on either side; it matches the `this` of the frame that threw, so it only
+narrows throws from an INSTANCE method. Measured working on Temurin 17/21/25 against two instances throwing
+the same type from the same line — this is the one stop-point kind where HotSpot both accepts AND applies the
+modifier, which is why the other kinds refuse it rather than offering it (FILT-9, ADR-0027). THE HANDLE IS A
+WEAK REFERENCE (ADR-0022): if the debuggee collects the object the filter stops matching and the stop point
+goes quiet, which is indistinguishable from the exception never being thrown — debug.list_stop_points checks
+and says so. PASS condition TO FILTER THE THROWS YOU DO NOT WANT (FILT-6), and note what the exception
+instance is called: it is reachable as `exception`, so exception.cdException != 42 reads a field the frame
+cannot give you — the hit's top frame belongs to the THROWING method, so `this` is the thrower. That matters
+here because a type used for validation control flow throws far more often than it fails, and its message is
+often null (a constructor that calls no super(...) never sets one), which leaves the exception's own field as
+the only usable discriminator. `!`, `&&` and `||` all work. A condition-skipped hit is NOT charged to the
+trace budget, so a budget of N still means N matches rather than N throws. On a SUSPENDING exception stop the
+VM is frozen while the condition is evaluated; on a traced one only the hit thread is held, which is what
+makes this the cheap way to filter an exception trace on a shared instance.
 
 ## debug.set_field_stop
 Break when a field is read or written — answers "who mutates this?" for a field that changes behind your back
@@ -626,30 +631,35 @@ DISAGREEMENT rather than a value: ["tenant.getIdentificador()", "sessao.getNmSch
 the SAME hit, which two stop points on the line cannot do — they record into two independently budgeted
 streams you then have to join by hand. Each element is evaluated in turn against the same frame and gets its
 own numbered slot (Trace expr[0], Trace expr[1]), so one that errors leaves the others intact — a chain going
-null on some hits and not others is the normal case. ONE STRING IS UNCHANGED, down to the rendering. Capped at
-4 expressions, because each is a full resolution inside the capture window and capture is serialised, so they
-divide the same throughput budget trace_max_hits is charged against; over the cap it keeps the first 4 and the
-reply names what it dropped. debug.list_stop_points reports what the watch is actually costing once hits have
-landed. A watched field can't be JIT-optimised, so clear it when done. PASS hit_count TO FIRE ONLY ON THE Nth
-TOUCH, with JDWP's Count semantics: the JVM reports the Nth write (or read) and then deletes the request
-itself, so the watch fires ONCE and is then SPENT — debug.list_stop_points says so rather than listing it as
-armed, clearing it sends nothing to the debuggee, and debug.toggle_stop_point re-arms it with the same count.
-Not "the first N", which is trace_max_hits; the two together yield one snapshot, and the arm reply says so.
-PASS instance_id TO WATCH ONE OBJECT'S COPY OF THE FIELD — the @0x… handle any reply prints. This is JDWP's
-InstanceOnly modifier, so the JVM does the matching and a write to any other instance's copy costs no packet
-and no snapshot: the way to answer "who is clearing THIS session's total?" on an instance where 400 of them
-are live. REFUSED ON A STATIC FIELD, because a static write has no `this` for the modifier to match — and
-HotSpot accepts it anyway and then reports every write, with no error and a reply claiming the watch is scoped
-(measured on Temurin 17/21/25). A static field is one copy in the whole JVM, so there is nothing to narrow to;
-watch it unfiltered and use trace_expr or a condition. THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the
-debuggee collects the object the watch goes quiet, which reads as the field never being touched —
-debug.list_stop_points checks and says so. PASS condition TO FILTER THE WRITES YOU DO NOT WANT (FILT-6). The
-INCOMING value is reachable as `newValue` — newValue == 999, or newValue.getStatus() for a reference field —
-which reading the field cannot give you, because a FIELD_MODIFICATION event is reported BEFORE the write
-lands. There is deliberately no oldValue: at condition time the field still holds it, so its own name reads
-it, and status != newValue asks whether this write actually changes anything. `!`, `&&` and `||` all work. A
-condition-skipped hit is NOT charged to the trace budget. On a SUSPENDING watch the VM is frozen while the
-condition is evaluated.
+null on some hits and not others is the normal case. ONE STRING IS UNCHANGED, down to the rendering. AN
+ELEMENT MAY ALSO COMPARE (TRACE-13): "pagtoFormaRQ == pagtoForma" records true or false, with the operators
+and the semantics condition accepts — ==, !=, <, <=, >, >=, joined with && / ||, identity for two references
+and content for two Strings. That belongs here rather than only in condition because "are these two the same
+instance?" is a question about ONE INSTANT: a condition can merely filter on it, and two separate expressions
+leave you comparing @0x… handles by eye, which stops being possible as soon as either side is an expression
+rather than a local. Capped at 4 expressions, because each is a full resolution inside the capture window and
+capture is serialised, so they divide the same throughput budget trace_max_hits is charged against; over the
+cap it keeps the first 4 and the reply names what it dropped. debug.list_stop_points reports what the watch is
+actually costing once hits have landed. A watched field can't be JIT-optimised, so clear it when done. PASS
+hit_count TO FIRE ONLY ON THE Nth TOUCH, with JDWP's Count semantics: the JVM reports the Nth write (or read)
+and then deletes the request itself, so the watch fires ONCE and is then SPENT — debug.list_stop_points says
+so rather than listing it as armed, clearing it sends nothing to the debuggee, and debug.toggle_stop_point
+re-arms it with the same count. Not "the first N", which is trace_max_hits; the two together yield one
+snapshot, and the arm reply says so. PASS instance_id TO WATCH ONE OBJECT'S COPY OF THE FIELD — the @0x…
+handle any reply prints. This is JDWP's InstanceOnly modifier, so the JVM does the matching and a write to any
+other instance's copy costs no packet and no snapshot: the way to answer "who is clearing THIS session's
+total?" on an instance where 400 of them are live. REFUSED ON A STATIC FIELD, because a static write has no
+`this` for the modifier to match — and HotSpot accepts it anyway and then reports every write, with no error
+and a reply claiming the watch is scoped (measured on Temurin 17/21/25). A static field is one copy in the
+whole JVM, so there is nothing to narrow to; watch it unfiltered and use trace_expr or a condition. THE HANDLE
+IS A WEAK REFERENCE (ADR-0022): if the debuggee collects the object the watch goes quiet, which reads as the
+field never being touched — debug.list_stop_points checks and says so. PASS condition TO FILTER THE WRITES YOU
+DO NOT WANT (FILT-6). The INCOMING value is reachable as `newValue` — newValue == 999, or newValue.getStatus()
+for a reference field — which reading the field cannot give you, because a FIELD_MODIFICATION event is
+reported BEFORE the write lands. There is deliberately no oldValue: at condition time the field still holds
+it, so its own name reads it, and status != newValue asks whether this write actually changes anything. `!`,
+`&&` and `||` all work. A condition-skipped hit is NOT charged to the trace budget. On a SUSPENDING watch the
+VM is frozen while the condition is evaluated.
 
 ## debug.set_line_stop
 Set a breakpoint at a location (class_pattern + line and/or method). class_pattern takes AN EXACT CLASS, A
@@ -693,61 +703,72 @@ STRING, and it is how you see a DISAGREEMENT rather than a value: ["tenant.getId
 record into two independently budgeted streams you then have to join by hand. Each element is evaluated in
 turn against the same frame and gets its own numbered slot (Trace expr[0], Trace expr[1]), so one that errors
 leaves the others intact — a chain going null on some hits and not others is the normal case. ONE STRING IS
-UNCHANGED, down to the rendering. Capped at 4 expressions, because each is a full resolution inside the
-capture window and capture is serialised, so they divide the same throughput budget trace_max_hits is charged
-against; over the cap it keeps the first 4 and the reply names what it dropped. debug.list_stop_points then
-reports what this stop point is actually costing on this JVM, so you need not take the ~720 figure on trust.
-THE NON-SUSPENDING PROMISE IS NOT THIS STOP POINT'S TO KEEP, AND THE REPLY NOW SAYS WHEN IT IS BROKEN: a JDWP
-composite carries ONE suspend policy for the whole event set — the strongest any member asked for — so a
-SUSPENDING stop point at the same bytecode location turns every trace:true stop point there into a VM-freezing
-one, on every hit (measured identical on Temurin 17/21/25). Arming either way round is ACCEPTED rather than
-refused, because suspending on a line you are already tracing is a legitimate thing to want; what changes is
-that the reply names the stop points whose behaviour just changed — in both directions, so a trace armed onto
-an already-suspending line is told it will not be cheap — and debug.list_stop_points marks them `(trace —
-SUSPEND POLICY OVERRIDDEN)` rather than a bare `(trace)`. Clearing the suspending stop point restores
-snapshot-and-resume. Two traced stop points on one line are unaffected, since EventThread plus EventThread is
-still EventThread. STALE BYTECODE IS REPORTED UNASKED: if a class root is configured (debug.attach
-{class_roots}, JDWP_CLASS_ROOTS) the reply appends a warning when the JVM's line table for the method you just
-armed does not match your compiled .class — the case where a breakpoint at :412 resolves against last week's
-build and then never fires, or fires with locals that make no sense for the code you are reading, which is
-indistinguishable from a wrong hypothesis. It speaks ONLY when it has a proof: no class root, no class file,
-or no line table on either side all stay silent rather than guessing, and a silent reply is not a claim that
-your build is current — ask debug.check_stale for that. Costs no extra JDWP packets, because arming already
-read the line table. ONE SOURCE LINE CAN BE SEVERAL BYTECODE LOCATIONS, AND ALL OF THEM ARE ARMED: javac does
-not compile a finally body once and jump to it, it inlines a copy per exit path, so a line inside a finally is
-in the line table twice — once for normal completion and once for the exception path. Arming only the first
-(which is what this did before) means the stop point reports the calls that SUCCEEDED and goes silent on the
-one that failed, which is the case you are debugging and is indistinguishable from the code never running. A
-finally is the idiomatic logpoint site precisely because the request and the response are both still in scope
-on both paths. The reply and debug.list_stop_points now say `Armed at N locations` whenever N > 1, and a line
-that maps to exactly one location reads exactly as it always has. It stays ONE stop point: one bp_ id, listed
-once, cleared or toggled once, and a traced hit charges trace_max_hits once per hit rather than once per armed
-location. THE SAME IS TRUE OF CLASSLOADERS: an exact class name is not unique in a JVM, because every
-classloader that has loaded it defines its own type with its own statics, and on WildFly a library packed into
-more than one deployment's WEB-INF/lib is genuinely loaded once per war. All of those copies are armed, the
-reply says `Armed on N classloaders`, and debug.list_stop_points names each loader so a read can be pinned to
-one. Arming a single copy is how a stop point reported "armed" and then never fired, which is
-indistinguishable from a wrong hypothesis about the code path. AND IT KEEPS WATCHING: an exact class name
-holds a class-load watch for the stop point's whole life, so a copy of that class loaded LATER — under a new
-module classloader, which is exactly what a redeploy produces — is armed into the SAME bp_ id with no re-arm
-from you. Before this it watched once and stopped, so the loop `set breakpoint, edit, recompile, redeploy,
-fire the request` went quiet: the stop point stayed enabled, stayed listed, and watched the retired
-deployment's copy, and an empty debug.get_traces reads as "the code path I predicted is not the one running"
-rather than as a stale arm. debug.list_stop_points keeps the two facts apart — how many copies are armed NOW,
-how many have loaded since you armed it, and whether it is still watching — because `Armed on 4 classloaders`
-alone cannot tell a library packed into four wars from three redeploys of one. A stop point that is NOT
-watching says so. PASS instance_id TO SCOPE THE STOP POINT TO ONE OBJECT — the @0x… handle any reply prints,
-from a trace snapshot's locals, an expanded field tree or debug.list_instances. This is JDWP's InstanceOnly
-modifier, so the JVM does the matching: a hit on any other instance costs no packet, no snapshot and no
-suspension at all, which is what makes "trace salvar() on THIS Reserva, not all 400 in flight" cheap on a
-shared instance. That is the difference from condition, which we evaluate on our side and therefore pay for on
-EVERY hit. REFUSED IN TWO CASES, BOTH BECAUSE THE ALTERNATIVE IS A SILENT LIE: on a STATIC method, which has
-no `this` to match — HotSpot accepts the modifier there and then fires for every hit, with no error and a
-reply claiming the stop point is scoped (measured on Temurin 17/21/25); and on a class that is NOT LOADED yet,
-because a deferred stop point cannot be checked for the first case and no instance of an unfetched class can
-exist anyway, so the handle would belong to something else. THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the
-debuggee collects the object the filter simply stops matching and the stop point goes quiet, which is
-indistinguishable from the code never running — debug.list_stop_points checks for that and says so.
+UNCHANGED, down to the rendering. AN ELEMENT MAY ALSO COMPARE (TRACE-13): "pagtoFormaRQ == pagtoForma" records
+true or false, with the operators and the semantics condition accepts — ==, !=, <, <=, >, >=, joined with && /
+||, identity for two references and content for two Strings. That belongs here rather than only in condition
+because "are these two the same instance?" is a question about ONE INSTANT: a condition can merely filter on
+it, and two separate expressions leave you comparing @0x… handles by eye, which stops being possible as soon
+as either side is an expression rather than a local. Capped at 4 expressions, because each is a full
+resolution inside the capture window and capture is serialised, so they divide the same throughput budget
+trace_max_hits is charged against; over the cap it keeps the first 4 and the reply names what it dropped.
+debug.list_stop_points then reports what this stop point is actually costing on this JVM, so you need not take
+the ~720 figure on trust. THE NON-SUSPENDING PROMISE IS NOT THIS STOP POINT'S TO KEEP, AND THE REPLY NOW SAYS
+WHEN IT IS BROKEN: a JDWP composite carries ONE suspend policy for the whole event set — the strongest any
+member asked for — so a SUSPENDING stop point at the same bytecode location turns every trace:true stop point
+there into a VM-freezing one, on every hit (measured identical on Temurin 17/21/25). Arming either way round
+is ACCEPTED rather than refused, because suspending on a line you are already tracing is a legitimate thing to
+want; what changes is that the reply names the stop points whose behaviour just changed — in both directions,
+so a trace armed onto an already-suspending line is told it will not be cheap — and debug.list_stop_points
+marks them `(trace — SUSPEND POLICY OVERRIDDEN)` rather than a bare `(trace)`. Clearing the suspending stop
+point restores snapshot-and-resume. Two traced stop points on one line are unaffected, since EventThread plus
+EventThread is still EventThread. STALE BYTECODE IS REPORTED UNASKED: if a class root is configured
+(debug.attach {class_roots}, JDWP_CLASS_ROOTS) the reply appends a warning when the JVM's line table for the
+method you just armed does not match your compiled .class — the case where a breakpoint at :412 resolves
+against last week's build and then never fires, or fires with locals that make no sense for the code you are
+reading, which is indistinguishable from a wrong hypothesis. IT SPEAKS EITHER WAY, AND SILENCE NOW MEANS
+CHECKED (DISC-14): with no class root configured, no .class under the roots, an unreadable one, or no line
+table on either side, the reply says `Staleness NOT CHECKED, which is not the same as checked and fine` and
+which of those it was — so the absence of a warning means COMPARED AND EQUAL rather than 'nobody looked'. It
+used to mean both, and in a session that had configured no roots — the toolkit's own default — it always meant
+the second: an arm against a war exported before the edit printed its `2 locations` and `2 classloaders`
+warnings, said nothing about staleness, and cost six tool calls before the Method: line gave it away. A
+wildcard that arms many classes states one shared reason once rather than per class. Costs no extra JDWP
+packets, because arming already read the line table. ONE SOURCE LINE CAN BE SEVERAL BYTECODE LOCATIONS, AND
+ALL OF THEM ARE ARMED: javac does not compile a finally body once and jump to it, it inlines a copy per exit
+path, so a line inside a finally is in the line table twice — once for normal completion and once for the
+exception path. Arming only the first (which is what this did before) means the stop point reports the calls
+that SUCCEEDED and goes silent on the one that failed, which is the case you are debugging and is
+indistinguishable from the code never running. A finally is the idiomatic logpoint site precisely because the
+request and the response are both still in scope on both paths. The reply and debug.list_stop_points now say
+`Armed at N locations` whenever N > 1, and a line that maps to exactly one location reads exactly as it always
+has. It stays ONE stop point: one bp_ id, listed once, cleared or toggled once, and a traced hit charges
+trace_max_hits once per hit rather than once per armed location. THE SAME IS TRUE OF CLASSLOADERS: an exact
+class name is not unique in a JVM, because every classloader that has loaded it defines its own type with its
+own statics, and on WildFly a library packed into more than one deployment's WEB-INF/lib is genuinely loaded
+once per war. All of those copies are armed, the reply says `Armed on N classloaders`, and
+debug.list_stop_points names each loader so a read can be pinned to one. Arming a single copy is how a stop
+point reported "armed" and then never fired, which is indistinguishable from a wrong hypothesis about the code
+path. AND IT KEEPS WATCHING: an exact class name holds a class-load watch for the stop point's whole life, so
+a copy of that class loaded LATER — under a new module classloader, which is exactly what a redeploy produces
+— is armed into the SAME bp_ id with no re-arm from you. Before this it watched once and stopped, so the loop
+`set breakpoint, edit, recompile, redeploy, fire the request` went quiet: the stop point stayed enabled,
+stayed listed, and watched the retired deployment's copy, and an empty debug.get_traces reads as "the code
+path I predicted is not the one running" rather than as a stale arm. debug.list_stop_points keeps the two
+facts apart — how many copies are armed NOW, how many have loaded since you armed it, and whether it is still
+watching — because `Armed on 4 classloaders` alone cannot tell a library packed into four wars from three
+redeploys of one. A stop point that is NOT watching says so. PASS instance_id TO SCOPE THE STOP POINT TO ONE
+OBJECT — the @0x… handle any reply prints, from a trace snapshot's locals, an expanded field tree or
+debug.list_instances. This is JDWP's InstanceOnly modifier, so the JVM does the matching: a hit on any other
+instance costs no packet, no snapshot and no suspension at all, which is what makes "trace salvar() on THIS
+Reserva, not all 400 in flight" cheap on a shared instance. That is the difference from condition, which we
+evaluate on our side and therefore pay for on EVERY hit. REFUSED IN TWO CASES, BOTH BECAUSE THE ALTERNATIVE IS
+A SILENT LIE: on a STATIC method, which has no `this` to match — HotSpot accepts the modifier there and then
+fires for every hit, with no error and a reply claiming the stop point is scoped (measured on Temurin
+17/21/25); and on a class that is NOT LOADED yet, because a deferred stop point cannot be checked for the
+first case and no instance of an unfetched class can exist anyway, so the handle would belong to something
+else. THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the debuggee collects the object the filter simply stops
+matching and the stop point goes quiet, which is indistinguishable from the code never running —
+debug.list_stop_points checks for that and says so.
 
 ## debug.set_method_exit_stop
 Report what a method actually RETURNED, without having to guess which `return` statement runs — for a method
@@ -769,37 +790,43 @@ TRACE_EXPR TAKES A LIST AS WELL AS A STRING, and it is how you see a DISAGREEMEN
 on the line cannot do — they record into two independently budgeted streams you then have to join by hand.
 Each element is evaluated in turn against the same frame and gets its own numbered slot (Trace expr[0], Trace
 expr[1]), so one that errors leaves the others intact — a chain going null on some hits and not others is the
-normal case. ONE STRING IS UNCHANGED, down to the rendering. Capped at 4 expressions, because each is a full
-resolution inside the capture window and capture is serialised, so they divide the same throughput budget
-trace_max_hits is charged against; over the cap it keeps the first 4 and the reply names what it dropped.
-Composes with thread_id, trace_max_hits and trace_frames; debug.list_stop_points reports what a traced request
-is actually costing once hits have landed. A JVM below JDWP 1.6 degrades to the return site without the value,
-and says so. hit_count IS ACCEPTED ONLY WITHOUT method, AND THE REFUSAL IS THE HONEST ANSWER RATHER THAN A
-MISSING FEATURE. JDWP applies Count to the REQUEST, and this request is a ClassMatch firing for every method
-of the class; `method` is filtered on our side afterwards. So hit_count:3 with method:"save" would ask the JVM
-for the 3rd exit of ANY method of the class — almost certainly a getter — which we then drop as the wrong
-method, leaving a stop point that reported nothing and that the JVM has already deleted. There is no way to
-make it mean what it reads like, so it is refused with that explanation. WITHOUT method it means exactly what
-it says: the Nth return out of the class, whichever method produced it, after which the request is gone and
-debug.list_stop_points reports it SPENT. PASS exclude_classes TO STOP THE EVENTS BEING GENERATED AT ALL, which
-is what makes a WILDCARD class_pattern usable here: the JVM does the ClassMatch, so a broad pattern sweeps in
-every proxy and interceptor the container generates and each unwanted exit costs a real event before the
-method-name filter on this side can discard it. A ClassExclude is applied by the JVM instead. There is
-deliberately NO default set here, unlike the stepping tools — a method-exit class_pattern is something you
-wrote, and silently subtracting from it would answer a different question from the one you asked. Measured: a
-request accepts at least 5000 exclusion patterns, so the list is not a resource to ration. instance_id IS
-ACCEPTED AND ALWAYS REFUSED HERE, AND THE REFUSAL IS THE ANSWER RATHER THAN A MISSING FEATURE. A method exit
-HAS a `this`, so nothing about the request looks wrong — HotSpot accepts an InstanceOnly modifier on it,
-replies success, and then records exits from every instance regardless (measured on Temurin 17/21/25, re-run
-on its own to be sure: FILT-9, ADR-0027). There is no signal of any kind that the scope was dropped, so
-passing it through would mean a reply saying the stop point is scoped to one object while it reports all 400 —
-which is the exact failure this server is built to refuse. Use a condition instead (evaluated on our side, so
-it works on every kind), or put the stop point on a LINE inside an instance method, where instance_id does
-work. PASS condition TO FILTER THE RETURNS YOU DO NOT WANT (FILT-6), evaluated on the returning method's own
-frame — so its locals and `this` are in scope. `!`, `&&` and `||` all work, and a condition-skipped hit is NOT
-charged to the trace budget. Two costs worth knowing: on a SUSPENDING request the VM is frozen while the
-condition is evaluated, and this request receives EVERY method of a matching class, so a condition on a broad
-class_pattern is evaluated far more often than it fires — a method filter is the cheaper narrowing.
+normal case. ONE STRING IS UNCHANGED, down to the rendering. AN ELEMENT MAY ALSO COMPARE (TRACE-13):
+"pagtoFormaRQ == pagtoForma" records true or false, with the operators and the semantics condition accepts —
+==, !=, <, <=, >, >=, joined with && / ||, identity for two references and content for two Strings. That
+belongs here rather than only in condition because "are these two the same instance?" is a question about ONE
+INSTANT: a condition can merely filter on it, and two separate expressions leave you comparing @0x… handles by
+eye, which stops being possible as soon as either side is an expression rather than a local. Capped at 4
+expressions, because each is a full resolution inside the capture window and capture is serialised, so they
+divide the same throughput budget trace_max_hits is charged against; over the cap it keeps the first 4 and the
+reply names what it dropped. Composes with thread_id, trace_max_hits and trace_frames; debug.list_stop_points
+reports what a traced request is actually costing once hits have landed. A JVM below JDWP 1.6 degrades to the
+return site without the value, and says so. hit_count IS ACCEPTED ONLY WITHOUT method, AND THE REFUSAL IS THE
+HONEST ANSWER RATHER THAN A MISSING FEATURE. JDWP applies Count to the REQUEST, and this request is a
+ClassMatch firing for every method of the class; `method` is filtered on our side afterwards. So hit_count:3
+with method:"save" would ask the JVM for the 3rd exit of ANY method of the class — almost certainly a getter —
+which we then drop as the wrong method, leaving a stop point that reported nothing and that the JVM has
+already deleted. There is no way to make it mean what it reads like, so it is refused with that explanation.
+WITHOUT method it means exactly what it says: the Nth return out of the class, whichever method produced it,
+after which the request is gone and debug.list_stop_points reports it SPENT. PASS exclude_classes TO STOP THE
+EVENTS BEING GENERATED AT ALL, which is what makes a WILDCARD class_pattern usable here: the JVM does the
+ClassMatch, so a broad pattern sweeps in every proxy and interceptor the container generates and each unwanted
+exit costs a real event before the method-name filter on this side can discard it. A ClassExclude is applied
+by the JVM instead. There is deliberately NO default set here, unlike the stepping tools — a method-exit
+class_pattern is something you wrote, and silently subtracting from it would answer a different question from
+the one you asked. Measured: a request accepts at least 5000 exclusion patterns, so the list is not a resource
+to ration. instance_id IS ACCEPTED AND ALWAYS REFUSED HERE, AND THE REFUSAL IS THE ANSWER RATHER THAN A
+MISSING FEATURE. A method exit HAS a `this`, so nothing about the request looks wrong — HotSpot accepts an
+InstanceOnly modifier on it, replies success, and then records exits from every instance regardless (measured
+on Temurin 17/21/25, re-run on its own to be sure: FILT-9, ADR-0027). There is no signal of any kind that the
+scope was dropped, so passing it through would mean a reply saying the stop point is scoped to one object
+while it reports all 400 — which is the exact failure this server is built to refuse. Use a condition instead
+(evaluated on our side, so it works on every kind), or put the stop point on a LINE inside an instance method,
+where instance_id does work. PASS condition TO FILTER THE RETURNS YOU DO NOT WANT (FILT-6), evaluated on the
+returning method's own frame — so its locals and `this` are in scope. `!`, `&&` and `||` all work, and a
+condition-skipped hit is NOT charged to the trace budget. Two costs worth knowing: on a SUSPENDING request the
+VM is frozen while the condition is evaluated, and this request receives EVERY method of a matching class, so
+a condition on a broad class_pattern is evaluated far more often than it fires — a method filter is the
+cheaper narrowing.
 
 ## debug.set_monitor_stop
 Watch LOCK CONTENTION as it happens, WITHOUT SUSPENDING ANYTHING — the answer to "requests are hanging on a

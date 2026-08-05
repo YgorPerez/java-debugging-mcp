@@ -423,6 +423,13 @@ pub struct SetBreakpointArgs {
     /// *disagreement* between two values. Each element is evaluated in turn against the same frame and
     /// gets its own labelled slot, so one that errors leaves the others intact. Bounded — the cost is per
     /// hit and multiplies — and a request over the ceiling is clamped with the clamp reported.
+    ///
+    /// **An element may COMPARE** (TRACE-13): `pagtoFormaRQ == pagtoForma` records `true` or `false`, with
+    /// the operators and the semantics `condition` accepts — `==`, `!=`, `<`, `<=`, `>`, `>=`, joined with
+    /// `&&`/`||`, identity for two references and content for two Strings. It belongs here and not only in
+    /// `condition` because "are these two the same instance?" is a question about ONE INSTANT: a condition
+    /// can merely filter on it, and two separate expressions leave a reader comparing `@0x…` handles by
+    /// eye — which stops being possible the moment either side is an expression rather than a local.
     #[serde(default)]
     pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm this logpoint automatically after recording this many hits, so
@@ -1224,6 +1231,13 @@ pub struct SetExceptionBreakpointArgs {
     /// *disagreement* between two values. Each element is evaluated in turn against the same frame and
     /// gets its own labelled slot, so one that errors leaves the others intact. Bounded — the cost is per
     /// hit and multiplies — and a request over the ceiling is clamped with the clamp reported.
+    ///
+    /// **An element may COMPARE** (TRACE-13): `pagtoFormaRQ == pagtoForma` records `true` or `false`, with
+    /// the operators and the semantics `condition` accepts — `==`, `!=`, `<`, `<=`, `>`, `>=`, joined with
+    /// `&&`/`||`, identity for two references and content for two Strings. It belongs here and not only in
+    /// `condition` because "are these two the same instance?" is a question about ONE INSTANT: a condition
+    /// can merely filter on it, and two separate expressions leave a reader comparing `@0x…` handles by
+    /// eye — which stops being possible the moment either side is an expression rather than a local.
     #[serde(default)]
     pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit),
@@ -1370,6 +1384,13 @@ pub struct SetWatchpointArgs {
     /// *disagreement* between two values. Each element is evaluated in turn against the same frame and
     /// gets its own labelled slot, so one that errors leaves the others intact. Bounded — the cost is per
     /// hit and multiplies — and a request over the ceiling is clamped with the clamp reported.
+    ///
+    /// **An element may COMPARE** (TRACE-13): `pagtoFormaRQ == pagtoForma` records `true` or `false`, with
+    /// the operators and the semantics `condition` accepts — `==`, `!=`, `<`, `<=`, `>`, `>=`, joined with
+    /// `&&`/`||`, identity for two references and content for two Strings. It belongs here and not only in
+    /// `condition` because "are these two the same instance?" is a question about ONE INSTANT: a condition
+    /// can merely filter on it, and two separate expressions leave a reader comparing `@0x…` handles by
+    /// eye — which stops being possible the moment either side is an expression rather than a local.
     #[serde(default)]
     pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit),
@@ -1529,6 +1550,13 @@ pub struct SetMethodBreakpointArgs {
     /// *disagreement* between two values. Each element is evaluated in turn against the same frame and
     /// gets its own labelled slot, so one that errors leaves the others intact. Bounded — the cost is per
     /// hit and multiplies — and a request over the ceiling is clamped with the clamp reported.
+    ///
+    /// **An element may COMPARE** (TRACE-13): `pagtoFormaRQ == pagtoForma` records `true` or `false`, with
+    /// the operators and the semantics `condition` accepts — `==`, `!=`, `<`, `<=`, `>`, `>=`, joined with
+    /// `&&`/`||`, identity for two references and content for two Strings. It belongs here and not only in
+    /// `condition` because "are these two the same instance?" is a question about ONE INSTANT: a condition
+    /// can merely filter on it, and two separate expressions leave a reader comparing `@0x…` handles by
+    /// eye — which stops being possible the moment either side is an expression rather than a local.
     #[serde(default)]
     pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit).
@@ -1721,7 +1749,10 @@ pub struct SetMonitorStopArgs {
     /// same capture. `JdwpError::InvokeTimeout`'s message is what speaks for that case.
     ///
     /// Accepts a LIST as well as a string (TRACE-11), each element evaluated against the same frame into
-    /// its own labelled slot.
+    /// its own labelled slot — and an element may COMPARE (`lock.owner == this.pedido`, TRACE-13) with the
+    /// operators and the semantics `condition` accepts. A comparison of two FIELD READS invokes nothing, so
+    /// it is accepted on `blocked` like any other field read; one whose side calls a method is refused there
+    /// for the same reason a bare call is.
     #[serde(default)]
     pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm automatically after this many recorded hits (default 200; 0 = no

@@ -157,8 +157,9 @@ claude mcp add --scope project jdwp /path/to/jdwp-mcp
 ```
 
 `JDWP_CLASS_ROOTS` and `JDWP_SOURCE_ROOTS` are worth setting too — they are what `debug.check_stale`,
-`debug.reload_class` and `debug.source` read, and the arm-time staleness warning stays silent without
-them.
+`debug.reload_class` and `debug.source` read, and without a class root the arm-time staleness check has
+nothing to compare against, so every stop point you arm says `Staleness NOT CHECKED` instead of vouching
+for the line it just resolved (DISC-14).
 
 ## Use it
 

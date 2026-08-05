@@ -1386,14 +1386,19 @@ pub struct BreakpointInfo {
     pub trace_max_length: Option<usize>,
     /// Observed capture cost, reported by `list_stop_points` (TRACE-7).
     pub trace_cost: TraceCost,
-    /// DISC-8: the stale-bytecode caveat found when this stop point was armed, if there was a proof.
+    /// DISC-8 and DISC-14: what the arming path found out about the build behind this stop point's line —
+    /// a proof of drift, a proof of agreement, or the reason it could not tell.
     ///
     /// Stored as well as reported, because the two arming paths differ in what they *can* report. The
     /// immediate path returns a reply and says it there; the **deferred** path arms inside the event pump
     /// when the class finally loads, where there is no reply to append to — so without this the caller who
     /// most needs the warning (they armed against a class that was not loaded yet) is the one who never
     /// sees it. `debug.list_stop_points` renders it for both.
-    pub drift: Option<String>,
+    ///
+    /// A three-state verdict rather than `Option<String>` since DISC-14 (#130): "compared, and they agree"
+    /// and "there was nothing to compare" were both `None`, which is the one distinction a silent reply
+    /// cannot carry — see [`crate::handlers::DriftCheck`].
+    pub drift: crate::handlers::DriftCheck,
     /// One rendered label per classloader this stop point is armed on, in the order the JVM listed
     /// them, when the class name resolved to more than one copy (BP-5, #79). Empty otherwise — which is
     /// almost always, and is what keeps an ordinary listing byte-identical.

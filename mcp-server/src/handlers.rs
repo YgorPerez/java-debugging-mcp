@@ -5960,9 +5960,10 @@ fn render_breakpoint_line(
     }
     output.push_str(&list_trace_exprs(&bp.trace_expr));
     // DISC-8. Rendered here as well as in the arm reply, because a deferred stop point arms in the event
-    // pump where no reply exists — this is the only place its caller can learn the build had drifted.
-    if let Some(d) = &bp.drift {
-        let _ = writeln!(output, "    {}", d.trim_start_matches('\n').trim_end());
+    // pump where no reply exists — this is the only place its caller can learn the build had drifted. Since
+    // DISC-14 it is also the only place a deferred stop point can say the check did not RUN.
+    if let Some(note) = bp.drift.listing_note(&bp.class_pattern) {
+        let _ = writeln!(output, "{note}");
     }
     render_hits(output, bp.hits);
     render_trace_cost(output, bp.trace, &bp.trace_cost);
@@ -7718,6 +7719,18 @@ fn parse_seg(raw: &str) -> Result<Seg, String> {
         Ok(Seg { name: name.to_string(), args: Some(args), subs })
     } else {
         if !is_ident(&head) {
+            // TRACE-13 (#131): a comparison is the one unsupported token that a caller has a reason to
+            // believe in, because `condition` and `trace_expr` both accept it — and this parser serves the
+            // arguments that must RETURN a value, where `a == b` has nowhere to put its answer. Saying so
+            // costs one sentence and saves the bisecting that "Unsupported token" invites.
+            if split_comparison(&head).is_some() {
+                return Err(format!(
+                    "Unsupported token: '{head}' — that is a COMPARISON, and this argument takes an \
+                     expression that resolves to a VALUE. `condition` and `trace_expr` both accept \
+                     `left OP right` (==, !=, <, <=, >, >=, joined with && / ||); an expression evaluated \
+                     for its value does not."
+                ));
+            }
             return Err(format!("Unsupported token: '{head}'"));
         }
         Ok(Seg { name: head, args: None, subs })
@@ -9236,36 +9249,165 @@ async fn one_line_table(
     }
 }
 
-/// DISC-8: the drift caveat for the one method a breakpoint was just armed in, or `None`.
+/// Why an arming reply could not check for stale bytecode when no class root is configured (DISC-14, #130).
+///
+/// **The commonest reason by a distance, and the one the issue was filed from.** It is a property of the
+/// SESSION rather than of the stop point — every arm in a rootless session earns this same sentence — so it
+/// is written once and names both ways to fix it. `debug.source`'s DISC-11 note answers the neighbouring
+/// question in the same words and is deliberately NOT shared with this one: that one is about a `.class` to
+/// compare the *source* against, this one about a line table to compare the *JVM* against, and collapsing
+/// them into one string would make each half wrong somewhere.
+const NO_CLASS_ROOT_TO_COMPARE: &str =
+    "no class root is configured, so there is no compiled .class to compare the JVM's line table against. \
+     The line above was resolved against WHATEVER THIS DEPLOYMENT HAS LOADED, which may not be your build.\
+     \n       Set one with debug.attach {\"class_roots\":[...]} or JDWP_CLASS_ROOTS (a path list in this \
+     platform's spelling) — a class root is where the package tree starts in the BUILD OUTPUT \
+     (target/classes), not src/main/java — and this check then runs on every arm, unasked.";
+
+/// What the arming path found out about the build behind the line it just resolved (DISC-8, DISC-14).
+///
+/// Three answers rather than two, and the third is the whole of DISC-14 (#130). `check_stale` has always
+/// distinguished them — it is the tool a caller *asked* — but the unasked check on the arming path folded
+/// "compared, and they agree" together with "there was nothing to compare", and those are the two states a
+/// silent reply cannot tell apart. Silence was documented to mean the first and in the toolkit's own
+/// deployment (no `JDWP_CLASS_ROOTS`, no `class_roots` on attach) it always meant the second: an arm
+/// against a war exported before the edit printed its `2 locations` and `2 classloaders` warnings, said
+/// nothing about staleness, and cost six tool calls before the `Method:` line gave it away.
+///
+/// So the silence is narrowed to the one state that has been *proved*, and the other two both speak.
+#[derive(Debug, Clone)]
+pub enum DriftCheck {
+    /// The JVM's line table for the armed method does not match the build. Carries the whole caveat,
+    /// leading newline and indentation included, because it is appended to a reply verbatim.
+    Stale(String),
+    /// Compared, and the two agree. The only state that says nothing at all — and now the only one that
+    /// a reader is entitled to read a silent reply as.
+    Current,
+    /// The comparison could not be made, with the reason in the caller's terms. Not an error: arming
+    /// succeeded, and this is an aside about how much the reply's line number can be trusted.
+    NotChecked(String),
+}
+
+impl DriftCheck {
+    /// The caveat to append to a single stop point's arming reply, or empty when there is nothing to say.
+    ///
+    /// The two speaking states get different markers on purpose, and they are the markers their two
+    /// sibling tools already use: `⚠️` for a proof of drift (as `debug.check_stale` and `debug.source`
+    /// do) and `ℹ️` for a check that did not run, phrased in `debug.source`'s own words — *not the same as
+    /// checked and fine*. A reader who learns that sentence in one reply should not have to learn a second
+    /// spelling of it here.
+    fn arming_note(&self) -> String {
+        match self {
+            Self::Stale(caveat) => caveat.clone(),
+            Self::Current => String::new(),
+            Self::NotChecked(why) => {
+                format!("\n   ℹ️  Staleness NOT CHECKED, which is not the same as checked and fine: {why}")
+            }
+        }
+    }
+
+    /// The stale caveat alone, for the batched reply that collects them into a roll-call.
+    const fn stale_caveat(&self) -> Option<&String> {
+        match self {
+            Self::Stale(caveat) => Some(caveat),
+            _ => None,
+        }
+    }
+
+    /// The unchecked reason alone, collected into its own roll-call for the same reason.
+    const fn not_checked(&self) -> Option<&String> {
+        match self {
+            Self::NotChecked(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// This stop point's line in `debug.list_stop_points`, or `None` when there is nothing to say.
+    ///
+    /// **The unchecked state is one short line here and a paragraph in the arming reply, and that
+    /// difference is the point.** In a session with no class roots EVERY line stop point is unchecked, so
+    /// printing the reason per entry would repeat the same five lines down a listing whose job is to fit
+    /// several stop points on a screen — and a listing that is tiring to read is one that gets skimmed past
+    /// the `⚠️` that matters. What has to survive the shortening is the fact itself, which is the half a
+    /// reader cannot recover: `NOT CHECKED` is not `checked and fine`, and `debug.check_stale` says why.
+    ///
+    /// A proof of drift is printed in full, exactly as it always has been. It is rare, it is per class, and
+    /// it is the one thing here worth interrupting a listing for.
+    fn listing_note(&self, class_pattern: &str) -> Option<String> {
+        match self {
+            Self::Stale(caveat) => Some(format!("    {}", caveat.trim_start_matches('\n').trim_end())),
+            Self::Current => None,
+            Self::NotChecked(_) => Some(format!(
+                "     ℹ️  Staleness NOT CHECKED — no proof either way for this line; \
+                 debug.check_stale {{\"class_name\":\"{class_pattern}\"}} says why."
+            )),
+        }
+    }
+}
+
+/// DISC-8 and DISC-14: what the arming path can say about the build behind the method it just armed in.
 ///
 /// `check_stale` exists and is good, but it only answers when asked — and the caller this failure ruins is
 /// the one who does not suspect drift at all. Arming a line breakpoint is where that springs: you set
 /// `:412`, it never fires or fires with locals that make no sense, and the next twenty tool calls go into
 /// the program instead of the deployment. So the proof runs here, unasked.
 ///
-/// **Silence is the default and it is load-bearing.** This returns `None` for every reason short of a
-/// proof: no class root configured, no class file under the roots, an unreadable or unparseable file, a
-/// file declaring a different class, no line table on either side. An unsolicited aside that is sometimes
-/// wrong is worse than no aside, because a reader who has been misled once discounts it forever — and the
-/// four distinct answers `debug.source` and `debug.check_stale` carefully separate belong in the tools a
-/// caller *asked*, not in a footnote on a different question.
+/// **Every non-proof is a REASON now, not silence** (DISC-14, #130). No class root, no class file under the
+/// roots, an unreadable or unparseable file, a file declaring a different class, no line table on either
+/// side: each of those used to return `None`, identically to a build that had been compared and matched.
+/// The care that produced that — an unsolicited aside which is sometimes wrong gets discounted forever —
+/// was aimed at the wrong risk. A wrong *verdict* is what a reader stops trusting; "I could not check, and
+/// here is the argument that would let me" is checkable on the spot, and it is the sentence `debug.source`
+/// has carried on the same question since DISC-11.
+///
+/// The reasons are quoted from `resolve_class_file` where it has one, exactly as
+/// `source_freshness_section` does: it already says which of its cases this is and what to fix, and a
+/// second vaguer sentence about the same thing would be worse.
 ///
 /// Costs no JDWP packets: `jvm_lines` was already fetched to resolve the line, and everything else is a
 /// local file read. That is what makes it affordable to do on every arming against a shared instance.
-async fn drift_caveat_for_armed_method(
+async fn drift_check_for_armed_method(
     session: &crate::session::DebugSession,
     class_name: &str,
     method: &jdwp_client::reftype::MethodInfo,
     jvm_lines: Vec<(u64, i32)>,
-) -> Option<String> {
-    if session.class_roots.is_empty() || jvm_lines.is_empty() {
-        return None;
+) -> DriftCheck {
+    if session.class_roots.is_empty() {
+        return DriftCheck::NotChecked(NO_CLASS_ROOT_TO_COMPARE.to_string());
     }
-    let path = resolve_class_file(class_name, None, &session.class_roots).ok()?;
-    let bytes = tokio::fs::read(&path).await.ok()?;
-    let built = crate::classfile::parse(&bytes).ok()?;
+    if jvm_lines.is_empty() {
+        return DriftCheck::NotChecked(format!(
+            "the JVM reports no line table for {}{}, so there is nothing on the running side to compare — \
+             a class deployed from a -g:none build.",
+            method.name, method.signature,
+        ));
+    }
+    let path = match resolve_class_file(class_name, None, &session.class_roots) {
+        Ok(p) => p,
+        Err(why) => return DriftCheck::NotChecked(why),
+    };
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(why) => {
+            return DriftCheck::NotChecked(format!("found {} but could not read it: {why}", path.display()));
+        }
+    };
+    let built = match crate::classfile::parse(&bytes) {
+        Ok(c) => c,
+        Err(why) => {
+            return DriftCheck::NotChecked(format!(
+                "{} could not be parsed as a class file: {why}",
+                path.display()
+            ));
+        }
+    };
     if built.this_class != class_name {
-        return None;
+        return DriftCheck::NotChecked(format!(
+            "{} declares {}, not {class_name} — that is a wrong class root rather than drift, so nothing \
+             was compared.",
+            path.display(),
+            built.this_class,
+        ));
     }
 
     let jvm = MethodLines {
@@ -9279,14 +9421,14 @@ async fn drift_caveat_for_armed_method(
 
 /// The verdict and wording of the arming-path caveat, with the session and the filesystem taken out.
 ///
-/// Split from [`drift_caveat_for_armed_method`] for the reason `compare_line_tables` is split from the
+/// Split from [`drift_check_for_armed_method`] for the reason `compare_line_tables` is split from the
 /// JDWP reads: this is where the answer is decided, and a detector that cries stale on a current build
 /// gets ignored within a day, so it has to be testable without a JVM or a class file on disk.
 fn drift_caveat_from_tables(
     jvm: &MethodLines,
     built_methods: Vec<crate::classfile::ClassFileMethod>,
     path: &std::path::Path,
-) -> Option<String> {
+) -> DriftCheck {
     // Reuse `compare_line_tables` rather than re-deciding what drift means: narrowing the build side to
     // the one method under test makes the whole-class comparison answer a single-method question, so the
     // two paths cannot disagree about what counts as drift. A method the build does not have at all lands
@@ -9296,7 +9438,21 @@ fn drift_caveat_from_tables(
         built_methods.into_iter().filter(|m| (m.name.as_str(), m.descriptor.as_str()) == jvm.key()).collect();
     let report = compare_line_tables(std::slice::from_ref(jvm), &same_method);
     if !report.is_stale() {
-        return None;
+        // DISC-14 (#130): `compare_line_tables` counts a method with no line table on one side as
+        // `skipped` rather than as matching, and skipped-with-nothing-matched is the `-g:none` build — the
+        // comparison ran and could not decide. Reporting that as `Current` is the exact confusion this
+        // issue is about, one level in: the class root was configured, so the caller has every reason to
+        // read the silence as "checked".
+        if report.matched == 0 && report.skipped > 0 {
+            return DriftCheck::NotChecked(format!(
+                "{} has no line table for {}{} — a -g:none build has code with no line numbers, so there \
+                 is nothing to compare the JVM's against.",
+                path.display(),
+                jvm.name,
+                jvm.descriptor,
+            ));
+        }
+        return DriftCheck::Current;
     }
 
     let detail = report
@@ -9304,7 +9460,7 @@ fn drift_caveat_from_tables(
         .first()
         .cloned()
         .unwrap_or_else(|| format!("{}{} is not in your build at all", jvm.name, jvm.descriptor));
-    Some(format!(
+    DriftCheck::Stale(format!(
         "\n   ⚠️  STALE BYTECODE: the JVM's line table for this method does not match {}.\n       \
          {detail}\n       The line above was resolved against the DEPLOYED build, so it may not be the \
          line you are reading. debug.check_stale for the whole class; debug.reload_class to install your \
@@ -10684,7 +10840,7 @@ async fn try_arm_deferred_breakpoints(
                         // comparison is even possible — and there is no reply to append it to, since
                         // this runs in the event pump. Stored for `list_stop_points` to render.
                         let drift =
-                            drift_caveat_for_armed_method(session, &pend.class_pattern, &method, lines).await;
+                            drift_check_for_armed_method(session, &pend.class_pattern, &method, lines).await;
                         session.breakpoints.insert(
                             pend.bp_id,
                             crate::session::BreakpointInfo {
@@ -12822,11 +12978,44 @@ const INVOKE_NEEDS_AN_EVENT: &str =
      does NOT invoke still works on a thread you suspended: the stack and its locals, expand_objects \
      (which reads fields), and debug.set_value on a local.";
 
-/// Append [`INVOKE_NEEDS_AN_EVENT`] when a failed invocation was refused for that reason, so every
-/// invoking path explains it the same way instead of passing a wire error through.
+/// What `ALREADY_INVOKING` (JDWP 502) means to a caller, who did nothing wrong (TRACE-12, #131).
+///
+/// **The state belongs to the THREAD, not to the expression that reported it**, and that is the whole
+/// content of this message: JDWP allows one invocation per thread at a time, so an expression can fail for
+/// no reason of its own and the same expression usually succeeds on the next hit. Handed back as the bare
+/// code — `invoke getClass() failed: JDWP error code 502: ALREADY_INVOKING` — it reads as a verdict on the
+/// expression, which sends a reader off to rewrite an expression that was already correct.
+///
+/// **How it happens here without anything being racy.** Every path in this server invokes with the
+/// connection borrowed mutably and awaits the reply, and a trace capture evaluates its expressions one
+/// after another in a single event pump, so this server never has two invocations of its own in flight on
+/// one thread. What it *can* leave behind is an invocation the DEBUGGEE is still running: the invoke budget
+/// ([`jdwp_client::connection::DEFAULT_INVOKE_TIMEOUT_MS`], 2000 ms) frees the debugger, and JDWP has no
+/// way to cancel the call — the same asymmetry ADR-0036 was written about. The next invocation on that
+/// thread then earns this, which is why a timeout earlier in the same capture is named as the likeliest
+/// cause rather than a general "try again".
+const INVOKE_ALREADY_INVOKING: &str =
+    "\n   The JVM answered ALREADY_INVOKING, which is a fact about the THREAD rather than about this \
+     expression: JDWP permits one method invocation per thread at a time, and one is still outstanding on \
+     this one. The likeliest cause is an EARLIER invocation on the same thread that hit the 2000ms invoke \
+     budget — another trace_expr element in the same capture, a toString() rendered for a captured value, \
+     or a previous debug.evaluate — because that budget frees the debugger and NOT the debuggee, and the \
+     call keeps running there where JDWP cannot cancel it. Nothing is wrong with the expression: read it \
+     again (a traced stop point will retry it by itself on the next hit), or use a FIELD instead of a \
+     getter, which needs no invocation and therefore cannot collide.";
+
+/// Append the note that explains a failed invocation, so every invoking path explains it the same way
+/// instead of passing a wire error through.
+///
+/// Two codes have a note, and they are the two whose bare wire form is actively misleading — one names the
+/// thread argument for a rule that has nothing to do with it, the other names this expression for a state
+/// belonging to the thread. Everything else keeps its own message.
 const fn invoke_hint(e: &jdwp_client::JdwpError) -> &'static str {
     match e {
         jdwp_client::JdwpError::JdwpErrorCode(10, _) => INVOKE_NEEDS_AN_EVENT,
+        // 502 is ALREADY_INVOKING; spelled as the number for the same reason 10 is, since neither has a
+        // named constant in `jdwp_client::protocol` and both are matched in exactly one place.
+        jdwp_client::JdwpError::JdwpErrorCode(502, _) => INVOKE_ALREADY_INVOKING,
         _ => "",
     }
 }
@@ -13460,9 +13649,9 @@ struct ArmedBreakpoint {
     /// path; never silently dropped, because a stop point covering fewer paths than the caller thinks
     /// is the failure this change exists to remove.
     partial: Vec<String>,
-    /// DISC-8: the stale-bytecode caveat, when there is a proof of drift. `None` the rest of the time,
-    /// including every case where the answer is merely unknown.
-    drift: Option<String>,
+    /// DISC-8 and DISC-14: the stale-bytecode caveat when there is a proof of drift, the reason when there
+    /// was nothing to compare, and nothing at all only when the two were compared and agreed.
+    drift: DriftCheck,
 }
 
 impl ArmedBreakpoint {
@@ -13740,7 +13929,7 @@ async fn arm_and_insert(
         Vec::new()
     };
     // Computed before the insert so the stop point carries it too, not only this reply (DISC-8).
-    let drift = drift_caveat_for_armed_method(session, &spec.class_pattern, &method, jvm_lines).await;
+    let drift = drift_check_for_armed_method(session, &spec.class_pattern, &method, jvm_lines).await;
     session.breakpoints.insert(
         bp_id.clone(),
         crate::session::BreakpointInfo {
@@ -14564,7 +14753,7 @@ async fn arm_single_named(
         bp_id,
         request_id,
         extra
-    ) + armed.drift.as_deref().unwrap_or(""))
+    ) + &armed.drift.arming_note())
 }
 
 fn render_pattern_outcomes(
@@ -14588,11 +14777,12 @@ fn render_pattern_outcomes(
     }
     out.push_str(":\n\n");
 
-    // Stale bytecode, gathered across every class armed by this call (DISC-8). One armed class prints the
-    // whole caveat; several print a roll-call, because 40 paragraphs is not a warning anyone reads.
-    let mut stale: Vec<(&str, &str)> = Vec::new();
+    // What the build looked like behind every class this call armed (DISC-8, DISC-14). One armed class
+    // prints the whole caveat; several print a roll-call, because 40 paragraphs is not a warning anyone
+    // reads.
+    let mut builds = DriftRollCall::default();
     for (pattern, outcome) in patterns.iter().zip(outcomes) {
-        render_one_pattern_outcome(&mut out, pattern, outcome, max_classes, &mut stale);
+        render_one_pattern_outcome(&mut out, pattern, outcome, max_classes, &mut builds);
     }
 
     let shared = describe_shared_arming_settings(base, frames_note);
@@ -14601,18 +14791,30 @@ fn render_pattern_outcomes(
         out.push('\n');
     }
 
-    render_stale_summary(&mut out, &stale);
+    render_stale_summary(&mut out, &builds.stale);
+    render_not_checked_summary(&mut out, &builds.not_checked);
     render_family_footer(&mut out, outcomes);
     out
 }
 
-/// One pattern's block in the arming reply, plus whatever drift it turned up.
+/// The build verdicts a batched arming reply gathers across every class it armed (DISC-8, DISC-14).
+///
+/// Two lists rather than one, because the two summaries below are shaped differently on purpose: a proof of
+/// drift is per class and names them, while "there was nothing to compare" is usually one fact about the
+/// session repeated N times. Merging them would force one shape onto both.
+#[derive(Default)]
+struct DriftRollCall<'a> {
+    stale: Vec<(&'a str, &'a str)>,
+    not_checked: Vec<(&'a str, &'a str)>,
+}
+
+/// One pattern's block in the arming reply, plus whatever the build check turned up for it.
 fn render_one_pattern_outcome<'a>(
     out: &mut String,
     pattern: &'a str,
     outcome: &'a PatternOutcome,
     max_classes: usize,
-    stale: &mut Vec<(&'a str, &'a str)>,
+    builds: &mut DriftRollCall<'a>,
 ) {
     match outcome {
         PatternOutcome::Armed(a) => {
@@ -14624,8 +14826,11 @@ fn render_one_pattern_outcome<'a>(
                 a.method_name,
                 a.describe_requests()
             );
-            if let Some(d) = &a.drift {
-                stale.push((pattern, d));
+            if let Some(d) = a.drift.stale_caveat() {
+                builds.stale.push((pattern, d));
+            }
+            if let Some(why) = a.drift.not_checked() {
+                builds.not_checked.push((pattern, why));
             }
         }
         PatternOutcome::Deferred { bp_id } => {
@@ -14641,8 +14846,11 @@ fn render_one_pattern_outcome<'a>(
         PatternOutcome::Family(f) => {
             render_family_block(out, pattern, f, max_classes);
             for m in &f.members {
-                if let Some(d) = &m.armed.drift {
-                    stale.push((m.class.as_str(), d));
+                if let Some(d) = m.armed.drift.stale_caveat() {
+                    builds.stale.push((m.class.as_str(), d));
+                }
+                if let Some(why) = m.armed.drift.not_checked() {
+                    builds.not_checked.push((m.class.as_str(), why));
                 }
             }
         }
@@ -14781,6 +14989,41 @@ fn render_stale_summary(out: &mut String, stale: &[(&str, &str)]) {
             );
         }
     }
+}
+
+/// DISC-14 across many classes: the same three shapes, for the check that could not run.
+///
+/// **The middle shape is the one this needs and [`render_stale_summary`] does not.** A proof of drift is a
+/// fact about one class, so N of them is N facts and a roll-call of names is the right answer. "There was
+/// nothing to compare" is almost always a fact about the SESSION — no class root is configured — so a
+/// wildcard that arms twenty classes produces twenty copies of one sentence, and naming the classes would
+/// imply the reason was theirs. Identical reasons therefore collapse into one line that says how many
+/// classes it covers; genuinely different reasons (a root that holds some of the classes and not others)
+/// fall through to the roll-call.
+fn render_not_checked_summary(out: &mut String, not_checked: &[(&str, &str)]) {
+    let Some((_, first)) = not_checked.first() else { return };
+    // One armed class reads exactly like the single-arm reply, down to the marker and the indentation.
+    if not_checked.len() == 1 {
+        let note = DriftCheck::NotChecked((*first).to_string()).arming_note();
+        let _ = writeln!(out, "{}", note.trim_end());
+        return;
+    }
+    let n = not_checked.len();
+    if not_checked.iter().all(|(_, why)| why == first) {
+        let _ = writeln!(
+            out,
+            "\nℹ️  Staleness NOT CHECKED on any of the {n} classes armed above — one reason covers all of \
+             them, so it is stated once: {first}"
+        );
+        return;
+    }
+    let names: Vec<&str> = not_checked.iter().map(|(c, _)| *c).collect();
+    let _ = writeln!(
+        out,
+        "\nℹ️  Staleness NOT CHECKED on {n} of the classes armed above, for MORE THAN ONE reason — {}. The \
+         first of them: {first} `debug.check_stale {{class_name}}` answers it per class.",
+        names.join(", ")
+    );
 }
 
 /// Resolve a breakpoint location (method, bytecode index, source line) on an already-loaded class,
@@ -22365,9 +22608,13 @@ async fn capture_trace(
                 // `expr_len` rather than a literal 200: TRACE-9 (#80) made the cap caller-raisable, and a
                 // decoded SOAP envelope is worthless at 200 chars, so the two features are only useful
                 // together.
+                //
+                // TRACE-13 (#131): `resolve_trace_expr` rather than `resolve_expression`, so an element
+                // that COMPARES two values (`pagtoFormaRQ == pagtoForma`) is evaluated instead of refused
+                // for a token `condition` has always accepted.
                 let rendered = match split_charset(&e) {
                     Ok((expr_text, bytes)) => {
-                        match resolve_expression(conn, Some(thread), Some(&frame), expr_text).await {
+                        match resolve_trace_expr(conn, thread, &frame, expr_text).await {
                             Ok(v) => render_value(conn, &v, Some(thread), expr_len, bytes).await,
                             Err(err) => format!("<error: {err}>"),
                         }
@@ -22410,6 +22657,45 @@ async fn capture_trace(
         // Filled in by the caller, which is what owns the chain bookkeeping (EXC-3).
         rethrow: None,
     }
+}
+
+/// One `trace_expr` element, resolved against the hit frame — **a comparison included** (TRACE-12, #131).
+///
+/// `condition` has accepted `expr OP expr` since it existed, and `trace_expr` accepted only a chain that
+/// resolves to a value. That asymmetry was not written down anywhere and the neighbouring argument invites
+/// the attempt, so what a caller actually got for `pagtoFormaRQ == pagtoForma` was
+/// `<error: Unsupported token: 'pagtoFormaRQ == pagtoForma'>` on every hit.
+///
+/// **It is `trace_expr`, not `condition`, where a comparison is the only way to ask the question.** "Are
+/// these two the same instance?" is a fact about ONE INSTANT, and a condition can only *filter* on it —
+/// two separate expressions record two values a reader then has to compare by eye, which works when both
+/// sides happen to print an `@0x…` handle and cannot be done at all when either side is the result of an
+/// expression rather than a local. That is what #131 hit: the workaround was reading two handles the
+/// snapshot printed for its locals, and it worked by luck.
+///
+/// Both evaluators are reached as they already are, so neither semantics is re-decided here: identity for
+/// two references, content for two Strings, one f64 scale for numbers ([`compare_resolved`]), and the
+/// literal coercions ([`compare_values`]) for a right-hand side like `1` or `"orinter"`. `&&`, `||` and
+/// `!` come along because they are the same parser, and refusing them would be a second asymmetry to
+/// explain.
+///
+/// **The bindings are deliberately empty.** `exception` and `newValue` are `condition`'s reserved names,
+/// documented there and meaningful only where the event supplies them; a name that resolves to a local on
+/// one stop point and to a reserved binding on another is worse than not having it. So a comparison here
+/// sees exactly what the rest of `trace_expr` sees — the frame.
+async fn resolve_trace_expr(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread: u64,
+    frame: &jdwp_client::thread::Frame,
+    expr: &str,
+) -> Result<jdwp_client::types::Value, String> {
+    if !expr_is_boolean(expr) {
+        return resolve_expression(conn, Some(thread), Some(frame), expr).await;
+    }
+    let holds = eval_condition(conn, thread, frame, expr, ConditionBindings::default()).await?;
+    // A real `Value` rather than a formatted "true"/"false", so the snapshot renders a boolean exactly as
+    // it renders a boolean local — one rendering path, so the two cannot drift apart.
+    Ok(value_bool(holds))
 }
 
 /// Read every local and argument in scope at `loc` off one frame, rendered for a trace snapshot.
@@ -22870,6 +23156,27 @@ fn parse_bool_tree(s: &str) -> BoolTree {
         }
     }
     BoolTree::Leaf(s.to_string())
+}
+
+/// Whether an expression is a BOOLEAN one — a comparison, or several joined by `&&`/`||`/`!` — rather
+/// than a value to read and render (TRACE-13, #131).
+///
+/// This is the whole of the test that decides which evaluator a `trace_expr` element goes to, and it is
+/// deliberately the *parser's* answer rather than a scan for an operator character: `getName().contains("a
+/// && b")` and `map["x>y"].id` carry the operators inside a string literal, and `foo(a > b)` carries one
+/// inside parens, so a `contains('>')` would send all three to the condition evaluator and break
+/// expressions that work today. [`parse_bool_tree`] and [`split_comparison`] already track quotes and
+/// depth for `condition`, which is exactly the tracking needed here.
+///
+/// A leaf with no top-level comparison is a plain chain (`dsMotivo`, `pagtoForma.getStatus()`) and reads
+/// exactly as it did before this existed — that is the compatibility promise, and it is why the negative
+/// cases are tested as carefully as the positive ones.
+fn expr_is_boolean(expr: &str) -> bool {
+    match parse_bool_tree(expr) {
+        // `&&`, `||` or a leading `!` — nothing that yields a value looks like this.
+        BoolTree::Or(_) | BoolTree::And(_) | BoolTree::Not(_) => true,
+        BoolTree::Leaf(leaf) => split_comparison(&leaf).is_some(),
+    }
 }
 
 /// Whether `s` is wholly wrapped in one matching pair of parens, so they can be stripped before
@@ -24929,17 +25236,22 @@ mod tests {
         }
     }
 
-    fn caveat(jvm: &MethodLines, built: Vec<crate::classfile::ClassFileMethod>) -> Option<String> {
+    fn caveat(jvm: &MethodLines, built: Vec<crate::classfile::ClassFileMethod>) -> DriftCheck {
         drift_caveat_from_tables(jvm, built, std::path::Path::new("/build/com/acme/OrderService.class"))
     }
 
     // DISC-8: the current-build case is the one that decides whether the warning is worth having. An
     // unsolicited aside that fires on a good build is worse than no aside, because a reader who has been
     // misled once discounts it forever.
+    //
+    // DISC-14 (#130) narrowed what this asserts, and the narrowing is the whole issue: `Current` rather
+    // than "produced nothing", because the states that produce nothing are now this one alone.
     #[test]
     fn arming_against_the_running_build_produces_no_caveat() {
         let lines = [(0, 10), (4, 11), (9, 12)];
-        assert_eq!(caveat(&jvm_method(&lines, true), vec![built_method("save", &lines)]), None);
+        let verdict = caveat(&jvm_method(&lines, true), vec![built_method("save", &lines)]);
+        assert!(matches!(verdict, DriftCheck::Current), "a matching build is a PROVED match: {verdict:?}");
+        assert_eq!(verdict.arming_note(), "", "and a proved match says nothing at all");
     }
 
     #[test]
@@ -24947,7 +25259,8 @@ mod tests {
         let jvm = jvm_method(&[(0, 10), (4, 11)], true);
         let built = vec![built_method("save", &[(0, 12), (4, 13)])];
 
-        let out = caveat(&jvm, built).expect("a moved line is a proof of drift");
+        let verdict = caveat(&jvm, built);
+        let out = verdict.stale_caveat().expect("a moved line is a proof of drift").clone();
 
         assert!(out.contains("STALE BYTECODE"), "{out}");
         assert!(out.contains("OrderService.class"), "must name the file it compared against:\n{out}");
@@ -24960,21 +25273,123 @@ mod tests {
     // the branch where a naive `report.differing[0]` would panic.
     #[test]
     fn a_method_missing_from_the_build_is_reported_without_a_line_difference() {
-        let out = caveat(&jvm_method(&[(0, 10)], true), vec![built_method("somethingElse", &[(0, 10)])])
-            .expect("a method the build lacks is drift");
+        let verdict = caveat(&jvm_method(&[(0, 10)], true), vec![built_method("somethingElse", &[(0, 10)])]);
+        let out = verdict.stale_caveat().expect("a method the build lacks is drift");
         assert!(out.contains("not in your build at all"), "{out}");
     }
 
-    // The three silences. Each is a case where the honest answer is "cannot tell", and the four distinct
-    // answers `check_stale` separates belong in the tool a caller asked, not in a footnote on arming.
+    // DISC-14 (#130): the three cases that used to be silent, which is what made silence unreadable. Each
+    // is a `-g:none` line table on one side or the other — the comparison ran and could not decide — and
+    // each now says so without claiming drift.
     #[test]
-    fn nothing_is_claimed_when_either_side_has_no_line_table() {
-        // -g:none on the running class: a valid reply with zero entries, which is not drift.
-        assert_eq!(caveat(&jvm_method(&[], false), vec![built_method("save", &[(0, 10)])]), None);
-        // -g:none in the build: has code, no lines.
-        assert_eq!(caveat(&jvm_method(&[(0, 10)], true), vec![built_method("save", &[])]), None);
-        // Nothing on either side.
-        assert_eq!(caveat(&jvm_method(&[], false), vec![built_method("save", &[])]), None);
+    fn a_missing_line_table_on_either_side_is_reported_as_not_checked() {
+        for (what, verdict) in [
+            // -g:none on the running class: a valid reply with zero entries, which is not drift.
+            ("the running side", caveat(&jvm_method(&[], false), vec![built_method("save", &[(0, 10)])])),
+            // -g:none in the build: has code, no lines.
+            ("the build side", caveat(&jvm_method(&[(0, 10)], true), vec![built_method("save", &[])])),
+            // Nothing on either side.
+            ("neither side", caveat(&jvm_method(&[], false), vec![built_method("save", &[])])),
+        ] {
+            let why = verdict.not_checked().unwrap_or_else(|| panic!("{what}: {verdict:?}"));
+            assert!(why.contains("-g:none"), "{what} must name the shape of build that causes it: {why}");
+            let note = verdict.arming_note();
+            assert!(note.contains("NOT CHECKED"), "{what}: {note}");
+            assert!(!note.contains("STALE"), "{what} must not be reported as drift: {note}");
+        }
+    }
+
+    // The sentence a reader has to be able to carry away from a listing, where the reason does not fit.
+    #[test]
+    fn a_listing_shortens_the_unchecked_reason_but_never_the_fact() {
+        let verdict = DriftCheck::NotChecked(NO_CLASS_ROOT_TO_COMPARE.to_string());
+        let line = verdict.listing_note("com.acme.OrderService").expect("an unchecked stop point speaks");
+        assert!(line.contains("NOT CHECKED"), "the fact survives the shortening: {line}");
+        assert!(line.contains("check_stale"), "and names the tool that has the reason: {line}");
+        assert!(!line.contains('\n'), "one line per stop point, so a listing stays readable: {line}");
+        assert!(line.len() < 160, "and a short one, {} chars: {line}", line.len());
+        assert_eq!(DriftCheck::Current.listing_note("com.acme.OrderService"), None);
+    }
+
+    // A wildcard in a rootless session arms N classes for ONE reason, and N copies of one sentence is how a
+    // reply teaches you to skip its footer. Different reasons still get the roll-call.
+    #[test]
+    fn identical_unchecked_reasons_collapse_into_one_line() {
+        let mut out = String::new();
+        render_not_checked_summary(
+            &mut out,
+            &[("com.acme.A", NO_CLASS_ROOT_TO_COMPARE), ("com.acme.B", NO_CLASS_ROOT_TO_COMPARE)],
+        );
+        assert!(out.contains("any of the 2 classes"), "the count carries the classes: {out}");
+        assert!(!out.contains("com.acme.A"), "naming them would imply the reason was theirs: {out}");
+        assert_eq!(out.matches("no class root is configured").count(), 1, "stated once: {out}");
+
+        let mut mixed = String::new();
+        render_not_checked_summary(
+            &mut mixed,
+            &[("com.acme.A", NO_CLASS_ROOT_TO_COMPARE), ("com.acme.B", "not found on disk")],
+        );
+        assert!(mixed.contains("MORE THAN ONE reason"), "two reasons are two facts: {mixed}");
+        assert!(mixed.contains("com.acme.A, com.acme.B"), "so the classes are named: {mixed}");
+    }
+
+    // ---- TRACE-13 (#131): a `trace_expr` that COMPARES, and the token test that routes it ----
+
+    // The whole risk of accepting comparisons is misrouting an expression that works today, so the
+    // negative cases matter more than the positive ones: an operator inside a string literal, inside
+    // parens, or inside a subscript is not a comparison, and a chain that resolves to a value must keep
+    // going to `resolve_expression`.
+    #[test]
+    fn a_comparison_is_told_apart_from_a_chain_that_merely_contains_an_operator() {
+        for boolean in [
+            "pagtoFormaRQ == pagtoForma",
+            "a.name != b.name",
+            "total > 100",
+            "this.limit <= other.limit",
+            "!flag",
+            "a == b && c != d",
+            "status == \"PAID\" || total > 0",
+        ] {
+            assert!(expr_is_boolean(boolean), "must be evaluated as a comparison: {boolean}");
+        }
+        for value in [
+            "dsMotivo",
+            "pagtoForma.getStatus()",
+            "order.lines[0].sku",
+            "getName().contains(\"a && b\")",
+            "map[\"x>y\"].id",
+            "compare(a > b)",
+            "@0x7f",
+            "log.dsRequest#ISO-8859-1",
+        ] {
+            assert!(!expr_is_boolean(value), "must still be read for its VALUE: {value}");
+        }
+    }
+
+    // The reverse discoverability hole: `debug.evaluate` cannot return a comparison, and saying only
+    // "Unsupported token" there is what sent #131 looking for a typo in a correct expression.
+    #[test]
+    fn a_comparison_where_a_value_is_required_says_where_comparisons_are_accepted() {
+        let Err(err) = parse_expr("pagtoFormaRQ == pagtoForma") else {
+            panic!("an argument evaluated for its value cannot take a comparison")
+        };
+        assert!(err.contains("COMPARISON"), "{err}");
+        assert!(err.contains("condition"), "must name where it IS accepted: {err}");
+        assert!(err.contains("trace_expr"), "both of them: {err}");
+    }
+
+    // A state of the THREAD reported as a failure of the expression is what #131 hit, and the bare wire
+    // code is indistinguishable from "your expression is wrong".
+    #[test]
+    fn already_invoking_is_explained_as_a_thread_state_rather_than_a_bad_expression() {
+        let hint = invoke_hint(&jdwp_client::JdwpError::JdwpErrorCode(502, "ALREADY_INVOKING".to_string()));
+        assert!(hint.contains("one method invocation per thread"), "{hint}");
+        assert!(hint.contains("2000ms"), "must name the budget that leaves one outstanding: {hint}");
+        assert!(hint.contains("next hit"), "and that a traced stop point retries by itself: {hint}");
+        // The neighbouring code keeps its own note, and an unrelated one still gets none.
+        assert!(invoke_hint(&jdwp_client::JdwpError::JdwpErrorCode(10, String::new()))
+            .contains("suspended BY AN EVENT"));
+        assert_eq!(invoke_hint(&jdwp_client::JdwpError::JdwpErrorCode(20, String::new())), "");
     }
 
     // ---- DISC-11 (#87): the freshness note under a `debug.source` window ----

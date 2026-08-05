@@ -34,8 +34,10 @@ do not read it as work outstanding.
 The **toolkit items** at the end are the exception: they are work in
 [`infotravel-dev-toolkit`](https://github.com/ygor-infotera/infotravel-dev-toolkit), a downstream repo
 this one cannot see, so their status is not knowable from here. One of them did come back as work on this
-side — an unconfigured class root makes the arm-time staleness warning silent, which reads as "your build
-is current" ([#130](https://github.com/YgorPerez/java-debugging-mcp/issues/130), open).
+side — an unconfigured class root made the arm-time staleness warning silent, which reads as "your build
+is current" ([#130](https://github.com/YgorPerez/java-debugging-mcp/issues/130)): **shipped**, and the
+silence now means *compared and equal* rather than either that or "nobody looked" (DISC-14, see `TODO.md`
+§ Shipped).
 
 ## The two items that are bugs, not gaps
 

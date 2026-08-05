@@ -332,6 +332,53 @@ built for that run (`CARGO_BIN_EXE_jdwp-mcp`), so they can never test a stale bi
 
 ## ✅ Shipped (context)
 
+- **An arming reply says when it could NOT check for stale bytecode (DISC-14/#130)** — DISC-8's warning was
+  working exactly as designed and its *silence* was unreadable. Armed against an 8180 whose exported war
+  predated the edit — a comment pruning had moved every line in the file — the reply printed its `2
+  locations` and `2 classloaders` notes, said nothing about staleness, and the `Method:` line named
+  `capturarTentativa3DSConfirmada` where the caller had asked for `removerTentativa3DS`. Six tool calls went
+  into the program before the deployment was suspected. The cause was no class root: the attach passed
+  `source_roots` only, `JDWP_CLASS_ROOTS` was unset, and with no build to compare against the check has
+  nothing to say — so it said nothing, which is byte-for-byte what a *checked and current* build produces.
+  `drift_check_for_armed_method` now returns a three-state `DriftCheck` (`Stale` / `Current` / `NotChecked`)
+  and every non-proof carries its reason: no class root (the common one, written once as
+  `NO_CLASS_ROOT_TO_COMPARE` and naming both ways to set one), no `.class` under the roots, an unreadable or
+  unparseable file, a file declaring another class, no line table on either side. The wording is
+  `debug.source`'s own — *NOT CHECKED, which is not the same as checked and fine* — because DISC-11
+  (ADR-0029) settled this exact question one reply over, and a reader who has learned that sentence should
+  not have to learn a second spelling of it. **Silence now means compared-and-equal, and nothing else.**
+  Two shapes rather than one: a wildcard arming twenty classes in a rootless session states the one shared
+  reason **once** with the count, since naming twenty classes would imply the reason was theirs, and
+  genuinely differing reasons still get the roll-call. `list_stop_points` keeps the fact and drops the
+  paragraph — one line per stop point, pointing at `debug.check_stale` — which is also the only channel a
+  **deferred** stop point has, since it arms in the event pump where there is no reply. Proven by
+  `arming_with_no_class_root_says_the_staleness_check_did_not_run`, which asserted the *opposite* until this
+  landed, and by the current-build test now also asserting the absence of `NOT CHECKED`: with three states,
+  each silence has to be pinned from both directions or the pair proves nothing.
+- **A `trace_expr` element may compare (TRACE-13/#131)** — `condition` has accepted `left OP right` since it
+  existed and `trace_expr` answered `<error: Unsupported token: 'pagtoFormaRQ == pagtoForma'>`, an asymmetry
+  written down nowhere and invited by the neighbouring argument. It matters more here than in `condition`:
+  "are these two the same instance?" is a question about **one instant**, which a condition can only filter
+  on, and two separate expressions leave a reader comparing `@0x…` handles by eye — which stops being
+  possible the moment either side is an expression rather than a local. The session that filed it proved its
+  thesis by luck, because both sides happened to be locals that printed their handles.
+  `resolve_trace_expr` routes an element to `eval_condition` when `expr_is_boolean` says so and to
+  `resolve_expression` otherwise, so neither semantics is re-decided: identity for two references, content
+  for two Strings, one f64 scale for numbers, the literal coercions for `== 1`, and `&&`/`||`/`!` because
+  they are the same parser. The routing test is mostly **negative** on purpose — an operator inside a string
+  literal, inside parens or inside a subscript is not a comparison — since the only real risk was
+  misrouting an expression that already worked. Bindings are deliberately not shared: `exception` and
+  `newValue` stay `condition`'s reserved names rather than becoming names that mean a local on one stop point
+  and something else on another. The second half of the issue was a raw `JDWP error code 502:
+  ALREADY_INVOKING` reported as the expression's failure; `invoke_hint` now explains it as a state of the
+  **thread** — one invocation per thread, most likely an earlier one in the same capture that hit the 2000 ms
+  budget and is still running where JDWP cannot cancel it — and says the same read usually works on the next
+  hit. Serialising the capture's invocations was the issue's other suggestion and there was nothing to fix:
+  a capture already evaluates its expressions one at a time in a single event pump, so the collision comes
+  from the debuggee outliving our budget (ADR-0036's asymmetry), which no ordering on this side can prevent.
+  Proven against `EvalProbe.work`, whose `a` and `b` are two distinct `Item`s built with the same name — so
+  `a == b` is `false` and `a.name == b.name` is `true` on the same hit, and a comparison that answered the
+  same for both would be indistinguishable from one that worked.
 - **An armed exact-name stop point keeps watching for later copies (BP-7/#115, ADR-0028)** — the redeploy
   loop contains no re-arm, which is why BP-4's explicit re-resolve (#9) and BP-5's arm-every-copy (#79)
   both miss it: `set_line_stop` → *edit, recompile, redeploy* → the request that reaches the line →
@@ -1168,15 +1215,13 @@ and said four when six were). The open set:
 | [#56](https://github.com/YgorPerez/java-debugging-mcp/issues/56) TEST-21 · P3 · S | flake | attach `Connection refused` |
 | [#64](https://github.com/YgorPerez/java-debugging-mcp/issues/64) TEST-23 · P2 · S | flake | `events_are_buffered` sees one event more than it staged (JDK 17) |
 | [#118](https://github.com/YgorPerez/java-debugging-mcp/issues/118) TEST-34 · P2 · S | flake | `launch_suspends_before_the_first_instruction`, ~1 in 3 under CI contention |
-| [#130](https://github.com/YgorPerez/java-debugging-mcp/issues/130) DISC-14 · P2 · S | product | an unconfigured class root makes the arm-time stale warning silent, which reads as "your build is current" |
-| [#131](https://github.com/YgorPerez/java-debugging-mcp/issues/131) TRACE-12 · P3 · S | product | `trace_expr` refuses `==` that `condition` accepts; a second invoking expression returns a raw `ALREADY_INVOKING` |
 
-**Four flakes and two product defects.** The four flakes are the family below — #118 joined it after the
-tables were written and is the only member not described there. The two product defects are both the same
-shape this repo keeps filing against itself, and it is the shape `CLAUDE.md` opens with: **a silence that
-reads as an answer.** #130's quiet reply looks like "your build is current" when it means "I was never told
-where to look"; #131's raw JDWP error code looks like a defect in the expression rather than a second
-invocation on one thread.
+**Four flakes, and the two product defects that were here are shipped** (DISC-14/#130 and TRACE-13/#131 —
+see § Shipped). The four flakes are the family below — #118 joined it after the tables were written and is
+the only member not described there. Both product defects were the same shape this repo keeps filing against
+itself, and it is the shape `CLAUDE.md` opens with: **a silence that reads as an answer.** #130's quiet reply
+looked like "your build is current" when it meant "I was never told where to look"; #131's raw JDWP error
+code looked like a defect in the expression rather than a second invocation on one thread.
 
 > **The tables below are the record of how the board got here, not work outstanding.** Every issue named in
 > them is closed. They are kept because the "why it exists" column is where the evidence lives — the

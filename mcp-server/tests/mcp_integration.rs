@@ -9714,6 +9714,72 @@ fn too_many_trace_expressions_are_clamped_and_the_reply_names_what_it_dropped() 
     assert!(!armed.contains("Trace expr[4]"), "and the fifth is not listed as armed: {armed}");
 }
 
+/// TRACE-13 (#131): a `trace_expr` element may COMPARE, which `condition` has always allowed and this
+/// argument answered with `<error: Unsupported token: '…'>`.
+///
+/// **`EvalProbe.work` is the probe this needs and it already existed**: `a` and `b` are two DISTINCT `Item`s
+/// constructed with the SAME name, per call. So one line proves both halves of the semantics at once —
+/// `a == b` is identity and must be **false**, `a.name == b.name` compares two Strings by content and must
+/// be **true** — and a comparison that answered the same for both would be indistinguishable from one that
+/// worked. That distinction is the whole question #131 was asked in anger: a fix whose thesis was "for a
+/// caller who already passes a managed entity, this returns the SAME instance" cannot be proved by two
+/// values that merely look alike.
+///
+/// The third element is a comparison against a LITERAL, which takes the other coercion path, and it is
+/// deliberately in the same call: three elements against one hit is also the guard that routing an element
+/// to the condition evaluator does not disturb its neighbours.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_trace_expr_may_compare_two_values_against_the_same_hit() {
+    let Some(jdk) = jdk_or_skip("a_trace_expr_may_compare_two_values_against_the_same_hit") else { return };
+    let mut probe =
+        Probe::launch_running(&jdk, "EvalProbe", |l| l.starts_with("work ")).expect("launch EvalProbe");
+    let line = probe_line(&probe_source("EvalProbe"), "// BP1");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "EvalProbe", "line": line, "trace": true,
+            "trace_expr": ["a == b", "a.name == b.name", "n >= 0"],
+        }),
+    );
+    assert!(armed.contains("bp_"), "the logpoint must arm: {armed}");
+
+    let traces = server
+        .wait_for_traces("a == b =>", EVENT_TIMEOUT)
+        .expect("the logpoint recorded no hit carrying the comparison's own slot");
+    let hit = traces
+        .lines()
+        .find(|l| l.contains("EvalProbe.work:") && l.contains("a == b =>"))
+        .unwrap_or_else(|| panic!("no hit line carrying the comparison in:\n{traces}"));
+
+    assert!(
+        hit.contains("a == b => (boolean) false"),
+        "two distinct instances are NOT the same object, and this is the answer #131 needed: {hit}"
+    );
+    assert!(
+        hit.contains("a.name == b.name => (boolean) true"),
+        "two equal Strings compare by content, exactly as in a condition: {hit}"
+    );
+    assert!(
+        hit.contains("n >= 0 => (boolean) true"),
+        "and a comparison against a literal takes the coercion path unharmed: {hit}"
+    );
+    assert!(!hit.contains("Unsupported token"), "the old refusal must be gone: {hit}");
+
+    // TRACE-2's discipline, and the reason this test uses a trace rather than a suspending stop point:
+    // three evaluations per hit must still resume the thread. Only the probe can say so.
+    let before = probe.output().len();
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("work ")).is_some(),
+        "the probe stopped printing, so a comparison in a capture suspended the thread\n  output after \
+         {before} lines: {:?}",
+        probe.output(),
+    );
+}
+
 /// TRACE-12 (#117): a suspending stop point converts every traced stop point on the same line into a
 /// VM-freezing one, and until this nothing said so.
 ///
@@ -10117,12 +10183,31 @@ fn arming_says_nothing_about_drift_on_a_current_build() {
 
     assert!(armed.contains("Stop-point ID"), "the breakpoint must have been set:\n{armed}");
     assert!(!armed.contains("STALE"), "false positive on a rebuild of the running source:\n{armed}");
+    // DISC-14 (#130): the OTHER half of the silence. A configured root and a matching build is the one
+    // state that says nothing, so this reply must carry neither warning — that is what now makes an arm
+    // reply with no staleness line a positive statement rather than an absence.
+    assert!(
+        !armed.contains("NOT CHECKED"),
+        "a check that ran and agreed must not report itself as unchecked:\n{armed}"
+    );
 }
 
+/// DISC-14 (#130): with no class root there is nothing to compare, and the reply says THAT instead of
+/// nothing.
+///
+/// This test asserted the opposite until #130, and the session that filed it is why. Armed against an 8180
+/// whose exported war predated the edit — every line in the file had moved — the reply carried its `2
+/// locations` and `2 classloaders` warnings and no staleness line, because the attach had passed
+/// `source_roots` and no `class_roots`. Six tool calls went by before the `Method:` line named a method
+/// nobody had asked for. The staleness check was working exactly as designed; what could not be read was its
+/// silence, which meant "compared and equal" in one session and "nobody looked" in this one.
+///
+/// The reply must NOT claim drift — there is no evidence of any — and must name the argument that would let
+/// the check run, which is the part that makes it actionable in the reply the caller is already looking at.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
-fn arming_says_nothing_about_drift_when_no_class_root_is_configured() {
-    let Some(jdk) = jdk_or_skip("arming_says_nothing_about_drift_when_no_class_root_is_configured") else {
+fn arming_with_no_class_root_says_the_staleness_check_did_not_run() {
+    let Some(jdk) = jdk_or_skip("arming_with_no_class_root_says_the_staleness_check_did_not_run") else {
         return;
     };
     let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
@@ -10136,9 +10221,26 @@ fn arming_says_nothing_about_drift_when_no_class_root_is_configured() {
     );
 
     assert!(armed.contains("Stop-point ID"), "the breakpoint must have been set:\n{armed}");
+    assert_contains_all(
+        "the unchecked state is named, and so is the way to fix it",
+        &armed,
+        &["NOT CHECKED", "not the same as checked and fine", "class_roots", "JDWP_CLASS_ROOTS"],
+    );
     assert!(
         !armed.contains("STALE"),
-        "with nothing to compare against, the reply must not mention drift at all:\n{armed}"
+        "with nothing to compare against, the reply must not claim drift either:\n{armed}"
+    );
+    // And the listing carries it too, in one line rather than the paragraph: this is the only channel a
+    // DEFERRED stop point has, since it arms inside the event pump where there is no reply.
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert_contains_all(
+        "a listing keeps the fact and drops the reason, pointing at the tool that has it",
+        &listed,
+        &["NOT CHECKED", "check_stale"],
+    );
+    assert!(
+        !listed.contains("JDWP_CLASS_ROOTS"),
+        "the listing must not repeat the whole paragraph per stop point:\n{listed}"
     );
 }
 
