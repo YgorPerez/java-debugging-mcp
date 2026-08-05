@@ -19778,6 +19778,52 @@ const DEEP_NODE_BUDGET: usize = 400;
 /// and the exhaustion notice says so.
 const STACK_NODE_BUDGET: usize = 1000;
 
+/// The most nodes one node at `depth` can consume, itself included.
+///
+/// A node at or past the depth limit renders as a leaf: one node, no recursion. Below it, a node is itself
+/// plus at most `child_limit` children — doubled, because a *map* entry renders a key **and** a value, so a
+/// map level is two nodes per child slot. Conservative on purpose: this bounds a prefetch, and a bound that
+/// is too small licenses speculation while one that is too large only declines a saving.
+///
+/// Saturating throughout, because `max_depth` and `max_children` are the caller's to set and the product is
+/// exponential in the first. A saturated bound makes [`certain_children`] answer 1, which switches the
+/// prefetch off — the safe direction, reached by arithmetic rather than by a special case.
+const fn subtree_max(depth: usize, opts: DeepOpts) -> usize {
+    let fanout = opts.child_limit.saturating_mul(2);
+    let mut bound = 1_usize;
+    let mut d = opts.depth_limit;
+    while d > depth {
+        bound = 1_usize.saturating_add(fanout.saturating_mul(bound));
+        d -= 1;
+    }
+    bound
+}
+
+/// How many of a level's `children` are **certain** to be rendered, so their first reads may be waved.
+///
+/// This is the whole of #129's deep-path licence, and it is arithmetic rather than judgement. `render_node`
+/// renders a child iff the budget is non-zero when it reaches it, and each earlier child's subtree consumes
+/// at most `S = subtree_max(child_depth)`. So children `1..k` are all certain when
+/// `budget >= (k-1) * S + 1`, which rearranges to `k <= (budget - 1) / S + 1`.
+///
+/// **Why this is not the speculation ADR-0038 refused.** That refusal is right and stands: prefetching a
+/// *whole* level reads for children the budget may never reach. This prefetches only the prefix the budget
+/// cannot fail to reach, so it reads exactly what the sequential walk reads and stops where the sequential
+/// walk might stop. It also needs no decision about what a budget-bound reply contains — the reserve-breadth-
+/// first alternative did, and that is what made *it* caller-visible.
+///
+/// It declines where it should: with the default `max_depth 3`, a top-level level has `S = 1641` against a
+/// 1000-node budget and this answers 1, so nothing is waved. Deeper levels, where `S` is small and the reads
+/// are numerous, get the whole level. `the_deep_node_budget_does_not_bind_on_a_usable_reply` is the
+/// measurement that says those are the levels that matter.
+fn certain_children(budget: usize, children: usize, child_depth: usize, opts: DeepOpts) -> usize {
+    if children == 0 || budget == 0 {
+        return 0;
+    }
+    let subtree = subtree_max(child_depth, opts).max(1);
+    (((budget - 1) / subtree) + 1).min(children)
+}
+
 /// Mutable state threaded through one deep render.
 struct DeepState {
     /// Nodes left to visit across the whole render.
@@ -19786,11 +19832,22 @@ struct DeepState {
     /// purpose: a value reachable twice by different routes is worth printing twice in a debugger,
     /// but a true cycle (`parent.child.parent`) must not recurse.
     path: Vec<u64>,
+    /// First reads prefetched for the levels rendered so far (PERF-2, #129).
+    ///
+    /// **Here rather than beside the connection, and the reason is `budget` above.** A prefetch on the deep
+    /// path is legal exactly while the budget provably cannot bind before a level completes — see
+    /// [`certain_children`] — so its legality is *derived from* the budget, and the two belong to the same
+    /// scratchpad for the same reason. (On the shallow path the equivalent map is a local in
+    /// `project_query_rows`, because there is no budget there to derive anything from.)
+    ///
+    /// A map on `JdwpConnection` would be `TypeCache` with a weak key and would be wrong for ADR-0022's
+    /// reason. This one is born and dies with one render.
+    reads: ValueReads,
 }
 
 impl DeepState {
-    const fn new(budget: usize) -> Self {
-        Self { budget, path: Vec::new() }
+    fn new(budget: usize) -> Self {
+        Self { budget, path: Vec::new(), reads: ValueReads::none() }
     }
 
     /// Whether the budget ran out during the render(s) so far.
@@ -19865,33 +19922,30 @@ async fn render_node(
     // redundant. This used to sit below the boxed-primitive check, which read the type to decide that a
     // `java.lang.String` is not a boxed primitive (PERF-2, #129).
     if value.tag == 115 {
-        if let Ok(s) = conn.get_string_value(id).await {
+        if let Some(s) = state.reads.string_contents(conn, id).await {
             return format!("\"{}\"", truncate(&s, opts.text_len));
         }
     }
     // The object's type, read ONCE for this node. Every step below takes it as an argument rather than
     // resolving it again from the id — which is the whole of #129's dedup half.
-    let Ok(type_id) = conn.get_object_reference_type(id).await else {
+    //
+    // Both of these come from `state.reads` when the level that produced this node proved the budget could
+    // not bind before reaching it (`certain_children`), and fall through to a single read otherwise. So the
+    // packet count is the sequential walk's either way.
+    let Some(type_id) = state.reads.reference_type(conn, id).await else {
         return format!("(object) @0x{id:x}");
     };
     let sig = conn.get_signature(type_id).await.unwrap_or_default();
     let name = decode_signature(&sig);
     if name == "java.lang.String" {
-        if let Ok(s) = conn.get_string_value(id).await {
+        if let Some(s) = state.reads.string_contents(conn, id).await {
             return format!("\"{}\"", truncate(&s, opts.text_len));
         }
     }
 
     // A boxed primitive is a leaf, whatever the depth: expanding it would turn a `List<Integer>`
     // into twenty `java.lang.Integer { value = (int) n }` blocks instead of twenty numbers.
-    //
-    // `ValueReads::none()` at all three of this function's uses of it: **the deep walk commits to nothing**,
-    // because `state.budget` is decremented per node as it renders, so how many of a level's children will
-    // be rendered is not known until they have been. Prefetching for a level would read for children the
-    // budget may never reach, which is `CONTEXT.md`'s **speculative read** and the invariant every one of
-    // these conversions protects. Resolving it needs a decision about what a budget-bound reply contains,
-    // which is caller-visible — ADR-0038 and #129.
-    if let Some(unboxed) = render_boxed_primitive(conn, &ValueReads::none(), id, type_id, &name).await {
+    if let Some(unboxed) = render_boxed_primitive(conn, &state.reads, id, type_id, &name).await {
         return unboxed;
     }
 
@@ -19900,7 +19954,7 @@ async fn render_node(
     if depth >= opts.depth_limit {
         return render_resolved_object(
             conn,
-            &ValueReads::none(),
+            &state.reads,
             id,
             type_id,
             &sig,
@@ -19989,6 +20043,16 @@ async fn render_fields_deep(
     let Ok(values) = conn.get_object_values(id, ids).await else {
         return format!("{name} @0x{id:x} (fields unreadable)");
     };
+
+    // PERF-2 (#129): wave the first reads of the children the budget CANNOT fail to reach.
+    //
+    // The rendered set is `min(shown, values.len())` — the zip below decides it — and `certain_children`
+    // narrows that to the prefix whose rendering is arithmetically guaranteed. Everything past it renders
+    // exactly as before, one read at a time, so this changes when packets are sent and never how many.
+    let rendered = shown.min(values.len());
+    let certain = certain_children(state.budget, rendered, depth + 1, opts);
+    let committed: Vec<&jdwp_client::types::Value> = values.iter().take(certain).collect();
+    state.reads.extend_committed(conn, &committed).await;
 
     let pad = indent(depth + 1);
     let mut out = format!("{name} @0x{id:x} {{");
@@ -20240,6 +20304,13 @@ async fn render_indexed_block(
     }
     let take = len.min(i32::try_from(opts.child_limit).unwrap_or(i32::MAX));
     let elems = conn.get_array_values(arr, 0, take).await.ok()?;
+
+    // PERF-2 (#129), as in `render_fields_deep`: every element is in hand before any is rendered, so the
+    // prefix the budget cannot fail to reach can have its first reads waved.
+    let certain = certain_children(state.budget, elems.len(), depth + 1, opts);
+    let committed: Vec<&jdwp_client::types::Value> = elems.iter().take(certain).collect();
+    state.reads.extend_committed(conn, &committed).await;
+
     let pad = indent(depth + 1);
     let mut out = format!("{header} {{");
     for (i, e) in elems.iter().enumerate() {
@@ -24083,6 +24154,77 @@ mod tests {
         // One family: round-robin over it is creation order, so announcing it would be noise.
         let narrowed = FamilySelection { eligible: 300, families: 1, withheld: Vec::new() };
         assert_eq!(family_order_note(40, &narrowed), "");
+    }
+
+    // PERF-2 (#129): the deep walk's prefetch is legal only for the prefix of a level the budget cannot fail
+    // to reach, and `certain_children` is that argument in arithmetic. It is unit-tested rather than left to
+    // the integration census because getting it wrong licenses a speculative read — the one thing this whole
+    // issue is written to avoid — and because a pure function is checkable without a JVM, a probe or a
+    // suspension.
+    #[test]
+    fn a_levels_certain_prefix_is_never_more_than_the_budget_guarantees() {
+        let opts = |depth_limit, child_limit| DeepOpts {
+            depth_limit,
+            child_limit,
+            text_len: 80,
+            bytes: ByteRender::default(),
+        };
+
+        // At the depth limit a child renders as a leaf: one node each, so the whole level is certain as long
+        // as the budget covers it one-for-one.
+        let at_limit = opts(2, 20);
+        assert_eq!(certain_children(1000, 12, 2, at_limit), 12, "every child is a leaf and 1000 >> 12");
+        assert_eq!(certain_children(12, 12, 2, at_limit), 12, "exactly enough is enough");
+        assert_eq!(certain_children(5, 12, 2, at_limit), 5, "budget 5 guarantees the first 5 and no more");
+
+        // One level up, a child may expand: fanout is 2 x child_limit (a map entry renders a key AND a
+        // value), so a child at depth 1 with the limit at 2 can consume 1 + 40 = 41 nodes.
+        assert_eq!(subtree_max(2, at_limit), 1);
+        assert_eq!(subtree_max(1, at_limit), 41);
+        assert_eq!(certain_children(1000, 40, 1, at_limit), 25, "(1000 - 1) / 41 + 1");
+
+        // The default `get_stack` shape: a top-level level cannot be waved at all, which is the arithmetic
+        // declining rather than a special case. `the_deep_node_budget_does_not_bind_on_a_usable_reply` is the
+        // measurement that says the deep levels are the ones that carry the reads.
+        let deep = opts(3, 20);
+        assert_eq!(subtree_max(1, deep), 1 + 40 * 41);
+        assert_eq!(certain_children(1000, 20, 1, deep), 1, "S=1641 against a 1000 budget: only the first");
+
+        // Degenerate inputs answer zero rather than one.
+        assert_eq!(certain_children(0, 12, 2, at_limit), 0, "no budget, no certainty");
+        assert_eq!(certain_children(1000, 0, 2, at_limit), 0, "no children, nothing to wave");
+
+        // A caller may set max_depth and max_children, and the bound is exponential in the first. Saturating
+        // arithmetic has to leave the answer at 1 — the safe direction — instead of wrapping to something
+        // large, which would license reading a whole level the budget cannot possibly cover.
+        let absurd = opts(64, 4096);
+        assert_eq!(subtree_max(1, absurd), usize::MAX, "the bound saturates rather than wrapping");
+        assert_eq!(certain_children(1000, 4096, 1, absurd), 1, "and a saturated bound wagers nothing");
+
+        // The property the whole licence rests on, over a spread of shapes: if the first `k` children are
+        // claimed certain, the budget must cover the worst case of the `k - 1` before the last one plus the
+        // one node the last one needs. Asserted as the inequality rather than trusted from the division.
+        for depth_limit in 1_usize..5 {
+            for child_limit in [1_usize, 3, 20, 100] {
+                let o = opts(depth_limit, child_limit);
+                for child_depth in 1..=depth_limit {
+                    for budget in [1_usize, 2, 7, 41, 400, 1000, 9999] {
+                        let k = certain_children(budget, 4096, child_depth, o);
+                        if k == 0 {
+                            continue;
+                        }
+                        let s = subtree_max(child_depth, o).max(1);
+                        let needed = (k - 1).saturating_mul(s).saturating_add(1);
+                        assert!(
+                            needed <= budget,
+                            "claimed {k} children certain at depth {child_depth} of {depth_limit} with \
+                             child_limit {child_limit} and budget {budget}, but the worst case for the first \
+                             {k} is {needed} nodes. That is a speculative read licensed by arithmetic."
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // DUMP-5 (#51): `list_threads` now reads every thread's name before choosing, and the criterion for

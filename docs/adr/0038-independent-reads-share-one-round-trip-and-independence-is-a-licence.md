@@ -384,9 +384,50 @@ reply**: it converts the walk on every workload anyone runs, and switches itself
 caller-visible arm would have had a cost.
 
 `the_deep_node_budget_does_not_bind_on_a_usable_reply` pins the premise, so this reasoning fails rather than
-rots if `DeepProbe` grows or either budget changes. **The conversion itself is not done here**: it is a second
-call site with a soundness argument of its own, and "convert one call site" is #100's instruction as much as its
-first half is.
+rots if `DeepProbe` grows or either budget changes.
+
+### And built — where it turned out the waving was not the point
+
+`certain_children` is that arithmetic, unit-tested as an inequality over a spread of shapes rather than trusted
+from its own division, because a bound that is too small licenses precisely the speculative read this ADR exists
+to refuse. `DeepState` carries the prefetch, which reverses the seam this work chose for the shallow path and
+for a reason: on the deep path the prefetch's *legality* is derived from the budget, and the budget lives there,
+so the two belong to one scratchpad. On the shallow path there is no budget to derive anything from and the map
+is a local.
+
+Measured on a warm `debug.get_stack --expand_objects --max_depth 3` walk over `DeepProbe`, identically on JDK
+11.0.32, 17.0.20 and 21.0.12:
+
+```text
+                                 after dedup   after the deep prefetch
+  ObjectReference.ReferenceType          873                       227
+  StringReference.Value                  437                       229
+  ObjectReference.GetValues              349                       349
+  ObjectReference.InvokeMethod           586                       586
+  total commands                        2529                      1675
+```
+
+Round trips through `LatencyRelay` at 8ms fell by the same third — `max_depth 2` from ~1085 to ~729, `max_depth
+3` from ~2830 to ~1833. **That equality is the finding.** If the saving were the waving, round trips would have
+fallen while the command count held; both fell together, so almost all of it is the map answering *repeated
+renders of the same object*. `ObjectReference.InvokeMethod` is 586 commands that can never be waved and
+dominates what remains.
+
+**That is the third time this line of work has found deduplication worth more than pipelining** — after the
+stack walk above, and after #129's own first commit. The waving is kept because it costs nothing and because a
+twenty-element level is a shape `DeepProbe` does not present through the field path; the honest headline is the
+dedup. Taken with the earlier commits, a deep walk went from 3357 commands to 1675: **half of it removed, and
+none of it by pipelining.**
+
+**What this cost, stated rather than buried.** The map answering a *later* render means a value may be read
+before an invocation and printed after one, and the deep walk invokes (`toString()` at the depth limit,
+collections throughout). An object's class never changes and a `String`'s contents never change, so the only
+reachable failure is the object being collected in between — where a live read would have failed and this prints
+a name that *was* true. A snapshot, not a wrong answer, and not new in kind: `render_fields_deep` has always read
+a level's values in one `GetValues` and rendered them one at a time, so the ids were already held across
+invocations. Sixteen deep renders across four depths and three expressions are **byte-for-byte** what they were
+before, 106552 bytes of them, and `a_rendered_object_is_asked_for_its_type_once` now bounds the total as well as
+forbidding adjacent duplicates.
 
 So this one is left, and #129 is extended to cover it rather than a fourth conversion being forced: once a
 wave-aware `render_value` exists, it is the mechanism that carries these 37 reads too, and it has to solve the

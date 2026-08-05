@@ -363,9 +363,14 @@ licence and has to be established separately, because between the two there is a
 
 **A commitment is only as good as its window.** Committing says the value will be rendered; it does not say
 the object will still be there when it is. An `InvokeMethod` between the wave and the render runs arbitrary
-debuggee code, so a value read before it and printed after it can describe an object that has since been
-collected — which is why the grant also requires that nothing be invoked in between, and why every converted
-path so far renders with no thread to invoke on.
+debuggee code, so a value read before it and printed after it describes the object as of the *read*.
+
+The shallow grants close that window outright by rendering with no thread to invoke on. The **deep** grant
+cannot — it renders at the depth limit via `toString()` — and takes the window knowingly, because what it can
+cost is bounded: a class never changes and a `String`'s contents never change, so the only reachable failure is
+the object being collected in between, where a live read would have failed and a prefetched one prints a name
+that *was* true. A snapshot rather than a wrong answer, and not new in kind — a level's values have always been
+read in one go and then rendered one at a time, so the ids were already held across invocations.
 
 Distinguish from **a store committing**, in the `independent reads` entry above: there it is the debuggee's
 write landing in memory, and the subject is the JVM. Here a *caller* commits **to** rendering something, and

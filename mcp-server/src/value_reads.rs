@@ -27,15 +27,41 @@
 //!    *unconditionally*, before it has decided anything — so a committed value's first read costs exactly
 //!    the packet the sequential path would have spent. Pass a value the renderer might skip (a child beyond
 //!    a node budget, a field past a `… +n more` cap) and that guarantee is gone.
-//! 2. **No `ObjectReference.InvokeMethod` between the wave and the render.** An invocation runs arbitrary
-//!    debuggee code, so a string read before it and printed after it could be describing an object that has
-//!    since been collected — and JDWP invalidates every frame id on the thread as well. Every path that
-//!    renders with `thread_id: None` satisfies this for free, because that argument is exactly what stops
-//!    `render_value` reaching for `toString()`. A path that renders with a thread does not.
+//! 2. **The window between the wave and the render is understood.** An invocation runs arbitrary debuggee
+//!    code, so a value read before one and printed after it describes the object as of the *read*. The
+//!    shallow callers close this precondition outright: they render with `thread_id: None`, which is exactly
+//!    what stops `render_value` reaching for `toString()`, so no debuggee code runs inside their window at
+//!    all.
+//!
+//!    **The deep walk cannot close it and uses the map anyway, deliberately** (PERF-2, #129). It renders at
+//!    the depth limit via `toString()` and expands collections by invoking, so an invocation *can* sit
+//!    between a wave and a later use of it. What that can cost is bounded and worth stating exactly: an
+//!    object's class never changes, and a `java.lang.String`'s contents never change, so the only reachable
+//!    failure is the object being **collected** in between — in which case a live read would have failed and
+//!    this prints a type name that was true when it was read. That is a snapshot, not a wrong answer, and it
+//!    is not a new exposure in kind: `render_fields_deep` has always read a level's values in one
+//!    `GetValues` and then rendered them one at a time, so the *ids* were already being held across
+//!    invocations for exactly the same reason.
+//!
+//!    Measured rather than reasoned: sixteen deep renders across four depths and three expressions are
+//!    **byte-for-byte** what they were before the deep prefetch, 106552 bytes of them.
 //!
 //! Both are properties of the caller, and nothing in this module can check either. Which is why the grant
 //! is spelled in the name at the call site: `grep -rn "_committed" mcp-server/src/` lists it, the way
 //! `grep -rn "_independently" jdwp-client/src/` lists the wave surface under it.
+//!
+//! ## What the deep path actually bought, which was not what it was built for
+//!
+//! The deep grant was designed as a **wave**: prefetch the prefix of a level the budget provably cannot fail
+//! to reach (`certain_children` in `handlers.rs` is that argument in arithmetic). Measured, the waving is not
+//! where the saving came from. A warm `max_depth 3` walk over `DeepProbe` fell from 2529 commands to 1675,
+//! and its round trips fell by the same third — so almost all of it is the map answering **repeated renders
+//! of the same object**, not commands overlapping on the wire. `ObjectReference.InvokeMethod` is 586 of those
+//! commands, can never be waved, and dominates what is left.
+//!
+//! That is the third time this issue has found deduplication worth more than pipelining, after ADR-0038's
+//! stack walk and #129's own first commit. The waving is kept because it is free and because a level of
+//! twenty elements is a shape `DeepProbe` does not have; the honest headline is the dedup.
 
 use jdwp_client::types::{Value, ValueData};
 use jdwp_client::JdwpConnection;
@@ -104,18 +130,38 @@ impl ValueReads {
     /// always correlated replies by packet id. Only the single-read fallbacks below want `&mut`, and they
     /// want it because `send_command` has it rather than because the transport requires it.
     pub async fn committed(conn: &JdwpConnection, values: &[&Value]) -> Self {
+        let mut reads = Self::none();
+        reads.extend_committed(conn, values).await;
+        reads
+    }
+
+    /// Add the first reads of more committed values to a pass already under way.
+    ///
+    /// **Accumulating rather than replacing, which the deep walk needs and the shallow one does not.** A deep
+    /// render is depth-first, so a level's entries have to survive its children's levels: a level that
+    /// dropped its parent's entries would make the *parent's* wave speculative in retrospect — it would have
+    /// read for values that then got read a second time. So this only ever grows, and it is bounded by the
+    /// node budget that bounds the walk.
+    ///
+    /// **An id already answered is not asked again**, which is what makes calling this per level safe. A cycle
+    /// or a shared child would otherwise be waved once per level that reaches it.
+    pub async fn extend_committed(&mut self, conn: &JdwpConnection, values: &[&Value]) {
         let mut seen: HashSet<u64> = HashSet::new();
         let mut string_ids: Vec<u64> = Vec::new();
         let mut object_ids: Vec<u64> = Vec::new();
         for value in values {
             match Self::first_read(value) {
-                Some(FirstRead::StringContents(id)) if seen.insert(id) => string_ids.push(id),
-                Some(FirstRead::ReferenceType(id)) if seen.insert(id) => object_ids.push(id),
+                Some(FirstRead::StringContents(id)) if !self.strings.contains_key(&id) && seen.insert(id) => {
+                    string_ids.push(id);
+                }
+                Some(FirstRead::ReferenceType(id)) if !self.types.contains_key(&id) && seen.insert(id) => {
+                    object_ids.push(id);
+                }
                 _ => {}
             }
         }
 
-        let mut reads = Self::none();
+        let reads = &mut *self;
         if !string_ids.is_empty() {
             let got = conn.read_string_values_independently(&string_ids).await;
             for (id, outcome) in string_ids.iter().zip(got) {
@@ -128,7 +174,6 @@ impl ValueReads {
                 reads.types.insert(*id, outcome.ok());
             }
         }
-        reads
     }
 
     /// A string object's contents. `None` is "not readable", which is all the renderer has ever done with

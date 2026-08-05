@@ -3540,11 +3540,29 @@ fn a_warm_stack_walk_reads_each_methods_tables_once() {
 /// the whole walk removed, and the reply byte-identical. One *shallow* render of one object went from six
 /// commands to five (`StackFrame.GetValues`, `ReferenceType`, `InvokeMethod`, `StringReference.Value`).
 ///
-/// **The assertion is deliberately not a count.** A walk may legitimately read the same object's type
-/// twice — the same object reachable from two frames is rendered twice, and there is no cache to serve the
-/// second read, correctly. What the defect actually was is two reads of one id with **no other packet
-/// between them**, which is one render step asking twice and nothing else. That is what this asserts, so
-/// it cannot go stale as the probe's graph or the JDK's frame count changes.
+/// **The adjacency assertion is deliberately not a count.** What the defect was is two reads of one id with
+/// **no other packet between them** — one render step asking twice and nothing else. That is what it asserts,
+/// so it cannot go stale as the probe's graph or the JDK's frame count changes.
+///
+/// **That paragraph used to end "and there is no cache to serve the second read, correctly", and #129's deep
+/// prefetch reversed it.** A walk may still legitimately render the same object twice, but a pass-scoped
+/// `ValueReads` on `DeepState` now answers the second render from the first read, so a walk sends far fewer
+/// type reads than it renders nodes. The total is asserted below for exactly that, and the adjacency assertion
+/// is unaffected: one render step asking twice was never right and still is not.
+///
+/// ```text
+///                                   after dedup   after the deep prefetch
+///   ObjectReference.ReferenceType           873                       227
+///   StringReference.Value                   437                       229
+///   ObjectReference.GetValues               349                       349
+///   ObjectReference.InvokeMethod            586                       586
+///   total commands                         2529                      1675
+/// ```
+///
+/// **Nothing is newly invoked** — `InvokeMethod` is identical, which is #129's own criterion and is why it is
+/// in the table rather than only in the prose. `GetValues` is identical too: one per expanded object either
+/// way. And the sixteen deep replies this walk's workloads produce are **byte-for-byte** what they were
+/// before, all 106552 of them, which is the property the whole design turns on.
 ///
 /// Warm, and counted from the last `ThreadReference.Frames`, because a cold walk sends
 /// `ReferenceType.Signature` *between* the two duplicated reads and the adjacency would not be visible.
@@ -3609,8 +3627,14 @@ fn a_rendered_object_is_asked_for_its_type_once() {
         previous = Some(id);
     }
 
+    // Printed on a pass as well as a failure, on the same principle as the runner's `JDK in use:` line.
+    eprintln!(
+        "PERF-2: a warm deep walk over DeepProbe cost {} commands, {types} of them type reads.",
+        walk.len()
+    );
     // The control: this test's assertion passes trivially on a walk that read no types at all, which is
-    // the failure mode every check in this suite is written against. Measured at 873.
+    // the failure mode every check in this suite is written against. Measured at 227 after the deep prefetch
+    // and 873 before it.
     assert!(
         types >= 100,
         "only {types} type read(s) in a {} command walk over DeepProbe's graph — the walk is not \
@@ -3626,6 +3650,19 @@ fn a_rendered_object_is_asked_for_its_type_once() {
          {types} type read(s) in {} commands",
         repeats.len(),
         repeats.iter().take(5).collect::<Vec<_>>(),
+        walk.len()
+    );
+
+    // PERF-2's deep prefetch: the same walk, a third less traffic. Bounded above the 1675 reading and well
+    // below the 2529 that reading each node's first read on its own cost, so this fails if the pass-scoped map
+    // stops serving repeated renders — which is where the whole saving turned out to be.
+    assert!(
+        walk.len() <= 1900,
+        "a warm deep walk cost {} commands. It measured 1675 after #129's deep prefetch and 2529 before it, \
+         of which 227 and 873 were type reads ({types} here). A number near 2529 means `DeepState`'s \
+         `ValueReads` has stopped answering repeated renders of the same object — most likely because it is \
+         being replaced per level instead of accumulated, which would also make each level's own wave \
+         speculative in retrospect.",
         walk.len()
     );
 
