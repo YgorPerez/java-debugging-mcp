@@ -6751,8 +6751,62 @@ fn a_per_thread_suspended_frame_reads_and_writes_but_cannot_invoke() {
     );
 }
 
+/// Attempts allowed to catch worker-c somewhere it is not holding the `System.out` monitor (TEST-44, #133).
+///
+/// It ticks every 120ms and spends all but a sliver of that inside `Thread.sleep`, so one attempt almost
+/// always suffices; eight is for a contended box where a thread can sit descheduled inside `println` long
+/// enough to be caught there.
+const STDOUT_MONITOR_ATTEMPTS: usize = 8;
+
+/// How long one staging attempt waits for a sibling worker to print. Twelve tick periods — long enough that
+/// silence means a held monitor rather than a slow scheduler, short enough that eight failed attempts cost
+/// less than the single `EVENT_TIMEOUT` the unstaged version burned before failing.
+const STDOUT_MONITOR_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Whether worker-a or worker-b prints a new tick within `window`.
+///
+/// The question is deliberately "can they print at all", not "have they advanced N ticks": this is used to
+/// establish that the thread just suspended is not holding the stdout monitor every one of them needs, and
+/// the first line out of either of them settles that.
+fn another_worker_prints_within(probe: &Probe, window: std::time::Duration) -> bool {
+    let bases: Vec<(&str, i64)> =
+        ["worker-a", "worker-b"].iter().map(|w| (*w, highest_worker_tick(probe, w).unwrap_or(-1))).collect();
+    let deadline = std::time::Instant::now() + window;
+    while std::time::Instant::now() < deadline {
+        if bases.iter().any(|(who, base)| highest_worker_tick(probe, who).is_some_and(|n| n > *base)) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
 /// Suspends are counted, so two suspends need two resumes — and the reply must say so rather than
 /// report a success it did not achieve (ADR-0003, arriving at the per-thread door).
+///
+/// **TEST-44 (#133): this test's control used to be unsatisfiable by construction, and it read as a
+/// contention flake.** The subject is a negative observation — worker-c does not tick while suspended — which
+/// needs a clock, and the clock is the other workers still ticking. But every worker's only observable action
+/// is `System.out.println`, and `PrintStream` synchronises on the stream. So a `debug.suspend_thread` landing
+/// while worker-c is *inside* `println` leaves it holding the stdout monitor, and every other thread that
+/// prints blocks behind it: the clock can never advance, and the test then blames a starved JVM for a lock of
+/// its own making.
+///
+/// The CI sighting is what named it, and the numbers are the whole diagnosis: three lines of probe output and
+/// then 25s of silence — including `ephemeral-worker done`, due at t+6s from a thread this test never touches
+/// — while **107 other tests in the same shard passed**. A runner starving one JVM for 25s while the rest of
+/// the run progresses is a much worse explanation than a held monitor, and `lookup()` holds none, so
+/// `System.out` was the only candidate left.
+///
+/// It is now **staged rather than raced**: suspend, check that a sibling can still print, and on failure
+/// resume and try again for worker-c's `sleep(120)`, where it spends all but a sliver of its life. Staged by
+/// its *consequence* — "can the others print" — rather than by reading worker-c's frames, because that is the
+/// property actually needed and it does not depend on how a given JDK names the frames inside `PrintStream`.
+/// `2175007` is the precedent: stage the condition instead of racing for it.
+///
+/// The 2-tick demand in the clock below is deliberately **not** weakened. It is the margin that makes
+/// "worker-c did not tick" conclusive — worker-c ticks on the same 120ms period, so one sibling tick could
+/// elapse without worker-c being due — and weakening it would trade a flake for a false PASS.
 #[test]
 #[ignore = "needs a JDK and a live JVM; run with --ignored"]
 fn suspending_twice_then_resuming_once_says_the_thread_is_still_suspended() {
@@ -6768,7 +6822,43 @@ fn suspending_twice_then_resuming_once_says_the_thread_is_still_suspended() {
         .expect("worker-c never ticked");
 
     let tid = thread_id_named(&mut server, "worker-c");
-    server.call("debug.suspend_thread", serde_json::json!({"thread_id": &tid}));
+
+    // TEST-44 (#133): STAGE the precondition this test needs instead of racing for it.
+    //
+    // Every worker's only observable action is `System.out.println`, and `PrintStream` synchronises on the
+    // stream — so a `debug.suspend_thread` that lands while worker-c is *inside* `println` leaves it holding
+    // the stdout monitor, and every other thread that tries to print blocks behind it. The control below
+    // ("the other workers are still running") then cannot be satisfied by construction, and the test blames a
+    // starved JVM for a lock it created itself. That is what the CI sighting in #133 was: three lines of probe
+    // output and then 25s of total silence, including `ephemeral-worker done` from a thread this test never
+    // touches, while 107 other tests in the same shard passed.
+    //
+    // Staged by its consequence rather than by reading worker-c's frames: what this needs is *that the other
+    // workers can still print*, and asking that directly is immune to how a given JDK names the frames inside
+    // `PrintStream`. Suspend, check, and on failure resume and try again — `2175007` is the precedent for
+    // staging a condition rather than racing it.
+    let mut staged = false;
+    for _ in 0..STDOUT_MONITOR_ATTEMPTS {
+        server.call("debug.suspend_thread", serde_json::json!({"thread_id": &tid}));
+        if another_worker_prints_within(&probe, STDOUT_MONITOR_WINDOW) {
+            staged = true;
+            break;
+        }
+        // Caught inside `println`. Let it go, let the backlog drain, and try to catch it in its `sleep(120)`
+        // instead — which is where it spends all but a sliver of its life.
+        server.call("debug.resume_thread", serde_json::json!({"thread_id": &tid}));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        staged,
+        "after {STDOUT_MONITOR_ATTEMPTS} attempts, suspending worker-c always stopped the other workers \
+         printing too. Each attempt allowed {STDOUT_MONITOR_WINDOW:?} for one of them to print, against a \
+         120ms tick. Either this JVM is getting no CPU at all, or worker-c is holding a monitor its siblings \
+         need on every pass and not just the stdout one this stages around (TEST-44, #133).\n  probe's last \
+         8 lines: {:?}",
+        probe.output().iter().rev().take(8).collect::<Vec<_>>()
+    );
+
     let twice = server.call("debug.suspend_thread", serde_json::json!({"thread_id": &tid}));
     assert_contains_all(
         "a second suspend reports the depth it built",
@@ -6828,7 +6918,9 @@ fn suspending_twice_then_resuming_once_says_the_thread_is_still_suspended() {
     }
     assert!(
         others_moved,
-        "neither worker-a nor worker-b advanced two ticks in {EVENT_TIMEOUT:?}. What that does NOT establish \
+        "neither worker-a nor worker-b advanced in {EVENT_TIMEOUT:?} — and the staging above established \
+         that they COULD print while worker-c was suspended, so this is not the stdout monitor TEST-44 (#133) \
+         found. What it does NOT establish \
          is a VM-wide freeze: the suspended listing below says exactly one thread is held, so the debugger \
          held only what it was asked to and these two stopped for some other reason — a starved probe JVM \
          and a dead one both look like this. The tick numbers and the tail decide which, and they are here \
