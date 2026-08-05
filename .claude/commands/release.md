@@ -223,6 +223,18 @@ from the release body, and commit the pin and the docs together. Say in the comm
 undocumented and why, if any. **Push it** — the next step re-pulls the repo, so an unpushed commit is a
 commit the installer will not see.
 
+**Anything under `skills/` is a skill, so edit it as one.** Read
+`~/.claude/plugins/cache/claude-plugins-official/mattpocock-skills/*/skills/productivity/writing-great-skills/SKILL.md`
+before you touch one. It is `disable-model-invocation: true`, so it never fires on its own and is not in the
+invocable skill list — you have to open the file.
+
+Release time is where **sediment** comes from: every release tempts one more `since v0.X.Y` paragraph,
+appending feels safe while pruning feels risky, and a skill that only ever grows is the default outcome. The
+paragraph you add earns its context load like any other — recruit the skill's existing **leading word** rather
+than restating its setup (`jdwp-trace` has `Rule 0`), delete the sentence the new one made redundant, and
+prompt the **positive** instead of warning against a misreading. `README.md`, `mcp/README.md` and `docs/` are
+ordinary docs; this is about `skills/`.
+
 ## 8. Install it, or the release changed nothing on this machine
 
 Bumping the pin is a promise, and **`install.sh` is no longer what keeps it.** Since the plugin migration it
