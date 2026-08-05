@@ -26,6 +26,21 @@ fn empty() -> serde_json::Value {
     with_session_id(json!({"type": "object", "properties": {}, "additionalProperties": false}))
 }
 
+/// What `session_id` does, written once for all thirty-eight tools.
+///
+/// **`concat!` of one-line pieces, not a `\` continuation.** A continuation reads better in source and does
+/// not survive `cargo fmt`: it joined the pieces into a single literal and kept each line's indentation as
+/// *content*, so v0.17.0 shipped this description with runs of thirty-three spaces in it, on every tool. A
+/// description is the caller's documentation (`docs/toolkit-contract.md`, and DOC-7/#108 is the time that
+/// mattered), so it is assembled from fragments that carry no leading whitespace to lose.
+const SESSION_ID_DESC: &str = concat!(
+    "Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — ",
+    "the most recently attached one — which is what every example here assumes. Give it when more than one ",
+    "JVM is attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the ",
+    "whole reason a misspelling of this argument is now refused rather than ignored (DOC-9). ",
+    "`debug.list_sessions` accepts it and ignores it, having nothing to select.",
+);
+
 /// Publish `session_id` as an argument of every tool (DOC-9, #132).
 ///
 /// **It was an argument of all thirty-eight and a documented field of none.**
@@ -55,7 +70,7 @@ fn with_session_id(mut schema: serde_json::Value) -> serde_json::Value {
             json!({
                 "type": ["string", "null"],
                 "default": null,
-                "description": "Which debug session to act on, from `debug.list_sessions`. Omitted, the                                 CURRENT session is used — the most recently attached one — which is what                                 every example here assumes. Give it when more than one JVM is attached,                                 because the reply of a tool that hit the wrong one looks entirely normal:                                 that is the whole reason a misspelling of this argument is now refused                                 rather than ignored (DOC-9). `debug.list_sessions` accepts it and ignores                                 it, having nothing to select."
+                "description": SESSION_ID_DESC
             }),
         );
     }
@@ -558,6 +573,56 @@ mod tests {
         lines
     }
 
+    // DOC-9 (#132) shipped `session_id`'s description with runs of thirty-three spaces in it, on all
+    // thirty-eight tools: a `\`-continuation in the source, joined by `cargo fmt` with each line's
+    // indentation kept as CONTENT. A description is the caller's documentation (`docs/toolkit-contract.md`).
+    //
+    // **The two description snapshots cannot catch this, which is why a separate test has to.** Both render
+    // the text WORD-WRAPPED to 110 columns, and wrapping normalises whitespace — so fixing all
+    // thirty-eight of those descriptions produced a **byte-identical** `argument-schemas.txt`. The wrapping
+    // is deliberate and right for what it was written for (a corrupted clause becomes a two-line diff
+    // instead of a one-character one, DOC-7/#120), and it makes this class invisible by construction: the
+    // snapshot is a guard on what a description SAYS, not on what it is made of.
+    //
+    // Cheap and exact: no prose anyone writes deliberately carries a run of spaces mid-line, so the run is
+    // the defect.
+    #[test]
+    fn no_description_carries_the_indentation_of_the_source_it_was_written_in() {
+        let mut offenders: Vec<String> = Vec::new();
+        for tool in get_tools() {
+            let mut check = |what: &str, text: &str| {
+                // Per line, and only after that line's own indentation: a description is markdown, so a
+                // continuation indented under a bullet is correct authoring and `class_pattern` has one. The
+                // defect is a run of spaces in the MIDDLE of a line, which is the only way source
+                // indentation reaches a caller.
+                for line in text.lines() {
+                    let body = line.trim_start();
+                    if body.contains("  ") {
+                        offenders.push(format!("{} {what}: …{}…", tool.name, &body[..body.len().min(90)]));
+                        break;
+                    }
+                }
+            };
+            check("description", &tool.description);
+            if let Some(properties) = tool.input_schema.get("properties").and_then(|p| p.as_object()) {
+                for (argument, schema) in properties {
+                    if let Some(text) = schema.get("description").and_then(|d| d.as_str()) {
+                        check(&format!("{{{argument}}}"), text);
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "{} description(s) contain a run of two or more spaces, which is source indentation that \
+             reached the caller rather than anything a human typed. Assemble the string from `concat!` \
+             pieces that carry no leading whitespace; a `\\` continuation does not survive `cargo \
+             fmt`.\n  {}",
+            offenders.len(),
+            offenders.join("\n  ")
+        );
+    }
+
     /// The generated argument schemas, as a committed snapshot — the coverage the comment above used to
     /// claim (DOC-8, #120).
     ///
@@ -595,6 +660,7 @@ mod tests {
     ///
     /// Regenerate with `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot`, the same one
     /// command that regenerates the description snapshot, then read the diff.
+
     #[test]
     fn argument_schemas_match_the_committed_snapshot() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/argument-schemas.txt");
