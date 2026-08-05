@@ -1,7 +1,7 @@
 # Every debug.* tool's ARGUMENT schemas, as advertised to callers. GENERATED — do not hand-edit:
 #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot
 #
-# 38 tools, 184 arguments.
+# 38 tools, 222 arguments.
 #
 # Each argument shows its full generated schema minus the description — so a changed type,
 # default, format, minimum or anyOf arm fails as loudly as a renamed field — then the description
@@ -29,6 +29,12 @@
     watchpoint/exception reporting) still work; collection expansion and `toString()` rendering fall back to
     shallow, because they invoke methods in the debuggee. A guard against accident, NOT a security boundary.
     Also forced on by the `JDWP_READONLY` env var.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - source_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
     Directories `debug.source` searches for a class's `.java` file, e.g. `["/srv/app/src/main/java"]`. A root
     is where the PACKAGE TREE starts, not the project root: the file is looked for at `<root>/<package as
@@ -53,16 +59,38 @@
     `JDWP_CLASS_ROOTS`).
 - limit: {"default":40,"format":"uint","minimum":0,"type":"integer"}
     Max drifting methods to name; the rest are reported as a count.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.clear_stop_point
 - breakpoint_id: REQUIRED {"type":"string"}
     Stop-point ID from `debug.list_stop_points`.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.continue
-(no arguments)
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.disconnect
-(no arguments)
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.evaluate
 - expand_objects: {"default":false,"type":"boolean"}
@@ -115,6 +143,12 @@
     total node budget caps the work regardless.
 - max_result_length: {"default":2000,"format":"uint","minimum":0,"type":"integer"}
     Maximum length of the rendered result string (raise for long toString()s).
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID (optional; defaults to the last thread that hit a breakpoint).
 
@@ -136,10 +170,22 @@
     Stack frame index (0 = current frame).
 - max_result_length: {"default":2000,"format":"uint","minimum":0,"type":"integer"}
     Maximum length of each link's rendered value.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID (optional; defaults to the last thread that hit a breakpoint).
 
 ## debug.force_return
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Thread id (optional; defaults to last-hit thread). Must be suspended.
 - value: {"default":null,"type":["string","null"]}
@@ -153,6 +199,12 @@
 - limit: {"default":1,"format":"uint","minimum":0,"type":"integer"}
     How many buffered events to return, most recent LAST (default 1 — just the latest). Raise it to catch up
     when the reply says events are pending, e.g. after a broad exception breakpoint.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.get_stack
 - expand_objects: {"default":false,"type":"boolean"}
@@ -170,6 +222,12 @@
     Only show frames whose class name contains this substring (case-insensitive), e.g. your app package
     'br.com.infotravel'; framework frames collapse into "… N frame(s) hidden". Big token saver on deep JVM
     stacks.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID (optional; defaults to the last thread that hit a breakpoint/step).
 
@@ -183,6 +241,12 @@
     Clear the trace buffer after returning it.
 - limit: {"default":50,"format":"uint","minimum":0,"type":"integer"}
     Max snapshots to return, most recent last (default 50).
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - since: {"default":null,"format":"uint64","minimum":0,"type":["integer","null"]}
     Only snapshots newer than this sequence number, so a poller can ask for just what's new since its last
     read (the `#seq` shown on each record).
@@ -220,6 +284,12 @@
 - read_only: {"default":false,"type":"boolean"}
     Open the session read-only, exactly as `debug.attach` does. Rarely what you want on a JVM you started
     yourself, but `JDWP_READONLY` still applies deployment-wide and cannot be relaxed here (SAFE-3).
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - source_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
     Directories `debug.source` searches for `.java` files — see `debug.attach`.
 - suspend: {"default":true,"type":"boolean"}
@@ -241,6 +311,12 @@
     to arm a stop point on.
 - limit: {"default":100,"format":"uint","minimum":0,"type":"integer"}
     Max classes to return; the rest are reported as a hidden count.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.list_fields
 - class_name: REQUIRED {"type":"string"}
@@ -253,6 +329,12 @@
     Max fields to return; the rest are reported as a hidden count.
 - name_filter: {"default":null,"type":["string","null"]}
     Only fields whose name contains this substring (case-insensitive).
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.list_instances
 - class_names: REQUIRED {"items":{"type":"string"},"type":"array"}
@@ -270,6 +352,12 @@
 - max_instances: {"default":10,"format":"int32","type":"integer"}
     Handles to return per type. `0` means all of them; a negative value is refused. The **count** is reported
     in full either way, so clamping hides objects, never their number.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.list_methods
 - class_name: REQUIRED {"type":"string"}
@@ -282,12 +370,28 @@
     Max methods to return; the rest are reported as a hidden count.
 - name_filter: {"default":null,"type":["string","null"]}
     Only methods whose name contains this substring (case-insensitive).
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.list_sessions
-(no arguments)
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.list_stop_points
-(no arguments)
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.list_threads
 - limit: {"default":40,"format":"uint","minimum":0,"type":"integer"}
@@ -303,17 +407,39 @@
     Only threads whose name contains this substring (case-insensitive), e.g. 'Avail' or 'task'.
 - only_suspended: {"default":false,"type":"boolean"}
     Only threads currently suspended (also appends each thread's run status).
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.panic
-(no arguments)
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.pause
-(no arguments)
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 
 ## debug.pop_frame
 - frame: {"default":0,"format":"uint","minimum":0,"type":"integer"}
     Frame index to pop, as numbered by `debug.get_stack` (0 = innermost). Every frame above it goes too — that
     is what JDWP does, not a convenience added here.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Thread id (optional; defaults to last-hit thread). Must be suspended.
 
@@ -330,12 +456,24 @@
 - dry_run: {"default":false,"type":"boolean"}
     Report what WOULD be shipped — the resolved file, its size, and whether the JVM can `HotSwap` at all — and
     send nothing. The safe first call against a shared JVM.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Thread to check for frames still running the old bytecode after a successful swap (defaults to the
     last-hit thread). A redefinition does not touch frames already on the stack, so this is how the reply can
     tell you that the method you just changed is one of them.
 
 ## debug.resume_thread
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID to resume. Optional: with one thread held by `debug.suspend_thread` it defaults to that one,
     which is the case a caller is in almost every time. With several held it is required, and the reply lists
@@ -407,6 +545,12 @@
     JPA rather than a gap here: `EntityManager` publishes no way to enumerate its named queries, so the
     provider's `IllegalArgumentException` is all there is. The reply says the name was rejected by the
     provider and where such names are declared (`@NamedQuery`, `orm.xml`), instead of guessing at a spelling.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID (optional; defaults to the last thread that hit a breakpoint). Must be a thread suspended **by
     an event**, because running the query invokes methods.
@@ -456,6 +600,12 @@
 - max_classes: {"default":20,"format":"uint","minimum":0,"type":"integer"}
     Most loaded classes ONE wildcard pattern may arm (default 20, clamped at 200 — FILT-3). Ignored for an
     exact class name. The reply says what a full expansion left out rather than truncating quietly.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Only report throws on this thread (hex id, e.g. `0x2a`). On a busy app server with hundreds of threads,
     restricting to your request thread is the single biggest noise reduction — get the id from
@@ -566,6 +716,12 @@
     than for a line breakpoint.
 - modify: {"default":true,"type":"boolean"}
     Break on writes (`FIELD_MODIFICATION`) — the default, and what answers "who mutates this?".
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Only report touches from this thread (hex id, e.g. `0x2a`). On a busy app server, restricting to your
     request thread is the single biggest noise reduction — get the id from `debug.list_threads {name_filter}`
@@ -683,6 +839,12 @@
     family stops arming new ones once it is full, and `debug.list_stop_points` reports that it is.
 - method: {"default":null,"type":["string","null"]}
     Method name (optional). If given without `line`, breaks at the method's first line.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Only stop when this thread (hex id) hits it (optional).
 - trace: {"default":false,"type":"boolean"}
@@ -791,6 +953,12 @@
     Only report returns from this method name. Filtered on our side, because JDWP has no method-name modifier
     — the JVM still reports every method of the class and non-matching exits are dropped here. Overloads all
     match, since the name is all JDWP gives us to compare.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Only report returns on this thread (hex id, e.g. `0x2a`). On a busy app server this is the single biggest
     noise reduction for this event kind — get the id from `debug.list_threads` or `debug.thread_dump` first.
@@ -908,6 +1076,12 @@
     on `blocked` and 0 on `wait` (DUMP-7, ADR-0035). So it is refused where it does not mean what it reads
     like, on the same rule that refuses `instance_id` elsewhere. Use `thread_id`, or `min_duration_ms`, to
     narrow the contended pair.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Only report events on this thread (hex id, e.g. `0x2a`) — JDWP's `ThreadOnly`, applied **inside the JVM**,
     so a non-matching event costs no packet and no capture (FILT-1). The cheap narrowing, and the one to reach
@@ -966,6 +1140,12 @@
 ## debug.set_value
 - frame_index: {"default":0,"format":"uint","minimum":0,"type":"integer"}
     Frame index (default 0). Used for locals and for resolving an instance-field prefix.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - target: REQUIRED {"type":"string"}
     What to write. A local variable name (`counter`), a static field (`ConfigDefaultUtils.dsInfra` or a
     fully-qualified `pkg.Class.field`), an instance field reached from a suspended frame (`this.status`,
@@ -995,6 +1175,12 @@
 - max_lines: {"default":400,"format":"uint","minimum":0,"type":"integer"}
     Hard cap on how many source lines one reply may contain. Hitting it truncates loudly — the reply always
     says which lines of how many it is showing.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - source_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
     Directories to search for this call only, replacing the session's roots (set at `debug.attach` or by
     `JDWP_SOURCE_ROOTS`). Pass `[]` to skip reading any file and get only what the JVM knows.
@@ -1013,6 +1199,12 @@
     back in my package" (`br.com.infotravel.*`). Composes with `exclude_classes`: the JVM applies every
     modifier, so a class must match one of these AND none of the exclusions. Omitted or empty, nothing is
     restricted.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID to step (optional; defaults to the last thread that hit a breakpoint).
 
@@ -1027,6 +1219,12 @@
     back in my package" (`br.com.infotravel.*`). Composes with `exclude_classes`: the JVM applies every
     modifier, so a class must match one of these AND none of the exclusions. Omitted or empty, nothing is
     restricted.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID to step (optional; defaults to the last thread that hit a breakpoint).
 
@@ -1041,10 +1239,22 @@
     back in my package" (`br.com.infotravel.*`). Composes with `exclude_classes`: the JVM applies every
     modifier, so a class must match one of these AND none of the exclusions. Omitted or empty, nothing is
     restricted.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID to step (optional; defaults to the last thread that hit a breakpoint).
 
 ## debug.suspend_thread
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - thread_id: REQUIRED {"type":"string"}
     Thread ID to suspend, as `debug.list_threads` and `debug.thread_dump` print it (`0x7f2c…`).
 
@@ -1107,6 +1317,12 @@
     Only show frames whose class name contains this substring (case-insensitive), e.g. your app package;
     framework frames collapse into "… N frame(s) hidden" and cost no lookups. On a `WildFly` stack this is the
     difference between 8 useful frames and 8 servlet-filter frames.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.
 - suspend: {"default":false,"type":"boolean"}
     Suspend the VM for the duration of the dump, then resume it and verify it is running again. Off by
     default, and that default is the point: JDWP can only read a **suspended** thread's stack and locks, so a
@@ -1121,3 +1337,9 @@
 - enabled: {"default":null,"type":["boolean","null"]}
     Desired state: `false` clears the JDWP request but keeps the definition (`condition`, `trace_expr`) so it
     can be re-armed later; `true` re-arms it. Omit to flip the current state.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select.

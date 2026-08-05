@@ -14121,7 +14121,10 @@ fn conditional_field_and_method_exit_traces_filter_without_charging_the_budget()
         serde_json::json!({
             "class_name": "CondKindsProbe",
             "field_name": "total",
-            "on_write": true,
+            // `modify`, not `on_write` — the latter is not an argument and was silently discarded from
+            // FILT-6 (#83) until `deny_unknown_fields` landed (DOC-9, #132). It named the default, so this
+            // test verified the right behaviour by coincidence rather than by asking for it.
+            "modify": true,
             "trace": true,
             "condition": "newValue == 999",
             "trace_max_hits": 30,
@@ -14239,7 +14242,8 @@ fn a_read_only_session_refuses_an_invoking_condition_on_every_kind() {
         ),
         (
             "debug.set_field_stop",
-            serde_json::json!({"class_name": "CondKindsProbe", "field_name": "total", "on_write": true,
+            // `modify`, not `on_write` — see the note on the other arm above (DOC-9, #132).
+            serde_json::json!({"class_name": "CondKindsProbe", "field_name": "total", "modify": true,
                                "condition": "newValue.toString() == \"x\""}),
         ),
         (
@@ -15719,6 +15723,95 @@ fn the_deep_node_budget_does_not_bind_on_a_usable_reply() {
             bound(&reply)
         );
     }
+
+    server.panic_reset();
+}
+
+/// DOC-9 (#132): a misspelled argument is refused, and `session_id` is the one that made it matter.
+///
+/// **What this replaced.** serde ignores unknown fields by default, so every `debug.*` tool silently discarded
+/// any argument it did not recognise. `prot` for `port` fell back to the default. `sessionId` for `session_id`
+/// fell back to the **current session** — because `resolve_session` reads that key from the raw arguments and
+/// a key it cannot find is indistinguishable from one that was never sent. So a call naming one JVM executed
+/// against another, and the reply looked entirely normal.
+///
+/// Reproduced before the fix, one attached session, the same bogus value under four spellings:
+///
+/// ```text
+///   session_id = "sess_nope"    ->  No active debug session      <- refused, correctly
+///   sessionId  = "sess_nope"    ->  No breakpoints set           <- served by the CURRENT session
+///   session-id = "sess_nope"    ->  No breakpoints set           <- served by the CURRENT session
+///   sesion_id  = "sess_nope"    ->  No breakpoints set           <- served by the CURRENT session
+/// ```
+///
+/// `debug.attach`'s own description is built on the difference between a JVM that is yours and one that is
+/// shared. With one of each attached, a mistyped `session_id` on `debug.pause` or a suspending stop point did
+/// not fail — it landed on whichever session was current.
+///
+/// **The assertion is on the refusal AND on what the refusal says.** `deny_unknown_fields` makes serde name
+/// the fields it expected, which is the difference between "Invalid arguments" and a message a caller can act
+/// on; a refusal that did not name the alternatives would leave a misspelling as hard to find as it was when
+/// it was silent.
+///
+/// The three arms are the three shapes of tool this had to be made uniform across, and the third is the one
+/// that needed new code: a tool with typed arguments gets the check from its own struct, a tool with **no**
+/// arguments of its own parses `NoArgs` for it, and `debug.list_sessions` was not even handed its arguments
+/// until #132.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_misspelled_argument_is_refused_instead_of_silently_retargeting_the_call() {
+    let Some(jdk) = jdk_or_skip("a_misspelled_argument_is_refused_instead_of_silently_retargeting_the_call")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "DeepProbe").expect("launch DeepProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    // The control first: the correctly spelled argument still works, and a bad VALUE is still refused by
+    // naming the session rather than by naming the field. Without this the assertions below would pass on a
+    // server that refused everything.
+    let good = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(!good.contains("Invalid arguments"), "a call with no arguments must still work: {good}");
+    let bad_value = server.call("debug.list_stop_points", serde_json::json!({"session_id": "sess_nope"}));
+    assert!(
+        bad_value.contains("No active debug session") && !bad_value.contains("unknown field"),
+        "a correctly spelled session_id with an unknown VALUE is refused for the value, not the field: \
+         {bad_value}"
+    );
+
+    // A tool with typed arguments of its own: the check comes from its `deny_unknown_fields` struct.
+    for key in ["sessionId", "session-id", "sesion_id"] {
+        let reply = server.call("debug.list_stop_points", serde_json::json!({key: "sess_nope"}));
+        assert!(
+            reply.contains("unknown field") && reply.contains(key),
+            "`{key}` must be refused by name rather than served by the current session, which is what it \
+             used to be (DOC-9, #132): {reply}"
+        );
+    }
+
+    // A misspelling of an ordinary argument, on a tool that has several. The failure mode was the same and
+    // quieter: `prot` fell back to port 5005 and the reply said nothing.
+    let typo = server.call("debug.get_stack", serde_json::json!({"max_frame": 3}));
+    assert!(
+        typo.contains("unknown field") && typo.contains("max_frame") && typo.contains("max_frames"),
+        "a near-miss argument must be refused AND the real field named, or a misspelling stays as hard to \
+         find as it was when it was ignored: {typo}"
+    );
+
+    // A tool with no arguments of its own — `NoArgs` is what gives it the same treatment.
+    let no_args = server.call("debug.list_sessions", serde_json::json!({"limit": 5}));
+    assert!(
+        no_args.contains("unknown field") && no_args.contains("limit"),
+        "`debug.list_sessions` takes no arguments and was not handed its own arguments at all before #132, \
+         so an unknown one was discarded a level above it: {no_args}"
+    );
+    // And it still lists, with `session_id` accepted-and-ignored exactly as it always was.
+    let listed = server.call("debug.list_sessions", serde_json::json!({"session_id": "sess_nope"}));
+    assert!(
+        listed.contains("session(s):") && !listed.contains("Invalid arguments"),
+        "list_sessions has always accepted session_id and ignored it, having nothing to select: {listed}"
+    );
 
     server.panic_reset();
 }

@@ -15,14 +15,51 @@ use crate::args::{
 use crate::protocol::Tool;
 use serde_json::json;
 
-/// Convert a schemars-generated schema into the JSON value the MCP protocol carries.
+/// Convert a schemars-generated schema into the JSON value the MCP protocol carries, with `session_id`
+/// added.
 fn to_val(s: schemars::Schema) -> serde_json::Value {
-    serde_json::to_value(s).unwrap_or_else(|_| json!({"type": "object", "properties": {}}))
+    with_session_id(serde_json::to_value(s).unwrap_or_else(|_| json!({"type": "object", "properties": {}})))
 }
 
-/// Schema for a tool that takes no arguments.
+/// Schema for a tool that takes no arguments of its own.
 fn empty() -> serde_json::Value {
-    json!({"type": "object", "properties": {}})
+    with_session_id(json!({"type": "object", "properties": {}, "additionalProperties": false}))
+}
+
+/// Publish `session_id` as an argument of every tool (DOC-9, #132).
+///
+/// **It was an argument of all thirty-eight and a documented field of none.**
+/// `RequestHandler::resolve_session` reads it from the raw arguments for every tool, so it is a typed field on
+/// no `*Args` struct — see the NOTE in `args.rs` and the reason `crate::args::parse` strips it — and schemars
+/// only publishes what it can see. The result was an argument that existed, worked, and appeared in no
+/// `inputSchema`: invisible to a client that builds its calls from the schema, and absent from
+/// `mcp-server/tests/argument-schemas.txt`, whose whole job is to make an argument change get read by
+/// somebody. It was described in prose in two of the thirty-eight tool descriptions, which is not the same
+/// thing as being published.
+///
+/// Injected in the one place every schema passes through rather than declared thirty times. The description is
+/// written once here for the same reason.
+///
+/// `debug.list_sessions` accepts it and ignores it, as it always has — it lists every session, so there is
+/// nothing for it to select. That is published rather than special-cased, because the schema's job is to say
+/// what is accepted and an exception here would be a second rule to remember.
+fn with_session_id(mut schema: serde_json::Value) -> serde_json::Value {
+    let Some(object) = schema.as_object_mut() else { return schema };
+    // `deny_unknown_fields` on every args struct makes schemars publish this, and the six tools with no
+    // arguments of their own set it above. Stated for both, so the schema says that the field list is the
+    // whole of what is accepted.
+    object.insert("additionalProperties".to_string(), json!(false));
+    if let Some(properties) = object.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        properties.insert(
+            crate::args::SESSION_ID_ARG.to_string(),
+            json!({
+                "type": ["string", "null"],
+                "default": null,
+                "description": "Which debug session to act on, from `debug.list_sessions`. Omitted, the                                 CURRENT session is used — the most recently attached one — which is what                                 every example here assumes. Give it when more than one JVM is attached,                                 because the reply of a tool that hit the wrong one looks entirely normal:                                 that is the whole reason a misspelling of this argument is now refused                                 rather than ignored (DOC-9). `debug.list_sessions` accepts it and ignores                                 it, having nothing to select."
+            }),
+        );
+    }
+    schema
 }
 
 /// Every `debug.*` tool the server advertises.

@@ -85,6 +85,33 @@ byte-identical. That is the point of it:
 `debug.evaluate`, `debug.get_stack` and `debug.run_named_query` cost less and say the same thing, so the
 release notes owe the speed but no caller has anything to re-read.
 
+**DOC-9 (#132) is the one row on this table that can BREAK a caller, and the only entry here that is not
+merely a documentation risk.** Every `debug.*` tool now **refuses** an argument it does not recognise, where it
+used to discard it in silence. A client that sends a field this server does not have — a leftover argument, a
+camelCase spelling, anything speculative — stops working, loudly, where before it was quietly ignored.
+
+That is the change, and it was taken deliberately because the silence had a cost that outweighed it.
+`resolve_session` reads `session_id` from the raw arguments of every tool, so a key it cannot find is
+indistinguishable from one that was never sent: `sessionId` fell back to the **current session**, and a call
+naming one JVM executed against another with a reply that looked entirely normal. `debug.attach`'s own
+description is built on the difference between a JVM that is yours and one that is shared; on a mix of the two
+that silence could put a suspension on somebody else's app server.
+
+For the toolkit specifically, two things follow:
+
+- **Its skills quote tool arguments, and any argument they name that this server does not have is now an
+  error rather than a no-op.** That is worth an audit on the pin bump, and it is the good kind of break: it
+  surfaces at the first call with the field named and the real alternatives listed, rather than silently doing
+  the wrong thing. This repo's own suite found two such arguments the moment the check landed — both tests
+  passing `on_write` to `debug.set_field_stop`, which has `modify`, dead since FILT-6 (#83).
+- **`session_id` is now published in all 38 `inputSchema`s**, so `argument-schemas.txt` went from 184
+  arguments to 222. It was always accepted and documented in prose in exactly two tool descriptions, which is
+  not the same as being published — a client generating calls from the schema could not have known it existed.
+  Nothing about what it *does* changed.
+
+Both belong in the release notes in caller-visible terms, and the first belongs near the top: it is the only
+change in this range that can make a working caller stop working.
+
 **`debug.run_named_query` (EVAL-11, #124) is the "Add a tool" row being exercised, and that row is silent.**
 The toolkit will install a binary that can run a named JPA query and its skills will not mention it, so
 nobody will call it — the tool is not broken, it is invisible. Two things follow. The release notes have to

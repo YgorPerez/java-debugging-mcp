@@ -275,7 +275,7 @@ impl RequestHandler {
             "debug.step_into" => self.handle_step_into(args).await,
             "debug.step_out" => self.handle_step_out(args).await,
             "debug.pause" => self.handle_pause(args).await,
-            "debug.list_sessions" => self.handle_list_sessions().await,
+            "debug.list_sessions" => self.handle_list_sessions(args).await,
             "debug.disconnect" => self.handle_disconnect(args).await,
             "debug.panic" => self.handle_panic(args).await,
             _ => return None,
@@ -552,7 +552,12 @@ impl RequestHandler {
     /// Read-only on purpose. A dead session is *reported* dead rather than reaped: this is the tool you
     /// reach for when you are already confused about what is attached, and having it silently drop
     /// entries mid-listing would make it a worse instrument. `debug.disconnect {session_id}` removes one.
-    async fn handle_list_sessions(&self) -> Result<String, String> {
+    async fn handle_list_sessions(&self, args: serde_json::Value) -> Result<String, String> {
+        // Took no `args` parameter at all until DOC-9 (#132), which meant an unknown argument to this
+        // tool was discarded one level above it. It accepts `session_id` and ignores it, as it always has —
+        // it lists every session, so there is nothing to select — and refuses anything else rather than
+        // discarding it.
+        crate::args::parse::<crate::args::NoArgs>(&args)?;
         let (sessions, current) = self.session_manager.list().await;
         if sessions.is_empty() {
             return Ok("No debug sessions. Use debug.attach to open one.".to_string());
@@ -661,6 +666,9 @@ impl RequestHandler {
     }
 
     async fn handle_list_stop_points(&self, args: serde_json::Value) -> Result<String, String> {
+        // Takes no arguments of its own, so this is purely the unknown-argument check every other
+        // tool gets from its own `deny_unknown_fields` struct (DOC-9, #132).
+        crate::args::parse::<crate::args::NoArgs>(&args)?;
         let session_guard =
             self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
@@ -917,6 +925,9 @@ impl RequestHandler {
     }
 
     async fn handle_continue(&self, args: serde_json::Value) -> Result<String, String> {
+        // Takes no arguments of its own, so this is purely the unknown-argument check every other
+        // tool gets from its own `deny_unknown_fields` struct (DOC-9, #132).
+        crate::args::parse::<crate::args::NoArgs>(&args)?;
         let session_guard =
             self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
@@ -995,6 +1006,9 @@ impl RequestHandler {
     }
 
     async fn handle_panic(&self, args: serde_json::Value) -> Result<String, String> {
+        // Takes no arguments of its own, so this is purely the unknown-argument check every other
+        // tool gets from its own `deny_unknown_fields` struct (DOC-9, #132).
+        crate::args::parse::<crate::args::NoArgs>(&args)?;
         let session_guard =
             self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
@@ -2097,6 +2111,9 @@ impl RequestHandler {
     }
 
     async fn handle_pause(&self, args: serde_json::Value) -> Result<String, String> {
+        // Takes no arguments of its own, so this is purely the unknown-argument check every other
+        // tool gets from its own `deny_unknown_fields` struct (DOC-9, #132).
+        crate::args::parse::<crate::args::NoArgs>(&args)?;
         let session_guard =
             self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
@@ -2324,6 +2341,9 @@ impl RequestHandler {
     }
 
     async fn handle_disconnect(&self, args: serde_json::Value) -> Result<String, String> {
+        // Takes no arguments of its own, so this is purely the unknown-argument check every other
+        // tool gets from its own `deny_unknown_fields` struct (DOC-9, #132).
+        crate::args::parse::<crate::args::NoArgs>(&args)?;
         let target = match args.get("session_id").and_then(|v| v.as_str()) {
             Some(s) => Some(s.to_string()),
             None => self.session_manager.get_current_session_id().await,

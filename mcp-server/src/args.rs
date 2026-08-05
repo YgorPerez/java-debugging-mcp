@@ -84,10 +84,45 @@ pub fn parse_thread_id(s: Option<&str>) -> Option<u64> {
 
 /// Deserialize tool arguments into a typed struct, tolerating a missing/`null` arguments value
 /// (treated as an empty object so all-optional structs still get their defaults).
+///
+/// **Every struct below is `deny_unknown_fields`, and this is the one place that is made to work**
+/// (DOC-9, #132). A misspelled argument used to be discarded in silence: serde's default is to ignore
+/// what it does not recognise, so `prot` for `port` fell back to the default and `sessionId` for
+/// `session_id` fell back to the *current session* — a call executing against a JVM the caller did not
+/// name, reported as success. Now it is refused, and serde's error names the fields that were expected.
+///
+/// `session_id` is removed before deserializing because it is honoured by `RequestHandler::resolve_session`
+/// straight from the raw arguments, for every tool, and is therefore a typed field on none of these structs.
+/// Stripping it here — the single point every tool's arguments pass through — is what keeps that true while
+/// still rejecting everything else. Declaring it on all thirty structs instead would put thirty copies of one
+/// argument in the tree, and `serde(flatten)` cannot help: serde rejects `flatten` combined with
+/// `deny_unknown_fields`. `tools.rs` puts it back into each published `inputSchema`, so a caller can still
+/// see it.
 pub fn parse<T: serde::de::DeserializeOwned>(args: &serde_json::Value) -> Result<T, String> {
-    let v = if args.is_null() { serde_json::Value::Object(serde_json::Map::new()) } else { args.clone() };
+    let mut v = if args.is_null() { serde_json::Value::Object(serde_json::Map::new()) } else { args.clone() };
+    if let Some(object) = v.as_object_mut() {
+        object.remove(SESSION_ID_ARG);
+    }
     serde_json::from_value(v).map_err(|e| format!("Invalid arguments: {e}"))
 }
+
+/// The one cross-cutting tool argument, named once.
+///
+/// Read by `RequestHandler::resolve_session` from the raw arguments, stripped by [`parse`], and injected into
+/// every published `inputSchema` by `tools.rs`. Three places have to agree about this string, so it is a
+/// constant rather than three literals.
+pub const SESSION_ID_ARG: &str = "session_id";
+
+/// Arguments for a tool that takes **no** arguments of its own.
+///
+/// Six tools publish an empty schema — `debug.continue`, `debug.pause`, `debug.disconnect`,
+/// `debug.panic`, `debug.list_sessions`, `debug.list_stop_points` — and none of them used to parse their
+/// arguments at all, so an unknown argument to one of them was ignored however it was spelled. They parse
+/// this instead, which accepts `session_id` (stripped above) and nothing else, so strictness is the same
+/// across all thirty-eight rather than across the thirty that happened to have fields (DOC-9, #132).
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NoArgs {}
 
 /// Arguments for `debug.launch` (LAUNCH-1).
 ///
@@ -98,6 +133,7 @@ pub fn parse<T: serde::de::DeserializeOwned>(args: &serde_json::Value) -> Result
 /// break on code that runs during initialisation. It is not a way to manage an app server — a long-running
 /// deployment should be started by whatever normally starts it, and attached to.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchArgs {
     /// Main class to run, e.g. `com.example.Main`. Give this **or** `jar`, not both. Needs `classpath`
     /// unless the class is on the default one.
@@ -259,6 +295,7 @@ const fn default_max_classes() -> usize {
 
 /// Arguments for debug.attach.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AttachArgs {
     /// JVM host (e.g. "localhost").
     #[serde(default = "default_host")]
@@ -292,6 +329,7 @@ pub struct AttachArgs {
 
 /// Arguments for `debug.set_line_stop`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetBreakpointArgs {
     /// Where to break: an EXACT class name (`com.example.MyClass`), a WILDCARD matching many loaded
     /// classes (`com.example.*`, `*.OrderService`, `*Order*` — FILT-3), or a LIST of either
@@ -452,10 +490,14 @@ pub struct SetBreakpointArgs {
     pub max_classes: usize,
     // NOTE: `session_id` is a cross-cutting argument handled uniformly by `resolve_session`
     // (from the raw arguments) for every tool, so it is intentionally not a typed field here.
+    // DOC-9 (#132) kept that decision and closed what it used to cost: `parse` strips the key so
+    // `deny_unknown_fields` cannot reject it, and `tools::with_session_id` publishes it in every
+    // `inputSchema` so it is no longer an argument documented nowhere.
 }
 
 /// Arguments for `debug.toggle_stop_point` (BP-1).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ToggleBreakpointArgs {
     /// Stop-point ID (`bp_…`) from `debug.list_stop_points`.
     pub breakpoint_id: String,
@@ -467,6 +509,7 @@ pub struct ToggleBreakpointArgs {
 
 /// Arguments for `debug.get_traces`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetTracesArgs {
     /// Max snapshots to return, most recent last (default 50).
     #[serde(default = "default_trace_limit")]
@@ -489,6 +532,7 @@ pub struct GetTracesArgs {
 
 /// Arguments for `debug.get_last_event`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetLastEventArgs {
     /// How many buffered events to return, most recent LAST (default 1 — just the latest). Raise it
     /// to catch up when the reply says events are pending, e.g. after a broad exception breakpoint.
@@ -502,6 +546,7 @@ pub struct GetLastEventArgs {
 
 /// Arguments for `debug.clear_stop_point`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClearBreakpointArgs {
     /// Stop-point ID from `debug.list_stop_points`.
     pub breakpoint_id: String,
@@ -509,6 +554,7 @@ pub struct ClearBreakpointArgs {
 
 /// Arguments for `debug.step_over` / `step_into` / `step_out`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StepArgs {
     /// Thread ID to step (optional; defaults to the last thread that hit a breakpoint).
     #[serde(default)]
@@ -537,6 +583,7 @@ pub struct StepArgs {
 /// call is about it. Here the argument names the thread to *freeze*, and guessing wrong freezes a worker
 /// nobody asked about on a JVM other people are using. `debug.list_threads` is where the id comes from.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SuspendThreadArgs {
     /// Thread ID to suspend, as `debug.list_threads` and `debug.thread_dump` print it (`0x7f2c…`).
     pub thread_id: String,
@@ -544,6 +591,7 @@ pub struct SuspendThreadArgs {
 
 /// Arguments for `debug.resume_thread` (SAFE-11).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ResumeThreadArgs {
     /// Thread ID to resume. Optional: with one thread held by `debug.suspend_thread` it defaults to
     /// that one, which is the case a caller is in almost every time. With several held it is required,
@@ -554,6 +602,7 @@ pub struct ResumeThreadArgs {
 
 /// Arguments for `debug.get_stack`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetStackArgs {
     /// Thread ID (optional; defaults to the last thread that hit a breakpoint/step).
     #[serde(default)]
@@ -583,6 +632,7 @@ pub struct GetStackArgs {
 
 /// Arguments for debug.evaluate.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluateArgs {
     /// Java expression. Heads: a local, `this`, a class (`ConfigDefaultUtils`, or fully
     /// qualified), or an **object handle** — `@0x1f4c`, the spelling every reply prints beside an
@@ -659,6 +709,7 @@ pub struct EvaluateArgs {
 
 /// Arguments for `debug.evaluate_chain` (EVAL-6).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluateChainArgs {
     /// The chained Java expression to walk, in exactly the form `debug.evaluate` accepts —
     /// `wsReservaCircuito.getCircuitoParametro().getConfigUhList()[0].getSqQuarto()`, including an
@@ -693,6 +744,7 @@ pub struct EvaluateChainArgs {
 
 /// Arguments for `debug.list_threads`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListThreadsArgs {
     /// Only threads whose name contains this substring (case-insensitive), e.g. 'Avail' or 'task'.
     #[serde(default)]
@@ -717,6 +769,7 @@ pub struct ListThreadsArgs {
 
 /// Arguments for `debug.list_classes` (DISC-1).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListClassesArgs {
     /// Narrow by class name. Matched against the dotted FQN (com.example.Order), never the JNI
     /// signature the JVM reports. Three shapes: prefix 'com.example.*', suffix `*.OrderService`,
@@ -734,6 +787,7 @@ pub struct ListClassesArgs {
 
 /// Arguments for `debug.list_methods` (DISC-2).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListMethodsArgs {
     /// Fully-qualified class name, e.g. com.example.OrderService. Must already be loaded — find it
     /// with `debug.list_classes` if unsure.
@@ -757,6 +811,7 @@ pub struct ListMethodsArgs {
 /// does it hold"), and a caller who has learnt one should not have to learn the other. See ADR-0015 for
 /// why this is a second tool rather than a `fields:true` flag on the first.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListFieldsArgs {
     /// Fully-qualified class name, e.g. com.example.OrderService. Must already be loaded — find it
     /// with `debug.list_classes` if unsure.
@@ -786,6 +841,7 @@ const fn default_max_instances() -> i32 {
 
 /// Arguments for `debug.list_instances` (DISC-10).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListInstancesArgs {
     /// Fully-qualified class names whose live instances to find, e.g.
     /// `["br.com.infotravel.service.ApplicationSrv"]`. Each must already be **loaded** — find it with
@@ -822,6 +878,7 @@ const fn default_max_query_rows() -> usize {
 
 /// Arguments for `debug.run_named_query` (EVAL-11).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RunNamedQueryArgs {
     /// The `@NamedQuery` name, exactly as declared — e.g. `Reserva.findByCodigoAndStatus`. This is the
     /// string `EntityManager.createNamedQuery` is given, so it is the JPA name and not a class, a method
@@ -924,6 +981,7 @@ pub struct RunNamedQueryArgs {
 
 /// Arguments for `debug.source` (DISC-3).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SourceArgs {
     /// Fully-qualified class name, e.g. com.example.OrderService, or an inner class
     /// com.example.Order$Line. Must already be loaded — find it with `debug.list_classes`.
@@ -964,6 +1022,7 @@ pub struct SourceArgs {
 // much of the VM to touch, and grouping them would only make callers assemble a nested object.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ThreadDumpArgs {
     /// Only threads whose name contains this substring (case-insensitive), e.g. 'default task' for
     /// `WildFly`'s request pool. The cheapest way to cut the cost of a dump on a JVM with hundreds of
@@ -1061,6 +1120,7 @@ pub struct ThreadDumpArgs {
 
 /// Arguments for `debug.set_value`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetValueArgs {
     /// What to write. A local variable name (`counter`), a static field
     /// (`ConfigDefaultUtils.dsInfra` or a fully-qualified `pkg.Class.field`), an instance field
@@ -1082,6 +1142,7 @@ pub struct SetValueArgs {
 
 /// Arguments for `debug.set_exception_stop`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetExceptionBreakpointArgs {
     /// Exception class to break on (e.g. "java.lang.NullPointerException" or
     /// "br.com.infotravel.ErrorException"); its subclasses match too. Omit to break on ALL
@@ -1233,6 +1294,7 @@ pub struct SetExceptionBreakpointArgs {
 
 /// Arguments for `debug.set_field_stop`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetWatchpointArgs {
     /// Class declaring the field (e.g. `ConfigDefaultUtils` or a fully-qualified
     /// `br.com.infotravel.util.ConfigDefaultUtils`). Must already be loaded — a watchpoint needs a
@@ -1378,6 +1440,7 @@ pub struct SetWatchpointArgs {
 
 /// Arguments for `debug.set_method_exit_stop` (METH-1).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetMethodBreakpointArgs {
     /// Class whose method returns you want to see (e.g. `br.com.infotravel.IntegraSrv`), optionally
     /// with a leading/trailing `*`. This is a JDWP `ClassMatch`, so it fires for **every method** of
@@ -1528,6 +1591,7 @@ pub struct SetMethodBreakpointArgs {
 
 /// Arguments for `debug.set_monitor_stop` (DUMP-7, #96).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetMonitorStopArgs {
     /// Which of the four monitor events to report. Omitted arms `["blocked", "acquired"]` — the
     /// **contended-entry** pair, which is what "requests are hanging on a lock" asks about and the only
@@ -1690,6 +1754,7 @@ pub struct SetMonitorStopArgs {
 
 /// Arguments for `debug.force_return`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ForceReturnArgs {
     /// Return value literal, coerced to the method's declared return type: int, 123L, 1.5, 2.0f, 'a', true/false,
     /// null, or "string". Omit (or pass "void") for a void method.
@@ -1702,6 +1767,7 @@ pub struct ForceReturnArgs {
 
 /// Arguments for `debug.reload_class` (SWAP-1).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReloadClassArgs {
     /// Fully-qualified class name, e.g. com.example.OrderService. Must already be LOADED — a class
     /// the JVM has never loaded has nothing to redefine, and loading it is the application's job.
@@ -1727,6 +1793,7 @@ pub struct ReloadClassArgs {
 
 /// Arguments for `debug.check_stale` (DISC-7).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CheckStaleArgs {
     /// Fully-qualified class name, e.g. com.example.OrderService. Must already be loaded.
     pub class_name: String,
@@ -1755,6 +1822,7 @@ pub struct CheckStaleArgs {
 
 /// Arguments for `debug.pop_frame` (SWAP-1).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PopFrameArgs {
     /// Frame index to pop, as numbered by `debug.get_stack` (0 = innermost). Every frame above it goes
     /// too — that is what JDWP does, not a convenience added here.
