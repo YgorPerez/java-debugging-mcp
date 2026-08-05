@@ -285,10 +285,10 @@ _Avoid_: resync, recover (there is nothing to resync *to*; the instinct this ter
 **Independent reads**:
 Reads whose requests do not depend on each other's replies, and which may therefore be in flight together.
 
-**A property of the reads, not of the code that issues them** — which is why it is defined here rather than
-waiting for anything to exploit it. Every read this server makes is already independent or dependent today;
-what PERF-1 ([#100](https://github.com/YgorPerez/java-debugging-mcp/issues/100)) proposes is to *act* on the
-distinction, and the term exists so that proposal has something to be precise against.
+**A property of the reads, not of the code that issues them** — which is why it was defined here before
+anything exploited it. Every read this server makes is already independent or dependent; PERF-1
+([#100](https://github.com/YgorPerez/java-debugging-mcp/issues/100)) *acted* on the distinction, and the term
+existed first so that work had something to be precise against.
 
 **It names a licence, and the licence is per call site rather than per kind of read.** That is the whole
 weight of it: independence has to be *established* for a particular sequence, never assumed from the shape of
@@ -340,8 +340,10 @@ the cost rather than removed it, and has done so in the unit a caller's cost lin
 **It has two shapes here, and both are decided by something the reads cannot see.** A filter may discard a
 frame or a row before anything about it is read, so the filter is resolved first and only survivors are read
 for. And a budget may stop a walk part way, so how many of a level's children will be read is not known until
-they have been — which is why one fan-out was measured, found to be a fifth of its own call site, and left
-alone rather than converted.
+they have been.
+
+Neither shape makes a fan-out permanently speculative. Both make the *set* the thing that has to be settled
+before the reads go out, which is **committed values**.
 
 _Avoid_: prefetch (describes *when* a read happens, not whether it may be wasted — a prefetch for something
 already known to be needed is not speculative, and most of the ones here are not)
@@ -352,9 +354,17 @@ The values a caller has established *will* be rendered, before any of their read
 **This is what a prefetch needs in order not to be a speculative read**, and it is the reason the entry above
 can reject the word *prefetch* rather than the practice. A read is speculative because of what the *caller*
 does not yet know, so the fix is on the caller's side: establish the set first, then read for it. PERF-2
-([#129](https://github.com/YgorPerez/java-debugging-mcp/issues/129)) grants it at one call site — the row
-projection has every row's field values in hand, applies its own field cap, and only then waves the reads
-those exact values need.
+([#129](https://github.com/YgorPerez/java-debugging-mcp/issues/129)) grants it on the row-projection path and
+on the deep render.
+
+**A caller establishes commitment one of two ways, and the second is what a budget forces.** It may simply
+*hold* the set: a row projection has every row's field values in hand and applies its own field cap, so what it
+will render is enumerable before any read goes out. Or it may *prove* the set, which is what a shared node
+budget leaves it with — a deep render spends that budget per node as it goes, so a level's later children are
+not knowably reached by holding the list. The proof is arithmetic against the budget: children are **certain**
+when the budget cannot run out before the walk arrives at them, whatever the nodes ahead of them spend.
+Certainty is a property of a *prefix*, so a level is committed as far as the arithmetic reaches and read one at
+a time beyond that.
 
 **Committing bounds the set; it does not choose the reads.** What may be waved for a committed value is its
 *first* read — the one the renderer issues before it has decided anything, unconditionally. A second read that
