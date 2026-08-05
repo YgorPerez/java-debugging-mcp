@@ -83,6 +83,26 @@ the query it was asked to run), side-effect free (true, and says nothing about w
 (names one of the three consequences as if it were the property), read-only (a session mode, and a read-only
 session still invokes on this path — see **Read-only**)
 
+**Uncancellable invocation**:
+JDWP offers no way to abort a method invocation once it has been issued, so a call that outruns the invoke
+budget goes on running in the debuggee after this side has stopped waiting for it.
+**The budget frees the DEBUGGER and never the debuggee**, and every surprise here follows from that one
+asymmetry — each reasoned out separately at its own site before the property had a name. An invocation
+needing a monitor the hit thread does not own cannot complete at all, which is why an invoking
+**trace_expr** is refused on `blocked` (ADR-0036). One that merely outruns its budget leaves the JVM to
+re-suspend that thread when the call finally returns, 1.2 s later and for good (see **Trace**). A
+`toString()` that outruns it leaves the thread executing it, so that thread's frames stay unreadable until
+it finishes. And a LATER invocation on that thread earns JDWP's `ALREADY_INVOKING`, since a thread may have
+only one in flight.
+**The last is what earns the word.** TRACE-13 (#131) read an `ALREADY_INVOKING` as two of the caller's own
+expressions colliding, and asked for a **capture**'s invocations to be serialised — they already are, one at
+a time in one event pump. The collision is with a call nobody is waiting for any more, so no ordering on
+this side can prevent it, and what the reply owes is that explanation rather than the wire code.
+_Avoid_: cancelled (the one thing that cannot happen to it), timed-out invocation (names our clock as
+though it ended the call), orphaned (discouraged for an **in-flight hit** already, and wrong here for the
+same reason — it suggests something that may be dropped), hung (suggests the debuggee is stuck, when it is
+usually only slow)
+
 **Attached** / **launched**:
 Whose JVM it is — the fact every safety default here is derived from. An **attached** debuggee was started by
 somebody else and is *presumed* shared, so suspending it may be stalling a request nobody told you about,
@@ -460,8 +480,8 @@ and at `waited` it has **re-acquired** it — which this entry used to leave ope
 has measured") and DUMP-8 measured: an invocation needing the monitor answered promptly there, on Temurin
 21.0.12.
 It matters because it decides what may safely be *asked* at a hit. An invocation needing the monitor re-enters
-harmlessly where the thread already owns it, and cannot complete where it does not — and JDWP cannot cancel an
-invocation. So `blocked` is the one event of the four whose natural question (something about the object being
+harmlessly where the thread already owns it, and cannot complete where it does not — and an invocation is
+**uncancellable**. So `blocked` is the one event of the four whose natural question (something about the object being
 contended) is also the dangerous one, which is why this kind has no **condition** at all and why an invoking
 **trace_expr** is refused on it and on nothing else (DUMP-8, #123, ADR-0036).
 
@@ -673,7 +693,7 @@ The rule that follows is worth stating in the caller's terms rather than the pro
 instance, keep every stop point on a given line traced.** One suspending stop point revokes the promise for
 all of them.
 **A second route breaks the same promise and has nothing to do with the event set** (DUMP-8, #123). A
-`trace_expr` is evaluated on the hit thread while it is briefly held, and JDWP cannot cancel an invocation: one
+`trace_expr` is evaluated on the hit thread while it is briefly held, and an invocation is **uncancellable**: one
 that outruns its budget leaves the debuggee inside the call, and the JVM re-suspends that thread when the call
 finally returns — after this side has already resumed it and moved on. Measured at 1.2 s later on Temurin
 11.0.32 and 21.0.12, and the thread then stays suspended for good. An invoking `trace_expr` is refused on a
