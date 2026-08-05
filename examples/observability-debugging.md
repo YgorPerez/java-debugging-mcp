@@ -126,8 +126,9 @@ this.helloCounter.id.name = "hello_requests_total"
 debug.panic
 ```
 
-Clears every breakpoint and resumes all threads. Do this before you walk away: a suspended thread in a
-Spring app means a stuck request.
+Clears every stop point, resumes all threads, and releases every thread `debug.suspend_thread` is
+holding — verifying each against the JVM's own suspend count rather than reporting a success it did not
+achieve. Do this before you walk away: a suspended thread in a Spring app means a stuck request.
 
 ## If the metric is genuinely absent
 
@@ -190,6 +191,27 @@ you just filtered for.
 
 ## On a shared JVM
 
-On a shared JVM, pass `trace:true` — breakpoints, exception breakpoints and watchpoints all take it.
-Each snapshots the hit and resumes immediately, so a forgotten stop point can't freeze other people's
-requests. Read the snapshots with `debug.get_traces`.
+Everything above suspends the VM, which is fine on a probe and an outage on an app server other people
+are using. Three changes make the same walk safe:
+
+- **`trace:true`** on the stop point — all four kinds take it (line, exception, field, method-exit).
+  Each snapshots the hit and resumes immediately, so a forgotten stop point can't freeze other people's
+  requests. Read the snapshots with `debug.get_traces`, and add `trace_expr` to capture the registry
+  read itself rather than only the frame's locals.
+- **`debug.suspend_thread`** if you need a live frame rather than a snapshot — it holds one worker and
+  leaves the rest serving. It unlocks the stack, locals, field chains and `expand_objects`, which is
+  most of this document. What it does *not* unlock is method **invocation**: JDWP allows an invoke only
+  on a thread suspended by an event, so `getMeters()` and `values()` in the expressions above will
+  answer `INVALID_THREAD` there. Reach for the field (`this.registry.meterMap`) instead of the getter —
+  and note that a filter over a `ConcurrentHashMap` is answered by walking the map's own fields, so it
+  needs no invocation and no suspended thread at all.
+- **`JDWP_READONLY=1`**, or `read_only:true` on `debug.attach`, if you only mean to look. The honest
+  cost is shallower output — an object renders as `Type @0x…` because pretty-printing it means invoking
+  it — but that `@0x…` is a handle `debug.evaluate` accepts as an expression head.
+
+And if no frame you can reach holds the registry at all — the usual case for an `@ApplicationScoped`
+bean whose only reference is a container proxy — `debug.list_instances` finds it by type and hands back
+an `@0x…` handle to start from. It needs no suspend, but it is **not free**: the JVM stops the world for
+a full live-heap walk, and the reply states the pause it imposed. Ask for the concrete registry class
+rather than the `MeterRegistry` interface, because `Instances` is exact-type and would answer a
+confident `0`.

@@ -143,7 +143,9 @@ than a loop). Re-measured on 4 vCPU with no floor left: **shard 1/2 = 30.7 s at 
 amendments. Note what moved the needle each time: a *test* got faster, never the shard arithmetic.
 
 **Run the unsharded suite when you are working a flake.** `scripts/integration-test.sh` with no `--shard` still
-runs all 164 tests in one process, which is the contention CI used to have. Sharding *reduces* how many probe
+runs every `#[ignore]`d test in one process — **217** as of 2026-08-05 — which is the contention CI used to have.
+Count it rather than trusting that number (`<the-test-binary> --list --ignored | grep -c ': test$'`); this line
+said **164** for long enough that the figure was wrong by a third. Sharding *reduces* how many probe
 JVMs compete, so **a flake that stops reproducing under CI's new shape is not fixed** — #45, #56, #64 and #71
 were open when this landed and the trade was accepted with that stated. Refresh the timings file with
 `scripts/test-timings.py --emit-timings <log> > mcp-server/tests/timings.tsv`; it is generated, never hand-edited,
@@ -153,7 +155,11 @@ and drift is reported rather than fatal.
 reproduction recipe named `--shard 1/2`; six runs of it passed cleanly and the test it was supposed to
 exercise had moved to shard **2/2**, because the split is by *measured* duration and the suite had grown from
 180 tests to 197 with `timings.tsv` refreshed several times in between. Six green runs that proved nothing and
-looked like they proved something. **Check membership before trusting a shard number:**
+looked like they proved something.
+
+*It has since grown to 217, so those two numbers are now history as well — which is the point rather than an
+aside: this paragraph's own figures rotted in the weeks it took to read it.* **Check membership before
+trusting a shard number:**
 
 ```bash
 scripts/shard-plan.py --tests <(<the-test-binary> --ignored --list) --which launch_suspends

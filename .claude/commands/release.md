@@ -63,9 +63,9 @@ Read the commits since the last tag and classify them the way the **downstream c
 git log --oneline "$(git describe --tags --abbrev=0)..HEAD"
 ```
 
-- **Minor** (`0.6.0`) — a new tool, a renamed tool or argument, or changed behaviour behind an existing
-  name. Anything a caller could notice.
-- **Patch** (`0.6.1`) — fixes only, no caller-visible surface change.
+- **Minor** (`0.18.0` from today's `0.17.0`) — a new tool, a renamed tool or argument, or changed behaviour
+  behind an existing name. Anything a caller could notice.
+- **Patch** (`0.17.1`) — fixes only, no caller-visible surface change.
 - Prerelease suffixes (`-rc1`) are marked prerelease by the workflow and stay out of `/releases/latest`,
   which unattended installers follow.
 
@@ -194,8 +194,14 @@ the pin lacks advertises something nobody can call; bumping without documenting 
 
 **The pin is a file, not a line in `install.sh`.** It moved to `jdwp-version` because two things read it
 now — the installer and the plugin's SessionStart hook — and two copies of a version string was the drift
-that repo kept paying for. A `sed` against `JDWP_VERSION=` in `install.sh` silently matches nothing today;
-that line reads the file.
+that repo kept paying for.
+
+⚠️ **Do not `sed` `JDWP_VERSION=` in `install.sh`.** This used to say such a `sed` "silently matches
+nothing", which is **false and wrong in the harmful direction** — `install.sh:44` is
+`JDWP_VERSION="$(tr -d '[:space:]' < "$HERE/jdwp-version" …)"`, so a substitution *does* match it and
+replaces the **read of the pin file with a hardcoded literal**. That restores the exact two-copies drift
+this design removed, and it does it silently: the install works, the version is right that once, and the
+file stops being the source of truth. Write the file (`echo "$V" > jdwp-version`) and change nothing else.
 
 ```bash
 cd ~/html/infotravel-dev-toolkit

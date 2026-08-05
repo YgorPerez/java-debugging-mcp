@@ -2,125 +2,96 @@
 
 **Java debugging for LLMs via JDWP and Model Context Protocol**
 
-An MCP server that enables Claude Code and other LLM tools to debug Java
-applications through the Java Debug Wire Protocol (JDWP). Attach to running
-JVMs, set breakpoints, inspect variables, and step through code—all through
-natural language.
+An MCP server that lets Claude Code and other LLM tools debug Java applications over the Java Debug
+Wire Protocol. Attach to a running JVM — or launch one — set stop points, read live objects, evaluate
+expressions, step, and hot-swap code, all in natural language.
 
-## Features
+It speaks JDWP natively in Rust, so it is **one self-contained binary**: no JDK, no JDI, no agent to
+install in the target.
 
-- **Remote Debugging**: Connect to any JVM started with JDWP enabled
-- **Breakpoint Management**: Set/list/clear by class+line — with optional **hit-count** (stop on the
-  Nth hit) and **thread filters**, or set by **method name** (first line)
-- **Stack Inspection**: Stack frames with typed local variables and resolved **source lines**
-- **Execution Control**: **Step over/into/out**, continue, pause. Stepping **skips the JDK and the
-  container by default** — `java.*`, `javax.*`, `jakarta.*`, `sun.*`, `com.sun.*`, `jdk.*`,
-  `org.jboss.*`, `io.undertow.*`, `org.wildfly.*`, `org.hibernate.*` — so `step_into` lands on the next
-  line of *your* code rather than inside a Weld proxy or an EJB interceptor chain. `exclude_classes:[]`
-  restores the unfiltered behaviour, `only_classes` is the inverse ("keep going until we are back in my
-  package"), and every step reply says which was in force
-- **Expression Evaluation**: `localVar`/`this`/`Class` heads with `.field` and `.method(args)` chains
-  — including **static fields and static methods** (`ConfigDefaultUtils.getUrl()`) — resolving
-  overloads by the arguments' **runtime types**, including interfaces they implement (walked
-  transitively) and autoboxing, and refusing an argument a parameter can't accept. Arguments are
-  literals (int, long, boolean, null, `"string"`) **or expressions passed by reference**
-  (`svc.matches(reserva)`, `foo.handle(this, cfg.getId())`)
-- **Value Rendering**: Strings, typed objects (best-effort `toString()`), and **array contents**
-- **Recursive Expansion**: `expand_objects:true` on `debug.evaluate` / `debug.get_stack` walks nested
-  objects, arrays, and **`List`/`Set`/`Map`/`Optional` contents** into a field tree — bounded by
-  `max_depth`/`max_children` and a node budget, with **cycle detection** and unboxed wrappers
-- **Collection Subscripts**: `lines[0]`, `counts["key"]`, `lines[2..5]` (slice) and
-  **`lines[?qty > 3]`** (filter, with the left side resolved against each element). Filtering a `Map`
-  keeps the keys (`key → value`), and a single element can be **written** as well as read
-- **Collection reads that need no suspended thread**: a subscript, slice or filter on a
-  `java.util.HashMap`, `LinkedHashMap`, `ConcurrentHashMap` or `ArrayList` is answered by **walking the
-  collection's own fields** (`table[]` → `Node.key/value/next`, `elementData[0..size]`) instead of
-  invoking `get()` / `entrySet()` / `toArray()` in the debuggee — so the commonest cache question works
-  on a JVM you must not freeze, and under `read_only`. Any other implementation falls back to invoking,
-  and **the reply says which path it took**; a structural read also states that it took no lock, so the
-  value is a sample rather than a transaction
-- **`byte[]` as text**: a `byte[]` / `char[]` renders as **decoded text with the encoding named** —
-  `byte[73] ISO-8859-1 "<?xml version=…"` — rather than as a list of signed integers, and `arr.length`
-  works on any array. A trailing **`#<charset>`** on the expression picks the reading (`UTF-8` by
-  default, `ISO-8859-1`, `US-ASCII`, or `#raw` for the octets), and it composes with `trace_expr`, so a
-  supplier envelope is readable from a **non-suspending** stop point. Octets that do not decode are
-  marked `\xNN` rather than replaced, so a wrong charset looks wrong instead of looking like a bug in
-  whatever produced the payload
-- **Which link went null**: `debug.evaluate_chain` walks a chained expression left to right and names the
-  first link that is null, with every link's value above it and a count of the ones it never reached —
-  the one-call answer to a question that otherwise costs one `debug.evaluate` per link. Each method in
-  the chain runs exactly once. For the case where nothing *throws*; when it does, the exception's own
-  message is better (below)
-- **Set Values**: a local, a static or instance field, or one element of an array / `List` / `Map`
-- **Field Watchpoints**: break when a field is read or written — `debug.set_field_stop` reports the
-  mutating location with the **old → new** value, for "who changes this behind my back?"
-- **Method return values**: `debug.set_method_exit_stop` reports **what a method returned and from
-  which `return`**, so a method with several exits (or one whose value comes from a chain you can't
-  break on) stops being a guessing game. Trace mode is the default for this one
-- **Lock contention, live**: `debug.set_monitor_stop` reports what threads are **blocked on which lock**,
-  as it happens and **with no suspend** — the answer to "requests are hanging" that used to require freezing
-  a shared instance, because `debug.thread_dump` cannot read a running thread's monitors. Each snapshot names
-  the lock, the thread, the blocking path, and how long the block lasted; that duration is **measured by this
-  server**, because no monitor event carries one, and every reply says so
-- **Non-suspending trace mode**: `trace:true` on a breakpoint, an **exception breakpoint** or a
-  **watchpoint** snapshots the hit and resumes the thread immediately instead of freezing the VM —
-  the only safe way to use any of them on a shared instance. Each snapshot carries the **calling
-  chain** above the hit (`trace_frames`, default 3), so a logpoint answers *which path reached this*.
-  Read the snapshots with `debug.get_traces`.
-  Values are truncated **at capture time** — 100 characters per in-scope local, 200 for the `trace_expr`
-  result, a watchpoint's old → new pair and a method exit's returned value — so the cut string is what the
-  buffer stores and no later read can recover the rest. `trace_max_length` (ceiling 4000) raises all of
-  them together, which is what a JSON body, a SOAP envelope or a `+=`-built SQL string needs; a request
-  above the ceiling is clamped and the reply says so. The defaults stay frugal because a trace may fire
-  hundreds of times into a bounded buffer.
-  It does **not freeze** the VM, which is not the same as not **slowing** it: capture is serialised
-  through one connection, so a traced stop point tops out at ~**720 hits/s** (~1160 at
-  `trace_frames: 0`) and hits past that queue. Under a few hundred hits/s that is effectively free, and
-  `trace_max_hits` (default 200) keeps even a hot site to a sub-second blip — `trace_max_hits: 0` is
-  the one setting that removes that bound, and the arm reply warns when you use it
-  *(loopback figures against a trivial endpoint; the ceiling is the durable part, not the percentage)*
-  You do not have to take those figures on trust: once a traced stop point has fired,
-  `debug.list_stop_points` reports what **it** is costing on **your** JVM — the mean capture per hit, the
-  rate hits are arriving at, and the share of the window spent capturing (invert the mean for the rate past
-  which hits queue). A traced stop point that has captured nothing says so, rather than reporting zero
-- **Hot reload**: `debug.reload_class` installs freshly compiled bytecode into the running JVM
-  (`RedefineClasses`) — no redeploy, no restart, warm state intact, and a request suspended at a
-  breakpoint survives the fix: swap the method, `debug.pop_frame`, `debug.continue`, and it re-runs with
-  the new code without re-issuing the call that got you there. HotSpot accepts **method bodies only**,
-  and each of the twelve ways it can refuse is turned into what to do next instead of a bare error code
-- **Staleness detection**: `debug.check_stale` answers whether the JVM is running the build on your
-  disk, by comparing line tables method by method — the failure that otherwise costs twenty tool calls
-  debugging the *program* while the deployed bytecode is last week's. With a class root configured,
-  `debug.set_line_stop` also reports it **unasked** when the method you just armed has drifted (DISC-8),
-  since the caller this ruins is the one who never thought to check; it speaks only when it has a proof,
-  so a quiet reply is not a promise that your build is current. `bytecode:true` adds the evidence line
-  tables cannot give (DISC-9) — a body edit that moved no line, like `x < 5` to `x <= 5` — and is the only
-  one that answers at all on a `-g:none` build
-- **Thread Management**: tools default to the last thread that hit a breakpoint
-- **Thread dumps with lock ownership**: `debug.thread_dump` answers "it's wedged — which threads are
-  blocked on what?" in one call: every thread's stack, the monitors it holds, the one it is blocked
-  entering, and **who holds that** — so a deadlock cycle is visible without leaving the debugger. When it
-  cannot show every thread it picks them **one per thread-name family**, not the first `limit` the JVM
-  listed, because that is creation order and an app server creates its request pool last (ADR-0013).
-  `debug.list_threads` truncates by the same rule and says so in the same words, so the cheap call you run
-  to decide what to dump does not show you a different population than the dump will
-- **Structured Events**: `get_last_event` emits a machine-readable `[event]` line (thread, class.method:line),
-  from a bounded buffer — a burst of hits isn't lost, and the reply says how many are still pending
-- **An exception hit reports its message**, not just its type and location. On JDK 15+ that is frequently
-  the whole diagnosis: the JVM has already computed *`because the return value of "X.getY()" is null`*,
-  which names the failing subexpression a hand-run bisect would have taken three calls to find. Available
-  in trace mode too. And on a framework that rethrows — an EJB interceptor chain, a Spring proxy — the
-  sightings of one instance are **folded** rather than recorded 30 times: the original throw and the point
-  where it escapes are both kept, the plumbing between them becomes a count, and a collapsed rethrow does
-  not spend `trace_max_hits`
-- **Safety**: a `panic` tool (clear all + resume) and a **watchdog** that auto-resumes a long-suspended
-  VM (`JDWP_WATCHDOG_SECS`, default 120) so a forgotten breakpoint can't freeze a shared instance
+📖 **[Tool reference](docs/tools.md)** · 🛠 **[Development](docs/development.md)** ·
+⚖️ **[Compared with the other Java debugging MCP servers](docs/comparison.md)**
 
-> This fork implements `debug.evaluate` and `debug.step_*` (stubs upstream) plus the safety,
-> structured-event, array, set-value, and breakpoint-modifier features above. See
-> [Compared with the other Java debugging MCP servers](#compared-with-the-other-java-debugging-mcp-servers).
+## What it is good at
 
-## Quick Start
+**It is built for a JVM you are not allowed to freeze.** That constraint shapes everything else: a
+shared app server serving other people's requests, reached over a `kubectl port-forward`, where the
+usual debugger move — suspend everything and poke around — is an outage.
+
+- **Non-suspending trace mode.** `trace:true` on a breakpoint, exception stop, watchpoint or
+  method-exit stop snapshots the hit and resumes the thread immediately. Each snapshot carries the
+  calling chain above it, so a logpoint answers *which path reached this*. Read them with
+  `debug.get_traces`.
+- **Freeze one thread, not the VM.** `debug.suspend_thread` holds a single worker and leaves the rest
+  serving — enough for the whole stack, locals, field chains and deep object expansion.
+- **A watchdog that undoes your mistake.** A VM or thread left suspended too long is auto-resumed
+  (`JDWP_WATCHDOG_SECS`, default 120) and whatever froze it is *disabled*, so it cannot re-freeze on
+  the next hit. `debug.panic` does it on demand; `debug.disconnect` can never leave a JVM frozen.
+- **Read-only sessions.** `JDWP_READONLY=1` refuses everything that would execute or install code —
+  enforced at the JDWP boundary, so the indirect paths (`toString()` rendering, `Map` subscripts,
+  breakpoint conditions) are covered too.
+- **Costs are measured and reported, never guessed.** A thread dump says how long it held the VM and
+  how many packets it spent. A traced stop point reports its own capture cost *on your JVM*. A heap
+  query states the pause it imposed. A budget that truncates says what it dropped.
+
+**Expression evaluation that resolves like `javac` does.** `localVar` / `this` / `Class` / `@0x…`
+heads with `.field` and `.method(args)` chains, including static members. Overloads resolve on the
+arguments' **runtime types** — interfaces walked transitively, autoboxing applied, and an argument a
+parameter cannot accept is refused rather than handed to the JVM. Arguments may be literals or
+expressions passed by reference (`svc.matches(reserva)`).
+
+- **Collections as first-class syntax** — `lines[0]`, `counts["key"]`, `lines[2..5]`, and
+  `lines[?qty > 3]` filters with the left side resolved against each element. A filter reports
+  `N of M matched`, so an empty result is distinguishable from an unscanned one.
+- **Reads that need no suspended thread.** A subscript, slice or filter on a `HashMap`,
+  `LinkedHashMap`, `ConcurrentHashMap` or `ArrayList` is answered by walking the collection's own
+  fields instead of invoking `get()` in the debuggee — so the commonest cache question works under
+  `read_only` on a JVM you must not freeze. Any other implementation falls back to invoking, and the
+  reply says which path it took.
+- **Deep expansion** — `expand_objects:true` walks nested objects, arrays and `List`/`Set`/`Map`/
+  `Optional` contents into a field tree, bounded by depth, breadth and a node budget, with cycle
+  detection and unboxed wrappers.
+- **`byte[]` as text** — `byte[73] ISO-8859-1 "<?xml version=…"` rather than a list of signed
+  integers, with a trailing `#<charset>` to pick the reading. Octets that do not decode are marked
+  `\xNN`, so a wrong charset looks wrong instead of looking like a bug in the payload.
+
+**Questions that otherwise cost ten tool calls, answered in one.**
+
+| The question | The tool |
+| --- | --- |
+| Which link in this chain went null? | `debug.evaluate_chain` — names the first null, values above it, and how many links it never reached |
+| What did this method return, and from which `return`? | `debug.set_method_exit_stop` |
+| Who changes this field behind my back? | `debug.set_field_stop` — reports the mutating location with **old → new** |
+| Requests are hanging — which threads are blocked on what? | `debug.set_monitor_stop` (live, no suspend) or `debug.thread_dump` (names the lock *owner*) |
+| Is this JVM even running the code I compiled? | `debug.check_stale` — compares line tables method by method |
+| Where does this object live if nothing on the stack names it? | `debug.list_instances` — live objects of a type as `@0x…` handles |
+| Does this `@NamedQuery` return what its author believes? | `debug.run_named_query` — through the app's own `EntityManager`, without the flush it would have caused |
+
+**An exception hit reports its message.** On JDK 15+ that is frequently the whole diagnosis: the JVM
+has already computed *`because the return value of "X.getY()" is null`*, naming the failing
+subexpression a hand-run bisect would have taken three calls to find. On a framework that rethrows,
+the sightings of one instance are **folded** — original throw and escape point kept, the plumbing
+between them a count.
+
+**Hot reload, and the frame rewind that makes it work.** `debug.reload_class` installs freshly
+compiled bytecode into the running JVM — no redeploy, no restart, warm state intact — and a request
+suspended at a breakpoint survives the fix: swap the method, `debug.pop_frame`, `debug.continue`, and
+it re-runs with the new code. HotSpot accepts method bodies only, and each of the twelve ways it can
+refuse is turned into what to do next instead of a bare error code.
+
+**Stepping that lands on your code.** `step_into` skips the JDK and the container by default
+(`java.*`, `jakarta.*`, `org.jboss.*`, `io.undertow.*`, `org.hibernate.*`, …), so you arrive at the
+next line of *your* method rather than inside a Weld proxy. `exclude_classes:[]` restores the
+unfiltered behaviour, `only_classes` is the inverse, and every step reply says which was in force.
+
+**Discovery, for when you do not know the name yet.** `debug.list_classes` shows what the debuggee has
+actually loaded — the only way to find a generated proxy or a shaded class. `debug.list_methods` and
+`debug.list_fields` render signatures as Java source types with generics. `debug.source` settles
+whether your checkout is the code that is running.
+
+**38 tools in total** — see the [tool reference](docs/tools.md).
+
+## Install
 
 ### 1. Start your Java app with JDWP enabled
 
@@ -128,7 +99,10 @@ natural language.
 java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 -jar myapp.jar
 ```
 
-### 2. Get the MCP server
+Or skip this and let `debug.launch` start it for you — which is the only way to break on code that
+runs *during* startup, since it holds the VM before its first instruction.
+
+### 2. Get the server
 
 **Download a prebuilt binary** — no Rust toolchain needed — from the
 [latest release](https://github.com/YgorPerez/java-debugging-mcp/releases/latest):
@@ -145,7 +119,7 @@ distribution's glibc — including an app server older than the machine you down
 release ships a `SHA256SUMS` covering all four assets:
 
 ```bash
-tag=v0.1.0
+tag=v0.17.0
 base=https://github.com/YgorPerez/java-debugging-mcp/releases/download/$tag
 curl -LO "$base/jdwp-mcp-$tag-linux-x86_64" && curl -LO "$base/SHA256SUMS"
 sha256sum --ignore-missing -c SHA256SUMS   # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
@@ -163,28 +137,30 @@ cargo build --release   # binary at target/release/jdwp-mcp
 
 ### 3. Configure Claude Code
 
-The easiest way to enable the MCP server for your project:
-
 ```bash
 # From your Java project directory
-claude mcp add --scope project jdwp /path/to/jdwp-mcp/target/release/jdwp-mcp
+claude mcp add --scope project jdwp /path/to/jdwp-mcp
 ```
 
-Adjust the path to match where you saved the downloaded binary (or `target/release/jdwp-mcp` if you built from source). The `--scope project` flag makes the debugger available only in your current Java project.
-
-**Alternative**: Manual configuration via `.mcp.json`:
+`--scope project` makes the debugger available only in this project. Manual configuration via
+`.mcp.json` works too:
 
 ```json
 {
   "mcpServers": {
     "jdwp": {
-      "command": "/path/to/jdwp-mcp/target/release/jdwp-mcp"
+      "command": "/path/to/jdwp-mcp",
+      "env": { "JDWP_READONLY": "0", "JDWP_WATCHDOG_SECS": "120" }
     }
   }
 }
 ```
 
-### 4. Debug with natural language
+`JDWP_CLASS_ROOTS` and `JDWP_SOURCE_ROOTS` are worth setting too — they are what `debug.check_stale`,
+`debug.reload_class` and `debug.source` read, and the arm-time staleness warning stays silent without
+them.
+
+## Use it
 
 ```
 > Attach to the JVM at localhost:5005
@@ -192,534 +168,53 @@ Adjust the path to match where you saved the downloaded binary (or `target/relea
 > When it hits, show me the stack and the value of requestCount
 ```
 
-## Available Tools
+On a **shared** instance, ask for trace mode instead of a suspending stop point:
 
-| Tool | Description |
-|------|-------------|
-| `debug.attach` | Connect to a JVM via JDWP |
-| `debug.launch` | **Start** a JVM under the debugger and attach to it — `main_class` + `classpath`, or `jar`, plus optional `jvm_args` / `args` / `working_dir` / `java_home`. `suspend` defaults to true, holding the VM before its first instruction, which is the only way to break on code that runs during startup. `debug.disconnect` terminates it unless `detach_on_disconnect:true`; its stdout/stderr are captured (never inherited — this server's stdout is the MCP transport) and reported if it dies |
-| `debug.set_line_stop` | Set a breakpoint by class+line, or by method name. `class_pattern` takes an exact class, a **wildcard** (`com.example.*` — arms one breakpoint per matching loaded class, keeps arming ones that load later, and is clearable as one `bpset_` id; needs `method`, refuses `line`, bounded by `max_classes` — a family that is **full** parks its class-load watch, so it costs the JVM nothing until a cleared member frees a slot), or a **list** of either; optional `hit_count`, thread filter, `condition` (with `&&`/`||`), or `trace:true` (non-suspending logpoint, with `trace_max_hits`, `trace_frames` and `trace_max_length`) |
-| `debug.set_exception_stop` | Break when an exception (of a class + its subclasses, or all) is thrown; `caught`/`uncaught` selectable, an optional `thread_id` filter, an optional `hit_count` (fires **once**, on the Nth throw, and the JVM then deletes the request itself — the listing reports it `SPENT`), or `trace:true` (with `trace_max_hits` / `trace_frames` / `trace_max_length`) to collect throws without suspending. Each hit reports the exception's **message** as well as its type and catch site — on JDK 15+ that is usually the diagnosis itself, since a `NullPointerException` names the failing subexpression (`because the return value of "X.getY()" is null`). On a framework that rethrows, the sightings of one instance are **folded**: the original throw and the escape point are both kept, the layers between become a count, and a collapsed rethrow does not spend `trace_max_hits` |
-| `debug.get_traces` | Read snapshots captured by any `trace:true` stop point — line, exception or watchpoint, each with the caller chain above it (bounded ring buffer; narrow with `bp_id` / `class_filter` / `since`, optional `clear`). A record marked `↻ rethrow of #<seq>` is the escaping end of a rethrow chain, and `#<seq>` is the original throw — the one with the application frame and the cause |
-| `debug.list_stop_points` | List active stop points (line, deferred, exception, watchpoint, method-exit) with trace budgets and thread filters — plus **`Hits: N`** on every one, including `Hits: 0`, so "armed and never fired" is a statement rather than a silence; a stop point whose `hit_count` has fired reads **`SPENT`**, which is neither armed nor the caller's own `DISABLED`; and, for each traced one, its **measured** capture cost: mean per hit, the rate hits are arriving at, and the share of the window spent capturing |
-| `debug.clear_stop_point` | Remove a stop point (line, deferred, exception, watchpoint, method-exit) — or a whole wildcard family by its `bpset_…` id, which also drops its watch for classes that load later |
-| `debug.toggle_stop_point` | Silence or re-arm any stop point (`bp_…` / `exc_…` / `watch_…` / `mexit_…` / `bpset_…`) without losing its `condition`/`trace_expr`; the id stays the same across the round trip |
-| `debug.continue` | Resume execution |
-| `debug.step_over` | Step over current line (defaults to last-hit thread). Optional `exclude_classes` / `only_classes` (JDWP `ClassExclude` / `ClassOnly`) — a **default exclusion set** applies unless you pass your own or an empty list |
-| `debug.step_into` | Step into a method call — **skips framework and JDK frames by default**, so it lands on your next line instead of several steps deep in the container; `exclude_classes:[]` steps into everything |
-| `debug.step_out` | Step out of the current method |
-| `debug.get_stack` | Stack frames, compact `#i class.method:line` with typed locals indented |
-| `debug.evaluate` | Evaluate `var`/`this`/`Class` + `.field` / `.method(args)` chains in a frame; static methods, object arguments, `[i]`/`["k"]`/`[a..b]`/`[?pred]` subscripts (predicates support `&&`/`||`), `arr.length` on any array, a `byte[]`/`char[]` rendered as decoded text with a `#<charset>` selector, and `expand_objects` for a deep field tree |
-| `debug.evaluate_chain` | **Which link went null?** Walks the same chained expression `debug.evaluate` takes, link by link, printing each one's value and naming the first null — plus how many links after it were never evaluated. For a chain that returns null or an empty collection without throwing, which otherwise costs one `debug.evaluate` per link, bisected by hand. Every method in the chain runs **exactly once** (each link resolves against the previous link's value, not by re-evaluating longer prefixes) and no `toString()` is invoked. A separate tool rather than a flag, per ADR-0015 — "where did this become null" is a different question from "what is this value". If the chain *throws*, prefer the exception's own message: on JDK 15+ it names the failing subexpression |
-| `debug.set_value` | Write a local variable, a static field (`Class.field`), an instance field (`this.field`), or one element (`xs[0]`, `counts["k"]`) — from a literal or a copied live reference (`this.a = other.b`) |
-| `debug.set_field_stop` | Break when a field is written (or read) — reports the mutating location + old → new value; optional `thread_id` filter; `trace:true` (with `trace_max_hits` / `trace_frames` / `trace_max_length`) collects hits without suspending |
-| `debug.set_method_exit_stop` | Report what a method **returned**, and from which `return` — for a method with several exits, or a value from a chain you can't break on. `class_pattern` + `method`; `trace` defaults to **true** here (a suspending method exit on a hot method freezes a VM fastest), and a broad suspending request is refused with the reason. The returned value is captured at 200 chars unless `trace_max_length` raises it |
-| `debug.set_monitor_stop` | Watch **lock contention** as it happens, without suspending anything — JDWP's four `MONITOR_*` events, snapshotted into the trace buffer. `kinds` defaults to `["blocked","acquired"]`, the contended-entry pair; `["wait","waited"]` is the `Object.wait()` pair and `["all"]` is everything. **The duration is this server's own measurement** — no monitor event carries one, so it is taken across the two events of a pair and every reply says whose figure it is. `min_duration_ms` shows only the blocks that hurt, and says honestly that it filters what you *read* rather than what crosses the wire; `thread_id` is the filter that actually reduces debuggee cost. `trace` defaults to **true** and `trace:false` needs a `thread_id`, because contention is not a site you chose. `monitor_class` works on the wait pair only — measured: on the contended pair HotSpot applies `ClassOnly` to the blocking *code*'s class instead |
-| `debug.force_return` | Force the current method to return a given value, skipping the rest of its body |
-| `debug.reload_class` | **Hot reload**: ship a freshly compiled `.class` into the running JVM (`VirtualMachine.RedefineClasses` — what an IDE calls "reload changed classes"), with no redeploy and no restart. Warm state, pools, app context and any in-flight request survive, including one suspended at a breakpoint. Compiling stays yours; this reads the output, at `<class root>/<package as directories>/<SimpleName>.class` from `debug.attach {class_roots:[…]}`, `JDWP_CLASS_ROOTS`, the call, or an explicit `class_file`. HotSpot takes **method bodies only** — add a method or a field, change a modifier or the hierarchy, and the reply names which of those you did and says a redeploy is the only route, rather than leaving a bare `SCHEMA_CHANGE_NOT_IMPLEMENTED` to be re-tried forever. A refusal changes nothing (redefinition is all-or-nothing). Reports whether the thread you are stopped on is *inside* the class, since a frame already on the stack keeps the bytecode it entered with. `dry_run:true` sends nothing; refused read-only |
-| `debug.pop_frame` | Rewind a suspended thread to the **call site** of a frame (`StackFrame.PopFrames`), so `debug.continue` re-executes the call. The other half of a hot reload — a frame already running keeps its old bytecode, so a swap of the method you are stopped in looks like it did nothing until the frame is popped — and useful alone for re-running a method you stepped past. Every frame above the named one goes too (JDWP's behaviour, not a convenience). Side effects are **not** undone; refused read-only |
-| `debug.get_last_event` | Last event as a machine-readable `[event]` line (thread, class.method:line, exception type **and message**, watched field's old → new) + `[suspended]`; events are buffered, so `limit` reads a backlog and `drain` discards it. A watchdog rescue is reported only against the suspension it actually ended, so an old auto-resume is never replayed beside a live hit |
-| `debug.list_threads` | List threads by name; filter with `name_filter` / `only_suspended` / `limit`. A thread this session is holding with `debug.suspend_thread` is marked on its row with how long it has been held (and named below the listing if `limit` pushed it off the page) — read from session state, so it costs no extra packets. A listing too big for `limit` picks **one thread per name family** rather than the first `limit` in JDWP's creation order — the same rule as `debug.thread_dump`, stated in the reply the same way (ADR-0013). It reads one packet per thread *name* to do that: measured on `ChurnProbe`, 103 packets against the 381 of a dump of the same JVM, and it reaches all 8 workers the debuggee starts last where the old creation-order listing reached 0 |
-| `debug.list_classes` | What the debuggee has actually **loaded** — the first step when you don't already know the FQN a stop point needs, and the only way to find a generated proxy, a shaded class, or a deployment that differs from your checkout. `filter` takes `com.example.*`, `*.OrderService` or a bare substring, matched against the dotted name. Bounded: the reply reports matched-against-loaded rather than dumping thousands of types. Arrays excluded unless `include_arrays:true` |
-| `debug.list_methods` | A class's methods with signatures rendered as **Java source types**, type parameters and arguments included where the class file carries them (`<T> List<T> firstOf(List<T>, Map<String, T>)`) — what you need to compose a `debug.evaluate` call, since overloads resolve on the runtime types you supply. All overloads listed; `static`/`abstract`/`native` marked (the latter two have no body to break on). Declared-only unless `inherited:true` walks the superclass chain, attributing each row |
-| `debug.list_fields` | What state a class **holds** — with type arguments where the class file carries them (`List<ReservaHotel> lines`) — for when you have a type and no instance to expand — a static holder, a class you're about to breakpoint into, a vendored or shaded class the checkout can't show you. Rendered as a Java declaration (`static final java.lang.String INFRA`, `int qty`), so static and instance are told apart at a glance; `final` and `volatile` are marked too. **Statics are listed first** — they're the ones `debug.evaluate` reads with no instance and no suspended thread. Declared-only unless `inherited:true` walks the superclass chain, attributing each row. Reads no *values*; bounded like the other discovery tools. A class that declares nothing says so as an answer rather than looking like a failed lookup (ADR-0015) |
-| `debug.list_instances` | **The live objects of a type**, as `@0x…` handles `debug.evaluate` starts from — the only route to something no local, `this` and no static field can name: an `@ApplicationScoped` bean's caches, a producer-injected component, anything whose only reference is a container-held proxy. Ask about several types at once; the count for a whole batch is one walk. **It is not free and it looks free.** JDWP needs no suspend and none is issued, yet the JVM stops the world for a full live-heap walk — measured at **522 ms of held application threads on a 2,000,000-object heap to answer with 7 objects**, against 54 ms on a 20,000-object one for the same 7. The cost tracks the heap, not the answer. Nothing refuses on size; the reply states the duration it actually held them and how many walks it took (ADR-0023). **Exact type, not subtype-inclusive**: `Widget` answers 7 with two live `SubWidget`s in the heap, not 9, so an interface or a base class can answer a confident `0` about a type with hundreds of live instances — stated in the tool rather than left to be discovered |
-| `debug.run_named_query` | **Run a `@NamedQuery` through the application's own `EntityManager`** and report the row count plus a bounded, **invoke-free** read of each row — for the recurring question of whether a query returns what its author believes. The shape it was built for is a lookup whose parameters are all optional and null-guarded (`(:codigo is null or r.codigo = :codigo)`), which matches the **whole table** when they arrive null, so a call meant to find one row returns thousands and the caller takes the first; rebuilding that predicate in a SQL client loses the persistence context, the binding and the resolved tenant. It **invokes**, so it needs a thread suspended by an event and a `read_only` session refuses it. **It does not flush**, and that took work: JPA's default `FlushModeType.AUTO` makes `getResultList()` push pending changes to the *database*, so merely asking would commit someone else's half-finished work — the tool sets `COMMIT` on the query it created and every reply states the cost (the rows no longer reflect uncommitted changes), with `allow_flush:true` for when that is the question. `max_rows` bounds what is **rendered** and never the count; `max_fetch` bounds what the **debuggee builds** and makes the count a floor, which the reply says. Each row is read **invoke-free** — fields read, nothing called — so no getter runs and nothing is fetched, and a nested value is a type plus an `@0x…` handle you can fetch from deliberately. The `EntityManager` is found in the suspended frame by the **interface** it implements (`jakarta.` or `javax.persistence`), or given as `entity_manager`; there is no heap fallback and the refusal says why — `Instances` answers by exact runtime class, so it reports 0 for the interface however many beans are alive (ADR-0037) |
-| `debug.source` | What file a class was **compiled from**, and optionally the source lines around one. Two independent halves: the JVM half needs no local files and is what settles whether your checkout is the code actually running — a class reporting `Order.java` in a tree where that file was renamed months ago is the answer, and reading local source would never have shown it. A JSR-45 source debug extension (JSP, Kotlin, Groovy) is reported when the class carries one, meaning the `.java` name is only an intermediate. The disk half turns a frame's `class.method:line` into text: pass `line` for a bounded window (`context`, default 20 either side) rather than pulling a whole file into context; `whole_file:true` is capped by `max_lines` (default 400) and the reply always states which lines of how many. Roots come from `debug.attach {source_roots:[…]}`, `JDWP_SOURCE_ROOTS`, or the call itself, and a root is where the **package tree** starts. Not loaded / compiled with no `SourceFile` / no root holds it / found-but-unreadable stay four distinct answers |
-| `debug.check_stale` | **Is this JVM running the code you just compiled?** Compares the JVM's per-method line tables against the ones in your `.class`, from the same roots `debug.reload_class` reads. The half `debug.source` cannot answer: `SourceFile` is a compile-time string, identical across every build of the file, so it settles *which file* and never *which build of it* — and same-class-same-file-older-bytecode is the case a redeploy loop actually produces. It catches an edit that **moved a line** (which is what makes a stop point at `:412` mean something else) and is blind to one that moves none, so a clean result means "no line moved", not "byte-for-byte identical", and says so. A method on one side only is reported apart, as a class-shape change a hot reload could not fix; a class with no line tables at all (`-g:none`, an interface) reports **cannot tell** rather than a match |
-| `debug.thread_dump` | Every thread's stack in one call **plus** the monitors each holds and the one it is blocked entering, with the blocker named (`← held by 0x<id> "<name>"`) — a deadlock cycle is readable straight off it. JDWP can only read a *suspended* thread, so pass `suspend:true` (freeze, read, resume, verify) or `only_suspended:true`; it never suspends on its own. Bound the cost with `name_filter` / `limit` / `max_frames` / `package_filter`, and the freeze with `max_suspend_ms` (default 2000) — the reply reports how long it held the VM, the packets it spent, and any threads a budget made it skip. A dump too big for `limit` chooses **one thread per name family** (digits ignored) rather than the first `limit` in JDWP order, states that rule in its header, and names the groups it withheld (ADR-0013). `monitors_only:true` reads the lock graph without the stacks for a fraction of the freeze (measured: 245 packets / 33 ms against 770 / 117 ms on a 60-thread dump) |
-| `debug.pause` | Pause execution (suspend all threads) — watchdog-covered, so a forgotten pause can't freeze the JVM |
-| `debug.suspend_thread` | Freeze **one named thread** and leave the rest of the JVM serving — the affordable way to read a live frame on a shared instance, where `debug.pause` and a suspending stop point both stop everything. It unlocks the whole stack with locals, `debug.evaluate` of a local or field chain, `expand_objects` (which reads fields and invokes nothing), `debug.set_value` on a local, and that thread's own monitors. It does **not** unlock method **invocation**: JDWP allows an invoke only on a thread suspended *by an event*, so a Map subscript or a getter answers `INVALID_THREAD` — and, measured, does so after a `debug.pause` too, which is why the old "pause one or hit a breakpoint" advice was half wrong. Counted like every other suspend, so the reply reads the depth back from the JVM; watchdog-covered, because a worker frozen inside a `synchronized` block stalls everyone behind that lock (ADR-0021) |
-| `debug.resume_thread` | Give one held thread back. **One call, one decrement** — it issues the resume, asks the JVM whether the thread is running, and says `STILL suspended, N left` rather than reporting a success it did not achieve, so suspending twice and resuming once tells you so (ADR-0003's rule at the per-thread door). Optional `thread_id` when exactly one thread is held; required, with the list, when several are |
-| `debug.panic` | Safety: clear all stop points, resume all threads, **and** release every thread `debug.suspend_thread` is holding — naming each, and verifying each against the JVM's own count, since a VM-wide resume stops as soon as the thread it probes reaches zero |
-| `debug.list_sessions` | List live sessions — `host:port`, which is current, suspended or DEAD, which threads each is holding with `debug.suspend_thread` and for how long (kept apart from `SUSPENDED`, which means the whole VM is stopped), and how many stop points/traces/events each holds |
-| `debug.disconnect` | End the debug session |
+```
+> Trace com.example.OrderService.submit without suspending, and show me the caller chain
+> Read the traces
+```
 
-> **Renamed in VOCAB-1 (#20).** The stop-point tools were called `set_breakpoint`,
-> `set_exception_breakpoint`, `set_watchpoint`, `set_method_breakpoint`, `clear_breakpoint`,
-> `list_breakpoints` and `toggle_breakpoint`. "Breakpoint" named three different scopes across them —
-> one source location, two things that were not locations, and all four kinds — while `set_watchpoint`
-> was a stop point the word did not cover at all. The names above follow `CONTEXT.md`, where **stop
-> point** is the umbrella and **breakpoint** means a line breakpoint. Arguments are unchanged —
-> `breakpoint_id` on clear/toggle, `bp_id` on `get_traces`, and the `bp_…` / `exc_…` / `watch_…` /
-> `mexit_…` id prefixes all keep their names.
-
-Most tools take `thread_id` as an optional hex string (e.g. `"0x2"`); when omitted they default to
-the last thread that hit a breakpoint.
-
-**Keeping a shared JVM safe.** A watchdog auto-resumes a VM left suspended for too long
-(`JDWP_WATCHDOG_SECS`, default 120; `0` disables) — whether a stop point or a `debug.pause` froze it —
-and *disables* whatever caused it, so it can't re-freeze on the next hit. The same timer covers a thread
-held by `debug.suspend_thread`: less harmful than a whole-VM freeze, not harmless, since a worker frozen
-inside a `synchronized` block stalls everyone waiting on that lock. JDWP **counts** suspends, so
-resuming is treated as "make it actually run", not one Resume packet: `continue`, `panic` and the
-watchdog clear the whole suspend depth and verify it via `SuspendCount` before reporting success, and
-`debug.pause` is idempotent so a depth can't build up by accident. `debug.resume_thread` takes the same
-rule the other way — it decrements **one** suspend and then asks, so a thread you froze twice is reported
-as still suspended rather than as resumed. Disabling keeps the
-definition, so one `debug.toggle_stop_point` re-arms it with its condition and `trace_expr` intact;
-the same applies when a `trace:true` stop point hits its `trace_max_hits` budget.
-`debug.disconnect` resumes the VM and clears every request on the way out, so it can never leave a
-shared JVM frozen.
-
-**Read-only sessions.** Set `JDWP_READONLY=1` (or `read_only:true` on `debug.attach`) to refuse
-everything that would execute code in or install code into the target: method invocation, writes,
-`force_return`, `debug.pop_frame`, and `debug.reload_class` — on a shared instance a redefinition is an
-unannounced deploy, not a debugger read, so it is refused first and `dry_run:true` is the one part that
-still answers.
-Enforced on the connection itself rather than by inspecting expressions, so the indirect paths are
-covered too — `toString()` rendering, `List`/`Map` subscripts, and breakpoint `condition`/`trace_expr`
-(refused when you arm them, not silently on each hit). The honest cost is shallower output: objects
-render as `Type @0x…`, because pretty-printing one means invoking it — and that `@0x…` is a handle
-`debug.evaluate` accepts as an expression head, so a shallow render is still somewhere to go. Reads that need no
-invocation are unaffected — locals, fields, statics, array indexing, `get_stack`, and
-watchpoint/exception reporting. A guard against accidentally mutating a production JVM, **not** a
-security boundary: anyone who can reach the JDWP port can open their own connection without it.
-
-### Two things that look like reads and are not
-
-Neither is a defect in this tool, and neither is caught by `read_only` — which is why they are written down
-rather than guarded (DOC-6, #89).
-
-**A JAX-RS `Response` entity is single-pass, so reading it from the debugger corrupts the live request.**
-`response.readEntity(String.class)` **consumes** the entity; the application's own read afterwards gets an empty
-body. You break the thing you were inspecting by inspecting it. `read_only` lets it through, correctly — it
-invokes a method you asked for, writes no field and forces no return, and nothing here can know which of the
-debuggee's own methods tolerate being asked twice. What to do instead:
-
-- break at or **after** the assignment to a local, where the entity is a re-readable `String`;
-- or capture the returned value with `debug.set_method_exit_stop` on the method that reads it;
-- suspended *before* the read, only `getStatus()` and `getHeaders()` are safe to touch.
-
-The same applies to any one-shot stream — an `InputStream`, a `Scanner`, an `Iterator` — where reading it is
-what spends it.
-
-**A frame in `Foo_Subclass` is your `Foo`.** Build-time frameworks generate classes alongside yours: Quarkus
-emits `Foo_Bean`, `Foo_ClientProxy` and `Foo_Subclass`, and `_Subclass` **extends your own bean**, so any method
-reached through a CDI interceptor arrives through it. These have ordinary dotted names but no `SourceFile` and no
-useful line table — so a reader who has learned that source-less frames are framework internals will skip
-straight past their own code. `debug.list_classes` with a wildcard shows them already; set the stop point on
-`Foo`, where the line table is, and expect `Foo_Subclass` in the stack around it. `CONTEXT.md` calls this an
-**augmented class**, distinct from a JVM **hidden class** (a lambda or generated proxy, named with a `/`) and
-from a compiler-synthesised one (`Outer$1`, `lambda$…`, which have real source lines).
-
-## Compared with the other Java debugging MCP servers
-
-Two other projects solve the same problem, and one of them is this repository's **parent**: this is a
-fork of [`navicore/jdwp-mcp`](https://github.com/navicore/jdwp-mcp), which is where the JDWP client,
-the 13 original tool names and the architecture diagram above come from. The other is
-[`d4n-sec/jdb-mcp`](https://github.com/d4n-sec/jdb-mcp), an independent implementation built on JDI
-instead of the wire protocol. All three are MIT. The rows below were read off each repository — code,
-not just README — on **29 Jul 2026**; the two upstreams move, so re-check before quoting this.
-
-| | **this fork** | `navicore/jdwp-mcp` | `d4n-sec/jdb-mcp` |
-| --- | --- | --- | --- |
-| Talks to the JVM through | JDWP, implemented natively (Rust) | JDWP, implemented natively (Rust) | JDI, the JDK's own debug API (Java) |
-| Needs a JDK to run *the debugger* | no — one self-contained binary | no | **yes**, JDK 17+ (a JDK 7 build exists for legacy targets) |
-| Debug tools | 33 | 13 | 13+ (11 listed, `tools/list` for the rest) |
-| Stepping | yes | tool exists; the handler returns `"Step over not yet implemented"` | yes |
-| Expression evaluation | chains, static and instance methods, overload resolution on runtime types, subscripts, deep expansion | same stub as stepping | not yet — `debug_calc` is the first item on its TODO list |
-| Watchpoints / method-exit values | field read+write with old → new; return value **and which `return`** | no | `debug_set_watchpoint`, method entry/exit monitors |
-| Conditional, hit-count and thread-filtered stop points | yes | no | on the TODO list |
-| Wildcard / batched class patterns when arming | **yes** — one wildcard arms every matching loaded class *and* keeps arming ones that load later, addressable as one id; every arming tool also takes a list of patterns | no | on the TODO list (as "package prefix filtering" and "batch class filtering") |
-| Non-suspending trace mode | yes, on breakpoints, exception stops and watchpoints, with measured per-hit cost | no | not documented |
-| Hot reload / frame rewind | `RedefineClasses` + `PopFrames`, with all twelve HotSpot refusals mapped | no | no |
-| Concurrent sessions | yes, with `debug.list_sessions` | single | single — explicitly, "eliminating the need for complex `sessionId` management" |
-| Transports | stdio | stdio | stdio **and HTTP** |
-| A hit reaches the agent by | `notifications/message` **push**, plus the buffered `debug.get_last_event` — push for *suspending* hits only, since a traced stop point is built to fire hundreds of times a second (EVT-2) | event loop is listed as a next step | **MCP notifications** |
-| Launching the target for you | **yes** — `debug.launch`, and it holds the JVM *before its first instruction* (`suspend=y`), so a breakpoint in a static initialiser can fire | no | no (`debug_launch` is on its TODO list) |
-| `METHOD_ENTRY` monitors across a class pattern | **no**, deliberately (METH-1) | no | `debug_set_method_entry` |
-| Maintenance | this repo | GitHub copy **archived 28 Apr 2026**, moved to `git.navicore.tech` (last commit there 6 Oct 2025) | active, last push 30 Jan 2026 |
-
-**What the fork actually changed.** Upstream's README still lists "event loop for async breakpoint
-notifications", "stepping commands", "expression evaluation" and "string and object dereferencing" under
-*Next Steps*, and its `handle_evaluate` / `handle_step_*` return their TODO strings — so upstream is a
-working JDWP client and a set of tool names, and every capability in the Features list above except
-attach, line breakpoints and `get_stack` was written here. The largest additions are the ones a shared,
-long-running app server forces on you: an expression evaluator that resolves overloads the way `javac`
-would, non-suspending trace mode, the watchdog and read-only mode, hot reload with `pop_frame`,
-staleness detection, and a thread dump that names lock owners.
-
-**Where the others are ahead.** `jdb-mcp` ships an **HTTP transport**; stdio is the only way into this
-server. It also has `debug_set_method_entry`, a `METHOD_ENTRY` monitor across a class pattern, which
-here is a deliberate omission rather than a gap — with a `ClassMatch` it is the noisiest event in JDWP,
-and "what called this?" is answered far more cheaply by a traced breakpoint's caller chain (METH-1,
-TRACE-5) — but if you want that firehose, it has one and this does not. Being JDI-based it also
-inherits Oracle's implementation of the hard parts: a wire-protocol bug here is ours to find, and some
-have been (the packet reader had to become its own task because `select!` was cancelling it mid-packet).
-Upstream, for its part, is a much smaller codebase and still the clearest place to read how JDWP framing
-works in Rust.
-
-**Their roadmaps, measured against this.** Upstream's four *Next Steps* — event loop, stepping,
-expression evaluation, string/object dereferencing — are all implemented here. `jdb-mcp`'s six TODO items
-are now **all** implemented here: expression evaluation, multi-session, and conditional + thread-filtered
-breakpoints already were; package-prefix filtering, batch class filtering and `debug_launch` were built on
-2026-07-29 (FILT-3, FILT-4, LAUNCH-1) *because* this comparison surfaced them. That is not a claim about
-`jdb-mcp` — a TODO list is a statement of intent, and theirs may well arrive with a better shape than ours.
-
-**Where the three differ on starting the JVM.** The upstreams are attach-only: you start the JVM with
-`-agentlib:jdwp` yourself. This fork does both, and the difference is not convenience — attaching can never
-break on code that runs *during* startup, because by the time a connection is possible the static
-initialisers have run. `debug.launch` holds the VM before its first instruction. A launched JVM also has no
-one else on it, so the shared-instance cautions that shape everything else here do not apply to it.
-
-**Where none of the three differ.** None is a security boundary — anyone who can reach a JDWP port owns the
-JVM.
-
-## Example: Debugging with kubectl port-forward
-
-For Kubernetes-deployed Java apps:
+For a Kubernetes-deployed app, forward the JDWP port first:
 
 ```bash
-# Forward JDWP port from pod
 kubectl port-forward pod/my-app-pod 5005:5005
 ```
 
-Then in Claude Code:
-```
-> Attach to localhost:5005
-> Set a breakpoint in the processRequest method
-```
-
-## Architecture
-
-```
-Claude Code → MCP Server → JDWP Client → TCP Socket → JVM
-                ↓
-         Summarization &
-         Context Filtering
-```
-
-The MCP server handles:
-- **Protocol Translation**: MCP JSON-RPC ↔ JDWP binary protocol
-- **Smart Summarization**: Truncates large objects, limits depth
-- **State Management**: Tracks breakpoints, threads, sessions
-
-## Development
-
-### Project Structure
-
-```
-jdwp-mcp/
-├── jdwp-client/        # JDWP protocol implementation
-│   ├── connection.rs   # TCP + handshake
-│   ├── protocol.rs     # Packet encoding/decoding
-│   ├── commands.rs     # JDWP command constants
-│   ├── types.rs        # JDWP type definitions
-│   └── events.rs       # Event handling
-├── mcp-server/         # MCP server
-│   ├── main.rs         # Stdio transport
-│   ├── protocol.rs     # MCP JSON-RPC
-│   ├── handlers.rs     # Request routing
-│   ├── tools.rs        # Tool definitions
-│   ├── session.rs      # Debug session state
-│   └── tests/          # MCP-level integration tests (real binary + real JVM)
-└── examples/
-    ├── test_*.rs       # jdwp-client protocol examples
-    └── probes/         # Java programs the tests and examples attach to
-```
-
-### Testing
-
-```bash
-cargo test                      # unit tests + the stdio protocol tests (fast, no JVM)
-scripts/integration-test.sh     # MCP-level: the real binary over JSON-RPC against probe JVMs
-scripts/doctor.sh               # the rust-doctor health gate CI runs
-```
-
-`scripts/integration-test.sh` runs `mcp-server/tests/mcp_integration.rs`, which launches and reaps its
-own probe JVMs from `examples/probes/` — no manual steps. It does need a JDK: without one every test
-prints `SKIP` and passes, so check for `SKIP` lines before reading a green run as coverage.
-
-Which JDK it used is printed once per run and repeated as the last line, because a green run that cannot
-be attributed to a version is worth less than it looks (TEST-18,
-[#52](https://github.com/YgorPerez/java-debugging-mcp/issues/52)):
-
-```
-JDK in use: javac 11.0.30 at /home/you/.jdks/ms-11.0.30 (found via JAVA_HOME)
-```
-
-With `JAVA_HOME` unset the harness searches `PATH` and then a snap-installed IntelliJ's bundled runtime,
-and the banner says which it settled on. Setting `JAVA_HOME` is a **request for that specific JDK**: if it
-is not a usable one — a JRE with no `javac`, most often — the run fails and names what was missing rather
-than quietly testing a different JVM, which is what it used to do.
-
-`mcp-server/tests/stdio_protocol.rs` is one exception: it drives the real binary's JSON-RPC front door
-with malformed input (unparseable lines, non-objects, missing `method`, EOF mid-message) and needs no JDK,
-so it runs in plain `cargo test`. Each case checks that an error came back **and** that the server is
-still serving afterwards, since one bad line from a client must not end the session.
-
-The **cassette** tests are the other (see below). They live in `mcp_integration.rs` but carry no `#[ignore]`
-— which means `scripts/integration-test.sh` does *not* run them, since `--ignored` runs only ignored tests.
-Both commands are needed to see the whole file.
-
-#### Recorded sessions: testing the debugger with no JVM at all
-
-A third proxy mode **records** every JDWP request/reply pair to a file, and a replay server answers from
-that file with nothing behind the port (ADR-0014, TEST-12
-[#37](https://github.com/YgorPerez/java-debugging-mcp/issues/37)):
-
-```bash
-cargo test --test mcp_integration list_methods_renders_java_signatures_from_a_cassette   # no JDK needed
-JDWP_RERECORD_CASSETTES=1 scripts/integration-test.sh a_recorded_session_replays          # re-record
-```
-
-The cassettes are in `mcp-server/tests/cassettes/` and are meant to be read and edited: JSON, one object
-per exchange, payloads as hex in 32-byte lines, each exchange labelled with its JDWP command name. Answers
-are keyed by `(command set, command, request payload)` rather than by arrival order, and **a request the
-cassette cannot answer gets no reply at all** — the connection drops, the command is named on stderr, and
-the test fails. A replay that quietly returned an error reply would make every test using it meaningless.
-
-Two things this buys that a probe cannot:
-
-- **One visit to a real instance becomes a permanent fixture.** Record once, replay forever, with no
-  access, no JDK and no JVM.
-- **Shapes nothing here can produce become testable by editing a file.**
-  `method_exit_on_a_jdwp_1_5_vm.json` is a hand edit of a five-exchange recording that makes the debuggee
-  answer `JDWP 1.5`, which reaches `debug.set_method_exit_stop`'s degraded arming — a branch a JDK matrix
-  cannot reach, because JDWP's version tracks the JDK's and the oldest JVM in the estate speaks 1.11.
-
-Events are **not** replayed: a composite event answers no request, so it has no key. The recorder counts
-them and writes the count into the cassette, and says so when it is non-zero.
-
-#### Testing shared-instance behaviour without a shared instance
-
-The costs that matter on a busy remote JVM — how long a dump freezes it, how much a trace slows it — used
-to be answerable only against the real thing. They aren't. Three variables separate a real app server from
-a loopback probe, and two of them belong to the debuggee:
-
-| variable | how a test presents it |
-| --- | --- |
-| hundreds of threads, not tens | `PoolShapeProbe` — 300 workers, named like a real pool |
-| stacks far deeper than `max_frames` | `PoolShapeProbe` — 60 **distinct** frames per worker |
-| a network hop instead of loopback | `LatencyRelay::start(probe.port, rtt)`, then attach to `relay.port` |
-
-`LatencyRelay` forwards the JDWP stream adding a measured round trip, in userspace — `tc … netem` needs
-`NET_ADMIN`, and deterministic latency beats a real network's jitter for a test. It charges coalesced
-traffic once, so measurements through it are a lower bound, and it models latency only.
-
-The round trip is a **dial** (`relay.set_rtt(rtt)`), not just a constructor argument, and a test that
-*compares* two latencies should use it rather than standing up a second relay. Two relays mean two
-attaches, which puts a JVM handshake and several seconds between the readings — long enough on a box
-running the rest of this suite for a load spike to land on one of them and not the other, which is
-indistinguishable from the wire. Turning the dial under one live connection, alternating the arms and
-scoring each on its *fastest* sample, puts both readings in the same few seconds of the same machine
-(TEST-13, [#38](https://github.com/YgorPerez/java-debugging-mcp/issues/38)).
-
-The cost model these established is `held ≈ packets × (our per-packet cost + RTT)`, measured linear in RTT
-with a slope of 1 packet per round trip. So **packet count is the lever**, which is why a dump caches line
-tables per call (ADR-0011) rather than being given a longer suspension budget. Assert packet counts, not
-durations: a packet count is deterministic and load-independent.
-
-You do not have to take any of these figures on trust against your own instance, either: a dump reports
-what **it** cost there —
-
-```
-🧵 Thread dump — 40/306 thread(s)
-   ⏱  Held the VM suspended for 779ms.
-Cost: 258 JDWP packet(s), 3.08ms each (round trip + our own processing).
-```
-
-— and a dump the budget truncated says what finishing would have taken at the rate it was running, so the
-choice between narrowing it and raising `max_suspend_ms` is made against a number rather than a guess.
-Measured with the relay, the defaults hold the VM inside the 2000 ms budget up to roughly a **6 ms round
-trip**; past ~7 ms even a defaults dump truncates, which is the safety net working.
-
-For poking at the tools by hand against a realistic app, use the companion
-[java-example-for-k8s](../java-example-for-k8s) as a target:
-
-```bash
-cd ../java-example-for-k8s
-mvn clean package
-java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 \
-  -jar target/probe-demo-0.0.1-SNAPSHOT.jar
-```
-
-### Building
-
-```bash
-# Debug build
-cargo build
-
-# Release build
-cargo build --release
-
-# Run tests
-cargo test
-```
-
-### Code health
-
-[rust-doctor](https://github.com/arthjean/rust-doctor) folds clippy, `cargo-audit`/`deny`/`geiger`,
-and custom AST rules into one 0–100 score. Run it locally (no Rust build of the tool — `npx` fetches
-a prebuilt binary):
-
-```bash
-scripts/doctor.sh              # score card for the workspace
-scripts/doctor.sh --findings   # the findings the gate counts, and whether it would pass
-scripts/doctor.sh --verbose    # per-finding file:line detail
-scripts/doctor.sh --diff main  # only files changed vs main
-```
-
-**The score is not the gate.** CI fails the build on any warning, so a 100/100 "Great" can still be a
-red build — v0.2.0's tag build was, on five `excessive-clone` findings that had been sitting in a local
-run nobody could read out of it. `--findings` prints each warning/error in the same shape the CI step
-summary uses, says whether the gate would pass, and exits 3 if it would not:
-
-```
-- **warning** `excessive-clone` — `src/handlers.rs:3233`
-  `.clone()` inside a loop — may cause repeated heap allocations
-```
-
-It also names what the run did *not* look at — passes skipped for a missing tool, and passes that ran
-only because you have a tool CI does not install — since either one moves the verdict away from CI's.
-
-The same check runs in CI (`.github/workflows/rust-doctor.yml`, pinned to 0.2.0): it **gates on
-warnings** — a finding fails the build (#18) — and uploads results to GitHub code scanning (SARIF).
-Installing the optional external tools (`cargo install cargo-audit cargo-deny cargo-machete
-cargo-geiger`) unlocks the dependency/unsafe passes it otherwise skips.
-
-Because it gates on warnings, the Rust toolchain there is pinned, so a new pedantic lint in a future
-clippy cannot break a build on code nobody touched. `.github/workflows/toolchain-pin.yml` runs the same
-scan against `stable` once a month **without gating**, and opens an issue when the pin is behind — the
-bump is scheduled work rather than a surprise. See ADR-0007.
-
-One `clippy.toml`, at the workspace root, covers every crate; adding a workspace member needs nothing.
-It only applies because `scripts/doctor.sh` and the workflows set `CLIPPY_CONF_DIR` — rust-doctor drops
-a temporary `clippy.toml` into any member that lacks one, which would otherwise shadow it. The file
-says the rest.
-
-### Serena (semantic code navigation for agents)
-
-[Serena](https://github.com/oraios/serena) is registered as an MCP server for this repo, giving an agent
-symbol-level navigation over the Rust workspace instead of grep-and-read. The repo carries the shared
-configuration; each machine needs a one-time install.
-
-**One-time setup:**
-
-```bash
-# uv (Serena is a Python tool), then Serena itself
-winget install astral-sh.uv            # or: curl -LsSf https://astral.sh/uv/install.sh | sh
-uv tool install -p 3.13 serena-agent
-serena init
-
-# Rust support uses rust-analyzer from your rustup toolchain
-rustup component add rust-analyzer
-
-# Build the symbol cache once (a few seconds; it is gitignored)
-serena project index .
-```
-
-Committed here, so nothing else is needed: `.mcp.json` (the server registration, using
-`--project-from-cwd` so it contains no absolute paths), `.serena/project.yml` (Rust only — the Java files
-under `examples/probes/` are fixtures and get no language server), and `.claude/settings.json`
-(Serena's hooks).
-
-**One thing worth knowing before you rely on it**, measured on this workspace by tracing the LSP traffic:
-
-**Semantic queries return empty for the first ~2.5 minutes of a session, then work correctly.**
-
-rust-analyzer signals `quiescent` after about **152s** here — it spends that time on `Fetching`,
-`Building compile-time-deps`, `Building CrateGraph` and `Loading proc-macros` for the dependency tree.
-Serena stops waiting at a **hard-coded 120s** (`_SERVER_READY_TIMEOUT` in its `rust_analyzer.py`) and
-proceeds anyway, so a query in that ~30s gap is sent to a server that is not ready: rust-analyzer answers
-`[]` and the tool reports `{}`.
-
-What that means in practice:
-
-| | behaviour |
-| --- | --- |
-| `find_symbol`, `get_symbols_overview` | work immediately — document symbols only need parsing |
-| `find_referencing_symbols` and other semantic queries | empty before ~152s, **correct after** |
-| after quiescence | ~30ms–3s per query, including cross-crate references |
-
-**Raising the wait fixes it**, and is worth doing: at the default the first semantic query burns two
-minutes *and* returns an empty result, whereas with a longer wait it takes ~152s and is correct.
-
-The limit is a hard-coded local in Serena (`_SERVER_READY_TIMEOUT = 120.0` in
-`solidlsp/language_servers/rust_analyzer.py`) with no env var or config key, so it takes a one-line patch
-to make it configurable:
-
-```bash
-scripts/serena-ready-timeout.sh            # apply (rewrites the constant to read an env var)
-scripts/serena-ready-timeout.sh --check    # report status; exit 1 if not applied
-scripts/serena-ready-timeout.sh --revert   # restore the original line
-```
-
-It keeps `120` as the default and reads `SERENA_RUST_READY_TIMEOUT`, which `.mcp.json` sets to `300` for
-this repo. It is idempotent and refuses to run if the upstream line has changed — **re-run it after
-`uv tool upgrade serena-agent`**, which replaces the file. `--check` is a useful thing to run if semantic
-queries start coming back empty again.
-
-Without the patch, nothing is broken; just re-run a query that came back empty.
-
-Two other setup notes:
-
-- **`export MCP_TIMEOUT=300000`.** Serena's docs suggest `60000`; that is not enough here.
-- **Don't conclude "no references" from an early empty result.** That is the one genuinely misleading
-  behaviour, and it is a timing artefact rather than a limitation.
-
-Tuning rust-analyzer instead was measured and does not help: disabling `cachePriming` and `check` saves
-only ~5s of the 152s, and the settings that *would* help (`procMacro.enable: false`,
-`buildScripts.enable: false`) would break analysis of the derive macros this codebase is full of.
-
-Serena's own docs note that Claude Code's built-in tool descriptions bias the model strongly toward
-internal tools. The committed hooks are their recommended mitigation; they also suggest launching with
-
-```bash
-claude --system-prompt="$(serena prompts print-cc-system-prompt-override)"
-```
-
-which is left to you, since it changes how you start Claude Code rather than anything in this repo.
-
-Serena's **memories are deliberately not versioned** (see `.gitignore`). This repo keeps its curated
-knowledge in `CONTEXT.md`, `docs/adr/` and `TODO.md`; an agent-written store beside those would give the
-same facts two sources of truth. `.serena/project.yml`'s `initial_prompt` points Serena at those files
-instead.
+Most tools take `thread_id` as an optional hex string (e.g. `"0x2"`); when omitted they default to the
+last thread that hit a breakpoint. Every tool takes an optional `session_id` — `debug.attach` can hold
+several JVMs at once and `debug.list_sessions` finds one you lost.
+
+Worked examples with captured output are in [`examples/`](examples/README.md).
+
+## Two things that look like reads and are not
+
+Neither is caught by `read_only`, which is why they are written down rather than guarded.
+
+- **A JAX-RS `Response` entity is single-pass.** `response.readEntity(String.class)` **consumes** it,
+  and the application's own read afterwards gets an empty body — you break the thing you were
+  inspecting by inspecting it. Break at or after the assignment to a local instead, or capture the
+  value with `debug.set_method_exit_stop`. The same goes for any one-shot stream.
+- **`debug.list_instances` looks free and is not.** JDWP needs no suspend and none is issued, yet the
+  JVM stops the world for a full live-heap walk — measured at **522 ms of held application threads on
+  a 2,000,000-object heap to answer with 7 objects**. Nothing refuses on size; the reply states the
+  duration it actually held them.
+
+Both are covered in full, with the rest of the shared-instance rules, in the
+[tool reference](docs/tools.md).
 
 ## Status
 
-✅ **Functionally complete** — 33 debug tools, integrated and validated against a live JVM.
+✅ **Functionally complete** — 38 debug tools, integrated and validated against live JVMs on JDK 11,
+17 and 21.
 
-### Implemented
-- [x] JDWP protocol (handshake, packets, encoding/decoding)
-- [x] MCP server with 33 debug tools (stdio transport)
-- [x] VirtualMachine commands (Version, IDSizes, AllThreads, Suspend/Resume, CreateString, Capabilities/**CapabilitiesNew**, **RedefineClasses**)
-- [x] ClassesBySignature, ReferenceType.Methods/Fields/Signature, ClassType.Superclass
-- [x] Method.LineTable / VariableTable
-- [x] EventRequest.Set/Clear/ClearAllBreakpoints — breakpoints with location, **count**, **thread**, **exception**, and **field** modifiers
-- [x] ThreadReference.Frames, StackFrame.GetValues/SetValues/ThisObject/**PopFrames**
-- [x] ObjectReference.ReferenceType/GetValues/**InvokeMethod**, ClassType.**InvokeMethod** (statics), ArrayReference.Length/GetValues, StringReference.Value
-- [x] **Event loop** for async breakpoint/step notifications
-- [x] **Stepping** (step over/into/out)
-- [x] **Expression evaluation** — `var`/`this`/`Class` + `.field` / `.method(args)` chains, superclass walk
-- [x] **Static-method invocation** — `Class.staticMethod(args)`, restricted to `ACC_STATIC` overloads
-- [x] **Object arguments** — pass a local, `this`, or a nested expression by reference; overloads resolved
-      against each argument's runtime class chain (so `pick(Item)` beats `pick(Object)`), and a
-      type-mismatched invoke is refused rather than handed to the JVM
-- [x] **String and object dereferencing**, array contents, best-effort `toString()`, source-line resolution
-- [x] **Recursive object expansion** — bounded depth/breadth + node budget, cycle detection, boxed-wrapper
-      unboxing, and element-level `List`/`Set`/`Map`/`Optional` rendering (`expand_objects`)
-- [x] **Type cache** — per-connection memo of each loaded type's signature/fields/methods/superclass;
-      48% fewer JDWP packets on a cold deep expansion, 62% warm (values are never cached)
-- [x] **Collection subscripts** — index, `Map` key lookup (with key boxing), half-open slice, and
-      predicate filter with element-relative left sides; bounded by a documented scan cap
-- [x] **`byte[]` / `char[]` as decoded text** with the encoding named, a `#<charset>` selector on the
-      expression (UTF-8 / ISO-8859-1 / US-ASCII, or `#raw`) that composes with `trace_expr`, undecodable
-      octets marked rather than replaced, and `array.length` on any array (EVAL-7)
-- [x] **Conditional breakpoints** — `condition` evaluated in the hit frame (`expr OP expr` or boolean chains); auto-resumes when false
-- [x] **Multiple concurrent sessions** — `debug.attach` returns a `session_id`; tools take an optional `session_id` (defaults to current); `debug.list_sessions` finds one you lost
-- [x] **Arguments** in `evaluate` / conditions: literals (int, long `123L`, double `1.5`, float `2.0f`, char `'a'`, boolean, null, `"string"`) or expressions
-- [x] **Field watchpoints** — `FIELD_MODIFICATION` / `FIELD_ACCESS` requests; a write hit reports the
-      mutating location and the old → new pair (the old value is read before the pending store commits)
-- [x] **Hot reload** — `RedefineClasses` from a class root, with the twelve refusals mapped onto what to
-      do next, type-cache invalidation on success, and `PopFrames` so a suspended frame re-enters the new
-      code (SWAP-1)
-- [x] **Staleness detection** — per-method line tables from the JVM against a parsed `.class`, so "the
-      deployed bytecode is older than your build" stops looking like a wrong hypothesis (DISC-7)
-- [x] **Safety**: `panic` + idle watchdog auto-resume (clears breakpoints, exception breakpoints, watchpoints and method-exit requests; names any class left hot-reloaded, which it cannot undo)
-- [x] **Performance**: type cache, `package_filter`, single-threaded `invoke_method`, token-trimmed output
-- [x] Architecture independence (big-endian protocol; Intel & ARM)
+The JDWP client implements the VirtualMachine, ReferenceType, ClassType, Method, ObjectReference,
+StringReference, ArrayReference, ThreadReference, StackFrame and EventRequest command sets this needs,
+including `RedefineClasses`, `PopFrames`, `InvokeMethod` (instance and static), `Instances` /
+`InstanceCounts`, and the four `MONITOR_*` events — big-endian throughout, so Intel and ARM both work.
+
+Known open issues are tracked as [GitHub issues](https://github.com/YgorPerez/java-debugging-mcp/issues);
+`TODO.md` records what shipped and why, and `docs/adr/` the decisions that are settled.
 
 ## References
 

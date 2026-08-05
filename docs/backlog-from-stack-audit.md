@@ -9,6 +9,34 @@ probe.
 Ranked by (how often the bug shape occurs in those codebases) × (what the missing capability costs).
 Where an audit's ask is **already covered**, that is recorded too — a stale gap is worse than none.
 
+## Status: every item below has shipped
+
+**This is now a record, not a backlog.** All eleven items were filed as issues and all eleven are closed.
+It is kept because the *evidence* is what is expensive — the measured `finally` line table, the count of
+WildFly classloader copies, the 927 `integrador` parameters, the 1104-of-3166 null `getMessage()` — and
+several ADRs cite it rather than restating it. Read the item for why a capability has the shape it does;
+do not read it as work outstanding.
+
+| Item | Shipped as |
+|---|---|
+| BP-4 ([#78](https://github.com/YgorPerez/java-debugging-mcp/issues/78)) | A line arms **every** bytecode copy `javac` emitted for it and says so; hits are counted once per hit, not per location |
+| BP-5 ([#79](https://github.com/YgorPerez/java-debugging-mcp/issues/79)) | Arming covers every classloader's copy, reading picks one **and says which** — ADR-0019; member lookup extended the same way in EVAL-13 (#116) |
+| TRACE-9 ([#80](https://github.com/YgorPerez/java-debugging-mcp/issues/80)) | `trace_max_length` on the arming tools, ceiling 4000, clamped-and-reported |
+| EVAL-7 ([#81](https://github.com/YgorPerez/java-debugging-mcp/issues/81)) | `byte[]`/`char[]` as decoded text with a `#<charset>` selector, and `array.length` |
+| EVAL-8 ([#82](https://github.com/YgorPerez/java-debugging-mcp/issues/82)) | `double` / `float` / `char` literals in expressions, conditions and call arguments |
+| FILT-6 ([#83](https://github.com/YgorPerez/java-debugging-mcp/issues/83)) | `condition` on all four stop-point kinds, plus `!` — and a condition may name what the *hit* carries (`newValue`), ADR-0034 |
+| DISC-10 ([#84](https://github.com/YgorPerez/java-debugging-mcp/issues/84)) | `debug.list_instances`, reporting the pause it imposed and warning that `Instances` is exact-type — ADR-0023 |
+| TRACE-10 ([#85](https://github.com/YgorPerez/java-debugging-mcp/issues/85)) | `@0x…` object handles as expression heads (weak, never pinned — ADR-0022) and captured `val$*` fields surfaced |
+| EVAL-9 ([#86](https://github.com/YgorPerez/java-debugging-mcp/issues/86)) | An unfetched lazy association is reported as a **third answer**, not initialised behind your back — ADR-0032 |
+| DISC-11 ([#87](https://github.com/YgorPerez/java-debugging-mcp/issues/87)) | `debug.source` checks its window on two axes and treats mtime as a hint — ADR-0029 |
+| DUMP-6 ([#88](https://github.com/YgorPerez/java-debugging-mcp/issues/88)) | Identical stacks collapse into one counted entry — ADR-0013 amended |
+
+The **toolkit items** at the end are the exception: they are work in
+[`infotravel-dev-toolkit`](https://github.com/ygor-infotera/infotravel-dev-toolkit), a downstream repo
+this one cannot see, so their status is not knowable from here. One of them did come back as work on this
+side — an unconfigured class root makes the arm-time staleness warning silent, which reads as "your build
+is current" ([#130](https://github.com/YgorPerez/java-debugging-mcp/issues/130), open).
+
 ## The two items that are bugs, not gaps
 
 ### BP-4 — a line inside a `finally` arms only the success path
@@ -21,7 +49,7 @@ LineNumberTable:  line 9: 24     <- normal-completion copy
                   line 9: 39     <- exception-path copy
 ```
 
-`resolve_bp_location` (`mcp-server/src/handlers.rs:9124`) does
+`resolve_bp_location` (`mcp-server/src/handlers.rs`) does
 `line_table.lines.iter().find(|e| e.line_number == want)` and then `break`s. `find` returns the first
 entry, and HotSpot emits the table in ascending code-index order, so the breakpoint arms at the
 **normal-completion copy only**.
@@ -42,12 +70,11 @@ throwing path, asserting a hit from each. The pre-fix code must fail that test �
 
 ### BP-5 — an exact class name silently arms on one classloader's copy
 
-`classes_by_signature` (`jdwp-client/src/vm.rs:246`) returns `Vec<ClassInfo>` — **one entry per
+`classes_by_signature` (`jdwp-client/src/vm.rs`) returns `Vec<ClassInfo>` — **one entry per
 classloader that loaded the class**. Six call sites in `handlers.rs` reduce it to one and discard the
-rest with no note: `arm_single_named` (`:8825`, `classes.first()` — its own comment calls this "the
-overwhelmingly common call"), `arm_one_pattern` (`:8788`), `resolve_class_by_dotted` (`:10734`), plus
-`:4734`, `:7594`, `:8205`. `grep -rn 'classloader|duplicate class|ambiguous'` over `handlers.rs` returns
-nothing on the subject: the codebase nowhere admits a class can load twice.
+rest with no note: `arm_single_named` (`classes.first()` — its own comment called this "the overwhelmingly
+common call"), `arm_one_pattern`, `resolve_class_by_dotted`, and three more. `grep -rn 'classloader|duplicate class|ambiguous'` over `handlers.rs` returned nothing on the subject: the
+codebase nowhere admitted a class can load twice.
 
 **Measured in the target environment**: WildFly gives every deployment its own module classloader.
 `it-common` and `api-common` are packed into **each** consuming war's `WEB-INF/lib` — there is no shared
@@ -73,8 +100,8 @@ hits from both.
 
 ### TRACE-9 — a capture truncates payloads at 100/200 characters, irreversibly
 
-`capture_trace` renders locals at **100** chars (`handlers.rs:12837`) and the `trace_expr` result at
-**200** (`:12845`). Both literals, no argument. `TraceRecord` stores the already-truncated string, so
+`capture_trace` renders locals at **100** chars and the `trace_expr` result at **200** (both in
+`handlers.rs`). Both literals, no argument. `TraceRecord` stores the already-truncated string, so
 `get_traces` can never recover more.
 
 Ranked **#1 by the payments audit and central to two others**, because trace mode is the only safe
@@ -85,7 +112,8 @@ returnCode and the decline reason are all past the cut. The one mode that is saf
 you armed it for, and the workaround (suspend, then `evaluate` with a large `max_result_length`) is what
 must not happen on 8180.
 
-Same 200-char literal at `:4032` (method-exit `returned`), `:4091`/`:4093` (watchpoint old/new), `:4098`.
+The same 200-char literal appears four more times in `handlers.rs`: the method-exit `returned` value, the
+watchpoint old/new pair, and the trace-expression render.
 
 **Fix**: `trace_max_length` on the four arming tools, clamped and reported like `trace_frames`
 (`clamp_trace_frames`, `MAX_TRACE_FRAMES`), default preserving today's output byte-for-byte. Cost is
@@ -109,7 +137,7 @@ silently corrupt supplier text. Add `array.length`.
 
 ### EVAL-8 — no float/double literals, so no numeric condition on money
 
-`parse_lit` (`handlers.rs:4540`) has no branch for `1.5`, `2.0f` or `'a'`. So `condition:
+`parse_lit` (`handlers.rs`) has no branch for `1.5`, `2.0f` or `'a'`. So `condition:
 "vlPagamento != 1050.00"` and `[?vlTotal > 99.99]` are inexpressible, and a `double` argument cannot be
 passed at all.
 
@@ -133,7 +161,7 @@ fault lands. And the discriminator cannot be the message — `InfoTravelExceptio
 (`exception/InfoTravelException.java:55-57`) calls no `super(...)`, so `getMessage()` is `null` for
 **1104 of 3166** constructions; it has to be the `cdException` **field**.
 
-Needs `!` too (`parse_bool_tree`, `handlers.rs:13023`, has `And`/`Or`/`Leaf` and no `Not`, so there is no
+Needs `!` too (`parse_bool_tree`, `handlers.rs`, has `And`/`Or`/`Leaf` and no `Not`, so there is no
 way to write a negative condition at all).
 
 ### DISC-10 — no way to reach a container-held bean by type
@@ -172,7 +200,7 @@ Two halves of the same problem.
 
 `TraceRecord` stores only **rendered strings**, so a snapshot naming `WSReserva (id=4711)` cannot be
 drilled into afterwards. Keep live object ids on records and accept `0x<id>` as an expression head
-(`resolve_head`, `:9601`, takes only a local, `this` or a class name), pinning against collection with
+(`resolve_head` takes only a local, `this` or a class name), pinning against collection with
 `ObjectReference.DisableCollection` (9/7-9/8 — constants exist, unused).
 
 And on the thread boundary: `infotravel` fans out to suppliers through **57 anonymous `Callable`s** whose

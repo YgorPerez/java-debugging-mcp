@@ -523,7 +523,7 @@ _Avoid_: pending (used for the internal bookkeeping, not the concept)
 **Wildcard family**:
 The line breakpoints one wildcard `class_pattern` arms — one per matching class — together with the
 class-load watch that keeps arming matches as they load (FILT-3). Every member is an ordinary line breakpoint
-under its own `bp_` id; the family is a coarser handle over all of them *and* the watch.
+under its own `bp_` id; the family is a coarser **id** over all of them *and* the watch.
 _Avoid_: group; batch (a batch is several patterns in one call — a different thing, see **Batch**)
 
 **A family is not deferred**, and that is a distinction the tooling makes rather than a shade of meaning:
@@ -555,7 +555,7 @@ to do with this)
 
 **Batch**:
 Several class patterns given to one arming call, each resolved independently. Distinct from a **wildcard
-family**: a batch is many patterns and produces no shared handle, a family is one pattern and does. Its
+family**: a batch is many patterns and produces no shared id, a family is one pattern and does. Its
 defining property is that **partial success is the normal outcome**, so a batch reply is per-pattern rather
 than one verdict.
 _Avoid_: bulk, multi (and note a batch is not a thing that exists after the call — only its stop points are)
@@ -1009,8 +1009,28 @@ way a thread can end up held.
 
 ### Identity
 
+**Object handle**:
+The caller-facing name for one object in the debuggee — `@0x1f4c`, a JDWP `objectID` in hex. An expression
+**head** and only ever a head, so `something.@0x1f4c` is meaningless and is refused as such.
+It is defined here because three other entries already lean on it — **head**, **bound head** and **copy** —
+and because a convention nobody wrote down is one that drifts, which ADR-0022 names this file as the place to
+prevent. The rule it exists to keep is the one **loaded** records from SIG-1: *a name this tool shows is a
+name it accepts*. A rendered object ends in exactly this string, so a handle read out of a trace snapshot, a
+deep render or `debug.list_instances` pastes straight back in.
+**The classloader selector is the same rule, not a second one.** `com.example.Utils@0x7f3a1c` pins which
+**copy** a read resolves against by suffixing the class name with *the loader's* `objectID` — so both forms
+are "`@0x` + a JDWP objectID, in hex, copied out of a reply". **Position** disambiguates them: a token that
+*starts* with `@` is a handle, an interior `@` belongs to the class-name path. The two compose deliberately
+(ADR-0019, ADR-0022) rather than colliding, and a selector matching no loaded copy is an error naming the
+loaders that do exist — never a quiet fall back to the first.
+Whether the debuggee can collect the object out from under a handle is **filter pin**'s subject, not this
+one's.
+_Avoid_: **handle** for a **stop-point id** or a **wildcard family** — those are *ids*, and this entry is why
+the word is now spent; address, pointer (a JDWP id is neither, and it is not stable across a redeploy);
+reference (the Java word for what the debuggee holds, not for what the caller types)
+
 **Stop-point id**:
-The caller-facing handle for a stop point (`bp_1`, `exc_2`, `watch_modify_3`, `mexit_4`). Stable for the
+The caller-facing id for a stop point (`bp_1`, `exc_2`, `watch_modify_3`, `mexit_4`). Stable for the
 stop point's whole life, including across a disable and re-arm.
 
 `bpset_1` is a fifth kind, added by FILT-3 for a **wildcard family**. It is a distinct KIND of id in the same

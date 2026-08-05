@@ -14,13 +14,16 @@ If any of these files don't exist, **proceed silently**. Don't flag their absenc
 
 Single-context repo (most repos):
 
+This repo is single-context, and the shape is the real one rather than an illustration:
+
 ```
 /
 ├── CONTEXT.md
-├── docs/adr/
-│   ├── 0001-event-sourced-orders.md
-│   └── 0002-postgres-for-write-model.md
-└── src/
+├── docs/adr/                           ← 38 of them; README.md is the index
+│   ├── 0001-read-only-enforced-at-the-wire-boundary.md
+│   └── 0002-trace-budget-counted-server-side.md
+├── jdwp-client/
+└── mcp-server/
 ```
 
 Multi-context repo (presence of `CONTEXT-MAP.md` at the root):
@@ -48,4 +51,8 @@ If the concept you need isn't in the glossary yet, that's a signal — either yo
 
 If your output contradicts an existing ADR, surface it explicitly rather than silently overriding:
 
-> _Contradicts ADR-0007 (event-sourced orders) — but worth reopening because…_
+> _Contradicts ADR-0003 (suspends are counted, so resume must verify) — but worth reopening because…_
+
+Use a **real** ADR number when you do. The placeholder this line used to carry, "ADR-0007 (event-sourced
+orders)", named a decision from the upstream skill's example domain — and ADR-0007 here is *"doctor, not
+clippy, is the lint gate"*, so the example pointed at a real file that says something else entirely.

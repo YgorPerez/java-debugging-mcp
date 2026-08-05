@@ -141,3 +141,27 @@ method shares one line number. Guarded by
   remains is larger replies (a 60-frame `Frames` reply), so the measured cost rose from ~0.22 ms to ~0.42 ms
   per packet even as the total fell 6.8×. `held ≈ packets × (ours + RTT)` holds as a model, but `ours`
   depends on reply size.
+
+## Amendment (PERF-1, [#100](https://github.com/YgorPerez/java-debugging-mcp/issues/100)) — the cost model above is superseded; the decision is not
+
+**`held ≈ packets × (ours + RTT)`, stated twice above, is no longer true.** It was exact while every packet
+was awaited on its own. ADR-0038 made independent reads share a round trip, so it is now:
+
+```text
+  held ≈ round_trips × RTT + packets × our processing
+```
+
+This is a **caller-facing** correction, not an internal one: a dump reports the per-packet term in its own
+reply, so anyone reasoning `held ≈ packets × RTT` about a remote instance — including
+`docs/toolkit-contract.md`'s downstream readers — is working from the wrong denominator. A cost line now
+prints both figures, `Cost: 763 JDWP packet(s) in ~180 round trip(s), 1.54ms each`, because they answer
+different questions: the waits are what a remote caller feels, the traffic is what compares across releases.
+
+It was **found rather than predicted**: `latency_added_to_the_wire_shows_up_as_held_time_per_packet` failed
+at 1.45 ms against a floor of 1.6 ms, and its assertion now divides by round trips.
+
+**The decision this ADR records still stands, and for the reason it was made.** Caching line tables per dump
+removes packets, and a packet that is never sent costs nothing under either model — the 20-thread dump that
+motivated this went 3731 ms → 1175 ms held (−68%) at *the same 763 packets*, which is the round-trip term
+falling around a packet count this decision had already minimised. The two compose; neither replaces the
+other. What expires is only the arithmetic a reader would use to project a held time from a packet count.

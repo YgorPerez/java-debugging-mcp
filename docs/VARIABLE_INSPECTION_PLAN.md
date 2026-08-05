@@ -4,8 +4,8 @@
 variables. Every phase shipped; the document is kept as the record of what was planned, what was built,
 and the handful of decisions worth remembering.
 
-For the current tool list see `README.md`. For where each roadmap item landed in the code, see the
-appendix of `TODO.md`.
+For the current tool list see [`tools.md`](tools.md). For where each roadmap item landed in the code, see
+the appendix of `TODO.md`.
 
 ## The goal
 
@@ -122,9 +122,11 @@ the example step by step. What exists:
 - **Unit tests** for the pure logic — schema generation, the type cache, tool registration.
 - **Integration tests** (`mcp-server/tests/mcp_integration.rs`) driving the real `jdwp-mcp` binary over
   JSON-RPC against probe JVMs the harness compiles, launches and reaps itself. Run with
-  `scripts/integration-test.sh`. Fourteen tests cover expression resolution, watchpoints, deferred
-  breakpoints, `force_return`, deep expansion with its node budget and packet budget, collection
-  subscripts, the event buffer, non-suspending traces, session listing, and the roadmap criteria above.
+  `scripts/integration-test.sh`. Fourteen tests covered this plan's own subject matter — expression
+  resolution, watchpoints, deferred breakpoints, `force_return`, deep expansion with its node budget and
+  packet budget, collection subscripts, the event buffer, non-suspending traces, session listing, and the
+  roadmap criteria above. The suite has since grown well past that as the tool surface did; treat the
+  figure as the size of *this* plan's coverage, not the suite's.
 - **The example is validated** by the roadmap-criteria test, and its output blocks are captured from a
   real run rather than written by hand.
 - **The criteria were also run against a real Spring Boot + Micrometer app** (84 live meters), which is
@@ -137,10 +139,16 @@ have: a modifier-kind mix-up that came back as a bare `INTERNAL` naming nothing,
 invalidated by method invocation, and an ill-typed invoke that **SIGSEGV'd the debuggee**. A mock would
 have agreed with all three.
 
-## Non-goals (unchanged)
+## Non-goals
 
-Full debugger UI · hot code reload · code modification beyond `set_value`/`force_return` · performance
-profiling · memory-leak detection.
+Full debugger UI · code modification beyond `set_value`/`force_return` · performance profiling ·
+memory-leak detection.
+
+**Hot code reload was on this list and came off it.** `debug.reload_class` (SWAP-1) ships
+`RedefineClasses` with the twelve HotSpot refusals mapped, and `debug.pop_frame` the rewind that makes a
+swap take effect in a frame already running. The plan was right that it is not *variable inspection*;
+what changed is that the same shared-instance argument that motivated this plan — you cannot redeploy a
+JVM other people are using — applies harder to a fix than to a read.
 
 ## Resources
 

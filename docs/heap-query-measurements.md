@@ -1,8 +1,14 @@
 # The JDWP heap-query family, measured
 
-Wire details and **measured cost** for four JDWP commands this client does not implement, plus the full
-`CapabilitiesNew` vector. Written down because the headline result is counter-intuitive and expensive to
-reproduce: it needs a JDK, a shaped heap and a ticking probe.
+Wire details and **measured cost** for four JDWP commands, plus the full `CapabilitiesNew` vector.
+Written down because the headline result is counter-intuitive and expensive to reproduce: it needs a JDK,
+a shaped heap and a ticking probe.
+
+**Two of the four have since shipped** — `Instances` and `InstanceCounts`, behind `debug.list_instances`
+(DISC-10, #84; ADR-0023) — and this document is what decided the shape they shipped in, chiefly the
+reported pause and the exact-type warning. `ReferringObjects` and `IsObsolete` remain unimplemented. The
+per-command sections below were written before that split and describe the wire, which has not changed;
+§ "What shipped from this, and what did not" at the end is the reconciliation.
 
 Measured 2026-07-30 against `openjdk version "17.0.20" 2026-07-21, Temurin-17.0.20+8`, driven by
 `jdwp-client/examples/probe_heap_queries.rs` against `HeapProbe.java` (7 `Widget`, 2 `SubWidget extends
@@ -164,8 +170,10 @@ direction as the original table, not a linear scaling of it.
 
 ## Not yet measured
 
-- **JDK 11 and 21.** Only 17.0.20 is covered above. The `capabilities` vector in particular is per-JVM and
-  the whole point of decoding it is not to guess.
+- **The `CapabilitiesNew` vector on JDK 11 and 21.** Only 17.0.20 is decoded above. The *pause* has since
+  been reproduced on all three (the table immediately above), but the capability bits are per-JVM and the
+  whole point of decoding them is not to guess — `canUseSourceNameFilters` being false is exactly the kind
+  of answer that could differ by generation.
 - **`ClassExclude` (modKind 6) and `InstanceOnly` (modKind 11)** on `EventRequest.Set`. The probe reaches
   this section and the connection closed on it (`early eof`) after `IsObsolete`, and one run ended with the
   JVM `Aborted (core dumped)`. **Unexplained and not dismissed** — it may be the probe writing a malformed

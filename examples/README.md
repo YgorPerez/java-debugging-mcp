@@ -1,72 +1,94 @@
-# JDWP MCP Examples
+# Examples
 
-This directory contains examples of using the JDWP MCP debugger with Claude Code for real-world debugging scenarios.
+Worked debugging scenarios, and the Java programs everything here attaches to.
 
-## Running the Examples
+For the full tool surface see [`docs/tools.md`](../docs/tools.md); for build and test instructions,
+[`docs/development.md`](../docs/development.md).
 
-All examples assume:
-1. The JDWP MCP server is built and configured
-2. Your Java application is running with JDWP enabled on port 5005
-3. You're using Claude Code with the MCP server enabled
-
-## Examples
+## Worked scenario
 
 ### [observability-debugging.md](observability-debugging.md)
-**Debugging a missing metric** *(the roadmap's headline use case)*
 
-"Why isn't my custom metric showing up in `/actuator/metrics`?" — answered by reading the live registry
-instead of adding logging. Output is captured from a real run against `probes/MetricsProbe.java`, a
-stand-in for Spring + Micrometer; the doc says which parts you must adapt for a real app.
+**"Why isn't my custom metric showing up in `/actuator/metrics`?"** — answered by reading the live
+registry instead of adding logging and redeploying. Every output block is captured from a real run
+against `probes/MetricsProbe.java`, a stand-in for Spring + Micrometer; a closing section records what
+actually differed when the same criteria were run against a **real Spring Boot 2.6 app with
+`micrometer-registry-prometheus`** (84 live meters), which is the part a stand-in cannot prove.
 
-**What You'll Learn:**
-- Setting breakpoints in framework code (Spring, Micrometer)
-- Inspecting Spring application context during initialization
-- Verifying bean post-processing
-- Debugging missing metrics issues
-- Using natural language to navigate complex codebases
+What it demonstrates: finding the thread that stopped, `expand_objects` on a nested registry, predicate
+filters over a large collection, map subscripts, `package_filter` on a reflection-heavy stack, and what
+to do when the metric is genuinely absent.
 
-**Key Commands:**
+## Where to start, by question
+
+| You want to | Start with |
+| --- | --- |
+| See what a running JVM actually holds | `debug.get_stack`, then `debug.evaluate {expand_objects:true}` |
+| Find the class name to arm a stop point on | `debug.list_classes {filter:"com.example.*"}` — the loaded truth, including generated proxies |
+| Observe a **shared** instance | `trace:true` on the stop point, then `debug.get_traces` — never a bare breakpoint |
+| Read one live worker without stopping the VM | `debug.suspend_thread`, then `debug.resume_thread` |
+| Find out why a chain returned null | `debug.evaluate_chain` |
+| Find out what a method returned | `debug.set_method_exit_stop` |
+| Find out who wrote a field | `debug.set_field_stop` |
+| Find out why requests are hanging | `debug.thread_dump` (suspending) or `debug.set_monitor_stop` (live) |
+| Check the JVM is running your build | `debug.check_stale` |
+| Get out of trouble | `debug.panic` |
+
+## Prompts that work
+
+The server is driven in natural language; these are the shapes that map cleanly onto tools.
+
+**Connect and orient**
 ```
-> Attach to localhost:5005
-> Set a breakpoint at AbstractApplicationContext line 869
-> Show me the beanFactory variables
-> Evaluate this.getBeanNamesForType(ObservationRegistry.class)
-```
-
-### Basic Debugging (test_*.rs files)
-
-The Rust test files in this directory demonstrate low-level JDWP protocol usage:
-
-- **test_connection.rs** - Basic JDWP handshake and connection
-- **test_vm_commands.rs** - VirtualMachine commands (Version, IDSizes)
-- **test_find_class.rs** - Finding classes and methods
-- **test_breakpoint.rs** - Setting breakpoints
-- **test_manual_stack.rs** - Stack inspection with variables
-
-These are primarily for library development and testing.
-
-### MCP-level coverage lives in `cargo test`, not here
-
-Tests that exercise the **server's handlers** (rather than the raw protocol) are integration tests in
-`mcp-server/tests/mcp_integration.rs`. They drive the real `jdwp-mcp` binary over JSON-RPC on stdio
-against a probe JVM they launch and reap themselves:
-
-```bash
-scripts/integration-test.sh                # all
-scripts/integration-test.sh force_return   # filter by name
+Attach to the JVM at localhost:5005
+What classes matching com.example.* are loaded?
+List the methods of com.example.OrderService
 ```
 
-They currently cover expression resolution (static-method invocation, object arguments, overload
-selection, conditional breakpoints), field watchpoints, deferred breakpoints, `force_return`, and
-recursive object expansion, collection subscripts (index / map key / slice / filter), and the original
-roadmap's metrics-inspection criteria.
-Needs a JDK — without one each test prints `SKIP` and passes, so check for `SKIP` before trusting a
-green run.
+**Stop points**
+```
+Set a breakpoint at com.example.MyClass line 42
+Break on the first line of OrderService.submit
+Break only when qty > 3 and status is not "OK"
+Break on the 5th hit only
+List the active stop points          # also shows hit counts and what each trace is costing
+Clear bp_1
+```
 
-### probes/
+**Observe without freezing anything** — the default posture on a shared JVM:
+```
+Trace com.example.OrderService.submit without suspending, capture 5 caller frames
+Trace every throw of InfoTravelException without suspending
+Show me the traces
+```
 
-The Java programs everything attaches to. The integration harness compiles and launches these for
-you; only the `jdwp-client` examples need you to do it by hand:
+**Inspect**
+```
+Show me the current stack with variables
+Evaluate this.registry.getMeters()[?getId().getName() == "jvm.memory.used"]
+Expand order.customer to depth 3
+Which link in order.getCustomer().getAddress().getCity() went null?
+Read dsRequest as ISO-8859-1 text
+```
+
+**Control**
+```
+Continue
+Step over / step into / step out
+Suspend the thread named "http-nio-8080-exec-3"
+Resume it
+```
+
+**Clean up** — do this before you walk away; a suspended thread in an app server is a stuck request:
+```
+Panic
+Disconnect
+```
+
+## probes/
+
+The Java programs everything attaches to. The integration harness compiles and launches these for you;
+only the `jdwp-client` examples below need you to do it by hand:
 
 ```bash
 javac -g Probe.java   # -g is required: no -g means no local-variable table, so no locals at all
@@ -76,153 +98,81 @@ java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 -cp . 
 Use a fresh port per run — `server=y` stops listening after the first connection. Breakpoint lines are
 marked with `// BP<n>` comments so tests can find them by marker instead of by number.
 
-## Quick Reference
+## test_*.rs — raw protocol examples
 
-### Essential Prompts
+These drive `jdwp-client` directly, below the MCP layer, and are for library development: connection and
+handshake (`test_connection`), VirtualMachine commands (`test_vm_commands`), class and method lookup
+(`test_find_class`), arming breakpoints (`test_breakpoint`, `test_deferred_bp`, `test_exception_bp`,
+`test_trace_bp`), stack and variable reads (`test_manual_stack`, `test_stack_inspection`,
+`test_string_values`, `test_static_field`), and field writes (`test_set_field`). Each needs a probe JVM
+you started yourself, on the port it names.
 
-**Connection:**
-```
-Attach to the JVM at localhost:5005
-```
-
-**Breakpoints:**
-```
-Set a breakpoint at com.example.MyClass line 42
-List all breakpoints
-Clear breakpoint bp_1
-```
-
-**Execution Control:**
-```
-Continue execution
-Pause all threads
-Step over this line
-Step into this method
-```
-
-**Inspection:**
-```
-Show me the current stack with variables
-List all threads
-Get the stack for thread 5
-```
-
-**Evaluation:**
-```
-Evaluate myVariable.toString() in the current frame
-```
-
-**Cleanup:**
-```
-Clear all breakpoints
-Disconnect from the debug session
-```
-
-## Tips for Effective Debugging
-
-### 1. Strategic Breakpoint Placement
-
-Instead of stepping through every line, set breakpoints at key decision points:
-```
-> Set a breakpoint where the error condition is checked
-> Set a breakpoint at the entry of the suspicious method
-```
-
-### 2. Use Stack Inspection
-
-Get the full context when a breakpoint hits:
-```
-> When the breakpoint hits, show me the full stack with all variables
-```
-
-### 3. Expression Evaluation
-
-Inspect complex state without modifying code:
-```
-> Evaluate myObject.getInternalState() to see what's really happening
-```
-
-### 4. Thread Management
-
-For multithreaded issues:
-```
-> List all threads and show which ones are suspended
-> Get the stack for thread 12 to see what it's waiting on
-```
-
-## Common Scenarios
-
-### Debugging Spring Boot Applications
-
-```
-> Set a breakpoint in AbstractApplicationContext.refresh
-> When it hits, evaluate getBeanDefinitionNames() to see all beans
-```
-
-### Debugging HTTP Requests
-
-```
-> Set a breakpoint at MyController.handleRequest line 45
-> Make a curl request to trigger it
-> Show me the request parameters and headers
-```
-
-### Debugging Async/Reactive Code
-
-```
-> List all threads
-> Find threads with "reactor-http" in the name
-> Get stacks for those threads
-```
-
-### Debugging Database Queries
-
-```
-> Set a breakpoint at MyRepository.findByUsername
-> When it hits, evaluate username to see what's being queried
-```
-
-## Remote Debugging
-
-For Kubernetes-deployed applications:
+**MCP-level coverage is not here.** Tests that exercise the *server's handlers* live in
+`mcp-server/tests/mcp_integration.rs` and drive the real `jdwp-mcp` binary over JSON-RPC against probe
+JVMs they launch and reap themselves:
 
 ```bash
-# Terminal 1: Port forward
-kubectl port-forward pod/my-app-pod 5005:5005
-
-# Terminal 2: Claude Code
-> Attach to localhost:5005
-> Set a breakpoint in production code
+scripts/integration-test.sh                # all of them
+scripts/integration-test.sh force_return   # filter by name
 ```
+
+Needs a JDK — without one each test prints `SKIP` and passes, so check for `SKIP` before trusting a green
+run. See [`docs/development.md`](../docs/development.md) for the JDK matrix, sharding and the cassette
+tests that need no JVM at all.
+
+## Remote targets
+
+```bash
+kubectl port-forward pod/my-app-pod 5005:5005
+```
+
+Then attach to `localhost:5005`. A port-forwarded JVM is usually a **shared** one, so prefer `trace:true`
+and `debug.suspend_thread` over anything that suspends the VM, and set `JDWP_READONLY=1` if you only mean
+to look.
 
 ## Troubleshooting
 
-### Connection Refused
-Ensure your Java app is running with:
-```bash
--agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005
-```
+**Connection refused.** The app needs `-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005`,
+and `address=*:` rather than a bare port — a JDK 9+ JVM binds to localhost only otherwise, which a
+port-forward cannot reach.
 
-### Breakpoint Not Hit
-- Verify the class is loaded: `List all threads`
-- Check the line number matches your source code
-- Ensure the method is actually being called
+**The breakpoint never fires.** `debug.list_stop_points` reports `Hits: 0` explicitly rather than staying
+silent, so "armed and never fired" is a statement you can trust. Then: is the class loaded
+(`debug.list_classes`) and is it the class you think — a Quarkus `Foo_Subclass` extends *your* `Foo`, and
+a WildFly deployment can hold two copies of one name from different classloaders. Is the line the one you
+compiled (`debug.check_stale`)? Is the deployed bytecode your build at all (`debug.source`)?
 
-### Variables Show as "Cannot inspect"
-- Thread must be suspended (at a breakpoint or manually paused)
-- Try: `Pause all threads` first
+**Variables read as `Type @0x…` instead of values.** Two different causes, and they need opposite fixes:
 
-## Contributing Examples
+- **Read-only session.** Pretty-printing an object means invoking `toString()` in the debuggee, which
+  `read_only` refuses. That `@0x…` is a handle `debug.evaluate` accepts as an expression head, so it is
+  somewhere to go rather than a dead end.
+- **Expansion is opt-in.** Pass `expand_objects:true` for a field tree (ADR-0006). It invokes nothing —
+  fields only — so it works on a read-only session and on a thread held by `debug.suspend_thread`.
 
-Have a good debugging scenario? Add it to this directory:
+**"Cannot invoke" / `INVALID_THREAD`.** JDWP allows a method invocation **only on a thread suspended by an
+event**. So a getter, a `Map` subscript on a non-structural implementation, or a `toString()` render needs
+a thread stopped at a breakpoint, watchpoint or exception stop.
 
-1. Create a `.md` file describing the scenario
-2. Include the problem, debugging steps, and solution
-3. Show actual prompts and responses
-4. Submit a PR!
+Neither `debug.pause` nor `debug.suspend_thread` unlocks invocation — that is measured, and it is the one
+piece of folk wisdom worth unlearning here, because "pause all threads first" sounds like it should work
+and costs you the VM for nothing. What those two *do* unlock is everything that needs no invocation: the
+stack with locals, field and static chains, `expand_objects`, array indexing, `set_value` on a local, and
+structural collection reads on `HashMap` / `LinkedHashMap` / `ConcurrentHashMap` / `ArrayList`.
+
+**Something is frozen.** `debug.panic` clears every stop point, resumes the VM and releases every thread
+this session is holding, verifying each against the JVM's own suspend count. The watchdog would have done
+it for you within `JDWP_WATCHDOG_SECS` (default 120).
+
+## Contributing an example
+
+1. Add a `.md` file here describing the scenario: the problem, the steps, the answer.
+2. **Capture real output.** Every block in `observability-debugging.md` came from a run, and the doc says
+   which parts a reader must adapt. Hand-written output ages into fiction.
+3. If it needs a new probe, put it in `probes/` with `// BP<n>` markers.
+4. Link it from the list at the top of this file.
 
 ## Resources
 
 - [JDWP Specification](https://docs.oracle.com/javase/8/docs/technotes/guides/jpda/jdwp-spec.html)
-- [Spring Boot Documentation](https://docs.spring.io/spring-boot/docs/current/reference/html/)
 - [Micrometer Documentation](https://micrometer.io/docs)
