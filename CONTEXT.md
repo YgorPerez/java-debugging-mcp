@@ -581,6 +581,12 @@ the id is caller-facing and already shipped (v0.7.0, pinned downstream), so rena
 something and buys nothing the concept name has not already delivered. The window that entry describes —
 "taken while nothing scripted against them yet" — closed on this prefix the day it shipped.
 
+**A stop-point set is a different thing**, despite being one word from what this prefix says. That is an
+export artefact — a *description* of armed stop points, which can contain a family among its entries — where a
+family is a live collection. The two nest; they do not compete. Cross-referenced in both directions because the
+collision was noticed while the second term was still unreleased and was **kept deliberately** rather than
+missed.
+
 **Parked watch**:
 A class-load watch a **wildcard family** deliberately does not hold while it is full. A full family cannot arm
 the next matching class, so watching for one could only cost — an event, a suspension of the thread doing the
@@ -673,68 +679,11 @@ is printed — the number only works as a pair. The second because a request tha
 method and discards none, so a count there would assert a filter that was never armed.
 
 _Avoid_: dropped hit (a discarded exit is specifically **not** a hit of this stop point, which is the
-distinction the two counters exist to draw; `release_dropped_hit` is the function that resumes the thread and
-keeps that name because it is about the *thread*, not the tally), missed hit (nothing was missed — the request
+distinction the two counters exist to draw), missed hit (nothing was missed — the request
 was never for that method), filtered event (**filter** on this surface means a modifier the JVM applies, and
 the whole point here is that this one is not)
 
 [#156]: https://github.com/YgorPerez/java-debugging-mcp/issues/156
-
-**Stop-point set**:
-The armed stop points of a session written as the list of `debug.set_*` calls that would recreate them, emitted
-by `debug.list_stop_points {export: true}` and re-armed by `debug.arm_stop_points`. **Content the client stores**
-— this server writes no file and reads none (ADR-0041).
-
-Its own term because it is not the live set and not a listing of it: it is a **description** of one, which
-survives the process the live set dies with. Under stdio the client's lifetime *is* the session's, so
-"tomorrow's investigation" begins with no stop points at all.
-
-**It carries what the caller asked for, never what the resolver concluded.** That distinction is the whole
-correctness of the thing, and it is not obvious: `BreakpointInfo`'s `line` and `method` are *resolved* values,
-and `method` is `Some` on every armed breakpoint whether the caller named one or not. A set records `arm_line`
-and `arm_method` instead, because writing a resolved method into a requested field turns `{line: 28}` into
-`{line: 28, method: "classify"}` — right on the build it came from, wrong on one where that line has moved.
-
-**What it cannot carry, it drops and names.** An **instance filter** and a **thread filter** are both handles
-into one JVM (ADR-0022), so both are dropped, each with its own sentence, and the entries they came from are
-left **broader** than what was exported. Said above the block rather than below it: below is past the point
-where a reader has started copying.
-
-_Avoid_: profile (the upstream `save_debug_profile` word; it implies storage the server does not have and names
-that it does not keep), session export (that is an **investigation report**, a different artefact — see
-ADR-0042; the two share the verb *export* and nothing else), saved breakpoints (it carries all five kinds plus
-wildcard families, and a set is not necessarily saved anywhere — it is handed back)
-
-**Investigation report**:
-The whole session rendered as one Markdown document by `debug.export_investigation` — attach target, VM
-version, every stop point with its measured capture cost, the snapshots the ring still holds, the staleness
-verdicts, the budget disarms. What you attach to a ticket (ADR-0042).
-
-Its own term because it is **the session and not the buffer**, which is the distinction that made it a tool
-rather than a `debug.get_traces` flag: the stop points, their costs and the VM version are what make a snapshot
-interpretable, and none of them is in the buffer.
-
-**Unredacted, and it says so before any content.** Snapshots hold whatever the debuggee's variables held —
-payloads, bearer tokens, credentials in a `byte[]`, customer records — and none of it is altered, because a
-pattern-based redactor that misses one secret is worse than none: its output implies the file was cleaned. The
-warning is first because a reader who scrolled past it has already read what it warns about, and it **names**
-what to look for rather than saying "may contain sensitive data", which is a warning nobody acts on.
-
-**It clears nothing and cannot outlive the ring.** Preserving a long trace would need this server to write
-files as the buffer fills, which is the write path a **stop-point set** declined (ADR-0041). So it reports the
-loss instead: how many snapshots were recorded against how many survive.
-
-_Avoid_: session export (the words are fine, but this is the noun and `debug.export_investigation` the verb form
-— and "session" is separately loaded here, since a **session** is the live attachment this reports on), trace
-dump (it is not the buffer, which is the whole point), audit log (nothing here is written continuously or kept
-by this server; a report is produced on request and handed over)
-
-**Export** (verb):
-To emit something in a form that outlives the session. Used of exactly two artefacts, the **stop-point set**
-and the **investigation report**, and it means the same thing for both — the artefacts differ, the verb does
-not. Deliberately checked before shipping: one word doing two unrelated jobs is what `inherited` did for a day
-(ADR-0040), and the test applied here is that both uses answer "emit it so it can leave", which they do.
-_Avoid_: save, dump (both imply this server writes it somewhere, and it does not)
 
 **Event set**:
 What the debuggee actually sends: **one** packet carrying one **event** per request that matched at that
@@ -949,6 +898,54 @@ The work one traced hit costs: reading the hit frame's snapshot and the caller c
 reporting the hit and the thread being resumed. The unit the reported trace cost is measured in — deliberately
 narrower than "handling a hit", which also covers the condition check, the resume and our own bookkeeping.
 _Avoid_: hit (a hit is the event; a capture is the work), snapshot (that is the capture's *output*)
+
+### Outliving the session
+
+**Export** (verb):
+To emit something in a form that outlives the session. Names exactly two artefacts — a **stop-point set** and an
+**investigation report** — and means the same thing for both.
+_Avoid_: save, dump (both imply this server writes the thing somewhere, and it does not)
+
+**Stop-point set**:
+The armed stop points of a session written as the list of `debug.set_*` calls that would recreate them. Content
+the client stores: this server writes no file and reads none (ADR-0041).
+
+Its own term because it is neither the live set nor a listing of one, but a *description* of one — which
+survives the process the live set dies with. Under stdio the client's lifetime **is** the session's, so
+tomorrow's investigation starts with no stop points at all.
+
+**It carries what the caller asked for, never what the resolver worked out**: the line or the method they named,
+not the method a line turned out to sit in. Written down because the first version had it the other way round —
+a stop point armed by line came back naming its method too, which is right on the build it was exported from and
+wrong on any build where that line has moved.
+
+**An instance filter and a thread filter are both dropped**, each being a handle into one JVM (ADR-0022), which
+leaves those entries **broader** than what was exported. Both of them, not just the first: the thread filter was
+missed when this was designed.
+
+**Not a `bpset_`, and the near-miss is worth stating.** That prefix abbreviates *breakpoint set* and names a
+**wildcard family** — a live collection this glossary calls a family precisely because *set* was the wrong word
+for it. A stop-point set is the other kind of thing: a **description** rather than a live collection, and one
+that *contains* families among its entries. So the two nest rather than compete, but they are one word apart and
+a reader who meets `bpset_1` inside an exported set is entitled to check which is which.
+
+_Avoid_: profile (the upstream word; it implies storage this server does not have and names it does not keep),
+session export (that is an **investigation report** — a different artefact sharing only the verb), saved
+breakpoints (a set carries all five kinds plus wildcard families, and it is not necessarily saved anywhere)
+
+**Investigation report**:
+The whole session as one Markdown document — attach target, VM version, every stop point with its measured
+capture cost, the snapshots the ring still holds, the staleness verdicts, the budget disarms. **Unredacted**: it
+carries whatever the debuggee's variables carried, and says so before any of it (ADR-0042). What you attach to a
+ticket.
+
+Its own term because it is the **session** and not the trace buffer, which is the distinction that earns it a
+name: the stop points, their costs and the VM version are what make a snapshot interpretable, and none of them
+is in the buffer.
+
+_Avoid_: session export (the noun for this is *report*, and **session** is separately loaded here — it is the
+live attachment being reported on), trace dump (it is not the buffer, which is the whole point), audit log
+(nothing is written continuously or kept by this server; a report is produced on request and handed over)
 
 ### Arming and disarming
 
