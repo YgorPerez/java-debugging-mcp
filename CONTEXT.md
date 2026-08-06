@@ -528,7 +528,7 @@ A figure this server computed rather than read off the wire, labelled as such wh
 the two must never be printed as though they were the same kind of thing.
 _Avoid_: elapsed; measured (unqualified — the point of the term is *whose* measurement it is)
 
-**Several predate the term**: a traced stop point's mean capture, arrival rate and capture share (TRACE-7),
+**Several predate the term.** A traced stop point's mean capture, arrival rate and capture share (TRACE-7),
 and the duration `debug.thread_dump` held the VM (#17). What the term was finally needed for is a
 **monitor pair**'s duration (ADR-0035), because that is the first case where the wire offers a *look-alike*:
 `MONITOR_WAIT` carries a `timeout` field, which is the value the caller passed to `wait(…)` and not how long it
@@ -914,7 +914,7 @@ Its own term because it is neither the live set nor a listing of one, but a *des
 survives the process the live set dies with. Under stdio the client's lifetime **is** the session's, so
 tomorrow's investigation starts with no stop points at all.
 
-**It carries what the caller asked for, never what the resolver worked out**: the line or the method they named,
+**It carries what the caller asked for, never what the resolver worked out.** The line or the method they named,
 not the method a line turned out to sit in. Written down because the first version had it the other way round —
 a stop point armed by line came back naming its method too, which is right on the build it was exported from and
 wrong on any build where that line has moved.
@@ -1151,6 +1151,30 @@ this side resumed it and moved on. Neither suspension is VM-wide and neither is 
 watchdog reads nothing in either case, and the debuggee's own progress is the only thing that shows it.
 _Avoid_ reading this as "nothing stays frozen": it bounds the suspension a **caller asked for**, not every
 way a thread can end up held.
+
+**Rescue**:
+What the **watchdog** does on finding the **debuggee** VM-wide **suspended** past its bound: resume it *and*
+**disarm** whatever froze it. Both halves, because resuming without disarming re-freezes on the next hit of the
+stop point that caused it.
+_Avoid_: auto-resume (it names half of the action, and the half it omits is the one SAFE-2 and SAFE-5 were
+filed about)
+
+**Resume honesty**:
+The property that after **any** resume path, from **any** suspended state, the debuggee is genuinely running —
+or the reply said out loud that it is not. Asserted against the **probe**'s own output rather than a return
+value, because every tool here reports success either way (ADR-0003).
+
+Its own term because the failure it names is not "the resume failed" but "the resume reported success while the
+VM stayed stopped", and those are different things needing different words. The first is visible. The second is
+what five review rounds kept shipping: every round's worst bug was in the previous round's safety work, and the
+watchdog was wrong three times.
+
+**Disarm honesty is the other half, and deliberately not this word.** A VM that resumes and is then immediately
+re-frozen by a still-armed stop point was resumed honestly and **rescued** dishonestly — the SAFE-2/SAFE-5
+harm. The two are asserted differently: resume honesty asks whether the probe ticks at all, disarm honesty asks
+at what *rate* it ticks after a rescue. That is why they are not one test, and why they are not one word.
+_Avoid_: resume success (that is the return value, which is the thing being distrusted), verified resume,
+liveness (it is a claim about what the reply *said*, not only about the VM)
 
 ### Identity
 

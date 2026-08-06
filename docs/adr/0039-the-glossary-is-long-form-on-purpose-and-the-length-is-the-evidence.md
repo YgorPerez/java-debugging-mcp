@@ -2,8 +2,9 @@
 
 ## Context
 
-`CONTEXT.md` is ~1,190 lines for 151 terms — roughly eight lines a term, where a glossary entry is
-conventionally one or two sentences. The `/domain-modeling` skill that maintains it says so explicitly:
+`CONTEXT.md` was ~1,190 lines for 151 terms **when this was decided** — roughly eight lines a term, where a
+glossary entry is conventionally one or two sentences. The `/domain-modeling` skill that maintains it says so
+explicitly:
 *"Keep definitions tight. One or two sentences max. Define what it IS, not what it does"*, and
 *"`CONTEXT.md` should be totally devoid of implementation details… It is a glossary and nothing else."*
 
@@ -19,6 +20,11 @@ exists rather than the word it replaced.**
 
 **`CONTEXT.md` stays long-form, and the test for whether an entry has earned its length is whether the
 extra lines record a distinction that was got wrong at least once.**
+
+The figures above are **dated** and are not re-derived: the file grows, and this decision was never about a
+line count. What is defended is provenance, so the test is the sentence in bold and not a ratio. A reader
+checking whether the file is "still" eight lines a term is measuring the wrong thing — the same reason
+`CLAUDE.md` says to delete a written-down number rather than pin it in a second place.
 
 A one-sentence entry answers *what does this word mean*. The entries here that matter answer *why is this
 a separate word, and what goes wrong when it is not* — which is the question that actually gets asked,
