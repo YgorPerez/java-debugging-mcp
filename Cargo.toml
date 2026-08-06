@@ -6,9 +6,11 @@ resolver = "2"
 version = "0.18.0"
 edition = "2021"
 rust-version = "1.82"
-authors = ["Ed Sweeney <ed@onextent.com>"]
+# Ed Sweeney is the original author of the upstream this was forked from
+# (navicore/jdwp-mcp, the first 22 commits); LICENSE keeps his copyright notice.
+authors = ["Ygor Perez <ygor@infotera.com.br>", "Ed Sweeney <ed@onextent.com>"]
 license = "MIT"
-repository = "https://github.com/navicore/jdwp-mcp"
+repository = "https://github.com/YgorPerez/java-debugging-mcp"
 description = "MCP server for Java debugging via JDWP protocol"
 readme = "README.md"
 keywords = ["mcp", "jdwp", "java", "debugger", "llm"]
