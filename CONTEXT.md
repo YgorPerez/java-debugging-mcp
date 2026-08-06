@@ -949,6 +949,8 @@ rather than to cause.
 
 **A reply says when it took one.** A capture nobody asked for at this site is otherwise unexplained, and
 unexplained output that reads as an answer is the thing this glossary's **Reply** entry exists about.
+ADR-0040 records why this is a default rather than a `watch` tool family, and why the two lists are
+never combined.
 
 _Avoid_: **inherited** — that word is already taken on this surface for a field walked from a superclass
 (`list_fields {inherited:true}`, ADR-0015), and one word doing two unrelated caller-visible jobs is exactly
