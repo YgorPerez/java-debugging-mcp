@@ -4128,6 +4128,133 @@ fn a_broad_suspending_method_exit_is_refused_and_panic_clears_the_rest() {
     );
 }
 
+/// TRACE-15 (#156): `Hits: 0` beside a non-zero discard count, which is the exact reading the issue was
+/// filed about — reproduced against a real JVM rather than asserted on the renderer.
+///
+/// `ReturnProbe.main` is the perfect subject and it is one the probe already has: it is entered once and
+/// does not return for the life of the run, while `classify` and `other` return constantly. So a
+/// `METHOD_EXIT` request narrowed to `main` receives a steady stream of exits, matches none of them, and
+/// reported `Hits: 0` — indistinguishable from a stop point on code that never executed. That ambiguity
+/// cost the reporter two full end-to-end runs and nearly a supplier-side bug report for a hang that did
+/// not exist.
+///
+/// The budget never disarms this one, which is the other half of why it is the right test: nothing is ever
+/// captured, so `trace_max_hits` is never charged and the request stays armed indefinitely, paying for
+/// every exit and reporting none. Before the discard count there was nothing in any reply that revealed
+/// that state.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_method_exit_that_never_matches_reports_what_it_discarded_getting_there() {
+    let Some(jdk) = jdk_or_skip("a_method_exit_that_never_matches_reports_what_it_discarded_getting_there")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    // Traced, so nothing freezes: this is the arming a caller reaches for on a shared instance, and the
+    // one whose cost was invisible.
+    let armed = server.call(
+        "debug.set_method_exit_stop",
+        serde_json::json!({"class_pattern": "ReturnProbe", "method": "main"}),
+    );
+    assert_contains_all("the request arms on a method that will not return", &armed, &["mexit_", "trace"]);
+
+    // Let the probe run through several iterations. Each one returns from `classify` twice and `other`
+    // once, so every exit delivered belongs to a method this request did not ask for.
+    let base = highest_tick(&probe).expect("no tick to count from");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 3))
+        .expect("the probe must keep running under a traced method-exit request");
+
+    let listing = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(listing.contains("Hits: 0"), "`main` never returned, so the hit count must be 0: {listing}");
+    let discarded = discarded_exit_count(&listing)
+        .unwrap_or_else(|| panic!("the listing must report a discard count at all: {listing}"));
+    assert!(
+        discarded > 0,
+        "exits of `classify` and `other` were delivered and dropped, so the count cannot be 0 — a zero \
+         here means `record_discarded_exit` is never reached, and this whole feature would report nothing \
+         while looking like it worked: {listing}"
+    );
+
+    // The number alone is not the fix. Reading `Hits: 0` correctly is, so the reply has to contradict the
+    // wrong conclusion rather than leave the caller to infer it from two integers.
+    assert_contains_all(
+        "the listing names which of the two readings of `Hits: 0` applies",
+        &listing,
+        &["IS executing", "main", "never returned"],
+    );
+    assert!(
+        !listing.contains("did not run"),
+        "the opposite reading must NOT appear — it is the one that cost two end-to-end runs: {listing}"
+    );
+
+    server.panic_reset();
+}
+
+/// The other side of the same grid, and the reason zero is printed rather than omitted: a stop point whose
+/// method really is returning reports both numbers, and the discard count is what says the request is
+/// *also* being charged for the rest of the class.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_method_exit_that_does_match_reports_hits_and_discards_side_by_side() {
+    let Some(jdk) = jdk_or_skip("a_method_exit_that_does_match_reports_hits_and_discards_side_by_side")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    server.call(
+        "debug.set_method_exit_stop",
+        serde_json::json!({"class_pattern": "ReturnProbe", "method": "classify"}),
+    );
+    let base = highest_tick(&probe).expect("no tick to count from");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 3))
+        .expect("the probe must keep running under a traced method-exit request");
+
+    let listing = server.call("debug.list_stop_points", serde_json::json!({}));
+    let discarded = discarded_exit_count(&listing)
+        .unwrap_or_else(|| panic!("the listing must report a discard count: {listing}"));
+    assert!(
+        discarded > 0,
+        "`other()` returns once per iteration and is not what was asked for, so it must be counted as \
+         discarded — this is the arming cost, and the whole point is that it is now readable: {listing}"
+    );
+    assert!(
+        !listing.contains("Hits: 0"),
+        "`classify` returns twice per iteration, so this stop point HAS hits: {listing}"
+    );
+    // Deliberately not asserting a ratio. `classify` runs twice per iteration and `other` once, so hits
+    // should lead — but the two counts are sampled from one listing taken while the probe runs, and
+    // pinning arithmetic across that race is how a test becomes a flake. That it counts at all is the
+    // claim; TEST-32's contention lesson is why the tighter assertion is not worth making.
+
+    server.panic_reset();
+}
+
+/// Pull `exits discarded: N` out of a `debug.list_stop_points` reply.
+///
+/// Returns `None` when the line is absent, which the callers above turn into a failure with the listing
+/// attached — a helper that returned `0` for "no such line" would make the two tests pass against a build
+/// that never rendered the count.
+fn discarded_exit_count(listing: &str) -> Option<u32> {
+    listing
+        .split("exits discarded: ")
+        .nth(1)?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
 /// EVT-1: a second hit must not erase the first. Before the event ring buffer, `last_event` was one
 /// slot, so the breakpoint below was silently gone by the time the step landed.
 #[test]

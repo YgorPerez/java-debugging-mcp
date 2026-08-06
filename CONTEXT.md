@@ -641,7 +641,8 @@ about. A hit whose **condition** was false counts: the line ran, and "400 hits, 
 diagnosis from "never ran". A folded **rethrow** counts although it does not spend the trace budget, so on a
 traced stop point the tally and the capture count answer different questions instead of repeating one. An exit
 from a method other than the one asked for does *not* count — that is JDWP delivering traffic the request
-could not filter, not the stop point firing. Charged once per hit, never once per armed location.
+could not filter, not the stop point firing; it is counted as a **discarded exit** instead. Charged once per
+hit, never once per armed location.
 
 _Avoid_: hit count. That name belongs to the **`hit_count` argument**, which is the opposite kind of thing — a
 *requested* selector saying which single occurrence to stop on (JDWP's `Count`), after which the stop point is
@@ -649,6 +650,35 @@ _Avoid_: hit count. That name belongs to the **`hit_count` argument**, which is 
 were both called `hit_count` in the code, and the tally sat dead and always zero behind a listing that could
 never report it. Fixed in FILT-10 (#110) by renaming the tally to `hits` and leaving `hit_count` to mean the
 argument alone.
+
+**Discarded exit**:
+A `METHOD_EXIT` event the debuggee generated, sent and paid for, which belonged to a method other than the one
+the request asked for and was dropped on this side. Counted per method-exit stop point that carries a `method`
+filter, and reported by `list_stop_points` beside the **hit tally** as `exits discarded: N`.
+
+Its own word because it is neither a **hit** nor nothing, and until TRACE-15 ([#156]) the vocabulary had only
+those two. JDWP has no method-name modifier: a `ClassMatch` delivers every method of a matching class, so the
+`method` filter runs *here*, after the debuggee has already been charged. That makes a discarded exit the one
+kind of cost this server imposes that nothing was reporting.
+
+**The pair is the diagnosis; neither number is one alone.** `Hits: 0` by itself cannot tell *the code never ran*
+from *it fired constantly and every event was discarded* — the two are different investigations and printed the
+identical line. Beside `exits discarded: 0` it means the class produced no exits at all; beside a non-zero count
+it means the class is executing and the method asked for is what did not return. #156 was filed from a real
+investigation where that ambiguity cost two full end-to-end runs and came close to a supplier-side bug report
+for a hang that did not exist, on a request that went from 3.2 s unarmed to a 240 s read timeout armed.
+
+**Zero is printed, and nothing is printed without a `method` filter.** The first for the same reason `Hits: 0`
+is printed — the number only works as a pair. The second because a request that names no method wants every
+method and discards none, so a count there would assert a filter that was never armed.
+
+_Avoid_: dropped hit (a discarded exit is specifically **not** a hit of this stop point, which is the
+distinction the two counters exist to draw; `release_dropped_hit` is the function that resumes the thread and
+keeps that name because it is about the *thread*, not the tally), missed hit (nothing was missed — the request
+was never for that method), filtered event (**filter** on this surface means a modifier the JVM applies, and
+the whole point here is that this one is not)
+
+[#156]: https://github.com/YgorPerez/java-debugging-mcp/issues/156
 
 **Event set**:
 What the debuggee actually sends: **one** packet carrying one **event** per request that matched at that

@@ -43,6 +43,19 @@ rather than a debugging-shaped one, where the class-wide firing is the point rat
 That would still need the volume answered before it could ship: a method-name filter applied inside
 the debugger does not help, because the packet has already crossed the wire by then.
 
+## The same cost, on the kind that *is* armed
+
+That last sentence is the decisive one about volume and it applies unchanged to `METHOD_EXIT`, which this
+server **does** arm — where it was filed under `METHOD_ENTRY` and so was not read by anyone arming an
+exit. TRACE-15 (#156) is what that cost when nothing reported it: a `set_method_exit_stop` narrowed to one
+method still received every method of the class, and `list_stop_points` showed `Hits: 0` because the ones
+it received belonged elsewhere. Two full end-to-end runs went looking for a hang in the debuggee.
+
+`list_stop_points` now reports `exits discarded: N` beside the hit count, which is this file's argument
+turned into a measurement on the running JVM instead of a rejection. It does not reopen anything here —
+the volume objection is why `METHOD_ENTRY` stays unarmed, and the exit kind pays a smaller version of the
+same bill because a request can at least be narrowed to a concrete class.
+
 ## Prior requests
 
 - #16 — METH-1, which removed the decoded-but-unarmable variant and settled this

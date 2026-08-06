@@ -374,15 +374,28 @@ condition was FALSE still counts (so `Hits: 400` beside a condition that never m
 diagnosis from `Hits: 0`, and they used to look identical), a rethrow of an already-captured exception counts
 although it does not spend trace_max_hits (so on a traced stop point Hits and the capture count answer
 different questions rather than repeating one), and a method-exit request counts only exits of the method you
-ASKED for, not the every-method-of-the-class traffic JDWP delivers it. Counted once per hit and not once per
-armed location, so a finally line armed at 2 locations reports the number of times it ran. Cumulative across a
-toggle_stop_point disable and re-arm, since that keeps the same stop point rather than making a new one. A
-STOP POINT ARMED WITH hit_count IS REPORTED **SPENT** ONCE IT HAS FIRED, which is a third state and not a
-synonym for disabled: disabled is something YOU did with toggle_stop_point and can undo, spent is something
-the DEBUGGEE did — JDWP's Count modifier makes the JVM report the Nth occurrence and delete the request
-itself. Before this existed such a stop point was listed as armed forever, which is the same
-silence-reads-as-an-answer failure the Hits line above removes. toggle_stop_point re-arms a spent stop point
-with the same count.
+ASKED for, not the every-method-of-the-class traffic JDWP delivers it. A METHOD-EXIT STOP POINT WITH A method
+FILTER THEREFORE REPORTS A SECOND NUMBER BESIDE IT — `Hits: 0 · exits discarded: 3214` — AND THE PAIR IS THE
+DIAGNOSIS RATHER THAN EITHER HALF. Alone, `Hits: 0` cannot tell "the code never ran" from "it fired constantly
+and every event was discarded", because JDWP has no method-name modifier: a ClassMatch delivers every method
+of a matching class and the ones you did not ask for are dropped HERE, after the debuggee has already paid for
+them. Both readings printed the identical line until this existed, and the cost of that was measured — a
+request that went from 3.2 s unarmed to a 240 s read timeout armed still read `Hits: 0`, which sent two full
+end-to-end runs looking for a hang in the wrong process. So `exits discarded: 0` beside `Hits: 0` now says the
+class produced no exits at all, a non-zero count beside it says the class is executing and your method is what
+did not return, and a line under the pair says which of the two you are reading. THE DISCARDED COUNT IS ALSO
+THE ONLY REPORT OF WHAT ARMING THIS COST: every discarded exit is a notification the JVM raised and a packet
+it sent over the one connection, so it is the number to read before leaving a method-exit stop point armed on
+a shared instance. Narrowing class_pattern is the only thing that reduces it. Zero is printed, for the same
+reason `Hits: 0` is; nothing is printed at all when the request has no method filter, because such a request
+wants every method and discards none. Counted once per hit and not once per armed location, so a finally line
+armed at 2 locations reports the number of times it ran. Cumulative across a toggle_stop_point disable and
+re-arm, since that keeps the same stop point rather than making a new one. A STOP POINT ARMED WITH hit_count
+IS REPORTED **SPENT** ONCE IT HAS FIRED, which is a third state and not a synonym for disabled: disabled is
+something YOU did with toggle_stop_point and can undo, spent is something the DEBUGGEE did — JDWP's Count
+modifier makes the JVM report the Nth occurrence and delete the request itself. Before this existed such a
+stop point was listed as armed forever, which is the same silence-reads-as-an-answer failure the Hits line
+above removes. toggle_stop_point re-arms a spent stop point with the same count.
 
 ## debug.list_threads
 List threads by name (one `0x<id> <name>` line each). A JVM like WildFly has hundreds of threads — filter with
@@ -810,23 +823,27 @@ WITHOUT method it means exactly what it says: the Nth return out of the class, w
 after which the request is gone and debug.list_stop_points reports it SPENT. PASS exclude_classes TO STOP THE
 EVENTS BEING GENERATED AT ALL, which is what makes a WILDCARD class_pattern usable here: the JVM does the
 ClassMatch, so a broad pattern sweeps in every proxy and interceptor the container generates and each unwanted
-exit costs a real event before the method-name filter on this side can discard it. A ClassExclude is applied
-by the JVM instead. There is deliberately NO default set here, unlike the stepping tools — a method-exit
-class_pattern is something you wrote, and silently subtracting from it would answer a different question from
-the one you asked. Measured: a request accepts at least 5000 exclusion patterns, so the list is not a resource
-to ration. instance_id IS ACCEPTED AND ALWAYS REFUSED HERE, AND THE REFUSAL IS THE ANSWER RATHER THAN A
-MISSING FEATURE. A method exit HAS a `this`, so nothing about the request looks wrong — HotSpot accepts an
-InstanceOnly modifier on it, replies success, and then records exits from every instance regardless (measured
-on Temurin 17/21/25, re-run on its own to be sure: FILT-9, ADR-0027). There is no signal of any kind that the
-scope was dropped, so passing it through would mean a reply saying the stop point is scoped to one object
-while it reports all 400 — which is the exact failure this server is built to refuse. Use a condition instead
-(evaluated on our side, so it works on every kind), or put the stop point on a LINE inside an instance method,
-where instance_id does work. PASS condition TO FILTER THE RETURNS YOU DO NOT WANT (FILT-6), evaluated on the
-returning method's own frame — so its locals and `this` are in scope. `!`, `&&` and `||` all work, and a
-condition-skipped hit is NOT charged to the trace budget. Two costs worth knowing: on a SUSPENDING request the
-VM is frozen while the condition is evaluated, and this request receives EVERY method of a matching class, so
-a condition on a broad class_pattern is evaluated far more often than it fires — a method filter is the
-cheaper narrowing.
+exit costs a real event before the method-name filter on this side can discard it — AND debug.list_stop_points
+NOW REPORTS HOW MANY, as `exits discarded: N` beside the hit count, so that cost is a measurement you can read
+rather than a warning you have to believe. Read it before leaving one of these armed on a shared instance, and
+read it too when the answer is `Hits: 0`: a non-zero discard count beside a zero hit count means the class IS
+executing and your method is what never returned, which is the opposite conclusion from the one `Hits: 0`
+reads like on its own. A ClassExclude is applied by the JVM instead. There is deliberately NO default set
+here, unlike the stepping tools — a method-exit class_pattern is something you wrote, and silently subtracting
+from it would answer a different question from the one you asked. Measured: a request accepts at least 5000
+exclusion patterns, so the list is not a resource to ration. instance_id IS ACCEPTED AND ALWAYS REFUSED HERE,
+AND THE REFUSAL IS THE ANSWER RATHER THAN A MISSING FEATURE. A method exit HAS a `this`, so nothing about the
+request looks wrong — HotSpot accepts an InstanceOnly modifier on it, replies success, and then records exits
+from every instance regardless (measured on Temurin 17/21/25, re-run on its own to be sure: FILT-9, ADR-0027).
+There is no signal of any kind that the scope was dropped, so passing it through would mean a reply saying the
+stop point is scoped to one object while it reports all 400 — which is the exact failure this server is built
+to refuse. Use a condition instead (evaluated on our side, so it works on every kind), or put the stop point
+on a LINE inside an instance method, where instance_id does work. PASS condition TO FILTER THE RETURNS YOU DO
+NOT WANT (FILT-6), evaluated on the returning method's own frame — so its locals and `this` are in scope. `!`,
+`&&` and `||` all work, and a condition-skipped hit is NOT charged to the trace budget. Two costs worth
+knowing: on a SUSPENDING request the VM is frozen while the condition is evaluated, and this request receives
+EVERY method of a matching class, so a condition on a broad class_pattern is evaluated far more often than it
+fires — a method filter is the cheaper narrowing.
 
 ## debug.set_monitor_stop
 Watch LOCK CONTENTION as it happens, WITHOUT SUSPENDING ANYTHING — the answer to "requests are hanging on a

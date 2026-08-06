@@ -4705,6 +4705,7 @@ async fn arm_one_method_exit(
             condition: a.condition.clone(),
             instance_filter: arm.instance_filter,
             hits: 0,
+            discarded: 0,
             class_pattern: class_pattern.to_string(),
             exclude_classes: a.exclude_classes.clone().unwrap_or_default(),
             method: method.cloned(),
@@ -6108,7 +6109,7 @@ fn render_breakpoint_line(
     if let Some(note) = bp.drift.listing_note(&bp.class_pattern) {
         let _ = writeln!(output, "{note}");
     }
-    render_hits(output, bp.hits);
+    render_hits(output, bp.hits, "");
     render_trace_cost(output, bp.trace, &bp.trace_cost);
 }
 
@@ -6284,7 +6285,7 @@ fn render_exception_line(
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
-    render_hits(output, er.hits);
+    render_hits(output, er.hits, "");
     render_trace_cost(output, er.trace, &er.trace_cost);
 }
 
@@ -6336,8 +6337,66 @@ fn trace_budget_tag(trace: bool, budget: Option<u32>) -> String {
 ///    rather than two spellings of one number;
 ///  - an exit from a method other than the one asked for does **not** count. See
 ///    [`MethodExitRequestInfo::hits`](crate::session::MethodExitRequestInfo::hits).
-fn render_hits(output: &mut String, hits: u32) {
-    let _ = writeln!(output, "     Hits: {hits}");
+///
+/// `tail` is appended after the number, on the same line and in the same sentence, and every kind but the
+/// method exit passes `""`. It is a parameter rather than a second `writeln!` because the only thing that
+/// belongs there — the discarded-exit count (TRACE-15) — is the *complement* of this number and reads as a
+/// separate finding on a line of its own, which is the reading it exists to remove.
+fn render_hits(output: &mut String, hits: u32, tail: &str) {
+    let _ = writeln!(output, "     Hits: {hits}{tail}");
+}
+
+/// The discarded-exit count and what it means, for a method-exit stop point that carries a method filter
+/// (TRACE-15, [#156](https://github.com/YgorPerez/java-debugging-mcp/issues/156)).
+///
+/// **Nothing at all without a method filter**, and that is a correctness point rather than terseness. A
+/// request armed with no `method` reports every method of a matching class *on purpose* (trace mode only),
+/// so it drops nothing by name and there is no such thing as a discarded exit for it. Printing
+/// `exits discarded: 0` there would assert a filter that is not present.
+///
+/// **Zero is printed when a filter IS present**, for exactly the reason [`render_hits`] prints `Hits: 0`
+/// rather than omitting it: the number is only a diagnosis as a pair. `Hits: 0 · exits discarded: 0` says
+/// the class produced no exits at all; `Hits: 0 · exits discarded: 3214` says it produced thousands and
+/// none of them were the method asked for. Suppressing the zero would leave those two looking identical
+/// again, which is the whole defect.
+///
+/// **The sentence under it is the part that was actually missing.** #156 was filed from a real
+/// investigation where a request went from 3.2 s unarmed to a 240 s read timeout armed, twice, and
+/// `Hits: 0` read as *this never fired* — costing two end-to-end runs and very nearly a supplier-side bug
+/// report for a hang that did not exist. A bare second number would not have prevented that; naming which
+/// of the two readings it supports does.
+fn describe_discarded_exits(method: Option<&str>, hits: u32, discarded: u32) -> String {
+    let Some(method) = method else {
+        return String::new();
+    };
+    let mut out = format!(" · exits discarded: {discarded}");
+    match (hits, discarded) {
+        (0, 0) => out.push_str(
+            "\n       ↳ so no method of this class returned at all while this was armed — here `Hits: 0` \
+             does mean the code did not run.",
+        ),
+        (0, d) => {
+            let _ = write!(
+                out,
+                "\n       ↳ this class IS executing: {d} exit(s) of its OTHER methods arrived here and \
+                 were dropped, because JDWP has no method-name modifier and a ClassMatch delivers every \
+                 method of a matching class. So `Hits: 0` means `{method}` never returned — not that \
+                 nothing ran. Those {d} exit(s) are also what this stop point has cost the debuggee: each \
+                 one is a notification the JVM raised and a packet it sent."
+            );
+        }
+        (_, 0) => {}
+        (_, d) => {
+            let _ = write!(
+                out,
+                "\n       ↳ {d} exit(s) of other methods of this class were delivered and dropped as \
+                 well, and the debuggee paid for each of them — JDWP has no method-name modifier, so a \
+                 ClassMatch delivers every method. Narrowing `class_pattern` is the only thing that \
+                 reduces it; the `method` filter is applied here, after the cost."
+            );
+        }
+    }
+    out
 }
 
 fn render_trace_cost(output: &mut String, trace: bool, cost: &crate::session::TraceCost) {
@@ -6830,7 +6889,7 @@ fn render_watchpoint_line(
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
-    render_hits(output, wp.hits);
+    render_hits(output, wp.hits, "");
     render_trace_cost(output, wp.trace, &wp.trace_cost);
 }
 
@@ -6868,7 +6927,7 @@ fn render_method_exit_line(
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
-    render_hits(output, me.hits);
+    render_hits(output, me.hits, &describe_discarded_exits(me.method.as_deref(), me.hits, me.discarded));
     render_trace_cost(output, me.trace, &me.trace_cost);
 }
 
@@ -6940,7 +6999,7 @@ fn render_monitor_line(
     if !tag.is_empty() {
         let _ = writeln!(output, "   {tag}");
     }
-    render_hits(output, mon.hits);
+    render_hits(output, mon.hits, "");
     render_trace_cost(output, mon.trace, &mon.trace_cost);
 }
 
@@ -12513,7 +12572,12 @@ async fn record_one_traced_event(
     // rather than after the condition, because a false condition means the line RAN and the caller's
     // filter rejected it — "400 hits, none matched" and "0 hits" are different diagnoses that read
     // identically when only matches are counted.
-    if !wrong_method {
+    if wrong_method {
+        // TRACE-15 (#156): and the other side of the same fork, because the drop is not free. This exit
+        // crossed the wire and cost the debuggee a notification; counting it here is what lets `Hits: 0`
+        // mean "the method did not return" rather than "nothing ran". See `record_discarded_exit`.
+        record_discarded_exit(session, req_id);
+    } else {
         record_stop_point_hit(session, req_id);
     }
     // DUMP-7: the pair is opened or closed BEFORE the recording decision and regardless of it, because
@@ -12703,6 +12767,30 @@ fn record_stop_point_hit(session: &mut crate::session::DebugSession, req_id: i32
     }
 }
 
+/// Charge one exit that was delivered and dropped because it belonged to a different method (TRACE-15).
+///
+/// The exact complement of [`record_stop_point_hit`], and it exists because that function's own reasoning
+/// left a number named and unreported. It argues — correctly — that counting *before* `method_name_matches`
+/// "would report thousands of hits on a stop point that reported three". Those thousands are real events
+/// that really cost the debuggee, and until this existed nothing said so: `Hits: 0` on a method-exit stop
+/// point could mean the code never ran, or that it ran constantly and every exit delivered was somebody
+/// else's. Two different diagnoses behind one identical line.
+///
+/// **One map, not five.** The four other kinds have no method filter and so no name-drop path at all — a
+/// line, exception, field or monitor request either matches or is not delivered. Searching their maps here
+/// would imply a discard they cannot have, which is the reverse of the honesty this is for.
+///
+/// **Not charged for a false `condition`, and not for a spent budget.** Both of those drop a hit that *was*
+/// this stop point's, and both are already visible elsewhere — a false condition is counted in `hits` by
+/// FILT-10's rule (so `Hits: 400` beside no captures is already a distinct reading), and a budget disarm
+/// says so in the listing. Folding them in here would make one number mean three things and cost the pair
+/// above its only useful property: that `hits + discarded` is every exit this request was delivered.
+fn record_discarded_exit(session: &mut crate::session::DebugSession, req_id: i32) {
+    if let Some(m) = session.method_exits.values_mut().find(|m| m.request_id == Some(req_id)) {
+        m.discarded = m.discarded.saturating_add(1);
+    }
+}
+
 /// Retire a stop point that carries a `hit_count`, because this hit was its last (FILT-8).
 ///
 /// The bookkeeping is exact rather than heuristic, and this is why: `Count` means the JVM reports **only**
@@ -12849,6 +12937,9 @@ async fn store_reportable_event(
         {
             release_dropped_hit(session, thread, held_thread_only).await;
             skip = true;
+            // TRACE-15 (#156): the suspending path's drop is the more expensive of the two — this exit
+            // froze a thread (or the VM) before we resumed it — so it is exactly as worth counting.
+            record_discarded_exit(session, req_id);
         }
         // FILT-10: past the method filter, so this hit is this stop point's — counted before the
         // condition for the same reason the traced path counts before its condition. See
@@ -23708,6 +23799,59 @@ mod tests {
         assert!(session.contains('a') && session.contains("dropped one"), "{session}");
     }
 
+    /// TRACE-15 (#156): the four `(hits, discarded)` readings are four different findings, and the whole
+    /// defect was that two of them printed the same line.
+    ///
+    /// Asserted on the *distinction* rather than on the wording — `reply-fragments.txt` pins the wording —
+    /// because the property that matters is that no two cells can be confused, and that survives a rewrite
+    /// of every sentence below.
+    #[test]
+    fn a_zero_hit_count_reads_differently_depending_on_what_was_discarded() {
+        let never_ran = describe_discarded_exits(Some("reservar"), 0, 0);
+        let all_dropped = describe_discarded_exits(Some("reservar"), 0, 3214);
+
+        // The pair #156 was filed about. Both of these sit beside an identical `Hits: 0`, so if they were
+        // ever equal the tool would be back to answering two questions with one reply.
+        assert_ne!(never_ran, all_dropped, "the two readings of `Hits: 0` must not render identically");
+        assert!(
+            never_ran.contains("did not run"),
+            "with nothing discarded, `Hits: 0` is safe to read as \"the code did not run\" and the reply \
+             should say so plainly: {never_ran}"
+        );
+        assert!(
+            all_dropped.contains("IS executing") && all_dropped.contains("3214"),
+            "with exits discarded it must contradict that reading and quote the count: {all_dropped}"
+        );
+        assert!(
+            all_dropped.contains("reservar"),
+            "and name the method that did not return, since that is the actual finding: {all_dropped}"
+        );
+
+        // Zero is printed rather than omitted, for the same reason `Hits: 0` is: the number is only a
+        // diagnosis as a pair, and a suppressed zero puts the two readings back to looking identical.
+        assert!(never_ran.contains("exits discarded: 0"), "zero is printed, not omitted: {never_ran}");
+
+        // But NOT when there is no method filter — such a request wants every method and discards none, so
+        // a count here would assert a filter that was never armed.
+        assert_eq!(
+            describe_discarded_exits(None, 0, 0),
+            "",
+            "a request with no method filter has no discard path, so it must claim none"
+        );
+
+        // The two hits>0 cells: a clean one says nothing extra, a dirty one reports the cost.
+        assert!(
+            !describe_discarded_exits(Some("reservar"), 7, 0).contains('↳'),
+            "nothing was dropped, so there is nothing to explain"
+        );
+        let mixed = describe_discarded_exits(Some("reservar"), 7, 3214);
+        assert!(
+            mixed.contains("class_pattern"),
+            "the cost is only reducible by narrowing the pattern — the method filter runs after it, so the \
+             reply has to name which lever works: {mixed}"
+        );
+    }
+
     /// TEST-46 (#154): the caller-visible reply FRAGMENTS, pinned rather than substring-checked.
     ///
     /// 163 substring assertions guard these strings today, and a substring check passes a rewording. That
@@ -23826,6 +23970,15 @@ mod tests {
 
         case("overridden_traces/none", describe_overridden_traces(&[]));
         case("overridden_traces/one", describe_overridden_traces(&[("Foo.java:12", vec!["Bar.java:34"])]));
+
+        // TRACE-15 (#156). All four cells of the (hits, discarded) grid, because the WHOLE point of this
+        // renderer is that the four readings must not collapse into one another — and the no-filter case,
+        // which must stay empty rather than assert a filter that is not there.
+        case("discarded_exits/no-filter", describe_discarded_exits(None, 0, 0));
+        case("discarded_exits/none-ran", describe_discarded_exits(Some("reservar"), 0, 0));
+        case("discarded_exits/all-discarded", describe_discarded_exits(Some("reservar"), 0, 3214));
+        case("discarded_exits/clean", describe_discarded_exits(Some("reservar"), 7, 0));
+        case("discarded_exits/mixed", describe_discarded_exits(Some("reservar"), 7, 3214));
 
         out
     }

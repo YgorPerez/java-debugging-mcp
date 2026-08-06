@@ -944,6 +944,25 @@ pub struct MethodExitRequestInfo {
     /// The tally is charged *after* that filter — counting before it would report thousands of hits on a
     /// stop point that reported three, which is a worse answer than the missing one this replaced.
     pub hits: u32,
+    /// How many exits of *other* methods of a matching class arrived and were dropped by
+    /// `method_name_matches` (TRACE-15, #156). Meaningless without [`Self::method`], since a request with
+    /// no method filter drops nothing by name.
+    ///
+    /// This is the complement of [`Self::hits`] rather than a second version of it, and the pair is what
+    /// makes `Hits: 0` a diagnosis instead of a question. Alone it cannot distinguish *the code never ran*
+    /// from *it fired constantly and every event was discarded*, which is the case that cost the reporter
+    /// two end-to-end runs and nearly a supplier bug report: a request that went from 3.2 s unarmed to a
+    /// 240 s read timeout armed still read `Hits: 0`, because every exit delivered belonged to another
+    /// method. Beside `discarded: 0` that same line means the class produced no exits at all.
+    ///
+    /// It also makes the arming cost visible, which nothing else here reports. Every discarded exit is a
+    /// packet the debuggee generated, notified and sent over the one connection this server multiplexes —
+    /// `.out-of-scope/method-entry-events.md` is the recorded reasoning about that volume, and this is the
+    /// same cost measured rather than argued.
+    ///
+    /// Charged at the drop sites in [`crate::handlers`], which have already called `method_name_matches`
+    /// either way, so the count needs no extra JDWP round trip.
+    pub discarded: u32,
     /// Dotted class pattern the caller gave, kept so a disabled request can be re-armed.
     pub class_pattern: String,
     /// `ClassExclude` patterns this request was armed with (STEP-1), kept so a re-arm reproduces them —
