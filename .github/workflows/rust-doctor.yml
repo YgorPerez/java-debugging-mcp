@@ -137,13 +137,43 @@ jobs:
       #   - coverage — `coverage.yml` owns it, produces `target/coverage/lcov.info`, and knows about the
       #     atexit-handler trap TEST-5 found. Generating coverage again here would double the test run to
       #     tell doctor something another workflow already publishes.
-      - name: Install the tools rust-doctor's passes need
+      # cargo-shear is the one entry here that is NOT for a rust-doctor pass — see the step below.
+      - name: Install the tools the gate needs
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-machete
+          tool: cargo-deny,cargo-machete,cargo-shear
 
       - name: Run rust-doctor
         run: /tmp/rust-doctor --sarif --fail-on warning > rust-doctor.sarif
+
+      # WHY A SECOND UNUSED-DEPENDENCY TOOL, when rust-doctor's `dependencies` pass already runs
+      # cargo-machete. Because that pass cannot see the case this workspace is actually shaped for.
+      #
+      # Measured, on this tree, by adding one unused dependency in each position and running both:
+      #
+      #   unused dep in a member crate            machete: flags     shear: flags
+      #   dep named only in a source comment      machete: flags     shear: flags
+      #   unused [workspace.dependencies] entry   machete: SILENT    shear: flags
+      #
+      # That last row is the one that matters here. Both members take their dependencies through
+      # `<name>.workspace = true`, so the day the last member stops using one, the entry in the root
+      # `[workspace.dependencies]` becomes dead weight that machete will never report — it checks
+      # what a *package* declares against what that package's sources use, and a workspace table is
+      # neither. (The middle row was a guess that turned out wrong: machete is not fooled by a
+      # mention in a comment. It is not the naive regex its reputation suggests.)
+      #
+      # It runs as its own step rather than replacing machete because the tool is rust-doctor's
+      # choice, not ours: the `dependencies` pass invokes cargo-machete and takes no option to swap
+      # it. This is the same shape as the `semver` job at the bottom of this file — rust-doctor's
+      # pass could not be pointed at the right baseline, so the check it would have done lives
+      # beside it instead of inside it. Keeping machete costs nothing (0.06 s) and keeps doctor's
+      # own pass honest rather than reporting `skipped-pass`.
+      #
+      # `if: always()` so a clippy finding above cannot hide a dependency finding here. Exit 1 on a
+      # finding, 0 when clean, both verified — so this gates.
+      - name: Unused dependencies the doctor pass cannot see (cargo-shear)
+        if: always()
+        run: cargo shear
 
       # A failing gate prints nothing useful: --sarif sends every finding to the file, so the step log
       # ends at "exit code 3" and the findings are only readable via the code-scanning API. Print them,

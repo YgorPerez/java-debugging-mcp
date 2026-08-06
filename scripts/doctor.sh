@@ -193,10 +193,28 @@ if [ "$FINDINGS" -eq 1 ]; then
   # matters: the workflow gained a COMMENT containing the words "cargo install" and the answer flipped to
   # yes, which silenced the "ran here, but not in the gate" section below — the section whose entire job is
   # to stop a local verdict being read as CI's. Prose cannot be allowed to answer a question about
-  # configuration. Yes/no was also too coarse to be true any more: CI installs cargo-deny and cargo-machete
-  # and deliberately does not install cargo-geiger or cargo-semver-checks, so the honest answer is a list.
+  # configuration. Yes/no was also too coarse to be true any more: CI installs cargo-deny, cargo-machete
+  # and cargo-shear, and deliberately does not install cargo-geiger or cargo-semver-checks, so the honest
+  # answer is a list. (cargo-shear appears in that list but matches no rust-doctor pass — it is a step of
+  # its own, for the reason the workflow gives at it. Extra names here are harmless: the list is only ever
+  # asked whether a pass that RAN has its tool in CI.)
+  #
+  # `head -1` IS THE FIX FOR A REAL BUG, and the bug is worth keeping described because the broken version
+  # produced a correct answer by accident. `tr -d '[:space:]'` deletes newlines as well as spaces, so two
+  # `tool:` lines collapsed into one string before `paste` could join them and the list came out as
+  # `…,cargo-machetecargo-semver-checks` — one nonsense entry where there should have been two names. The
+  # accident: the second `tool:` line belongs to the `semver` JOB, which installs cargo-semver-checks for
+  # `scripts/semver-check.sh`. Gluing it to its neighbour kept it out of the list, and out is right —
+  # rust-doctor's own semver pass is deliberately NOT in the gate (it would compare against the wrong
+  # crate), so it must keep reporting as "ran here, but not in the gate". Repairing only the `tr` would
+  # have added cargo-semver-checks to the list and silenced that line, which is the one outcome worse than
+  # the bug. So: scope the question to the health job's install step, which is what "does the SCAN have
+  # this tool" actually means, and strip blanks rather than all whitespace.
+  #
+  # If the health job ever gains a second install step, this reads only the first. Prefer keeping that
+  # job's tools on the one `tool:` line above adding another step.
   CI_TOOLS="$(sed -n 's/^[[:space:]]*tool:[[:space:]]*//p' .github/workflows/rust-doctor.yml 2>/dev/null |
-    tr -d '[:space:]' | paste -sd, -)"
+    head -1 | tr -d '[:blank:]')"
 
   verdict=0
   if ! command -v node >/dev/null 2>&1; then
@@ -303,6 +321,36 @@ process.stdout.write(out.join("\n") + "\n");
 // Same exit code rust-doctor's own gate uses, so this is usable as a pre-push check.
 process.exit(gated.length ? 3 : 0);
 JS
+
+  # cargo-shear gates in CI beside this scan, and rust-doctor's `dependencies` pass cannot reach what
+  # it checks: that pass runs cargo-machete, which compares what a PACKAGE declares against what that
+  # package's sources use — and an entry in the root `[workspace.dependencies]` is neither. Both members
+  # here take their dependencies through `<name>.workspace = true`, so a workspace entry whose last user
+  # goes away is dead weight machete reports as "Good job!". Measured, not assumed; the workflow carries
+  # the table.
+  #
+  # It runs HERE rather than only in CI so that `--findings` keeps meaning what it says. This script's
+  # whole claim is that a clean local run is a green gate; a check that gates in CI and not here would
+  # quietly retire that claim, which is the defect the "ran here, but not in the gate" section above
+  # exists to prevent — in the other direction.
+  if command -v cargo-shear >/dev/null 2>&1; then
+    shear_status=0
+    shear_out="$(cargo shear 2>&1)" || shear_status=$?
+    if [ "$shear_status" -ne 0 ]; then
+      printf '\n%s\n' "unused dependencies (cargo-shear): WOULD FAIL — this gates in CI."
+      printf '%s\n' "$shear_out" | sed 's/^/      /'
+      verdict=3
+    else
+      printf '\n%s\n' "unused dependencies (cargo-shear): would pass."
+    fi
+  else
+    # A pass that did not run reports nothing, which reads exactly like one that found nothing. That
+    # sentence is already in the skipped-pass section above; this is the same rule applied to our own step.
+    printf '\n%s\n' "not looked at here — cargo-shear is not installed, and it GATES in CI."
+    printf '%s\n' "      A clean run above is therefore not a green gate. Install it with"
+    printf '%s\n' "      \`cargo install cargo-shear --locked\` (or \`taiki-e/install-action\`, as CI does)."
+  fi
+
   exit "$verdict"
 fi
 

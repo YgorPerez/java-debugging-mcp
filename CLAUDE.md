@@ -34,7 +34,23 @@ the job summary — so nothing is silently dropped. Notes still reach you two ot
 the `rust-doctor-sarif` artifact, and `--findings` prints locally.
 
 **CI now installs `cargo-deny` and `cargo-machete`** (prebuilt, seconds), so those two passes are part of the
-gate — machete's first run found `anyhow` and `serde_json` declared and unused by `jdwp-client`. Three passes
+gate — machete's first run found `anyhow` and `serde_json` declared and unused by `jdwp-client`.
+
+**`cargo-shear` is installed too, and it is not a rust-doctor pass — it is a step of its own, because
+machete cannot see the case this workspace is shaped for.** Measured by planting one unused dependency in
+each position and running both: in a *member crate* both flag it; named only in a *source comment* both
+still flag it (machete is not the naive regex its reputation suggests — that was a guess, and it was
+wrong); but an unused entry in the root **`[workspace.dependencies]`** table is reported by shear and
+machete says "Good job!". Machete compares what a *package* declares against what that package's sources
+use, and a workspace table is neither. Both members here take everything through `<name>.workspace = true`,
+so an entry whose last user goes away is exactly the drift that would go unseen. Shear runs beside machete
+rather than replacing it because the tool is *rust-doctor's* choice — the `dependencies` pass invokes
+machete and takes no option to swap it — which is the same shape as the `semver` job below: a check
+rust-doctor could not be pointed at the right thing for, living next to it instead of inside it.
+`scripts/doctor.sh --findings` runs shear too, and **says so loudly when the binary is missing**, because a
+local run that skips a check that gates in CI would retire this script's whole claim.
+
+Three passes
 stay off deliberately and `rust-doctor.yml` says why at each one: `cargo-geiger` feeds the
 `unsafe-dependency` rule this repo ignores, `cargo-semver-checks` through *that* pass would compare against
 **bonk-dev's** unrelated `jdwp-client` on crates.io (ours are unpublished) and answer confidently from the
