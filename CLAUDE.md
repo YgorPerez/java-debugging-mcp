@@ -123,6 +123,18 @@ wanted, it needs `CLAUDE_CODE_OAUTH_TOKEN` set as a repository secret **first**,
 repo's actual risks (suspension honesty, resume verification, caller-visible replies) instead of "performance
 considerations".
 
+**A reworded reply is now a failing test, not a silent break** (TEST-46, #154). 163 substring
+assertions guard the tool replies and a substring check cannot see a *rewording* — which is the failure
+mode `docs/toolkit-contract.md` exists for, five of whose six downstream breakages are silent.
+`mcp-server/tests/reply-fragments.txt` pins the output of the **pure** renderers (`describe_step_filter`,
+`describe_trace_frames`, `describe_trace_exprs`, `merge_clamp_notes`, `describe_overridden_traces`) over
+a fixed table of inputs, so it needs no JVM, no cassette and no redaction. **Fragments and not whole
+replies, deliberately**: pinning everything makes each behaviour change a large diff and trains people
+to regenerate without reading, which is the DOC-7 (#108) failure the generated file's own header warns
+about. Regenerate with the **same** command as the other two snapshots —
+`UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot` — and then **read the diff and put it in
+the release notes**, because that is a caller-visible change.
+
 **The wire read path is fuzzed, and the half that matters runs on stable** (TEST-45, #153).
 `mcp-server/tests/malformed_wire.rs` rides on every `cargo test`: truncations and single-byte
 corruptions of the **real frames in the cassettes**, all 256 value tags against every short buffer, and

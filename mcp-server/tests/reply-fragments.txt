@@ -1,0 +1,62 @@
+# Caller-visible reply FRAGMENTS from the pure renderers. GENERATED — do not hand-edit:
+#     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot
+#
+# This file exists because 163 substring assertions cannot see a REWORDING, and a reworded
+# reply behind an unchanged tool name is the silent break docs/toolkit-contract.md is about.
+# A diff here is a caller-visible change: read it, and put it in the release notes.
+#
+# `·` marks a newline so one fragment stays on one line and a diff stays readable.
+
+## step_filter/none
+·   No class filter: this steps into framework and JDK code as well as yours.
+
+## step_filter/defaulted
+·   Stepping OVER java.*, jdk.* (the default set) — pass exclude_classes:[] to step into everything
+
+## step_filter/exclude-only
+·   Stepping OVER java.* (your exclude_classes)
+
+## step_filter/only-only
+·   Stepping ONLY within com.example.*
+
+## step_filter/both
+·   Stepping OVER java.* (your exclude_classes)·   Stepping ONLY within com.example.*
+
+## trace_frames/off
+
+
+## trace_frames/zero
+·   Caller frames: 0 (no caller frames are captured)
+
+## trace_frames/some
+·   Caller frames: 3
+
+## trace_frames/noted
+·   Caller frames: 3·   ⚠️  clamped from 99
+
+## trace_exprs/none
+
+
+## trace_exprs/one
+·   Trace expr: pedido.total
+
+## trace_exprs/several
+·   Trace expr[0]: a·   Trace expr[1]: b·   Trace expr[2]: c
+
+## clamp_notes/none
+
+
+## clamp_notes/first
+first
+
+## clamp_notes/second
+second
+
+## clamp_notes/both
+first·   ⚠️  second
+
+## overridden_traces/none
+
+
+## overridden_traces/one
+·⚠️  SUSPEND POLICY OVERRIDDEN — these trace:true stop points freeze the WHOLE VM on every hit, because a JDWP composite carries one suspend policy for the entire event set (the strongest any member asked for) and something suspending is armed at the same location:·   Foo.java:12 — escalated by Bar.java:34·   debug.list_stop_points marks them too; clearing the suspending stop point restores snapshot-and-resume.·
