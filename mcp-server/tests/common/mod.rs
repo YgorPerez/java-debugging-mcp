@@ -984,7 +984,7 @@ fn composite_event_kind(pkt: &[u8]) -> Option<u8> {
 /// `HotSpot` will not produce on demand.
 ///
 /// Some of this codebase's most important branches are the ones that report bad news, and several were
-/// unreachable from outside. TODO.md's coverage review names the worst case: `resume_all_fully`'s
+/// unreachable from outside. `docs/coverage.md`'s review names the worst case: `resume_all_fully`'s
 /// "the VM is STILL suspended" tail, which needs a suspend depth above `MAX_RESUME_ATTEMPTS`, and
 /// **cannot be built by any sequence of this tool's own calls** because `debug.pause` is idempotent
 /// (ADR-0003). That branch is the entire point of ADR-0003 — a resume that verifies instead of assuming —

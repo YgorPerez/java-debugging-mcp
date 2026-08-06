@@ -45,9 +45,11 @@ different way: REL-3 (#137) added `server.json`, the MCP registry manifest, so s
 server finds it from the registry rather than from a search engine reaching a Pages site.
 
 **Not that `TODO.md` should be published.** DOC-12's third question asked whether 182 KB of
-shipped-and-why belongs in public. It is an engineering log, it reads as one, and it is load-bearing for
-agents working in the repo. Publishing it would put the least audience-shaped document here on the most
-public surface, which is the reverse of what the issue wanted.
+shipped-and-why belongs in public, and the answer was that it is an engineering log and reads as one.
+That question has since been settled another way: `TODO.md` was **deleted**, its backlog role having
+already passed to GitHub issues and its shipped-and-why to the commit bodies the release notes publish
+verbatim. The ~215 lines other files actually cited were salvaged into `docs/coverage.md`, ADR-0003,
+ADR-0014 and `docs/agents/issue-tracker.md`.
 
 ## What would change this
 

@@ -73,7 +73,8 @@ links that already had one, which rustdoc accepts as inert text and clippy catch
 toolchain without you arranging anything — which is the half of the problem CI configuration could never
 reach. It replaces the sed that used to pull the number out of `rust-doctor.yml`; `scripts/doctor.sh` and
 `toolchain-pin.yml` both read the file now, and the number lives in exactly one place. The old
-`RUSTUP_TOOLCHAIN=… scripts/doctor.sh` recipe in `TODO.md` is history rather than instruction, and
+`RUSTUP_TOOLCHAIN=… scripts/doctor.sh` recipe is history rather than instruction (it lived in the
+since-deleted `TODO.md`), and
 doctor's "this run uses rustc X, but the gate is pinned to Y" warning is now a backstop that only fires
 when something outranks the file — `RUSTUP_TOOLCHAIN`, a `+toolchain`, or a rustc rustup does not manage.
 

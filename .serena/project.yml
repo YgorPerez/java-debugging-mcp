@@ -159,7 +159,7 @@ initial_prompt: |
     - docs/adr/       settled decisions, each with the rejected alternative and the evidence. Several
                       exist because a decision was nearly re-made wrongly later. Check for one before
                       changing suspension, invocation, read-only or budget behaviour.
-    - TODO.md         what shipped and why, including bugs found and how they were caught.
+    - docs/coverage.md  how coverage is measured, the reviewed gaps, and why there is no percentage gate.
     - CLAUDE.md       issue tracker and triage conventions.
 
   Two habits this codebase is built around, both learned from real bugs:

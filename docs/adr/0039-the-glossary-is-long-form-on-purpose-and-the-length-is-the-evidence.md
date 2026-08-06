@@ -64,7 +64,7 @@ what would actually be lost, since "we would lose nuance" is the kind of claim t
 The compression is not lossy in a recoverable way. The distinctions above were each learned from a
 specific failure — a stop point that stayed listed and never fired, a chain walk that initialised a lazy
 association, two ADRs that contradicted each other on the word "pin" — and the record of *which* failure
-taught *which* distinction exists nowhere else in this repo in that form. `TODO.md` holds what shipped and
+taught *which* distinction exists nowhere else in this repo in that form. the release notes hold what shipped and
 `docs/adr/` holds what was decided; neither is organised by *word*, which is the index a reader has when
 they are about to use the wrong one. Cutting the entry leaves the term correct and the trap invisible, and
 the trap is what the entry was written for.

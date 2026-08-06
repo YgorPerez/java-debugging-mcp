@@ -14,9 +14,13 @@ needs another visit, by someone with access.
 The second is that **some shapes cannot be produced at all**. ADR-0011's numbers came from probes;
 `FaultRelay` (`7db6318`) reached ADR-0003's honest-failure tail by making one reply lie. But a JVM that
 speaks `JDWP 1.5` is not a lie you can inject into one reply — it changes what the debugger *sends* next.
-TODO.md's TEST-11 row records the dead end explicitly: JDWP's version tracks the JDK's, the oldest JVM in
-the estate speaks 1.11, and so `debug.set_method_exit_stop`'s degraded-arming branch had never executed on
-any machine.
+TEST-11 ([#36](https://github.com/YgorPerez/java-debugging-mcp/issues/36)) recorded the dead end explicitly,
+and it is inlined here because that row lived in `TODO.md`, which is gone. **A JDK matrix cannot reach the
+`JDWP < 1.6` path.** JDWP's version tracks the JDK's, so JDK 11 — the oldest in the estate, and what the shared
+8180 runs — speaks JDWP 1.11; 8 is deliberately not a leg because nothing in the estate runs it. #36 measured
+the whole worry and retired it rather than confirming it (56/56 identical on 11, 17 and 21, so no test needs a
+version-gated skip), and the one thing left over was this branch: `debug.set_method_exit_stop`'s
+degraded-arming had never executed on any machine, and no matrix leg could make it.
 
 The proxy seam was already there twice — `LatencyRelay` and `FaultRelay` — and `7db6318` had written down
 the rule for when to merge them: *a third user is the point to unify, not the second.*

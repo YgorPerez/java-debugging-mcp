@@ -13458,7 +13458,7 @@ async fn escalate_to_vm_suspend(
     let Err(e) = session.connection.suspend_all().await else { return None };
     // Both halves or neither. "The condition matched" alone reads as a normal suspending hit and sends
     // the caller to `get_stack` on a moving target; "the suspend failed" alone loses the one thing they
-    // were waiting for. This is the resume-honesty family (ADR-0003, TODO.md) seen from the other side:
+    // were waiting for. This is the resume-honesty family (ADR-0003) seen from the other side:
     // there, a resume must not claim a freeze it did not lift; here, a stop point must not claim a
     // freeze it did not take.
     //

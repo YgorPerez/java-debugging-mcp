@@ -56,7 +56,7 @@ The gate is now `--fail-on warning` on a **pinned** toolchain (`.github/workflow
   than the number. Rejected because the drift above is what "ungated" actually looked like in practice —
   not a considered trade, but a silent one that was then mis-reported as pre-existing.
 
-Note the deliberate contrast with coverage, where `TODO.md` records a decision **not** to gate on a
+Note the deliberate contrast with coverage, where `docs/coverage.md` records a decision **not** to gate on a
 percentage. The difference is what the number means: a coverage percentage can be raised by tests that
 assert nothing, so the gate would measure the wrong thing, whereas a doctor warning is a specific finding
 at a specific line that is either fixed or not.

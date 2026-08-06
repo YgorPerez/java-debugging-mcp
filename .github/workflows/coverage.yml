@@ -9,7 +9,7 @@ name: coverage
 # build tools for link.exe). Linux has both, and a JDK for the probes. TEST-7 (#19) stalled on exactly
 # that, so the measurement lives here instead of depending on who has the right machine.
 #
-# There is deliberately NO percentage gate — the standing decision in TODO.md, and the reason is that
+# There is deliberately NO percentage gate — the standing decision in docs/coverage.md, and the reason is that
 # a coverage percentage rises with tests that assert nothing. The job still FAILS when the suite fails
 # or when nothing ran, because a report generated from a suite that did not execute is the failure mode
 # TEST-5 found (llvm-cov flushes counters in an atexit handler that SIGKILL skips, so the whole
@@ -81,7 +81,7 @@ jobs:
           {
             echo '## Coverage — unit + integration'
             echo ''
-            echo 'No percentage gate (see TODO.md). The per-file region column is the list worth reading:'
+            echo 'No percentage gate (see docs/coverage.md). The per-file region column is the list worth reading:'
             echo 'the branch nobody reaches is where the untested *states* hide.'
             echo ''
             echo '```'

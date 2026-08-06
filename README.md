@@ -214,8 +214,9 @@ StringReference, ArrayReference, ThreadReference, StackFrame and EventRequest co
 including `RedefineClasses`, `PopFrames`, `InvokeMethod` (instance and static), `Instances` /
 `InstanceCounts`, and the four `MONITOR_*` events — big-endian throughout, so Intel and ARM both work.
 
-Known open issues are tracked as [GitHub issues](https://github.com/YgorPerez/java-debugging-mcp/issues);
-`TODO.md` records what shipped and why, and `docs/adr/` the decisions that are settled.
+Known open issues are tracked as [GitHub issues](https://github.com/YgorPerez/java-debugging-mcp/issues),
+which are the authority on open work. [`docs/adr/`](docs/adr/) holds the decisions that are settled, and each
+release's notes carry the commit body of what shipped and why.
 
 ## References
 

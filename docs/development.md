@@ -1,5 +1,8 @@
 # Development
 
+> Coverage is documented separately in [`coverage.md`](coverage.md) — how it is measured, the gaps that
+> were reviewed once with a verdict each, and why there is deliberately no percentage gate.
+
 Building, testing and the lint gate. For what the tools *do*, see [`tools.md`](tools.md).
 
 ## Architecture
@@ -334,6 +337,6 @@ claude --system-prompt="$(serena prompts print-cc-system-prompt-override)"
 which is left to you, since it changes how you start Claude Code rather than anything in this repo.
 
 Serena's **memories are deliberately not versioned** (see `.gitignore`). This repo keeps its curated
-knowledge in `CONTEXT.md`, `docs/adr/` and `TODO.md`; an agent-written store beside those would give the
+knowledge in `CONTEXT.md` and `docs/adr/`; an agent-written store beside those would give the
 same facts two sources of truth. `.serena/project.yml`'s `initial_prompt` points Serena at those files
 instead.

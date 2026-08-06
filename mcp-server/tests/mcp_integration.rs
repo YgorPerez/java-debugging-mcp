@@ -2712,7 +2712,7 @@ fn a_monitors_only_dump_finds_the_cycle_for_a_fraction_of_the_packets() {
     assert!(!cheap.contains("(no frames)"), "nor claim the threads have none:\n{cheap}");
 
     // The actual saving, in the units the tool reports. DeadlockProbe's threads are only five frames
-    // deep, so this is the *shallow* end of the benefit — see the 60-thread measurement in TODO.md.
+    // deep, so this is the *shallow* end of the benefit — DUMP-2's commit measured a 60-thread dump.
     let (full_cost, cheap_cost) = (dump_cost(&full), dump_cost(&cheap));
     assert!(
         cheap_cost * 3 < full_cost * 2,
@@ -5804,7 +5804,7 @@ fn a_false_condition_holds_one_thread_and_a_true_one_stops_the_vm() {
     //
     // The stop point is CLEARED first, and that is not tidying. `CondProbe`'s worker calls the conditioned
     // line in a tight loop, so a breakpoint left armed across the resume re-fires immediately and keeps
-    // re-firing — which is the *disarm*-honesty case TODO.md deliberately keeps out of the resume-honesty
+    // re-firing — which is the *disarm*-honesty case ADR-0003 deliberately keeps out of the resume-honesty
     // matrix, because `continue` may legitimately re-freeze there. Leaving it armed made this assertion
     // fail on a loaded box against a VM that had genuinely been resumed, which is the confound rather than
     // the bug. Resume honesty for this state is asserted properly by the matrix's `ConditionEscalated`
@@ -6769,7 +6769,7 @@ fn assert_resume_is_honest(jdk: &Jdk, freeze: Freeze, resume: Resume) {
 ///
 /// This branch is why `resume_all_fully` exists — "resume" and "is it running" are different questions in
 /// JDWP, and a watchdog that reported success on the strength of a command returning OK was the SAFE-7 bug.
-/// It was also the one path TODO.md's coverage review called **unreachable through the tool's own API**:
+/// It was also the one path `docs/coverage.md`'s review calls **unreachable through the tool's own API**:
 /// getting there needs a suspend count that outlives `MAX_RESUME_ATTEMPTS` resumes, and since ADR-0003 made
 /// `debug.pause` idempotent, no sequence of this tool's own calls can build one. So the most important
 /// failure branch in the codebase had never executed, and the tests around it only ever proved the *success*
@@ -8000,7 +8000,8 @@ fn arm_a_traced_method_exit(server: &mut Server) -> Vec<String> {
 
 /// TEST-12 (#37): a JVM answering **`JDWP 1.5`** — the shape the issue names, and one nothing here can be.
 ///
-/// TODO.md's TEST-11 row states the problem and hands it to this issue: a JDK matrix cannot reach the
+/// TEST-11 (#36) states the problem and hands it to this issue, and ADR-0014 records it: a JDK matrix
+/// cannot reach the
 /// `JDWP < 1.6` branch, because JDWP's version tracks the JDK's and the oldest JVM in the estate speaks
 /// 1.11. So `debug.set_method_exit_stop`'s degraded arming — the one that tells a caller they will get the
 /// return *site* and not the return *value* — had never executed, and the warning it prints had never been

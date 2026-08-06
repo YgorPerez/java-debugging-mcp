@@ -97,7 +97,11 @@ means the same thing for both: *emit in a form that outlives the session*. The a
 names. This was checked deliberately before shipping rather than after, because one word doing two unrelated
 jobs is what `inherited` did for a day in ADR-0040.
 
-`get_version` was until now dead code in `jdwp-client`; the report is its first caller, and the one round trip
-it costs is worth it because "which JVM was this?" is the first question asked of an attached report and
+`get_version` was already reached — `can_get_method_return_values` calls it to decide between `METHOD_EXIT`
+kinds 41 and 42, so every `debug.set_method_exit_stop` has been going through it. (An earlier draft of this ADR
+called it dead code and the report its first caller. That was wrong, and the coverage review salvaged out of
+`TODO.md` is what caught it: it had recorded `get_version` as "now reached, 2 hits, via attach" and was right.)
+What the report adds is the first use of the *result* as an answer rather than as a version gate. The one round
+trip it costs is worth it because "which JVM was this?" is the first question asked of an attached report and
 `endpoint` does not answer it across a redeploy. A failure to read it is **stated** rather than omitted, since
 an absent line reads as "no VM information exists" when what happened is that one command failed.

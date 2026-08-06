@@ -5,7 +5,8 @@ variables. Every phase shipped; the document is kept as the record of what was p
 and the handful of decisions worth remembering.
 
 For the current tool list see [`tools.md`](tools.md). For where each roadmap item landed in the code, see
-the appendix of `TODO.md`.
+the appendix of `TODO.md`, which has since been deleted — the roadmap it tracked is complete and the
+follow-ups it named all shipped.
 
 ## The goal
 

@@ -3,7 +3,7 @@
 Seven parallel audits of the codebases this debugger is actually pointed at — `infotravel`,
 `it-common`, `api-common`, `it-pagamento`, `omnibees`, `integraWS`, plus the `infotravel-dev-toolkit`
 that ships the skills — cross-referenced against this tool's real capabilities. Items are in the
-`/to-issues` vertical-slice format TODO.md uses: JDWP primitive + wiring + a validation against a live
+`/to-issues` vertical-slice format in `docs/agents/issue-tracker.md`: JDWP primitive + wiring + a validation against a live
 probe.
 
 Ranked by (how often the bug shape occurs in those codebases) × (what the missing capability costs).
@@ -36,8 +36,8 @@ The **toolkit items** at the end are the exception: they are work in
 this one cannot see, so their status is not knowable from here. One of them did come back as work on this
 side — an unconfigured class root made the arm-time staleness warning silent, which reads as "your build
 is current" ([#130](https://github.com/YgorPerez/java-debugging-mcp/issues/130)): **shipped**, and the
-silence now means *compared and equal* rather than either that or "nobody looked" (DISC-14, see `TODO.md`
-§ Shipped).
+silence now means *compared and equal* rather than either that or "nobody looked" (DISC-14, #130 — its commit body is
+the record).
 
 ## The two items that are bugs, not gaps
 
