@@ -7,6 +7,35 @@
 # reads a 4000-character line in a diff (DOC-7, #108). Argument schemas are guarded separately,
 # in argument-schemas.txt, which the same command regenerates (DOC-8, #120).
 
+## debug.arm_stop_points
+Re-arm a whole investigation from a stop-point set that debug.list_stop_points produced with export:true — the
+inverse of that export, and the reason a repeat investigation does not have to be re-armed by hand. Pass the
+block back verbatim as `set`; the ```json fence it was shown inside is accepted, because that is how the
+export renders it. EVERY ENTRY GOES THROUGH THE ORDINARY debug.set_* HANDLER FOR ITS KIND, which is the design
+rather than an implementation detail: a set IS the list of those calls, so replaying it inherits every
+refusal, clamp, capability check, deferral and read-only rule those tools already enforce, instead of a second
+arming path that could drift from them — and the rules it would drift on are the ones that keep a shared JVM
+alive. So a broad suspending method exit is refused here exactly as it is there, and an invoking condition or
+trace_expr is refused under read_only exactly as it is there; arming itself is not a write to the debuggee, so
+read_only does not otherwise apply. IT IS NOT A GENERIC BATCH EXECUTOR. A set may name only the five arming
+tools, and an entry naming anything else is refused with the whitelist quoted — without that list this would
+be a way to invoke anything in this server from a blob of JSON. NOTHING ABORTS ON A BAD ENTRY and EVERY
+OUTCOME IS REPORTED PER ENTRY: the reply leads with `2 armed, 1 deferred, 1 refused` and then names each entry
+that is not plainly armed, with the tool's own reason. One refused location is a normal batch result, not a
+reason to leave the other twenty-nine unarmed — and an aggregate that read `4 armed` while one of the four was
+refused is the silence-reads-as-success failure this reply shape exists to prevent. Deferral is read off the
+session rather than out of the reply text, so it stays right when the wording changes. AN ENTRY MARKED
+DISABLED IS NOT ARMED, and this is deliberate rather than a limitation: it was off when you exported it, and
+arming-then-disabling would arm it for real in between, which on a suspending stop point is long enough to
+fire. Its arguments are still in the set, so arm it by hand from what is written there. LINES ARE NOT CHECKED
+AGAINST THE LOADED BYTECODE and the reply says so every time anything armed. A set carries line numbers, which
+are a claim about the build it came from; against a redeployed one they resolve to whatever is now on that
+line and arming reports success either way. Run debug.check_stale to settle it — it is a separate call because
+thirty entries would be thirty round trips, and a set re-armed ten seconds later against the same JVM needs
+none of them. A set that arms SUSPENDING stop points is warned about and not refused, because this is the one
+call that can arm many at once, where every other path arms one and you read a reply between each. A set from
+a NEWER build of this server is refused rather than read optimistically.
+
 ## debug.attach
 Open a debug session against a JVM that is ALREADY RUNNING with -agentlib:jdwp — host + port; nothing is
 launched for you, and the JVM must have been started with the agent before you got here. THE FIRST THING TO
@@ -395,7 +424,23 @@ IS REPORTED **SPENT** ONCE IT HAS FIRED, which is a third state and not a synony
 something YOU did with toggle_stop_point and can undo, spent is something the DEBUGGEE did — JDWP's Count
 modifier makes the JVM report the Nth occurrence and delete the request itself. Before this existed such a
 stop point was listed as armed forever, which is the same silence-reads-as-an-answer failure the Hits line
-above removes. toggle_stop_point re-arms a spent stop point with the same count.
+above removes. toggle_stop_point re-arms a spent stop point with the same count. PASS export:true TO GET THE
+SET BACK AS CONTENT YOU CAN KEEP, instead of a listing to read. A stop-point set dies with the process — stdio
+means the client's lifetime IS the session's — so eight stop points across four classes, with their
+conditions, trace_expr lists and hit_counts, are gone at disconnect and re-armed by hand tomorrow. The export
+is the list of debug.set_* calls that would recreate them, which is also exactly what debug.arm_stop_points
+takes back. THIS SERVER WRITES NO FILE AND READS NONE: you store the block, which keeps the safety model's
+reliance on process death being an unambiguous end of session, and means there is no policy here about where
+your output lands. TWO THINGS CANNOT CROSS INTO ANOTHER JVM AND ARE DROPPED RATHER THAN CARRIED, each named in
+the reply against the stop point it came from: an instance filter (a JDWP object id is a WEAK reference to one
+object in one JVM, ADR-0022) and a thread filter (same reason, and a pool that retires idle workers
+invalidates it even inside one JVM). Read those lines, because a dropped filter leaves that entry BROADER than
+the one you exported — on a shared instance that is the difference between a diagnostic and an outage.
+Resolved class, method and field ids are not in the set at all; it carries the class name, line and field name
+you gave and re-resolves them, which is what makes a set usable against a REDEPLOYED build rather than only
+against the same process. trace_max_hits in the set is the budget REMAINING, not the one you originally asked
+for, since that is the only one a session keeps — a stop point that has spent 190 of 200 exports with 10. A
+disabled or spent stop point is exported with its arguments and marked, and arm_stop_points will NOT arm it.
 
 ## debug.list_threads
 List threads by name (one `0x<id> <name>` line each). A JVM like WildFly has hundreds of threads — filter with

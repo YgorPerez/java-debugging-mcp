@@ -33,6 +33,7 @@ mod generics;
 mod handlers;
 mod protocol;
 mod session;
+mod stop_point_set;
 mod tools;
 mod value_reads;
 

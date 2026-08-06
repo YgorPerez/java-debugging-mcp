@@ -1367,6 +1367,22 @@ pub struct BreakpointInfo {
     pub class_pattern: String,
     pub line: u32,
     pub method: Option<String>,
+    /// The `line` the **caller** asked for, which is not always [`Self::line`] and is never `Some` when they
+    /// asked by method name (BP-8, #135).
+    ///
+    /// Kept for the export, and the distinction is the whole reason it exists. [`Self::line`] and
+    /// [`Self::method`] are what the *resolver* concluded — `method` is always `Some` once armed, filled in
+    /// from the method the line landed in. Exporting those would write a resolution artefact into a field that
+    /// means *request*: a stop point armed as `{line: 28}` would come back as `{line: 28, method: "classify"}`,
+    /// which on a redeployed build where line 28 has moved into another method resolves differently or is
+    /// refused outright. The same mistake as carrying an instance handle across a JVM, one level less obvious.
+    ///
+    /// So a set replays the caller's words. Both may be `Some` — a caller names both to disambiguate a line
+    /// that appears in more than one method — and both may be `None` only for a family member re-pointed from
+    /// a spec that had neither, which cannot arm.
+    pub arm_line: Option<i32>,
+    /// The `method` the **caller** asked for. See [`Self::arm_line`]; `None` when they armed by line alone.
+    pub arm_method: Option<String>,
     /// Whether the breakpoint is currently armed in the JVM. A disabled breakpoint stays listed (so
     /// its `condition`/`trace_expr` aren't lost) but has no JDWP request and never fires (BP-1).
     pub enabled: bool,

@@ -680,6 +680,38 @@ the whole point here is that this one is not)
 
 [#156]: https://github.com/YgorPerez/java-debugging-mcp/issues/156
 
+**Stop-point set**:
+The armed stop points of a session written as the list of `debug.set_*` calls that would recreate them, emitted
+by `debug.list_stop_points {export: true}` and re-armed by `debug.arm_stop_points`. **Content the client stores**
+— this server writes no file and reads none (ADR-0041).
+
+Its own term because it is not the live set and not a listing of it: it is a **description** of one, which
+survives the process the live set dies with. Under stdio the client's lifetime *is* the session's, so
+"tomorrow's investigation" begins with no stop points at all.
+
+**It carries what the caller asked for, never what the resolver concluded.** That distinction is the whole
+correctness of the thing, and it is not obvious: `BreakpointInfo`'s `line` and `method` are *resolved* values,
+and `method` is `Some` on every armed breakpoint whether the caller named one or not. A set records `arm_line`
+and `arm_method` instead, because writing a resolved method into a requested field turns `{line: 28}` into
+`{line: 28, method: "classify"}` — right on the build it came from, wrong on one where that line has moved.
+
+**What it cannot carry, it drops and names.** An **instance filter** and a **thread filter** are both handles
+into one JVM (ADR-0022), so both are dropped, each with its own sentence, and the entries they came from are
+left **broader** than what was exported. Said above the block rather than below it: below is past the point
+where a reader has started copying.
+
+_Avoid_: profile (the upstream `save_debug_profile` word; it implies storage the server does not have and names
+that it does not keep), session export (that is an **investigation report**, a different artefact — see
+ADR-0042; the two share the verb *export* and nothing else), saved breakpoints (it carries all five kinds plus
+wildcard families, and a set is not necessarily saved anywhere — it is handed back)
+
+**Export** (verb):
+To emit something in a form that outlives the session. Used of exactly two artefacts, the **stop-point set**
+and the **investigation report**, and it means the same thing for both — the artefacts differ, the verb does
+not. Deliberately checked before shipping: one word doing two unrelated jobs is what `inherited` did for a day
+(ADR-0040), and the test applied here is that both uses answer "emit it so it can leave", which they do.
+_Avoid_: save, dump (both imply this server writes it somewhere, and it does not)
+
 **Event set**:
 What the debuggee actually sends: **one** packet carrying one **event** per request that matched at that
 moment, plus a single suspend policy for all of them. Three stop points on one line produce one event set

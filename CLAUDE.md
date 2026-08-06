@@ -298,7 +298,7 @@ than a loop). Re-measured on 4 vCPU with no floor left: **shard 1/2 = 30.7 s at 
 amendments. Note what moved the needle each time: a *test* got faster, never the shard arithmetic.
 
 **Run the unsharded suite when you are working a flake.** `scripts/integration-test.sh` with no `--shard` still
-runs every `#[ignore]`d test in one process — **221** as of 2026-08-06, and DOC-15 (#145) now asserts that number against the binary rather than asking you to trust it — which is the contention CI used to have.
+runs every `#[ignore]`d test in one process — **224** as of 2026-08-06, and DOC-15 (#145) now asserts that number against the binary rather than asking you to trust it — which is the contention CI used to have.
 Count it rather than trusting that number (`<the-test-binary> --list --ignored | grep -c ': test$'`); this line
 said **164** for long enough that the figure was wrong by a third. Sharding *reduces* how many probe
 JVMs compete, so **a flake that stops reproducing under CI's new shape is not fixed** — #45, #56, #64 and #71

@@ -317,15 +317,41 @@ impl RequestHandler {
         name: &str,
         args: serde_json::Value,
     ) -> Option<Result<String, String>> {
+        // The five arming tools live in their own dispatch below, and the split is what makes
+        // `debug.arm_stop_points` possible at all: it replays entries through `dispatch_armable`, so routing
+        // them from *here* would make this function call itself and `async fn` recursion needs boxing.
+        //
+        // The better half of the accident is that `ARMABLE_TOOLS` is now load-bearing for routing rather than
+        // a second list beside it. A tool added to `dispatch_armable` and forgotten in the constant does not
+        // get dispatched at all, which is a loud failure; the two cannot quietly disagree about what a set is
+        // allowed to name.
+        if crate::stop_point_set::ARMABLE_TOOLS.contains(&name) {
+            return self.dispatch_armable(name, args).await;
+        }
+        Some(match name {
+            "debug.list_stop_points" => self.handle_list_stop_points(args).await,
+            "debug.clear_stop_point" => self.handle_clear_stop_point(args).await,
+            "debug.toggle_stop_point" => self.handle_toggle_stop_point(args).await,
+            // BP-8 (#135). Cannot recurse: `ARMABLE_TOOLS` does not contain this tool, so a set cannot name
+            // it, and the branch above is the only path back into the arming handlers.
+            "debug.arm_stop_points" => self.handle_arm_stop_points(args).await,
+            _ => return None,
+        })
+    }
+
+    /// The five tools that **arm** a stop point, and the only ones a stop-point set may name (BP-8, #135).
+    ///
+    /// Split out of [`Self::dispatch_stop_points`] so `debug.arm_stop_points` can replay a set through the real
+    /// handlers without the enclosing dispatch calling itself. Keep this in step with
+    /// [`crate::stop_point_set::ARMABLE_TOOLS`]; that constant is what routes to here, so the two cannot
+    /// disagree silently.
+    async fn dispatch_armable(&self, name: &str, args: serde_json::Value) -> Option<Result<String, String>> {
         Some(match name {
             "debug.set_line_stop" => self.handle_set_line_stop(args).await,
             "debug.set_exception_stop" => self.handle_set_exception_stop(args).await,
             "debug.set_field_stop" => self.handle_set_field_stop(args).await,
             "debug.set_method_exit_stop" => self.handle_set_method_exit_stop(args).await,
             "debug.set_monitor_stop" => self.handle_set_monitor_stop(args).await,
-            "debug.list_stop_points" => self.handle_list_stop_points(args).await,
-            "debug.clear_stop_point" => self.handle_clear_stop_point(args).await,
-            "debug.toggle_stop_point" => self.handle_toggle_stop_point(args).await,
             _ => return None,
         })
     }
@@ -725,13 +751,24 @@ impl RequestHandler {
     }
 
     async fn handle_list_stop_points(&self, args: serde_json::Value) -> Result<String, String> {
-        // Takes no arguments of its own, so this is purely the unknown-argument check every other
-        // tool gets from its own `deny_unknown_fields` struct (DOC-9, #132).
-        crate::args::parse::<crate::args::NoArgs>(&args)?;
+        // One argument of its own since BP-8 (#135); the parse is still also the unknown-argument check every
+        // other tool gets from its own `deny_unknown_fields` struct (DOC-9, #132).
+        let a: crate::args::ListStopPointsArgs = crate::args::parse(&args)?;
         let session_guard =
             self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
 
         let mut session = session_guard.lock().await;
+
+        // BP-8: the export form. Above the emptiness check below, deliberately — an export of a session with no
+        // stop points has to be an empty *set* and not the "No breakpoints set" prose. `arm_stop_points` still
+        // refuses an empty set, but it refuses it with "there is nothing to arm, which is what an export of a
+        // session with no stop points looks like" instead of "that is not JSON", and the difference between
+        // those two messages is a caller knowing whether they exported the wrong thing or nothing.
+        if a.export {
+            let export = crate::stop_point_set::export(&session);
+            drop(session);
+            return Ok(crate::stop_point_set::render_export(&export));
+        }
 
         if session.breakpoints.is_empty()
             && session.pending_breakpoints.is_empty()
@@ -802,6 +839,86 @@ impl RequestHandler {
         drop(session);
 
         Ok(output)
+    }
+
+    /// Re-arm a stop-point set exported by `debug.list_stop_points {export: true}` (BP-8, #135).
+    ///
+    /// **Every entry goes through the ordinary handler for its tool.** That is the design and not an
+    /// implementation shortcut: a set is a list of the `debug.set_*` calls that would recreate it, so replaying
+    /// it inherits every refusal, clamp, capability check, deferral and read-only rule those handlers already
+    /// enforce. A parallel arming path would be a second place for all of that to live and a second place for
+    /// it to drift out of step — and the rules it would drift on are the ones that keep a shared JVM alive.
+    ///
+    /// `read_only` therefore needs nothing here. Arming is not a write to the debuggee, and an *invoking*
+    /// `condition` or `trace_expr` is refused by the handler that receives it, exactly as it would be if the
+    /// caller had typed the call out. #135's open question asked, and the answer is that the existing check is
+    /// already in the right place.
+    ///
+    /// **Nothing aborts on a bad entry**, following the wildcard/list precedent (FILT-4): one refused location
+    /// is a normal batch result, not a reason to leave the other twenty-nine unarmed. Every outcome is reported
+    /// per entry (DISC-14, #130) — an aggregate that read `4 armed` while one of the four was refused would be
+    /// the same silence-reads-as-success defect that issue was filed about.
+    async fn handle_arm_stop_points(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::ArmStopPointsArgs = crate::args::parse(&args)?;
+        let entries = crate::stop_point_set::parse(&a.set)?;
+
+        // Resolved once and up front so a set is never half-armed against one session and half against
+        // another, and so "no session" is one refusal rather than N identical ones.
+        let session_guard = self
+            .resolve_session(&args)
+            .await
+            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
+
+        let session_id = args.get("session_id").cloned();
+        let mut outcomes: Vec<(String, crate::stop_point_set::ArmOutcome)> =
+            Vec::with_capacity(entries.len());
+        let mut suspending = 0usize;
+
+        for (i, entry) in entries.into_iter().enumerate() {
+            let label = describe_set_entry(i, &entry);
+            if !entry.enabled {
+                outcomes.push((label, crate::stop_point_set::ArmOutcome::SkippedDisabled));
+                continue;
+            }
+            // `trace` defaults to true on every kind that has it, so an absent flag is not a suspending stop
+            // point — read the same way the handlers read it rather than treating missing as false.
+            if entry.args.get("trace").and_then(serde_json::Value::as_bool) == Some(false) {
+                suspending += 1;
+            }
+
+            let call = route_to_session(entry.args, session_id.as_ref());
+
+            // Deferral is read off the session rather than sniffed out of the reply text. A substring check
+            // for "deferred" would be a reply-wording dependency of exactly the kind TEST-46 (#154) exists to
+            // stop, and it would silently start reporting every entry as armed the day that word changed.
+            let pending_before = session_guard.lock().await.pending_breakpoints.len();
+            let armed = self.dispatch_armable(&entry.tool, call).await;
+            let pending_after = session_guard.lock().await.pending_breakpoints.len();
+
+            outcomes.push((
+                label,
+                match armed {
+                    None => crate::stop_point_set::ArmOutcome::Refused(format!(
+                        "`{}` is not a tool this build can arm.",
+                        entry.tool
+                    )),
+                    Some(Err(why)) => crate::stop_point_set::ArmOutcome::Refused(why),
+                    Some(Ok(_)) if pending_after > pending_before => {
+                        crate::stop_point_set::ArmOutcome::Deferred
+                    }
+                    Some(Ok(_)) => crate::stop_point_set::ArmOutcome::Armed,
+                },
+            ));
+        }
+
+        let armed =
+            outcomes.iter().filter(|(_, o)| matches!(o, crate::stop_point_set::ArmOutcome::Armed)).count();
+        Ok(format!(
+            "📦 Stop-point set armed — {}{}{}",
+            crate::stop_point_set::describe_arm_outcomes(&outcomes),
+            crate::stop_point_set::describe_unverified_lines(armed),
+            crate::stop_point_set::describe_suspending(suspending),
+        ))
     }
 
     async fn handle_clear_stop_point(&self, args: serde_json::Value) -> Result<String, String> {
@@ -11009,23 +11126,8 @@ async fn try_arm_deferred_breakpoints(
                         // The other copies of a duplicated line (BP-4, #78). A refused copy shows only
                         // as a smaller count in `list_stop_points`, this being the event pump — there is
                         // no reply here to carry the reason.
-                        let mut arm = crate::session::BreakpointArm {
-                            class_id: cp_ref,
-                            method_id: method.method_id,
-                            bytecode_index: index,
-                            extra_locations: extra_code_indices
-                                .into_iter()
-                                .map(|bytecode_index| crate::session::ArmedLocation {
-                                    class_id: cp_ref,
-                                    method_id: method.method_id,
-                                    bytecode_index,
-                                })
-                                .collect(),
-                            suspend_policy: sp,
-                            hit_count: pend.hit_count,
-                            thread_filter: pend.thread_filter,
-                            instance_filter: pend.instance_filter,
-                        };
+                        let mut arm =
+                            deferred_arm(cp_ref, method.method_id, index, extra_code_indices, sp, &pend);
                         let extra_copies = arm_extra_line_copies(session, &arm).await;
                         arm.extra_locations = extra_copies.armed;
                         let mut request_ids = vec![req_id];
@@ -11050,6 +11152,9 @@ async fn try_arm_deferred_breakpoints(
                                 class_pattern: pend.class_pattern,
                                 line: u32::try_from(line).unwrap_or(0),
                                 method: Some(method.name),
+                                // BP-8, and the one kind that already stored these unresolved.
+                                arm_line: pend.line,
+                                arm_method: pend.method,
                                 drift,
                                 enabled: true,
                                 spent: false,
@@ -11084,6 +11189,38 @@ async fn try_arm_deferred_breakpoints(
     rearm_later_copies(session, cp_ref, &cp_sig).await;
     let _ = session.connection.resume_thread(cp_thread).await;
     true
+}
+
+/// The [`BreakpointArm`](crate::session::BreakpointArm) for a deferred breakpoint that has just resolved.
+///
+/// Extracted from [`try_arm_deferred_breakpoints`] only because that function reached its line limit — but the
+/// seam is a real one, since this is the part that translates a *resolved location* into the armed record and
+/// touches nothing about the pump or the pending list.
+///
+/// `extra` is the other bytecode copies of a duplicated line (BP-4, #78), each of which becomes an
+/// [`ArmedLocation`](crate::session::ArmedLocation) in the same class and method: a `CLASS_PREPARE` names
+/// exactly one reference type, so there is no cross-classloader multiplicity to fold in here.
+fn deferred_arm(
+    class_id: u64,
+    method_id: u64,
+    bytecode_index: u64,
+    extra: Vec<u64>,
+    suspend_policy: jdwp_client::SuspendPolicy,
+    pend: &crate::session::PendingBreakpoint,
+) -> crate::session::BreakpointArm {
+    crate::session::BreakpointArm {
+        class_id,
+        method_id,
+        bytecode_index,
+        extra_locations: extra
+            .into_iter()
+            .map(|bytecode_index| crate::session::ArmedLocation { class_id, method_id, bytecode_index })
+            .collect(),
+        suspend_policy,
+        hit_count: pend.hit_count,
+        thread_filter: pend.thread_filter,
+        instance_filter: pend.instance_filter,
+    }
 }
 
 /// Clear every stop-point request this session owns, of every event kind, and forget them.
@@ -12791,6 +12928,69 @@ fn record_discarded_exit(session: &mut crate::session::DebugSession, req_id: i32
     }
 }
 
+/// Name one entry of a stop-point set well enough to find it in a set of thirty (BP-8).
+///
+/// The index alone is useless in a reply a person reads, and the `from` id the export recorded is the id from
+/// the **old** session, which no longer means anything here. So it is the index plus what the entry actually
+/// arms, read out of the args it carries: the identity a caller recognises is the class and line they chose,
+/// not either id.
+fn describe_set_entry(i: usize, entry: &crate::stop_point_set::SetEntry) -> String {
+    let s = |key: &str| entry.args.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    let what = match entry.tool.as_str() {
+        "debug.set_line_stop" => {
+            let class = s("class_pattern").unwrap_or_else(|| "?".to_string());
+            entry.args.get("line").and_then(serde_json::Value::as_i64).map_or_else(
+                || format!("{class}.{}", s("method").unwrap_or_else(|| "?".to_string())),
+                |line| format!("{class}:{line}"),
+            )
+        }
+        "debug.set_exception_stop" => {
+            // An exception stop with no pattern is the every-exception form, which is a real and deliberate
+            // arming rather than a missing field — so it is named as such instead of rendering `?`.
+            s("class_pattern").map_or_else(|| "every exception".to_string(), |c| format!("exception {c}"))
+        }
+        "debug.set_field_stop" => format!(
+            "{}.{}",
+            s("class_name").unwrap_or_else(|| "?".to_string()),
+            s("field_name").unwrap_or_else(|| "?".to_string())
+        ),
+        "debug.set_method_exit_stop" => format!(
+            "{}.{} exit",
+            s("class_pattern").unwrap_or_else(|| "?".to_string()),
+            s("method").unwrap_or_else(|| "*".to_string())
+        ),
+        "debug.set_monitor_stop" => {
+            let kinds = entry.args.get("kinds").and_then(serde_json::Value::as_array).map_or_else(
+                || "blocked+acquired".to_string(),
+                |k| k.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("+"),
+            );
+            format!("monitor {kinds}")
+        }
+        other => other.to_string(),
+    };
+    format!("entries[{i}] {what}")
+}
+
+/// Point one set entry's arguments at the session `debug.arm_stop_points` was itself routed to (BP-8).
+///
+/// **Carried explicitly rather than left out.** Each `debug.set_*` handler resolves its own session from its
+/// own arguments, so a set armed against a *named* session whose entries said nothing would arm the **current**
+/// one instead — DOC-9's "a call executing against a JVM the caller did not name, reported as success", one
+/// level up. An entry that already names a session keeps it, since a hand-written set is allowed to be
+/// deliberate about that.
+///
+/// Its own function so the per-entry clone of the session id is not inside the arming loop: the id is one small
+/// value and copying it per entry is nothing, but a `.clone()` in a loop body is a shape worth not having.
+fn route_to_session(
+    mut args: serde_json::Value,
+    session_id: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    if let (Some(obj), Some(sid)) = (args.as_object_mut(), session_id) {
+        obj.entry("session_id").or_insert_with(|| sid.clone());
+    }
+    args
+}
+
 /// Retire a stop point that carries a `hit_count`, because this hit was its last (FILT-8).
 ///
 /// The bookkeeping is exact rather than heuristic, and this is why: `Count` means the JVM reports **only**
@@ -14171,6 +14371,9 @@ async fn arm_and_insert(
             class_pattern: spec.class_pattern.clone(),
             line: u32::try_from(line).unwrap_or(0),
             method: Some(method.name.clone()),
+            // BP-8: the caller's own locator, not the resolver's. See `BreakpointInfo::arm_line`.
+            arm_line: spec.line_opt,
+            arm_method: spec.method_hint.clone(),
             drift: drift.clone(),
             enabled: true,
             spent: false,

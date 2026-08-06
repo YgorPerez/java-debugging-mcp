@@ -119,7 +119,7 @@ pub const SESSION_ID_ARG: &str = "session_id";
 /// `debug.panic`, `debug.list_sessions`, `debug.list_stop_points` — and none of them used to parse their
 /// arguments at all, so an unknown argument to one of them was ignored however it was spelled. They parse
 /// this instead, which accepts `session_id` (stripped above) and nothing else, so strictness is the same
-/// across all thirty-eight rather than across the thirty that happened to have fields (DOC-9, #132).
+/// across all thirty-nine rather than across the thirty that happened to have fields (DOC-9, #132).
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NoArgs {}
@@ -587,6 +587,30 @@ pub struct GetLastEventArgs {
 pub struct ClearBreakpointArgs {
     /// Stop-point ID from `debug.list_stop_points`.
     pub breakpoint_id: String,
+}
+
+/// Arguments for `debug.list_stop_points` (BP-8, #135).
+///
+/// It parsed [`NoArgs`] until the export form existed, and `export` is the only argument it will accept while
+/// ADR-0015 holds: a flag may change how an answer is **rendered** and may not change what the question was.
+/// "What stop points are armed?" is the same question in both forms — one answers it for a reader, the other in
+/// a shape that can be handed back.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListStopPointsArgs {
+    /// Return the armed set as a machine-readable **stop-point set** instead of a listing, for
+    /// `debug.arm_stop_points` to take back later.
+    #[serde(default)]
+    pub export: bool,
+}
+
+/// Arguments for `debug.arm_stop_points` (BP-8, #135).
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArmStopPointsArgs {
+    /// A **stop-point set** from `debug.list_stop_points` with `export: true`, passed back verbatim. The
+    /// surrounding fenced-json block is accepted, since that is how the export renders it.
+    pub set: String,
 }
 
 /// Arguments for `debug.step_over` / `step_into` / `step_out`.

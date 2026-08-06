@@ -4239,6 +4239,215 @@ fn a_method_exit_that_does_match_reports_hits_and_discards_side_by_side() {
     server.panic_reset();
 }
 
+/// BP-8 (#135): a stop-point set survives losing every stop point, and re-arms all three kinds with the
+/// conditions and expressions they carried.
+///
+/// The whole claim of the feature in one test, and it is deliberately a *round trip* rather than an assertion
+/// about the exported text: an export nobody can arm is the failure mode that reads like success. `debug.panic`
+/// in the middle is what makes it real — it clears every stop point, so the second half is arming against a
+/// session that genuinely has none, exactly as a fresh process would.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_stop_point_set_re_arms_every_kind_it_carried_after_panic_cleared_them() {
+    let Some(jdk) = jdk_or_skip("a_stop_point_set_re_arms_every_kind_it_carried_after_panic_cleared_them")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    let line = probe_line(&probe_source("ReturnProbe"), "calls++;");
+
+    // Three kinds, each carrying something an export could plausibly lose: a condition, a trace_expr, and a
+    // method filter. All traced, so nothing freezes the probe.
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "ReturnProbe", "line": line, "trace": true,
+            "condition": "n > 1000000", "trace_expr": ["calls"],
+        }),
+    );
+    server.call(
+        "debug.set_field_stop",
+        serde_json::json!({"class_name": "ReturnProbe", "field_name": "calls", "modify": true, "trace": true}),
+    );
+    server.call(
+        "debug.set_method_exit_stop",
+        serde_json::json!({"class_pattern": "ReturnProbe", "method": "classify", "trace": true}),
+    );
+
+    let exported = server.call("debug.list_stop_points", serde_json::json!({"export": true}));
+    assert_contains_all(
+        "the export names every kind it carried and says nothing was written to disk",
+        &exported,
+        &["Stop-point set exported", "3 entries", "no filesystem write path", "debug.arm_stop_points"],
+    );
+    let block = set_block(&exported).unwrap_or_else(|| panic!("no ```json block in the export: {exported}"));
+    assert_contains_all(
+        "the block is the set of calls that would recreate the three stop points",
+        &block,
+        &[
+            "jdwp_mcp_stop_point_set",
+            "debug.set_line_stop",
+            "debug.set_field_stop",
+            "debug.set_method_exit_stop",
+            "n > 1000000",
+            "classify",
+        ],
+    );
+
+    // The line stop was armed with a line and NO method, so the set must not have acquired one. `method` is
+    // always `Some` on an armed breakpoint — the resolver fills in whichever method the line landed in — and
+    // the first version of this export wrote that into the args, turning `{line: 28}` into
+    // `{line: 28, method: "classify"}`. Harmless on this build and wrong on a redeployed one, where line 28
+    // may sit in another method: the entry would then resolve elsewhere or be refused. Checked by parsing
+    // rather than by a substring, because "classify" legitimately appears in the method-exit entry.
+    let parsed: serde_json::Value = serde_json::from_str(&block).expect("the exported block must be JSON");
+    let line_entry = parsed["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .find(|e| e["tool"] == "debug.set_line_stop")
+        .expect("no line-stop entry in the set");
+    assert_eq!(line_entry["args"]["line"], serde_json::json!(line), "the caller's line is what is recorded");
+    assert!(
+        line_entry["args"].get("method").is_none(),
+        "a line stop armed WITHOUT a method must not export the one the resolver inferred: {line_entry}"
+    );
+
+    // Everything gone, which is what the next process would look like.
+    server.panic_reset();
+    let empty = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(!empty.contains("bp_"), "panic must have cleared the set being restored: {empty}");
+
+    let armed = server.call("debug.arm_stop_points", serde_json::json!({"set": block}));
+    assert_contains_all(
+        "the reply leads with per-entry counts and disclaims the line check it did not do",
+        &armed,
+        &["3 armed, 0 deferred, 0 refused", "NOT checked", "check_stale"],
+    );
+
+    // The point of the round trip: the details that are easy to get wrong came back, not just the locations.
+    let restored = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert_contains_all(
+        "the restored stop points carry their condition, expression and method filter",
+        &restored,
+        &["n > 1000000", "calls", "classify"],
+    );
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).is_some(),
+        "the probe must still be running — every restored stop point was traced\n  output: {:?}",
+        probe.output(),
+    );
+    server.panic_reset();
+}
+
+/// A thread filter cannot cross into another JVM, so the export drops it and says the entry is now BROADER.
+///
+/// #135's body named only instance filters. A thread id is the same problem for the same reason, and this is
+/// the half that can be tested without persuading the debuggee to collect an object: `list_stop_points` already
+/// warns about the two separately (FILT-2 and FILT-9) because the cause and fix differ, and the export follows
+/// that split rather than inventing one warning for both.
+///
+/// The load-bearing assertion is the **absence** of the filter from the block. A warning beside a set that
+/// still carried the id would be worse than either: it would read as handled.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_exported_set_drops_a_thread_filter_and_says_the_entry_is_now_broader() {
+    let Some(jdk) = jdk_or_skip("an_exported_set_drops_a_thread_filter_and_says_the_entry_is_now_broader")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    let line = probe_line(&probe_source("ReturnProbe"), "calls++;");
+    let idle = thread_hex_for(&mut server, "Reference Handler")
+        .expect("no Reference Handler thread — expected in every HotSpot");
+    let arm = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "ReturnProbe", "line": line, "trace": true, "thread_id": idle,
+        }),
+    );
+    let bp = stop_id(&arm, "bp_").expect("no bp_ id in the filtered arm reply");
+
+    let exported = server.call("debug.list_stop_points", serde_json::json!({"export": true}));
+    assert_contains_all(
+        "the export names the dropped filter, the stop point it came from, and the consequence",
+        &exported,
+        &["Thread filter DROPPED", &bp, "BROADER", "list_threads"],
+    );
+
+    let block = set_block(&exported).unwrap_or_else(|| panic!("no ```json block: {exported}"));
+    assert!(
+        !block.contains("thread_id"),
+        "the set must NOT carry the filter it just said it dropped — a warning beside a set that still \
+         carried the id would read as handled: {block}"
+    );
+    // The `0x` prefix is load-bearing in this assertion. Checking the bare hex digits instead is what the
+    // first version did, and it failed against a correct export: the Reference Handler's id is a short hex
+    // string, so its digits occur in `"line": 28` and in the format version. A substring check needs a needle
+    // that cannot occur by accident, and only the prefixed form is one — a JSON number never renders as `0x…`.
+    assert!(!block.contains(&idle), "nor the raw id anywhere else in the set: {block}");
+
+    // And it really does re-arm — broader, as advertised, rather than refused for the missing filter.
+    server.panic_reset();
+    let armed = server.call("debug.arm_stop_points", serde_json::json!({"set": block}));
+    assert!(armed.contains("1 armed"), "the entry re-arms without its filter: {armed}");
+    server.panic_reset();
+}
+
+/// The set is refused rather than half-applied when it is not a set at all, and the refusals reach the caller
+/// through the tool rather than only through the unit tests of the parser.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn arm_stop_points_refuses_anything_that_is_not_a_set() {
+    let Some(jdk) = jdk_or_skip("arm_stop_points_refuses_anything_that_is_not_a_set") else { return };
+    let mut probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    // The likeliest mistake by far: handing back the listing a human reads instead of the exported block.
+    let listing = server.call("debug.list_stop_points", serde_json::json!({}));
+    let refused = server.call("debug.arm_stop_points", serde_json::json!({"set": listing}));
+    assert!(
+        refused.contains("rendered listing") || refused.contains("not JSON"),
+        "passing the listing back must be refused by naming the mistake: {refused}"
+    );
+
+    // The whitelist, through the real tool: a set may arm stop points and nothing else.
+    let sneaky = serde_json::json!({
+        "set": r#"{"jdwp_mcp_stop_point_set":1,"entries":[{"tool":"debug.disconnect","args":{}}]}"#
+    });
+    let blocked = server.call("debug.arm_stop_points", sneaky);
+    assert_contains_all(
+        "an entry naming a non-arming tool is refused with the whitelist quoted",
+        &blocked,
+        &["debug.disconnect", "whitelist", "debug.set_line_stop"],
+    );
+    // It must not have run: a refusal that disconnected first would be the worst possible outcome.
+    assert!(
+        !server.call("debug.list_stop_points", serde_json::json!({})).contains("No active debug session"),
+        "the refused entry must not have been executed"
+    );
+    server.panic_reset();
+}
+
+/// The fenced json block out of an export reply, or `None` if there is not one.
+///
+/// Returns `None` rather than the whole reply on a miss, so a test that expected a block fails at the
+/// extraction with the reply attached instead of passing a listing into `arm_stop_points` and failing later
+/// with a confusing refusal.
+fn set_block(reply: &str) -> Option<String> {
+    let after = reply.split("```json").nth(1)?;
+    Some(after.split("```").next()?.trim().to_string())
+}
+
 /// Pull `exits discarded: N` out of a `debug.list_stop_points` reply.
 ///
 /// Returns `None` when the line is absent, which the callers above turn into a failure with the listing
