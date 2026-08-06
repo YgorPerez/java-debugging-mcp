@@ -1,0 +1,29 @@
+# The toolchain this repo lints, formats and builds with by default — and the reason it is a FILE rather
+# than seven copies of a version string across five workflows (LINT-5, #141).
+#
+# The channel below is the GATE's toolchain. LINT-1 (#18) pinned it because rust-doctor fails on warnings,
+# so an unpinned `stable` would let a new pedantic lint in a future clippy redden a build on code nobody
+# touched. LINT-2 (#28) is what keeps the pin from going stale: toolchain-pin.yml compares it against
+# stable monthly, gates on nothing, and files an issue when it falls behind.
+#
+# WHAT THIS FILE ADDS is the local half, which no amount of CI configuration could reach. rustup honours a
+# toolchain file automatically, so `cargo clippy` in this directory now runs the same compiler the gate
+# runs. That was the actual gap LINT-5 named: scripts/doctor.sh could only *warn* that your rustc differed,
+# and that warning exists because the mismatch had already cost a red `main` — two
+# `Duration::from_millis(1000)` passed a local 1.94 run at 100/100 and failed CI on
+# `clippy::duration_suboptimal_units`, a lint 1.97 added.
+#
+# IT OUTRANKS BOTH `rustup default` AND `dtolnay/rust-toolchain@stable`, which is the trap in adding it.
+# A job that asked for `stable` and silently got this pin instead would look exactly like a job that
+# passed — this repo's recurring failure shape, and the one CLAUDE.md keeps writing post-mortems about.
+# Two things hold it off: every job wanting a different toolchain passes it explicitly to
+# .github/actions/setup-rust *and says why at the call site*, and that action prints the compiler it
+# actually ended up on. Read the printed line, not the request.
+#
+# `components` is what rustup installs for a local clone — the path this file exists to fix. CI does not
+# inherit it: .github/actions/setup-rust passes an explicit toolchain to dtolnay/rust-toolchain, so each
+# job names the components it needs at its own call site (coverage adds llvm-tools-preview, toolchain-pin
+# adds clippy). Keep this list to what a contributor running `cargo fmt` and `scripts/doctor.sh` needs.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]

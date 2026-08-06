@@ -58,10 +58,12 @@ jobs:
       # the earlier `--fail-on error` compromise came about in the first place. Pinning moves that from
       # a surprise into a scheduled bump: raise this number, fix what the new clippy finds, commit both
       # together. rust-doctor itself is already pinned (0.2.0, below and in scripts/doctor.sh).
+      # No `toolchain:` input: this is the job the pin exists for, so it takes rust-toolchain.toml's
+      # channel. That file is now the one place the number lives — scripts/doctor.sh and
+      # toolchain-pin.yml read it from there too.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: "1.97.1"
           components: clippy, rustfmt
 
       # Formatting, on the SAME pinned toolchain as the lint below and for the same reason: rustfmt's
@@ -74,9 +76,6 @@ jobs:
       # rustfmt.toml for where the two settings came from — both measured off this tree, not chosen.
       - name: Check formatting
         run: cargo fmt --all --check
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
 
       # Clippy only re-lints what it rebuilds, so a warm cache makes this gate check ONLY the crates that
       # changed — a pre-existing warning in an untouched crate is silently absent from the report and
@@ -286,9 +285,10 @@ jobs:
           fetch-depth: 0 # tags and history: the baseline is a tag, not a registry
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: "1.97.1" # the pin the health scan uses, for the same reason
+          # No `toolchain:` — the same pin the health scan uses, for the same reason, now from one file.
+          cache: "false"
 
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@v2

@@ -116,22 +116,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # `@stable`, matching tests.yml and coverage.yml — NOT rust-doctor.yml's "1.97.1". That pin exists
+      # `stable`, matching tests.yml and coverage.yml — NOT the pin in rust-toolchain.toml. That pin exists
       # for exactly one reason (#18): rust-doctor fails the build on clippy warnings, so a new lint in a
       # newer toolchain would break code nobody touched. This job compiles and gates on nothing, so a
       # second pinned version number here would buy no safety and add a second thing to remember to bump
       # — the maintenance hazard LINT-2 (#28) is about.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
+          # Explicit, because rust-toolchain.toml pins the gate's toolchain and would otherwise govern here — and
+          # shipping release binaries built by an old pinned compiler is not what that pin is for.
+          toolchain: stable
           targets: ${{ matrix.target }}
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
           # rust-cache keys on job and host, not on --target, so without this the two macOS slices share
           # the arm64 runner's cache entry and fight over it.
-          key: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}
 
       # GLIBC: the Linux slice is static musl, not glibc, and that is a deliberate answer to where these
       # binaries run. This debugger attaches to Java app servers, which are routinely older than a GitHub

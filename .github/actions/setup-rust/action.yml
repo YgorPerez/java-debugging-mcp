@@ -1,0 +1,117 @@
+name: setup-rust
+description: Install a Rust toolchain and restore the cargo cache, defaulting the channel to rust-toolchain.toml.
+
+# CI-7 (#152). Toolchain-plus-cache setup was copy-pasted across seven call sites in five workflows and
+# had already diverged: two of them used `dtolnay/rust-toolchain@master` with a hardcoded "1.97.1", four
+# used `@stable`, and the cache was configured three different ways.
+#
+# This is deliberately sequenced AFTER LINT-5 (#141) added rust-toolchain.toml, because on its own it
+# would have been worth almost nothing: a composite action that hardcoded `stable` just relocates the
+# duplication. With the file, one place governs the channel and this action is what makes that true of
+# all seven jobs.
+#
+# WHAT IT DOES NOT DO is decide which toolchain a job wants. That reasoning lives at each call site, in
+# the comment already written there, because "why is this leg on stable" is a question about the leg.
+
+inputs:
+  toolchain:
+    description: >
+      Toolchain to install. Leave empty to take the channel from rust-toolchain.toml — the gate's pin,
+      and the one a local `cargo` already uses. Pass a value only where the job needs a DIFFERENT
+      toolchain, and say why at the call site.
+    required: false
+    default: ""
+  components:
+    description: Extra rustup components, comma-separated. rust-toolchain.toml already installs clippy and rustfmt.
+    required: false
+    default: ""
+  targets:
+    description: Extra compilation targets, comma-separated.
+    required: false
+    default: ""
+  cache:
+    description: Set to "false" for a job that must run cold. toolchain-pin.yml is the one that does.
+    required: false
+    default: "true"
+  cache-key:
+    description: Passed to rust-cache as `key`. Needed where one job name covers several builds (release's --target matrix).
+    required: false
+    default: ""
+  cache-shared-key:
+    description: Passed to rust-cache as `shared-key`. Needed where several job names should share one entry (the test legs).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Read through an env var rather than interpolating `${{ inputs.toolchain }}` straight into the
+    # script: the value is repo-controlled here, but template expansion inside `run:` is the shape
+    # zizmor flags as template-injection and there is no reason to add one.
+    - name: Resolve the toolchain
+      id: resolve
+      shell: bash
+      env:
+        REQUESTED: ${{ inputs.toolchain }}
+      run: |
+        want="$REQUESTED"
+        source="the call site"
+        if [ -z "$want" ]; then
+          want="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)"
+          source="rust-toolchain.toml"
+        fi
+        if [ -z "$want" ]; then
+          echo "::error::no toolchain input, and the channel could not be read from rust-toolchain.toml — the sed that reads it no longer matches the file"
+          exit 1
+        fi
+        echo "toolchain=$want" >> "$GITHUB_OUTPUT"
+        echo "source=$source" >> "$GITHUB_OUTPUT"
+
+    - name: Install the toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ steps.resolve.outputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    # INSTALLING A TOOLCHAIN IS NOT THE SAME AS USING IT, and this step is the difference.
+    # rust-toolchain.toml outranks `rustup default`, which is what dtolnay/rust-toolchain sets — so
+    # without this, a job asking for `stable` gets stable installed and then runs every `cargo` command
+    # on the pin anyway. Measured, because the first version of this action shipped without it:
+    #
+    #   rustup default 1.85.0, file present   -> 1.97.1   (the file wins)
+    #   RUSTUP_TOOLCHAIN=1.85.0, file present -> 1.85.0   (the env wins)
+    #   cargo +1.85.0, file present           -> 1.85.0   (the command line wins)
+    #
+    # `RUSTUP_TOOLCHAIN` is the one of those three that reaches every later step in the job, so it is
+    # the one that makes `toolchain:` mean what it says. Set only when a toolchain was asked for
+    # explicitly: with no input the file is meant to govern, and shadowing it with an env var would hide
+    # the source of truth behind a copy of itself.
+    - name: Make the requested toolchain govern the rest of the job
+      if: inputs.toolchain != ''
+      shell: bash
+      env:
+        REQUESTED: ${{ inputs.toolchain }}
+      run: echo "RUSTUP_TOOLCHAIN=$REQUESTED" >> "$GITHUB_ENV"
+
+    - name: Cache cargo artifacts
+      if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}
+        shared-key: ${{ inputs.cache-shared-key }}
+
+    # THE SAFETY RAIL, and the reason this action is worth having beyond deduplication. The step above
+    # is what SHOULD make the request take effect; this is what proves it did on this runner. A leg that
+    # asked for `stable` and silently ran on the pin would otherwise be indistinguishable from one that
+    # did what it said — and that failure was real, not hypothetical: this action's first version had no
+    # RUSTUP_TOOLCHAIN step and would have quietly moved all six test legs onto the pin.
+    #
+    # The test legs already print `JDK in use:` and CLAUDE.md tells you to quote that line rather than
+    # your intent. Same instruction, same reason. Quote what it printed.
+    - name: Rust in use
+      shell: bash
+      run: |
+        actual="$(rustc -vV | sed -n 's/^release: *//p')"
+        echo "Rust in use: ${actual} (asked for '${{ steps.resolve.outputs.toolchain }}', from ${{ steps.resolve.outputs.source }})"
+        rustc -vV

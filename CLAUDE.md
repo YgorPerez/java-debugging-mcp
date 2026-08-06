@@ -68,6 +68,24 @@ fails the gate on a `pub(crate)` item inside a private module. Two of the 85 wer
 a careless bulk fix**: a regex that appended `(crate::X)` to every `[`X`]` doubled the target on the two
 links that already had one, which rustdoc accepts as inert text and clippy catches as a bare path.
 
+**`rust-toolchain.toml` now decides which compiler you are using, including locally** (LINT-5, #141).
+`rustup` honours it, so `cargo fmt` and `scripts/doctor.sh` in this directory run the gate's pinned
+toolchain without you arranging anything — which is the half of the problem CI configuration could never
+reach. It replaces the sed that used to pull the number out of `rust-doctor.yml`; `scripts/doctor.sh` and
+`toolchain-pin.yml` both read the file now, and the number lives in exactly one place. The old
+`RUSTUP_TOOLCHAIN=… scripts/doctor.sh` recipe in `TODO.md` is history rather than instruction, and
+doctor's "this run uses rustc X, but the gate is pinned to Y" warning is now a backstop that only fires
+when something outranks the file — `RUSTUP_TOOLCHAIN`, a `+toolchain`, or a rustc rustup does not manage.
+
+**The file outranks `dtolnay/rust-toolchain@stable`, so every job that wants a different toolchain says so
+at its own call site**, through `.github/actions/setup-rust` (CI-7, #152), which collapsed seven
+copy-pasted toolchain-plus-cache blocks across five workflows. The test, coverage and release legs pass
+`stable` deliberately — they are the signal that the code still builds on current Rust, which a pinned
+gate cannot give you — and the composite action **prints `Rust in use:` in every job**. Quote that line
+rather than the `toolchain:` you asked for, for exactly the reason you quote `JDK in use:` rather than
+your intent: a leg that asked for `stable`, silently got the pin, and passed is indistinguishable from one
+that did what it said.
+
 Three passes
 stay off deliberately and `rust-doctor.yml` says why at each one: `cargo-geiger` feeds the
 `unsafe-dependency` rule this repo ignores, `cargo-semver-checks` through *that* pass would compare against

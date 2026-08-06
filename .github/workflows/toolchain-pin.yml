@@ -2,7 +2,7 @@ name: toolchain-pin
 
 # Who bumps the pin, and on what trigger (LINT-2, #28).
 #
-# `rust-doctor.yml` gates on warnings against Rust 1.97.1, pinned so that a new pedantic lint in a
+# `rust-doctor.yml` gates on warnings against the Rust version `rust-toolchain.toml` pins, so that a new pedantic lint in a
 # future clippy cannot break a build on code nobody touched (LINT-1, #18). The cost of that pin is the
 # other kind of drift: the repo lints against one clippy until somebody raises the number, and nothing
 # was scheduled to. The longer the gap, the bigger the batch of new lints when it finally moves.
@@ -64,25 +64,41 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
+          # `stable` is this job's entire purpose: it exists to find out what stable is now and compare
+          # it against the pin. Taking the pin from rust-toolchain.toml here would compare it to itself.
+          toolchain: stable
           components: clippy
+          # No cargo cache, deliberately — see the note further down.
+          cache: "false"
 
-      # Read BOTH pins out of the gate's own workflow rather than repeating the numbers here. A second
-      # copy of "1.97.1" is a second thing to remember to bump, which is the maintenance hazard this
-      # issue is about; release.yml declines to carry one for the same reason. The rust-doctor version
-      # matters just as much: an advisory scan run by a different tool than the gate answers a question
-      # nobody asked. scripts/doctor.sh reads the toolchain with the identical sed.
+      # Read BOTH pins from where they live rather than repeating the numbers here. A second copy of
+      # the pinned version is a second thing to remember to bump, which is the maintenance hazard this workflow is
+      # about; release.yml declines to carry one for the same reason. The rust-doctor version matters
+      # just as much: an advisory scan run by a different tool than the gate answers a question nobody
+      # asked.
+      #
+      # THE TOOLCHAIN MOVED (LINT-5, #141). It used to be a YAML string in rust-doctor.yml and this job
+      # sed'd it out of there; it is now `channel` in rust-toolchain.toml, which is also what rustup
+      # reads, so the number the gate uses and the number your local `cargo` uses cannot drift apart.
+      # scripts/doctor.sh reads it from the same file with the identical sed. The rust-doctor version is
+      # still a workflow string, so that one is still read from rust-doctor.yml.
       - name: Compare stable against the pin
         id: pin
         shell: bash
         run: |
           gate=.github/workflows/rust-doctor.yml
-          pinned="$(sed -n 's/.*toolchain: *"\([0-9][0-9.]*\)".*/\1/p' "$gate" | head -1)"
+          toolchain_file=rust-toolchain.toml
+          pinned="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$toolchain_file" | head -1)"
           doctor="$(sed -n 's/.*rust-doctor@\([0-9][0-9.]*\).*/\1/p' "$gate" | head -1)"
           stable="$(rustc -vV | sed -n 's/^release: *//p')"
-          if [ -z "$pinned" ] || [ -z "$doctor" ]; then
-            echo "::error::could not read the pinned toolchain ('$pinned') and rust-doctor version ('$doctor') out of $gate — the seds that read them no longer match the file"
+          if [ -z "$pinned" ]; then
+            echo "::error::could not read the pinned toolchain out of $toolchain_file — the sed that reads it no longer matches the file"
+            exit 1
+          fi
+          if [ -z "$doctor" ]; then
+            echo "::error::could not read the rust-doctor version ('$doctor') out of $gate — the sed that reads it no longer matches the file"
             exit 1
           fi
           echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
@@ -92,7 +108,7 @@ jobs:
             echo "behind=false" >> "$GITHUB_OUTPUT"
             echo "## The pin is current" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`rust-doctor.yml\` is pinned to \`$pinned\`, which is stable. Nothing to do." >> "$GITHUB_STEP_SUMMARY"
+            echo "\`rust-toolchain.toml\` is pinned to \`$pinned\`, which is stable. Nothing to do." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "behind=true" >> "$GITHUB_OUTPUT"
           fi
@@ -127,7 +143,7 @@ jobs:
           pinned, stable = os.environ["PINNED"], os.environ["STABLE"]
           lines = []
           if rows:
-              lines.append(f"Rust **{stable}** is out. `.github/workflows/rust-doctor.yml` is pinned to "
+              lines.append(f"Rust **{stable}** is out. `rust-toolchain.toml` is pinned to "
                            f"**{pinned}**, and the gate's own scan on {stable} reports "
                            f"**{len(rows)} warning/error finding(s)** that the pinned clippy does not:\n")
               # Capped, because a body over GitHub's 65k limit is a 422 and no notification at all —
@@ -141,7 +157,7 @@ jobs:
                            "toolchain and the code that satisfies it land together.")
           else:
               lines.append(f"Rust **{stable}** is out and the gate's scan on it is **clean**. "
-                           f"`.github/workflows/rust-doctor.yml` is pinned to **{pinned}**; raising it to "
+                           f"`rust-toolchain.toml` is pinned to **{pinned}**; raising it to "
                            f"{stable} costs one line and no cleanup.")
           lines.append("\n---\n")
           lines.append(f"Filed by `.github/workflows/toolchain-pin.yml` (LINT-2, #28), which runs "

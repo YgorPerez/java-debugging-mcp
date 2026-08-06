@@ -45,12 +45,11 @@ jobs:
       # warnings and a new clippy lint would break untouched code. Nothing here gates on a number, so a
       # toolchain bump can only change the figure, which is the thing we want current anyway.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
+          # Explicit, because rust-toolchain.toml pins the gate's toolchain and would otherwise govern here.
+          toolchain: stable
           components: llvm-tools-preview
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
 
       # Prebuilt binary — `cargo install cargo-llvm-cov` from source costs several minutes.
       - name: Install cargo-llvm-cov

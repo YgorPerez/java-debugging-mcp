@@ -103,9 +103,17 @@ export CLIPPY_CONF_DIR="$PWD"
 # same shape as this repo's other green-runs-of-nothing (SIGKILL'd coverage counters, an undetectable JDK,
 # a filter matching no tests): a check that reported success without having looked.
 #
-# Read from the workflow rather than duplicated here, so the two cannot drift apart. A mismatch warns
-# rather than fails: running on whatever you have is still worth doing, as long as you know what it means.
-PINNED_TOOLCHAIN="$(sed -n 's/.*toolchain: *"\([0-9][0-9.]*\)".*/\1/p' .github/workflows/rust-doctor.yml | head -1)"
+# Read from rust-toolchain.toml rather than duplicated here, so the two cannot drift apart. A mismatch
+# warns rather than fails: running on whatever you have is still worth doing, as long as you know what it
+# means.
+#
+# THIS IS NOW A BACKSTOP RATHER THAN THE MECHANISM (LINT-5, #141). rustup honours rust-toolchain.toml on
+# its own, so in a normal clone the active toolchain already IS the pin and this warning stays quiet. It
+# is kept for the cases where the file cannot do its job: `RUSTUP_TOOLCHAIN` set in the environment (which
+# outranks it), a `+toolchain` override, or a rustc that rustup does not manage. A quiet warning that has
+# nothing left to warn about is not the same as one that was deleted — this one still fires on the
+# override that reintroduces the exact failure it was written for.
+PINNED_TOOLCHAIN="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)"
 ACTIVE_TOOLCHAIN="$(rustc -vV 2>/dev/null | sed -n 's/^release: *//p')"
 if [ -n "$PINNED_TOOLCHAIN" ] && [ -n "$ACTIVE_TOOLCHAIN" ] && [ "$PINNED_TOOLCHAIN" != "$ACTIVE_TOOLCHAIN" ]; then
   cat >&2 <<EOF

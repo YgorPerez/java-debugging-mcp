@@ -49,16 +49,18 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      # `shared-key` rather than the default, and it is the same string in the integration job below.
-      # rust-cache keys on the JOB name by default, so splitting one job into four would have turned one
-      # cargo build into four cold ones — and the JDK a leg installs changes nothing about the Rust
-      # artifacts, so there is no reason for them to be different entries.
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/setup-rust
         with:
-          shared-key: tests
+          # Explicit, because rust-toolchain.toml pins the gate's toolchain and would otherwise govern here. These
+          # legs stay on `stable` on purpose: they are the signal that the code still builds and tests on
+          # current Rust, which the gate's pinned toolchain cannot tell us. Read the action's
+          # `Rust in use:` line to confirm which one a leg actually got.
+          toolchain: stable
+          # `shared-key` rather than the default, and it is the same string in the integration job below.
+          # rust-cache keys on the JOB name by default, so splitting one job into four would have turned one
+          # cargo build into four cold ones — and the JDK a leg installs changes nothing about the Rust
+          # artifacts, so there is no reason for them to be different entries.
+          cache-shared-key: tests
 
       # No JDK step here on purpose. Everything `cargo test` runs is either JVM-free or `#[ignore]`d —
       # including mcp-server/tests/stdio_protocol.rs, which drives the real binary's front door with
@@ -139,13 +141,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      # Shared with the `unit` job on purpose — see the note there.
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/setup-rust
         with:
-          shared-key: tests
+          # `stable` on purpose — see the note in the `unit` job.
+          toolchain: stable
+          # Shared with the `unit` job on purpose — see the note there.
+          cache-shared-key: tests
 
       # javac is required, not just a JRE: the harness compiles examples/probes/*.java at test time.
       - name: Install JDK ${{ matrix.java }}
