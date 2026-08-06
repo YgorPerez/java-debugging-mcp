@@ -20,7 +20,7 @@ impl JdwpConnection {
     /// Get values for variable slots in a frame (StackFrame.GetValues command)
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_frame_values(
         &mut self,
         thread_id: ThreadId,
@@ -116,7 +116,7 @@ impl JdwpConnection {
     /// to a field, a file or the network stays written. Only the frame is rewound.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the JVM refuses to pop the frame.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the JVM refuses to pop the frame.
     pub async fn pop_frames(&mut self, thread_id: ThreadId, frame_id: FrameId) -> JdwpResult<()> {
         // SAFE-9: at the wire, not above it (ADR-0001). A pop changes what a running thread does next,
         // and whatever the popped invocation already wrote stays written — so it is refused for a

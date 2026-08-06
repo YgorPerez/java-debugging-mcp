@@ -28,7 +28,7 @@ impl JdwpConnection {
     /// The `ReferenceTypeId` of the object's class
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_object_reference_type(&mut self, object_id: ObjectId) -> JdwpResult<ReferenceTypeId> {
         let packet = self.reference_type_request(object_id);
         let reply = self.send_command(packet).await?;
@@ -95,7 +95,7 @@ impl JdwpConnection {
     /// See ADR-0022.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed. In particular
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed. In particular
     /// `INVALID_OBJECT` (20) for an id this JVM has no record of.
     pub async fn is_collected(&mut self, object_id: ObjectId) -> JdwpResult<bool> {
         let id = self.next_id();
@@ -132,7 +132,7 @@ impl JdwpConnection {
     /// ```
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_object_values(
         &mut self,
         object_id: ObjectId,
@@ -221,7 +221,7 @@ impl JdwpConnection {
     /// Vector of Values corresponding to the requested fields
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_reference_values(
         &mut self,
         ref_type_id: ReferenceTypeId,
@@ -269,7 +269,7 @@ impl JdwpConnection {
     /// flip a static like `ConfigDefaultUtils.dsInfra` on a running JVM.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_reference_values(
         &mut self,
         class_id: ReferenceTypeId,
@@ -297,7 +297,7 @@ impl JdwpConnection {
     /// field's declared type.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_object_values(
         &mut self,
         object_id: ObjectId,

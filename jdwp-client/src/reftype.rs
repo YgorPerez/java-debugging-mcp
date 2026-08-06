@@ -42,7 +42,7 @@ impl JdwpConnection {
     /// Get methods for a reference type (ReferenceType.Methods command)
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_methods(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<Vec<MethodInfo>> {
         // Declared methods are fixed for a loaded type. Overload scoring walks this list once per
         // candidate class per call, so the hit rate here is high.
@@ -126,7 +126,7 @@ impl JdwpConnection {
     /// rules out.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_class_loader(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<Option<ObjectId>> {
         let id = self.next_id();
         let mut packet =
@@ -148,7 +148,7 @@ impl JdwpConnection {
     /// question callers actually have.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_interfaces(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<Vec<ReferenceTypeId>> {
         if let Some(hit) = self.types().interfaces(ref_type_id) {
             return Ok(hit);
@@ -182,7 +182,7 @@ impl JdwpConnection {
     /// thing a redefinition is *about* — a cache here would be a way to answer from before the swap.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_modifiers(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet =
@@ -204,7 +204,7 @@ impl JdwpConnection {
     /// about the same class costs nothing.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if a JDWP request fails or a reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if a JDWP request fails or a reply cannot be parsed.
     pub async fn implements_interface(&mut self, type_id: ReferenceTypeId, wanted: &str) -> JdwpResult<bool> {
         // Breadth-first over (superclasses × interfaces), with `seen` guarding the diamonds that make
         // interface graphs a lattice rather than a tree — without it, `Collection` is visited once per
@@ -317,7 +317,7 @@ impl JdwpConnection {
     /// ```
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_fields(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<Vec<FieldInfo>> {
         // Declared fields are fixed for a loaded type. Expanding N objects of the same class used to ask
         // the JVM for this list N times.
@@ -390,11 +390,11 @@ impl JdwpConnection {
     /// clamps, and a negative one is `ILLEGAL_ARGUMENT` (103) — rejected here before the round trip,
     /// since a wire error is a poor way to report an argument this crate can see is wrong.
     ///
-    /// Each returned [`Value`] carries the JVM's own tag, so a String, an array, a thread and a class
+    /// Each returned [`Value`](crate::types::Value) carries the JVM's own tag, so a String, an array, a thread and a class
     /// object are distinguishable without a follow-up round trip.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed. `NOT_IMPLEMENTED`
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed. `NOT_IMPLEMENTED`
     /// (99) when the JVM lacks `canGetInstanceInfo`, and `INVALID_OBJECT` (20) for a bogus type id — ask
     /// [`capabilities_new`](JdwpConnection::capabilities_new) first, so a refusal reads as "this JVM
     /// cannot answer that".

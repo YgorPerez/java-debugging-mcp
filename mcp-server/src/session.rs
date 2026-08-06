@@ -924,11 +924,9 @@ pub struct MethodExitRequestInfo {
     /// [`BreakpointInfo::hits`] for what the number counts and why it is not called `hit_count`.
     ///
     /// "Asked-for" is load-bearing here and nowhere else: JDWP has no method-name modifier, so this
-    /// request receives every method of a matching class and [`method_name_matches`] drops the rest.
+    /// request receives every method of a matching class and `method_name_matches` drops the rest.
     /// The tally is charged *after* that filter — counting before it would report thousands of hits on a
     /// stop point that reported three, which is a worse answer than the missing one this replaced.
-    ///
-    /// [`method_name_matches`]: crate::handlers::method_name_matches
     pub hits: u32,
     /// Dotted class pattern the caller gave, kept so a disabled request can be re-armed.
     pub class_pattern: String,

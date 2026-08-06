@@ -30,7 +30,7 @@ impl JdwpConnection {
     /// Maps source code line numbers to bytecode positions
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_line_table(
         &mut self,
         ref_type_id: ReferenceTypeId,
@@ -103,12 +103,12 @@ impl JdwpConnection {
     /// identical and the code array different. That is also the commonest edit in a redeploy loop, so it
     /// is the case a line-table comparison is quietest about.
     ///
-    /// Gated on `canGetBytecodes` (see [`VmCapabilities`](crate::VmCapabilities)); a JVM without it
+    /// Gated on `canGetBytecodes` (see [`VmCapabilities`](crate::vm::VmCapabilities)); a JVM without it
     /// answers `NOT_IMPLEMENTED`, which is worth reporting as "cannot tell" rather than as a match. An
     /// abstract or native method has no code and answers `ABSENT_INFORMATION` for the same reason.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_bytecodes(
         &mut self,
         ref_type_id: ReferenceTypeId,
@@ -140,7 +140,7 @@ impl JdwpConnection {
     /// Returns info about local variables (names, types, slots)
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_variable_table(
         &mut self,
         ref_type_id: ReferenceTypeId,

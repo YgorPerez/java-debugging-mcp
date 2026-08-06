@@ -28,7 +28,7 @@ pub struct CommandRequest {
 ///
 /// This handle can be cloned to send commands from multiple tasks, but only ONE clone
 /// should call `recv_event()` or `try_recv_event()` at a time. The event receiver is
-/// wrapped in an Arc<Mutex<Receiver>> which allows sharing, but concurrent event
+/// wrapped in an `Arc<Mutex<Receiver>>` which allows sharing, but concurrent event
 /// consumption from multiple tasks will lead to unpredictable behavior (events distributed
 /// round-robin across consumers).
 ///

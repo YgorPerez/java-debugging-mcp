@@ -169,7 +169,7 @@ fn type_sig(c: &mut Cursor) -> Option<String> {
     Some(format!("{base}{}", "[]".repeat(dims)))
 }
 
-/// `ClassTypeSignature`: `L` package/Simple\[<args>] { `.` Simple\[<args>] } `;`
+/// `ClassTypeSignature`: `L` package/Simple\[`<args>`] { `.` Simple\[`<args>`] } `;`
 ///
 /// The package separator becomes `.` unconditionally here, unlike `decode_signature`'s deliberate refusal
 /// to rewrite the `/` in a lambda's generated name (SIG-1, #46). That is safe rather than an oversight: a

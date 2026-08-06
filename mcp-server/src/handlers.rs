@@ -1727,7 +1727,7 @@ impl RequestHandler {
     /// default flush mode it would WRITE: see [`suppress_query_flush`], which is why the reply says what it
     /// suppressed and what that costs in accuracy.
     ///
-    /// Each row is read **invoke-free** ([`project_query_row`]), which is the only way to keep the promise
+    /// Each row is read **invoke-free** ([`project_query_rows`]), which is the only way to keep the promise
     /// that reading the result does not fetch the associations it came back with.
     async fn handle_run_named_query(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::RunNamedQueryArgs = crate::args::parse(&args)?;
@@ -3757,7 +3757,7 @@ const fn suspend_policy_for_line(trace: bool, conditional: bool) -> jdwp_client:
     }
 }
 
-/// TRACE-12: every armed location of one stop point — the primary plus [`BreakpointArm::extra_locations`].
+/// TRACE-12: every armed location of one stop point — the primary plus [`crate::session::BreakpointArm::extra_locations`].
 fn armed_locations_of(arm: &crate::session::BreakpointArm) -> Vec<(u64, u64, u64)> {
     let mut out = Vec::with_capacity(1 + arm.extra_locations.len());
     out.push((arm.class_id, arm.method_id, arm.bytecode_index));

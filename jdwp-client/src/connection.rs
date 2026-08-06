@@ -239,7 +239,7 @@ impl JdwpConnection {
     /// abandoning the wait would abandon only the *answer* while the JVM did the work anyway. A caller
     /// wanting to stop at the first failure can do that to the returned `Vec` at no cost to the wire. A
     /// failed command therefore cannot desynchronise its siblings — see
-    /// [`InFlight`](crate::eventloop::InFlight) for why it cannot desynchronise the stream either.
+    /// [`InFlight`] for why it cannot desynchronise the stream either.
     ///
     /// Results are positional: `result[i]` answers `packets[i]`, whether it succeeded, failed at the JVM,
     /// or was never written. An error reply is `Ok` here and carries its error code, exactly as

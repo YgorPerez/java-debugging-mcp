@@ -29,7 +29,7 @@ impl JdwpConnection {
     /// ```
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_string_value(&mut self, string_id: ObjectId) -> JdwpResult<String> {
         let packet = self.string_value_request(string_id);
         let reply = self.send_command(packet).await?;

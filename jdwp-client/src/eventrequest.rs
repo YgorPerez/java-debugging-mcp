@@ -73,7 +73,7 @@ impl JdwpConnection {
     /// Returns the request ID for this breakpoint
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_breakpoint(
         &mut self,
         class_id: ReferenceTypeId,
@@ -118,7 +118,7 @@ impl JdwpConnection {
     /// Clear a breakpoint by request ID (EventRequest.Clear command)
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn clear_breakpoint(&mut self, request_id: i32) -> JdwpResult<()> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
@@ -143,7 +143,7 @@ impl JdwpConnection {
     /// breakpoint when the matching `ClassPrepare` event arrives.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_class_prepare(
         &mut self,
         class_pattern: &str,
@@ -173,7 +173,7 @@ impl JdwpConnection {
     /// Clear a `CLASS_PREPARE` request by id (EventRequest.Clear command).
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn clear_class_prepare(&mut self, request_id: i32) -> JdwpResult<()> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
@@ -192,7 +192,7 @@ impl JdwpConnection {
     /// id. This is the primitive behind `debug.set_exception_stop`.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_exception_request(
         &mut self,
         ref_type: Option<ReferenceTypeId>,
@@ -223,7 +223,7 @@ impl JdwpConnection {
     /// that is where [`set_breakpoint_ex`](Self::set_breakpoint_ex) uses it.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_exception_request_ex(
         &mut self,
         ref_type: Option<ReferenceTypeId>,
@@ -265,7 +265,7 @@ impl JdwpConnection {
     /// Clear an EXCEPTION request by id (EventRequest.Clear command).
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn clear_exception_request(&mut self, request_id: i32) -> JdwpResult<()> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
@@ -288,7 +288,7 @@ impl JdwpConnection {
     /// watchpoints disable JIT optimisation of that field, so expect the debuggee to slow down.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed. A JVM
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed. A JVM
     /// without the capability answers `NOT_IMPLEMENTED` (99).
     pub async fn set_field_watch(
         &mut self,
@@ -307,7 +307,7 @@ impl JdwpConnection {
     /// server-side instead (ADR-0002).
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed. A JVM
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed. A JVM
     /// without the capability answers `NOT_IMPLEMENTED` (99).
     pub async fn set_field_watch_ex(
         &mut self,
@@ -365,7 +365,7 @@ impl JdwpConnection {
     /// Returns the request id.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_method_exit_request(
         &mut self,
         class_pattern: &str,
@@ -396,7 +396,7 @@ impl JdwpConnection {
     /// answers `INTERNAL` (113), which says nothing about the cause.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_method_exit_request_ex(
         &mut self,
         class_pattern: &str,
@@ -447,7 +447,7 @@ impl JdwpConnection {
     /// 42 are different keys, so clearing with the wrong one silently leaves the request armed.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn clear_method_exit_request(
         &mut self,
         request_id: i32,
@@ -469,7 +469,7 @@ impl JdwpConnection {
     /// wrong means looking for a bit that does not exist and concluding the JVM can't do it.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the version request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the version request fails or the reply cannot be parsed.
     pub async fn can_get_method_return_values(&mut self) -> JdwpResult<bool> {
         let v = self.get_version().await?;
         Ok(v.jdwp_major > 1 || (v.jdwp_major == 1 && v.jdwp_minor >= 6))
@@ -493,14 +493,14 @@ impl JdwpConnection {
     /// adds a `ClassOnly`, and **what it narrows depends on the kind**, per the JDWP spec's own wording for
     /// modKind 4: for [`MonitorKind::Wait`] and [`MonitorKind::Waited`] it tests the class of the *monitor
     /// object*, and for [`MonitorKind::Blocked`] and [`MonitorKind::Acquired`] it tests the class of the
-    /// *location* — the code that blocked, not the lock it blocked on. See [`mod_kinds::CLASS_ONLY`].
+    /// *location* — the code that blocked, not the lock it blocked on. See `mod_kinds::CLASS_ONLY`.
     ///
     /// `filters.count` and `filters.instance` are accepted by the signature because [`EventFilters`] is one
     /// value, but see `mcp-server`'s arming path: `InstanceOnly` is refused there rather than passed
     /// through, on the ADR-0027 rule that acceptance is not application.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed. `NOT_IMPLEMENTED`
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed. `NOT_IMPLEMENTED`
     /// (99) when the JVM lacks `canRequestMonitorEvents`.
     pub async fn set_monitor_request(
         &mut self,
@@ -543,7 +543,7 @@ impl JdwpConnection {
     /// separate keys, so clearing with the wrong one silently leaves the request armed.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn clear_monitor_request(&mut self, request_id: i32, kind: MonitorKind) -> JdwpResult<()> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
@@ -558,7 +558,7 @@ impl JdwpConnection {
     /// request was created with — JDWP keys requests by (eventKind, requestID).
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn clear_field_watch(&mut self, request_id: i32, kind: WatchKind) -> JdwpResult<()> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
@@ -671,7 +671,7 @@ impl MonitorKind {
     }
 
     /// Whether a `ClassOnly` modifier on this kind tests the **monitor object**'s class rather than the
-    /// location's — true for the wait pair only, per [`mod_kinds::CLASS_ONLY`].
+    /// location's — true for the wait pair only, per `mod_kinds::CLASS_ONLY`.
     #[must_use]
     pub const fn class_filter_tests_monitor(self) -> bool {
         matches!(self, Self::Wait | Self::Waited)

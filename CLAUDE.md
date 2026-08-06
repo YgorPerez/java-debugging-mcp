@@ -50,6 +50,24 @@ rust-doctor could not be pointed at the right thing for, living next to it inste
 `scripts/doctor.sh --findings` runs shear too, and **says so loudly when the binary is missing**, because a
 local run that skips a check that gates in CI would retire this script's whole claim.
 
+**That same script now also checks that the documentation renders**, so the instruction above already
+covers it and there is no second command to learn. It gates in CI as a step beside rust-doctor (DOC-13,
+#143) — the same shape as shear and the `semver` job, because rust-doctor has no rustdoc pass and takes no
+option to add one. **The failure it catches is prose that compiles and does not render**, which is why it
+earns its place in a repo where `rustfmt.toml` deliberately does not reflow comments so the narrative doc
+comments can be written long: ~12,200 `///` and `//!` lines were a primary artefact that nothing checked.
+It was red the day it was added, at **85 findings**. 74 were one cause — `JdwpError` linked from modules
+that do not import it, so every `# Errors` section rendered a literal `[JdwpError]` — and the worst of the
+other 11 was an unbackticked `Arc<Mutex<Receiver>>` that rustdoc parsed as an HTML tag, leaving the page
+reading "wrapped in an Arc which allows sharing" with the type the sentence is about deleted from it.
+`--document-private-items` is not optional: most of the narrative in `jdwp-client` hangs off private items,
+and without it you check a small fraction of the prose you meant to. **Qualify a doc link rather than
+widening visibility to satisfy one** — `mod_kinds::CLASS_ONLY` and `method_name_matches` are plain code
+spans for that reason, and `pub(crate)` on the second was reverted because `clippy::redundant_pub_crate`
+fails the gate on a `pub(crate)` item inside a private module. Two of the 85 were also **self-inflicted by
+a careless bulk fix**: a regex that appended `(crate::X)` to every `[`X`]` doubled the target on the two
+links that already had one, which rustdoc accepts as inert text and clippy catches as a bare path.
+
 Three passes
 stay off deliberately and `rust-doctor.yml` says why at each one: `cargo-geiger` feeds the
 `unsafe-dependency` rule this repo ignores, `cargo-semver-checks` through *that* pass would compare against

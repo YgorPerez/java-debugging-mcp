@@ -21,7 +21,7 @@ impl JdwpConnection {
     /// ReferenceType.Signature — JNI signature of a type, e.g. "Lbr/com/x/WSReserva;".
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_signature(&mut self, ref_type_id: ReferenceTypeId) -> JdwpResult<String> {
         // A loaded type's signature never changes, so this is the cheapest cache hit available and the
         // most frequently asked question in the whole tool.
@@ -100,7 +100,7 @@ impl JdwpConnection {
     /// ClassType.Superclass — direct superclass of a class (None for java.lang.Object).
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_superclass(&mut self, class_id: ClassId) -> JdwpResult<Option<ClassId>> {
         match self.types().superclass(class_id) {
             crate::connection::CachedSuperclass::Root => return Ok(None),
@@ -122,7 +122,7 @@ impl JdwpConnection {
     /// StackFrame.ThisObject — the `this` reference for a frame (0 = static method).
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_this_object(&mut self, thread_id: ThreadId, frame_id: FrameId) -> JdwpResult<ObjectId> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::STACK_FRAME, stack_frame_commands::THIS_OBJECT);
@@ -140,8 +140,8 @@ impl JdwpConnection {
     /// Uses `INVOKE_SINGLE_THREADED` so only the target thread runs during the call.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed, or
-    /// [`JdwpError::ReadOnly`] if the connection refuses invocation
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed, or
+    /// [`JdwpError::ReadOnly`](crate::JdwpError::ReadOnly) if the connection refuses invocation
     /// ([`set_read_only`](Self::set_read_only)).
     pub async fn invoke_method(
         &mut self,
@@ -179,8 +179,8 @@ impl JdwpConnection {
     /// the target thread runs during the call.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed, or
-    /// [`JdwpError::ReadOnly`] if the connection refuses invocation
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed, or
+    /// [`JdwpError::ReadOnly`](crate::JdwpError::ReadOnly) if the connection refuses invocation
     /// ([`set_read_only`](Self::set_read_only)).
     pub async fn invoke_static_method(
         &mut self,

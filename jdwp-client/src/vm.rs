@@ -141,7 +141,7 @@ impl JdwpConnection {
     /// Get JVM version information (VirtualMachine.Version command)
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_version(&mut self) -> JdwpResult<VmVersion> {
         let id = self.next_id();
         let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::VERSION);
@@ -173,7 +173,7 @@ impl JdwpConnection {
     /// into "this JVM cannot do that" — see [`VmCapabilities`].
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn capabilities(&mut self) -> JdwpResult<VmCapabilities> {
         let id = self.next_id();
         let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::CAPABILITIES);
@@ -203,7 +203,7 @@ impl JdwpConnection {
     /// are 13-15, which sit between bits that *are* consulted.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn capabilities_new(&mut self) -> JdwpResult<VmCapabilitiesNew> {
         let id = self.next_id();
         let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::CAPABILITIES_NEW);
@@ -258,7 +258,7 @@ impl JdwpConnection {
     /// which makes a typo look like an absence — the caller has to resolve names first.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed. `NOT_IMPLEMENTED`
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed. `NOT_IMPLEMENTED`
     /// (99) when the JVM lacks `canGetInstanceInfo` — ask [`capabilities_new`](Self::capabilities_new)
     /// first, so a refusal can be reported as "this JVM cannot answer that" rather than as an error code.
     pub async fn instance_counts(&mut self, ref_types: &[ReferenceTypeId]) -> JdwpResult<Vec<i64>> {
@@ -302,7 +302,7 @@ impl JdwpConnection {
     /// *obsolete* rather than invalid, so a cached list would keep naming code the JVM no longer runs.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the JVM refuses the redefinition.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the JVM refuses the redefinition.
     pub async fn redefine_classes(&mut self, defs: &[(ReferenceTypeId, Vec<u8>)]) -> JdwpResult<()> {
         // SAFE-9: at the wire, not above it (ADR-0001). A redefinition installs code, and it is the one
         // mutation on this connection that outlives the connection — nothing here can undo it.
@@ -340,7 +340,7 @@ impl JdwpConnection {
     /// than try and move on.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn dispose(&mut self) -> JdwpResult<()> {
         let id = self.next_id();
         let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::DISPOSE);
@@ -353,7 +353,7 @@ impl JdwpConnection {
     /// Signature format: "Lcom/example/MyClass;" for classes
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn classes_by_signature(&mut self, signature: &str) -> JdwpResult<Vec<ClassInfo>> {
         let id = self.next_id();
         let mut packet =
@@ -391,7 +391,7 @@ impl JdwpConnection {
     /// signature ending in `/ConfigDefaultUtils;`.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn all_classes(&mut self) -> JdwpResult<Vec<ClassInfo>> {
         let id = self.next_id();
         let packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::ALL_CLASSES);

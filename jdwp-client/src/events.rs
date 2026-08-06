@@ -168,7 +168,7 @@ pub enum EventModifier {
 /// Parse an event packet from JDWP
 ///
 /// # Errors
-/// Returns a [`JdwpError`] if the buffer does not contain enough bytes or is malformed.
+/// Returns a [`JdwpError`](crate::JdwpError) if the buffer does not contain enough bytes or is malformed.
 pub fn parse_event_packet(data: &[u8]) -> JdwpResult<EventSet> {
     let mut buf = data;
 

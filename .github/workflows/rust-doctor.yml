@@ -175,6 +175,31 @@ jobs:
         if: always()
         run: cargo shear
 
+      # WHY RUSTDOC IS A STEP AND NOT A rust-doctor PASS. The same shape as cargo-shear above and the
+      # `semver` job below: rust-doctor has no rustdoc pass and takes no option to add one, so the check
+      # lives beside it rather than inside it.
+      #
+      # It earns its place in THIS repo specifically. `rustfmt.toml` is configured not to reflow comments
+      # so the narrative doc comments can be written long (LINT-4, #44), and there are ~12,200 `///` and
+      # `//!` lines across the workspace. The prose is a primary artefact here, and until DOC-13 (#143)
+      # nothing checked whether any of it rendered — not this workflow, not tests.yml, not doctor.sh.
+      #
+      # It was RED when it was added: 85 findings. 74 were one cause — `JdwpError` linked from modules
+      # that do not import it, so every `# Errors` section rendered a literal `[JdwpError]` instead of a
+      # link. The worst of the other 11 was an unbackticked `Arc<Mutex<Receiver>>`, which rustdoc parsed
+      # as an HTML tag: the rendered page read "wrapped in an Arc which allows sharing", with the type
+      # the sentence is about silently deleted from it. Prose that compiles and does not render is
+      # exactly the class of silence this repo refuses to ship.
+      #
+      # `--document-private-items` because most of the narrative in `jdwp-client` hangs off private items;
+      # without it this checks a small fraction of the prose it exists to protect. `if: always()` so a
+      # finding in an earlier step cannot hide one here.
+      - name: Check the documentation renders (rustdoc)
+        if: always()
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --document-private-items
+
       # A failing gate prints nothing useful: --sarif sends every finding to the file, so the step log
       # ends at "exit code 3" and the findings are only readable via the code-scanning API. Print them,
       # so the reason a build failed is in the build that failed.

@@ -33,7 +33,7 @@ impl JdwpConnection {
     /// Get stack frames for a thread (ThreadReference.Frames command)
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_frames(
         &mut self,
         thread_id: ThreadId,
@@ -87,7 +87,7 @@ impl JdwpConnection {
     /// the answer is `NOT_IMPLEMENTED` (99).
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn owned_monitors(&mut self, thread_id: ThreadId) -> JdwpResult<Vec<Monitor>> {
         let id = self.next_id();
         let mut packet =
@@ -119,7 +119,7 @@ impl JdwpConnection {
     /// [`owned_monitors`](Self::owned_monitors) for why both hold.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn current_contended_monitor(&mut self, thread_id: ThreadId) -> JdwpResult<Option<Monitor>> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(
@@ -142,7 +142,7 @@ impl JdwpConnection {
     /// Get all threads (VirtualMachine.AllThreads)
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_all_threads(&mut self) -> JdwpResult<Vec<ThreadId>> {
         let id = self.next_id();
         let packet =
@@ -166,7 +166,7 @@ impl JdwpConnection {
     /// Get a thread's name (ThreadReference.Name).
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_thread_name(&mut self, thread_id: ThreadId) -> JdwpResult<String> {
         let packet = self.thread_read_request(thread_id, thread_commands::NAME);
         let reply = self.send_command(packet).await?;
@@ -241,7 +241,7 @@ impl JdwpConnection {
     /// `suspend_status` != 0 means the thread is currently suspended.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_thread_status(&mut self, thread_id: ThreadId) -> JdwpResult<(i32, i32)> {
         let packet = self.thread_read_request(thread_id, thread_commands::STATUS);
         let reply = self.send_command(packet).await?;
@@ -256,7 +256,7 @@ impl JdwpConnection {
     /// Verified against a real JVM: two `Suspend`s then one `Resume` leaves the debuggee stopped.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn suspend_count(&mut self, thread_id: ThreadId) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(
@@ -280,7 +280,7 @@ impl JdwpConnection {
     /// again, or they will build a depth that a single resume can't undo.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn suspend_all(&mut self) -> JdwpResult<()> {
         let id = self.next_id();
         let packet =
@@ -299,7 +299,7 @@ impl JdwpConnection {
     /// the application actually continues.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn resume_all(&mut self) -> JdwpResult<()> {
         let id = self.next_id();
         let packet =
@@ -325,7 +325,7 @@ impl JdwpConnection {
     /// suspended individually (an `EventThread`-policy event) may legitimately need more than one.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if a JDWP request fails or a reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if a JDWP request fails or a reply cannot be parsed.
     pub async fn resume_all_fully(
         &mut self,
         probe_thread: ThreadId,
@@ -368,7 +368,7 @@ impl JdwpConnection {
     /// (DUMP-4), so this returns the raw error rather than a sentence.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn suspend_thread(&mut self, thread_id: ThreadId) -> JdwpResult<()> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::SUSPEND);
@@ -393,7 +393,7 @@ impl JdwpConnection {
     /// the count did not reach zero.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn resume_thread(&mut self, thread_id: ThreadId) -> JdwpResult<()> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::THREAD_REFERENCE, thread_commands::RESUME);
@@ -412,7 +412,7 @@ impl JdwpConnection {
     /// editing and redeploying code. Requires the JVM's `canForceEarlyReturn` capability.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn force_early_return(
         &mut self,
         thread_id: ThreadId,

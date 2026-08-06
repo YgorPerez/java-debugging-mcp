@@ -46,7 +46,7 @@ impl JdwpConnection {
     /// Set a breakpoint with optional Count (stop on Nth hit) and `ThreadOnly` filters.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_breakpoint_ex(
         &mut self,
         class_id: ReferenceTypeId,
@@ -96,7 +96,7 @@ impl JdwpConnection {
     /// clear it with `clear_step` before resuming again, or stepping will run away.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_step(&mut self, thread: ThreadId, depth: StepDepth) -> JdwpResult<i32> {
         self.set_step_ex(thread, depth, &[], &[]).await
     }
@@ -122,7 +122,7 @@ impl JdwpConnection {
     /// production would have looked like a bug in this function rather than a limit.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_step_ex(
         &mut self,
         thread: ThreadId,
@@ -162,7 +162,7 @@ impl JdwpConnection {
     /// Clear a single-step request (EventRequest.Clear, `SINGLE_STEP`).
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn clear_step(&mut self, request_id: i32) -> JdwpResult<()> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::EVENT_REQUEST, event_commands::CLEAR);
@@ -176,7 +176,7 @@ impl JdwpConnection {
     /// Clear all breakpoints (EventRequest.ClearAllBreakpoints).
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn clear_all_breakpoints(&mut self) -> JdwpResult<()> {
         let id = self.next_id();
         let packet =
@@ -189,7 +189,7 @@ impl JdwpConnection {
     /// ArrayReference.Length.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_array_length(&mut self, array_id: ObjectId) -> JdwpResult<i32> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::ARRAY_REFERENCE, ARRAY_LENGTH);
@@ -203,7 +203,7 @@ impl JdwpConnection {
     /// ArrayReference.GetValues — returns `length` elements starting at `first`.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn get_array_values(
         &mut self,
         array_id: ObjectId,
@@ -243,7 +243,7 @@ impl JdwpConnection {
     /// failing. The caller reads the component type from the array's signature and coerces first.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails, including `INVALID_LENGTH` when the range
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails, including `INVALID_LENGTH` when the range
     /// runs past the end of the array.
     pub async fn set_array_values(
         &mut self,
@@ -268,7 +268,7 @@ impl JdwpConnection {
     /// VirtualMachine.CreateString — mirror a string into the target VM, returning its id.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn create_string(&mut self, s: &str) -> JdwpResult<ObjectId> {
         let id = self.next_id();
         let mut packet = CommandPacket::new(id, command_sets::VIRTUAL_MACHINE, vm_commands::CREATE_STRING);
@@ -284,7 +284,7 @@ impl JdwpConnection {
     /// StackFrame.SetValues — set a single local variable slot to `value`.
     ///
     /// # Errors
-    /// Returns a [`JdwpError`] if the JDWP request fails or the reply cannot be parsed.
+    /// Returns a [`JdwpError`](crate::JdwpError) if the JDWP request fails or the reply cannot be parsed.
     pub async fn set_frame_value(
         &mut self,
         thread_id: ThreadId,

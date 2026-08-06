@@ -351,6 +351,29 @@ JS
     printf '%s\n' "      \`cargo install cargo-shear --locked\` (or \`taiki-e/install-action\`, as CI does)."
   fi
 
+  # rustdoc gates in CI beside this scan (DOC-13, #143), for the same reason cargo-shear does: rust-doctor
+  # has no rustdoc pass and takes no option to add one, so the check lives next to it. And it runs HERE for
+  # the reason the block above runs here — a check that gates in CI and not locally retires this script's
+  # whole claim that a clean run is a green gate.
+  #
+  # Unlike cargo-shear this needs no separate binary: `cargo doc` ships with every toolchain. So there is
+  # no "not installed" branch to write and no way for this one to quietly not run, which is the only
+  # reason this block is shorter than that one rather than sloppier.
+  #
+  # Only `error`/`warning` lines are echoed. rustdoc prints the offending source line and several help
+  # notes per finding, and 85 findings' worth of that (which is what this found on the day it was added)
+  # buries the list it is meant to hand you. The full output is one `cargo doc` away.
+  rustdoc_status=0
+  rustdoc_out="$(RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items 2>&1)" ||
+    rustdoc_status=$?
+  if [ "$rustdoc_status" -ne 0 ]; then
+    printf '\n%s\n' "documentation (rustdoc): WOULD FAIL — this gates in CI."
+    printf '%s\n' "$rustdoc_out" | grep -E '^(error|warning)' | sed 's/^/      /'
+    verdict=3
+  else
+    printf '\n%s\n' "documentation (rustdoc): would pass."
+  fi
+
   exit "$verdict"
 fi
 
