@@ -261,6 +261,26 @@ replaces the code behind it, which is exactly why ADR-0011 refuses to cache line
 
 ### The wire
 
+**Reply**:
+What a `debug.*` tool hands back to the caller — the rendered text a model reads, not anything on the socket.
+Every claim this glossary makes about what a reply "says", "prints", "owes" or "left out" is about that text.
+
+**A reply packet is the other thing, and it is always spelled with the noun.** One JDWP message answering one
+command, correlated to it by packet id — a **packet**, in the unit sense defined below. The two are not
+related by a rendering step: a single reply is assembled from many reply packets, and the tools that report
+their own cost are reporting how many.
+
+**This entry exists because the bare word was doing both jobs, undefined, forty lines apart in this very
+section** — "the middle of a real reply, as a length" is a packet, "a reply that prints a duration" is caller
+text. Twelve or so uses meant the caller sense against six meaning the packet, `docs/toolkit-contract.md`
+already made "change what a **reply says**" a row in its caller-visible risk table, and nothing anywhere
+defined either. The bare word therefore goes to the caller sense on the numbers and on the contract doc, and
+the wire sense pays the two syllables. It is placed here, in the section about the socket, precisely because
+this is where a reader meets both and has no way to tell them apart.
+_Avoid_: response (nothing here uses it and it invites the HTTP request/response frame, which JDWP does not
+have — see the `_Avoid_` on **independent reads**); output (the tool's stdout is a different thing, owned by
+one task, ADR-0012); bare "reply" for the packet
+
 **Packet**:
 One JDWP message, and **the unit this server reports its own cost in** — a dump is "~8 packets per thread",
 `list_threads` is "one packet per thread name". Packets rather than bytes or milliseconds because a packet
@@ -298,12 +318,13 @@ _Avoid_: hop (a network term for something else entirely — a round trip here m
 JDWP messages are length-prefixed with **no delimiter between them**, so the reader's position is only
 correct if every preceding message was consumed exactly. There is no marker to seek forward to, which is
 what makes losing alignment unrecoverable rather than a hiccup: the next read interprets whatever it lands
-on — usually the middle of a real reply — as a length. So a lost byte does not corrupt one answer, it ends
-the session (ADR-0018).
+on — usually the middle of a real reply packet — as a length. So a lost byte does not corrupt one answer, it
+ends the session (ADR-0018).
 _Avoid_: resync, recover (there is nothing to resync *to*; the instinct this term exists to correct)
 
 **Independent reads**:
-Reads whose requests do not depend on each other's replies, and which may therefore be in flight together.
+Reads whose requests do not depend on each other's reply packets, and which may therefore be in flight
+together.
 
 **A property of the reads, not of the code that issues them** — which is why it was defined here before
 anything exploited it. Every read this server makes is already independent or dependent; PERF-1
@@ -321,11 +342,11 @@ than of a *sequence* would quietly license all three.
 What it buys is **round trips**, not **packets** — the same commands are still sent, so it is not a cheaper
 read but a shorter wait, and a shorter **suspension window** wherever the reads happen under one.
 
-_Avoid_: pipelined (borrowed from HTTP, where it promises replies come back IN ORDER — JDWP correlates a
-reply to its request by packet id and they may arrive in any order, so the word asserts the one thing that
-has to be *proven* rather than assumed); batched (taken, and by something close enough to confuse: a
+_Avoid_: pipelined (borrowed from HTTP, where it promises responses come back IN ORDER — JDWP correlates a
+reply packet to its command by packet id and they may arrive in any order, so the word asserts the one thing
+that has to be *proven* rather than assumed); batched (taken, and by something close enough to confuse: a
 **batch** is many class patterns given to one arming call, and it also has partial failure as a normal
-outcome — and it implies one combined request answered by one reply, which JDWP has no such thing as);
+outcome — and it implies one combined request answered by one reply packet, which JDWP has no such thing as);
 concurrent (true of the mechanism and silent about the property that makes it safe)
 
 **Wave**:
@@ -335,9 +356,9 @@ A set of **independent reads** issued together and awaited together.
 the licence is the part that has to be established and the mechanism is the part that cannot check it.
 Anything may be issued as a wave; only an independent set may *correctly* be.
 
-**Every reply is awaited, including after one has failed.** A wave is not an all-or-nothing request: it has
-no combined reply, its results answer its reads one for one, and a failure is one of those answers rather
-than the end of the set. That follows from the wire rather than from taste — the commands are already sent
+**Every reply packet is awaited, including after one has failed.** A wave is not an all-or-nothing request:
+it has no combined reply packet, its results answer its reads one for one, and a failure is one of those
+answers rather than the end of the set. That follows from the wire rather than from taste — the commands are already sent
 and JDWP has no way to recall one, so abandoning the wait would abandon only the answer while the debuggee
 does the work regardless.
 
@@ -346,7 +367,8 @@ mechanism from becoming a way to have unlimited work outstanding, and it means t
 fan-out wider than the bound is divided by it, not eliminated.
 
 _Avoid_: batch (taken — see the `_Avoid_` above); pipeline (same objection as above); burst (describes the
-traffic's shape on the wire and says nothing about the reads being independent or the replies being awaited)
+traffic's shape on the wire and says nothing about the reads being independent or the reply packets being
+awaited)
 
 **Speculative read**:
 A read issued for something that may turn out never to have been needed.
@@ -867,8 +889,8 @@ exactly once and is gone.
 Its own word, and the fifth in this cluster rather than a variety of the fourth, because of the one property the
 other four do not have: **a disarm is something this debugger does, so its own records are right by
 construction; a spent stop point is something the debuggee did, so its records are a stale belief.** There is no
-event, no reply and no acknowledgement — the request id we hold is one the JVM has forgotten. Two consequences
-follow from that and from nothing else, which is why the distinction earns a term: such a stop point must not be
+event, no reply packet and no acknowledgement — the request id we hold is one the JVM has forgotten. Two
+consequences follow from that and from nothing else, which is why the distinction earns a term: such a stop point must not be
 listed as armed, and clearing it must not send a clear for a **request id** the debuggee may have since reissued
 to someone else. Both are now true — `list_stop_points` renders `SPENT` with its own glyph and
 `clear_stop_point` sends no packet and says it did not (FILT-8, #99; ADR-0026, which also records why "always
@@ -1192,7 +1214,7 @@ that wait.
 _Avoid_: "started", "up", "attached" — every one of them reads as either state.
 
 **Cassette**:
-A recorded JDWP session — every request and the reply it got — kept in a file and served back to the
+A recorded JDWP session — every command and the reply packet it got — kept in a file and served back to the
 debugger with no JVM behind the port. One debuggee on one JVM, fixed at the moment of recording, so it
 complements a probe rather than replacing one: it cannot notice the debuggee changing, and it can be *edited*
 into a shape no JVM here could be asked to produce. See ADR-0014.
@@ -1204,4 +1226,4 @@ transcript of a real session, and its authority comes from that)
 
 **Miss**:
 A request a cassette has no recorded answer for. Never answered — the connection is dropped and the command
-is named — because a plausible-looking error reply would let a replay test pass while proving nothing.
+is named — because a plausible-looking error reply packet would let a replay test pass while proving nothing.
