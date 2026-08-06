@@ -361,6 +361,14 @@ tree, asks before `git push`, and warns on a soak loop against the working tree,
 already written down in this file — the hook adds no policy, it just stops the policy depending on
 somebody having read this far.
 
+**Two of those rules used to search the raw command line**, which the hook's own module docstring says
+not to do and for exactly the reason it gives: commands here routinely *mention* the guarded thing as
+data. Recording a soak result with `gh issue comment` made the guard fire on the prose it was writing
+about itself, and a rule that cries wolf on its own documentation is the fastest way to get the whole
+guard switched off. Both now walk **tokens** and both require the *value* to follow — `--test-threads`
+needs a digit and `--shard` needs `N/M` — so a `grep` for the flag in the docs is not an override.
+Three of the matrix's cases are that regression, and they were found in the wild rather than imagined.
+
 The rationale for each severity lives in `.claude/settings.json`'s comment block and is deliberately
 **not** repeated here; that file is the one place to change it. `bash .claude/hooks/pre-bash-guard.test.sh`
 is the 20-case matrix, and eleven of those cases assert the guard does *not* fire — a guard that trips

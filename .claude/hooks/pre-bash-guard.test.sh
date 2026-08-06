@@ -48,6 +48,8 @@ check ask   "git push"                      'git push origin main'
 check ask   "git push, chained"             'cargo fmt --all && git push'
 check warn  "literal --shard"               'scripts/integration-test.sh --shard 1/2'
 check warn  "--test-threads override"       'cargo test --test mcp_integration -- --ignored --test-threads 4'
+check warn  "--test-threads=N joined form"  'cargo test -- --ignored --test-threads=4'
+check warn  "--shard=N/M joined form"       'scripts/integration-test.sh --shard=1/2'
 check warn  "JDWP_TEST_THREADS override"    'while true; do JDWP_TEST_THREADS=8 /tmp/arm.bin; done'
 check warn  "unbounded workspace cargo"     'cargo build --workspace'
 check warn  "unbounded, time-prefixed"      'time cargo test --workspace'
@@ -58,6 +60,13 @@ echo "Rules that must NOT fire (the half that keeps the guard switched on):"
 check allow "plain ls"                      'ls -la'
 check allow "BOOTSTRAP on the test binary"  'RUSTC_BOOTSTRAP=1 ./target/debug/deps/mcp_integration-abc --ignored'
 check allow "shard-plan --which"            'scripts/shard-plan.py --tests f --which launch_suspends'
+# THESE THREE ARE THE REGRESSION, and they were found in the wild rather than imagined. Both rules used
+# to search the RAW command line, which the module docstring explicitly says not to do — so recording a
+# soak result with `gh issue comment` made the guard fire on the prose it was writing about itself. A
+# rule that cries wolf on documentation of that rule is the fastest way to get the guard switched off.
+check allow "flag quoted in a gh comment"   'gh issue comment 45 --body "ran with --test-threads 16 under taskset"'
+check allow "shard quoted in a gh comment"  'gh issue comment 118 --body "the recipe named --shard 1/2 and it had moved"'
+check allow "grep for the flag in the docs" 'grep -rn -- "--test-threads" CLAUDE.md'
 check allow "workspace cargo, tailed"       'cargo build --workspace 2>&1 | tail -20'
 check allow "workspace cargo, redirected"   'cargo test --workspace > /tmp/o.log 2>&1'
 check allow "push named inside an echo"     'echo "remember to git push later"'

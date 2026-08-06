@@ -54,8 +54,12 @@ COMMAND_PREFIXES = {"do", "then", "else", "elif", "{", "(", "!", "time", "exec",
 # operator first so `&&` survives.
 PUNCT_CHARS = set("();|&<>")
 PUNCT_OPERATORS = ("&&", "||", "|&", ">>", "<<", ";", "|", "&", "(", ")", ">", "<")
-# `--shard 1/2`, `--shard=1/2`. See shard_number_is_hardcoded for why this is only a warning.
-SHARD = re.compile(r"--shard[= ]\s*(\d+)\s*/\s*(\d+)")
+# `--shard=1/2` as one token, and the `1/2` that follows a bare `--shard`. Matched per TOKEN rather
+# than over the raw line: see shard_number_is_hardcoded. Only a warning, for the reason given there.
+SHARD_JOINED = re.compile(r"^--shard=(\d+)/(\d+)$")
+SHARD_VALUE = re.compile(r"^(\d+)/(\d+)$")
+# `--test-threads=16`. The bare `--test-threads` form is matched by token with a digit required after it.
+THREADS_JOINED = re.compile(r"^--test-threads=\d+$")
 LOOP_KEYWORD = re.compile(r"\b(for|while|until)\b")
 
 
@@ -118,8 +122,8 @@ def main() -> int:
         note
         for note in (
             soaks_against_the_working_tree(command, commands),
-            shard_number_is_hardcoded(command),
-            overrides_test_threads(command, commands),
+            shard_number_is_hardcoded(commands),
+            overrides_test_threads(commands),
             floods_the_context(command, commands),
         )
         if note
@@ -166,10 +170,29 @@ def soaks_against_the_working_tree(command: str, commands: list[list[str]]) -> s
     )
 
 
-def shard_number_is_hardcoded(command: str) -> str | None:
-    """A literal `--shard N/M` copied from prose is stale by construction."""
-    match = SHARD.search(command)
-    if not match or "shard-plan.py" in command:
+def shard_number_is_hardcoded(commands: list[list[str]]) -> str | None:
+    """A literal `--shard N/M` copied from prose is stale by construction.
+
+    TOKEN-SCOPED, and it was not always. This searched the raw line, which is precisely what the
+    module docstring says not to do and for precisely the reason given there: this repo's commands
+    routinely MENTION the guarded thing as data. Found in the wild by a `gh issue comment` whose body
+    quoted a soak recipe — the guard fired on prose it was writing about itself. A rule that cries wolf
+    on documentation is a rule that gets switched off, which is what half of the test matrix is for.
+    """
+    match = None
+    for segment in commands:
+        # Asking WHICH shard a test is in is the remedy this rule points at, not the mistake.
+        if any(Path(token).name == "shard-plan.py" for token in segment):
+            continue
+        for index, token in enumerate(segment):
+            match = SHARD_JOINED.match(token)
+            if not match and token == "--shard" and index + 1 < len(segment):
+                match = SHARD_VALUE.match(segment[index + 1])
+            if match:
+                break
+        if match:
+            break
+    if not match:
         return None
     return (
         f"`--shard {match.group(1)}/{match.group(2)}` is a literal shard number. The split is by "
@@ -181,9 +204,29 @@ def shard_number_is_hardcoded(command: str) -> str | None:
     )
 
 
-def overrides_test_threads(command: str, commands: list[list[str]]) -> str | None:
-    """Overriding the thread count stops the run being CI-shaped."""
-    explicit = "--test-threads" in command
+def overrides_test_threads(commands: list[list[str]]) -> str | None:
+    """Overriding the thread count stops the run being CI-shaped.
+
+    Token-scoped for the same reason as `shard_number_is_hardcoded` above, and found the same way: a
+    `gh issue comment` recording a soak result quoted `--test-threads 16` in its body and tripped this.
+    `shlex` keeps a quoted body as ONE token, so an exact-token test sees the flag only when it is
+    really being passed.
+    """
+    explicit = False
+    for segment in commands:
+        for index, token in enumerate(segment):
+            # A VALUE HAS TO FOLLOW, which is the same discipline `shard_number_is_hardcoded` uses and
+            # for the same reason: `grep -rn -- "--test-threads" CLAUDE.md` passes the flag as a
+            # standalone token without ever running a test. libtest accepts only `--test-threads N` and
+            # `--test-threads=N`, so requiring the number costs nothing real and drops the false positive.
+            if THREADS_JOINED.match(token):
+                explicit = True
+            elif token == "--test-threads" and index + 1 < len(segment):
+                explicit = segment[index + 1].isdigit()
+            if explicit:
+                break
+        if explicit:
+            break
     env = any(token.startswith("JDWP_TEST_THREADS=") for seg in commands_with_env() for token in seg)
     if not (explicit or env):
         return None
