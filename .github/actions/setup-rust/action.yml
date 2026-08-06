@@ -68,7 +68,7 @@ runs:
         echo "source=$source" >> "$GITHUB_OUTPUT"
 
     - name: Install the toolchain
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-08-06; no version tags exist for this action
       with:
         toolchain: ${{ steps.resolve.outputs.toolchain }}
         components: ${{ inputs.components }}
@@ -87,16 +87,21 @@ runs:
     # the one that makes `toolchain:` mean what it says. Set only when a toolchain was asked for
     # explicitly: with no input the file is meant to govern, and shadowing it with an env var would hide
     # the source of truth behind a copy of itself.
+    # zizmor: ignore[github-env]
+    # A GITHUB_ENV write is what this step IS, and the value is an action input set by a call site in
+    # this repo — not an expansion of anything a contributor or a PR author controls. The alternative
+    # zizmor suggests (an output consumed per-step) cannot work here: the whole point is to govern every
+    # LATER step in the job, including ones this action never sees.
     - name: Make the requested toolchain govern the rest of the job
       if: inputs.toolchain != ''
       shell: bash
       env:
         REQUESTED: ${{ inputs.toolchain }}
-      run: echo "RUSTUP_TOOLCHAIN=$REQUESTED" >> "$GITHUB_ENV"
+      run: echo "RUSTUP_TOOLCHAIN=$REQUESTED" >> "$GITHUB_ENV" # zizmor: ignore[github-env]
 
     - name: Cache cargo artifacts
       if: inputs.cache == 'true'
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         key: ${{ inputs.cache-key }}
         shared-key: ${{ inputs.cache-shared-key }}
@@ -111,7 +116,10 @@ runs:
     # your intent. Same instruction, same reason. Quote what it printed.
     - name: Rust in use
       shell: bash
+      env:
+        ASKED: ${{ steps.resolve.outputs.toolchain }}
+        SOURCE: ${{ steps.resolve.outputs.source }}
       run: |
         actual="$(rustc -vV | sed -n 's/^release: *//p')"
-        echo "Rust in use: ${actual} (asked for '${{ steps.resolve.outputs.toolchain }}', from ${{ steps.resolve.outputs.source }})"
+        echo "Rust in use: ${actual} (asked for '${ASKED}', from ${SOURCE})"
         rustc -vV

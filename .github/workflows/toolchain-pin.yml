@@ -61,7 +61,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust stable
         uses: ./.github/actions/setup-rust
@@ -122,7 +124,12 @@ jobs:
       # newer clippy cannot turn this job red. The findings are read out of the SARIF below.
       - name: Run rust-doctor against stable, gating on nothing
         if: steps.pin.outputs.behind == 'true'
-        run: npx -y "rust-doctor@${{ steps.pin.outputs.doctor }}" --sarif --fail-on none > rust-doctor-stable.sarif
+        # Through `env:` rather than expanded into the script, same as the issue step below. The value is
+        # sed'd out of rust-doctor.yml in this repo two steps up and nothing external can reach it — this
+        # is about not leaving the pattern lying around to be copied somewhere it would matter.
+        env:
+          DOCTOR: ${{ steps.pin.outputs.doctor }}
+        run: npx -y "rust-doctor@${DOCTOR}" --sarif --fail-on none > rust-doctor-stable.sarif
 
       - name: Read the findings
         id: findings
@@ -183,11 +190,18 @@ jobs:
       # Clean scan -> `ready-for-agent`, because a one-line bump with nothing to fix is exactly what
       # that label is for. Findings -> `needs-triage`, because someone has to decide whether the new
       # lints are worth fixing before the number moves.
+      # Both values reach the script through `env:` rather than being expanded into it (CI-5, #150).
+      # Neither is attacker-controllable — one is a version this job read from `rustc -vV`, the other a
+      # count it computed itself — but a `${{ }}` inside a `run:` is the shape that stops being safe the
+      # day someone reuses the pattern with an event payload, and env costs nothing.
       - name: Open the bump issue, unless it is already open
         if: steps.pin.outputs.behind == 'true'
         shell: bash
+        env:
+          STABLE: ${{ steps.pin.outputs.stable }}
+          FINDING_COUNT: ${{ steps.findings.outputs.count }}
         run: |
-          title="chore: bump the rust-doctor toolchain pin to ${{ steps.pin.outputs.stable }}"
+          title="chore: bump the rust-doctor toolchain pin to ${STABLE}"
           existing="$(gh issue list --state open --search "in:title \"$title\"" --json number,title \
                        --jq ".[] | select(.title == \"$title\") | .number" | head -1)"
           if [ -n "$existing" ]; then
@@ -195,7 +209,7 @@ jobs:
             echo "Already tracked as #$existing." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          if [ "${{ steps.findings.outputs.count }}" = "0" ]; then
+          if [ "$FINDING_COUNT" = "0" ]; then
             label="ready-for-agent"
           else
             label="needs-triage"
@@ -204,7 +218,7 @@ jobs:
 
       - name: Upload the stable SARIF as an artifact
         if: always() && steps.pin.outputs.behind == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rust-doctor-stable-sarif
           path: rust-doctor-stable.sarif

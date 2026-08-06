@@ -436,6 +436,24 @@ JS
     printf '%s\n' "        git config core.hooksPath .githooks"
   fi
 
+  # zizmor gates in CI beside this scan (CI-5, #150), and runs here for the same reason the blocks above
+  # do. `uvx` is how CI runs it too, so there is no separate binary to install and get out of step.
+  if command -v uvx >/dev/null 2>&1; then
+    zizmor_status=0
+    zizmor_out="$(uvx zizmor --persona=regular .github/ 2>&1)" || zizmor_status=$?
+    if [ "$zizmor_status" -ne 0 ]; then
+      printf '\n%s\n' "workflow lint (zizmor): WOULD FAIL — this gates in CI."
+      printf '%s\n' "$zizmor_out" | grep -E '^(error|warning)' | sed 's/^/      /'
+      verdict=3
+    else
+      printf '\n%s\n' "workflow lint (zizmor): would pass."
+    fi
+  else
+    printf '\n%s\n' "not looked at here — uvx is not installed, and zizmor GATES in CI."
+    printf '%s\n' "      A clean run above is therefore not a green gate. Install uv:"
+    printf '%s\n' "      https://docs.astral.sh/uv/getting-started/installation/"
+  fi
+
   exit "$verdict"
 fi
 

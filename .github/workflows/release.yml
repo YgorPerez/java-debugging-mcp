@@ -35,7 +35,9 @@ jobs:
     name: Tag agrees with the manifest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # [workspace.package].version is the single source of truth and the tag is a claim about it. Read
       # the TOML directly rather than asking cargo: it keeps the first job free of a toolchain install,
@@ -114,7 +116,9 @@ jobs:
             target: x86_64-pc-windows-msvc
             ext: .exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # `stable`, matching tests.yml and coverage.yml — NOT the pin in rust-toolchain.toml. That pin exists
       # for exactly one reason (#18): rust-doctor fails the build on clippy warnings, so a new lint in a
@@ -170,7 +174,7 @@ jobs:
       # upload. Naming it `${{ matrix.name }}` (`linux-x86_64`) meant the download had no way to say
       # "mine" without listing the slices, which is how REL-2 (#41) happened.
       - name: Upload the binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.ASSET }}
           path: ${{ env.ASSET }}
@@ -191,8 +195,9 @@ jobs:
       # commit's parent) and every commit between it and here; the default depth-1 fetch has neither, and
       # would produce a changelog of one commit against no baseline rather than an error.
       - name: Check out the tagged commit and its history
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       # `pattern` is the whole point: without it download-artifact takes EVERY artifact the run produced,
@@ -202,7 +207,7 @@ jobs:
       # reusable workflow silently adopts that workflow's artifacts; naming what we want instead of taking
       # what is there is what keeps the next gate's uploads out too.
       - name: Collect every platform's binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           pattern: jdwp-mcp-* # the build matrix names its artifacts after the file they carry

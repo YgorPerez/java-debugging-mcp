@@ -123,6 +123,21 @@ wanted, it needs `CLAUDE_CODE_OAUTH_TOKEN` set as a repository secret **first**,
 repo's actual risks (suspension honesty, resume verification, caller-visible replies) instead of "performance
 considerations".
 
+**Every action is SHA-pinned and `zizmor` gates the workflows** (CI-4/#149, CI-5/#150). The first
+zizmor run found **71**: 32 unpinned refs — two of them `dtolnay/rust-toolchain@master`, a *branch* —
+9 `artipacked` (checkout leaving credentials in the runner's git config), a workflow-level
+`security-events: write` only one job needed, and several `${{ }}` expansions inside `run:` blocks.
+**All fixed rather than suppressed, except one**: the `GITHUB_ENV` write in `setup-rust`, which is what
+that step is, and which carries its reason at the line. If you accept a future finding, annotate it at
+the line with why — a bare `# zizmor: ignore[…]` is how that becomes a file for silencing the tool.
+Dependabot is the other half and they land together: **a pin nobody bumps rots into a two-year-old
+`checkout`**, and `dtolnay/rust-toolchain` is pinned to a bare commit because it publishes a tag per
+toolchain and has no version tags at all. Both ecosystems are grouped weekly with a **7-day cooldown** —
+zizmor's `dependabot-cooldown` audit caught its absence on the first run after the file was written,
+and it is the point: pinning is undone by a bot that pulls a version the moment it exists. **Auto-merge
+is deliberately off**, because `main` has no branch protection (the API returns 404), so there is
+nothing required to gate on and auto-merge would mean merge-on-open.
+
 **Two git hooks are checked in, and they do nothing until you opt in** (LINT-6/#146, REL-4/#147):
 `git config core.hooksPath .githooks` — per-clone, because a commit cannot set it. `pre-commit` runs
 `cargo fmt --all --check`; `commit-msg` checks the subject against the types `release-notes.py`

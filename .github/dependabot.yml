@@ -1,0 +1,69 @@
+# CI-4 (#149), and it is half of a pair: CI-5 (#150) SHA-pinned every action in the same commit, and
+# neither is much good alone. Pins do not rot gracefully — they rot into a two-year-old `checkout` that
+# nobody notices, because a pinned ref never announces that it is stale. This is what announces it.
+#
+# The reverse dependency matters too: `dtolnay/rust-toolchain` publishes a tag per TOOLCHAIN and has no
+# version tags at all, so `.github/actions/setup-rust` pins it to a bare commit on `master` with no
+# version to name. That is the pin most in need of a bot, and the least able to explain itself without one.
+
+version: 2
+updates:
+  # `directory: "/"` covers the whole workspace: Cargo.toml at the root plus both member crates, since
+  # they take everything through `<name>.workspace = true`.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    # A COOLDOWN, because the point of pinning is undone by a bot that pulls a version the moment it
+    # exists. The supply-chain attacks that matter here are the ones caught within days of publication —
+    # a compromised release is typically yanked fast, and a week's delay is the difference between
+    # merging it and reading about it. zizmor's `dependabot-cooldown` audit is what flagged its absence,
+    # on the first run after this file was written.
+    cooldown:
+      default-days: 7
+    # GROUPED, and the reason is runner cost rather than tidiness. Every dependency PR runs six
+    # integration legs (three JDKs x two shards) plus the health scan — CLAUDE.md measures the suite at
+    # 494 runner-seconds — so ten separate PRs is ten times that for one weekly batch of bumps. One
+    # grouped PR is one run.
+    groups:
+      cargo:
+        patterns: ["*"]
+    # A single maintainer, so the limit is about what can be reviewed rather than what can be produced.
+    open-pull-requests-limit: 3
+    commit-message:
+      # Matches the vocabulary release-notes.py categorises on and .githooks/commit-msg enforces
+      # (REL-4, #147). Without this, Dependabot writes "Bump serde from x to y" and every dependency
+      # bump lands in "Other Changes" on the releases page.
+      prefix: chore
+      include: scope
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    # A COOLDOWN, because the point of pinning is undone by a bot that pulls a version the moment it
+    # exists. The supply-chain attacks that matter here are the ones caught within days of publication —
+    # a compromised release is typically yanked fast, and a week's delay is the difference between
+    # merging it and reading about it. zizmor's `dependabot-cooldown` audit is what flagged its absence,
+    # on the first run after this file was written.
+    cooldown:
+      default-days: 7
+    # Dependabot scans `.github/workflows/` AND `.github/actions/*/action.yml` from this one entry, which
+    # matters here: after CI-7 (#152) the toolchain and cache pins live in the composite action rather
+    # than in the workflows, so an entry that only covered workflows would miss the two that move most.
+    groups:
+      actions:
+        patterns: ["*"]
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: ci
+      include: scope
+
+# NOT ENABLED: auto-merge. It is only safe when the required checks genuinely cover a bump, and this repo
+# has NO branch protection at all on `main` — `gh api .../branches/main/protection` returns 404 — so there
+# is nothing required to gate on and auto-merge would mean merge-on-open. The checks themselves are
+# strong enough (six integration legs, the health scan, the rustdoc, deny, shear and typos steps); it is
+# the enforcement that is missing. Revisit alongside CI-6 (#151), which adds the aggregate `ci-ok` job
+# that branch protection would need to require.

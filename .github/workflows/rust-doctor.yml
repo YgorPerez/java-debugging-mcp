@@ -29,7 +29,9 @@ on:
 
 permissions:
   contents: read
-  security-events: write # upload SARIF to GitHub code scanning
+  # `security-events: write` is NOT here: it is granted on the `health` job alone, which is the only one
+  # that uploads SARIF (CI-5, #150). At workflow level it would also be handed to `semver`, which needs
+  # nothing but `contents: read`.
 
 concurrency:
   group: rust-doctor-${{ github.ref }}
@@ -39,6 +41,9 @@ jobs:
   health:
     name: Health scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload SARIF to GitHub code scanning; scoped to this job (CI-5, #150)
 
     # The workspace has ONE clippy.toml, at the root, and this is what makes rust-doctor read it
     # (LINT-2, #28). rust-doctor writes a temporary `<crate>/clippy.toml` into any member that lacks
@@ -49,7 +54,9 @@ jobs:
       CLIPPY_CONF_DIR: ${{ github.workspace }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # rust-doctor shells out to `cargo clippy`, so the runner needs cargo + clippy.
       #
@@ -138,7 +145,7 @@ jobs:
       #     tell doctor something another workflow already publishes.
       # cargo-shear is the one entry here that is NOT for a rust-doctor pass — see the step below.
       - name: Install the tools the gate needs
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
           tool: cargo-deny,cargo-machete,cargo-shear,typos
 
@@ -236,6 +243,28 @@ jobs:
         if: always()
         run: typos
 
+      # CI-5 (#150). Nothing linted the workflows, and the first run of zizmor found 71 findings: 32
+      # unpinned action references, 9 `artipacked` (checkout leaving credentials in the runner's git
+      # config), a workflow-level `security-events: write` that only one job needed, and a handful of
+      # `${{ }}` expansions inside `run:` blocks. All of them are fixed rather than suppressed, except
+      # one — the GITHUB_ENV write in .github/actions/setup-rust, which is what that step IS, and which
+      # carries its reason at the line.
+      #
+      # It gates because it is green: adding a linter that reports 71 findings and gates on none of them
+      # is the permanent-red-or-meaningless-green shape this repo keeps writing post-mortems about. If a
+      # future finding is genuinely acceptable, annotate it AT THE LINE with why — a `# zizmor: ignore[…]`
+      # with no reason is how this turns into a file for silencing the tool.
+      #
+      # `uvx` rather than an install step: zizmor is a Python tool, it is not one of rust-doctor's passes,
+      # and the health job's `tool:` list is read by scripts/doctor.sh with `head -1` — see the comment
+      # there before adding a second install step.
+      #
+      # `--persona=regular` is the default posture. `--pedantic` adds findings this repo would suppress
+      # in bulk, which is the opposite of the point.
+      - name: Lint the workflows (zizmor)
+        if: always()
+        run: uvx zizmor --persona=regular .github/
+
       # A failing gate prints nothing useful: --sarif sends every finding to the file, so the step log
       # ends at "exit code 3" and the findings are only readable via the code-scanning API. Print them,
       # so the reason a build failed is in the build that failed.
@@ -273,14 +302,14 @@ jobs:
 
       - name: Upload SARIF to code scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # codeql-bundle-v2.26.2
         with:
           sarif_file: rust-doctor-published.sarif
           category: rust-doctor
 
       - name: Upload SARIF as an artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rust-doctor-sarif
           path: rust-doctor.sarif
@@ -317,8 +346,9 @@ jobs:
     name: Public API vs the last tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           fetch-depth: 0 # tags and history: the baseline is a tag, not a registry
 
       - name: Install Rust toolchain
@@ -328,7 +358,7 @@ jobs:
           cache: "false"
 
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
           tool: cargo-semver-checks
 
