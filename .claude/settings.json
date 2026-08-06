@@ -17,7 +17,32 @@
     "  cleanup      discards hook session state when the session ends.",
     "",
     "These require the `serena-hooks` executable on PATH (installed with serena-agent). If Serena is",
-    "not installed the hooks fail harmlessly, but see README.md for the one-time setup."
+    "not installed the hooks fail harmlessly, but see README.md for the one-time setup.",
+    "",
+    "----------------------------------------------------------------------------------------------",
+    "",
+    "pre-bash-guard.py enforces traps CLAUDE.md already documents, because prose that has to be read",
+    "to be obeyed is obeyed inconsistently. Three severities, and the split is the design:",
+    "",
+    "  deny   RUSTC_BOOTSTRAP=1 on cargo (hashed into the build fingerprint, so it recompiles the",
+    "         workspace under a flag that admits nightly features silently), and `git commit` while",
+    "         `cargo fmt --check` fails. Both are SILENTLY wrong -- they produce an answer that is",
+    "         not about what you think. Escape with SKIP_JDWP_AGENT_GUARD=1 in the command.",
+    "  ask    `git push`. Not unsafe, but this repo's release flow commits and tags while",
+    "         deliberately NOT pushing, so a push is the user's call rather than the agent's.",
+    "  warn   a soak loop against the working tree, a hardcoded --shard N/M, a --test-threads",
+    "         override, and unbounded full-workspace cargo output. Emitted as additionalContext, so",
+    "         the model reads it and the command still runs -- `probably` is doing real work in each",
+    "         of these and a block would strand a legitimate run.",
+    "",
+    "The guard is tested: `bash .claude/hooks/pre-bash-guard.test.sh` runs 20 cases including the",
+    "must-NOT-fire ones (a heredoc mentioning RUSTC_BOOTSTRAP, an echo containing `git push`, a grep",
+    "for --shard in the docs). Two real tokenizer bugs were found by that matrix, not by reading.",
+    "",
+    "statusline.py surfaces this repo's invisible states: branch (amber on main), workspace version,",
+    "dirty count, unpushed commits, and -- the one that earns its slot -- an annotated tag on HEAD",
+    "that the remote does not have, which is exactly what `scripts/release.sh` leaves behind by",
+    "design."
   ],
   "hooks": {
     "PreToolUse": [
@@ -36,6 +61,16 @@
           {
             "type": "command",
             "command": "serena-hooks auto-approve --client=claude-code"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-bash-guard.py",
+            "statusMessage": "Checking command against this repo's documented traps..."
           }
         ]
       }
@@ -62,5 +97,10 @@
         ]
       }
     ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/statusline.py",
+    "refreshInterval": 10
   }
 }

@@ -220,6 +220,21 @@ See `docs/agents/triage-labels.md`.
 
 Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
+### Guardrails
+
+**Some of the traps above are now enforced rather than described.** `.claude/hooks/pre-bash-guard.py`
+runs on every Bash call and denies `RUSTC_BOOTSTRAP=1 cargo …` and a `git commit` over a misformatted
+tree, asks before `git push`, and warns on a soak loop against the working tree, a hardcoded
+`--shard N/M`, a `--test-threads` override, and unbounded workspace cargo output. Every rule is one
+already written down in this file — the hook adds no policy, it just stops the policy depending on
+somebody having read this far.
+
+The rationale for each severity lives in `.claude/settings.json`'s comment block and is deliberately
+**not** repeated here; that file is the one place to change it. `bash .claude/hooks/pre-bash-guard.test.sh`
+is the 20-case matrix, and eleven of those cases assert the guard does *not* fire — a guard that trips
+on a heredoc or an `echo` gets switched off within the day. Escape any deny with
+`SKIP_JDWP_AGENT_GUARD=1` in the command itself.
+
 ## Releasing
 
 **Use `/release [X.Y.Z]`** (`.claude/commands/release.md`). `scripts/release.sh` is the half that bumps,
