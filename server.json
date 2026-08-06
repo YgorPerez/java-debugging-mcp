@@ -1,0 +1,13 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.YgorPerez/java-debugging-mcp",
+  "title": "Java Debugger (JDWP)",
+  "description": "Native JDWP debugger: stop points, stack and variable inspection, expression evaluation.",
+  "version": "0.18.1",
+  "repository": {
+    "url": "https://github.com/YgorPerez/java-debugging-mcp",
+    "source": "github",
+    "id": "1278388521"
+  },
+  "websiteUrl": "https://github.com/YgorPerez/java-debugging-mcp#readme"
+}

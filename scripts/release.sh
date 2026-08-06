@@ -178,7 +178,7 @@ NOTE
 step "Bumping [workspace.package].version"
 
 if [ "$DRY_RUN" = 1 ]; then
-  echo "    would set version = \"$VERSION\" in Cargo.toml"
+  echo "    would set version = \"$VERSION\" in Cargo.toml and server.json"
   echo "    would refresh Cargo.lock, commit 'chore(release): $VERSION', and tag $TAG"
   step "Dry run complete — nothing changed"
   exit 0
@@ -197,6 +197,30 @@ if n != 1:
     sys.exit("could not find version under [workspace.package] — has Cargo.toml been restructured?")
 open("Cargo.toml", "w").write(out)
 print(f"    Cargo.toml: version = \"{new}\"")
+PY
+
+# server.json is the MCP registry manifest (REL-3, #137). It carries its own `version`, and a manifest that
+# silently lags the release it describes is worse than no manifest — a searcher is told a version exists
+# that nobody published. Bumped HERE rather than by hand for the same reason Cargo.lock is, and asserted
+# against Cargo.toml by `the_registry_manifest_version_matches_the_crate` in docs_claims.rs, so the two
+# cannot drift even if this step is later removed.
+python3 - "$VERSION" <<'PY'
+import json, sys
+
+new = sys.argv[1]
+path = "server.json"
+try:
+    with open(path) as fh:
+        doc = json.load(fh)
+except FileNotFoundError:
+    sys.exit(0)  # having no manifest is a decision someone can make; a stale one is not
+except json.JSONDecodeError as why:
+    sys.exit(f"{path} is not valid JSON ({why}) — refusing to guess at a registry manifest")
+doc["version"] = new
+with open(path, "w") as fh:
+    json.dump(doc, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+print(f'    server.json: version = "{new}"')
 PY
 
 # Cargo.lock records both workspace members' versions, is committed, and the release build uses --locked.
@@ -218,7 +242,7 @@ WROTE="$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))[
 
 step "Committing and tagging"
 
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock server.json
 
 # The subject only. Every release in this repo carries a written rationale in its commit body (0.4.0 is
 # the precedent), but it is prose about what shipped and this script has no way to know that — so it

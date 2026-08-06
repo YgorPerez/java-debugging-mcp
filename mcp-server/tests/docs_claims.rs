@@ -165,6 +165,41 @@ fn the_load_bearing_licence_allowances_are_still_present() {
     }
 }
 
+/// The MCP registry manifest names a version, and a manifest that lags the release it describes tells a
+/// searcher a version exists that nobody published (REL-3, #137). `scripts/release.sh` bumps it beside
+/// Cargo.toml; this is what makes that non-optional rather than a step someone can quietly drop.
+#[test]
+fn the_registry_manifest_version_matches_the_crate() {
+    let manifest = read("server.json");
+    let declared = manifest
+        .split("\"version\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').nth(1))
+        .expect("no \"version\" in server.json");
+
+    let crate_version = read("Cargo.toml")
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("version")?
+                .trim()
+                .strip_prefix('=')?
+                .trim()
+                .strip_prefix('"')?
+                .split('"')
+                .next()
+        })
+        .map(str::to_owned)
+        .expect("no version in Cargo.toml");
+
+    assert_eq!(
+        declared, crate_version,
+        "server.json says {declared} and Cargo.toml says {crate_version}. The registry manifest is \
+         published to searchers; a version there that was never released is worse than no listing. \
+         scripts/release.sh bumps both — if this drifted, that step was skipped or removed."
+    );
+}
+
 /// `.githooks/commit-msg` accepts exactly the vocabulary `release-notes.py` categorises on, by asking the
 /// script for it (REL-4, #147). The flag it asks with is the whole mechanism.
 #[test]

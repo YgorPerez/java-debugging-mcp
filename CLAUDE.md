@@ -387,6 +387,15 @@ worst is that a non-interactive `release.sh` writes only the commit **subject**,
 **re-tagging** — an annotated tag names one commit, and amending leaves the tag pointing at an object no
 longer on the branch.
 
+**`server.json` is the MCP registry manifest and `release.sh` bumps it** (REL-3, #137). It carries its own
+`version`, so a manifest left behind tells a searcher a release exists that was never published — the
+same class of defect as a stale pin. `the_registry_manifest_version_matches_the_crate` asserts it against
+`Cargo.toml`, so the bump step cannot be quietly dropped. **It is deliberately metadata-only** — no
+`packages` block — because the registry's direct-download type is `mcpb`, which wants a bundle this repo
+does not build and a `fileSha256` for it; a listing that named an install method we do not have would
+advertise something nobody can run. Validate any edit against the published schema before committing:
+`description` is capped at **100 characters** and the first draft here was well over it.
+
 **The release body reaches the releases page through `scripts/release-notes.py`**, and it did not until
 v0.9.0. The workflow published with `--generate-notes`, which lists merged **pull requests** — so a release
 of direct pushes to main generated an empty "What's Changed", and the commit body it never read is where all
