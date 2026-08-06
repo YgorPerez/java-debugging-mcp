@@ -383,7 +383,7 @@ impl DebugSession {
     }
 
     /// Record that the VM is running again. Every resume path calls this, so neither field is left stale.
-    pub fn mark_resumed(&mut self) {
+    pub const fn mark_resumed(&mut self) {
         self.suspended_since = None;
         self.suspended_cause = None;
     }

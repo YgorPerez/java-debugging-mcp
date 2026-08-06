@@ -260,3 +260,49 @@ jobs:
           scripts/test-timings.py --markdown \
             --label 'Integration (JDK ${{ matrix.java }}, shard ${{ matrix.shard }}/2)' \
             integration.log >> "$GITHUB_STEP_SUMMARY"
+
+  # BUILD-2 (#142). `rust-version` in Cargo.toml was a claim no job tested, and when it was finally run it
+  # turned out to be false — the workspace had never built on the version it advertised. See the comment
+  # at that line for the two floors and how they were measured.
+  #
+  # IT GATES, unlike the semver job's release-only posture (CI-2, #122). That job reports rather than gates
+  # because between releases its red was routine and tested nothing. This one is the opposite: the floor is
+  # measured, so a break here is a real regression in what the manifest promises, and it should stop the
+  # push that caused it.
+  #
+  # The number is READ FROM THE MANIFEST, not repeated here. A workflow literal and a `rust-version` that
+  # have to move together is the second copy this repo keeps writing post-mortems about — and it is the
+  # specific hazard #142 raised about its own fix.
+  #
+  # `--all-targets` on purpose: the test code is where the harder floor lives (a dev-dependency needing
+  # edition2024), and a check that built only the library would certify a version nobody can run the suite
+  # on. `cargo check` rather than `build` — this asks whether the toolchain accepts the code, and linking
+  # answers nothing extra.
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the declared MSRV
+        id: msrv
+        shell: bash
+        run: |
+          v="$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+          if [ -z "$v" ]; then
+            echo "::error::could not read rust-version out of Cargo.toml — the sed that reads it no longer matches the file"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $v"
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          # The declared floor, which is neither rust-toolchain.toml's pin nor stable. Read the action's
+          # `Rust in use:` line to confirm the job got it: the toolchain file outranks `rustup default`,
+          # so an MSRV job that silently ran on the pin would pass while testing nothing.
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Build the workspace on the declared floor
+        run: cargo check --workspace --all-targets

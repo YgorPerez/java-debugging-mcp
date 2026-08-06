@@ -5,7 +5,23 @@ resolver = "2"
 [workspace.package]
 version = "0.18.0"
 edition = "2021"
-rust-version = "1.82"
+# MEASURED, not declared (BUILD-2, #142). "1.82" sat here untested and was false in both directions
+# that matter: the workspace has never built on it. Two separate floors, found by running each toolchain:
+#
+#   1.82  fails on OUR code   -- mcp-server/src/session.rs, `pub const fn watch_mut(&mut self)`,
+#                               three E0658; `const_mut_refs` stabilised in 1.83.
+#   1.83  builds lib and bin, fails `--all-targets` -- tempfile -> getrandom 0.4.3 needs edition2024,
+#   1.84  same                                         which Cargo gained in 1.85. Fails at RESOLUTION,
+#                                                      before any of our code is compiled.
+#   1.85  builds everything.
+#
+# 1.85 is one honest number rather than 1.83 plus a documented dev floor. Two numbers that must move
+# together is the duplicated fact DOC-15 (#145) is about, and a contributor who clones this and runs
+# `cargo test` needs 1.85 whatever the library alone would tolerate.
+#
+# The `msrv` job in tests.yml reads this line and builds on it, so the claim is checked rather than
+# asserted. Raising it here raises what CI tests, in one place.
+rust-version = "1.85"
 # Ed Sweeney is the original author of the upstream this was forked from
 # (navicore/jdwp-mcp, the first 22 commits); LICENSE keeps his copyright notice.
 authors = ["Ygor Perez <ygor@infotera.com.br>", "Ed Sweeney <ed@onextent.com>"]

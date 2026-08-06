@@ -7382,7 +7382,7 @@ impl Quoted {
         self.in_str || self.in_char
     }
 
-    fn step(&mut self, c: char) {
+    const fn step(&mut self, c: char) {
         if self.escaped {
             self.escaped = false;
             return;
