@@ -1,0 +1,64 @@
+# cargo-deny's policy for this workspace (CI-3, #148).
+#
+# WHY THIS FILE HAD TO EXIST BEFORE THE CHECK MEANT ANYTHING, which is the opposite of how the issue
+# guessed it. cargo-deny ships `[licenses] allow = []`, so with no config the licences check does not
+# merely run strictly — it rejects the entire dependency graph, MIT included:
+#
+#   $ cargo deny check licenses          # before this file
+#   error[rejected]: failed to satisfy license requirements
+#     zmij-1.0.23/Cargo.toml:34   license = "MIT"   rejected: license is not explicitly allowed
+#   licenses FAILED   (exit 4, 98 crates rejected)
+#
+# So this is new coverage rather than a written-down version of a pass that already happened. The other
+# three checks (advisories, bans, sources) did pass on defaults, and still do.
+
+[graph]
+all-features = true
+
+# TAKEN FROM THE TREE, not guessed. `cargo deny list` on the graph as of v0.18.0 reports MIT on 57
+# crates, Apache-2.0 on 38, Unicode-3.0 on unicode-ident and Unlicense on memchr. No copyleft, nothing
+# needing an exception.
+#
+# ONLY TWO OF THESE FOUR ENTRIES ACTUALLY DO ANYTHING, measured by deleting each one and re-running:
+#
+#   MIT removed          -> 18 rejections    load-bearing
+#   Unicode-3.0 removed  ->  1 rejection     load-bearing: unicode-ident is
+#                                            "(MIT OR Apache-2.0) AND Unicode-3.0", and an AND clause
+#                                            cannot be satisfied by the alternatives
+#   Apache-2.0 removed   ->  0 rejections    redundant today: every Apache-2.0 crate here is dual
+#   Unlicense removed    ->  0 rejections    redundant today: memchr is "Unlicense OR MIT"
+#
+# The two redundant entries stay on purpose, and the measurement is written down so nobody later
+# "tidies" them away believing the list was copied from a template. They are licences this project is
+# willing to accept, and dropping them would reject the first dependency that happens to be Apache-2.0
+# only — a very common shape — for no reason anybody chose.
+#
+# Adding a fifth is a decision about what this project is willing to ship, so make it deliberately: the
+# check going red on a new dependency is the check working, and the fix is usually a different
+# dependency rather than a wider list.
+[licenses]
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "Unlicense"]
+
+# ADVISORIES ARE OWNED HERE, and only here (question 3 of #148). cargo-deny and cargo-audit read the same
+# RUSTSEC database, and running both means a suppression has to be written twice or it silences one tool
+# and not the other. rust-doctor's own `dependencies (cargo-deny)` pass is what runs in the gate, and
+# `.github/workflows/rust-doctor.yml` installs `cargo-deny` and NOT `cargo-audit` — so cargo-deny is
+# already the only advisory source in CI, and this file is where an exception belongs if one is ever
+# needed. There is none today: `cargo deny check advisories` is clean.
+[advisories]
+yanked = "deny"
+
+# `warn`, deliberately, and the current warning is real: `syn` 2 and `syn` 3 are both in the graph,
+# pulled by different proc-macro dependencies. Nothing here can fix that — it resolves when the
+# ecosystem finishes moving — and a `deny` would turn somebody else's migration schedule into a red
+# gate on this repo. That is the permanent-red shape CI-2 (#122) and the removed AI-review workflow are
+# both about.
+[bans]
+multiple-versions = "warn"
+
+# Everything comes from crates.io today and there is no reason for that to change quietly. A git
+# dependency appearing in this workspace is worth a conversation, not a silent resolve.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

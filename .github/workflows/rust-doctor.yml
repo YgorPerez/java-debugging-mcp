@@ -199,6 +199,25 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --workspace --no-deps --document-private-items
 
+      # WHY cargo-deny RUNS AGAIN when rust-doctor already has a `dependencies (cargo-deny)` pass.
+      # Because that pass does not check licences, and until CI-3 (#148) nothing did — cargo-deny ships
+      # `[licenses] allow = []`, so without a deny.toml the check rejects the whole graph, MIT included
+      # (98 crates, exit 4). A check nobody can run is a check nobody runs, which is why its absence
+      # looked like a pass. deny.toml is what makes it answerable; this step is what makes it gate.
+      #
+      # `cargo deny check` runs all four. advisories, bans and sources already passed on defaults and
+      # still do, so the new coverage is licences — and running the other three here costs ~0.1 s and
+      # keeps one command as the answer to "what is the dependency policy".
+      #
+      # Advisories are owned by cargo-deny and not cargo-audit, deliberately: both read RUSTSEC, and
+      # the install list above deliberately carries only cargo-deny, so an exception is written once in
+      # deny.toml rather than twice in two tools' configs.
+      #
+      # `if: always()` for the same reason as the two steps above.
+      - name: Dependency policy (cargo-deny)
+        if: always()
+        run: cargo deny check
+
       # A failing gate prints nothing useful: --sarif sends every finding to the file, so the step log
       # ends at "exit code 3" and the findings are only readable via the code-scanning API. Print them,
       # so the reason a build failed is in the build that failed.

@@ -382,6 +382,26 @@ JS
     printf '\n%s\n' "documentation (rustdoc): would pass."
   fi
 
+  # cargo-deny gates in CI beside this scan (CI-3, #148), and runs here for the reason the two blocks
+  # above run here: a check that gates in CI and not locally retires this script's claim that a clean
+  # run is a green gate. rust-doctor's own `dependencies (cargo-deny)` pass does not cover licences,
+  # which is the half deny.toml made answerable at all.
+  if command -v cargo-deny >/dev/null 2>&1; then
+    deny_status=0
+    deny_out="$(cargo deny check 2>&1)" || deny_status=$?
+    if [ "$deny_status" -ne 0 ]; then
+      printf '\n%s\n' "dependency policy (cargo-deny): WOULD FAIL — this gates in CI."
+      printf '%s\n' "$deny_out" | grep -E '^(error|warning)' | sed 's/^/      /'
+      verdict=3
+    else
+      printf '\n%s\n' "dependency policy (cargo-deny): would pass."
+    fi
+  else
+    printf '\n%s\n' "not looked at here — cargo-deny is not installed, and it GATES in CI."
+    printf '%s\n' "      A clean run above is therefore not a green gate. Install it with"
+    printf '%s\n' "      \`cargo install cargo-deny --locked\` (or \`taiki-e/install-action\`, as CI does)."
+  fi
+
   exit "$verdict"
 fi
 
