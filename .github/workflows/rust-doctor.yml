@@ -140,7 +140,7 @@ jobs:
       - name: Install the tools the gate needs
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-machete,cargo-shear
+          tool: cargo-deny,cargo-machete,cargo-shear,typos
 
       - name: Run rust-doctor
         run: /tmp/rust-doctor --sarif --fail-on warning > rust-doctor.sarif
@@ -217,6 +217,24 @@ jobs:
       - name: Dependency policy (cargo-deny)
         if: always()
         run: cargo deny check
+
+      # DOC-14 (#144). Nothing spellchecked ~896 KB of prose, and some of that prose is the tool
+      # descriptions and argument schemas that ship to callers — where a typo is not cosmetic, because
+      # docs/toolkit-contract.md makes a caller-visible wording change the dangerous category.
+      #
+      # BE HONEST ABOUT WHAT THIS BOUGHT ON DAY ONE: nothing. The first run found 70 findings and all 70
+      # were false positives — see _typos.toml, which carries the breakdown and a reason per entry. This
+      # gate is a bet on the next typo, not a fix for the current ones, and if it ever reports a long
+      # list again the right response is to read them rather than widen the allowlist.
+      #
+      # `typos` is the taiki-e/install-action name; the crate is `typos-cli`. Added to the one `tool:`
+      # line above rather than as a second install step, because scripts/doctor.sh reads only the first
+      # one (`head -1`) and the comment there explains at length why.
+      #
+      # `if: always()` for the same reason as the steps above.
+      - name: Spellcheck the prose (typos)
+        if: always()
+        run: typos
 
       # A failing gate prints nothing useful: --sarif sends every finding to the file, so the step log
       # ends at "exit code 3" and the findings are only readable via the code-scanning API. Print them,

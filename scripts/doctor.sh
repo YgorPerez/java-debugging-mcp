@@ -402,6 +402,25 @@ JS
     printf '%s\n' "      \`cargo install cargo-deny --locked\` (or \`taiki-e/install-action\`, as CI does)."
   fi
 
+  # typos gates in CI beside this scan (DOC-14, #144), and runs here for the same reason the three
+  # blocks above do. Only the finding lines are echoed: typos prints the offending line and a caret per
+  # finding, and this list is meant to be the thing you act on.
+  if command -v typos >/dev/null 2>&1; then
+    typos_status=0
+    typos_out="$(typos --format brief 2>&1)" || typos_status=$?
+    if [ "$typos_status" -ne 0 ]; then
+      printf '\n%s\n' "spelling (typos): WOULD FAIL — this gates in CI."
+      printf '%s\n' "$typos_out" | sed 's/^/      /'
+      verdict=3
+    else
+      printf '\n%s\n' "spelling (typos): would pass."
+    fi
+  else
+    printf '\n%s\n' "not looked at here — typos is not installed, and it GATES in CI."
+    printf '%s\n' "      A clean run above is therefore not a green gate. Install it with"
+    printf '%s\n' "      \`cargo install typos-cli --locked\` (the action's tool name is \`typos\`)."
+  fi
+
   exit "$verdict"
 fi
 

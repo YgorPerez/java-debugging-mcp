@@ -1,0 +1,42 @@
+# Spellcheck policy (DOC-14, #144).
+#
+# READ THIS BEFORE ADDING AN ENTRY. The first run of `typos` on this tree produced 70 findings and every
+# one of them was a false positive — Portuguese domain vocabulary, a tokenizer artifact, an English
+# variant, a Rust identifier, and two deliberate misspellings that exist to make tests fail. Not one
+# genuine typo. So this gate protects nothing that is wrong *today*, and it was added anyway, for the
+# next typo in a tool description that ships to callers rather than for these.
+#
+# That makes the allowlist the entire day-one deliverable, which is the exact shape a config file has
+# when it is being used to silence a tool rather than configure one. The defence is that every entry
+# below carries the reason it is not a typo, and two of them would BREAK CODE if "fixed". An entry
+# without a reason is how this file turns into the thing it was warned about.
+
+[default.extend-words]
+
+# ── Portuguese. This debugger is pointed at infotravel, whose domain language is Portuguese, and the
+#    JPA probe fixture models it directly (examples/probes/JpaProbe.java: `public static class Itens`).
+#    Renaming the fixture to English would make it a worse model of the code it stands in for.
+itens = "itens"
+cliente = "cliente"
+limite = "limite"      # `Config.LIMITE` in a doc example, mcp-server/src/args.rs:390
+
+# ── Deliberate misspellings, which is the category that matters: correcting these changes behaviour.
+#
+#    `Ordr` is a NEGATIVE assertion — mcp-server/src/handlers.rs:26360 reads
+#      assert!(!class_matches("com.example.OrderService", "Ordr"));
+#    so "fixing" it to `Order` inverts the test into one that passes for the wrong reason.
+#
+#    `sesion` is the same idea on the argument surface: mcp_integration.rs feeds
+#      ["sessionId", "session-id", "sesion_id"]
+#    to prove an unknown spelling is refused rather than guessed at.
+ordr = "ordr"
+sesion = "sesion"
+
+# ── Tokenizer artifacts. The word in the source is correct; typos splits it and flags a fragment.
+selec = "selec"        # the source says `SELECTs` — the plural of an all-caps SQL keyword
+mis = "mis"            # the English prefix: "mis-set", "mis-read", "mis-reported", "mis-step"
+ands = "ands"          # a Rust identifier: `let ands = split_bool(s, '&')`, the boolean-tree parser
+
+# ── A variant, not an error. Both spellings are current English; typos merely prefers one. 12 uses
+#    across this tree, and rewriting them would be churn in narrative prose for no reader's benefit.
+unparseable = "unparseable"
