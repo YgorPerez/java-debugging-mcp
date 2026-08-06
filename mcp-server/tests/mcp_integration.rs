@@ -4465,6 +4465,43 @@ fn highest_tick(probe: &Probe) -> Option<i64> {
     probe.output().iter().filter_map(|l| tick_index(l)).max()
 }
 
+/// The tick a later one is compared against, ESTABLISHED rather than assumed (TEST-40 #125, TEST-47 #155).
+///
+/// The three `MonitorProbe` tests that check "the VM was not left suspended" used to open with
+/// `highest_tick(&probe).unwrap_or(-1)`, and that sentinel made the assertion decorative.
+/// `monitor_probe_ready` waits for `monitors ready`, and its own doc explains why it is not `tick ` —
+/// correct for arming, but it means readiness fires BEFORE the first tick line exists. So `before` was
+/// -1 on every run, and `after > before` only meant "kept ticking" by accident: it passed whenever
+/// `after` parsed at all. It failed only when the probe was ALSO slow to start, at which point `after`
+/// was -1 too and the message blamed a stop that the evidence never showed.
+///
+/// Two rules, both of which the sentinel broke. Wait for a first tick, so there is a witness. And do not
+/// invent one: a parse failure is a disagreement between `tick_index` and the probe, not a count of -1.
+fn first_tick_witness(probe: &Probe, what: &str) -> i64 {
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).unwrap_or_else(|| {
+        panic!("{what}: the probe never printed a tick, so there was never a witness to keep")
+    });
+    highest_tick(probe).unwrap_or_else(|| {
+        panic!("{what}: a tick line was seen but did not parse, so tick_index and the probe disagree")
+    })
+}
+
+/// Assert the probe is STILL ticking, against a `before` from [`first_tick_witness`].
+///
+/// Polled rather than read once, which is the third part of #125's fix. The claim is that the probe kept
+/// going, and a single read taken the instant a reply arrives can land between two of its 150 ms ticks —
+/// a coin flip dressed as an assertion. A bounded wait for the NEXT tick is the same observation without
+/// it, and still fails in the same time if the probe is genuinely frozen.
+fn assert_still_ticking(probe: &Probe, before: i64, what: &str) {
+    let advanced = probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > before));
+    assert!(
+        advanced.is_some(),
+        "{what}: the probe stopped ticking. It WAS ticking beforehand (tick {before}), so this is a stop \
+         and not a slow start.\n  probe tail: {:?}",
+        probe.output().iter().rev().take(8).collect::<Vec<_>>(),
+    );
+}
+
 /// Pull `<key>=(int) N` out of one `debug.get_traces` line.
 fn trace_int(line: &str, key: &str) -> Option<i64> {
     let needle = format!("{key}=(int) ");
@@ -14859,7 +14896,7 @@ fn a_paired_monitor_snapshot_carries_a_debugger_measured_duration() {
     let mut server = Server::start().expect("start server");
     probe.attach(&mut server);
 
-    let before = highest_tick(&probe).unwrap_or(-1);
+    let before = first_tick_witness(&probe, "a paired monitor snapshot");
     // The default kinds are exactly this pair, so passing none is also a test of that default.
     let armed = server.call("debug.set_monitor_stop", serde_json::json!({"trace_max_hits": 0}));
     assert_contains_all(
@@ -14912,8 +14949,7 @@ fn a_paired_monitor_snapshot_carries_a_debugger_measured_duration() {
          measured={measured:?}"
     );
 
-    let after = highest_tick(&probe).unwrap_or(-1);
-    assert!(after > before, "the probe stopped ticking: before={before} after={after}");
+    assert_still_ticking(&probe, before, "a paired monitor snapshot left the VM suspended");
     server.panic_reset();
 }
 
@@ -14937,7 +14973,7 @@ fn a_monitor_duration_threshold_keeps_the_slow_lock_and_drops_the_fast_one() {
     let mut server = Server::start().expect("start server");
     probe.attach(&mut server);
 
-    let before = highest_tick(&probe).unwrap_or(-1);
+    let before = first_tick_witness(&probe, "a monitor duration threshold");
     let armed = server.call(
         "debug.set_monitor_stop",
         serde_json::json!({"min_duration_ms": 200, "trace_max_hits": 0, "trace_frames": 0}),
@@ -14991,8 +15027,7 @@ fn a_monitor_duration_threshold_keeps_the_slow_lock_and_drops_the_fast_one() {
          the threshold, which is the thing that makes a filtered silence unreadable. hits={hits:?}"
     );
 
-    let after = highest_tick(&probe).unwrap_or(-1);
-    assert!(after > before, "the probe stopped ticking: before={before} after={after}");
+    assert_still_ticking(&probe, before, "a monitor duration threshold left the VM suspended");
     server.panic_reset();
 }
 
@@ -15056,19 +15091,11 @@ fn a_flooding_monitor_stop_disarms_itself_on_its_budget_and_says_so() {
     let mut server = Server::start().expect("start server");
     probe.attach(&mut server);
 
-    // THE PREMISE OF THE FINAL ASSERTION, ESTABLISHED RATHER THAN HOPED FOR (#125). `monitor_probe_ready`
-    // waits for `monitors ready`, and its own doc explains why it is not `tick ` — correct for arming, but it
-    // means readiness fires BEFORE the first tick line exists, so `before` was the `unwrap_or(-1)` default on
-    // every single run. `after > before` then only means "kept ticking" if `before` was a real number: when a
-    // flooding stop point on a starved 4-vCPU runner delayed main's first `println` past the budget disarm,
-    // `after` was -1 as well, `-1 > -1` failed, and the message blamed the probe for STOPPING when it had
-    // never started. Two of three CI attempts on JDK 11 shard 1/2, and 3/3 green locally — a gentler box, as
-    // CLAUDE.md warns.
-    probe
-        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some())
-        .expect("MonitorProbe never printed a tick, so there was never a witness to keep");
-    let before = highest_tick(&probe)
-        .expect("a tick line was seen but did not parse, which means tick_index and the probe disagree");
+    // The premise of the final assertion, established rather than hoped for — see `first_tick_witness`,
+    // which is this same three-part fix extracted (#155) after #125 wrote it here and two siblings kept
+    // the broken form. The CI evidence that produced it: two of three attempts on JDK 11 shard 1/2, and
+    // 3/3 green locally, a gentler box exactly as CLAUDE.md warns.
+    let before = first_tick_witness(&probe, "a flooding monitor stop");
     server.call(
         "debug.set_monitor_stop",
         serde_json::json!({"kinds": ["wait"], "trace_max_hits": 5, "trace_frames": 0}),
@@ -15089,17 +15116,10 @@ fn a_flooding_monitor_stop_disarms_itself_on_its_budget_and_says_so() {
 
     // A disarm is not a freeze: the whole point of the TRACE-8 in-flight handling is that events the JVM
     // had already generated are dropped and resumed rather than surfaced as suspending hits.
-    // Polled rather than read once: the claim is that the probe is STILL ticking, and one read taken the
-    // instant the budget note appears can land between two of its 150 ms ticks. A bounded wait for the next
-    // tick is the same observation without the coin flip — and it still fails, in the same time, if the
-    // probe is genuinely frozen.
-    let advanced = probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > before));
-    assert!(
-        advanced.is_some(),
-        "the probe stopped ticking after the budget disarm, so an in-flight monitor event was surfaced as a \
-         suspending hit. It WAS ticking before it (tick {before}), so this is a stop and not a slow \
-         start.\n  probe tail: {:?}",
-        probe.output().iter().rev().take(8).collect::<Vec<_>>(),
+    assert_still_ticking(
+        &probe,
+        before,
+        "an in-flight monitor event was surfaced as a suspending hit after the budget disarm",
     );
 
     server.panic_reset();
