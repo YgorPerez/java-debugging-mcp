@@ -123,6 +123,20 @@ wanted, it needs `CLAUDE_CODE_OAUTH_TOKEN` set as a repository secret **first**,
 repo's actual risks (suspension honesty, resume verification, caller-visible replies) instead of "performance
 considerations".
 
+**Seven of this file's claims are now asserted against the tree** (DOC-15, #145).
+`mcp-server/tests/docs_claims.rs` runs in plain `cargo test` and checks the *claims* rather than the
+code — that the pin is still readable by the sed two scripts use, that the first `tool:` line is the
+health job's, that every check `doctor.sh` says "GATES in CI" is really a step in the gate. Most guard a
+**sed rather than a number**, which is the cheapest thing here to get wrong: a sed that stops matching
+returns *empty*, and empty reads like "nothing to report" everywhere it lands. The ignored-test count
+lives in `mcp_integration.rs` as an `#[ignore]`d test, because only the binary's own `--list --ignored`
+can answer it — a static `grep -c '#[ignore'` says 188 and `timings.tsv` has 222 rows, and all three are
+honest. **It caught the drift on its first run**, and the deal it enforces is that a red here is fixed by
+updating the number in the same commit. **Where that deal is not worth it, delete the number instead of
+pinning it** — that is what happened to the second copy of this count, and to the `--shard N/M` rule,
+where every occurrence in the tree is either a usage line or prose explaining why not to write one down,
+so the test would only ever have fired on the documentation of its own rule.
+
 **The test legs skip on a docs-only push, and the filtering is per-JOB rather than `on: push: paths:`**
 (CI-6, #151). That distinction is the whole issue: a workflow skipped by a path filter produces **no
 check run**, so a required status check never reports and a PR waits on something that will never
@@ -234,7 +248,7 @@ than a loop). Re-measured on 4 vCPU with no floor left: **shard 1/2 = 30.7 s at 
 amendments. Note what moved the needle each time: a *test* got faster, never the shard arithmetic.
 
 **Run the unsharded suite when you are working a flake.** `scripts/integration-test.sh` with no `--shard` still
-runs every `#[ignore]`d test in one process — **217** as of 2026-08-05 — which is the contention CI used to have.
+runs every `#[ignore]`d test in one process — **219** as of 2026-08-06, and DOC-15 (#145) now asserts that number against the binary rather than asking you to trust it — which is the contention CI used to have.
 Count it rather than trusting that number (`<the-test-binary> --list --ignored | grep -c ': test$'`); this line
 said **164** for long enough that the figure was wrong by a third. Sharding *reduces* how many probe
 JVMs compete, so **a flake that stops reproducing under CI's new shape is not fixed** — #45, #56, #64 and #71
@@ -248,8 +262,10 @@ exercise had moved to shard **2/2**, because the split is by *measured* duration
 180 tests to 197 with `timings.tsv` refreshed several times in between. Six green runs that proved nothing and
 looked like they proved something.
 
-*It has since grown to 217, so those two numbers are now history as well — which is the point rather than an
-aside: this paragraph's own figures rotted in the weeks it took to read it.* **Check membership before
+*The suite has grown again since, so those two numbers are now history as well — which is the point rather
+than an aside: this paragraph's own figures rotted in the weeks it took to read it. The count above is
+carried in one place and asserted (DOC-15, #145); this sentence deliberately names no number, because a
+second copy of it is what rotted here twice.* **Check membership before
 trusting a shard number:**
 
 ```bash

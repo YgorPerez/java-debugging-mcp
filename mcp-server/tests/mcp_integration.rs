@@ -4460,6 +4460,63 @@ fn tick_index(line: &str) -> Option<i64> {
     line.strip_prefix("tick ")?.split_whitespace().next()?.parse().ok()
 }
 
+/// DOC-15 (#145): the ignored-test count in `CLAUDE.md` against the only source that can answer it.
+///
+/// This number has cost two investigations. `CLAUDE.md` carries the post-mortems: it read **164** long
+/// enough to be wrong by a third, and a later paragraph's own figures rotted in the weeks it took to
+/// read it. The file's answer so far has been to tell you to count it yourself, which is a warning and
+/// not a check.
+///
+/// THREE NUMBERS DISAGREE AND ALL THREE ARE HONEST, which is the actual defect: a static
+/// `grep -c '#\[ignore'` over the tests gives 188 because macro-generated tests defeat it, and
+/// `timings.tsv` has 222 rows because it keeps rows for tests that no longer exist by design. Only the
+/// binary's own list is authoritative, so this asks the binary — `current_exe`, which IS the test binary,
+/// so there is nothing to locate and nothing to keep in step.
+///
+/// `#[ignore]`d because it shells out to a JVM-less but still real subprocess, and because #145 placed it
+/// in the integration leg rather than a fast job. It needs no JDK.
+///
+/// WHEN THIS FAILS, THE FIX IS TO UPDATE CLAUDE.md IN THE SAME COMMIT. That is the deal #145 names: a
+/// test asserting an exact count is only worth having if the remedy travels with it. If that ever stops
+/// being the habit, delete the number from the prose instead of loosening this.
+#[test]
+#[ignore = "spawns the test binary to list itself; run with --ignored"]
+fn claude_md_reports_the_ignored_test_count_the_binary_reports() {
+    // Anchored to the sentence that makes the claim, not to "a bold number somewhere in the file". The
+    // loose version passed on the historical **164** two paragraphs below — so a post-mortem about this
+    // very number going stale would have satisfied the test asserting that it is not.
+    const CLAIM: &str = "runs every `#[ignore]`d test in one process — **";
+
+    let exe = std::env::current_exe().expect("current_exe");
+    let out = std::process::Command::new(&exe)
+        .args(["--list", "--ignored"])
+        .output()
+        .unwrap_or_else(|e| panic!("could not run {exe:?} --list --ignored: {e}"));
+    assert!(out.status.success(), "{exe:?} --list --ignored exited {:?}", out.status);
+
+    let actual = String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.ends_with(": test")).count();
+    assert!(actual > 0, "the binary listed no ignored tests, which means the list format changed rather than that there are none");
+
+    let claude = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../CLAUDE.md"))
+        .expect("read CLAUDE.md");
+    let claimed: Vec<usize> = claude
+        .match_indices(CLAIM)
+        .filter_map(|(at, _)| claude[at + CLAIM.len()..].split("**").next()?.parse::<usize>().ok())
+        .collect();
+    assert!(
+        !claimed.is_empty(),
+        "could not find the sentence that states the ignored-test count. It reads:\n  {CLAIM}<n>**\n\
+         If the wording changed, change it here too — this test is why the number can be trusted."
+    );
+
+    assert!(
+        claimed.contains(&actual),
+        "CLAUDE.md does not state the ignored-test count the binary reports.\n           binary says: {actual}\n           CLAUDE.md's sentence says: {claimed:?}\n\n         Update the number in the sentence about running the unsharded suite, in THIS commit. \
+         Note that a static grep for `#[ignore` and the row count of timings.tsv both give different \
+         answers and both are honest; this list is the authoritative one."
+    );
+}
+
 /// The highest tick a probe has printed so far.
 fn highest_tick(probe: &Probe) -> Option<i64> {
     probe.output().iter().filter_map(|l| tick_index(l)).max()
