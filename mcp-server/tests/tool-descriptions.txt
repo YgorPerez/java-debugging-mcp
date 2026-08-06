@@ -220,6 +220,31 @@ LOOKUP SEARCHES ALL OF THEM, exactly as debug.evaluate does: a redeploy leaves t
 loaded and sorting first, so a member added or re-signed since is absent from it. A later copy that has the
 member answers, and the walk's notes name which copy did.
 
+## debug.export_investigation
+Emit the WHOLE investigation as one Markdown report — the attach target and VM version, every stop point with
+its measured capture cost, every trace snapshot still in the buffer, the drift verdicts and the budget
+disarms. Call it when the finding is the deliverable: an investigation is otherwise readable exactly once, by
+exactly one reader, and the evidence a shared-JVM diagnosis rests on is usually "here are 40 snapshots showing
+the tenant arriving null on 11 of them", which is a thing to attach to a ticket rather than paraphrase — and
+paraphrase is all that survives a context window being summarised. IT IS NOT REDACTED, AND THE REPORT SAYS SO
+IN ITS OWN FIRST PARAGRAPH. Snapshots hold whatever the debuggee's variables held: request and response
+payloads, bearer tokens, credentials in a byte[], customer records. Nothing is altered, because a
+pattern-based redactor that misses one secret is WORSE than none — its output implies the file was cleaned.
+Reviewing it before attaching it anywhere is the caller's job, and the warning names payloads, tokens and
+byte[] credentials specifically rather than saying "may contain sensitive data", because a generic warning is
+one nobody acts on. Until now this content went to one caller who had already seen it; a file on a ticket is a
+different exposure, and that is the change to weigh. IT IS THE SESSION AND NOT THE BUFFER, which is why it is
+a tool of its own rather than a flag on debug.get_traces: the stop points, their costs, the attach target and
+the VM version are what make the snapshots interpretable, and none of that is in the buffer. The stop-point
+section is the same renderer debug.list_stop_points uses, so the report cannot drift from the listing. IT
+NEVER CLEARS ANYTHING — the buffer, the stop points and the disarm notices are exactly as they were, and
+debug.get_traces with clear:true is still the only thing that empties them. Nor does it let a long trace
+outlive the ring: it CANNOT, because that would mean this server writing files as the buffer fills, which BP-8
+declined. What it does instead is say how many snapshots are already gone, since a ring capped at 500 drops
+the earliest hits of a long trace and a folded rethrow replaces an earlier record — neither recoverable, and a
+partial record that does not admit it is a misleading one. Markdown rather than JSON or HTML because the
+consumer is a model or a ticket, and a JSON dump would lose the prose that makes a snapshot mean something.
+
 ## debug.force_return
 Force the current method (top frame of a suspended thread) to return immediately with the given value,
 skipping the rest of its body — e.g. make a rejecting salvar() return true without redeploying. Value is

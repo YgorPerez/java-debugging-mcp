@@ -4438,6 +4438,78 @@ fn arm_stop_points_refuses_anything_that_is_not_a_set() {
     server.panic_reset();
 }
 
+/// TRACE-14 (#136): the report carries the session, not just the buffer — and it clears nothing.
+///
+/// The two claims worth testing against a real JVM are the ones that cannot be checked on a pure renderer: that
+/// the sections which need a live debuggee are actually populated (VM version, real snapshots, the stop points
+/// as `list_stop_points` renders them), and that calling it twice returns the same evidence. The second is the
+/// destructive-by-default failure — an export that drained the buffer would pass any single-call test.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_investigation_report_carries_the_session_and_clears_nothing() {
+    let Some(jdk) = jdk_or_skip("an_investigation_report_carries_the_session_and_clears_nothing") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "ReturnProbe").expect("launch ReturnProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    let line = probe_line(&probe_source("ReturnProbe"), "calls++;");
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "ReturnProbe", "line": line, "trace": true, "trace_expr": ["calls"],
+        }),
+    );
+    // Let real snapshots accumulate — a report of an empty buffer would not exercise the section that matters.
+    let base = highest_tick(&probe).expect("no tick to count from");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2))
+        .expect("the probe must keep running under a traced stop point");
+
+    let report = server.call("debug.export_investigation", serde_json::json!({}));
+    assert_contains_all(
+        "the report opens with the exposure warning and carries every section",
+        &report,
+        &[
+            "# Investigation report",
+            "NOT redacted",
+            "yours to do",
+            "## Session",
+            "## Stop points",
+            "## Trace snapshots",
+        ],
+    );
+    // The section that needs a live JVM: the VM version comes off the wire, not from the endpoint string.
+    assert!(
+        report.contains("**VM**:") && !report.contains("could not be read"),
+        "the report must carry the VM version it read from the debuggee: {report}"
+    );
+    // And the section that needs real hits, including the expression that was captured.
+    assert!(report.contains("ReturnProbe"), "the snapshots must name the class: {report}");
+    assert!(
+        report.contains("in the buffer") && report.contains("recorded in total"),
+        "the report must state what the ring still holds against what it recorded: {report}"
+    );
+    assert!(report.contains("Nothing was cleared"), "and say plainly that it changed nothing: {report}");
+
+    // The load-bearing half. A single call cannot distinguish "read the buffer" from "drained the buffer".
+    let again = server.call("debug.export_investigation", serde_json::json!({}));
+    assert!(
+        again.contains("## Trace snapshots") && again.contains("ReturnProbe"),
+        "a second report must carry the same evidence — an export that drained the buffer would have passed \
+         every assertion above: {again}"
+    );
+    let still = server.call("debug.get_traces", serde_json::json!({}));
+    assert!(
+        !still.contains("No trace snapshots yet"),
+        "and debug.get_traces must still find them, since only clear:true may empty it: {still}"
+    );
+
+    server.panic_reset();
+}
+
 /// The fenced json block out of an export reply, or `None` if there is not one.
 ///
 /// Returns `None` rather than the whole reply on a miss, so a test that expected a block fails at the

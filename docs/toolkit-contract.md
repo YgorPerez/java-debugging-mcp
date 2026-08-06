@@ -139,7 +139,7 @@ a word-wrapped snapshot of all 38 descriptions that a deliberate edit must regen
 
 **`mcp-server/tests/argument-schemas.txt` is the same guard for the row above it** — the one about renaming an
 argument, which is silent too. It is generated from the advertised tool list rather than a hand-kept roster, so
-it covers **39 tools and 227 arguments** by construction: each argument's full schema minus its description
+it covers **40 tools and 228 arguments** by construction: each argument's full schema minus its description
 (type, default, `format`, `minimum`, `anyOf`, whether it is required) followed by the description word-wrapped.
 `schemars` publishes those descriptions as the `inputSchema`, so they are the caller's documentation for every
 argument — the same thing the tool description is one level up, and this file's insistence that an audit count

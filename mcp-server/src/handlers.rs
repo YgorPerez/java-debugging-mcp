@@ -393,6 +393,10 @@ impl RequestHandler {
             "debug.reload_class" => self.handle_reload_class(args).await,
             "debug.pop_frame" => self.handle_pop_frame(args).await,
             "debug.get_traces" => self.handle_get_traces(args).await,
+            // TRACE-14 (#136). Its own tool rather than a flag on `get_traces`, under ADR-0015's rule: the
+            // report covers the stop points, their costs, the attach target and the VM version, none of which
+            // is in the trace buffer — so it answers a different question rather than rendering the same one.
+            "debug.export_investigation" => self.handle_export_investigation(args).await,
             // Not in `dispatch_discovery` despite taking class names: that group answers what a class
             // DECLARES, with no suspended thread and no cost to anyone else. This one asks what is
             // ALIVE, and stops the world to find out.
@@ -919,6 +923,106 @@ impl RequestHandler {
             crate::stop_point_set::describe_unverified_lines(armed),
             crate::stop_point_set::describe_suspending(suspending),
         ))
+    }
+
+    /// Emit the whole investigation as a Markdown report (TRACE-14, #136).
+    ///
+    /// **What it is for.** An investigation is otherwise readable exactly once, by exactly one reader: the model
+    /// that called `debug.get_traces`. The evidence a shared-JVM diagnosis rests on is frequently "here are 40
+    /// snapshots showing the tenant arriving null on 11 of them", which is a thing to attach to a ticket rather
+    /// than paraphrase — and paraphrase is all that survives a context window being summarised.
+    ///
+    /// **Markdown, not JSON or HTML.** The consumer is a model or a ticket and both prefer it. JSON's one
+    /// advantage is diffing two sessions, which nobody has asked for, and a JSON dump would lose the prose that
+    /// makes a snapshot interpretable — the caller chain, the measured cost, the staleness verdict. HTML is what
+    /// the upstream comparison produces and is the wrong default for either consumer here.
+    ///
+    /// **It is the session, not the buffer.** #136's third question: stop points, their measured costs, the
+    /// attach target, the VM version and the drift verdicts are all what makes the snapshots mean anything, and
+    /// none of it is in the trace buffer. The stop-point section is the *same* renderer `list_stop_points` uses,
+    /// so the report cannot drift from the listing.
+    ///
+    /// **It never clears.** `debug.get_traces` already has an explicit `clear`, and an export that silently
+    /// emptied the buffer would be destructive by default. It does not let a long trace outlive the ring
+    /// either — that would need this server to write files as the buffer fills, which is the write path BP-8
+    /// (ADR-0041) declined. What it does instead is *say* how many snapshots are already gone.
+    async fn handle_export_investigation(&self, args: serde_json::Value) -> Result<String, String> {
+        crate::args::parse::<crate::args::NoArgs>(&args)?;
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+
+        // One round trip, and the only one this tool makes. Worth it: "which JVM was this?" is the first
+        // question asked of an attached report, and `endpoint` alone does not answer it across a redeploy.
+        let vm = session.connection.get_version().await.ok();
+        let dead = dead_filter_threads(&mut session).await;
+
+        let mut out = String::new();
+        let _ = writeln!(out, "# Investigation report — {}\n", session.endpoint);
+        // FIRST, and before any content. A reader who has scrolled past the warning has already read the
+        // payloads it is warning about.
+        out.push_str(&describe_investigation_exposure());
+
+        let _ = writeln!(out, "\n## Session\n");
+        let _ = writeln!(out, "- **Endpoint**: `{}`", session.endpoint);
+        match &vm {
+            Some(v) => {
+                let _ = writeln!(
+                    out,
+                    "- **VM**: {} — {} (JDWP {}.{})",
+                    v.vm_name.trim(),
+                    v.vm_version.trim(),
+                    v.jdwp_major,
+                    v.jdwp_minor
+                );
+            }
+            // Said rather than omitted, on the same rule the rest of this server follows: an absent line
+            // reads as "no VM information exists", and what happened is that one command failed.
+            None => out.push_str("- **VM**: could not be read (the Version command failed on this JVM)\n"),
+        }
+        let _ = writeln!(
+            out,
+            "- **Read-only**: {}",
+            if session.read_only { "yes — nothing here invoked or wrote anything" } else { "no" }
+        );
+        if let Some(l) = &session.launched {
+            let _ = writeln!(out, "- **Launched by this server**: {l:?}");
+        }
+
+        let _ = writeln!(out, "\n## Stop points\n\n```");
+        render_every_stop_point(&mut out, &session, &dead);
+        out.push_str("```\n");
+
+        // The two silences that make an empty buffer mean something other than "nothing happened". Same
+        // reasoning as `get_traces`' own FILT-2/FILT-9 notes, and a report is read further from the session
+        // than a reply is, so it needs them more.
+        if !dead.dead_threads.is_empty() || !dead.vanished_objects.is_empty() {
+            let _ = writeln!(
+                out,
+                "\n⚠️  {} stop point(s) filtered to a dead thread and {} scoped to a collected object. Those \
+                 cannot record anything, so their silence in this report is not \"no hits\".",
+                dead.dead_threads.len(),
+                dead.vanished_objects.len()
+            );
+        }
+
+        out.push_str(&render_investigation_traces(&session));
+
+        if !session.redefinitions.is_empty() {
+            let _ = writeln!(out, "\n## Class redefinitions\n");
+            for (class, r) in &session.redefinitions {
+                let _ = writeln!(out, "- `{class}` — {r:?}");
+            }
+        }
+
+        let _ = writeln!(
+            out,
+            "\n---\n\nNothing was cleared: the trace buffer, the stop points and the disarm notices are all \
+             exactly as they were before this call. Use debug.get_traces with clear:true when you actually \
+             want the buffer emptied."
+        );
+        drop(session);
+        Ok(out)
     }
 
     async fn handle_clear_stop_point(&self, args: serde_json::Value) -> Result<String, String> {
@@ -12991,6 +13095,106 @@ fn route_to_session(
     args
 }
 
+/// The exposure warning every investigation report opens with (TRACE-14, #136).
+///
+/// **There is no redaction, and this sentence is the whole of what replaces it.** That is a decision rather
+/// than an omission. A pattern-based redactor that misses one secret is *worse* than none, because its output
+/// implies the file was cleaned — which is the same inversion this project files most of its issues about, a
+/// mechanism whose result reads as a stronger guarantee than it gives. So the report is unaltered and says so.
+///
+/// Consistent with the posture everywhere else here: ADR-0023's heap query ships with the pause it imposed
+/// printed in its own reply, ADR-0010's traced stop point reports its own cost, and TRACE-15 (#156) added a
+/// count rather than a refusal. Report the cost, never silently alter the answer.
+///
+/// **Named concretely, not as "may contain sensitive data".** A caller weighing whether to attach a file needs
+/// to know *what* to look for, and the three things that actually turn up in this server's snapshots are request
+/// payloads, tokens in a header or field, and credentials sitting in a `byte[]`. A generic warning is one nobody
+/// acts on.
+fn describe_investigation_exposure() -> String {
+    "> ⚠️  **This report is NOT redacted, and reviewing it before you attach it anywhere is yours to do.**\n\
+     >\n\
+     > Trace snapshots hold whatever the debuggee's variables held at the hit: request and response payloads, \
+     bearer tokens in a header or a field, credentials sitting in a `byte[]`, customer records. This server \
+     alters none of it, because a pattern-based redactor that misses one secret is worse than no redactor — its \
+     output implies the file was cleaned. Nothing here has implied that.\n\
+     >\n\
+     > Until now this content went to one caller who had already seen it. A file on a ticket is a different \
+     exposure, and that is the change to weigh.\n"
+        .to_string()
+}
+
+/// The trace-snapshot section of an investigation report, and what the ring has already lost.
+///
+/// Reuses `get_traces`' own per-record formatters rather than rendering snapshots a second way: a report that
+/// showed a hit differently from the tool the caller read it in would be two sources of truth about one
+/// snapshot, and the drift would be invisible.
+///
+/// **The loss is stated, because it cannot be undone.** TRACE-9 (#80) established that a capture truncates at
+/// capture time and the cut is irreversible; the ring adds a second, coarser loss on top — the early hits of a
+/// long trace are gone by the time the interesting one arrives. `trace_seq` counts every record ever filed and
+/// `traces.len()` is what survives, so the difference is exactly what a reader of this report cannot see, and
+/// printing it is the difference between a partial record and a misleading one.
+fn render_investigation_traces(session: &crate::session::DebugSession) -> String {
+    let held = session.traces.len();
+    let filed = session.trace_seq;
+    let mut out = format!("\n## Trace snapshots\n\n{held} in the buffer, {filed} recorded in total");
+    if filed > held as u64 {
+        let _ = write!(
+            out,
+            " — **{} are no longer here.** The buffer is a ring capped at {}, so the earliest hits of a long \
+             trace are dropped to make room for later ones, and a rethrow folded into an earlier record \
+             replaces it. Neither is recoverable: this report can only carry what the buffer still holds.",
+            filed - held as u64,
+            crate::session::MAX_TRACES
+        );
+    }
+    out.push_str(".\n\n");
+
+    if session.traces.is_empty() {
+        out.push_str(
+            "No snapshots. With stop points armed above, that means either nothing reached them or every hit \
+             was filtered — see their `Hits:` counts, which distinguish the two.\n",
+        );
+        return out;
+    }
+
+    out.push_str("```\n");
+    for rec in &session.traces {
+        let _ = writeln!(
+            out,
+            "#{} [{}] {}.{}:{}{} thread=0x{:x}{}{}{}{}{}",
+            rec.seq,
+            rec.bp_id,
+            rec.class,
+            rec.method,
+            rec.line.unwrap_or(-1),
+            format_trace_callers(rec),
+            rec.thread,
+            format_trace_detail(rec),
+            format_trace_args(rec),
+            format_trace_captured(rec),
+            format_trace_expr(rec),
+            format_trace_rethrow(rec),
+        );
+    }
+    out.push_str("```\n");
+
+    if !session.trace_disarms.is_empty() {
+        out.push_str("\nStop points that disarmed themselves on their budget (TRACE-3):\n\n");
+        for (note, times) in &session.trace_disarms {
+            match times {
+                1 => {
+                    let _ = writeln!(out, "- {note}");
+                }
+                n => {
+                    let _ = writeln!(out, "- {note} (×{n})");
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Retire a stop point that carries a `hit_count`, because this hit was its last (FILT-8).
 ///
 /// The bookkeeping is exact rather than heuristic, and this is why: `Count` means the JVM reports **only**
@@ -24055,6 +24259,38 @@ mod tests {
         );
     }
 
+    /// TRACE-14 (#136): the exposure warning is what replaces redaction, so it has to do the job a redactor
+    /// would have claimed to — and the test is on the properties that make it act-on-able, not the phrasing.
+    #[test]
+    fn the_investigation_warning_names_what_to_look_for_and_never_implies_it_was_cleaned() {
+        let w = describe_investigation_exposure();
+
+        // Unambiguous about the fact. "may contain" would be the hedge that gets skimmed.
+        assert!(w.contains("NOT redacted"), "it has to say so outright: {w}");
+
+        // NAMED, not gestured at. A caller deciding whether to attach a file needs to know what to grep for,
+        // and these three are what actually turns up in this server's snapshots.
+        for what in ["payloads", "tokens", "byte[]"] {
+            assert!(w.contains(what), "the warning must name {what} concretely: {w}");
+        }
+
+        // The reason a redactor was rejected, in the reply rather than only in the ADR — otherwise the next
+        // person reads the absence of redaction as an unfinished feature and adds one.
+        assert!(
+            w.contains("worse than no redactor"),
+            "it must carry why there is none, or it reads as a gap to fill: {w}"
+        );
+
+        // And it must never claim the opposite. This is the assertion with teeth: any phrasing that implied
+        // the content had been cleaned would be the exact inversion the decision exists to avoid.
+        for forbidden in ["redacted for you", "has been cleaned", "sanitised", "sanitized", "safe to share"] {
+            assert!(!w.contains(forbidden), "must not imply the report was cleaned ({forbidden}): {w}");
+        }
+
+        // Whose job it is, stated. An unowned caveat is one nobody acts on.
+        assert!(w.contains("yours to do"), "the review has to be assigned to the caller: {w}");
+    }
+
     /// TEST-46 (#154): the caller-visible reply FRAGMENTS, pinned rather than substring-checked.
     ///
     /// 163 substring assertions guard these strings today, and a substring check passes a rewording. That
@@ -24170,6 +24406,11 @@ mod tests {
         case("session_default/clamped", describe_session_default(&ex(&["a"]), Some("dropped one")));
         case("took_session_default/no", describe_took_session_default(false, &ex(&["a"])));
         case("took_session_default/yes", describe_took_session_default(true, &ex(&["a", "b"])));
+
+        // TRACE-14 (#136). The one piece of prose in this repo whose exact wording is a safety property
+        // rather than a convenience: it is what stands in for redaction, so a rewrite that softened it would
+        // be a real change and needs to show up as a diff somebody reads.
+        case("investigation_exposure", describe_investigation_exposure());
 
         case("overridden_traces/none", describe_overridden_traces(&[]));
         case("overridden_traces/one", describe_overridden_traces(&[("Foo.java:12", vec!["Bar.java:34"])]));

@@ -705,6 +705,30 @@ that it does not keep), session export (that is an **investigation report**, a d
 ADR-0042; the two share the verb *export* and nothing else), saved breakpoints (it carries all five kinds plus
 wildcard families, and a set is not necessarily saved anywhere — it is handed back)
 
+**Investigation report**:
+The whole session rendered as one Markdown document by `debug.export_investigation` — attach target, VM
+version, every stop point with its measured capture cost, the snapshots the ring still holds, the staleness
+verdicts, the budget disarms. What you attach to a ticket (ADR-0042).
+
+Its own term because it is **the session and not the buffer**, which is the distinction that made it a tool
+rather than a `debug.get_traces` flag: the stop points, their costs and the VM version are what make a snapshot
+interpretable, and none of them is in the buffer.
+
+**Unredacted, and it says so before any content.** Snapshots hold whatever the debuggee's variables held —
+payloads, bearer tokens, credentials in a `byte[]`, customer records — and none of it is altered, because a
+pattern-based redactor that misses one secret is worse than none: its output implies the file was cleaned. The
+warning is first because a reader who scrolled past it has already read what it warns about, and it **names**
+what to look for rather than saying "may contain sensitive data", which is a warning nobody acts on.
+
+**It clears nothing and cannot outlive the ring.** Preserving a long trace would need this server to write
+files as the buffer fills, which is the write path a **stop-point set** declined (ADR-0041). So it reports the
+loss instead: how many snapshots were recorded against how many survive.
+
+_Avoid_: session export (the words are fine, but this is the noun and `debug.export_investigation` the verb form
+— and "session" is separately loaded here, since a **session** is the live attachment this reports on), trace
+dump (it is not the buffer, which is the whole point), audit log (nothing here is written continuously or kept
+by this server; a report is produced on request and handed over)
+
 **Export** (verb):
 To emit something in a form that outlives the session. Used of exactly two artefacts, the **stop-point set**
 and the **investigation report**, and it means the same thing for both — the artefacts differ, the verb does

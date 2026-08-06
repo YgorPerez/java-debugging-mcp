@@ -70,6 +70,9 @@ first·   ⚠️  second
 ## took_session_default/yes
 ·   ↪ Recording the session default trace_expr (a, b) — this stop point named none of its own. Pass trace_expr here to record something else, or set none on debug.attach to stop this.
 
+## investigation_exposure
+> ⚠️  **This report is NOT redacted, and reviewing it before you attach it anywhere is yours to do.**·>·> Trace snapshots hold whatever the debuggee's variables held at the hit: request and response payloads, bearer tokens in a header or a field, credentials sitting in a `byte[]`, customer records. This server alters none of it, because a pattern-based redactor that misses one secret is worse than no redactor — its output implies the file was cleaned. Nothing here has implied that.·>·> Until now this content went to one caller who had already seen it. A file on a ticket is a different exposure, and that is the change to weigh.·
+
 ## overridden_traces/none
 
 

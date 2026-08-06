@@ -119,7 +119,7 @@ pub const SESSION_ID_ARG: &str = "session_id";
 /// `debug.panic`, `debug.list_sessions`, `debug.list_stop_points` — and none of them used to parse their
 /// arguments at all, so an unknown argument to one of them was ignored however it was spelled. They parse
 /// this instead, which accepts `session_id` (stripped above) and nothing else, so strictness is the same
-/// across all thirty-nine rather than across the thirty that happened to have fields (DOC-9, #132).
+/// across all forty rather than across the thirty that happened to have fields (DOC-9, #132).
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NoArgs {}
