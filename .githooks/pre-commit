@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# LINT-6 (#146). "Run `cargo fmt` before you commit" has been in CLAUDE.md since LINT-4 (#44) and was
+# enforced only by CI, minutes later, on a push that then has to be amended or followed by a fixup.
+#
+# WHY ONLY `cargo fmt` AND NOT THE GATE. `scripts/doctor.sh` is the gate (ADR-0007) and takes ~40 s on a
+# warm tree — too slow for every commit, and a hook people disable is worse than no hook. Formatting is
+# seconds, is the documented instruction, and is the one failure that is a single command to fix.
+#
+# THIS IS NOT THE ONLY GUARD, and the other one covers the path most commits here actually take.
+# `.claude/hooks/pre-bash-guard.py` already denies `git commit` over a misformatted tree for agent
+# sessions, which is where most of this repo's commits come from. This is the human half — and it exists
+# because `core.hooksPath` is per-clone and a commit cannot set it, so neither guard subsumes the other.
+#
+# Escape hatch: `git commit --no-verify`. Deliberately not fought — a hook that cannot be skipped during
+# a rebase or a conflict resolution is a hook that gets uninstalled.
+set -euo pipefail
+
+if ! cargo fmt --all --check; then
+    cat >&2 <<'EOF'
+
+pre-commit: the tree is not rustfmt-clean, and CI fails on a misformatted diff.
+
+  cargo fmt --all      # then re-stage and commit again
+
+rustfmt.toml's settings were measured off this tree rather than chosen, and comments are NOT
+reflowed — so the long narrative doc comments in this repo are safe and this is only ever about code.
+EOF
+    exit 1
+fi

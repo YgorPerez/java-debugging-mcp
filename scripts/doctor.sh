@@ -421,6 +421,21 @@ JS
     printf '%s\n' "      \`cargo install typos-cli --locked\` (the action's tool name is \`typos\`)."
   fi
 
+  # LINT-6 (#146). `core.hooksPath` is per-clone: a commit cannot set it, so the checked-in hooks in
+  # .githooks/ do nothing until someone opts in. This says so rather than staying quiet about it, which
+  # is the same rule the sections above apply to skipped passes — an unconfigured guard reports nothing,
+  # which reads exactly like a guard that found nothing.
+  #
+  # It does NOT set the verdict. The hooks are a convenience that moves two failures earlier; the gate
+  # is this script and CI, and neither depends on them. A missing hook is not a finding about the code.
+  if [ "$(git config core.hooksPath 2>/dev/null || true)" != ".githooks" ]; then
+    printf '\n%s\n' "git hooks: not enabled in this clone (this is a note, not a finding)."
+    printf '%s\n' "      .githooks/ holds a pre-commit that runs \`cargo fmt --all --check\` and a commit-msg"
+    printf '%s\n' "      that checks the subject against the vocabulary release-notes.py categorises on."
+    printf '%s\n' "      Both only move a failure earlier; nothing here depends on them. Enable with:"
+    printf '%s\n' "        git config core.hooksPath .githooks"
+  fi
+
   exit "$verdict"
 fi
 

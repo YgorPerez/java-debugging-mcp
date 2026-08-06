@@ -123,6 +123,18 @@ wanted, it needs `CLAUDE_CODE_OAUTH_TOKEN` set as a repository secret **first**,
 repo's actual risks (suspension honesty, resume verification, caller-visible replies) instead of "performance
 considerations".
 
+**Two git hooks are checked in, and they do nothing until you opt in** (LINT-6/#146, REL-4/#147):
+`git config core.hooksPath .githooks` — per-clone, because a commit cannot set it. `pre-commit` runs
+`cargo fmt --all --check`; `commit-msg` checks the subject against the types `release-notes.py`
+categorises on, reading them from `--list-types` rather than a second copy, which is why there is no
+commitlint config here. `scripts/doctor.sh --findings` prints a note when the config is unset, and
+`bash .githooks/test.sh` is the 22-case matrix. **Two thirds of those cases assert the hooks do not
+fire**, for the reason the `.claude/` guard's matrix gives: a hook that rejects a subject the maintainer
+writes gets uninstalled the same day. Its history-replay case earned that immediately — the first
+version rejected 23 of this repo's own subjects, because `merge:` was missing from the vocabulary and
+the compound `fix(lint)+docs:` form failed the regex. That second one was a live defect in the published
+notes, not just the hook: those 13 commits had been landing in "Other Changes" with their type stripped.
+
 **Run the suite on more than one JDK.** `scripts/integration-test.sh` covers the `#[ignore]`d
 JVM tests; plain `cargo test` covers the unit and cassette tests, and you need both to see all of
 `mcp_integration.rs`. CI runs JDK 11/17/21 and has caught version-locked tests that passed on one JDK

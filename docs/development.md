@@ -216,6 +216,40 @@ It only applies because `scripts/doctor.sh` and the workflows set `CLIPPY_CONF_D
 a temporary `clippy.toml` into any member that lacks one, which would otherwise shadow it. The file
 says the rest.
 
+## Git hooks (opt-in, one command)
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`core.hooksPath` is per-clone and a commit cannot set it, so the hooks checked into `.githooks/` do
+nothing until you run that. `scripts/doctor.sh --findings` prints a note when it is unset — a note, not
+a finding, because nothing gates on these.
+
+Two hooks, and both only move a failure earlier than it would otherwise arrive:
+
+| Hook | What it does | Why it is worth a second |
+| --- | --- | --- |
+| `pre-commit` | `cargo fmt --all --check` | The instruction has been in `CLAUDE.md` since LINT-4 (#44) and was enforced only by CI, minutes later, on a push that then needs an amend or a fixup. |
+| `commit-msg` | Checks the subject against the types `scripts/release-notes.py` categorises on | A near-miss type lands under "Other Changes" on the releases page, and is discovered *after* the tag — when repairing it means re-tagging. |
+
+The `commit-msg` hook reads the vocabulary from `release-notes.py --list-types` rather than carrying a
+copy, which is the reason there is no `commitlint.config.*` here: that file would be the second copy.
+
+`bash .githooks/test.sh` is the 22-case matrix. Two thirds of the cases assert the hooks do **not**
+fire, and the strongest case is not a list of examples at all — it replays every commit subject since
+the fork through `commit-msg`. That case found both bugs in the first version: `merge:` (10 commits in
+this history) was not in the vocabulary, and the compound `fix(lint)+docs:` form (13 commits) failed the
+regex outright, which is also why `release-notes.py` had been filing those 13 under "Other Changes" with
+their type stripped.
+
+Skip either hook with `git commit --no-verify`. That is deliberate: a hook you cannot skip during a
+rebase or a conflict resolution is a hook that gets uninstalled.
+
+**Agent sessions do not use these.** `.claude/hooks/pre-bash-guard.py` already denies `git commit` over
+a misformatted tree, which covers the `pre-commit` half for the path most commits here take. There is no
+agent-side equivalent of the `commit-msg` check.
+
 ## Serena (semantic code navigation for agents)
 
 [Serena](https://github.com/oraios/serena) is registered as an MCP server for this repo, giving an agent

@@ -76,14 +76,40 @@ CATEGORIES: list[tuple[str, tuple[str, ...]]] = [
 BREAKING = "⚠️ Breaking Changes"
 OTHER = "Other Changes"
 
-CONVENTIONAL = re.compile(r"^(?P<type>[A-Za-z]+)(?:\((?P<scope>[^)]*)\))?(?P<bang>!)?:\s*(?P<desc>.+)$")
+# Types this repo writes on purpose that deliberately get no heading. `merge:` is used 10 times for a
+# commit landing a series of issues at once — it spans several categories by definition, so filing it
+# under any one of them would misreport it, and Other Changes with the type visible is the honest place.
+# They are listed here so `--list-types` reports the vocabulary the repo actually uses: a commit-msg hook
+# that rejected 23 of this repo's own 351 subjects would be uninstalled the same day, which is the test
+# `.claude/hooks/pre-bash-guard.test.sh` spends eleven of its twenty cases on.
+UNCATEGORISED_TYPES: tuple[str, ...] = ("merge",)
+
+# The trailing `(?:\+...)*` is this repo's compound form, and it was measured rather than imagined
+# (REL-4, #147): `fix(lint)+docs:` and `docs(dump)+measure:` appear 13 times in 351 commits, and every
+# one of them FAILED this regex outright — landing in Other Changes with its type stripped, which is
+# strictly worse than the unknown-type case below that keeps the type visible. The first type wins the
+# category, because it is the primary one in every use here.
+CONVENTIONAL = re.compile(
+    r"^(?P<type>[A-Za-z]+)(?:\((?P<scope>[^)]*)\))?"
+    r"(?P<extra>(?:\+[A-Za-z]+(?:\([^)]*\))?)*)"
+    r"(?P<bang>!)?:\s*(?P<desc>.+)$"
+)
 # A trailing `(#77)` or `(#73, #74, #75, #76)`. Both forms are in this history: squash-merged PRs get the
 # number appended by GitHub, and a direct push that closes issues often lists them the same way.
 TRAILING_REFS = re.compile(r"\s*\((#\d+(?:\s*,\s*#\d+)*)\)\s*$")
 # `chore(release): 0.8.0` — the release commit itself. Its body is the narrative above the changelog, so
 # listing it as a chore says the same thing twice and adds a line nobody reads.
-RELEASE_COMMIT = re.compile(r"^chore\(release\):\s*v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\s*$")
-BREAKING_FOOTER = re.compile(r"^BREAKING[ -]CHANGE:", re.M)
+# Trailing `(#123)` tolerated (REL-4, #147): a release commit that closes issues the way the rest of this
+# history does was listed as a chore, saying the same thing twice. Still anchored on the version, so an
+# ordinary `chore(release):` about something else is not swallowed.
+RELEASE_COMMIT = re.compile(
+    r"^chore\(release\):\s*v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\s*(?:\(#\d+(?:\s*,\s*#\d+)*\))?\s*$"
+)
+# Case-insensitive, and `BREAKING:` accepted alongside the spec's two spellings (REL-4, #147). This is the
+# one regex here whose miss is expensive: a genuine break written `Breaking change:` skipped the
+# `⚠️ Breaking Changes` section, and that section exists because semver-check.sh gates a public API — so a
+# break belongs at the top rather than under Features, and the miss is only visible after the tag.
+BREAKING_FOOTER = re.compile(r"^(?:BREAKING[ -]CHANGE|BREAKING):", re.M | re.I)
 
 RECORD = "\x1e"  # between commits
 FIELD = "\x1f"  # between a commit's fields
@@ -208,7 +234,23 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("tag", nargs="?", help="the tag being released (default: $GITHUB_REF_NAME, or HEAD's tag)")
     ap.add_argument("--since", metavar="TAG", help="baseline tag (default: the nearest ancestor tag)")
+    ap.add_argument(
+        "--list-types",
+        action="store_true",
+        help="print the accepted conventional-commit types, one per line, and exit",
+    )
     args = ap.parse_args()
+
+    # The .githooks/commit-msg hook calls this rather than carrying its own copy of the list. A second
+    # copy of the vocabulary is the duplicated fact this repo keeps writing post-mortems about, and it
+    # is the specific objection #147 raised against reaching for commitlint.
+    if args.list_types:
+        for _, kinds in CATEGORIES:
+            for kind in kinds:
+                print(kind)
+        for kind in UNCATEGORISED_TYPES:
+            print(kind)
+        return 0
 
     tag = resolve_tag(args.tag)
     if not tag:

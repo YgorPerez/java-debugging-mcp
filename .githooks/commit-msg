@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# REL-4 (#147). `scripts/release-notes.py` categorises the published changelog from conventional-commit
+# subjects against a closed vocabulary, and nothing checked a subject against it at authoring time.
+#
+# BE CLEAR ABOUT HOW SMALL THIS IS. The generator already fails safe: a type it does not know is printed
+# under "Other Changes" with the type kept visible, so nothing is silently dropped — the first draft of
+# #147 claimed otherwise and was wrong. What is left is that a near-miss (`fixes(trace):`, or a missing
+# colon) reads as an uncategorised change on the releases page, and is discovered *after* the tag. That
+# is the expensive moment: `.claude/commands/release.md` warns that repairing a release commit means
+# RE-TAGGING, because an annotated tag names one commit and amending leaves it pointing at an orphan.
+#
+# The vocabulary is READ FROM release-notes.py, never copied here. A second copy of the list is the
+# duplicated fact this repo keeps writing post-mortems about, and it is the reason #147 argued against
+# commitlint — whose config file would be exactly that second copy.
+set -euo pipefail
+
+msg_file="$1"
+subject="$(head -1 "$msg_file")"
+
+# Messages git generates or that are not ours to judge. `#` is a comment line, which is what an aborted
+# commit leaves behind.
+case "$subject" in
+"" | \#* | Merge\ * | Revert\ * | fixup!* | squash!* | "Applying "*) exit 0 ;;
+esac
+
+# If the generator cannot be run, say so and let the commit through. A hook that blocks work because a
+# helper moved is a hook that gets uninstalled, and this check is worth less than the commit is.
+if ! types="$(python3 scripts/release-notes.py --list-types 2>/dev/null)" || [ -z "$types" ]; then
+    echo "commit-msg: could not read the type vocabulary from scripts/release-notes.py — skipping the check." >&2
+    exit 0
+fi
+
+alternation="$(printf '%s' "$types" | tr '\n' '|' | sed 's/|$//')"
+
+# Mirrors CONVENTIONAL in release-notes.py, including the `fix(lint)+docs:` compound this repo uses 13
+# times. Only the FIRST type has to be known, exactly as the generator has it: the first type wins the
+# category and the rest are prose. Being stricter than the generator here cost a real subject —
+# `docs(dump)+measure:` — for a `measure` the published notes never needed to recognise.
+if printf '%s' "$subject" | grep -qE "^(${alternation})(\([^)]*\))?(\+[A-Za-z]+(\([^)]*\))?)*!?: .+"; then
+    exit 0
+fi
+
+{
+    echo
+    echo "commit-msg: this subject will not categorise on the releases page."
+    echo
+    echo "  $subject"
+    echo
+    echo "Expected  <type>(<scope>)?!?: <description>  with a type release-notes.py knows:"
+    printf '%s' "$types" | tr '\n' ' ' | fold -s -w 88 | sed 's/^/  /'
+    echo
+    echo
+    echo "The scope is optional and '!' marks a break. A subject that does not match still publishes —"
+    echo "it lands under 'Other Changes' with the type kept visible — but only after the tag exists, and"
+    echo "repairing a release commit means re-tagging. Preview the notes any time with:"
+    echo
+    echo "  python3 scripts/release-notes.py v<version>"
+    echo
+    echo "Skip this check with 'git commit --no-verify'."
+    echo
+} >&2
+exit 1
