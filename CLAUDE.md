@@ -123,6 +123,18 @@ wanted, it needs `CLAUDE_CODE_OAUTH_TOKEN` set as a repository secret **first**,
 repo's actual risks (suspension honesty, resume verification, caller-visible replies) instead of "performance
 considerations".
 
+**The test legs skip on a docs-only push, and the filtering is per-JOB rather than `on: push: paths:`**
+(CI-6, #151). That distinction is the whole issue: a workflow skipped by a path filter produces **no
+check run**, so a required status check never reports and a PR waits on something that will never
+arrive. A `changes` job computes the answer with six lines of `git diff` — no third-party action to pin
+and let Dependabot bump — and **`ci-ok` has no `if:`, so it reports on every event including the pushes
+where all three legs skip**. That is the job branch protection would require; `main` has none today, so
+this is groundwork rather than a change in enforcement. **It fails open on every branch it cannot
+resolve**, and the release path is refused a filter *by ref, checked first*: under `workflow_call`
+`github.event_name` is the caller's event, so a tag looks like an ordinary push, and a **re-pointed**
+tag would have had a real `before` and let a release skip the suite gating it. A newly created tag would
+have failed open by luck, and luck is not a gate — REL-1 (#34) is the recorded cost.
+
 **Every action is SHA-pinned and `zizmor` gates the workflows** (CI-4/#149, CI-5/#150). The first
 zizmor run found **71**: 32 unpinned refs — two of them `dtolnay/rust-toolchain@master`, a *branch* —
 9 `artipacked` (checkout leaving credentials in the runner's git config), a workflow-level

@@ -42,8 +42,84 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # CI-6 (#151). What follows is deliberately NOT `on: push: paths:`, and the reason is the blocker the
+  # issue leads with: a workflow skipped by a path filter produces NO check run, so a required status
+  # check never reports and a PR waits forever on something that will never arrive. Filtering at the JOB
+  # level instead keeps the workflow always triggering, so `ci-ok` at the bottom always reports —
+  # which is the half that makes branch protection possible at all. `main` has none today
+  # (`gh api .../branches/main/protection` -> 404), so this is groundwork rather than a change in
+  # enforcement, and CI-4 (#149) declines Dependabot auto-merge until it exists.
+  #
+  # NO THIRD-PARTY ACTION for this. `dorny/paths-filter` is the usual answer and would be one more thing
+  # to SHA-pin, review and let Dependabot bump, to replace six lines of `git diff`.
+  #
+  # IT FAILS OPEN, ALWAYS. Every branch that cannot determine a range — a tag, the first push to a
+  # branch, a force-push whose `before` no longer exists, `workflow_call` from release.yml — answers
+  # "yes, run everything". A filter that guesses wrong in the other direction is a green run of nothing,
+  # and REL-1 (#34) is the recorded cost of a release gated on a run that did not happen here.
+  changes:
+    name: What changed
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # a range needs both ends
+
+      - name: Decide whether the Rust legs need to run
+        id: filter
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          run_all() { echo "rust=true" >> "$GITHUB_OUTPUT"; echo "Running everything: $1"; exit 0; }
+
+          # THE RELEASE PATH IS NEVER FILTERED, checked first and by ref rather than by event. Under
+          # `workflow_call` from release.yml, `github.event_name` is the CALLER's event — "push" for a
+          # tag — so the case below would treat a release like an ordinary push. A newly created tag has
+          # an all-zero `before` and would fail open by luck; a RE-POINTED tag would not, and would let a
+          # release skip the suite that is supposed to gate it. REL-1 (#34) is the recorded cost of a
+          # release gated on a run that did not happen here, and luck is not a gate.
+          case "$REF" in
+          refs/tags/*) run_all "tag ref $REF — the release path is never filtered (REL-1, #34)" ;;
+          esac
+
+          case "$EVENT" in
+          push) base="$BEFORE" ;;
+          pull_request) base="$BASE_SHA" ;;
+          *) run_all "event '$EVENT' has no diff range (workflow_call, tag or manual)" ;;
+          esac
+
+          case "$base" in
+          "" | 0000000000000000000000000000000000000000) run_all "no base commit (new branch or first push)" ;;
+          esac
+          git cat-file -e "${base}^{commit}" 2>/dev/null || run_all "base $base is not in this clone (force-push?)"
+
+          changed="$(git diff --name-only "$base" "$HEAD_SHA")" || run_all "could not diff $base..$HEAD_SHA"
+          echo "Changed files:"; printf '%s\n' "$changed" | sed 's/^/  /'
+
+          # CONSERVATIVE ON PURPOSE, and it is the list to argue with rather than the mechanism. It
+          # includes the workflow and the composite action themselves, because a change to how the tests
+          # run is a change that has to be tested; and scripts/, because integration-test.sh, shard-plan.py
+          # and test-timings.py are all load-bearing for these legs.
+          if printf '%s\n' "$changed" | grep -qE '^(.*\.rs|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|rustfmt\.toml|_typos\.toml|examples/probes/.*|scripts/.*|mcp-server/.*|jdwp-client/.*|\.github/workflows/tests\.yml|\.github/actions/.*)$'; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "A Rust-relevant path changed."
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing Rust-relevant changed; the test legs will skip and ci-ok will still report."
+          fi
+
   unit:
     name: Unit
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -84,6 +160,8 @@ jobs:
 
   integration:
     name: Integration (JDK ${{ matrix.java }}, shard ${{ matrix.shard }}/2)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     strategy:
       # One JDK failing must not hide whether the others would have passed: with a version matrix the
@@ -284,6 +362,8 @@ jobs:
   # answers nothing extra.
   msrv:
     name: Minimum supported Rust version
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -312,3 +392,31 @@ jobs:
 
       - name: Build the workspace on the declared floor
         run: cargo check --workspace --all-targets
+
+  # THE JOB BRANCH PROTECTION WOULD REQUIRE, and the reason the filtering above is per-job rather than
+  # `on: push: paths:` (CI-6, #151). This one has no `if:`, so it runs on every event including the
+  # docs-only pushes where all three legs skip — which is the whole point. A required check that
+  # sometimes does not exist is a PR that can never merge.
+  #
+  # `success()` is NOT the test here. A skipped `needs:` job makes `success()` false, so using it would
+  # fail exactly the docs-only case this exists to let through. The result of each leg is read instead,
+  # and only `failure` and `cancelled` are refused — `skipped` is the filter working.
+  #
+  # Read through `toJSON(needs)` in an env var rather than expanded into the script, per CI-5 (#150).
+  ci-ok:
+    name: CI
+    if: always()
+    needs: [changes, unit, integration, msrv]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every leg passed or was deliberately skipped
+        shell: bash
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          if printf '%s' "$RESULTS" | grep -qE '"result"[[:space:]]*:[[:space:]]*"(failure|cancelled)"'; then
+            echo "::error::a required leg did not pass — see the results above"
+            exit 1
+          fi
+          echo "All legs passed or were skipped by the path filter."
