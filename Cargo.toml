@@ -1,5 +1,8 @@
 [workspace]
 members = ["mcp-server", "jdwp-client"]
+# `fuzz/` is its own workspace on purpose (TEST-45, #153): cargo-fuzz needs nightly, and keeping it
+# out of this graph is what stops a nightly toolchain reaching the crates the gate builds.
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

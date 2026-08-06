@@ -36,3 +36,13 @@
 
 # Agent worktrees (Claude Code) — nested checkouts, never part of the repo.
 .claude/worktrees/
+
+# TEST-45 (#153). `fuzz/` is its own workspace with its own build dir, and the corpus is DERIVED from
+# the cassettes — `fuzz/seed-corpus.py` rebuilds it in milliseconds. Committing it would be a second
+# copy of bytes that already live in mcp-server/tests/cassettes/, free to drift the day one is
+# re-recorded. `artifacts/` is where libfuzzer writes a crashing input; if one ever appears there it is
+# a finding to act on, not a file to commit.
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/Cargo.lock

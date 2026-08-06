@@ -393,6 +393,66 @@ jobs:
       - name: Build the workspace on the declared floor
         run: cargo check --workspace --all-targets
 
+  # TEST-45 (#153). No test fed a malformed reply packet to the wire read path, where a lost byte ends a
+  # session. The honest case is availability and correctness rather than memory safety — there is no
+  # `unsafe` in jdwp-client — but a panic in the event loop drops a session and a desync misattributes
+  # replies, which on a shared JVM is the worst outcome this repo has (SAFE-7, #7).
+  #
+  # SHORT ON PURPOSE. 45 s per target is a regression check, not a fuzzing campaign: it re-runs the seed
+  # corpus and whatever the mutator reaches from it, which is enough to catch a change that makes an
+  # already-known frame panic. Finding something genuinely new takes hours and belongs on a machine, not
+  # on a PR. If that is ever wanted, it is a scheduled workflow with a persisted corpus, not a bigger
+  # number here.
+  #
+  # The corpus is REBUILT from the cassettes rather than committed — see fuzz/seed-corpus.py for why.
+  #
+  # `+nightly` explicitly, never RUSTC_BOOTSTRAP: CLAUDE.md explains that the env var is hashed into the
+  # build fingerprint and silently admits nightly-only features into an ordinary build, and
+  # .claude/hooks/pre-bash-guard.py denies it. `fuzz/` is a separate workspace so this toolchain cannot
+  # reach the crates the gate builds.
+  fuzz:
+    name: Fuzz the wire read path
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          # cargo-fuzz needs nightly. Read the action's `Rust in use:` line to confirm this leg got it.
+          toolchain: nightly
+          cache-shared-key: fuzz
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
+        with:
+          tool: cargo-fuzz
+
+      - name: Seed the corpus from the cassettes
+        run: ./fuzz/seed-corpus.py
+
+      - name: Fuzz each target
+        working-directory: fuzz
+        run: |
+          for target in reply_packet value_by_tag read_string; do
+            echo "::group::$target"
+            cargo +nightly fuzz run "$target" -- -max_total_time=45 -runs=2000000
+            echo "::endgroup::"
+          done
+
+      # A crashing input is the finding, and it is useless if it dies with the runner.
+      - name: Upload any crashing input
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
   # THE JOB BRANCH PROTECTION WOULD REQUIRE, and the reason the filtering above is per-job rather than
   # `on: push: paths:` (CI-6, #151). This one has no `if:`, so it runs on every event including the
   # docs-only pushes where all three legs skip — which is the whole point. A required check that
@@ -406,7 +466,7 @@ jobs:
   ci-ok:
     name: CI
     if: always()
-    needs: [changes, unit, integration, msrv]
+    needs: [changes, unit, integration, msrv, fuzz]
     runs-on: ubuntu-latest
     steps:
       - name: Every leg passed or was deliberately skipped

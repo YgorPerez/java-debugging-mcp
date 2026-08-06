@@ -1,0 +1,44 @@
+# A SEPARATE WORKSPACE, and that is the whole point of this directory (TEST-45, #153).
+#
+# `cargo-fuzz` needs nightly. CLAUDE.md is emphatic that `RUSTC_BOOTSTRAP=1` must stay off `cargo` —
+# it is hashed into the build fingerprint, so setting it recompiles the workspace under a flag that
+# lets nightly-only features in silently, and `.claude/hooks/pre-bash-guard.py` denies it outright.
+# The answer is a real nightly toolchain invoked explicitly (`cargo +nightly fuzz run ...`), and an
+# empty `[workspace]` here so this never joins the parent's build graph. The parent's `exclude` says
+# the same thing from the other side; both are needed, because a `rust-toolchain.toml` at the repo
+# root would otherwise pin this to the gate's 1.97.1 and `cargo fuzz` would refuse.
+[workspace]
+
+[package]
+name = "jdwp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+jdwp-client = { path = "../jdwp-client" }
+
+[[bin]]
+name = "reply_packet"
+path = "fuzz_targets/reply_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value_by_tag"
+path = "fuzz_targets/value_by_tag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_string"
+path = "fuzz_targets/read_string.rs"
+test = false
+doc = false
+bench = false

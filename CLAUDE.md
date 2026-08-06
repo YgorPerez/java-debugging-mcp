@@ -123,6 +123,19 @@ wanted, it needs `CLAUDE_CODE_OAUTH_TOKEN` set as a repository secret **first**,
 repo's actual risks (suspension honesty, resume verification, caller-visible replies) instead of "performance
 considerations".
 
+**The wire read path is fuzzed, and the half that matters runs on stable** (TEST-45, #153).
+`mcp-server/tests/malformed_wire.rs` rides on every `cargo test`: truncations and single-byte
+corruptions of the **real frames in the cassettes**, all 256 value tags against every short buffer, and
+lying string lengths. `fuzz/` is the deeper half — a **separate workspace** so nightly cannot reach the
+crates the gate builds, invoked as `cargo +nightly fuzz run <target>` and **never** via
+`RUSTC_BOOTSTRAP`. Its corpus is **generated** by `fuzz/seed-corpus.py` from those same cassettes rather
+than committed, so re-recording a cassette cannot leave a stale copy behind. The claim under test is
+*never panics*, not memory safety — there is no `unsafe` here; a panic in the event loop drops a session,
+and a dropped session can leave a shared debuggee suspended. **It found nothing, which was the
+expectation**: `reader.rs` already guards every read with `ensure` plus a checked slice. Verified by
+planting a panic in `ReplyPacket::decode` and confirming two tests catch it — an unverified "no crashes"
+result is indistinguishable from a harness that never ran.
+
 **Seven of this file's claims are now asserted against the tree** (DOC-15, #145).
 `mcp-server/tests/docs_claims.rs` runs in plain `cargo test` and checks the *claims* rather than the
 code — that the pin is still readable by the sed two scripts use, that the first `tool:` line is the
