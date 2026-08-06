@@ -1,7 +1,7 @@
 # Every debug.* tool's ARGUMENT schemas, as advertised to callers. GENERATED — do not hand-edit:
 #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot
 #
-# 38 tools, 222 arguments.
+# 38 tools, 224 arguments.
 #
 # Each argument shows its full generated schema minus the description — so a changed type,
 # default, format, minimum or anyOf arm fails as loudly as a renamed field — then the description
@@ -41,6 +41,16 @@
     directories>/<file the JVM reports>`. Plain directories only — sources inside JARs are not read. Given
     here they replace the `JDWP_SOURCE_ROOTS` environment default for this session; omitted, that default
     applies.
+- trace_expr: {"anyOf":[{"$ref":"#/$defs/TraceExprs"},{"type":"null"}]}
+    Expressions every stop point in this session should record unless it names its own `trace_expr` (EVAL-14).
+    The shape this exists for is *step, look at the same six things, step again*: without it, each stop point
+    has to restate the list, and two stop points record into separately budgeted streams you then join by
+    hand. A DEFAULT, not an override. A stop point that passes `trace_expr` keeps exactly what it passed — the
+    two lists are never merged, because merging would push a caller's own list past the 4-expression cap and
+    silently drop the end of it. Every arming reply says whether it inherited. Same cap and same cost as a
+    per-stop-point `trace_expr`: at most 4, each evaluated inside the window the hit already holds the thread
+    for, and refused under `read_only` if it would invoke. Nothing is evaluated on events you did not ask to
+    stop for.
 
 ## debug.check_stale
 - bytecode: {"default":false,"type":"boolean"}
@@ -298,6 +308,16 @@
     time you can connect, static initialisers, framework bootstrapping and anything else that runs once have
     already run. With this you arm the stop points first and then `debug.continue`. Pass false for a JVM you
     only want running and attached.
+- trace_expr: {"anyOf":[{"$ref":"#/$defs/TraceExprs"},{"type":"null"}]}
+    Expressions every stop point in this session should record unless it names its own `trace_expr` (EVAL-14).
+    The shape this exists for is *step, look at the same six things, step again*: without it, each stop point
+    has to restate the list, and two stop points record into separately budgeted streams you then join by
+    hand. A DEFAULT, not an override. A stop point that passes `trace_expr` keeps exactly what it passed — the
+    two lists are never merged, because merging would push a caller's own list past the 4-expression cap and
+    silently drop the end of it. Every arming reply says whether it inherited. Same cap and same cost as a
+    per-stop-point `trace_expr`: at most 4, each evaluated inside the window the hit already holds the thread
+    for, and refused under `read_only` if it would invoke. Nothing is evaluated on events you did not ask to
+    stop for.
 - working_dir: {"default":null,"type":["string","null"]}
     Working directory for the JVM. Defaults to this server's own.
 

@@ -194,6 +194,20 @@ pub struct LaunchArgs {
     /// `debug.attach`.
     #[serde(default)]
     pub class_roots: Option<Vec<String>>,
+    /// Expressions every stop point in this session should record unless it names its own `trace_expr`
+    /// (EVAL-14). The shape this exists for is *step, look at the same six things, step again*: without
+    /// it, each stop point has to restate the list, and two stop points record into separately budgeted
+    /// streams you then join by hand.
+    ///
+    /// A DEFAULT, not an override. A stop point that passes `trace_expr` keeps exactly what it passed —
+    /// the two lists are never merged, because merging would push a caller's own list past the
+    /// 4-expression cap and silently drop the end of it. Every arming reply says whether it inherited.
+    ///
+    /// Same cap and same cost as a per-stop-point `trace_expr`: at most 4, each evaluated inside the
+    /// window the hit already holds the thread for, and refused under `read_only` if it would invoke.
+    /// Nothing is evaluated on events you did not ask to stop for.
+    #[serde(default)]
+    pub trace_expr: Option<TraceExprs>,
 }
 
 /// A class argument that takes **one** pattern or **several** (FILT-4).
@@ -325,6 +339,20 @@ pub struct AttachArgs {
     /// `JDWP_CLASS_ROOTS` environment default for this session; omitted, that default applies.
     #[serde(default)]
     pub class_roots: Option<Vec<String>>,
+    /// Expressions every stop point in this session should record unless it names its own `trace_expr`
+    /// (EVAL-14). The shape this exists for is *step, look at the same six things, step again*: without
+    /// it, each stop point has to restate the list, and two stop points record into separately budgeted
+    /// streams you then join by hand.
+    ///
+    /// A DEFAULT, not an override. A stop point that passes `trace_expr` keeps exactly what it passed —
+    /// the two lists are never merged, because merging would push a caller's own list past the
+    /// 4-expression cap and silently drop the end of it. Every arming reply says whether it inherited.
+    ///
+    /// Same cap and same cost as a per-stop-point `trace_expr`: at most 4, each evaluated inside the
+    /// window the hit already holds the thread for, and refused under `read_only` if it would invoke.
+    /// Nothing is evaluated on events you did not ask to stop for.
+    #[serde(default)]
+    pub trace_expr: Option<TraceExprs>,
 }
 
 /// Arguments for `debug.set_line_stop`.

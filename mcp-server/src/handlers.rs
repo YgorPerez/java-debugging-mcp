@@ -116,6 +116,17 @@ fn enabled_state_of(session: &crate::session::DebugSession, id: &str) -> Result<
     Err(format!("Stop point not found: {id}"))
 }
 
+/// What a session inherits from the call that opened it, rather than from the environment.
+///
+/// Grouped because `open_session` crossed `clippy::too_many_arguments` when EVAL-14 (#134) added the
+/// third, and because they are one idea: the things `debug.attach` and `debug.launch` set once for a
+/// whole session instead of on every later call. A fourth belongs here too.
+struct SessionDefaults<'a> {
+    source_roots: Option<&'a Vec<String>>,
+    class_roots: Option<&'a Vec<String>>,
+    trace_exprs: Vec<String>,
+}
+
 impl RequestHandler {
     pub fn new(alerter: crate::protocol::Alerter) -> Self {
         Self { session_manager: SessionManager::new(alerter.clone()), alerter }
@@ -381,14 +392,25 @@ impl RequestHandler {
         // than by inspecting expression text up here (SAFE-6). The flag is shared with every clone,
         // including the event pump's — which is what evaluates a condition or `trace_expr` on a hit.
         let read_only = a.read_only || env_readonly();
+        // EVAL-14 (#134). The session-wide `trace_expr` default, clamped by the same rule a per-stop-point
+        // list is — a caller must not be able to smuggle a fifth expression past the cap by setting it
+        // here instead. Refused for read-only here rather than at each stop point that inherits it: a
+        // list that would invoke is wrong once, at the moment it is set, and learning that five armings
+        // later is worse than learning it now.
+        let (session_exprs, session_expr_note) =
+            clamp_trace_exprs(crate::args::trace_exprs(a.trace_expr.clone()));
+        check_readonly_exprs(read_only, None, &session_exprs)?;
         let session_id = self
             .open_session(
                 &args,
                 connection,
                 format!("{host}:{port}"),
                 read_only,
-                a.source_roots.as_ref(),
-                a.class_roots.as_ref(),
+                SessionDefaults {
+                    source_roots: a.source_roots.as_ref(),
+                    class_roots: a.class_roots.as_ref(),
+                    trace_exprs: session_exprs.clone(),
+                },
             )
             .await?;
 
@@ -397,7 +419,24 @@ impl RequestHandler {
         } else {
             ""
         };
-        Ok(format!("Connected to JVM at {host}:{port} (session: {session_id}){ro}"))
+        Ok(format!(
+            "Connected to JVM at {host}:{port} (session: {session_id}){ro}{}",
+            describe_session_exprs(&session_exprs, session_expr_note.as_deref())
+        ))
+    }
+
+    /// The session's `trace_expr` default, read without holding a stop-point handler's own guard.
+    ///
+    /// Only `handle_set_line_stop` needs this: it clamps its arguments before acquiring a session, while
+    /// the other four stop-point handlers already hold theirs at that point and read the field directly.
+    /// An absent session is an empty default rather than an error — the handler below reports "no active
+    /// session" far better than this could, and answering that question twice would mean two messages
+    /// disagreeing about which one is the caller's problem.
+    async fn session_trace_exprs(&self, args: &serde_json::Value) -> Vec<String> {
+        match self.resolve_session(args).await {
+            Some(guard) => guard.lock().await.trace_exprs.clone(),
+            None => Vec::new(),
+        }
     }
 
     /// Create a session around an established connection and start the two tasks it cannot live without.
@@ -412,9 +451,9 @@ impl RequestHandler {
         connection: jdwp_client::JdwpConnection,
         endpoint: String,
         read_only: bool,
-        source_roots: Option<&Vec<String>>,
-        class_roots: Option<&Vec<String>>,
+        defaults: SessionDefaults<'_>,
     ) -> Result<crate::session::SessionId, String> {
+        let SessionDefaults { source_roots, class_roots, trace_exprs } = defaults;
         if read_only {
             connection.set_read_only(true);
         }
@@ -431,7 +470,7 @@ impl RequestHandler {
             class_roots.map_or_else(env_class_roots, |v| v.iter().map(std::path::PathBuf::from).collect());
         let session_id = self
             .session_manager
-            .create_session(connection, endpoint, read_only, source_roots, class_roots)
+            .create_session(connection, endpoint, read_only, source_roots, class_roots, trace_exprs)
             .await;
         // Get the session guard once so the listener/watchdog handles are stored before we return.
         let session_guard = self
@@ -512,14 +551,25 @@ impl RequestHandler {
         };
 
         let read_only = a.read_only || env_readonly();
+        // EVAL-14 (#134). The session-wide `trace_expr` default, clamped by the same rule a per-stop-point
+        // list is — a caller must not be able to smuggle a fifth expression past the cap by setting it
+        // here instead. Refused for read-only here rather than at each stop point that inherits it: a
+        // list that would invoke is wrong once, at the moment it is set, and learning that five armings
+        // later is worse than learning it now.
+        let (session_exprs, session_expr_note) =
+            clamp_trace_exprs(crate::args::trace_exprs(a.trace_expr.clone()));
+        check_readonly_exprs(read_only, None, &session_exprs)?;
         let session_id = self
             .open_session(
                 &args,
                 connection,
                 format!("127.0.0.1:{port}"),
                 read_only,
-                a.source_roots.as_ref(),
-                a.class_roots.as_ref(),
+                SessionDefaults {
+                    source_roots: a.source_roots.as_ref(),
+                    class_roots: a.class_roots.as_ref(),
+                    trace_exprs: session_exprs.clone(),
+                },
             )
             .await?;
 
@@ -544,7 +594,8 @@ impl RequestHandler {
             }
         }
 
-        Ok(render_launch_reply(&a, &target, &LaunchReply { session_id: &session_id, port, pid, read_only }))
+        Ok(render_launch_reply(&a, &target, &LaunchReply { session_id: &session_id, port, pid, read_only })
+            + &describe_session_exprs(&session_exprs, session_expr_note.as_deref()))
     }
 
     /// List every live session, so a caller who lost a `session_id` can find it again.
@@ -605,7 +656,14 @@ impl RequestHandler {
         let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
         // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
         // re-deriving it from the argument and each reaching its own answer.
-        let (trace_exprs, expr_note) = clamp_trace_exprs(crate::args::trace_exprs(a.trace_expr.clone()));
+        // EVAL-14 (#134). Read BEFORE this handler takes its own session guard, which it does
+        // further down — the other four stop-point handlers already hold theirs here and read
+        // `session.trace_exprs` directly. Calling the helper while holding that guard would
+        // re-lock the same mutex and deadlock, so the two paths differ on purpose.
+        let session_default = self.session_trace_exprs(&args).await;
+        let (trace_exprs, expr_note, inherited_exprs) =
+            resolve_trace_exprs(a.trace_expr.clone(), &session_default);
+        let inherit_note = describe_inherited_exprs(inherited_exprs, &trace_exprs);
         let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
         // One definition, pointed at each pattern in turn below.
@@ -662,7 +720,8 @@ impl RequestHandler {
         drop(session);
 
         Ok(render_pattern_outcomes(&base, &patterns, &outcomes, frames_note.as_deref(), max_classes)
-            + &overridden)
+            + &overridden
+            + inherit_note.as_str())
     }
 
     async fn handle_list_stop_points(&self, args: serde_json::Value) -> Result<String, String> {
@@ -2857,7 +2916,10 @@ impl RequestHandler {
         let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
         // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
         // re-deriving it from the argument and each reaching its own answer.
-        let (trace_exprs, expr_note) = clamp_trace_exprs(crate::args::trace_exprs(a.trace_expr.clone()));
+        // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
+        let (trace_exprs, expr_note, inherited_exprs) =
+            resolve_trace_exprs(a.trace_expr.clone(), &session.trace_exprs);
+        let inherit_note = describe_inherited_exprs(inherited_exprs, &trace_exprs);
         let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
 
@@ -2900,8 +2962,11 @@ impl RequestHandler {
         }
         drop(session);
 
-        let trailer =
-            exception_batch_trailer(&a, thread_filter, instance_filter, trace_frames, frames_note.as_deref());
+        let trailer = format!(
+            "{}{}",
+            exception_batch_trailer(&a, thread_filter, instance_filter, trace_frames, frames_note.as_deref()),
+            inherit_note
+        );
         Ok(render_batch_arming("exception stop(s)", &batches, max_classes, &trailer))
     }
 
@@ -2938,7 +3003,10 @@ impl RequestHandler {
         let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
         // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
         // re-deriving it from the argument and each reaching its own answer.
-        let (trace_exprs, expr_note) = clamp_trace_exprs(crate::args::trace_exprs(a.trace_expr.clone()));
+        // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
+        let (trace_exprs, expr_note, inherited_exprs) =
+            resolve_trace_exprs(a.trace_expr.clone(), &session.trace_exprs);
+        let inherit_note = describe_inherited_exprs(inherited_exprs, &trace_exprs);
         let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
         let arm = FieldArm {
@@ -2994,6 +3062,7 @@ impl RequestHandler {
             trace_frames,
             frames_note.as_deref(),
         );
+        let trailer = format!("{trailer}{inherit_note}");
         Ok(render_batch_arming("watchpoint(s)", &batches, max_classes, &trailer))
     }
 
@@ -3038,7 +3107,10 @@ impl RequestHandler {
         let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
         // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
         // re-deriving it from the argument and each reaching its own answer.
-        let (trace_exprs, expr_note) = clamp_trace_exprs(crate::args::trace_exprs(a.trace_expr.clone()));
+        // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
+        let (trace_exprs, expr_note, inherited_exprs) =
+            resolve_trace_exprs(a.trace_expr.clone(), &session.trace_exprs);
+        let inherit_note = describe_inherited_exprs(inherited_exprs, &trace_exprs);
         let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
 
         let mexit = MethodExitArm {
@@ -3072,7 +3144,7 @@ impl RequestHandler {
         }
         drop(session);
 
-        let trailer = format!("{mode}{extra}");
+        let trailer = format!("{mode}{extra}{inherit_note}");
         Ok(render_batch_arming("method-exit request(s)", &batches, 0, &trailer))
     }
 
@@ -3117,7 +3189,10 @@ impl RequestHandler {
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
         let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
         let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
-        let (trace_exprs, expr_note) = clamp_trace_exprs(crate::args::trace_exprs(a.trace_expr.clone()));
+        // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
+        let (trace_exprs, expr_note, inherited_exprs) =
+            resolve_trace_exprs(a.trace_expr.clone(), &session.trace_exprs);
+        let inherit_note = describe_inherited_exprs(inherited_exprs, &trace_exprs);
         let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
 
         let arm = MonitorArm {
@@ -3145,7 +3220,7 @@ impl RequestHandler {
             .map(|(id, req, k)| format!("   {}  {id}  (JDWP request {req})", k.label()))
             .collect();
         Ok(format!(
-            "✅ Monitor contention reporting armed\n{}\n{}",
+            "✅ Monitor contention reporting armed{inherit_note}\n{}\n{}",
             rows.join("\n"),
             describe_monitor_arm(&a, &kinds, &arm, caps, frames_note.as_deref()),
         ))
@@ -3672,6 +3747,60 @@ fn list_trace_exprs(exprs: &[String]) -> String {
         let _ = writeln!(out, "     {}: {e}", trace_expr_label(i, exprs.len()));
     }
     out
+}
+
+/// The `trace_expr` a stop point records with, and whether it came from the session (EVAL-14, #134).
+///
+/// A DEFAULT, NEVER A MERGE. A stop point that names its own list keeps exactly that list: merging the two
+/// would push a caller's own four expressions past [`MAX_TRACE_EXPRS`] and silently drop the tail, which
+/// is the failure the cap exists to make visible rather than to cause.
+///
+/// The session's list arrives already clamped and already read-only-checked, at attach — so inheriting
+/// cannot smuggle a fifth expression past the cap, and a list that would invoke was refused once, where
+/// the caller set it, instead of at each of the five armings that would otherwise inherit it.
+///
+/// The third return value is what the arming reply uses to SAY it inherited. A capture nobody asked for
+/// at this site, appearing without explanation, is the kind of silence this repo treats as a defect.
+fn resolve_trace_exprs(
+    asked: Option<crate::args::TraceExprs>,
+    session_default: &[String],
+) -> (Vec<String>, Option<String>, bool) {
+    let asked = crate::args::trace_exprs(asked);
+    if asked.is_empty() && !session_default.is_empty() {
+        return (session_default.to_vec(), None, true);
+    }
+    let (kept, note) = clamp_trace_exprs(asked);
+    (kept, note, false)
+}
+
+/// How `debug.attach` and `debug.launch` report the session-wide default they just set (EVAL-14, #134).
+///
+/// Stated at the moment it is set, because it changes what every later arming does. A caller who sets a
+/// list here and then sees an unexplained capture at a stop point they armed plainly is owed the link
+/// between the two, and this is the cheaper end of it — the arming replies carry the other end.
+fn describe_session_exprs(exprs: &[String], note: Option<&str>) -> String {
+    if exprs.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n   👁 Session trace_expr: {} — every stop point that names no trace_expr of its own records \
+         these, inside the window its hit already holds.{}",
+        list_trace_exprs(exprs),
+        note.map_or_else(String::new, |n| format!("\n   ⚠️  {n}"))
+    )
+}
+
+/// How an arming reply says the list was not the caller's own (EVAL-14, #134).
+fn describe_inherited_exprs(inherited: bool, exprs: &[String]) -> String {
+    if !inherited || exprs.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n   ↪ Inherited the session's trace_expr ({}) — this stop point named none. \
+         Pass trace_expr on the stop point to override, or trace_expr:[] on debug.attach to stop \
+         inheriting.",
+        list_trace_exprs(exprs)
+    )
 }
 
 /// Clamp a requested list of trace expressions to [`MAX_TRACE_EXPRS`], returning `(exprs, note)`.
@@ -23504,6 +23633,56 @@ async fn compare_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EVAL-14 (#134): a session default is inherited only where the caller named nothing, and the two
+    /// lists are NEVER merged — merging would push a caller's own four expressions past the cap and drop
+    /// the tail, which is the failure the cap exists to make visible rather than to cause.
+    #[test]
+    fn a_session_trace_expr_is_a_default_and_never_a_merge() {
+        let session = vec!["a".to_string(), "b".to_string()];
+        let own = crate::args::TraceExprs::Many(vec!["mine".to_string()]);
+
+        let (exprs, note, inherited) = resolve_trace_exprs(None, &session);
+        assert_eq!(exprs, session, "a stop point naming nothing records the session's list");
+        assert!(inherited, "and the reply has to be able to say so");
+        assert!(note.is_none());
+
+        let (exprs, _, inherited) = resolve_trace_exprs(Some(own), &session);
+        assert_eq!(exprs, vec!["mine".to_string()], "a stop point naming its own list keeps exactly that");
+        assert!(!inherited, "nothing was inherited, so nothing may claim it was");
+
+        let (exprs, _, inherited) = resolve_trace_exprs(None, &[]);
+        assert!(exprs.is_empty() && !inherited, "no session default is not an inheritance of nothing");
+    }
+
+    /// The cap is not reachable through the session default either: the list is clamped once, at attach,
+    /// so inheriting cannot smuggle a fifth expression past it.
+    #[test]
+    fn inheriting_cannot_exceed_the_trace_expr_cap() {
+        let five: Vec<String> = (0..5).map(|i| format!("e{i}")).collect();
+        let (clamped, note) = clamp_trace_exprs(five);
+        assert_eq!(clamped.len(), MAX_TRACE_EXPRS);
+        assert!(note.is_some(), "dropping expressions has to be reported, not done quietly");
+
+        let (inherited, _, was_inherited) = resolve_trace_exprs(None, &clamped);
+        assert_eq!(inherited.len(), MAX_TRACE_EXPRS, "the session default arrives already clamped");
+        assert!(was_inherited);
+    }
+
+    /// The two reply fragments say nothing when there is nothing to say, and name the list when there is.
+    #[test]
+    fn the_trace_expr_notes_are_silent_when_there_is_nothing_to_report() {
+        assert_eq!(describe_inherited_exprs(false, &["a".to_string()]), "");
+        assert_eq!(describe_inherited_exprs(true, &[]), "");
+        assert_eq!(describe_session_exprs(&[], None), "");
+
+        let inherited = describe_inherited_exprs(true, &["pedido.total".to_string()]);
+        assert!(inherited.contains("pedido.total"), "the reply names what it recorded: {inherited}");
+        assert!(inherited.contains("Inherited"), "and that it was not asked for here: {inherited}");
+
+        let session = describe_session_exprs(&["a".to_string()], Some("dropped one"));
+        assert!(session.contains('a') && session.contains("dropped one"), "{session}");
+    }
 
     /// TEST-46 (#154): the caller-visible reply FRAGMENTS, pinned rather than substring-checked.
     ///

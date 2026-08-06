@@ -144,6 +144,22 @@ pub struct DebugSession {
     /// nothing about the other. Same per-session reasoning otherwise: the build output belongs to the
     /// JVM you attached to.
     pub class_roots: Vec<std::path::PathBuf>,
+    /// The `trace_expr` list every stop point in this session inherits when it names none (EVAL-14, #134).
+    ///
+    /// Per session for the same reason `source_roots` is: *step, look at the same six things, step again*
+    /// is a property of the investigation, not of one stop point. Before this, a list belonged to the
+    /// stop point that declared it (TRACE-11, #93), so arming a second one elsewhere meant restating the
+    /// expressions and then joining two independently budgeted streams by hand.
+    ///
+    /// IT IS A DEFAULT, NOT AN OVERRIDE. A stop point that names its own `trace_expr` keeps it — the two
+    /// are never merged, because a merge would silently push a caller's four-expression list past the cap
+    /// and drop the end of it. Inheriting is reported in the arming reply rather than assumed, so a
+    /// capture nobody asked for at this site is never a surprise.
+    ///
+    /// Evaluated only at a stop the caller already caused, inside a capture that was going to happen
+    /// anyway. Never on events nobody asked to stop for: that would spend debuggee time on a JVM this
+    /// project exists not to disturb, which is the same budget the 4-expression cap protects.
+    pub trace_exprs: Vec<String>,
     /// Classes this session redefined and **cannot restore** (SWAP-2), keyed by class name.
     ///
     /// Its own bookkeeping because a redefinition is the only mutation here that outlives the thing that
@@ -1569,6 +1585,7 @@ impl SessionManager {
         read_only: bool,
         source_roots: Vec<std::path::PathBuf>,
         class_roots: Vec<std::path::PathBuf>,
+        trace_exprs: Vec<String>,
     ) -> SessionId {
         let session_id = format!("session_{}", uuid::v4());
         let session = DebugSession {
@@ -1594,6 +1611,7 @@ impl SessionManager {
             read_only,
             source_roots,
             class_roots,
+            trace_exprs,
             redefinitions: std::collections::BTreeMap::new(),
             pending_breakpoints: Vec::new(),
             pattern_sets: HashMap::new(),

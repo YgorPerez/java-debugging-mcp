@@ -123,6 +123,20 @@ wanted, it needs `CLAUDE_CODE_OAUTH_TOKEN` set as a repository secret **first**,
 repo's actual risks (suspension honesty, resume verification, caller-visible replies) instead of "performance
 considerations".
 
+**`debug.attach` and `debug.launch` take a session-wide `trace_expr`** (EVAL-14, #134), which every stop
+point inherits when it names none. Built as a **default on the existing mechanism rather than a new
+`watch` tool family**, because the second composes with the budget accounting and the 4-expression cap
+TRACE-11 already built. Three rules it holds to, each of which is a trap avoided: it is **never a merge**
+— merging a caller's own list with the session's would push past the cap and silently drop the tail,
+which is the failure the cap exists to *reveal*; it is clamped and read-only-checked **once, at attach**,
+so inheriting cannot smuggle a fifth expression through and an invoking list is refused where it was set
+rather than at the fifth arming that inherits it; and **every arming reply says it inherited**, because a
+capture nobody asked for at that site is otherwise unexplained. It evaluates **only at a stop the caller
+already caused**, never on events nobody asked to stop for — that would spend debuggee time on the JVM
+this project exists not to disturb. Note `handle_set_line_stop` reads the default through
+`session_trace_exprs()` while the other four read `session.trace_exprs` directly: it clamps before taking
+its guard, and calling the helper while holding that guard would re-lock the same mutex.
+
 **A reworded reply is now a failing test, not a silent break** (TEST-46, #154). 163 substring
 assertions guard the tool replies and a substring check cannot see a *rewording* — which is the failure
 mode `docs/toolkit-contract.md` exists for, five of whose six downstream breakages are silent.
