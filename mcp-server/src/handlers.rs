@@ -421,7 +421,7 @@ impl RequestHandler {
         };
         Ok(format!(
             "Connected to JVM at {host}:{port} (session: {session_id}){ro}{}",
-            describe_session_exprs(&session_exprs, session_expr_note.as_deref())
+            describe_session_default(&session_exprs, session_expr_note.as_deref())
         ))
     }
 
@@ -595,7 +595,7 @@ impl RequestHandler {
         }
 
         Ok(render_launch_reply(&a, &target, &LaunchReply { session_id: &session_id, port, pid, read_only })
-            + &describe_session_exprs(&session_exprs, session_expr_note.as_deref()))
+            + &describe_session_default(&session_exprs, session_expr_note.as_deref()))
     }
 
     /// List every live session, so a caller who lost a `session_id` can find it again.
@@ -661,9 +661,9 @@ impl RequestHandler {
         // `session.trace_exprs` directly. Calling the helper while holding that guard would
         // re-lock the same mutex and deadlock, so the two paths differ on purpose.
         let session_default = self.session_trace_exprs(&args).await;
-        let (trace_exprs, expr_note, inherited_exprs) =
+        let (trace_exprs, expr_note, took_session_default) =
             resolve_trace_exprs(a.trace_expr.clone(), &session_default);
-        let inherit_note = describe_inherited_exprs(inherited_exprs, &trace_exprs);
+        let session_default_note = describe_took_session_default(took_session_default, &trace_exprs);
         let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
         // One definition, pointed at each pattern in turn below.
@@ -721,7 +721,7 @@ impl RequestHandler {
 
         Ok(render_pattern_outcomes(&base, &patterns, &outcomes, frames_note.as_deref(), max_classes)
             + &overridden
-            + inherit_note.as_str())
+            + session_default_note.as_str())
     }
 
     async fn handle_list_stop_points(&self, args: serde_json::Value) -> Result<String, String> {
@@ -2917,9 +2917,9 @@ impl RequestHandler {
         // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
         // re-deriving it from the argument and each reaching its own answer.
         // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
-        let (trace_exprs, expr_note, inherited_exprs) =
+        let (trace_exprs, expr_note, took_session_default) =
             resolve_trace_exprs(a.trace_expr.clone(), &session.trace_exprs);
-        let inherit_note = describe_inherited_exprs(inherited_exprs, &trace_exprs);
+        let session_default_note = describe_took_session_default(took_session_default, &trace_exprs);
         let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
 
@@ -2965,7 +2965,7 @@ impl RequestHandler {
         let trailer = format!(
             "{}{}",
             exception_batch_trailer(&a, thread_filter, instance_filter, trace_frames, frames_note.as_deref()),
-            inherit_note
+            session_default_note
         );
         Ok(render_batch_arming("exception stop(s)", &batches, max_classes, &trailer))
     }
@@ -3004,9 +3004,9 @@ impl RequestHandler {
         // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
         // re-deriving it from the argument and each reaching its own answer.
         // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
-        let (trace_exprs, expr_note, inherited_exprs) =
+        let (trace_exprs, expr_note, took_session_default) =
             resolve_trace_exprs(a.trace_expr.clone(), &session.trace_exprs);
-        let inherit_note = describe_inherited_exprs(inherited_exprs, &trace_exprs);
+        let session_default_note = describe_took_session_default(took_session_default, &trace_exprs);
         let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
         let arm = FieldArm {
@@ -3062,7 +3062,7 @@ impl RequestHandler {
             trace_frames,
             frames_note.as_deref(),
         );
-        let trailer = format!("{trailer}{inherit_note}");
+        let trailer = format!("{trailer}{session_default_note}");
         Ok(render_batch_arming("watchpoint(s)", &batches, max_classes, &trailer))
     }
 
@@ -3108,9 +3108,9 @@ impl RequestHandler {
         // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
         // re-deriving it from the argument and each reaching its own answer.
         // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
-        let (trace_exprs, expr_note, inherited_exprs) =
+        let (trace_exprs, expr_note, took_session_default) =
             resolve_trace_exprs(a.trace_expr.clone(), &session.trace_exprs);
-        let inherit_note = describe_inherited_exprs(inherited_exprs, &trace_exprs);
+        let session_default_note = describe_took_session_default(took_session_default, &trace_exprs);
         let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
 
         let mexit = MethodExitArm {
@@ -3144,7 +3144,7 @@ impl RequestHandler {
         }
         drop(session);
 
-        let trailer = format!("{mode}{extra}{inherit_note}");
+        let trailer = format!("{mode}{extra}{session_default_note}");
         Ok(render_batch_arming("method-exit request(s)", &batches, 0, &trailer))
     }
 
@@ -3190,9 +3190,9 @@ impl RequestHandler {
         let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
         let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
         // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
-        let (trace_exprs, expr_note, inherited_exprs) =
+        let (trace_exprs, expr_note, took_session_default) =
             resolve_trace_exprs(a.trace_expr.clone(), &session.trace_exprs);
-        let inherit_note = describe_inherited_exprs(inherited_exprs, &trace_exprs);
+        let session_default_note = describe_took_session_default(took_session_default, &trace_exprs);
         let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
 
         let arm = MonitorArm {
@@ -3220,7 +3220,7 @@ impl RequestHandler {
             .map(|(id, req, k)| format!("   {}  {id}  (JDWP request {req})", k.label()))
             .collect();
         Ok(format!(
-            "✅ Monitor contention reporting armed{inherit_note}\n{}\n{}",
+            "✅ Monitor contention reporting armed{session_default_note}\n{}\n{}",
             rows.join("\n"),
             describe_monitor_arm(&a, &kinds, &arm, caps, frames_note.as_deref()),
         ))
@@ -3749,6 +3749,16 @@ fn list_trace_exprs(exprs: &[String]) -> String {
     out
 }
 
+/// The expressions as one inline phrase, for a sentence rather than a block (EVAL-14, #134).
+///
+/// [`list_trace_exprs`] is a BLOCK: indented, one `trace_expr:` line each, newline-terminated. Dropping
+/// that into `({})` inside a sentence produced a mangled reply — `Session trace_expr:      trace_expr: a`
+/// followed by a bare newline mid-clause. Caught by reading the rendered output, which is the only thing
+/// that catches it; both helpers return a String and the compiler cannot tell them apart.
+fn inline_trace_exprs(exprs: &[String]) -> String {
+    exprs.join(", ")
+}
+
 /// The `trace_expr` a stop point records with, and whether it came from the session (EVAL-14, #134).
 ///
 /// A DEFAULT, NEVER A MERGE. A stop point that names its own list keeps exactly that list: merging the two
@@ -3778,28 +3788,32 @@ fn resolve_trace_exprs(
 /// Stated at the moment it is set, because it changes what every later arming does. A caller who sets a
 /// list here and then sees an unexplained capture at a stop point they armed plainly is owed the link
 /// between the two, and this is the cheaper end of it — the arming replies carry the other end.
-fn describe_session_exprs(exprs: &[String], note: Option<&str>) -> String {
+fn describe_session_default(exprs: &[String], note: Option<&str>) -> String {
     if exprs.is_empty() {
         return String::new();
     }
     format!(
         "\n   👁 Session trace_expr: {} — every stop point that names no trace_expr of its own records \
          these, inside the window its hit already holds.{}",
-        list_trace_exprs(exprs),
+        inline_trace_exprs(exprs),
         note.map_or_else(String::new, |n| format!("\n   ⚠️  {n}"))
     )
 }
 
-/// How an arming reply says the list was not the caller's own (EVAL-14, #134).
-fn describe_inherited_exprs(inherited: bool, exprs: &[String]) -> String {
+/// How an arming reply says it is recording the SESSION DEFAULT rather than a list named here.
+///
+/// Deliberately not the word "inherited": that is already taken on this surface for a field walked from a
+/// superclass (`list_fields {inherited:true}`, ADR-0015), and one word carrying two unrelated meanings in
+/// caller-visible replies is the exact defect CONTEXT.md's `Reply` entry was added for. See the
+/// **Session default** entry there (EVAL-14, #134).
+fn describe_took_session_default(inherited: bool, exprs: &[String]) -> String {
     if !inherited || exprs.is_empty() {
         return String::new();
     }
     format!(
-        "\n   ↪ Inherited the session's trace_expr ({}) — this stop point named none. \
-         Pass trace_expr on the stop point to override, or trace_expr:[] on debug.attach to stop \
-         inheriting.",
-        list_trace_exprs(exprs)
+        "\n   ↪ Recording the session default trace_expr ({}) — this stop point named none of its own. \
+         Pass trace_expr here to record something else, or set none on debug.attach to stop this.",
+        inline_trace_exprs(exprs)
     )
 }
 
@@ -23658,7 +23672,7 @@ mod tests {
     /// The cap is not reachable through the session default either: the list is clamped once, at attach,
     /// so inheriting cannot smuggle a fifth expression past it.
     #[test]
-    fn inheriting_cannot_exceed_the_trace_expr_cap() {
+    fn the_session_default_cannot_exceed_the_trace_expr_cap() {
         let five: Vec<String> = (0..5).map(|i| format!("e{i}")).collect();
         let (clamped, note) = clamp_trace_exprs(five);
         assert_eq!(clamped.len(), MAX_TRACE_EXPRS);
@@ -23672,15 +23686,25 @@ mod tests {
     /// The two reply fragments say nothing when there is nothing to say, and name the list when there is.
     #[test]
     fn the_trace_expr_notes_are_silent_when_there_is_nothing_to_report() {
-        assert_eq!(describe_inherited_exprs(false, &["a".to_string()]), "");
-        assert_eq!(describe_inherited_exprs(true, &[]), "");
-        assert_eq!(describe_session_exprs(&[], None), "");
+        assert_eq!(describe_took_session_default(false, &["a".to_string()]), "");
+        assert_eq!(describe_took_session_default(true, &[]), "");
+        assert_eq!(describe_session_default(&[], None), "");
 
-        let inherited = describe_inherited_exprs(true, &["pedido.total".to_string()]);
+        let inherited = describe_took_session_default(true, &["pedido.total".to_string()]);
         assert!(inherited.contains("pedido.total"), "the reply names what it recorded: {inherited}");
-        assert!(inherited.contains("Inherited"), "and that it was not asked for here: {inherited}");
+        assert!(
+            inherited.contains("session default"),
+            "and that it came from the session rather than from here: {inherited}"
+        );
+        // It opens with a newline by design — it is appended to a reply — but must not be a BLOCK.
+        // `list_trace_exprs` is the block form and putting it in a sentence produced a mangled clause.
+        assert_eq!(
+            inherited.trim_start_matches('\n').lines().count(),
+            1,
+            "the note is one line inside a sentence, not a block: {inherited:?}"
+        );
 
-        let session = describe_session_exprs(&["a".to_string()], Some("dropped one"));
+        let session = describe_session_default(&["a".to_string()], Some("dropped one"));
         assert!(session.contains('a') && session.contains("dropped one"), "{session}");
     }
 
@@ -23790,6 +23814,15 @@ mod tests {
             "clamp_notes/both",
             merge_clamp_notes(Some("first".into()), Some("second".into())).unwrap_or_default(),
         );
+
+        // EVAL-14 (#134). Pinned because the first version of these two read as mangled sentences: they
+        // embedded `list_trace_exprs`, which is an indented multi-line BLOCK, inside `({})`. Nothing but
+        // the rendered text catches that — both helpers return a String.
+        case("session_default/unset", describe_session_default(&[], None));
+        case("session_default/set", describe_session_default(&ex(&["a", "b"]), None));
+        case("session_default/clamped", describe_session_default(&ex(&["a"]), Some("dropped one")));
+        case("took_session_default/no", describe_took_session_default(false, &ex(&["a"])));
+        case("took_session_default/yes", describe_took_session_default(true, &ex(&["a", "b"])));
 
         case("overridden_traces/none", describe_overridden_traces(&[]));
         case("overridden_traces/one", describe_overridden_traces(&[("Foo.java:12", vec!["Bar.java:34"])]));

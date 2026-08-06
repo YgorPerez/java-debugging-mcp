@@ -937,6 +937,24 @@ honest case and needs no word), ignored (true but reads as ours to fix)
 it caused are still unhandled — see **in-flight hit**. Treating "disarmed" as "silent" is what froze a
 debuggee in #72.
 
+**Session default**:
+A value set once on `debug.attach` or `debug.launch` that later calls use when they name none of their own.
+`trace_expr` is the one a caller sees named as such (EVAL-14); `source_roots` and `class_roots` are the same
+shape and predate the phrase.
+
+**It is a default and never a merge**, which is most of why it needs a word. A stop point naming its own
+`trace_expr` records exactly that list, and the two are never combined — combining them would push a
+caller's own four expressions past the cap and drop the tail, which is the failure the cap exists to reveal
+rather than to cause.
+
+**A reply says when it took one.** A capture nobody asked for at this site is otherwise unexplained, and
+unexplained output that reads as an answer is the thing this glossary's **Reply** entry exists about.
+
+_Avoid_: **inherited** — that word is already taken on this surface for a field walked from a superclass
+(`list_fields {inherited:true}`, ADR-0015), and one word doing two unrelated caller-visible jobs is exactly
+the defect **Reply** was written for; it was used here for a day and replaced. Also avoid *watch* and *watch
+list*: no `watch_*` tool family exists, and `set_field_stop`'s watchpoints are an unrelated subject
+
 ### Suspension
 
 **Suspended**:

@@ -55,6 +55,21 @@ second
 ## clamp_notes/both
 first·   ⚠️  second
 
+## session_default/unset
+
+
+## session_default/set
+·   👁 Session trace_expr: a, b — every stop point that names no trace_expr of its own records these, inside the window its hit already holds.
+
+## session_default/clamped
+·   👁 Session trace_expr: a — every stop point that names no trace_expr of its own records these, inside the window its hit already holds.·   ⚠️  dropped one
+
+## took_session_default/no
+
+
+## took_session_default/yes
+·   ↪ Recording the session default trace_expr (a, b) — this stop point named none of its own. Pass trace_expr here to record something else, or set none on debug.attach to stop this.
+
 ## overridden_traces/none
 
 

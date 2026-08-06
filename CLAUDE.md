@@ -123,14 +123,25 @@ wanted, it needs `CLAUDE_CODE_OAUTH_TOKEN` set as a repository secret **first**,
 repo's actual risks (suspension honesty, resume verification, caller-visible replies) instead of "performance
 considerations".
 
+**Do not call it `inherited`, and check `CONTEXT.md` before naming anything a caller will read.** That word
+is taken on this surface for a field walked from a superclass (`list_fields {inherited:true}`, ADR-0015).
+It shipped in #134's replies anyway and lasted a day — one word doing two unrelated caller-visible jobs,
+which is the defect the `**Reply**` entry was added for a day earlier. The glossary now carries
+**Session default** with that collision in its `_Avoid_` line. **The same pass caught a rendering bug the
+compiler could not**: both new replies embedded `list_trace_exprs`, which is an indented multi-line
+*block*, inside a sentence — `Session trace_expr:      trace_expr: a` and a bare newline mid-clause. Both
+helpers return a `String`, so only reading the rendered output finds it, and the five new cases in
+`reply-fragments.txt` are there to keep it found.
+
 **`debug.attach` and `debug.launch` take a session-wide `trace_expr`** (EVAL-14, #134), which every stop
-point inherits when it names none. Built as a **default on the existing mechanism rather than a new
+point takes as its **session default** when it names none. Built as a **default on the existing mechanism rather than a new
 `watch` tool family**, because the second composes with the budget accounting and the 4-expression cap
 TRACE-11 already built. Three rules it holds to, each of which is a trap avoided: it is **never a merge**
 — merging a caller's own list with the session's would push past the cap and silently drop the tail,
 which is the failure the cap exists to *reveal*; it is clamped and read-only-checked **once, at attach**,
-so inheriting cannot smuggle a fifth expression through and an invoking list is refused where it was set
-rather than at the fifth arming that inherits it; and **every arming reply says it inherited**, because a
+so taking the default cannot smuggle a fifth expression through and an invoking list is refused where it was
+set rather than at the fifth arming that takes it; and **every arming reply says when it took the session
+default**, because a
 capture nobody asked for at that site is otherwise unexplained. It evaluates **only at a stop the caller
 already caused**, never on events nobody asked to stop for — that would spend debuggee time on the JVM
 this project exists not to disturb. Note `handle_set_line_stop` reads the default through

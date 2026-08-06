@@ -201,7 +201,8 @@ pub struct LaunchArgs {
     ///
     /// A DEFAULT, not an override. A stop point that passes `trace_expr` keeps exactly what it passed —
     /// the two lists are never merged, because merging would push a caller's own list past the
-    /// 4-expression cap and silently drop the end of it. Every arming reply says whether it inherited.
+    /// 4-expression cap and silently drop the end of it. Every arming reply says when it is recording
+    /// this session default rather than a list named on the stop point itself.
     ///
     /// Same cap and same cost as a per-stop-point `trace_expr`: at most 4, each evaluated inside the
     /// window the hit already holds the thread for, and refused under `read_only` if it would invoke.
@@ -346,7 +347,8 @@ pub struct AttachArgs {
     ///
     /// A DEFAULT, not an override. A stop point that passes `trace_expr` keeps exactly what it passed —
     /// the two lists are never merged, because merging would push a caller's own list past the
-    /// 4-expression cap and silently drop the end of it. Every arming reply says whether it inherited.
+    /// 4-expression cap and silently drop the end of it. Every arming reply says when it is recording
+    /// this session default rather than a list named on the stop point itself.
     ///
     /// Same cap and same cost as a per-stop-point `trace_expr`: at most 4, each evaluated inside the
     /// window the hit already holds the thread for, and refused under `read_only` if it would invoke.
