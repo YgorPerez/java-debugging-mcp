@@ -290,6 +290,56 @@ jobs:
         if: always()
         run: zizmor --persona=regular .github/
 
+      # CI-9 (#166). zizmor audits what a workflow is ALLOWED TO DO; nothing checked whether one MEANS WHAT
+      # IT SAYS. actionlint resolves `needs.<job>.outputs.<name>` against the outputs that job declares,
+      # type-checks `${{ }}` expressions, and validates `runs-on`, `shell:` and the job schema. Same shape as
+      # cargo-shear beside machete and the `semver` job beside the scan: the incumbent tool cannot be pointed
+      # at this question.
+      #
+      # THE FAILURE IT COVERS HERE IS CI-6's (#151). `needs.changes.outputs.rust == 'true'` appears four
+      # times in tests.yml, and a typo in the output name — or a rename in the `changes` job without
+      # updating its readers — evaluates to the empty string, every leg skips, and `ci-ok` reports green,
+      # because `ci-ok` has no `if:` and is designed to report on exactly the pushes where the legs skip.
+      # Verified rather than assumed: planting `outputs.rusty` produces four
+      # `property "rusty" is not defined in object type {rust: string}` findings and exit 1. The same run
+      # caught a planted `timeout-minutes:` on a `uses:` job, which is why the two gate jobs in release.yml
+      # carry a comment instead of a budget (CI-10, #172).
+      #
+      # FIRST-RUN COUNT: 0. Nothing in `.github/` was wrong. That is the result, it is in the commit message,
+      # and this gate is a bet on the next rename rather than a fix for a current defect.
+      #
+      # NOT INSTALLED THROUGH THE `tool:` LINE ABOVE, because taiki-e/install-action does not carry
+      # actionlint (it carries shellcheck, typos and zizmor; checked against its manifest list). Curled from
+      # the pinned upstream release instead, the same way rust-doctor itself is fetched a few steps up and
+      # for the same reason BUILD-1 (#66) moved that one off npm. Its absence from that `tool:` line is
+      # harmless to `scripts/doctor.sh`, which reads the line only to answer "does the SCAN have this
+      # cargo-* tool" — actionlint backs no rust-doctor pass.
+      - name: Fetch actionlint
+        if: always()
+        run: |
+          curl -fsSL -o /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          tar xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint --version
+
+      # `-shellcheck=` AND `-pyflakes=` TURN OFF INTEGRATIONS THAT ARE ON BY DEFAULT, and this is the one
+      # decision in the step worth arguing with, so here is the measurement behind it.
+      #
+      # actionlint shells out to shellcheck for every `run:` block when shellcheck is on PATH — and GitHub's
+      # runner images ship it. Measured on this tree with shellcheck 0.11.0: 3 findings, all from shellcheck
+      # (one SC2010 in release.yml's dist/ guard, two SC2129 style notes in toolchain-pin.yml) and none of
+      # them a workflow-semantics finding. The problem is not the three, it is the version: the runner's
+      # shellcheck is not pinned by anything here, so a gate that consulted it would move under untouched
+      # workflows on an image bump — the drift LINT-1 (#18) pinned clippy to avoid. And a dev box may have
+      # no shellcheck at all (this one does not), so `scripts/doctor.sh` would print "would pass" over
+      # findings CI has, which is precisely how the uvx/zizmor disagreement went unnoticed for eight hours.
+      #
+      # Turning them on later means pinning shellcheck through the `tool:` line above AND teaching doctor.sh
+      # to refuse a partial verdict when it is missing. Worth doing; not worth doing silently.
+      - name: Lint the workflow semantics (actionlint)
+        if: always()
+        run: /tmp/actionlint -shellcheck= -pyflakes=
+
       # A failing gate prints nothing useful: --sarif sends every finding to the file, so the step log
       # ends at "exit code 3" and the findings are only readable via the code-scanning API. Print them,
       # so the reason a build failed is in the build that failed.

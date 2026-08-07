@@ -103,6 +103,7 @@ fn every_check_doctor_says_gates_in_ci_is_a_step_in_rust_doctor_yml() {
         ("dependency policy (cargo-deny)", "cargo deny check"),
         ("spelling (typos)", "typos"),
         ("workflow lint (zizmor)", "run: zizmor --persona=regular"),
+        ("workflow semantics (actionlint)", "run: /tmp/actionlint -shellcheck= -pyflakes="),
     ] {
         assert!(
             doctor.contains(label),
@@ -115,6 +116,35 @@ fn every_check_doctor_says_gates_in_ci_is_a_step_in_rust_doctor_yml() {
              `{command}` step. One of the two is lying, and the script is the one people trust."
         );
     }
+}
+
+/// actionlint's version is written down in two places and they have to agree (CI-9, #166): the gate curls
+/// a pinned release URL, and `scripts/doctor.sh` tells you which version the gate pins so a local binary
+/// finding something CI will not is diagnosable rather than baffling. That second copy exists because the
+/// script cannot read the URL — but two copies of a number is what this file is for.
+///
+/// taiki-e/install-action does not carry actionlint, which is why this one is a curl with a literal version
+/// in it rather than an entry on the `tool:` line the test above guards.
+#[test]
+fn doctor_reports_the_actionlint_version_the_gate_actually_pins() {
+    let wf = read(".github/workflows/rust-doctor.yml");
+    let pinned =
+        wf.lines().find_map(|l| l.split("/actionlint/releases/download/v").nth(1)?.split('/').next()).expect(
+            "no pinned actionlint release URL in rust-doctor.yml — if the fetch moved, move this with it",
+        );
+
+    let doctor = read("scripts/doctor.sh");
+    assert!(
+        doctor.contains(&format!("CI pins {pinned}")),
+        "the gate curls actionlint {pinned}, but scripts/doctor.sh does not say `CI pins {pinned}`. That \
+         line is what tells you a local finding is your binary's rather than the gate's; a stale number \
+         there sends you looking in the wrong place."
+    );
+    assert!(
+        doctor.contains(&format!("actionlint_{pinned}_linux_amd64.tar.gz")),
+        "scripts/doctor.sh's install hint does not offer actionlint {pinned}, which is what the gate runs. \
+         Following it would install a different linter than the one whose verdict it is reporting."
+    );
 }
 
 /// `rust-version` is the MSRV the `msrv` job builds on, and that job reads it out of the manifest with a

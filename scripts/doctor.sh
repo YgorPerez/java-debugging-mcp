@@ -472,6 +472,39 @@ JS
     printf '%s\n' "        cargo install zizmor        # or: uv tool install zizmor"
   fi
 
+  # actionlint gates in CI beside zizmor (CI-9, #166), and runs here for the reason every block above runs
+  # here: a check that gates in CI and not locally retires this script's claim that a clean run is a green
+  # gate. The two workflow linters answer different questions and neither implies the other — zizmor audits
+  # what a workflow is ALLOWED to do, actionlint whether it MEANS WHAT IT SAYS, which is what resolves
+  # `needs.<job>.outputs.<name>` against the outputs that job declares.
+  #
+  # `-shellcheck=` and `-pyflakes=` are ON PURPOSE and must match the gate's invocation exactly; the reason
+  # is written out at the step in rust-doctor.yml. In one line: those integrations are on by default when
+  # the binaries are on PATH, GitHub's runners ship shellcheck and this box does not, so leaving them on is
+  # a verdict that depends on which machine printed it.
+  #
+  # The VERSION is printed rather than assumed, the way the zizmor block prints its route. CI pins v1.7.12;
+  # a local binary at some other version can find something the gate will not, and the line is what makes
+  # that diagnosable instead of baffling.
+  if command -v actionlint >/dev/null 2>&1; then
+    actionlint_ver="$(actionlint --version 2>/dev/null | head -1)"
+    actionlint_status=0
+    actionlint_out="$(actionlint -no-color -oneline -shellcheck= -pyflakes= 2>&1)" || actionlint_status=$?
+    if [ "$actionlint_status" -ne 0 ]; then
+      printf '\n%s\n' "workflow semantics (actionlint): WOULD FAIL — this gates in CI. [local ${actionlint_ver}, CI pins 1.7.12]"
+      printf '%s\n' "$actionlint_out" | sed 's/^/      /'
+      verdict=3
+    else
+      printf '\n%s\n' "workflow semantics (actionlint): would pass. [local ${actionlint_ver}, CI pins 1.7.12]"
+    fi
+  else
+    printf '\n%s\n' "not looked at here — actionlint is not installed, and it GATES in CI."
+    printf '%s\n' "      A clean run above is therefore not a green gate. taiki-e/install-action does not"
+    printf '%s\n' "      carry it, so CI curls the pinned release and you can do the same:"
+    printf '%s\n' "        curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \\"
+    printf '%s\n' "          | tar xz -C ~/.local/bin actionlint"
+  fi
+
   exit "$verdict"
 fi
 

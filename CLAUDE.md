@@ -216,6 +216,19 @@ and it is the point: pinning is undone by a bot that pulls a version the moment 
 is deliberately off**, because `main` has no branch protection (the API returns 404), so there is
 nothing required to gate on and auto-merge would mean merge-on-open.
 
+**`actionlint` gates beside it, and the two answer different questions** (CI-9, #166). zizmor audits what
+a workflow is *allowed to do*; actionlint checks whether it *means what it says* — chiefly by resolving
+`needs.<job>.outputs.<name>` against the outputs that job declares. That is the check CI-6 (#151) needs:
+`needs.changes.outputs.rust == 'true'` appears four times in `tests.yml`, a typo evaluates to the empty
+string, every leg skips, and **`ci-ok` reports green by design**. **Its first run found 0**, which is the
+result and is not a reason to soften the claim — this one is a bet on the next rename. Two things about
+its invocation are decisions rather than defaults: it is **curled from a pinned release** because
+`taiki-e/install-action` does not carry it, and **`-shellcheck=` / `-pyflakes=` turn off integrations that
+are on whenever those binaries are on `PATH`**. GitHub's runners ship shellcheck and a dev box may not, so
+leaving them on makes the verdict depend on which machine printed it — measured at 3 findings under
+shellcheck 0.11.0, none of them a semantics finding. `scripts/doctor.sh --findings` runs the identical
+invocation and prints both versions, and `docs_claims.rs` asserts the two files name the same one.
+
 **Every job in `.github/` now has a `timeout-minutes`, derived at its own line** (CI-10, #172). It used to
 be one job in the whole repo, at a round 30; everything else ran under GitHub's default of **360
 minutes**. This suite's failure mode is a *wait* rather than an assertion — a probe JVM that never reaches
@@ -223,7 +236,8 @@ its breakpoint, a suspended debuggee nobody resumes — and with `fail-fast: fal
 of runner per hung leg. **Each number says what it was derived from**, because a bare one rots the way a
 written-down shard number does; where there is no measurement to derive from (the crates.io publish has
 never succeeded) the comment says *that* instead of inventing one. Note the two `uses:` jobs in
-`release.yml` carry **no** timeout: the schema forbids it on a reusable-workflow call.
+`release.yml` carry **no** timeout: the schema forbids it on a reusable-workflow call, and actionlint
+fails the file on one.
 
 **Two git hooks are checked in, and they do nothing until you opt in** (LINT-6/#146, REL-4/#147):
 `git config core.hooksPath .githooks` — per-clone, because a commit cannot set it. `pre-commit` runs
