@@ -62,3 +62,7 @@ same bill because a request can at least be narrowed to a concrete class.
 - Raised again 2026-07-26 while comparing tool surfaces against
   [`d4n-sec/jdb-mcp`](https://github.com/d4n-sec/jdb-mcp), which exposes `debug_set_method_entry`.
   Not filed as an issue — the decision above still holds.
+- Raised a third time 2026-08-07 by `kpanuragh/xdebug-mcp`'s `get_function_history`. Also not filed, and
+  DOC-16 (#161) is the response to it being raised three times: `docs/comparison.md` now sorts that whole
+  surface into settled, open and not-applicable, so the fourth reader finds the decision instead of
+  re-deriving it.

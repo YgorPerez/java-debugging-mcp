@@ -46,7 +46,9 @@ Not "somebody wants it". Concretely:
 
 ## Related
 
-- `docs/comparison.md` — where the row came from
+- `docs/comparison.md` — where the row came from, and since DOC-16 (#161) also the place that sorts
+  `kpanuragh/xdebug-mcp`'s seven profiling and coverage tools against this file, so the question is
+  answered without opening it
 - `.out-of-scope/method-entry-events.md` — the precedent: a high-volume observation mechanism rejected
   in favour of a cheaper one answering the same question
 - ADR-0023 — a heap query ships, and reports the pause it imposed

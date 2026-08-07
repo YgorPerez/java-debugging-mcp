@@ -13,6 +13,11 @@ The issue named both options rather than leaving the choice to be made by accide
 [`kpanuragh/xdebug-mcp`](https://github.com/kpanuragh/xdebug-mcp) carries and where the issue came from —
 or a **session-scoped default** for the `trace_expr` that already exists.
 
+That whole surface is now sorted tool by tool in
+[`docs/comparison.md`](../comparison.md#a-fourth-surface-in-another-language-kpanuraghxdebug-mcp), which is
+where to start if you are comparing the two projects rather than reading this one decision (DOC-16, #161).
+The watch family is one of twelve tools there that this repo has already settled against.
+
 **This ADR exists mostly to be read next to [ADR-0015](0015-a-second-tool-not-a-flag-that-changes-the-subject.md).**
 That one faced a comparable choice and decided the opposite-looking thing — a second tool rather than a
 flag on an existing one — and its general rule is stated in as many words:
