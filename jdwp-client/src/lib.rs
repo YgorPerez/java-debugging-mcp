@@ -16,14 +16,40 @@
     test,
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic_in_result_fn)
 )]
-// JDWP client library for Java debugging
-//
-// Implements a subset of the JDWP protocol focused on practical debugging scenarios:
-// - Connection management
-// - Breakpoint operations
-// - Stack inspection
-// - Variable evaluation
-// - Execution control
+//! A JDWP (Java Debug Wire Protocol) client — the transport and command layer behind the `jdwp-mcp`
+//! debugging server.
+//!
+//! Implements the subset of JDWP that practical debugging needs: connection management, breakpoint and
+//! event-request operations, stack and variable inspection, expression evaluation, and execution control.
+//!
+//! # This is not a supported public API
+//!
+//! **The crate is published because `jdwp-mcp` depends on it, and for no other reason.** `cargo publish`
+//! rejects a bare path dependency, so a binary on crates.io requires its library to be there too; that
+//! requirement is the whole story of this listing.
+//!
+//! What follows from that, and it is worth reading before you build on this:
+//!
+//! - **The surface is shaped for one consumer.** These modules are the seams `jdwp-mcp` needed, exposed
+//!   where it needed them. They are not a curated library API, and several are public only because a
+//!   sibling module had to reach them.
+//! - **Anything here may change in any release**, including a patch one. The version gate in this
+//!   repository exists to keep the *version number* honest about what changed, not to promise that
+//!   nothing will.
+//! - **Nothing here is deprecated before it is removed**, because there is no deprecation cycle to run.
+//!
+//! None of that means it will not work — it is the code a real debugger runs against real JVMs, and it
+//! is tested against JDK 11, 17 and 21. It means the cost of a break lands on you rather than on us, and
+//! that pinning an exact version is the only safe way to depend on it.
+//!
+//! If you want the debugger rather than the protocol layer, install `jdwp-mcp`.
+//!
+//! # Where the documentation is
+//!
+//! The narrative lives on the items themselves rather than here. The design decisions behind them are in
+//! the repository's `docs/adr/`, and `CONTEXT.md` is the glossary for the vocabulary these types use —
+//! *stop point*, *trace*, *snapshot*, *hit* and *suspension* all have precise meanings that are not
+//! guessable from the type names.
 
 pub mod commands;
 pub mod connection;

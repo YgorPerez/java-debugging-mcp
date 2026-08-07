@@ -44,6 +44,42 @@ buys a shorter name and costs the only lib target in the workspace — which is 
 `scripts/semver-check.sh`, since `cargo-semver-checks` reads libraries and not binaries. Trading a working
 API-stability check for a nicer string is not a trade.
 
+### The library is published as a dependency, and is explicitly NOT a supported API
+
+Publishing turns a private seam into something strangers can call, and that happens whether or not anyone
+decides it should. **Measured: 79 public items across 11 public modules**, shaped for `mcp-server` to
+consume — several are public only because a sibling module had to reach them.
+
+**The decision is that this stays an implementation detail, and says so where it will be read.** Three
+places, because they are three different moments in a stranger's decision: the crates.io `description`
+(search results, before any click), the crate README (the landing page crates.io renders), and the
+crate-level `//!` (the docs.rs front page).
+
+**Rejected: treating it as a supported library.** It would be the more generous answer and it is not one
+this project can honour — the surface was never designed for outside use, and promising stability on 79
+items shaped by one consumer's needs would either freeze `mcp-server`'s refactoring or make the promise
+a lie.
+
+**Rejected: narrowing the surface before the first publish**, which was the one moment it is free — after
+publishing, every removal is breaking and `semver-check.sh` gates it on the release path. Rejected because
+the stated non-support makes it unnecessary: an API nobody is promised is an API that can still be narrowed
+later. Worth recording as a road not taken, since the *cost* of narrowing does rise permanently at the
+first publish even though the *right* to do it does not.
+
+Note what does **not** change: `scripts/semver-check.sh` still gates the release path. That is not a
+contradiction of the above. It keeps the version *number* honest about what changed, which the downstream
+toolkit's pin depends on; it never promised that nothing would change.
+
+`readme` is the one field that stops being inherited from the workspace. The root README.md is an
+install-and-configure guide for the MCP server, and crates.io renders the readme as the landing page — so
+inheriting it would greet someone who found the *library* with instructions for adding a debugger to
+Claude Code, directly under a sentence saying not to depend on this.
+
+The crate-level docs are also new rather than moved. `jdwp-client` had **1,875 `///` item-doc lines and
+zero `//!`** — its crate description sat in plain `//` comments that rustdoc never rendered, which is
+precisely the failure DOC-13 (#143) added the rustdoc gate for, surviving on the front page of the crate
+about to be published because that gate checks what renders and not what should have.
+
 ### That version number moves with the workspace, and `release.sh` owns it
 
 A `^0.x` requirement matches only its own minor. Leave `0.19.0` in that entry while the workspace moves to

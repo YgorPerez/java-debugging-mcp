@@ -14,9 +14,15 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "JDWP protocol client library for Java debugging"
+# The description is the one line a stranger reads in crates.io search results, before any decision to
+# click, so the "not a supported API" part belongs in it rather than only on the docs.rs front page.
+description = "JDWP protocol client for Java debugging — implementation detail of jdwp-mcp, not a supported API"
 repository.workspace = true
-readme.workspace = true
+# NOT `readme.workspace = true`, which is the root README.md — an install-and-configure guide for the
+# jdwp-mcp MCP server. crates.io renders the readme as the crate's landing page, so inheriting it would
+# greet someone who found the *library* with instructions for adding a debugger to Claude Code, which
+# contradicts the sentence directly above it.
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 

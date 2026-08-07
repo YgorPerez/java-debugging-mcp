@@ -438,10 +438,11 @@ not.
 ## Consequences
 
 - `issue` / `InFlight` / `read_independently` are public API. That surface is now published, as
-  `java-debugging-jdwp-client` (ADR-0043), so it is reachable by strangers rather than only by `mcp-server` —
-  which raises the cost of breaking it without changing the analysis here. `scripts/semver-check.sh` still
-  compares against the last release tag; additions are not breaking, and relaxing `send_command` to `&self`
-  later would not be either.
+  `java-debugging-jdwp-client` (ADR-0043), so it is reachable by strangers rather than only by `mcp-server`
+  — but **the cost of breaking it is unchanged**, because the same ADR declares the crate an implementation
+  detail of `jdwp-mcp` rather than a supported API, in its description, README and crate docs. Publishing
+  made this surface *visible*, not *owed*. `scripts/semver-check.sh` still compares against the last release
+  tag; additions are not breaking, and relaxing `send_command` to `&self` later would not be either.
 - The relay charges coalesced traffic once, which is exactly what a wave produces, so every figure above is
   a **lower bound on the real saving** and was read with that in mind: the assertion is set at one whole
   round trip per row, which a serialised path could not reach even with the flattery.
