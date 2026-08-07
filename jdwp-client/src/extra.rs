@@ -13,8 +13,22 @@ use bytes::BufMut;
 // JDWP modifier kinds
 const MOD_COUNT: u8 = 1;
 const MOD_THREAD_ONLY: u8 = 3;
-/// `ClassOnly` (4): restrict the request to classes matching a pattern.
-const MOD_CLASS_ONLY: u8 = 4;
+/// `ClassMatch` (5): restrict the request to classes whose name matches a pattern. One modifier per
+/// pattern, each a single string — the mirror of [`MOD_CLASS_EXCLUDE`] below.
+///
+/// **This was `ClassOnly` (4) until STEP-3, and that is a different modifier.** `ClassOnly` takes a
+/// `referenceTypeID` — eight bytes naming one loaded class — while this code wrote a JDWP *string*. The
+/// JVM read the string's 4-byte length and the first 4 bytes of its text as a type id, found no such
+/// object, and answered `INVALID_OBJECT` (20). So `only_classes` on `debug.step_*` could never have
+/// worked against any JVM: every call carrying one failed outright with "Failed to set step".
+///
+/// It survived STEP-1 (#94) because that issue's integration test drives the EXCLUSION arm on both
+/// sides and never sends an `only_classes` at a live JVM. Nothing else could have caught it either: a
+/// unit test asserting the bytes this function writes would have been written from the same wrong
+/// reading of the spec, and the JVM is the only party that knows modKind 4 from modKind 5. So the
+/// regression test is an integration one — `only_classes` armed against a real JVM, in
+/// `mcp_integration.rs` — and it fails with the same `INVALID_OBJECT` if this constant goes back to 4.
+const MOD_CLASS_MATCH: u8 = 5;
 /// `ClassExclude` (6): drop events from classes matching a pattern. One modifier per pattern —
 /// JDWP takes a single string each, so N exclusions are N modifiers on one request.
 const MOD_CLASS_EXCLUDE: u8 = 6;
@@ -146,7 +160,7 @@ impl JdwpConnection {
             StepDepth::Out => step_depths::OUT,
         });
         for pat in only {
-            packet.data.put_u8(MOD_CLASS_ONLY);
+            packet.data.put_u8(MOD_CLASS_MATCH);
             write_jdwp_string(&mut packet, pat);
         }
         for pat in exclude {

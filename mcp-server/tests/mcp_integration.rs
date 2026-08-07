@@ -12294,6 +12294,61 @@ fn step_into_skips_the_jdk_by_default_and_steps_into_it_when_asked() {
     server.panic_reset();
 }
 
+/// STEP-3: `only_classes` on a step reaches the JVM at all.
+///
+/// It did not, from STEP-1 (#94) until this test existed. `set_step_ex` wrote each pattern under JDWP
+/// modKind **4** (`ClassOnly`), which takes a `referenceTypeID` — so the JVM read the string's length
+/// and first bytes as an object id, found nothing, and answered `INVALID_OBJECT` (20). Every
+/// `debug.step_* {only_classes: […]}` call ever made failed outright with "Failed to set step". The
+/// string form is modKind **5** (`ClassMatch`), the mirror of the `ClassExclude` used beside it.
+///
+/// Nothing in the tree could have caught it short of a live JVM: the argument parsed, the reply
+/// rendering was right, and a unit test over the bytes would have been written from the same misreading
+/// of the spec. STEP-1's own integration test drives the exclusion arm only, which is why this sat for a
+/// dozen releases behind a feature that reads as working.
+///
+/// The assertion is deliberately the WEAKEST one that proves the point — that the step was accepted and
+/// reported. Where it lands is STEP-1's subject and is covered above; this is about the packet.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_step_restricted_with_only_classes_is_accepted_by_the_jvm() {
+    let Some(jdk) = jdk_or_skip("a_step_restricted_with_only_classes_is_accepted_by_the_jvm") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "StepFilterProbe").expect("launch StepFilterProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 1 "))
+        .expect("probe never reached its second tick, so StepFilterProbe never loaded");
+
+    let src = probe_source("StepFilterProbe");
+    let sort_line = probe_line(&src, "// BP1");
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "StepFilterProbe", "line": sort_line}),
+    );
+    server
+        .wait_for_event(&format!("\"line\":{sort_line}"), EVENT_TIMEOUT)
+        .expect("breakpoint on the sort line never fired");
+
+    let reply = server.call("debug.step_into", serde_json::json!({"only_classes": ["StepFilterProbe"]}));
+    assert!(
+        !reply.contains("Failed to set step"),
+        "the JVM refused a ClassMatch-filtered step. INVALID_OBJECT here means the modifier went out as \
+         ClassOnly (4) again, which takes a referenceTypeID and not a pattern:\n{reply}"
+    );
+    assert_contains_all(
+        "the step is accepted and says what restricted it",
+        &reply,
+        &["Stepping ONLY within", "StepFilterProbe"],
+    );
+    server.wait_for_event("\"event\":\"step\"", EVENT_TIMEOUT).expect("restricted step never reported");
+
+    server.panic_reset();
+}
+
 /// TRACE-8 (#72) on the path a caller actually drives: **clearing a traced stop point must not leave the
 /// hit thread frozen.**
 ///
