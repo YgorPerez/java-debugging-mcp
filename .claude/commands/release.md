@@ -63,13 +63,35 @@ Read the commits since the last tag and classify them the way the **downstream c
 git log --oneline "$(git describe --tags --abbrev=0)..HEAD"
 ```
 
+**First ask whether there is anything to release at all**, because the two bumps below both assume there
+is, and a docs-only `main` matches *"no caller-visible surface change"* word for word — so reading the list
+alone steers you into cutting a patch release of nothing. These are the paths a release is actually built
+from:
+
+```bash
+git diff --name-only "$(git describe --tags --abbrev=0)..HEAD" \
+  | grep -E '\.rs$|Cargo\.(toml|lock)$|\.github/|server\.json$' || echo "nothing shippable changed"
+```
+
+When none of them moved, the binaries are behaviourally identical to the last tag and the crates would
+carry identical code: **say so and stop.** `CLAUDE.md`, `CONTEXT.md`, the ADRs and this file already serve
+their readers from `main`, and the next real release carries them in its changelog for free. Cutting one
+anyway spends a crates.io version permanently on a no-op — yankable, never reusable (ADR-0043) — and
+obliges a toolkit pin bump whose commit would have to say nothing was gained.
+
+`README.md` is the one deliberate omission from that pattern. It ships *inside* both `.crate` tarballs as
+the crates.io landing page, so a README edit does change what gets published — but it changes no behaviour,
+which makes it a reason to let the next release carry it rather than a reason to cut one.
+
+Then the bump itself:
+
 - **Minor** (`0.18.0` from today's `0.17.0`) — a new tool, a renamed tool or argument, or changed behaviour
   behind an existing name. Anything a caller could notice.
 - **Patch** (`0.17.1`) — fixes only, no caller-visible surface change.
 - Prerelease suffixes (`-rc1`) are marked prerelease by the workflow and stay out of `/releases/latest`,
   which unattended installers follow.
 
-If `$ARGUMENTS` is empty, state the bump and why, then continue.
+If `$ARGUMENTS` is empty, state the bump and why — **including when the answer is none** — then continue.
 
 ## 3. Gate, then cut
 
