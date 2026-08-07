@@ -4868,11 +4868,17 @@ fn tick_index(line: &str) -> Option<i64> {
     line.strip_prefix("tick ")?.split_whitespace().next()?.parse().ok()
 }
 
-/// DOC-15 (#145): the ignored-test count in `CLAUDE.md` against the only source that can answer it.
+/// DOC-15 (#145): the ignored-test count in the docs against the only source that can answer it.
 ///
-/// This number has cost two investigations. `CLAUDE.md` carries the post-mortems: it read **164** long
+/// **The sentence moved to `docs/agents/testing.md` with DOC-17 (#169)**, which routed the suite's
+/// catalogue out of the always-loaded `CLAUDE.md`. This test is the reason that move could not be silent:
+/// it reads the file by path, so the split had to bring it along. #169 named `docs_claims.rs` as the thing
+/// a move would break and that was wrong — `docs_claims.rs` never reads either document. This is the one
+/// assertion anywhere that reads repository prose.
+///
+/// This number has cost two investigations. The docs carry the post-mortems: the count read **164** long
 /// enough to be wrong by a third, and a later paragraph's own figures rotted in the weeks it took to
-/// read it. The file's answer so far has been to tell you to count it yourself, which is a warning and
+/// read it. The answer before this test was to tell you to count it yourself, which is a warning and
 /// not a check.
 ///
 /// THREE NUMBERS DISAGREE AND ALL THREE ARE HONEST, which is the actual defect: a static
@@ -4884,16 +4890,19 @@ fn tick_index(line: &str) -> Option<i64> {
 /// `#[ignore]`d because it shells out to a JVM-less but still real subprocess, and because #145 placed it
 /// in the integration leg rather than a fast job. It needs no JDK.
 ///
-/// WHEN THIS FAILS, THE FIX IS TO UPDATE CLAUDE.md IN THE SAME COMMIT. That is the deal #145 names: a
+/// WHEN THIS FAILS, THE FIX IS TO UPDATE THE DOC IN THE SAME COMMIT. That is the deal #145 names: a
 /// test asserting an exact count is only worth having if the remedy travels with it. If that ever stops
 /// being the habit, delete the number from the prose instead of loosening this.
 #[test]
 #[ignore = "spawns the test binary to list itself; run with --ignored"]
-fn claude_md_reports_the_ignored_test_count_the_binary_reports() {
+fn the_docs_report_the_ignored_test_count_the_binary_reports() {
     // Anchored to the sentence that makes the claim, not to "a bold number somewhere in the file". The
     // loose version passed on the historical **164** two paragraphs below — so a post-mortem about this
     // very number going stale would have satisfied the test asserting that it is not.
     const CLAIM: &str = "runs every `#[ignore]`d test in one process — **";
+    // Which file that sentence is in. It moved once already (DOC-17, #169), and this test is what made
+    // the move visible rather than silent.
+    const DOC: &str = "docs/agents/testing.md";
 
     let exe = std::env::current_exe().expect("current_exe");
     let out = std::process::Command::new(&exe)
@@ -4905,21 +4914,22 @@ fn claude_md_reports_the_ignored_test_count_the_binary_reports() {
     let actual = String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.ends_with(": test")).count();
     assert!(actual > 0, "the binary listed no ignored tests, which means the list format changed rather than that there are none");
 
-    let claude = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../CLAUDE.md"))
-        .expect("read CLAUDE.md");
-    let claimed: Vec<usize> = claude
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/agents/testing.md");
+    let prose = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {DOC}: {e}"));
+    let claimed: Vec<usize> = prose
         .match_indices(CLAIM)
-        .filter_map(|(at, _)| claude[at + CLAIM.len()..].split("**").next()?.parse::<usize>().ok())
+        .filter_map(|(at, _)| prose[at + CLAIM.len()..].split("**").next()?.parse::<usize>().ok())
         .collect();
     assert!(
         !claimed.is_empty(),
-        "could not find the sentence that states the ignored-test count. It reads:\n  {CLAIM}<n>**\n\
-         If the wording changed, change it here too — this test is why the number can be trusted."
+        "could not find the sentence that states the ignored-test count in {DOC}. It reads:\n  {CLAIM}<n>**\n\
+         If the wording changed, or the paragraph moved to another file, change it here too — this test \
+         is why the number can be trusted, and it is the only assertion that reads repository prose."
     );
 
     assert!(
         claimed.contains(&actual),
-        "CLAUDE.md does not state the ignored-test count the binary reports.\n           binary says: {actual}\n           CLAUDE.md's sentence says: {claimed:?}\n\n         Update the number in the sentence about running the unsharded suite, in THIS commit. \
+        "{DOC} does not state the ignored-test count the binary reports.\n           binary says: {actual}\n           the doc's sentence says: {claimed:?}\n\n         Update the number in the sentence about running the unsharded suite, in THIS commit. \
          Note that a static grep for `#[ignore` and the row count of timings.tsv both give different \
          answers and both are honest; this list is the authoritative one."
     );

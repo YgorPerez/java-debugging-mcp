@@ -4,411 +4,109 @@ A native JDWP debugger exposed as an MCP server (Rust). `jdwp-client` speaks the
 `mcp-server` wraps it as `debug.*` MCP tools (attach, breakpoints, stack/variable inspection,
 expression evaluation, stepping). See `README.md` for the full tool list and setup.
 
+**This file is always loaded, so it holds constraints and routes and nothing else** (DOC-17, #169). The
+test for a paragraph earning a place here is whether **reading it after you have acted is too late** — the
+traps below all cost time exactly that way. Everything that is a fact you can look up when you need it
+lives behind a route, and `docs/agents/task-map.md` says which route for which task.
+
+## Where to read next
+
+| you are about to | read |
+|---|---|
+| pick what to read | `docs/agents/task-map.md` |
+| use the vocabulary a caller sees | `CONTEXT.md` |
+| understand why something is the way it is | `docs/adr/` |
+| change a gate tool | `docs/agents/lint-gate.md` |
+| work on the suite, or a flake | `docs/agents/testing.md` |
+| change a workflow | `docs/agents/ci.md` |
+| cut a release | `/release`, then `docs/agents/releasing.md` |
+| set up a clone, or the git hooks | `docs/development.md` |
+| triage | `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md` |
+
 ## Before you commit
 
-**Run `cargo fmt`.** The workspace is rustfmt-formatted as of LINT-4 (#44) and CI fails on a
-misformatted diff. Settings live in `rustfmt.toml` and were measured off this tree rather than
-chosen — comments are *not* reflowed, so the narrative doc comments are safe to write long.
+**Run `cargo fmt`.** The workspace is rustfmt-formatted as of LINT-4 (#44) and CI fails on a misformatted
+diff. Settings live in `rustfmt.toml` and were measured off this tree rather than chosen — comments are
+*not* reflowed, so the narrative doc comments are safe to write long.
 
-**Run `scripts/doctor.sh --findings`**, not just `cargo clippy`. Doctor is the gate (ADR-0007), it
-fails on *warnings*, and the score is not the verdict — 100/100 "Great" has sat on top of 21 warnings.
-`--findings` prints what the gate will fail on and says whether it would pass.
+**Run `scripts/doctor.sh --findings`**, not just `cargo clippy`. Doctor is the gate (ADR-0007), it fails on
+*warnings*, and the score is not the verdict — 100/100 "Great" has sat on top of 21 warnings. `--findings`
+prints what the gate will fail on and says whether it would pass. **A clean tree prints `would pass`, so any
+finding is yours**; it also runs every check that gates in CI beside rust-doctor and says loudly when a
+binary it needs is missing, because a local run that skips one would retire its whole claim. What each check
+is for: `docs/agents/lint-gate.md`.
 
-**There is no baseline any more: a clean tree prints `would pass`, so any finding is yours.** It used to
-be "21 `unsafe-dependency` findings, anything beyond that is yours" — a pass condition you had to decode
-against a number written down here, and one that was never constant, since it is whatever subset of the
-dependency tree `cargo-geiger` flags and it moves with every `Cargo.lock` change. Those findings were all
-about *third-party* crates (`tokio`, `syn`, `serde_json`…), none of which anyone was going to replace, and
-CI never even ran the pass. `rust-doctor.toml` now ignores the rule and explains it at length, including
-why the `Warning: unknown rule(s) in ignore config` the tool prints on every run is **false** — the entry
-works, and was measured working. Our own `unsafe` is a different rule and still fails the gate.
+**Quote what a run printed, not what you asked for.** Every test leg prints `JDK in use: …` and every job
+prints `Rust in use: …`. A leg that asked for `stable`, silently got the pin, and passed is
+indistinguishable from one that did what it said — and the same is true of a JDK. This has been real twice.
 
-**GitHub's security tab shows only what the gate fails on**, via `scripts/sarif-for-code-scanning.py`, and an
-empty tab there is now meaningful rather than reassuring. It used to publish rust-doctor's raw SARIF, which
-grew to **115 open alerts against a green gate**: 109 `excessive-clone` notes (one identical sentence, on
-`Arc` handle clones), 6 `skipped-pass` notes (a tool wasn't installed — not a finding about the code), and
-every one of them anchored to a path that does not exist in this tree, because rust-doctor writes
-crate-relative URIs (`src/handlers.rs`) under a `%SRCROOT%` base id it never declares and this is a
-workspace. The script resolves the paths, publishes `warning`/`error` only, and prints what it withheld into
-the job summary — so nothing is silently dropped. Notes still reach you two other ways: the full SARIF is
-the `rust-doctor-sarif` artifact, and `--findings` prints locally.
+## Naming, and what a caller reads
 
-**CI now installs `cargo-deny` and `cargo-machete`** (prebuilt, seconds), so those two passes are part of the
-gate — machete's first run found `anyhow` and `serde_json` declared and unused by `jdwp-client`.
+**Check `CONTEXT.md` before naming anything a caller will read**, and **do not call it `inherited`** — that
+word is taken on this surface for a field walked from a superclass (`list_fields {inherited:true}`,
+ADR-0015). It shipped in #134's replies anyway and lasted a day: one word doing two unrelated
+caller-visible jobs. The glossary carries **Session default** with that collision in its `_Avoid_` line.
 
-**`cargo-shear` is installed too, and it is not a rust-doctor pass — it is a step of its own, because
-machete cannot see the case this workspace is shaped for.** Measured by planting one unused dependency in
-each position and running both: in a *member crate* both flag it; named only in a *source comment* both
-still flag it (machete is not the naive regex its reputation suggests — that was a guess, and it was
-wrong); but an unused entry in the root **`[workspace.dependencies]`** table is reported by shear and
-machete says "Good job!". Machete compares what a *package* declares against what that package's sources
-use, and a workspace table is neither. Both members here take everything through `<name>.workspace = true`,
-so an entry whose last user goes away is exactly the drift that would go unseen. Shear runs beside machete
-rather than replacing it because the tool is *rust-doctor's* choice — the `dependencies` pass invokes
-machete and takes no option to swap it — which is the same shape as the `semver` job below: a check
-rust-doctor could not be pointed at the right thing for, living next to it instead of inside it.
-`scripts/doctor.sh --findings` runs shear too, and **says so loudly when the binary is missing**, because a
-local run that skips a check that gates in CI would retire this script's whole claim.
+**A caller-visible change goes in the release notes, and a behaviour change updates the tool description in
+the same commit.** `docs/toolkit-contract.md` is why: six of the seven ways a change here reaches the
+downstream toolkit are silent, and the notes are the only mitigation for most of them.
 
-**That same script now also checks that the documentation renders**, so the instruction above already
-covers it and there is no second command to learn. It gates in CI as a step beside rust-doctor (DOC-13,
-#143) — the same shape as shear and the `semver` job, because rust-doctor has no rustdoc pass and takes no
-option to add one. **The failure it catches is prose that compiles and does not render**, which is why it
-earns its place in a repo where `rustfmt.toml` deliberately does not reflow comments so the narrative doc
-comments can be written long: ~12,200 `///` and `//!` lines were a primary artefact that nothing checked.
-It was red the day it was added, at **85 findings**. 74 were one cause — `JdwpError` linked from modules
-that do not import it, so every `# Errors` section rendered a literal `[JdwpError]` — and the worst of the
-other 11 was an unbackticked `Arc<Mutex<Receiver>>` that rustdoc parsed as an HTML tag, leaving the page
-reading "wrapped in an Arc which allows sharing" with the type the sentence is about deleted from it.
-`--document-private-items` is not optional: most of the narrative in `jdwp-client` hangs off private items,
-and without it you check a small fraction of the prose you meant to. **Qualify a doc link rather than
-widening visibility to satisfy one** — `mod_kinds::CLASS_ONLY` and `method_name_matches` are plain code
-spans for that reason, and `pub(crate)` on the second was reverted because `clippy::redundant_pub_crate`
-fails the gate on a `pub(crate)` item inside a private module. Two of the 85 were also **self-inflicted by
-a careless bulk fix**: a regex that appended `(crate::X)` to every `[`X`]` doubled the target on the two
-links that already had one, which rustdoc accepts as inert text and clippy catches as a bare path.
+**Regenerate a snapshot with `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot`, then read the
+diff.** One command rewrites all three snapshots. Reading the diff *is* the mechanism — DOC-7 (#108)
+shipped interleaved gibberish in a release because nobody read a 4000-character line. The same rule applies
+to `scripts/tests/run.sh --update`.
 
-**`rust-toolchain.toml` now decides which compiler you are using, including locally** (LINT-5, #141).
-`rustup` honours it, so `cargo fmt` and `scripts/doctor.sh` in this directory run the gate's pinned
-toolchain without you arranging anything — which is the half of the problem CI configuration could never
-reach. It replaces the sed that used to pull the number out of `rust-doctor.yml`; `scripts/doctor.sh` and
-`toolchain-pin.yml` both read the file now, and the number lives in exactly one place. The old
-`RUSTUP_TOOLCHAIN=… scripts/doctor.sh` recipe is history rather than instruction (it lived in the
-since-deleted `TODO.md`), and
-doctor's "this run uses rustc X, but the gate is pinned to Y" warning is now a backstop that only fires
-when something outranks the file — `RUSTUP_TOOLCHAIN`, a `+toolchain`, or a rustc rustup does not manage.
+**A `String` returned by a helper only reveals its rendering when you read the rendered output.** Two
+replies embedded a multi-line indented block inside a sentence and the compiler was happy;
+`reply-fragments.txt` exists to keep that found.
 
-**The file outranks `dtolnay/rust-toolchain@stable`, so every job that wants a different toolchain says so
-at its own call site**, through `.github/actions/setup-rust` (CI-7, #152), which collapsed seven
-copy-pasted toolchain-plus-cache blocks across five workflows. The test, coverage and release legs pass
-`stable` deliberately — they are the signal that the code still builds on current Rust, which a pinned
-gate cannot give you — and the composite action **prints `Rust in use:` in every job**. Quote that line
-rather than the `toolchain:` you asked for, for exactly the reason you quote `JDK in use:` rather than
-your intent: a leg that asked for `stable`, silently got the pin, and passed is indistinguishable from one
-that did what it said.
+## Running the suite
 
-Three passes
-stay off deliberately and `rust-doctor.yml` says why at each one: `cargo-geiger` feeds the
-`unsafe-dependency` rule this repo ignores, `cargo-semver-checks` through *that* pass would compare against
-the latest crates.io **release**, which cannot answer for a commit between releases — and before REL-5 it was
-wrong more loudly than that, comparing against **bonk-dev's** unrelated `jdwp-client`, the name our library
-has since been renamed away from — so the check lives in the `semver` job instead, via `scripts/semver-check.sh`, which uses the
-last release **tag** as the baseline: 196 checks run that way against 0 through the pass. **It gates on the
-release path only** (CI-2, #122): `release.yml` passes `gate_semver: true`, so a broken public API blocks a tag,
-while a push to `main` or a PR gets the same finding printed — with the bump that would permit it — and
-concludes green. That is a change, and the reason is that the red was routine: between releases the working
-version *equals* the baseline tag, so every break violates the smallest bump and this job was the only failing
-one in every run across two whole cycles. The only way to clear it was to cut the release. A permanent red that
-tested nothing is the same defect as a green tick that means too much, and it is the one this file warns about
-two paragraphs down. Read its verdict rather than the tick:
-on a release commit every check skips, because a bump that permits breaking changes leaves nothing to
-violate, and the script prints "0 checks ran, so this verified nothing" instead of passing quietly. Coverage
-belongs to `coverage.yml`. `--findings` works this out **per tool** from the workflow's install
-list, so "ran here, but not in the gate" stays true as that list changes — it used to be a yes/no grep for
-`cargo install` anywhere in the file, which a *comment* containing those words silently flipped.
+**Run more than one JDK.** `scripts/integration-test.sh` covers the `#[ignore]`d JVM tests; plain
+`cargo test` covers the unit and cassette tests, and you need both to see all of `mcp_integration.rs`. CI
+runs 11/17/21 and has caught version-locked tests that passed on one (#36). `docs/agents/testing.md` has
+how to get those JDKs locally.
 
-**There is deliberately no AI code-review workflow, and re-adding one by reflex would undo a decision.**
-`/install-github-app` had scaffolded `claude-code-review.yml` and `claude.yml` — untouched template, commented-out
-`paths:` filter and all. The auth step was never finished: the repo has **no secrets at all**, so
-`CLAUDE_CODE_OAUTH_TOKEN` was always empty. The review workflow ran five times, **failed five times, and never
-posted a comment**; the `@claude` one skipped twenty times and would have failed the same way if anyone had tried
-it. Both are removed.
+**Do not re-derive the thread count from Brent's bound** (`total_work / threads`), which says four threads
+is already 97 % efficient and is how a ten-times-concurrent lever stayed invisible: that bound assumes
+CPU-bound work, and this suite waits on probe JVMs. Neither is copying a neighbour's number the answer. The
+transferable part is *do not accept a default that assumes work you do not have*. The measurements are in
+`docs/agents/testing.md`; `integration-test.sh` computes the number and prints it, so you need not.
 
-They were removed rather than wired up because a red check that verified nothing is the inversion of the rule the
-rest of this section is built on. `--findings` names the passes that did not run, `sarif-for-code-scanning.py`
-prints what it withheld, and `semver-check.sh` says "0 checks ran, so this verified nothing" instead of passing
-quietly — all so a green tick cannot mean less than it looks like. A permanent red that tested nothing costs more
-than that: it teaches you to ignore red on PRs. Review depth already comes from doctor (the gate, ADR-0007),
-rust-doctor, the semver job, coverage, six integration legs, GitGuardian, and the `/code-review` skill locally —
-which reads this file, `CONTEXT.md` and the ADRs rather than a generic five-bullet prompt. If an AI review is
-wanted, it needs `CLAUDE_CODE_OAUTH_TOKEN` set as a repository secret **first**, and a prompt that names this
-repo's actual risks (suspension honesty, resume verification, caller-visible replies) instead of "performance
-considerations".
-
-**Do not call it `inherited`, and check `CONTEXT.md` before naming anything a caller will read.** That word
-is taken on this surface for a field walked from a superclass (`list_fields {inherited:true}`, ADR-0015).
-It shipped in #134's replies anyway and lasted a day — one word doing two unrelated caller-visible jobs,
-which is the defect the `**Reply**` entry was added for a day earlier. The glossary now carries
-**Session default** with that collision in its `_Avoid_` line. **The same pass caught a rendering bug the
-compiler could not**: both new replies embedded `list_trace_exprs`, which is an indented multi-line
-*block*, inside a sentence — `Session trace_expr:      trace_expr: a` and a bare newline mid-clause. Both
-helpers return a `String`, so only reading the rendered output finds it, and the five new cases in
-`reply-fragments.txt` are there to keep it found.
-
-**`debug.attach` and `debug.launch` take a session-wide `trace_expr`** (EVAL-14, #134), which every stop
-point takes as its **session default** when it names none. Built as a **default on the existing mechanism rather than a new
-`watch` tool family**, because the second composes with the budget accounting and the 4-expression cap
-TRACE-11 already built. Three rules it holds to, each of which is a trap avoided: it is **never a merge**
-— merging a caller's own list with the session's would push past the cap and silently drop the tail,
-which is the failure the cap exists to *reveal*; it is clamped and read-only-checked **once, at attach**,
-so taking the default cannot smuggle a fifth expression through and an invoking list is refused where it was
-set rather than at the fifth arming that takes it; and **every arming reply says when it took the session
-default**, because a
-capture nobody asked for at that site is otherwise unexplained. It evaluates **only at a stop the caller
-already caused**, never on events nobody asked to stop for — that would spend debuggee time on the JVM
-this project exists not to disturb. Note `handle_set_line_stop` reads the default through
-`session_trace_exprs()` while the other four read `session.trace_exprs` directly: it clamps before taking
-its guard, and calling the helper while holding that guard would re-lock the same mutex.
-
-**A reworded reply is now a failing test, not a silent break** (TEST-46, #154). 163 substring
-assertions guard the tool replies and a substring check cannot see a *rewording* — which is the failure
-mode `docs/toolkit-contract.md` exists for, five of whose six downstream breakages are silent.
-`mcp-server/tests/reply-fragments.txt` pins the output of the **pure** renderers (`describe_step_filter`,
-`describe_trace_frames`, `describe_trace_exprs`, `merge_clamp_notes`, `describe_overridden_traces`) over
-a fixed table of inputs, so it needs no JVM, no cassette and no redaction. **Fragments and not whole
-replies, deliberately**: pinning everything makes each behaviour change a large diff and trains people
-to regenerate without reading, which is the DOC-7 (#108) failure the generated file's own header warns
-about. Regenerate with the **same** command as the other two snapshots —
-`UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot` — and then **read the diff and put it in
-the release notes**, because that is a caller-visible change.
-
-**The four Python scripts that decide what CI publishes have a fixture matrix** (TEST-48, #163).
-`bash scripts/tests/run.sh` — one committed transcript per case holding the command, the **exit status**,
-and **stdout and stderr separately**, because that split is part of the contract (`shard-plan.py` puts
-names on stdout so a caller can pipe them) and a merged capture would let it swap silently. It gates in CI
-beside rust-doctor, `scripts/doctor.sh --findings` runs the identical command, and there is a `--update`
-that you must **read the diff of** — DOC-7 (#108) is the record of a generated file people regenerated
-without reading. **The cost is already on the board**: `release-notes.py` did not match the compound
-`fix(lint)+docs:` subject, so **13 commits reached published release notes with their type stripped**, and
-the commit-msg hook found it rather than anything testing the script. All fifteen cases were verified by
-**reverting the behaviour each one covers** — seven separate reversions across the four scripts.
-
-**Adding a JDWP command to `jdwp-client` now costs a line in a table, including a read** (SAFE-12, #171).
-`WIRE_COMMANDS` in `connection.rs`'s test module classifies **every** command this crate can send as
-`Read`, `Mutation` or `AllowedStateChange`, and the suite goes red on one it has never heard of. That is
-the point rather than a side effect: ADR-0001 says read-only is enforced *at the wire*, and SAFE-9 (#60) is
-the record of that invariant breaking with **nothing failing**, because the two primitives arrived with no
-client-side guard at all — which leaves the set of `guard_mutation` literals unchanged and is therefore
-invisible to any check built on them. Classify it as a `Mutation` and a second assertion goes red until a
-`guard_mutation` exists behind it. There is a companion table of the nine mutating primitives whose
-refusals are asserted **on `packets_sent()`, not just on the error** — "refused" and "sent nothing" are
-different claims and only the second is the contract. All of it needs no JVM. Do not reach for a third
-verdict to make a red go away: `VirtualMachine.Suspend` is an `AllowedStateChange`, not a read, and the
-enum has that value so nobody has to lie.
-
-**The wire read path is fuzzed, and the half that matters runs on stable** (TEST-45, #153).
-`mcp-server/tests/malformed_wire.rs` rides on every `cargo test`: truncations and single-byte
-corruptions of the **real frames in the cassettes**, all 256 value tags against every short buffer, and
-lying string lengths. `fuzz/` is the deeper half — a **separate workspace** so nightly cannot reach the
-crates the gate builds, invoked as `cargo +nightly fuzz run <target>` and **never** via
-`RUSTC_BOOTSTRAP`. Its corpus is **generated** by `fuzz/seed-corpus.py` from those same cassettes rather
-than committed, so re-recording a cassette cannot leave a stale copy behind. The claim under test is
-*never panics*, not memory safety — there is no `unsafe` here; a panic in the event loop drops a session,
-and a dropped session can leave a shared debuggee suspended. **It found nothing, which was the
-expectation**: `reader.rs` already guards every read with `ensure` plus a checked slice. Verified by
-planting a panic in `ReplyPacket::decode` and confirming two tests catch it — an unverified "no crashes"
-result is indistinguishable from a harness that never ran.
-
-**Seven of this file's claims are now asserted against the tree** (DOC-15, #145).
-`mcp-server/tests/docs_claims.rs` runs in plain `cargo test` and checks the *claims* rather than the
-code — that the pin is still readable by the sed two scripts use, that the first `tool:` line is the
-health job's, that every check `doctor.sh` says "GATES in CI" is really a step in the gate. Most guard a
-**sed rather than a number**, which is the cheapest thing here to get wrong: a sed that stops matching
-returns *empty*, and empty reads like "nothing to report" everywhere it lands. The ignored-test count
-lives in `mcp_integration.rs` as an `#[ignore]`d test, because only the binary's own `--list --ignored`
-can answer it — a static `grep -c '#[ignore'` says 188 and `timings.tsv` has 222 rows, and all three are
-honest. **It caught the drift on its first run**, and the deal it enforces is that a red here is fixed by
-updating the number in the same commit. **Where that deal is not worth it, delete the number instead of
-pinning it** — that is what happened to the second copy of this count, and to the `--shard N/M` rule,
-where every occurrence in the tree is either a usage line or prose explaining why not to write one down,
-so the test would only ever have fired on the documentation of its own rule.
-
-**The test legs skip on a docs-only push, and the filtering is per-JOB rather than `on: push: paths:`**
-(CI-6, #151). That distinction is the whole issue: a workflow skipped by a path filter produces **no
-check run**, so a required status check never reports and a PR waits on something that will never
-arrive. A `changes` job computes the answer with six lines of `git diff` — no third-party action to pin
-and let Dependabot bump — and **`ci-ok` has no `if:`, so it reports on every event including the pushes
-where all three legs skip**. That is the job branch protection would require; `main` has none today, so
-this is groundwork rather than a change in enforcement. **It fails open on every branch it cannot
-resolve**, and the release path is refused a filter *by ref, checked first*: under `workflow_call`
-`github.event_name` is the caller's event, so a tag looks like an ordinary push, and a **re-pointed**
-tag would have had a real `before` and let a release skip the suite gating it. A newly created tag would
-have failed open by luck, and luck is not a gate — REL-1 (#34) is the recorded cost.
-
-**Every action is SHA-pinned and `zizmor` gates the workflows** (CI-4/#149, CI-5/#150). The first
-zizmor run found **71**: 32 unpinned refs — two of them `dtolnay/rust-toolchain@master`, a *branch* —
-9 `artipacked` (checkout leaving credentials in the runner's git config), a workflow-level
-`security-events: write` only one job needed, and several `${{ }}` expansions inside `run:` blocks.
-**All fixed rather than suppressed, except one**: the `GITHUB_ENV` write in `setup-rust`, which is what
-that step is, and which carries its reason at the line. If you accept a future finding, annotate it at
-the line with why — a bare `# zizmor: ignore[…]` is how that becomes a file for silencing the tool.
-Dependabot is the other half and they land together: **a pin nobody bumps rots into a two-year-old
-`checkout`**, and `dtolnay/rust-toolchain` is pinned to a bare commit because it publishes a tag per
-toolchain and has no version tags at all. Both ecosystems are grouped weekly with a **7-day cooldown** —
-zizmor's `dependabot-cooldown` audit caught its absence on the first run after the file was written,
-and it is the point: pinning is undone by a bot that pulls a version the moment it exists. **Auto-merge
-is deliberately off**, because `main` has no branch protection (the API returns 404), so there is
-nothing required to gate on and auto-merge would mean merge-on-open.
-
-**`actionlint` gates beside it, and the two answer different questions** (CI-9, #166). zizmor audits what
-a workflow is *allowed to do*; actionlint checks whether it *means what it says* — chiefly by resolving
-`needs.<job>.outputs.<name>` against the outputs that job declares. That is the check CI-6 (#151) needs:
-`needs.changes.outputs.rust == 'true'` appears four times in `tests.yml`, a typo evaluates to the empty
-string, every leg skips, and **`ci-ok` reports green by design**. **Its first run found 0**, which is the
-result and is not a reason to soften the claim — this one is a bet on the next rename. Two things about
-its invocation are decisions rather than defaults: it is **curled from a pinned release** because
-`taiki-e/install-action` does not carry it, and **`-shellcheck=` / `-pyflakes=` turn off integrations that
-are on whenever those binaries are on `PATH`**. GitHub's runners ship shellcheck and a dev box may not, so
-leaving them on makes the verdict depend on which machine printed it — measured at 3 findings under
-shellcheck 0.11.0, none of them a semantics finding. `scripts/doctor.sh --findings` runs the identical
-invocation and prints both versions, and `docs_claims.rs` asserts the two files name the same one.
-
-**Every job in `.github/` now has a `timeout-minutes`, derived at its own line** (CI-10, #172). It used to
-be one job in the whole repo, at a round 30; everything else ran under GitHub's default of **360
-minutes**. This suite's failure mode is a *wait* rather than an assertion — a probe JVM that never reaches
-its breakpoint, a suspended debuggee nobody resumes — and with `fail-fast: false` the bill was six hours
-of runner per hung leg. **Each number says what it was derived from**, because a bare one rots the way a
-written-down shard number does; where there is no measurement to derive from (the crates.io publish has
-never succeeded) the comment says *that* instead of inventing one. Note the two `uses:` jobs in
-`release.yml` carry **no** timeout: the schema forbids it on a reusable-workflow call, and actionlint
-fails the file on one.
-
-**Two git hooks are checked in, and they do nothing until you opt in** (LINT-6/#146, REL-4/#147):
-`git config core.hooksPath .githooks` — per-clone, because a commit cannot set it. `pre-commit` runs
-`cargo fmt --all --check`; `commit-msg` checks the subject against the types `release-notes.py`
-categorises on, reading them from `--list-types` rather than a second copy, which is why there is no
-commitlint config here. `scripts/doctor.sh --findings` prints a note when the config is unset, and
-`bash .githooks/test.sh` is the 22-case matrix. **Two thirds of those cases assert the hooks do not
-fire**, for the reason the `.claude/` guard's matrix gives: a hook that rejects a subject the maintainer
-writes gets uninstalled the same day. Its history-replay case earned that immediately — the first
-version rejected 23 of this repo's own subjects, because `merge:` was missing from the vocabulary and
-the compound `fix(lint)+docs:` form failed the regex. That second one was a live defect in the published
-notes, not just the hook: those 13 commits had been landing in "Other Changes" with their type stripped.
-
-**Run the suite on more than one JDK.** `scripts/integration-test.sh` covers the `#[ignore]`d
-JVM tests; plain `cargo test` covers the unit and cassette tests, and you need both to see all of
-`mcp_integration.rs`. CI runs JDK 11/17/21 and has caught version-locked tests that passed on one JDK
-(#36). Every run now prints one `JDK in use: …` line naming the version, the home the JVM reports, and
-which of `JAVA_HOME` / `PATH` / the snap JBR it came from — read it, and quote it rather than your
-intent when you report a result. Setting `JAVA_HOME` is a *request*: if it is not a usable JDK the run
-now fails instead of quietly testing another one, which it used to do (TEST-18, #52).
-
-**Every run ends with a ranked slowest-tests list, so quote it instead of estimating.** `scripts/test-timings.py`
-prints it (TEST-26, #103; ADR-0024), and the three CI legs publish it into their job summaries. Two numbers,
-easy to swap: **test time** is the sum of every test's own duration — occupancy, 647.4 s — and **wall clock**
-is what you wait for, 177.3 s under `taskset -c 0-3`. Neither includes the build, the JDK install or the
-cache restore. It exists because a triage estimate of the largest available saving was **4x too high**; the
-same section warning you about the two backwards flake investigations applies to speed claims. As of v0.9.0
-the four `*_is_honest_from_every_suspended_state` tests were **29% of the suite's test time** between them,
-and the slowest single test was 74 s. **TEST-30 cut that**: they were waiting out a 25 s `EVENT_TIMEOUT` to
-observe an *absence* — proving "this path correctly did not resume" by letting the wait expire — and reading
-the path's own `STILL suspended` admission instead took the suite from **609 s to 540 s of test time** and the
-floor from **70 s to 35 s**. The lesson generalises past this suite: **a negative observation needs only as
-long as the positive would have taken.** `WatchProbe` ticks every 150 ms, so 25 s was two orders of magnitude
-more than ruling it out required.
-
-**TEST-35 then removed the floor altogether, and the cause was not the one the timings suggested.** The five
-resume-honesty tests each looped over eight suspended states *inside one test body*, and every cell launches its
-own probe JVM and its own server — so eight JVMs ran **sequentially in one libtest thread** while the other
-fifteen sat idle. Per-cell instrumentation found each cell waiting ~2 s and advancing, so barely half of the
-35 s was the assertions at all; the unshortenable 25 s wait in the watchdog cell was the obvious suspect and was
-not the cost. Splitting them into **40 per-cell `#[test]`s** took the slowest single test to **18.7 s** and
-shard 1/2 on 4 vCPU from **53.7 s to 30.7 s**, for no extra runners. **Check whether a slow test can be
-*scheduled* before looking at the timeouts inside it** — `shard-plan.py` cannot split one test, so a long loop
-is a floor under every shard count.
-
-**The suite is oversubscribed on purpose, and the runner prints the number** (TEST-32). Almost every test
-waits on a probe JVM rather than computing, so libtest's `available_parallelism()` default leaves the cores
-idle. Measured on 4 vCPU: **4 threads 139.1 s (3.8x concurrent), 8 threads 87.7 s (6.3x), 16 threads 63.8 s
-(10.2x)** — *ten times concurrent on four cores*. Sixteen cores continue it: 16 -> 56.9 s, 24 -> 50.1 s,
-40 -> 45.6 s. `integration-test.sh` therefore runs **4x cores capped at 40**, and `JDWP_TEST_THREADS`
-overrides.
-
-**Do not re-derive this from Brent's bound** (`total_work / threads`), which says four threads is already
-97 % efficient and is how the lever stayed invisible: that bound assumes CPU-bound work, and this suite is
-not. Neither is copying a neighbour's number the answer — `b2c-next`'s vitest takes one worker per core and
-`~/html/infotravel-doc` caps Playwright at `workers: 4`, both correct for CPU-bound JS. The transferable
-part is *do not accept a default that assumes work you do not have*.
-
-**It raises contention, which is what the flakes come from.** Accepted deliberately: the trade is stated in
-TEST-32's commit and #114 carries the one flake the soak surfaced.
-
-Because the timing flag is nightly-gated, `integration-test.sh` now **builds with `cargo test --no-run` and
-runs the test binary directly**, keeping `RUSTC_BOOTSTRAP=1` off `cargo` — it is hashed into the build
-fingerprint, so setting it on a `cargo test` recompiles the workspace and compiles it under a flag that lets
-nightly-only features in silently. Arguments still go straight to libtest and the script still supplies the
-`--`.
-
-**CI runs six legs now: three JDKs x two shards** (TEST-29, #106; ADR-0025). A shard is half the suite split by
-*measured* duration — `scripts/shard-plan.py` reading `mcp-server/tests/timings.tsv` — because a split by name
-had a 1-in-8 chance of piling the four resume-honesty tests into one shard and making it the whole wall clock.
-Measured on CI when sharding landed: **workflow wall clock 223 s → 147 s (−34%), runner-seconds 648 → 747
-(+15%)** — wall clock bought *at the cost of* runner-seconds. **Re-measured after TEST-30 and TEST-32: wall
-clock 91 s, slowest leg 88 s, runner-seconds 494 s**, so both are now better than either earlier state and
-runner-seconds are below the *unsharded* baseline. **33 s of that 88 s leg is not the tests** (16 s build,
-the rest checkout/toolchain/cache), so fixed cost per leg is what now argues against a third shard. Two shards and
-not three for two reasons — the slowest single test was **70 s** and cannot be split, and a 60-test shard only
-reaches ~2.6x concurrent on 4 vCPU against 3.7x for the full 118, so halving a shard's test time does *not*
-halve its wall clock. **Both reasons have now expired, and the answer did not
-change.** TEST-30 took the floor to 35 s and TEST-35 removed it (18.7 s, and that one is a single test rather
-than a loop). Re-measured on 4 vCPU with no floor left: **shard 1/2 = 30.7 s at 14.0x concurrent, shard 1/3 =
-30.6 s at 11.6x** — falling concurrency cancels the smaller workload exactly, so a third shard is worth
-**0.1 s** for +50 % runners. Still two, now on a measurement rather than a caveat; ADR-0025 carries both
-amendments. Note what moved the needle each time: a *test* got faster, never the shard arithmetic.
-
-**Run the unsharded suite when you are working a flake.** `scripts/integration-test.sh` with no `--shard` still
-runs every `#[ignore]`d test in one process — **225** as of 2026-08-06, and DOC-15 (#145) now asserts that number against the binary rather than asking you to trust it — which is the contention CI used to have.
-Count it rather than trusting that number (`<the-test-binary> --list --ignored | grep -c ': test$'`); this line
-said **164** for long enough that the figure was wrong by a third. Sharding *reduces* how many probe
-JVMs compete, so **a flake that stops reproducing under CI's new shape is not fixed** — #45, #56, #64 and #71
-were open when this landed and the trade was accepted with that stated. Refresh the timings file with
-`scripts/test-timings.py --emit-timings <log> > mcp-server/tests/timings.tsv`; it is generated, never hand-edited,
-and drift is reported rather than fatal.
-
-**A shard number written down anywhere is stale, and following one costs a green run of nothing.** #118's
-reproduction recipe named `--shard 1/2`; six runs of it passed cleanly and the test it was supposed to
-exercise had moved to shard **2/2**, because the split is by *measured* duration and the suite had grown from
-180 tests to 197 with `timings.tsv` refreshed several times in between. Six green runs that proved nothing and
-looked like they proved something.
-
-*The suite has grown again since, so those two numbers are now history as well — which is the point rather
-than an aside: this paragraph's own figures rotted in the weeks it took to read it. The count above is
-carried in one place and asserted (DOC-15, #145); this sentence deliberately names no number, because a
-second copy of it is what rotted here twice.* **Check membership before
-trusting a shard number:**
-
-```bash
-scripts/shard-plan.py --tests <(<the-test-binary> --ignored --list) --which launch_suspends
-# 2/2  launch_suspends_before_the_first_instruction_and_disconnect_terminates_it
-```
-
-`--which` exits non-zero and says so when the name is in **no** shard, which is the case that otherwise looks
-like a pass. Prefer the unsharded form in anything you write down: it has no shard number to rot.
-
-**Getting the JDKs CI has.** "More than one" was aspirational for a while because this workspace had only
-JDK 11 and a snap JBR, so every result ended in "17 and 21 are CI's to confirm" — which is a slow way to
-learn that a test is version-locked. Adoptium tarballs need no root and no package manager:
-
-```bash
-mkdir -p ~/.jdks && cd ~/.jdks
-for v in 17 21; do
-  curl -fsSL "https://api.adoptium.net/v3/binary/latest/$v/ga/linux/x64/jdk/hotspot/normal/eclipse" \
-    | tar xz
-done
-JAVA_HOME=~/.jdks/jdk-17.0.20+8 scripts/integration-test.sh   # and quote the `JDK in use:` line
-```
-
-**A single test on an idle 16-core box is a *gentler* environment than CI, not a harsher one.** Worth
-saying because two separate flake investigations here got it backwards and spent thousands of cycles
-proving very little. CI runs all 164 `#[ignore]`d tests at once on a 4-vCPU runner, so the contention that
-produces these failures comes from dozens of probe JVMs competing, not from CPU scarcity alone. To
-reproduce that, pin the whole suite instead of adding load:
+**A single test on an idle 16-core box is a *gentler* environment than CI, not a harsher one.** Two separate
+flake investigations here got that backwards and spent thousands of cycles proving very little. The
+contention comes from dozens of probe JVMs competing, so reproduce it by pinning the whole suite rather than
+by adding load:
 
 ```bash
 taskset -c 0-3 cargo test --test mcp_integration -- --ignored --nocapture
 ```
 
-Pass **no** `--test-threads`: `integration-test.sh` now computes one (**4x cores, capped at 40** — TEST-32)
-and prints it, and under `taskset -c 0-3` that comes out at **16**, which is exactly what CI passes. So the
-recipe still reproduces CI's contention; it just is not libtest's default any more. Overriding with
-`JDWP_TEST_THREADS`, or an explicit `--test-threads`, changes the shape and stops it being CI's.
+Pass **no** `--test-threads`, and prefer this to a CPU hog — a hog-based arm leaked 32 processes twice,
+because `trap … EXIT` does not fire on SIGKILL.
 
-And prefer this to CPU hogs — a hog-based arm leaked 32 processes twice, because `trap … EXIT` does not
-fire on SIGKILL.
+**A shard number written down anywhere is stale, and following one costs a green run of nothing.** #118's
+recipe named `--shard 1/2`; six runs of it passed cleanly and the test had moved to shard 2/2, because the
+split is by *measured* duration. Six green runs that proved nothing and looked like they proved something.
+Check membership rather than trusting a number:
+
+```bash
+scripts/shard-plan.py --tests <(<the-test-binary> --ignored --list) --which launch_suspends
+```
+
+`--which` exits non-zero when the name is in **no** shard, which is the case that otherwise looks like a
+pass. Prefer the unsharded form in anything you write down: it has no number to rot.
 
 **Run a soak against a copied binary, never the working tree.** `cp $(cargo test --no-run …) /tmp/arm.bin`
 first. An arm that rebuilds while you edit reports *your compile errors* as failures: that produced a
 confident "8 failures in 40" that were nothing of the kind.
+
+**Adding a JDWP command to `jdwp-client` costs a line in a table, including a read** (SAFE-12, #171).
+`WIRE_COMMANDS` in `connection.rs`'s test module classifies **every** command this crate can send as `Read`,
+`Mutation` or `AllowedStateChange`, and the suite goes red on one it has never heard of. That is the point:
+ADR-0001 says read-only is enforced *at the wire*, and SAFE-9 (#60) is the record of that invariant breaking
+with nothing failing. Do not reach for a third verdict to make a red go away — `VirtualMachine.Suspend` is
+an `AllowedStateChange`, not a read, and the enum has that value so nobody has to lie.
 
 ## Agent skills
 
@@ -428,124 +126,47 @@ Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/do
 
 ### Guardrails
 
-**Some of the traps above are now enforced rather than described.** `scripts/guard.py` denies
-`RUSTC_BOOTSTRAP=1 cargo …` and a `git commit` over a misformatted tree, asks before `git push`, and
-warns on a soak loop against the working tree, a hardcoded `--shard N/M`, a `--test-threads` override,
-and unbounded workspace cargo output. Every rule is one already written down in this file — the guard
-adds no policy, it just stops the policy depending on somebody having read this far.
+**Some of the traps above are enforced rather than described.** `scripts/guard.py` denies
+`RUSTC_BOOTSTRAP=1 cargo …` and a `git commit` over a misformatted tree, asks before `git push`, and warns
+on a soak loop against the working tree, a hardcoded `--shard N/M`, a `--test-threads` override, and
+unbounded workspace cargo output. Every rule is one already written down here — the guard adds no policy, it
+just stops the policy depending on somebody having read this far. Escape any deny with
+`SKIP_JDWP_AGENT_GUARD=1` in the command itself.
 
-**The rules moved out of `.claude/` and that is the whole of LINT-7 (#167).** They were a Claude Code
-`PreToolUse` hook and nothing else, so five of the seven held for exactly one host: a plain shell,
-another agent, or a script in CI got none of them, and the tree could not check itself against its own
-documented policy. `.claude/hooks/pre-bash-guard.py` is now an **adapter** — it calls `check()` and
-renders that host's JSON, and holds no rule. Any host can ask the same question:
+**Nothing runs it for you outside Claude Code** (LINT-7, #167). The rules are host-neutral now and
+`.claude/hooks/pre-bash-guard.py` is an adapter over them, but only that host invokes it automatically; the
+two checked-in git hooks cover the `cargo fmt` half of one rule and are opt-in per clone besides. Elsewhere
+it is a command:
 
 ```bash
-scripts/guard.py check 'RUSTC_BOOTSTRAP=1 cargo test'   # prints the verdict; exits 20
+scripts/guard.py check 'RUSTC_BOOTSTRAP=1 cargo test'   # allow | warn | ask | deny, with the reason
 ```
 
-**What a non-Claude host still does not get, said plainly:** nothing calls this automatically. The two
-checked-in git hooks cover the `cargo fmt` half of one rule and are opt-in per clone besides. So
-elsewhere this is a command you run rather than a guard that runs — which is still more than the nothing
-that was reachable before, and is why the entry point takes a command line and not a hook payload.
-
-**Two of those rules used to search the raw command line**, which the guard's own module docstring says
-not to do and for exactly the reason it gives: commands here routinely *mention* the guarded thing as
-data. Recording a soak result with `gh issue comment` made the guard fire on the prose it was writing
-about itself, and a rule that cries wolf on its own documentation is the fastest way to get the whole
-guard switched off. Both now walk **tokens** and both require the *value* to follow — `--test-threads`
-needs a digit and `--shard` needs `N/M` — so a `grep` for the flag in the docs is not an override.
-Three of the matrix's cases are that regression, and they were found in the wild rather than imagined.
-
-The rationale for each severity lives in `.claude/settings.json`'s comment block and is deliberately
-**not** repeated here; that file is the one place to change it, and it is where the matrix's case counts
-live too — a second copy of a number is what `docs_claims.rs` exists for, and it now asserts that one.
-`bash scripts/guard.test.sh` is the matrix, most of whose cases assert the guard does *not* fire — a
-guard that trips on a heredoc or an `echo` gets switched off within the day — with four more driving the
-adapter, because a `warn` rendered as a decision would start blocking commands meant to proceed. Escape
-any deny with `SKIP_JDWP_AGENT_GUARD=1` in the command itself.
+The rationale for each severity, and the matrix's case counts, live in `.claude/settings.json`'s comment
+block — one place, and `docs_claims.rs` asserts the counts. `bash scripts/guard.test.sh` is the matrix, most
+of whose cases assert the guard does *not* fire: a guard that trips on a heredoc or an `echo` gets switched
+off within the day.
 
 ## Releasing
 
 **Use `/release [X.Y.Z]`** (`.claude/commands/release.md`). `scripts/release.sh` is the half that bumps,
 gates, commits and tags — deliberately stopping before the push — and the command is everything around it:
 which bump, the release body (which *is* the release notes, so the toolkit can read it), the tag push, the
-downstream pin and skill audit, and the issue closes.
+downstream pin and skill audit, and the issue closes. **Do not hand-roll a release.**
 
 It leads with the four traps that have actually cost time, so read them rather than rediscovering them. The
 worst is that a non-interactive `release.sh` writes only the commit **subject**, and repairing that means
 **re-tagging** — an annotated tag names one commit, and amending leaves the tag pointing at an object no
 longer on the branch.
 
-**A tag also publishes both crates to crates.io** (REL-5, ADR-0043) — the one step here nothing can undo,
-since a version can be yanked but keeps its number forever. It runs last for that reason, over OIDC with no
-stored token, and needs nothing from you: the manual bootstrap happened at v0.20.0. ADR-0043 has the
-sequence if it ever has to be done again, and `/release` step 5 has what to do when that job goes red.
+**A tag publishes to crates.io, which is the one step nothing can undo** — a version can be yanked but keeps
+its number forever. It runs last for that reason. What else a tag publishes, and why each piece is shaped
+the way it is: `docs/agents/releasing.md`.
 
-**`scripts/toolkit-parity.py` diffs the toolkit's documented tools against the release it pins** (CI-8,
-#162), and it **reports, never gates** — nothing here depends on the toolkit and a check pointed at another
-repo that could block a change is what got two workflows deleted. It covers three of
-`docs/toolkit-contract.md`'s seven rows (a renamed/removed tool, a renamed argument, an added tool nobody
-names) and says at its own head which four it cannot. Every unresolvable input is **fatal**, because an
-empty diff from a run that read nothing is worse than a red. **There is no `schedule:` and that is a
-deviation the issue's premise forced**: `ygor-infotera/infotravel-dev-toolkit` is **private**, so the
-"public contents API" #162 assumed does not exist and a workflow's `GITHUB_TOKEN` cannot reach it. Turning
-the schedule on means adding **this repository's first secret** — the workflow header has the fine-grained
-scope and the `gh secret set` recipe that keeps the token out of a transcript. Run it locally meanwhile: it
-shells out to `gh api` and uses the auth you already have. Measured 7 Aug 2026 at **40 tools named
-downstream, 40 exported, no drift in either direction** — and its first run had a false positive worth
-knowing about, `debug.step_` from the glob `debug.step_*` in their prose.
-
-**A tag also publishes `tool-surface-<tag>.json`, so "what changed for callers" is two curls** (REL-8,
-#165). Every `debug.*` tool, its description and every argument's schema in one document. It is
-**built from the committed snapshots, never regenerated from the binary** — an asset re-derived at release
-time would be a second source of truth beside the files `cargo test` gates — and `scripts/tool-surface.py`
-**refuses to publish** rather than emit a half-parse: the two snapshots must name the same tools, the
-`# N tools, M arguments` line in the argument file must match what was parsed, and `docs/tools.md`'s table
-must agree. Three decisions are written at the step: it lives **outside `dist/`** so REL-2's guard stays as
-strict as it was, it is **deliberately absent from `SHA256SUMS`** because that file is the *binaries'*
-manifest the downstream installer matches host names against, and it is therefore **an attestation
-subject** — the one asset for which that is the only integrity story. The format is versioned by
-`surface_version`, independent of the crate; the bump rule and the pinnable `$id` live in
-`docs/tool-surface.schema.json`, and `docs_claims.rs` asserts the script and the schema name the same one.
-
-**A tag publishes five platform binaries now, not four, and each one carries signed build provenance**
-(REL-9/#173, REL-7/#164). Both are caller-visible and both need saying in the release notes. The new
-asset is **`jdwp-mcp-<tag>-linux-aarch64`**, built natively on `ubuntu-24.04-arm` and statically linked
-against musl like its x86_64 sibling; that name is the *interface* (`docs/toolkit-contract.md`), and it
-is what downstream's `jdwp-platforms` — which currently documents ARM Linux as "absent on purpose" — will
-match against `SHA256SUMS`. Provenance is the other half: `SHA256SUMS` proves the **download**, not the
-build, because the manifest ships beside the binaries it lists. `gh attestation verify <asset> --repo
-YgorPerez/java-debugging-mcp` answers the half a checksum cannot, over OIDC with **no stored token** and
-**no file added to `dist/`**, so REL-2's guard there is untouched. **The build matrix also runs its own
-output now** — initialize / `tools/list` over stdio, before the upload — on every slice except
-`x86_64-apple-darwin`, which is the one binary its own builder cannot execute.
-
-**The library's package name is `java-debugging-jdwp-client`, not `jdwp-client`** — the obvious name belongs
-to an unrelated project on crates.io, the collision `scripts/semver-check.sh` was built around. `[lib] name`
-is still `jdwp_client`, so imports are untouched, but **anything taking a `-p` package name wants the long
-one**: `cargo clean -p jdwp-client` cleans nothing and exits 0, leaving the stale-cache step in
-`rust-doctor.yml` **vacuous** while it still reads as passing.
-
-**`server.json` is the MCP registry manifest and `release.sh` bumps it** (REL-3, #137). It carries its own
-`version`, so a manifest left behind tells a searcher a release exists that was never published — the
-same class of defect as a stale pin. `the_registry_manifest_version_matches_the_crate` asserts it against
-`Cargo.toml`, so the bump step cannot be quietly dropped. **It is deliberately metadata-only** — no
-`packages` block — because the registry's direct-download type is `mcpb`, which wants a bundle this repo
-does not build and a `fileSha256` for it; a listing that named an install method we do not have would
-advertise something nobody can run. Validate any edit against the published schema before committing:
-`description` is capped at **100 characters** and the first draft here was well over it.
-
-**The release body reaches the releases page through `scripts/release-notes.py`**, and it did not until
-v0.9.0. The workflow published with `--generate-notes`, which lists merged **pull requests** — so a release
-of direct pushes to main generated an empty "What's Changed", and the commit body it never read is where all
-the caller-visible detail lives. Every release from v0.2.1 to v0.8.0 published one line: the compare link.
-The script now leads with that commit body verbatim and appends a changelog categorized from the
-conventional-commit subjects since the previous tag, under the same emoji headings `~/html/b2c-next` uses.
-Preview it with `python3 scripts/release-notes.py v<version>`; it is byte-for-byte what will be published,
-and it also lands in the run's job summary. There is deliberately **no `.github/release.yml`** — that is
-b2c-next's mechanism and it categorizes by PR *label*, which here would categorize almost nothing and look
-load-bearing while deciding nothing.
+**Anything taking a `-p` package name wants `java-debugging-jdwp-client`, not `jdwp-client`.** The obvious
+name belongs to an unrelated project on crates.io. `[lib] name` is still `jdwp_client`, so imports are
+untouched — but `cargo clean -p jdwp-client` cleans nothing and exits 0, which left the stale-cache step in
+`rust-doctor.yml` **vacuous** while it still read as passing.
 
 ## Downstream consumer
 
