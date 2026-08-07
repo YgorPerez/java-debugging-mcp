@@ -55,10 +55,18 @@ jobs:
     runs-on: ubuntu-latest
     # CI-10 (#172). 8 s observed — BUT ONLY ON THE FAST PATH, and quoting that number as the budget would be
     # the mistake this repo keeps writing post-mortems about. Every run so far has found the pin current and
-    # stopped at the comparison step; the scan path below has never executed. So the derivation is the gate's
-    # own `health` job, 69 s warm, times the fact that this one passes `cache: "false"` deliberately and
-    # therefore lints the whole dependency graph from scratch. See tests.yml's `changes` job for the
-    # general argument.
+    # stopped at the comparison step; the scan path below has never executed on a runner. So the derivation
+    # is the gate's own `health` job, 69 s warm, times the fact that this one passes `cache: "false"`
+    # deliberately and therefore lints the whole dependency graph from scratch. See tests.yml's `changes`
+    # job for the general argument.
+    #
+    # STILL NOT RE-DERIVED FROM A RUNNER, and BUILD-3 (#174) asked for that. What exists is the scan path
+    # run for the first time end to end — `scripts/doctor.sh --sarif --fail-on none`, 41 s, 122 KB of SARIF,
+    # 183 results — on a 16-core dev box with a warm cargo cache and the PINNED toolchain. That figure says
+    # the plumbing works and says almost nothing about this job's budget, which is a cold runner on a
+    # toolchain it has just installed. Left at 30 until a `workflow_dispatch` run against a lowered pin
+    # produces the real one: replacing a reasoned budget with a measurement from a gentler machine is the
+    # same error as reasoning one, with a number attached to make it look otherwise.
     timeout-minutes: 30
 
     env:
@@ -82,36 +90,34 @@ jobs:
           # No cargo cache, deliberately — see the note further down.
           cache: "false"
 
-      # Read BOTH pins from where they live rather than repeating the numbers here. A second copy of
-      # the pinned version is a second thing to remember to bump, which is the maintenance hazard this workflow is
-      # about; release.yml declines to carry one for the same reason. The rust-doctor version matters
-      # just as much: an advisory scan run by a different tool than the gate answers a question nobody
-      # asked.
+      # Read the pin from where it lives rather than repeating the number here. A second copy of the
+      # pinned version is a second thing to remember to bump, which is the maintenance hazard this workflow is
+      # about; release.yml declines to carry one for the same reason.
       #
       # THE TOOLCHAIN MOVED (LINT-5, #141). It used to be a YAML string in rust-doctor.yml and this job
       # sed'd it out of there; it is now `channel` in rust-toolchain.toml, which is also what rustup
       # reads, so the number the gate uses and the number your local `cargo` uses cannot drift apart.
-      # scripts/doctor.sh reads it from the same file with the identical sed. The rust-doctor version is
-      # still a workflow string, so that one is still read from rust-doctor.yml.
+      # scripts/doctor.sh reads it from the same file with the identical sed.
+      #
+      # THIS STEP USED TO READ THE rust-doctor VERSION TOO, AND IT READ IT OUT OF A COMMENT (BUILD-3, #174).
+      # The sed was `s/.*rust-doctor@\([0-9][0-9.]*\).*/\1/p` over rust-doctor.yml — and since BUILD-1 (#66)
+      # moved that gate off npm, the only line in the file it matched was the SENTENCE EXPLAINING THE NPM
+      # REMOVAL. It answered `0.2.0` by reading prose about the bug, so rewording that sentence, or bumping
+      # the pin without touching it, would have silently scanned with the wrong version or errored out. The
+      # scan step below now runs `scripts/doctor.sh`, which owns the version, so there is nothing left to
+      # read: the fix for "prose answered a question about configuration" is not a better regex over prose.
       - name: Compare stable against the pin
         id: pin
         shell: bash
         run: |
-          gate=.github/workflows/rust-doctor.yml
           toolchain_file=rust-toolchain.toml
           pinned="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$toolchain_file" | head -1)"
-          doctor="$(sed -n 's/.*rust-doctor@\([0-9][0-9.]*\).*/\1/p' "$gate" | head -1)"
           stable="$(rustc -vV | sed -n 's/^release: *//p')"
           if [ -z "$pinned" ]; then
             echo "::error::could not read the pinned toolchain out of $toolchain_file — the sed that reads it no longer matches the file"
             exit 1
           fi
-          if [ -z "$doctor" ]; then
-            echo "::error::could not read the rust-doctor version ('$doctor') out of $gate — the sed that reads it no longer matches the file"
-            exit 1
-          fi
           echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
-          echo "doctor=$doctor" >> "$GITHUB_OUTPUT"
           echo "stable=$stable" >> "$GITHUB_OUTPUT"
           if [ "$pinned" = "$stable" ]; then
             echo "behind=false" >> "$GITHUB_OUTPUT"
@@ -129,14 +135,27 @@ jobs:
       #
       # `--fail-on none` is what makes this advisory: rust-doctor always exits 0, so a new lint in a
       # newer clippy cannot turn this job red. The findings are read out of the SARIF below.
+      #
+      # THROUGH `scripts/doctor.sh`, NOT `npx` (BUILD-3, #174). This step read
+      # `npx -y "rust-doctor@${DOCTOR}"` until 2026-08-07, which is the call BUILD-1 (#66) removed from the
+      # gate and from doctor.sh when the npm package was *unpublished*: the registry now serves an empty
+      # version list, so every value of `${DOCTOR}` is an `ETARGET`. This file was outside #66's scope and
+      # kept the broken call, behind an `if:` that has never been true.
+      #
+      # `doctor.sh --sarif` is not a wrapper around the scan, it IS the scan: the script `exec`s the
+      # rust-doctor binary for the modes "whose stdout belongs to a program, not a person", so this
+      # redirect receives the tool's own bytes with nothing prepended. Its narration — which version it
+      # fetched, and the loud "this run uses rustc X but the gate is pinned to Y" — goes to stderr, where
+      # on this job it is the truth worth reading: running a DIFFERENT rustc than the pin is this job's
+      # entire purpose.
+      #
+      # And it means this workflow carries no rust-doctor version of its own. The one it uses is
+      # doctor.sh's, which is the one a maintainer gets locally; an advisory scan run by a different tool
+      # than the gate answers a question nobody asked. `docs_claims.rs` holds the two remaining
+      # declarations (doctor.sh's default and rust-doctor.yml's release URL) to each other.
       - name: Run rust-doctor against stable, gating on nothing
         if: steps.pin.outputs.behind == 'true'
-        # Through `env:` rather than expanded into the script, same as the issue step below. The value is
-        # sed'd out of rust-doctor.yml in this repo two steps up and nothing external can reach it — this
-        # is about not leaving the pattern lying around to be copied somewhere it would matter.
-        env:
-          DOCTOR: ${{ steps.pin.outputs.doctor }}
-        run: npx -y "rust-doctor@${DOCTOR}" --sarif --fail-on none > rust-doctor-stable.sarif
+        run: scripts/doctor.sh --sarif --fail-on none > rust-doctor-stable.sarif
 
       - name: Read the findings
         id: findings
@@ -153,6 +172,14 @@ jobs:
                    r.get("message", {}).get("text", "")[:200])
                   for run in sarif.get("runs", []) for r in run.get("results", [])
                   if r.get("level") in ("warning", "error")]
+
+          # The scanner that ACTUALLY RAN, taken out of its own output rather than from whatever this file
+          # asked for — the "quote what the run printed" rule in CLAUDE.md, and the half of BUILD-3 (#174)
+          # that a version read from the right place still would not have covered. `scripts/doctor.sh`
+          # honours RUST_DOCTOR_VERSION and RUST_DOCTOR_BIN from the environment, so the version in this
+          # SARIF is the only thing that can say which tool produced these findings.
+          driver = (sarif.get("runs") or [{}])[0].get("tool", {}).get("driver", {})
+          scanner = " ".join(x for x in (driver.get("name"), driver.get("version")) if x) or "an unidentified scanner"
 
           pinned, stable = os.environ["PINNED"], os.environ["STABLE"]
           lines = []
@@ -174,6 +201,8 @@ jobs:
                            f"`rust-toolchain.toml` is pinned to **{pinned}**; raising it to "
                            f"{stable} costs one line and no cleanup.")
           lines.append("\n---\n")
+          lines.append(f"Scanned by **{scanner}**, via `scripts/doctor.sh` — the same tool and the same "
+                       f"fetch a maintainer gets locally (BUILD-3, #174).\n")
           lines.append(f"Filed by `.github/workflows/toolchain-pin.yml` (LINT-2, #28), which runs "
                        f"monthly against stable and gates on nothing. Close this by bumping the pin — "
                        f"or by deciding not to, and saying so here.")

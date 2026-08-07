@@ -11,7 +11,9 @@
 # decides what reaches GitHub's security tab and what is withheld. `shard-plan.py` decides which tests run
 # in which leg. `test-timings.py` writes `timings.tsv`, which `shard-plan.py` then reads. None of them had
 # a test, while `.githooks/test.sh` is a 22-case matrix, `scripts/guard.test.sh` another
-# one, and `docs_claims.rs` asserts seven of CLAUDE.md's claims against the tree.
+# one, and `docs_claims.rs` asserts CLAUDE.md's load-bearing claims against the tree. (It said "seven"
+# here until BUILD-3, #174, added the eleventh — a count in prose about a file that grows is the staleness
+# `docs_claims.rs` itself exists to catch, so it is gone rather than bumped.)
 #
 # ## The cost already paid, which is why release-notes.py leads
 #

@@ -58,6 +58,79 @@ fn the_toolchain_pin_is_readable_by_the_sed_two_scripts_use() {
     }
 }
 
+/// The rust-doctor version, which is a different number from the toolchain above and had a worse story
+/// (BUILD-3, #174). `.github/workflows/toolchain-pin.yml` used to run `npx -y "rust-doctor@${DOCTOR}"`
+/// with `${DOCTOR}` sed'd out of `rust-doctor.yml` — and since BUILD-1 (#66) moved that gate off npm, the
+/// only line in the file the sed still matched was the COMMENT explaining the npm removal. It answered
+/// `0.2.0` by reading a sentence about the bug, and was right by accident.
+///
+/// That workflow now runs `scripts/doctor.sh`, so it names no version at all. Two declarations are left
+/// and nothing else holds them together: doctor.sh's `RUST_DOCTOR_VERSION` default, which is what a
+/// maintainer and the advisory scan both get, and the release URL `rust-doctor.yml` curls, which is the
+/// gate. Drift between them means the advisory scan and the gate are different tools reporting under one
+/// name — the shape #174 was filed about, moved rather than removed.
+#[test]
+fn the_two_rust_doctor_declarations_agree_and_the_advisory_scan_carries_neither() {
+    let local = read("scripts/doctor.sh")
+        .lines()
+        .find_map(|l| {
+            l.trim().strip_prefix("RUST_DOCTOR_VERSION=\"${RUST_DOCTOR_VERSION:-")?.split('}').next()
+        })
+        .map(str::to_owned)
+        .expect(
+            "no `RUST_DOCTOR_VERSION=\"${RUST_DOCTOR_VERSION:-<version>}\"` in scripts/doctor.sh. That \
+             default is the version the local gate AND toolchain-pin.yml's advisory scan both run.",
+        );
+
+    // Anchored on `rust-doctor/` rather than on `/releases/download/v`, because rust-doctor.yml curls
+    // actionlint from a URL of exactly that shape a few steps later. Comment lines are dropped before the
+    // search for the same reason they are below: this whole test exists because a version was read out of
+    // a sentence, and reading one out of a sentence to check that is not better for being a different file.
+    let gate = read(".github/workflows/rust-doctor.yml")
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ci = gate
+        .split_once("rust-doctor/releases/download/v")
+        .and_then(|(_, rest)| rest.split('/').next())
+        .expect(
+            "no pinned rust-doctor release URL in .github/workflows/rust-doctor.yml — if the gate's fetch \
+             moved, move this with it (BUILD-1, #66 is why it is a release asset and not npx).",
+        );
+    assert_eq!(
+        local, ci,
+        "scripts/doctor.sh pins rust-doctor {local} and the gate curls {ci}. A local run that says \
+         \"would pass\" would then be a different tool's verdict than the one that gates, and since \
+         BUILD-3 (#174) the monthly advisory scan runs doctor.sh's, so it would disagree with the gate too."
+    );
+
+    // COMMENT LINES ARE EXCLUDED, and that exclusion IS the finding restated. The workflow's own comment
+    // quotes the `npx -y "rust-doctor@${DOCTOR}"` call it removed, because the removal is the thing worth
+    // explaining — so a check that could not tell prose from configuration would fire on the paragraph
+    // describing the defect, which is precisely the mistake #174 is about.
+    let pin_wf = read(".github/workflows/toolchain-pin.yml");
+    let executable =
+        pin_wf.lines().filter(|l| !l.trim_start().starts_with('#')).collect::<Vec<_>>().join("\n");
+    assert!(
+        !executable.contains("npx"),
+        "toolchain-pin.yml invokes npx again. The `rust-doctor` npm package was unpublished on \
+         2026-07-29 and the registry serves an empty version list, so every version is an ETARGET \
+         (BUILD-1 #66, BUILD-3 #174)."
+    );
+    assert!(
+        !executable.contains("rust-doctor@"),
+        "toolchain-pin.yml carries a `rust-doctor@<version>` again. It should carry no rust-doctor \
+         version: `scripts/doctor.sh` owns that number, and a third copy is what #174 declined to add."
+    );
+    assert!(
+        executable.contains("scripts/doctor.sh --sarif"),
+        "toolchain-pin.yml's advisory scan no longer goes through scripts/doctor.sh. That call is what \
+         makes it run the same tool, at the same version, as a maintainer's local gate — and doctor.sh \
+         `exec`s the binary for --sarif, so the redirect gets the tool's own bytes with nothing prepended."
+    );
+}
+
 /// `scripts/doctor.sh` reads the gate's tool list with `head -1` over `tool:` lines, deliberately, and the
 /// long comment there explains why repairing the previous bug naively would have been worse. That only
 /// stays correct while the FIRST `tool:` line in the file is the health job's — the second belongs to the
