@@ -435,12 +435,24 @@ jobs:
       - name: Seed the corpus from the cassettes
         run: ./fuzz/seed-corpus.py
 
+      # `--target` IS REQUIRED AND IS NOT A PREFERENCE. cargo-fuzz defaults the target to the triple it was
+      # ITSELF built for, and taiki-e/install-action installs statically-linked **musl** binaries, because
+      # that is what makes a prebuilt binary portable. So the default came out x86_64-unknown-linux-musl,
+      # and AddressSanitizer cannot work against a static libc:
+      #     error: sanitizer is incompatible with statically linked libc
+      #     error[E0463]: can't find crate for `core`
+      # Every run of this job failed that way from the moment it was added (TEST-45, #153) — it never fuzzed
+      # anything. Like the zizmor step in rust-doctor.yml, it landed during an Actions outage, so the red
+      # arrived hours later and read as one more casualty of the outage rather than a config error. Naming
+      # the host triple explicitly is the whole fix, and it also stops the target moving under the job if
+      # that prebuilt binary is ever built differently.
       - name: Fuzz each target
         working-directory: fuzz
         run: |
           for target in reply_packet value_by_tag read_string; do
             echo "::group::$target"
-            cargo +nightly fuzz run "$target" -- -max_total_time=45 -runs=2000000
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" \
+              -- -max_total_time=45 -runs=2000000
             echo "::endgroup::"
           done
 
