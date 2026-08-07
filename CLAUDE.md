@@ -162,6 +162,17 @@ about. Regenerate with the **same** command as the other two snapshots —
 `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot` — and then **read the diff and put it in
 the release notes**, because that is a caller-visible change.
 
+**The four Python scripts that decide what CI publishes have a fixture matrix** (TEST-48, #163).
+`bash scripts/tests/run.sh` — one committed transcript per case holding the command, the **exit status**,
+and **stdout and stderr separately**, because that split is part of the contract (`shard-plan.py` puts
+names on stdout so a caller can pipe them) and a merged capture would let it swap silently. It gates in CI
+beside rust-doctor, `scripts/doctor.sh --findings` runs the identical command, and there is a `--update`
+that you must **read the diff of** — DOC-7 (#108) is the record of a generated file people regenerated
+without reading. **The cost is already on the board**: `release-notes.py` did not match the compound
+`fix(lint)+docs:` subject, so **13 commits reached published release notes with their type stripped**, and
+the commit-msg hook found it rather than anything testing the script. All fifteen cases were verified by
+**reverting the behaviour each one covers** — seven separate reversions across the four scripts.
+
 **Adding a JDWP command to `jdwp-client` now costs a line in a table, including a read** (SAFE-12, #171).
 `WIRE_COMMANDS` in `connection.rs`'s test module classifies **every** command this crate can send as
 `Read`, `Mutation` or `AllowedStateChange`, and the suite goes red on one it has never heard of. That is

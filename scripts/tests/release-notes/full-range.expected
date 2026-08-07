@@ -1,0 +1,35 @@
+$ notes v0.2.0 --since v0.1.0
+exit: 0
+--- stdout
+This is the narrative someone wrote by hand, and it leads the body verbatim.
+
+`debug.example` is new. `debug.old_name` is now `debug.new_name` — both names, because
+docs/toolkit-contract.md makes a rename the dangerous kind of change.
+
+---
+
+## What's Changed
+
+### ⚠️ Breaking Changes
+* **api**: a bang-marked break (<sha>)
+* **eval**: a break announced only in the body (<sha>)
+
+### 🚀 Features
+* **attach**: a plain feature with a scope and a ref (#10 · <sha>)
+
+### 🐛 Bug Fixes
+* **lint**: the compound form that shipped wrong 13 times (<sha>)
+
+### 📝 Documentation
+* **dump**: a subject with [brackets], a * and (parens) (#11, #12, #13 · <sha>)
+* the singular spelling shares a heading with `docs` (<sha>)
+
+### Other Changes
+* merge: land a series of issues together (<sha>)
+* **dump**: measure: a type that has no heading (<sha>)
+* just a sentence about the change (<sha>)
+
+---
+
+**Full Changelog**: https://github.com/owner/repo/compare/v0.1.0...v0.2.0
+--- stderr

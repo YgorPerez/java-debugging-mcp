@@ -1,0 +1,18 @@
+$ notes --list-types
+exit: 0
+--- stdout
+feat
+fix
+perf
+refactor
+style
+docs
+doc
+test
+tests
+chore
+ci
+build
+revert
+merge
+--- stderr

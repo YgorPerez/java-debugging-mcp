@@ -1,0 +1,15 @@
+# A hand-made timings file for scripts/tests/run.sh. NOT a snapshot of the real suite: seven durations
+# chosen so the greedy split has one obvious answer and the report's numbers can be checked by eye.
+#
+# 70 is a deliberate echo of the real floor — one test longer than every other put together, so no
+# assignment can even the shards out and the report has to say so.
+#
+# `absent_from_the_binary` is here and NOT in tests.list: a recorded duration for a test that no longer
+# exists is one of the two drift directions shard-plan reports, and the one that is easy to leave rotting.
+70.0	a_very_slow_one
+20.0	b_medium
+10.0	c_small
+5.0	d_smaller
+2.5	e_tiny
+1.0	f_tiniest
+9.0	absent_from_the_binary

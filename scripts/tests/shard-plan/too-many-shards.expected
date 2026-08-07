@@ -1,0 +1,5 @@
+$ plan --plan --shards 99
+exit: 1
+--- stdout
+--- stderr
+shard-plan: 99 shards for 7 tests would leave some empty, and an empty shard is a green run of nothing.

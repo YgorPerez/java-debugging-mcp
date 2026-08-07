@@ -1,0 +1,7 @@
+$ sarif scripts/tests/sarif/truncated.in.sarif <work>/truncated.out.sarif
+exit: 1
+--- stdout
+--- stderr
+error: scripts/tests/sarif/truncated.in.sarif is not a SARIF document (Invalid control character at: line 1 column 70 (char 69)).
+       rust-doctor did not complete a scan, so there is nothing to publish — and
+       publishing an empty result set would close alerts on the strength of a crash.

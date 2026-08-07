@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "_comment_": [
+    "Hand-written, in rust-doctor shape. Every result below is a branch of resolve()/reanchor(), and the",
+    "two note-level ones are the withholding branch: 115 of those had accumulated in the security tab",
+    "against a green gate, which is what the script was written for.",
+    "The paths are real facts about THIS tree, deliberately. src/handlers.rs exists only under",
+    "mcp-server, so it resolves; Cargo.toml exists at the root and in both members, so it is ambiguous.",
+    "If the workspace is restructured this fixture goes red, which is correct - knowing where the files",
+    "are is the script whole job."
+  ],
+  "runs": [
+    {
+      "tool": { "driver": { "name": "rust-doctor", "version": "0.2.0" } },
+      "results": [
+        {
+          "ruleId": "excessive-clone",
+          "level": "note",
+          "message": { "text": "Clone of a value that may implement Copy" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "src/handlers.rs", "uriBaseId": "%SRCROOT%" },
+                "region": { "startLine": 10 }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "excessive-clone",
+          "level": "note",
+          "message": { "text": "Clone of a value that may implement Copy" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "src/handlers.rs", "uriBaseId": "%SRCROOT%" },
+                "region": { "startLine": 20 }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "skipped-pass",
+          "level": "note",
+          "message": { "text": "coverage: no report found" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "Cargo.toml", "uriBaseId": "%SRCROOT%" },
+                "region": { "startLine": 1 }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "unwrap-in-production",
+          "level": "warning",
+          "message": { "text": "a crate-relative uri that resolves to exactly one member" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "src/handlers.rs", "uriBaseId": "%SRCROOT%" },
+                "region": { "startLine": 30 }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "multiple_crate_versions",
+          "level": "warning",
+          "message": { "text": "a file rust-doctor created and deleted; re-anchored to the crate manifest" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "mcp-server/clippy.toml", "uriBaseId": "%SRCROOT%" },
+                "region": { "startLine": 1 }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "cargo_common_metadata",
+          "level": "error",
+          "message": { "text": "a uri that exists in the root and in both members" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "Cargo.toml", "uriBaseId": "%SRCROOT%" },
+                "region": { "startLine": 1 }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "panic-in-library",
+          "level": "warning",
+          "message": { "text": "a uri that is nowhere in the tree; re-anchors to the ROOT manifest, see the transcript" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "nowhere/at/all.rs", "uriBaseId": "%SRCROOT%" },
+                "region": { "startLine": 1 }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "hardcoded-secrets",
+          "level": "warning",
+          "message": { "text": "an absolute path from another machine's checkout" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "/somewhere/else/src/main.rs" },
+                "region": { "startLine": 1 }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -104,6 +104,7 @@ fn every_check_doctor_says_gates_in_ci_is_a_step_in_rust_doctor_yml() {
         ("spelling (typos)", "typos"),
         ("workflow lint (zizmor)", "run: zizmor --persona=regular"),
         ("workflow semantics (actionlint)", "run: /tmp/actionlint -shellcheck= -pyflakes="),
+        ("CI script fixtures (scripts/tests/run.sh)", "run: bash scripts/tests/run.sh"),
     ] {
         assert!(
             doctor.contains(label),

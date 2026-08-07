@@ -1,0 +1,19 @@
+{
+  "version": "2.1.0",
+  "_comment_": "Only note-level results, so nothing survives the filter. The empty upload is meaningful: it is what closes alerts code scanning is still holding from before this script existed, so the script must exit 0 and say so rather than treat it as a failure.",
+  "runs": [
+    {
+      "tool": { "driver": { "name": "rust-doctor" } },
+      "results": [
+        {
+          "ruleId": "excessive-clone",
+          "level": "note",
+          "message": { "text": "Clone of a value that may implement Copy" },
+          "locations": [
+            { "physicalLocation": { "artifactLocation": { "uri": "src/handlers.rs", "uriBaseId": "%SRCROOT%" } } }
+          ]
+        }
+      ]
+    }
+  ]
+}

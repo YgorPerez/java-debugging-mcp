@@ -1,0 +1,10 @@
+$ timings --emit-timings scripts/tests/test-timings/panicked.log
+exit: 0
+--- stdout
+# Per-test durations, seconds<TAB>name. Generated — do not hand-edit:
+#     scripts/test-timings.py --emit-timings <log> > mcp-server/tests/timings.tsv
+# Read by scripts/shard-plan.py. Drift is reported, not fatal: a test with no line here is charged
+# the median and named on stderr. Refresh it when the ranking changes materially, not every run.
+20.00	b_medium
+10.00	c_small
+--- stderr

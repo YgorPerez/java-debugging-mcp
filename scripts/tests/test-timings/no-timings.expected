@@ -1,0 +1,8 @@
+$ timings scripts/tests/test-timings/no-timings.log
+exit: 0
+--- stdout
+
+Slowest tests: no per-test timings in this log
+  note: 2 result line(s) carried no duration, so the ranking is incomplete: b_medium, c_small.
+  note: No timings and no refusal either, so the log is probably from a run that did not pass --report-time at all.
+--- stderr

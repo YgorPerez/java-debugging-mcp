@@ -1,0 +1,10 @@
+a_very_slow_one: test
+b_medium: test
+c_small: test
+d_smaller: test
+e_tiny: test
+f_tiniest: test
+g_has_no_recorded_duration: test
+a_benchmark_is_not_a_test: benchmark
+
+7 tests, 1 benchmark

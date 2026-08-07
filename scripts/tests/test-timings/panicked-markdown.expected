@@ -1,0 +1,22 @@
+$ timings --markdown --label Fixture scripts/tests/test-timings/panicked.log
+exit: 0
+--- stdout
+### Slowest tests — Fixture
+
+3 tests, 100.0s of test time in 33.1s wall clock (3.0x concurrent) — slowest a_very_slow_one at 70.00s
+
+<details><summary>Ranked durations</summary>
+
+| rank | duration | test |
+| --- | --- | --- |
+| 1 | 70.00s | `a_very_slow_one` **FAILED** |
+| 2 | 20.00s | `b_medium` |
+| 3 | 10.00s | `c_small` |
+
+</details>
+
+> **note** 1 result line(s) carried no duration, so the ranking is incomplete: g_no_duration_recorded.
+
+> **note** 1 test(s) failed; a failed test's duration is when it gave up, not what the work costs.
+
+--- stderr

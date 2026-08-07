@@ -1,0 +1,11 @@
+$ plan --shard 1/2
+exit: 0
+--- stdout
+a_very_slow_one
+--- stderr
+shard-plan: 7 tests over 2 shards — 116s of test time, heaviest shard 70s, lightest 46s, single-test floor 70s
+shard-plan:   shard 1/2: 1 tests, 70s
+shard-plan:   shard 2/2: 6 tests, 46s
+shard-plan: the heaviest shard is at the single-test floor, so more shards cannot help — the slowest test is the wall clock now.
+shard-plan: 1 test(s) have no recorded duration and were charged the median 7.5s: g_has_no_recorded_duration. Refresh the timings file if any of them is slow.
+shard-plan: 1 recorded duration(s) are for tests that no longer exist (absent_from_the_binary) — harmless, but the file is drifting.

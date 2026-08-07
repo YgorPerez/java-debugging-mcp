@@ -1,0 +1,12 @@
+$ notes v0.2.0 --since v0.2.0
+exit: 0
+--- stdout
+This is the narrative someone wrote by hand, and it leads the body verbatim.
+
+`debug.example` is new. `debug.old_name` is now `debug.new_name` — both names, because
+docs/toolkit-contract.md makes a rename the dangerous kind of change.
+
+---
+
+**Full Changelog**: https://github.com/owner/repo/compare/v0.2.0...v0.2.0
+--- stderr

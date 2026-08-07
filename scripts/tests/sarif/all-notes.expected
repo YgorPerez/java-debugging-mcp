@@ -1,0 +1,28 @@
+$ sarif scripts/tests/sarif/all-notes.in.sarif <work>/all-notes.out.sarif
+exit: 0
+--- stdout
+## rust-doctor → code scanning: published 0 of 1 result(s)
+
+Withheld (below the `--fail-on warning` gate, so they never failed anything; the full SARIF
+is in the `rust-doctor-sarif` artifact and `scripts/doctor.sh --findings` prints locally):
+
+- `excessive-clone` × 1 (note)
+
+Nothing to publish. The upload still happens: an empty result set is what tells code scanning
+that alerts it is holding from earlier runs are gone.
+--- stderr
+--- artifact: all-notes.out.sarif
+{
+  "version": "2.1.0",
+  "_comment_": "Only note-level results, so nothing survives the filter. The empty upload is meaningful: it is what closes alerts code scanning is still holding from before this script existed, so the script must exit 0 and say so rather than treat it as a failure.",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "rust-doctor"
+        }
+      },
+      "results": []
+    }
+  ]
+}

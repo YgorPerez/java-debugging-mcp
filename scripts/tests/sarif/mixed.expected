@@ -1,0 +1,142 @@
+$ sarif scripts/tests/sarif/mixed.in.sarif <work>/mixed.out.sarif
+exit: 0
+--- stdout
+## rust-doctor → code scanning: published 5 of 8 result(s)
+
+Withheld (below the `--fail-on warning` gate, so they never failed anything; the full SARIF
+is in the `rust-doctor-sarif` artifact and `scripts/doctor.sh --findings` prints locally):
+
+- `excessive-clone` × 2 (note)
+- `skipped-pass` × 1 (note)
+
+**Paths that were not in this tree.** A re-anchored one is published against the crate
+manifest, so the alert links somewhere real but not where the tool said; anything else is
+published as-is and will not link to code at all:
+
+- cargo_common_metadata: ambiguous across crates (., jdwp-client, mcp-server): Cargo.toml
+- hardcoded-secrets: absolute path outside the workspace: /somewhere/else/src/main.rs
+- multiple_crate_versions: re-anchored to mcp-server/Cargo.toml
+- panic-in-library: re-anchored to Cargo.toml
+
+--- stderr
+--- artifact: mixed.out.sarif
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "_comment_": [
+    "Hand-written, in rust-doctor shape. Every result below is a branch of resolve()/reanchor(), and the",
+    "two note-level ones are the withholding branch: 115 of those had accumulated in the security tab",
+    "against a green gate, which is what the script was written for.",
+    "The paths are real facts about THIS tree, deliberately. src/handlers.rs exists only under",
+    "mcp-server, so it resolves; Cargo.toml exists at the root and in both members, so it is ambiguous.",
+    "If the workspace is restructured this fixture goes red, which is correct - knowing where the files",
+    "are is the script whole job."
+  ],
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "rust-doctor",
+          "version": "0.2.0"
+        }
+      },
+      "results": [
+        {
+          "ruleId": "unwrap-in-production",
+          "level": "warning",
+          "message": {
+            "text": "a crate-relative uri that resolves to exactly one member"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "mcp-server/src/handlers.rs"
+                },
+                "region": {
+                  "startLine": 30
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "multiple_crate_versions",
+          "level": "warning",
+          "message": {
+            "text": "a file rust-doctor created and deleted; re-anchored to the crate manifest"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "mcp-server/Cargo.toml"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "cargo_common_metadata",
+          "level": "error",
+          "message": {
+            "text": "a uri that exists in the root and in both members"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "Cargo.toml"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "panic-in-library",
+          "level": "warning",
+          "message": {
+            "text": "a uri that is nowhere in the tree; re-anchors to the ROOT manifest, see the transcript"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "Cargo.toml"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "hardcoded-secrets",
+          "level": "warning",
+          "message": {
+            "text": "an absolute path from another machine's checkout"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/somewhere/else/src/main.rs"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

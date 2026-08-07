@@ -505,6 +505,24 @@ JS
     printf '%s\n' "          | tar xz -C ~/.local/bin actionlint"
   fi
 
+  # The CI scripts' fixture matrix gates in CI beside this scan (TEST-48, #163), and runs here for the
+  # reason every block above runs here. Four Python scripts decide what CI publishes and none of them had
+  # a test; `release-notes.py` shipping 13 commits with their type stripped is what that cost.
+  #
+  # Unlike cargo-shear or actionlint there is no third-party binary to be missing — python3 and git are
+  # already hard requirements of this repo — but `run.sh` still reports a missing python3 itself and exits
+  # non-zero, and that is echoed here rather than swallowed, because a matrix that did not run reports
+  # nothing, which reads exactly like a matrix that found nothing.
+  fixtures_status=0
+  fixtures_out="$(bash scripts/tests/run.sh 2>&1)" || fixtures_status=$?
+  if [ "$fixtures_status" -ne 0 ]; then
+    printf '\n%s\n' "CI script fixtures (scripts/tests/run.sh): WOULD FAIL — this gates in CI."
+    printf '%s\n' "$fixtures_out" | sed 's/^/      /'
+    verdict=3
+  else
+    printf '\n%s\n' "CI script fixtures (scripts/tests/run.sh): would pass. [$(printf '%s' "$fixtures_out" | tail -1)]"
+  fi
+
   exit "$verdict"
 fi
 

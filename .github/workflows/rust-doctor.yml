@@ -340,6 +340,22 @@ jobs:
         if: always()
         run: /tmp/actionlint -shellcheck= -pyflakes=
 
+      # TEST-48 (#163). Four Python scripts decide what CI publishes — the release body, what reaches the
+      # security tab, which tests run in which leg, and the timings file the sharding reads — and none of
+      # them had a test, while `.githooks/test.sh` is a 22-case matrix and `pre-bash-guard.test.sh` a
+      # 20-case one. The cost is on record: `release-notes.py` did not match the compound `fix(lint)+docs:`
+      # subject, so 13 commits landed in PUBLISHED release notes with their type stripped, and it was the
+      # commit-msg hook that found it rather than anything testing the script.
+      #
+      # Here rather than in tests.yml because this job is the one `scripts/doctor.sh` mirrors, and the
+      # script runs the identical command so a clean local run stays a green gate. It needs no Rust and no
+      # JDK — python3, git and the fixtures, all of which this job already has.
+      #
+      # `if: always()` for the same reason as the steps above.
+      - name: Fixture matrix for the CI scripts
+        if: always()
+        run: bash scripts/tests/run.sh
+
       # A failing gate prints nothing useful: --sarif sends every finding to the file, so the step log
       # ends at "exit code 3" and the findings are only readable via the code-scanning API. Print them,
       # so the reason a build failed is in the build that failed.

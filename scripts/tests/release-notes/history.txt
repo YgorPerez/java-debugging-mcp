@@ -1,0 +1,69 @@
+# The commit history `run.sh` replays into a throwaway git repo, oldest first.
+#
+# Records are separated by a line that is exactly `%%`. Within a record the first line is the SUBJECT, a
+# BLANK LINE ends it, and the rest is the BODY. A record whose first line is `@tag <name>` tags the newest
+# commit instead of making one. Lines starting with `#` are comments about the fixture and never reach a
+# commit.
+#
+# THE BLANK LINE IS LOAD-BEARING and the first draft of this file did not have it. git's `%s` is everything
+# up to the first blank line, not the first newline — so a body written flush against its subject becomes
+# part of the subject, and the two records that have bodies both came out wrong in a way that looked like
+# a categoriser bug: the `BREAKING:` footer landed under Performance because `%b` was empty, and the
+# release commit stopped matching RELEASE_COMMIT and was listed as a chore beside its own narrative.
+#
+# EVERY RECORD IS A BRANCH OF THE CATEGORISER, not a plausible history. Each one is annotated with which.
+# The commits are empty (`--allow-empty`): this script reads subjects, bodies and shas and never a diff.
+
+# The baseline. A tag needs a commit to point at, and `v0.1.0..v0.2.0` needs both ends to exist — the
+# first draft of this file opened with the tag directive and no commit, `git tag` failed on an empty repo,
+# and the range silently resolved to nothing. The transcript said so by holding a narrative and no
+# changelog at all, which is exactly the shape of the bug this whole file is about.
+chore(release): 0.1.0
+%%
+@tag v0.1.0
+%%
+# The ordinary case, with the trailing-refs form GitHub appends to a squash merge.
+feat(attach): a plain feature with a scope and a ref (#10)
+%%
+# THE CASE THIS FILE EXISTS FOR (REL-4, #147). The compound form appears 13 times in this repo's history
+# and every one of them failed the regex outright — landing in Other Changes with `fix(lint)+docs` stripped
+# off the front, in published notes. The first type wins the category, so this belongs under Bug Fixes.
+fix(lint)+docs: the compound form that shipped wrong 13 times
+%%
+# `merge:` is deliberately uncategorised — it spans several sections by definition, so Other Changes with
+# the type VISIBLE is the honest place. Distinguishing this from the bug above is the whole point: both
+# land in Other Changes, and only one of them is supposed to.
+merge: land a series of issues together
+%%
+# A conventional-looking subject whose type nobody here uses. Other Changes, type kept in the text.
+measure(dump): a type that has no heading
+%%
+# Not conventional at all. Other Changes, verbatim, no type invented for it.
+just a sentence about the change
+%%
+# The `!` marker. Must reach Breaking Changes, not Features.
+feat(api)!: a bang-marked break
+%%
+# The FOOTER spelling, which is the expensive miss: a genuine break written this way skipped the section
+# entirely, and that section exists because semver-check.sh gates a public API.
+perf(eval): a break announced only in the body
+
+BREAKING: the reply shape changed
+%%
+# Punctuation that could plausibly upset a regex: brackets, a star, parentheses inside the description,
+# and the multi-ref trailing form. The `·` separator rule matters here — commas belong WITHIN the refs.
+docs(dump): a subject with [brackets], a * and (parens) (#11, #12, #13)
+%%
+# Scope-less, and a type spelled with the alternate word the categoriser accepts.
+doc: the singular spelling shares a heading with `docs`
+%%
+# The release commit. It is SKIPPED from the changelog — its body is the narrative above it, so listing it
+# would say the same thing twice — and the trailing ref must not stop that (also REL-4).
+chore(release): 0.2.0 (#99)
+
+This is the narrative someone wrote by hand, and it leads the body verbatim.
+
+`debug.example` is new. `debug.old_name` is now `debug.new_name` — both names, because
+docs/toolkit-contract.md makes a rename the dangerous kind of change.
+%%
+@tag v0.2.0
