@@ -1,0 +1,13 @@
+$ surface_summary
+exit: 0
+--- stdout
+mcp-tool-surface v1 for v0.0.0-fixture
+$schema: https://raw.githubusercontent.com/YgorPerez/java-debugging-mcp/main/docs/tool-surface.schema.json
+40 tools, 228 arguments
+tool_count agrees with len(tools): True
+argument_count agrees with the tools: True
+every tool has a non-empty description: True
+every argument has a schema object: True
+tools are sorted by name: True
+first and last: debug.arm_stop_points … debug.toggle_stop_point
+--- stderr

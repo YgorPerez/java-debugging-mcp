@@ -1,0 +1,5 @@
+$ surface_against_broken heading-shape-changed
+exit: 1
+--- stdout
+--- stderr
+tool-surface: refusing to publish — parsed no tools out of tool-descriptions.txt — the `## <tool>` shape changed

@@ -148,6 +148,52 @@ fn doctor_reports_the_actionlint_version_the_gate_actually_pins() {
     );
 }
 
+/// The published tool surface names its format in two files that have to agree (REL-8, #165):
+/// `scripts/tool-surface.py` stamps `$schema` and `kind` into every document it emits, and
+/// `docs/tool-surface.schema.json` declares the same two as `$id` and a `const`. A consumer pins the URL,
+/// so a drift between them publishes a document that says it conforms to a schema it does not match.
+///
+/// The `surface_version` is deliberately NOT asserted equal to anything: it is a number that moves on its
+/// own rule, written at the field in the schema, and pinning it here would be a third copy that has to be
+/// bumped in lockstep with the two that matter.
+#[test]
+fn the_tool_surface_document_and_its_schema_name_the_same_format() {
+    let script = read("scripts/tool-surface.py");
+    let schema = read("docs/tool-surface.schema.json");
+
+    let url = script
+        .split("SCHEMA_URL = (\n    \"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("no SCHEMA_URL literal in scripts/tool-surface.py — if it moved, move this with it");
+    assert!(
+        url.contains("tool-surface.schema.json"),
+        "SCHEMA_URL reads {url:?}, which does not look like the schema's URL"
+    );
+    assert!(
+        schema.contains(&format!("\"$id\": \"{url}\"")),
+        "the script stamps `$schema: {url}` into every published document, but \
+         docs/tool-surface.schema.json does not declare that as its `$id`. A consumer pins that URL."
+    );
+    assert!(
+        schema.contains(&format!("\"const\": \"{url}\"")),
+        "the schema does not pin `$schema` to {url} as a const, so a document naming a different one \
+         would still validate."
+    );
+
+    let kind = script
+        .split("KIND = \"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("no KIND literal in scripts/tool-surface.py");
+    assert!(
+        schema.contains(&format!("\"const\": \"{kind}\"")),
+        "the script stamps `kind: {kind}` and the schema does not pin that value. The root discriminator \
+         exists so a reader branches on a tag instead of sniffing for fields; one that is not pinned is \
+         not a discriminator."
+    );
+}
+
 /// `rust-version` is the MSRV the `msrv` job builds on, and that job reads it out of the manifest with a
 /// sed rather than repeating it (BUILD-2, #142). An empty read there would install the empty string.
 #[test]

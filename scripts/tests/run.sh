@@ -222,5 +222,55 @@ check "test-timings: markdown, which is what the job summaries publish" \
 check "test-timings: no durations in the log is a report, not a failure" \
     "$HERE/test-timings/no-timings.expected" -- timings "$HERE/test-timings/no-timings.log"
 
+# ── tool-surface.py ─────────────────────────────────────────────────────────────
+#
+# The fifth script, added by REL-8 (#165) after this matrix existed — which is the point of having a
+# matrix. Its whole risk is a silent half-parse: it builds JSON out of two text files, and a parser that
+# stops matching returns FEWER TOOLS, which is a valid-looking document that understates the surface. So
+# the cases here are its refusals rather than its output.
+#
+# The happy path is NOT pinned as a transcript. It would be a 280KB expected file regenerated on every
+# description edit, which is the DOC-7 (#108) failure the fragment approach exists to avoid; the invariants
+# that matter are asserted by the script itself and checked below through the refusals.
+surface() { python3 scripts/tool-surface.py "$@"; }
+# Run against the REAL tree, so this doubles as the check that the script still parses today's snapshots.
+# `summarise.py` is what keeps it a fragment: see its header. The two counts in the transcript move when a
+# tool or an argument is added, which is a caller-visible change and belongs in a diff.
+surface_summary() {
+    python3 scripts/tool-surface.py --tag v0.0.0-fixture |
+        python3 "$HERE/tool-surface/summarise.py"
+}
+check "tool-surface: the document's skeleton, without pinning 280KB of prose" \
+    "$HERE/tool-surface/summary.expected" -- surface_summary
+# The refusals, driven off copies with one fact broken in each. `run.sh` writes them into the temp dir and
+# points the script at a whole fake tree, so the real snapshots are never touched.
+surface_against_broken() {
+    local how="$1"
+    local tree="$WORK/tree-$how"
+    mkdir -p "$tree/mcp-server/tests" "$tree/docs" "$tree/scripts"
+    cp mcp-server/tests/tool-descriptions.txt mcp-server/tests/argument-schemas.txt "$tree/mcp-server/tests/"
+    cp docs/tools.md "$tree/docs/"
+    cp scripts/tool-surface.py "$tree/scripts/"
+    case "$how" in
+    tool-sets-disagree)
+        python3 - "$tree" <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1], "mcp-server/tests/argument-schemas.txt")
+s = p.read_text()
+i = s.index("## debug.attach")
+p.write_text(s[:i] + s[s.index("## ", i + 3):])
+PY
+        ;;
+    totals-disagree) sed -i 's/^# 40 tools, 228 arguments\.$/# 39 tools, 227 arguments./' "$tree/mcp-server/tests/argument-schemas.txt" ;;
+    heading-shape-changed) sed -i 's/^## debug\./### debug./' "$tree/mcp-server/tests/tool-descriptions.txt" ;;
+    docs-table-drifted) sed -i '/^| `debug.attach` |/d' "$tree/docs/tools.md" ;;
+    esac
+    ( cd "$tree" && python3 scripts/tool-surface.py --tag v0.0.0-fixture )
+}
+for how in tool-sets-disagree totals-disagree heading-shape-changed docs-table-drifted; do
+    check "tool-surface: refuses to publish when $how" \
+        "$HERE/tool-surface/refuses-$how.expected" -- surface_against_broken "$how"
+done
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

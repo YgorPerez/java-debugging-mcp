@@ -1,0 +1,5 @@
+$ surface_against_broken docs-table-drifted
+exit: 1
+--- stdout
+--- stderr
+tool-surface: refusing to publish — docs/tools.md's table and the snapshots disagree. Only in the table: []; only in the snapshots: ['debug.attach'].

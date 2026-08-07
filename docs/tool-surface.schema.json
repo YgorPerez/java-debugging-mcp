@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/YgorPerez/java-debugging-mcp/main/docs/tool-surface.schema.json",
+  "title": "jdwp-mcp tool surface",
+  "description": "The `debug.*` tool surface of one release, published as `tool-surface-<tag>.json` beside the platform binaries (REL-8, #165). It exists so that `what changed for callers between the tag I pin and the one I am moving to` can be answered with two curls and a diff, instead of a clone at two tags. Built by `scripts/tool-surface.py` from the committed snapshots that `cargo test` gates, never regenerated from the binary — an asset re-derived at release time would be a second source of truth beside the files the snapshot tests guard.",
+  "type": "object",
+  "required": ["$schema", "kind", "surface_version", "release", "tool_count", "argument_count", "tools"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "description": "This document's stable identifier. Pin it: it is the format, not the release.",
+      "type": "string",
+      "const": "https://raw.githubusercontent.com/YgorPerez/java-debugging-mcp/main/docs/tool-surface.schema.json"
+    },
+    "kind": {
+      "description": "A discriminator at the document ROOT, so a reader branches on a tag rather than probing for the presence of a field. It exists for the asset this repo does not publish yet: if a second one is ever added, a consumer that already reads this must be able to tell them apart without sniffing.",
+      "type": "string",
+      "const": "mcp-tool-surface"
+    },
+    "surface_version": {
+      "description": "The version of THIS FORMAT, deliberately independent of the crate version. The crate moves for reasons that have nothing to do with the tool surface, so a consumer asking `did the contract change` cannot read the answer off it.\n\nBUMP IT when an existing field here is renamed, removed or changes type, or when a `required` field is added.\n\nDO NOT BUMP IT for an additive OPTIONAL field: an existing consumer sees a byte-identical wire shape on the path it already reads, and a version that moves for changes nobody can observe teaches people to ignore it. Note this is a rule about the SHAPE of this document, not about the tools it describes — a renamed tool changes the surface and not the format, which is what the release notes and `docs/toolkit-contract.md` are for.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "release": {
+      "description": "The tag this surface was published for, e.g. `v0.20.0`.",
+      "type": "string"
+    },
+    "tool_count": {
+      "description": "How many tools are in `tools`. Stated rather than left to be counted, because a consumer diffing two releases wants the headline before the 280KB of prose, and because a producer that silently emitted fewer would otherwise look valid.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "argument_count": {
+      "description": "How many arguments across all tools, for the same reason.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "tools": {
+      "description": "Every advertised tool, sorted by name.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "description", "arguments"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "pattern": "^debug\\.[a-z0-9_]+$" },
+          "description": {
+            "description": "THE WORD-WRAPPED FORM, at 110 columns, exactly as `mcp-server/tests/tool-descriptions.txt` holds it — not the raw string the server sends over `tools/list`. Said here rather than left to be assumed. It is the right form for this file's job: the asset exists to be diffed, and wrapping is what makes a corrupted clause a two-line diff instead of a one-character one (DOC-7, #108). The raw string is one `tools/list` call away for anyone who needs it.",
+            "type": "string",
+            "minLength": 1
+          },
+          "arguments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "required", "schema", "description"],
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "required": { "type": "boolean" },
+                "schema": {
+                  "description": "The generated JSON Schema for this argument, minus its description, exactly as advertised in `inputSchema`. A changed type, default, format, minimum or anyOf arm is visible here.",
+                  "type": "object"
+                },
+                "description": {
+                  "description": "Word-wrapped, for the same reason as the tool description above.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

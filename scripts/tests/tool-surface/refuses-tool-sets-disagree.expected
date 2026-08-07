@@ -1,0 +1,5 @@
+$ surface_against_broken tool-sets-disagree
+exit: 1
+--- stdout
+--- stderr
+tool-surface: refusing to publish — the two snapshots disagree about the tool set. Only in tool-descriptions.txt: ['debug.attach']; only in argument-schemas.txt: []. One of them was regenerated and the other was not, and publishing either would state a surface that is not this one.

@@ -325,9 +325,10 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      # Checked out for ONE reason — `scripts/release-notes.py` builds the release body out of git history
-      # — and it goes FIRST because `actions/checkout` clears its target directory. Put it after the
-      # download and it deletes `dist/`, taking every binary this run built with it.
+      # Checked out for two reasons — `scripts/release-notes.py` builds the release body out of git
+      # history, and `scripts/tool-surface.py` reads the committed snapshots (REL-8, #165) — and it goes
+      # FIRST because `actions/checkout` clears its target directory. Put it after the download and it
+      # deletes `dist/`, taking every binary this run built with it.
       #
       # fetch-depth: 0 is not caution. The notes need the previous tag (`git describe --tags` on the tagged
       # commit's parent) and every commit between it and here; the default depth-1 fetch has neither, and
@@ -380,6 +381,39 @@ jobs:
           sha256sum jdwp-mcp-* > SHA256SUMS
           cat SHA256SUMS
 
+      # REL-8 (#165). The tool surface is generated and committed and gated by snapshot tests, and it
+      # existed ONLY IN THE TREE — so "what changed for callers between the tag I pin and the one I am
+      # moving to" needed a clone at two tags and a diff, and the release notes' prose was the only
+      # published form of the answer. That is the dependency docs/toolkit-contract.md is uneasy about.
+      #
+      # WRITTEN OUTSIDE dist/, ON PURPOSE. REL-2 (#41) makes that directory "platform binaries only" after
+      # rust-doctor.sarif shipped as a sixth downloadable asset, and the guard above is worth more than the
+      # convenience of one directory: an allowlist would have to be kept in step with what the upload
+      # names, and a loosened pattern is what let the SARIF through in the first place. `surface/` costs
+      # nothing and leaves that guard exactly as strict as it was.
+      #
+      # NOT LISTED IN SHA256SUMS, and this is the choice #165 asks to be made explicitly. That file is the
+      # BINARIES' manifest: `ensure-jdwp.sh` matches the host's asset name against its contents, so a line
+      # for a non-binary changes what a consumer that already reads it is reading. Integrity comes from the
+      # attestation below instead, which covers this file as well and needs nothing added to SHA256SUMS.
+      # The consequence, stated so it is not discovered: the existing consumer cannot see this asset at
+      # all, which is the safe direction.
+      #
+      # BUILT FROM THE COMMITTED SNAPSHOTS rather than regenerated from the binary — see the script's
+      # header. What makes that trustworthy is that `gate-tests` above ran the whole suite on this commit,
+      # and `tool_descriptions_match_the_committed_snapshot` fails there if the snapshots are stale.
+      - name: Assemble the tool surface
+        shell: bash
+        run: |
+          mkdir -p surface
+          python3 scripts/tool-surface.py --tag "$GITHUB_REF_NAME" > "surface/tool-surface-$GITHUB_REF_NAME.json"
+          # A narrow guarantee, stated narrowly: the asset is what this tree's snapshots produce, checked
+          # after it was written rather than assumed. It catches an edit, a truncation or a swap between
+          # building and uploading; it does not re-check the snapshots against the binary, which is
+          # `cargo test`'s job and already ran.
+          python3 scripts/tool-surface.py --tag "$GITHUB_REF_NAME" --check "surface/tool-surface-$GITHUB_REF_NAME.json"
+          ls -l surface
+
       # REL-7 (#164). SHA256SUMS PROVES THE DOWNLOAD, NOT THE BUILD. The manifest and the binaries are
       # produced by the same job and published together, so anything able to replace one can replace the
       # other, and a consumer checking the hash learns only that the bytes match the list shipped beside
@@ -406,12 +440,18 @@ jobs:
       # `jdwp-mcp-*` glob the checksum and upload steps use also keeps the three from disagreeing about what
       # this release is.
       #
+      # THE TOOL SURFACE IS A SUBJECT, and it is the one asset for which this is the ONLY integrity story:
+      # it is deliberately absent from SHA256SUMS (REL-8, #165 — see the step above), so without a line
+      # here it would be the single published file nothing vouches for.
+      #
       # The consumer half — teaching `ensure-jdwp.sh` to run `gh attestation verify` — is the toolkit's, and
       # belongs in the release notes rather than here.
-      - name: Attest the provenance of every published binary
+      - name: Attest the provenance of everything this release publishes
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/jdwp-mcp-*
+          subject-path: |
+            dist/jdwp-mcp-*
+            surface/tool-surface-*.json
 
       # The release body, built here rather than by `--generate-notes`, which this step used to pass.
       #
@@ -438,9 +478,11 @@ jobs:
             cat release-notes.md
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # The upload globs `jdwp-mcp-*` plus SHA256SUMS by name — the same discipline the checksum step
-      # above uses — rather than `dist/*`. The two cannot disagree that way: what gets listed is what gets
-      # published. `dist/*` is how a file nobody checksummed ended up on the downloads page (#41).
+      # The upload globs `jdwp-mcp-*` plus SHA256SUMS and the tool surface BY NAME — the same discipline
+      # the checksum step above uses — rather than `dist/*` or `surface/*`. The steps cannot disagree that
+      # way: what gets listed is what gets published. `dist/*` is how a file nobody checksummed ended up on
+      # the downloads page (#41), and the surface file is named with the tag in it for the same reason
+      # every binary is: two of them in one directory would otherwise collide.
       #
       # --verify-tag matters more than it looks: without it `gh release create` happily CREATES a tag
       # that does not exist, so a typo would publish a release pointing at the default branch instead of
@@ -459,7 +501,8 @@ jobs:
           case "$GITHUB_REF_NAME" in
             *-*) flags+=(--prerelease) ;;
           esac
-          gh release create "$GITHUB_REF_NAME" "${flags[@]}" dist/jdwp-mcp-* dist/SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}" \
+            dist/jdwp-mcp-* dist/SHA256SUMS "surface/tool-surface-$GITHUB_REF_NAME.json"
 
   # Publishes both crates to crates.io, so `cargo install jdwp-mcp` works without a GitHub release asset
   # (REL-5). This ADDS a channel; it does not replace the binaries above, which remain the better path for

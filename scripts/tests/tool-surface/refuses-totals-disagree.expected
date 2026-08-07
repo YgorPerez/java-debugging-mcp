@@ -1,0 +1,5 @@
+$ surface_against_broken totals-disagree
+exit: 1
+--- stdout
+--- stderr
+tool-surface: refusing to publish — argument-schemas.txt says 39 tools and 227 arguments; this parsed 40 and 228. A parser that silently sees fewer tools produces a valid-looking document that understates the surface.

@@ -466,6 +466,19 @@ since a version can be yanked but keeps its number forever. It runs last for tha
 stored token, and needs nothing from you: the manual bootstrap happened at v0.20.0. ADR-0043 has the
 sequence if it ever has to be done again, and `/release` step 5 has what to do when that job goes red.
 
+**A tag also publishes `tool-surface-<tag>.json`, so "what changed for callers" is two curls** (REL-8,
+#165). Every `debug.*` tool, its description and every argument's schema in one document. It is
+**built from the committed snapshots, never regenerated from the binary** — an asset re-derived at release
+time would be a second source of truth beside the files `cargo test` gates — and `scripts/tool-surface.py`
+**refuses to publish** rather than emit a half-parse: the two snapshots must name the same tools, the
+`# N tools, M arguments` line in the argument file must match what was parsed, and `docs/tools.md`'s table
+must agree. Three decisions are written at the step: it lives **outside `dist/`** so REL-2's guard stays as
+strict as it was, it is **deliberately absent from `SHA256SUMS`** because that file is the *binaries'*
+manifest the downstream installer matches host names against, and it is therefore **an attestation
+subject** — the one asset for which that is the only integrity story. The format is versioned by
+`surface_version`, independent of the crate; the bump rule and the pinnable `$id` live in
+`docs/tool-surface.schema.json`, and `docs_claims.rs` asserts the script and the schema name the same one.
+
 **A tag publishes five platform binaries now, not four, and each one carries signed build provenance**
 (REL-9/#173, REL-7/#164). Both are caller-visible and both need saying in the release notes. The new
 asset is **`jdwp-mcp-<tag>-linux-aarch64`**, built natively on `ubuntu-24.04-arm` and statically linked

@@ -35,6 +35,30 @@ The asset **naming** is therefore part of the interface, not an implementation d
 platform binary, which is what REL-2 (#41) taught it after a SARIF file shipped as a release asset. That
 guard protects the toolkit too.
 
+### Available and deliberately not consumed
+
+A release also publishes **`tool-surface-<tag>.json`** (REL-8, #165): every `debug.*` tool, its description
+and every argument's schema, in one document, so that *what changed for callers between two tags* is two
+`curl`s and a `diff` instead of a clone at two tags. It is the machine-readable form of the answer this whole
+file is about — six of the seven rows below are silent, and the release notes were the only published place
+the answer existed.
+
+**The toolkit does not read it today and nothing here assumes it will.** Two consequences worth stating
+rather than leaving to be discovered:
+
+- **It is not listed in `SHA256SUMS`**, deliberately. That file is the *binaries'* manifest and
+  `ensure-jdwp.sh` matches the host's asset name against its contents, so a line for a non-binary would
+  change what a consumer already reading it is reading. The surface asset is therefore **invisible** to the
+  existing installer, which is the safe direction. Its integrity comes from the build attestation instead
+  (REL-7, #164): `gh attestation verify tool-surface-<tag>.json --repo YgorPerez/java-debugging-mcp`.
+- **Its format is versioned separately from the crate**, by `surface_version`, because the crate version
+  moves for reasons that have nothing to do with the surface. The bump rule lives at the field in
+  `docs/tool-surface.schema.json`, whose `$id` is the URL to pin. `kind` at the document root is the
+  discriminator, so a future second asset is distinguishable without sniffing for fields.
+
+An added tool is still the "Add a **tool**" row below — nobody finds a tool the docs do not name — but the
+diff that proves it exists is now published rather than reconstructable.
+
 ## What a change here costs downstream
 
 Ordered by how *quietly* it breaks, because that is what decides whether it needs a note in the release:
