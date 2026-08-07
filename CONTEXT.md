@@ -1366,3 +1366,37 @@ transcript of a real session, and its authority comes from that)
 **Miss**:
 A request a cassette has no recorded answer for. Never answered — the connection is dropped and the command
 is named — because a plausible-looking error reply packet would let a replay test pass while proving nothing.
+
+**Vacuous** (of a verdict — a pass, a failure, or an assertion):
+A verdict reached without the evidence it claims. The tool exited 0, the assertion held, the check reported
+"not found" — and none of it was information, because the thing being judged was never reached.
+
+**It earns a name because it is this project's most repeated defect and the tree already uses the word
+without ever defining it.** `scripts/semver-check.sh` has a section headed "The vacuous pass",
+`.github/workflows/rust-doctor.yml` uses it at the semver decision, and seven assertions in
+`mcp_integration.rs` exist to stop a test passing vacuously. What was missing is one word, so the same idea
+is said six ways: "0 checks ran, so this verified nothing"; "This did not check anything"; "A pass that did
+not run reports nothing, which reads exactly like one that found nothing"; and, in this glossary under
+**Miss**, "would let a replay test pass while proving nothing".
+
+**Both directions count, and the second is the one that gets missed.** A green run that verified nothing is
+the familiar shape. A *failure* asserted without evidence is the same defect wearing red: a crates.io check
+that rendered a refused request as "NOT PUBLISHED" reported both crates missing for twenty minutes after
+they were published, and did it seconds after an irreversible step, while the question was whether that step
+had worked (ADR-0043). Nothing about it was flaky and nothing was a wrong measurement — it never measured.
+
+**The rule is that a vacuous verdict announces itself rather than being reported as a result.** Every gate
+here that is trusted does this: `--findings` lists the passes that did not run, `sarif-for-code-scanning.py`
+prints what it withheld, `semver-check.sh` says "0 checks ran" instead of exiting 0 in silence. Its
+mechanical form, which is what the crates.io check got wrong: **a branch that reports absence must be
+reachable only by absence** — fold "no" and "could not ask" into one answer and the false verdict arrives at
+the least calm moment available.
+
+Its probe-side instance is **witness**, and the relationship is worth keeping straight: a probe that stops
+printing makes every later assertion vacuous, which is why that term insists a probe announce its own death.
+**Separated** is the next question rather than this one — this asks whether a verdict established anything,
+that asks, of one that did, which of its candidate causes fired.
+_Avoid_: "passed", "clean", "green" as a verdict on one — those are the words that make it dangerous rather
+than describe it; "false positive" / "false negative" (wrong axis: a vacuous verdict carries no information
+rather than wrong information); "flaky" (a vacuous check is perfectly deterministic — it will be vacuous
+every single run, which is why nobody catches it).
