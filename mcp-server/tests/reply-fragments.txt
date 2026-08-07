@@ -22,6 +22,30 @@
 ## step_filter/both
 ·   Stepping OVER java.* (your exclude_classes)·   Stepping ONLY within com.example.*
 
+## step_filter/session-exclude
+·   ↪ Using the session step filter set at attach — this call named none. Pass exclude_classes or only_classes here to step under a different one.·   Stepping OVER org.jboss.* (the session's step_exclude_classes)
+
+## step_filter/session-only
+·   ↪ Using the session step filter set at attach — this call named none. Pass exclude_classes or only_classes here to step under a different one.·   Stepping OVER java.* (the default set) — pass exclude_classes:[] to step into everything·   Stepping ONLY within br.com.app.*
+
+## step_filter/session-none
+·   ↪ Using the session step filter set at attach — this call named none. Pass exclude_classes or only_classes here to step under a different one.·   No class filter: this steps into framework and JDK code as well as yours.
+
+## session_step_filter/unset
+
+
+## session_step_filter/exclude
+·   👣 Session step filter: every debug.step_* call that names no filter of its own uses exclude_classes org.jboss.*, io.undertow.*. A step that names either exclude_classes or only_classes uses exactly what it names — this default is not merged into it.
+
+## session_step_filter/empty-exclude
+·   👣 Session step filter: every debug.step_* call that names no filter of its own uses NO exclusions (steps into everything). A step that names either exclude_classes or only_classes uses exactly what it names — this default is not merged into it.
+
+## session_step_filter/only
+·   👣 Session step filter: every debug.step_* call that names no filter of its own uses the built-in default exclusions, only within br.com.app.*. A step that names either exclude_classes or only_classes uses exactly what it names — this default is not merged into it.
+
+## session_step_filter/both
+·   👣 Session step filter: every debug.step_* call that names no filter of its own uses exclude_classes java.*, only within br.com.app.*. A step that names either exclude_classes or only_classes uses exactly what it names — this default is not merged into it.
+
 ## trace_frames/off
 
 

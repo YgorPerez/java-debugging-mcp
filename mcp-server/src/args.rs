@@ -209,6 +209,34 @@ pub struct LaunchArgs {
     /// Nothing is evaluated on events you did not ask to stop for.
     #[serde(default)]
     pub trace_expr: Option<TraceExprs>,
+    /// Class patterns every `debug.step_*` call in this session steps **over**, unless that call names a
+    /// filter of its own (STEP-2). The exclusion list for one app server is the same list every time — the
+    /// container, the JDK, the ORM, the servlet-filter chain — and stepping is where the most calls per
+    /// minute happen, which makes it the worst surface on which to restate an argument.
+    ///
+    /// A DEFAULT, not an override, and **never a merge**. A step that names EITHER `exclude_classes` or
+    /// `only_classes` uses exactly what it named and this session default is not consulted at all — not
+    /// even the half the call left out. Merging is the reading a caller would assume, and a union of two
+    /// exclusion lists silently changes where a step lands. Every stepping reply says which of the two it
+    /// used.
+    ///
+    /// Resolved at the step, not frozen here: change it and the next step changes, with nothing stale left
+    /// behind.
+    ///
+    /// **Named `step_` rather than `exclude_classes`** because that word is already taken on this surface
+    /// by `debug.set_method_exit_stop`, where it means *which events the JVM should not generate* — a
+    /// different question, and one that deliberately has no default set. One argument name doing two
+    /// unrelated caller-visible jobs is the `inherited` collision CONTEXT.md records (ADR-0015, ADR-0040).
+    #[serde(default)]
+    pub step_exclude_classes: Option<Vec<String>>,
+    /// Class patterns every `debug.step_*` call in this session steps **only** within, unless that call
+    /// names a filter of its own — the inverse of `step_exclude_classes`, for "keep going until we are back
+    /// in my package" (STEP-2).
+    ///
+    /// Same default-never-a-merge rule, and the two session fields are consulted as a PAIR: a step naming
+    /// `exclude_classes` alone does not pick this up either.
+    #[serde(default)]
+    pub step_only_classes: Option<Vec<String>>,
 }
 
 /// A class argument that takes **one** pattern or **several** (FILT-4).
@@ -355,6 +383,34 @@ pub struct AttachArgs {
     /// Nothing is evaluated on events you did not ask to stop for.
     #[serde(default)]
     pub trace_expr: Option<TraceExprs>,
+    /// Class patterns every `debug.step_*` call in this session steps **over**, unless that call names a
+    /// filter of its own (STEP-2). The exclusion list for one app server is the same list every time — the
+    /// container, the JDK, the ORM, the servlet-filter chain — and stepping is where the most calls per
+    /// minute happen, which makes it the worst surface on which to restate an argument.
+    ///
+    /// A DEFAULT, not an override, and **never a merge**. A step that names EITHER `exclude_classes` or
+    /// `only_classes` uses exactly what it named and this session default is not consulted at all — not
+    /// even the half the call left out. Merging is the reading a caller would assume, and a union of two
+    /// exclusion lists silently changes where a step lands. Every stepping reply says which of the two it
+    /// used.
+    ///
+    /// Resolved at the step, not frozen here: change it and the next step changes, with nothing stale left
+    /// behind.
+    ///
+    /// **Named `step_` rather than `exclude_classes`** because that word is already taken on this surface
+    /// by `debug.set_method_exit_stop`, where it means *which events the JVM should not generate* — a
+    /// different question, and one that deliberately has no default set. One argument name doing two
+    /// unrelated caller-visible jobs is the `inherited` collision CONTEXT.md records (ADR-0015, ADR-0040).
+    #[serde(default)]
+    pub step_exclude_classes: Option<Vec<String>>,
+    /// Class patterns every `debug.step_*` call in this session steps **only** within, unless that call
+    /// names a filter of its own — the inverse of `step_exclude_classes`, for "keep going until we are back
+    /// in my package" (STEP-2).
+    ///
+    /// Same default-never-a-merge rule, and the two session fields are consulted as a PAIR: a step naming
+    /// `exclude_classes` alone does not pick this up either.
+    #[serde(default)]
+    pub step_only_classes: Option<Vec<String>>,
 }
 
 /// Arguments for `debug.set_line_stop`.

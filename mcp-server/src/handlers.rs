@@ -125,6 +125,11 @@ struct SessionDefaults<'a> {
     source_roots: Option<&'a Vec<String>>,
     class_roots: Option<&'a Vec<String>>,
     trace_exprs: Vec<String>,
+    /// STEP-2 (#158). The fourth the comment above predicted, arriving as a pair — the two step-filter
+    /// fields are read together or not at all, so splitting them across two entries here would invite the
+    /// half-and-half resolution the whole design refuses.
+    step_exclude_classes: Option<&'a Vec<String>>,
+    step_only_classes: Option<&'a Vec<String>>,
 }
 
 impl RequestHandler {
@@ -440,6 +445,8 @@ impl RequestHandler {
                     source_roots: a.source_roots.as_ref(),
                     class_roots: a.class_roots.as_ref(),
                     trace_exprs: session_exprs.clone(),
+                    step_exclude_classes: a.step_exclude_classes.as_ref(),
+                    step_only_classes: a.step_only_classes.as_ref(),
                 },
             )
             .await?;
@@ -450,8 +457,9 @@ impl RequestHandler {
             ""
         };
         Ok(format!(
-            "Connected to JVM at {host}:{port} (session: {session_id}){ro}{}",
-            describe_session_default(&session_exprs, session_expr_note.as_deref())
+            "Connected to JVM at {host}:{port} (session: {session_id}){ro}{}{}",
+            describe_session_default(&session_exprs, session_expr_note.as_deref()),
+            describe_session_step_filter(a.step_exclude_classes.as_deref(), a.step_only_classes.as_deref())
         ))
     }
 
@@ -483,7 +491,13 @@ impl RequestHandler {
         read_only: bool,
         defaults: SessionDefaults<'_>,
     ) -> Result<crate::session::SessionId, String> {
-        let SessionDefaults { source_roots, class_roots, trace_exprs } = defaults;
+        let SessionDefaults {
+            source_roots,
+            class_roots,
+            trace_exprs,
+            step_exclude_classes,
+            step_only_classes,
+        } = defaults;
         if read_only {
             connection.set_read_only(true);
         }
@@ -500,7 +514,21 @@ impl RequestHandler {
             class_roots.map_or_else(env_class_roots, |v| v.iter().map(std::path::PathBuf::from).collect());
         let session_id = self
             .session_manager
-            .create_session(connection, endpoint, read_only, source_roots, class_roots, trace_exprs)
+            .create_session(
+                connection,
+                endpoint,
+                crate::session::SessionSeed {
+                    read_only,
+                    source_roots,
+                    class_roots,
+                    trace_exprs,
+                    // Cloned rather than defaulted from an env var: there is no `JDWP_STEP_EXCLUDE`, and
+                    // `None` here has to keep meaning "nothing was set", because the built-in default set
+                    // is what fills that gap at the step. An empty Vec is a different answer.
+                    step_exclude_classes: step_exclude_classes.cloned(),
+                    step_only_classes: step_only_classes.cloned(),
+                },
+            )
             .await;
         // Get the session guard once so the listener/watchdog handles are stored before we return.
         let session_guard = self
@@ -599,6 +627,8 @@ impl RequestHandler {
                     source_roots: a.source_roots.as_ref(),
                     class_roots: a.class_roots.as_ref(),
                     trace_exprs: session_exprs.clone(),
+                    step_exclude_classes: a.step_exclude_classes.as_ref(),
+                    step_only_classes: a.step_only_classes.as_ref(),
                 },
             )
             .await?;
@@ -625,7 +655,11 @@ impl RequestHandler {
         }
 
         Ok(render_launch_reply(&a, &target, &LaunchReply { session_id: &session_id, port, pid, read_only })
-            + &describe_session_default(&session_exprs, session_expr_note.as_deref()))
+            + &describe_session_default(&session_exprs, session_expr_note.as_deref())
+            + &describe_session_step_filter(
+                a.step_exclude_classes.as_deref(),
+                a.step_only_classes.as_deref(),
+            ))
     }
 
     /// List every live session, so a caller who lost a `session_id` can find it again.
@@ -1266,8 +1300,14 @@ impl RequestHandler {
         if let Some((req, _)) = session.pending_step.take() {
             let _ = session.connection.clear_step(req).await;
         }
-        let exclude = step_exclusions(a.exclude_classes.as_deref());
-        let only = a.only_classes.unwrap_or_default();
+        // STEP-2 (#158). Resolved from the call and the session default together, and the session guard
+        // is already held here — the deadlock `session_trace_exprs` exists to avoid does not arise.
+        let (exclude, only, defaulted_exclusions, filter_source) = resolve_step_filter(
+            a.exclude_classes.clone(),
+            a.only_classes.clone(),
+            session.step_exclude_classes.as_ref(),
+            session.step_only_classes.as_ref(),
+        );
         let req = session
             .connection
             .set_step_ex(thread_id, depth, &exclude, &only)
@@ -1281,7 +1321,7 @@ impl RequestHandler {
         Ok(format!(
             "👣 Stepping {label} on thread 0x{thread_id:x}. Call debug.get_last_event to see where it \
              stopped.{}",
-            describe_step_filter(&exclude, &only, a.exclude_classes.is_none())
+            describe_step_filter(&exclude, &only, defaulted_exclusions, filter_source)
         ))
     }
 
@@ -3825,23 +3865,141 @@ fn step_exclusions(from_caller: Option<&[String]>) -> Vec<String> {
     )
 }
 
+/// Where the filter one step used came from (STEP-2, #158).
+///
+/// Three states rather than a bool, because the reply has to distinguish them and two of them are easy to
+/// confuse: a step that named nothing on a session with no default is running the BUILT-IN set, which is
+/// not the same claim as running a list somebody chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepFilterSource {
+    /// The step named `exclude_classes` and/or `only_classes` itself.
+    Call,
+    /// The step named neither and the session carries a default.
+    SessionDefault,
+    /// The step named neither and neither does the session — [`DEFAULT_STEP_EXCLUSIONS`], as before #158.
+    BuiltIn,
+}
+
+/// Resolve one step's filter from the call and the session default (STEP-2, #158).
+///
+/// THE PAIR IS ALL-OR-NOTHING, and that is the whole decision. A step naming EITHER field uses exactly
+/// what it named; the session's other half is not applied, so `only_classes: ["x"]` on a session holding
+/// `step_exclude_classes` does not quietly keep excluding. Merging is the reading a caller assumes, and
+/// the union of two exclusion lists changes where a step lands with nothing in the reply to say why —
+/// ADR-0040 rejected exactly that for `trace_expr`, and the argument transposes without change.
+///
+/// What the session default REPLACES is the built-in set, not the caller's list. So a session with no
+/// default behaves precisely as it did before this existed, which is why the `BuiltIn` arm is separate:
+/// `step_exclusions` still turns an absent exclusion list into [`DEFAULT_STEP_EXCLUSIONS`] afterwards, on
+/// every path.
+///
+/// Resolved HERE, at the step, rather than frozen at attach — ADR-0040's "storing the resolved list at
+/// arming time" rejection, transposed. Change the session default and the next step changes with it.
+fn resolve_step_filter(
+    asked_exclude: Option<Vec<String>>,
+    asked_only: Option<Vec<String>>,
+    session_exclude: Option<&Vec<String>>,
+    session_only: Option<&Vec<String>>,
+) -> (Vec<String>, Vec<String>, bool, StepFilterSource) {
+    let (exclude, only, source) = if asked_exclude.is_some() || asked_only.is_some() {
+        (asked_exclude, asked_only, StepFilterSource::Call)
+    } else if session_exclude.is_some() || session_only.is_some() {
+        (session_exclude.cloned(), session_only.cloned(), StepFilterSource::SessionDefault)
+    } else {
+        (None, None, StepFilterSource::BuiltIn)
+    };
+    // Unchanged from STEP-1: an absent exclusion list means the built-in set, an explicit `[]` means step
+    // into everything. That distinction survives a session default because both are carried as `Option`
+    // the whole way down.
+    let defaulted = exclude.is_none();
+    let exclude = step_exclusions(exclude.as_deref());
+    let only = only.unwrap_or_default();
+    // `BuiltIn` and a `SessionDefault` that set only `step_only_classes` both leave the exclusions at the
+    // built-in set. The reply has to say "the default set" in both cases, so the flag survives as its own
+    // fact rather than being re-derived from the source.
+    let source = if source == StepFilterSource::SessionDefault && defaulted && only.is_empty() {
+        StepFilterSource::BuiltIn
+    } else {
+        source
+    };
+    (exclude, only, defaulted, source)
+}
+
+/// How `debug.attach` and `debug.launch` report the step filter they just set for the session (STEP-2).
+///
+/// Stated when it is set, for the same reason [`describe_session_default`] states the `trace_expr` one: it
+/// changes what every later step does, and a step landing somewhere unexpected two hours later is owed the
+/// link back to the call that arranged it.
+fn describe_session_step_filter(exclude: Option<&[String]>, only: Option<&[String]>) -> String {
+    if exclude.is_none() && only.is_none() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n   👣 Session step filter: every debug.step_* call that names no filter of its own uses",
+    );
+    match exclude {
+        Some([]) => out.push_str(" NO exclusions (steps into everything)"),
+        Some(list) => {
+            let _ = write!(out, " exclude_classes {}", list.join(", "));
+        }
+        None => out.push_str(" the built-in default exclusions"),
+    }
+    if let Some(list) = only {
+        if list.is_empty() {
+            out.push_str(", and no only_classes restriction");
+        } else {
+            let _ = write!(out, ", only within {}", list.join(", "));
+        }
+    }
+    out.push_str(
+        ". A step that names either exclude_classes or only_classes uses exactly what it names — this \
+         default is not merged into it.",
+    );
+    out
+}
+
 /// The line a step reply appends about what filtering was in force (STEP-1).
 ///
 /// Printed on every step rather than only when it is unusual, because the default is ON: a caller who
 /// does not know that reads a step landing two frames further along as the debugger misbehaving. Saying
 /// it costs one line and turns a surprise into a fact with an argument attached to it.
-fn describe_step_filter(exclude: &[String], only: &[String], defaulted: bool) -> String {
+fn describe_step_filter(
+    exclude: &[String],
+    only: &[String],
+    defaulted: bool,
+    source: StepFilterSource,
+) -> String {
     let mut out = String::new();
+    // STEP-2 (#158). Said BEFORE the patterns, because it is the fact that explains them. A step that
+    // skipped a frame the caller expected to land on is otherwise unexplained, and "which of the two
+    // lists was this" is the first question they will have.
+    if source == StepFilterSource::SessionDefault {
+        out.push_str(
+            "\n   ↪ Using the session step filter set at attach — this call named none. Pass \
+             exclude_classes or only_classes here to step under a different one.",
+        );
+    }
     if exclude.is_empty() && only.is_empty() {
         out.push_str("\n   No class filter: this steps into framework and JDK code as well as yours.");
         return out;
     }
     if !exclude.is_empty() {
+        // THREE LABELS, NOT TWO (STEP-2, #158). The first rendering of this said "your exclude_classes"
+        // for a list the SESSION set, which is a reply attributing a decision to the wrong call — caught
+        // by reading `reply-fragments.txt`, which is what that file is for. `defaulted` answers "is this
+        // the built-in set"; it cannot answer "whose list is it".
+        let whose = if defaulted {
+            "the default set"
+        } else if source == StepFilterSource::SessionDefault {
+            "the session's step_exclude_classes"
+        } else {
+            "your exclude_classes"
+        };
         let _ = write!(
             out,
             "\n   Stepping OVER {} ({}){}",
             exclude.join(", "),
-            if defaulted { "the default set" } else { "your exclude_classes" },
+            whose,
             if defaulted { " — pass exclude_classes:[] to step into everything" } else { "" }
         );
     }
@@ -24167,6 +24325,116 @@ mod tests {
         assert!(exprs.is_empty() && !inherited, "no session default is not an inheritance of nothing");
     }
 
+    /// STEP-2 (#158): the same rule as the test above, for the step filter — with the extra clause that
+    /// makes it harder. The session's two fields are a PAIR, so a step naming only one of its own does
+    /// not pick up the other half from the session; that is the case a merge would look most reasonable
+    /// in, and it is the one that would quietly change where a step lands.
+    #[test]
+    fn a_session_step_filter_is_a_default_and_never_a_merge() {
+        // NOT one of DEFAULT_STEP_EXCLUSIONS. The first draft used `org.jboss.*`, which is in the
+        // built-in set — so "the session's exclusions must not leak in" was unprovable, because the
+        // pattern is there either way. The test failed on exactly that, which is what it is for.
+        let s_ex = vec!["com.acme.filters.*".to_string()];
+        let s_only = vec!["br.com.app.*".to_string()];
+        let mine_ex = vec!["com.mine.*".to_string()];
+        let mine_only = vec!["com.only.*".to_string()];
+
+        // Names nothing: takes both halves of the session default.
+        let (ex, only, defaulted, src) = resolve_step_filter(None, None, Some(&s_ex), Some(&s_only));
+        assert_eq!(ex, s_ex);
+        assert_eq!(only, s_only);
+        assert!(!defaulted, "the session named exclusions, so these are not the built-in set");
+        assert_eq!(src, StepFilterSource::SessionDefault, "and the reply has to be able to say so");
+
+        // Names only_classes alone: the session's exclude_classes is NOT applied. The exclusions fall
+        // back to the built-in set, which is exactly what this call would have got before #158.
+        let (ex, only, defaulted, src) =
+            resolve_step_filter(None, Some(mine_only.clone()), Some(&s_ex), Some(&s_only));
+        assert!(!ex.contains(&"com.acme.filters.*".to_string()), "the session's exclusions must not leak in");
+        assert_eq!(ex, step_exclusions(None), "they fall back to the built-in set, not to nothing");
+        assert_eq!(only, mine_only);
+        assert!(defaulted);
+        assert_eq!(src, StepFilterSource::Call);
+
+        // Names exclude_classes alone: the session's only_classes is NOT applied.
+        let (ex, only, _, src) = resolve_step_filter(Some(mine_ex.clone()), None, Some(&s_ex), Some(&s_only));
+        assert_eq!(ex, mine_ex, "exactly what the call named");
+        assert!(only.is_empty(), "the session's only_classes must not narrow a call that named none");
+        assert_eq!(src, StepFilterSource::Call);
+
+        // No union is reachable from any combination.
+        for (a_ex, a_only) in [
+            (None, None),
+            (Some(mine_ex.clone()), None),
+            (None, Some(mine_only.clone())),
+            (Some(mine_ex), Some(mine_only)),
+        ] {
+            let (ex, only, ..) = resolve_step_filter(a_ex, a_only, Some(&s_ex), Some(&s_only));
+            assert!(
+                !(ex.contains(&"com.acme.filters.*".to_string()) && ex.contains(&"com.mine.*".to_string())),
+                "the two exclusion lists were merged: {ex:?}"
+            );
+            assert!(
+                !(only.contains(&"br.com.app.*".to_string()) && only.contains(&"com.only.*".to_string())),
+                "the two only-lists were merged: {only:?}"
+            );
+        }
+    }
+
+    /// A session with no default steps EXACTLY as it did before #158, including the two states that are
+    /// easy to collapse into each other: an absent `exclude_classes` means the built-in set, an explicit
+    /// empty one means step into everything.
+    #[test]
+    fn no_session_default_leaves_stepping_exactly_as_it_was() {
+        let (ex, only, defaulted, src) = resolve_step_filter(None, None, None, None);
+        assert_eq!(ex, step_exclusions(None), "the built-in set, as before");
+        assert!(only.is_empty());
+        assert!(defaulted);
+        assert_eq!(src, StepFilterSource::BuiltIn, "not a session default — nobody set one");
+
+        let (ex, _, defaulted, _) = resolve_step_filter(Some(vec![]), None, None, None);
+        assert!(ex.is_empty(), "an explicit [] still means step into everything");
+        assert!(!defaulted);
+
+        // And the same distinction survives being carried on the SESSION rather than on the call.
+        let (ex, _, defaulted, src) = resolve_step_filter(None, None, Some(&vec![]), None);
+        assert!(ex.is_empty(), "a session default of [] means step into everything too");
+        assert!(!defaulted);
+        assert_eq!(src, StepFilterSource::SessionDefault, "and it is a choice somebody made, so say so");
+
+        // A session default that restricts nothing is indistinguishable from none, and is reported as
+        // the built-in set rather than as a decision nobody made.
+        let (ex, only, _, src) = resolve_step_filter(None, None, None, Some(&vec![]));
+        assert_eq!(ex, step_exclusions(None));
+        assert!(only.is_empty());
+        assert_eq!(src, StepFilterSource::BuiltIn);
+    }
+
+    /// The two step-filter reply fragments say nothing when there is nothing to say, and name the
+    /// patterns when there is — the same contract as the `trace_expr` pair below.
+    #[test]
+    fn the_step_filter_notes_name_what_was_in_force() {
+        assert_eq!(describe_session_step_filter(None, None), "");
+
+        let set = describe_session_step_filter(Some(&["org.jboss.*".to_string()]), None);
+        assert!(set.contains("org.jboss.*"), "names the patterns: {set}");
+        assert!(set.contains("not merged"), "and states the rule that surprises people: {set}");
+
+        let empty = describe_session_step_filter(Some(&[]), None);
+        assert!(empty.contains("NO exclusions"), "an empty list is a decision, not an absence: {empty}");
+
+        let from_session =
+            describe_step_filter(&["org.jboss.*".to_string()], &[], false, StepFilterSource::SessionDefault);
+        assert!(from_session.contains("session step filter"), "{from_session}");
+        assert!(from_session.contains("org.jboss.*"), "{from_session}");
+
+        let from_call = describe_step_filter(&["com.mine.*".to_string()], &[], false, StepFilterSource::Call);
+        assert!(
+            !from_call.contains("session step filter"),
+            "a call's own filter must not claim to be the session's: {from_call}"
+        );
+    }
+
     /// The cap is not reachable through the session default either: the list is clamped once, at attach,
     /// so inheriting cannot smuggle a fifth expression past it.
     #[test]
@@ -24375,11 +24643,40 @@ mod tests {
 
         let ex = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
 
-        case("step_filter/none", describe_step_filter(&[], &[], false));
-        case("step_filter/defaulted", describe_step_filter(&ex(&["java.*", "jdk.*"]), &[], true));
-        case("step_filter/exclude-only", describe_step_filter(&ex(&["java.*"]), &[], false));
-        case("step_filter/only-only", describe_step_filter(&[], &ex(&["com.example.*"]), false));
-        case("step_filter/both", describe_step_filter(&ex(&["java.*"]), &ex(&["com.example.*"]), false));
+        let call = StepFilterSource::Call;
+        let built_in = StepFilterSource::BuiltIn;
+        let from_session = StepFilterSource::SessionDefault;
+        case("step_filter/none", describe_step_filter(&[], &[], false, call));
+        case("step_filter/defaulted", describe_step_filter(&ex(&["java.*", "jdk.*"]), &[], true, built_in));
+        case("step_filter/exclude-only", describe_step_filter(&ex(&["java.*"]), &[], false, call));
+        case("step_filter/only-only", describe_step_filter(&[], &ex(&["com.example.*"]), false, call));
+        case(
+            "step_filter/both",
+            describe_step_filter(&ex(&["java.*"]), &ex(&["com.example.*"]), false, call),
+        );
+        // STEP-2 (#158). The three the session default adds, and the one that matters most is
+        // `session/none`: a step that named nothing, on a session whose default is `step_exclude_classes:
+        // []`, has to read as a deliberate "step into everything" rather than as an absent filter.
+        case(
+            "step_filter/session-exclude",
+            describe_step_filter(&ex(&["org.jboss.*"]), &[], false, from_session),
+        );
+        case(
+            "step_filter/session-only",
+            describe_step_filter(&ex(&["java.*"]), &ex(&["br.com.app.*"]), true, from_session),
+        );
+        case("step_filter/session-none", describe_step_filter(&[], &[], false, from_session));
+        case("session_step_filter/unset", describe_session_step_filter(None, None));
+        case(
+            "session_step_filter/exclude",
+            describe_session_step_filter(Some(&ex(&["org.jboss.*", "io.undertow.*"])), None),
+        );
+        case("session_step_filter/empty-exclude", describe_session_step_filter(Some(&[]), None));
+        case("session_step_filter/only", describe_session_step_filter(None, Some(&ex(&["br.com.app.*"]))));
+        case(
+            "session_step_filter/both",
+            describe_session_step_filter(Some(&ex(&["java.*"])), Some(&ex(&["br.com.app.*"]))),
+        );
 
         case("trace_frames/off", describe_trace_frames(false, 3, None, "hint"));
         case("trace_frames/zero", describe_trace_frames(true, 0, None, "no caller frames are captured"));

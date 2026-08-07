@@ -1,7 +1,7 @@
 # Every debug.* tool's ARGUMENT schemas, as advertised to callers. GENERATED — do not hand-edit:
 #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot
 #
-# 40 tools, 228 arguments.
+# 40 tools, 232 arguments.
 #
 # Each argument shows its full generated schema minus the description — so a changed type,
 # default, format, minimum or anyOf arm fails as loudly as a renamed field — then the description
@@ -52,6 +52,25 @@
     directories>/<file the JVM reports>`. Plain directories only — sources inside JARs are not read. Given
     here they replace the `JDWP_SOURCE_ROOTS` environment default for this session; omitted, that default
     applies.
+- step_exclude_classes: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Class patterns every `debug.step_*` call in this session steps **over**, unless that call names a filter
+    of its own (STEP-2). The exclusion list for one app server is the same list every time — the container,
+    the JDK, the ORM, the servlet-filter chain — and stepping is where the most calls per minute happen, which
+    makes it the worst surface on which to restate an argument. A DEFAULT, not an override, and **never a
+    merge**. A step that names EITHER `exclude_classes` or `only_classes` uses exactly what it named and this
+    session default is not consulted at all — not even the half the call left out. Merging is the reading a
+    caller would assume, and a union of two exclusion lists silently changes where a step lands. Every
+    stepping reply says which of the two it used. Resolved at the step, not frozen here: change it and the
+    next step changes, with nothing stale left behind. **Named `step_` rather than `exclude_classes`** because
+    that word is already taken on this surface by `debug.set_method_exit_stop`, where it means *which events
+    the JVM should not generate* — a different question, and one that deliberately has no default set. One
+    argument name doing two unrelated caller-visible jobs is the `inherited` collision CONTEXT.md records
+    (ADR-0015, ADR-0040).
+- step_only_classes: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Class patterns every `debug.step_*` call in this session steps **only** within, unless that call names a
+    filter of its own — the inverse of `step_exclude_classes`, for "keep going until we are back in my
+    package" (STEP-2). Same default-never-a-merge rule, and the two session fields are consulted as a PAIR: a
+    step naming `exclude_classes` alone does not pick this up either.
 - trace_expr: {"anyOf":[{"$ref":"#/$defs/TraceExprs"},{"type":"null"}]}
     Expressions every stop point in this session should record unless it names its own `trace_expr` (EVAL-14).
     The shape this exists for is *step, look at the same six things, step again*: without it, each stop point
@@ -321,6 +340,25 @@
     accepts it and ignores it, having nothing to select.
 - source_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
     Directories `debug.source` searches for `.java` files — see `debug.attach`.
+- step_exclude_classes: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Class patterns every `debug.step_*` call in this session steps **over**, unless that call names a filter
+    of its own (STEP-2). The exclusion list for one app server is the same list every time — the container,
+    the JDK, the ORM, the servlet-filter chain — and stepping is where the most calls per minute happen, which
+    makes it the worst surface on which to restate an argument. A DEFAULT, not an override, and **never a
+    merge**. A step that names EITHER `exclude_classes` or `only_classes` uses exactly what it named and this
+    session default is not consulted at all — not even the half the call left out. Merging is the reading a
+    caller would assume, and a union of two exclusion lists silently changes where a step lands. Every
+    stepping reply says which of the two it used. Resolved at the step, not frozen here: change it and the
+    next step changes, with nothing stale left behind. **Named `step_` rather than `exclude_classes`** because
+    that word is already taken on this surface by `debug.set_method_exit_stop`, where it means *which events
+    the JVM should not generate* — a different question, and one that deliberately has no default set. One
+    argument name doing two unrelated caller-visible jobs is the `inherited` collision CONTEXT.md records
+    (ADR-0015, ADR-0040).
+- step_only_classes: {"default":null,"items":{"type":"string"},"type":["array","null"]}
+    Class patterns every `debug.step_*` call in this session steps **only** within, unless that call names a
+    filter of its own — the inverse of `step_exclude_classes`, for "keep going until we are back in my
+    package" (STEP-2). Same default-never-a-merge rule, and the two session fields are consulted as a PAIR: a
+    step naming `exclude_classes` alone does not pick this up either.
 - suspend: {"default":true,"type":"boolean"}
     Suspend the JVM at startup, before a single line of the program runs — **default true**, and the main
     reason this tool exists. `suspend=y` is unreachable when you attach to a JVM someone else started: by the

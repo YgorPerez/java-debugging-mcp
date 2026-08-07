@@ -160,6 +160,25 @@ pub struct DebugSession {
     /// anyway. Never on events nobody asked to stop for: that would spend debuggee time on a JVM this
     /// project exists not to disturb, which is the same budget the 4-expression cap protects.
     pub trace_exprs: Vec<String>,
+    /// The step filter every `debug.step_*` call in this session uses when it names none (STEP-2, #158).
+    ///
+    /// Per session for the reason `trace_exprs` is: the classes worth stepping over are a property of the
+    /// application you attached to, not of one step, and stepping is the surface with the most calls per
+    /// minute on it. STEP-1 (#94) shipped the per-call fields and they fixed the diving-into-WildFly
+    /// problem; forgetting one on a single `step_into` still lands you forty frames inside a filter chain.
+    ///
+    /// `None` means the caller set nothing and the built-in default set applies, exactly as before this
+    /// existed. `Some(vec![])` is a real answer and means *step into everything*.
+    ///
+    /// IT IS A DEFAULT, NOT AN OVERRIDE, AND THE PAIR IS ALL-OR-NOTHING. A step naming either of its own
+    /// filter fields uses exactly what it named; neither of these is consulted then, including the half
+    /// the call left out. See [`Self::step_only_classes`] and ADR-0040, whose three rules this follows.
+    pub step_exclude_classes: Option<Vec<String>>,
+    /// The `only_classes` half of this session's step-filter default (STEP-2, #158).
+    ///
+    /// Read as a pair with [`Self::step_exclude_classes`] — never merged with a call's own filter, and
+    /// never applied on its own to a step that named the other field.
+    pub step_only_classes: Option<Vec<String>>,
     /// Classes this session redefined and **cannot restore** (SWAP-2), keyed by class name.
     ///
     /// Its own bookkeeping because a redefinition is the only mutation here that outlives the thing that
@@ -1604,6 +1623,22 @@ pub struct SessionManager {
     alerter: crate::protocol::Alerter,
 }
 
+/// Everything a new session takes from the call that opened it (STEP-2, #158).
+///
+/// A struct rather than six positional parameters: `create_session` was already at the
+/// `clippy::too_many_arguments` line before the step filter added two, and the six are one idea anyway —
+/// what `debug.attach` and `debug.launch` set once instead of on every later call. It is the same
+/// grouping, and for the same reason, that `SessionDefaults` in `handlers.rs` already applies one layer
+/// up; this is its landing point.
+pub struct SessionSeed {
+    pub read_only: bool,
+    pub source_roots: Vec<std::path::PathBuf>,
+    pub class_roots: Vec<std::path::PathBuf>,
+    pub trace_exprs: Vec<String>,
+    pub step_exclude_classes: Option<Vec<String>>,
+    pub step_only_classes: Option<Vec<String>>,
+}
+
 impl SessionManager {
     pub fn new(alerter: crate::protocol::Alerter) -> Self {
         Self {
@@ -1617,11 +1652,16 @@ impl SessionManager {
         &self,
         connection: JdwpConnection,
         endpoint: String,
-        read_only: bool,
-        source_roots: Vec<std::path::PathBuf>,
-        class_roots: Vec<std::path::PathBuf>,
-        trace_exprs: Vec<String>,
+        seed: SessionSeed,
     ) -> SessionId {
+        let SessionSeed {
+            read_only,
+            source_roots,
+            class_roots,
+            trace_exprs,
+            step_exclude_classes,
+            step_only_classes,
+        } = seed;
         let session_id = format!("session_{}", uuid::v4());
         let session = DebugSession {
             connection,
@@ -1647,6 +1687,8 @@ impl SessionManager {
             source_roots,
             class_roots,
             trace_exprs,
+            step_exclude_classes,
+            step_only_classes,
             redefinitions: std::collections::BTreeMap::new(),
             pending_breakpoints: Vec::new(),
             pattern_sets: HashMap::new(),

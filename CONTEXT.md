@@ -1034,13 +1034,24 @@ debuggee in #72.
 
 **Session default**:
 A value set once on `debug.attach` or `debug.launch` that later calls use when they name none of their own.
-`trace_expr` is the one a caller sees named as such (EVAL-14); `source_roots` and `class_roots` are the same
+Two are named as such to a caller: `trace_expr` (EVAL-14) and the **step filter**,
+`step_exclude_classes` / `step_only_classes` (STEP-2, #158). `source_roots` and `class_roots` are the same
 shape and predate the phrase.
 
 **It is a default and never a merge**, which is most of why it needs a word. A stop point naming its own
 `trace_expr` records exactly that list, and the two are never combined — combining them would push a
 caller's own four expressions past the cap and drop the tail, which is the failure the cap exists to reveal
 rather than to cause.
+
+The step filter carries that rule one clause further, because it is a **pair**: a step naming *either*
+`exclude_classes` or `only_classes` uses exactly what it named, and **neither** session field is consulted —
+not even the half the call left out. That is the case a merge looks most reasonable in, and the one where it
+would quietly change where a step lands. What the session default replaces is the *built-in* exclusion set,
+never the caller's own list, so a session that sets none steps exactly as it did before the default existed.
+
+The two step fields carry a `step_` prefix rather than reusing `exclude_classes` for the reason the _Avoid_
+line below gives about **inherited**: `debug.set_method_exit_stop` already takes an `exclude_classes`, where
+it means *which events the JVM should not generate* and deliberately has no default set.
 
 **A reply says when it took one.** A capture nobody asked for at this site is otherwise unexplained, and
 unexplained output that reads as an answer is the thing this glossary's **Reply** entry exists about.

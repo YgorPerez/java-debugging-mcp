@@ -268,7 +268,12 @@ i = s.index("## debug.attach")
 p.write_text(s[:i] + s[s.index("## ", i + 3):])
 PY
         ;;
-    totals-disagree) sed -i 's/^# 40 tools, 228 arguments\.$/# 39 tools, 227 arguments./' "$tree/mcp-server/tests/argument-schemas.txt" ;;
+    # The pattern matches ANY count, deliberately. It used to name `40 tools, 228 arguments` literally, and
+    # STEP-2 (#158) added four arguments — so the sed matched nothing, the copy was not broken, the script
+    # published happily and the refusal this case exists for went unexercised. It failed loudly here only
+    # because the expected transcript pins `exit: 1`; the sed itself gave no sign. Same shape as BUILD-3
+    # (#174): a number written down in a second place, in a file that rots on a day nobody is looking at it.
+    totals-disagree) sed -i 's/^# [0-9]* tools, [0-9]* arguments\.$/# 39 tools, 227 arguments./' "$tree/mcp-server/tests/argument-schemas.txt" ;;
     heading-shape-changed) sed -i 's/^## debug\./### debug./' "$tree/mcp-server/tests/tool-descriptions.txt" ;;
     docs-table-drifted) sed -i '/^| `debug.attach` |/d' "$tree/docs/tools.md" ;;
     esac

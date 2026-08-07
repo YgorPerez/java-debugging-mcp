@@ -50,11 +50,14 @@ JDWP_READONLY env var, which cannot be relaxed per-attach) refuses invocation, s
 reload_class while leaving every read working, and a watchdog auto-resumes a VM left suspended after
 JDWP_WATCHDOG_SECS (default 120) — disabling the stop point that froze it, so the rescue can't be undone by
 the next hit. Optional source_roots / class_roots configure debug.source and debug.reload_class /
-debug.check_stale; each REPLACES its environment default for this session rather than adding to it. Concurrent
-sessions are supported: the newest becomes current, every tool takes an optional session_id, and
-debug.list_sessions finds one you lost. Attaching suspends nothing and changes nothing in the debuggee —
-though a JVM started with suspend=y is already frozen at startup waiting for you, and debug.continue is what
-releases it.
+debug.check_stale; each REPLACES its environment default for this session rather than adding to it. Optional
+step_exclude_classes / step_only_classes set the SESSION'S STEP FILTER (STEP-2): every debug.step_* call that
+names no filter of its own uses it, so the container/JDK/ORM exclusion list is stated once rather than on
+every step — and a step that DOES name exclude_classes or only_classes uses exactly what it named, with this
+default not merged in. Optional trace_expr does the same for stop points that name none. Concurrent sessions
+are supported: the newest becomes current, every tool takes an optional session_id, and debug.list_sessions
+finds one you lost. Attaching suspends nothing and changes nothing in the debuggee — though a JVM started with
+suspend=y is already frozen at startup waiting for you, and debug.continue is what releases it.
 
 ## debug.check_stale
 Is the JVM running the code you just compiled, or an older build? Compares the line tables the JVM holds for a
@@ -314,8 +317,10 @@ after which nothing here tracks it); if this server is SIGKILLed the JVM survive
 names its pid so you can kill it; and its stdout/stderr are CAPTURED rather than printed, because this
 server's stdout is the MCP transport — the last lines come back from debug.disconnect, and immediately if the
 JVM dies during startup, which is what turns "could not connect" into "your classpath was wrong, here is what
-java said". NOT for app servers: a long-running deployment should be started however it normally is and
-attached to with debug.attach.
+java said". Optional step_exclude_classes / step_only_classes set the session's step filter the same way
+debug.attach does (STEP-2) — a default for every debug.step_* call that names none, never merged into one that
+does. NOT for app servers: a long-running deployment should be started however it normally is and attached to
+with debug.attach.
 
 ## debug.list_classes
 List the classes the debuggee has actually LOADED — the first step when you do not already know the
@@ -1051,7 +1056,11 @@ a dozen — nearly every call crosses a Weld client proxy or an EJB interceptor 
 default set can match an application package, which is why it is safe to have on. Pass exclude_classes:[] for
 the old behaviour (step into everything), your own list to replace the default, or
 only_classes:["br.com.example.*"] for the inverse — keep stepping until we are back in my package. The reply
-always says which filtering was in force, so a step that lands somewhere surprising is explicable.
+always says which filtering was in force, so a step that lands somewhere surprising is explicable. SET IT ONCE
+FOR THE SESSION INSTEAD OF ON EVERY STEP (STEP-2): debug.attach and debug.launch take step_exclude_classes /
+step_only_classes, and a step that names neither of its own uses those. It is a DEFAULT AND NEVER A MERGE —
+naming either exclude_classes or only_classes here uses exactly what you named, and the session's list is not
+added to it, not even the half you left out. The reply says which of the two was in force.
 
 ## debug.step_out
 Run the current method to its return and stop at the CALL SITE in the caller's frame — the way out of a method
@@ -1072,7 +1081,11 @@ a dozen — nearly every call crosses a Weld client proxy or an EJB interceptor 
 default set can match an application package, which is why it is safe to have on. Pass exclude_classes:[] for
 the old behaviour (step into everything), your own list to replace the default, or
 only_classes:["br.com.example.*"] for the inverse — keep stepping until we are back in my package. The reply
-always says which filtering was in force, so a step that lands somewhere surprising is explicable.
+always says which filtering was in force, so a step that lands somewhere surprising is explicable. SET IT ONCE
+FOR THE SESSION INSTEAD OF ON EVERY STEP (STEP-2): debug.attach and debug.launch take step_exclude_classes /
+step_only_classes, and a step that names neither of its own uses those. It is a DEFAULT AND NEVER A MERGE —
+naming either exclude_classes or only_classes here uses exactly what you named, and the session's list is not
+added to it, not even the half you left out. The reply says which of the two was in force.
 
 ## debug.step_over
 Run the current line to completion and stop on the next line of the SAME frame — anything that line calls runs
@@ -1094,7 +1107,11 @@ difference between one step and a dozen — nearly every call crosses a Weld cli
 chain first. Nothing in the default set can match an application package, which is why it is safe to have on.
 Pass exclude_classes:[] for the old behaviour (step into everything), your own list to replace the default, or
 only_classes:["br.com.example.*"] for the inverse — keep stepping until we are back in my package. The reply
-always says which filtering was in force, so a step that lands somewhere surprising is explicable.
+always says which filtering was in force, so a step that lands somewhere surprising is explicable. SET IT ONCE
+FOR THE SESSION INSTEAD OF ON EVERY STEP (STEP-2): debug.attach and debug.launch take step_exclude_classes /
+step_only_classes, and a step that names neither of its own uses those. It is a DEFAULT AND NEVER A MERGE —
+naming either exclude_classes or only_classes here uses exactly what you named, and the session's list is not
+added to it, not even the half you left out. The reply says which of the two was in force.
 
 ## debug.suspend_thread
 Suspend ONE NAMED THREAD and leave every other thread in the JVM running and serving requests. THIS IS THE

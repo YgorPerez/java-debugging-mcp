@@ -108,3 +108,17 @@ before acquiring a session — calling the helper while holding the guard would 
 and this; they are the same shape and the first two predate the phrase. BP-8
 ([#135](https://github.com/YgorPerez/java-debugging-mcp/issues/135)) is the next candidate and should be
 weighed against this ADR before it adds a tool.
+
+**It has been applied a second time, and the transposition held.** STEP-2
+([#158](https://github.com/YgorPerez/java-debugging-mcp/issues/158)) gave the step filter a session default
+— `step_exclude_classes` / `step_only_classes` on `debug.attach` and `debug.launch` — against xdebug-mcp's
+`add_step_filter` / `list_step_filters` pair, which is the same tool-family shape this ADR rejected for
+watches. All three rules carried over unchanged: a default and never a merge, resolved at the call rather
+than frozen at attach, and every stepping reply says which list it used.
+
+It needed **one clause added**, and that clause is the reusable part. The step filter is a PAIR of fields,
+so "never a merge" had to be decided for the half-and-half case: a step naming `only_classes` alone does
+not pick up the session's `exclude_classes`. Naming one field disables the whole session default, and the
+built-in exclusion set fills the gap exactly as it would for a session that set none. That is the case a
+merge looks most reasonable in, and the one where it would silently change where a step lands. The next
+default of this shape should decide the same question before it ships rather than after.

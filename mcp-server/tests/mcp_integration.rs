@@ -12349,6 +12349,131 @@ fn a_step_restricted_with_only_classes_is_accepted_by_the_jvm() {
     server.panic_reset();
 }
 
+/// STEP-2 (#158): the step filter set at attach is a **session default**, and a step that names one of
+/// its own gets exactly that — never a union of the two.
+///
+/// The three arms are the three things a merge would break, and they run against ONE probe in one test
+/// deliberately, for the reason the STEP-1 test above gives: a single arm can pass on a JVM that never
+/// steps where the feature is about, leaving the whole thing untested and green.
+///
+/// `StepFilterProbe`'s marked line calls `List.sort(...)` with a comparator that is a method of the probe,
+/// so execution goes *ours -> java.util -> ours*. That is what makes "did it step into the JDK" an
+/// observable fact rather than a claim about the reply text.
+///
+/// ARM 3 IS THE ONE THAT MATTERS. The session excludes `java.*`; the call names `only_classes` and no
+/// exclusions. Under a merge the JDK stays excluded and the step lands in the probe — indistinguishable
+/// from arm 2, and the reason a merge is easy to ship by accident. Under the rule, the call's filter is
+/// the whole filter, the session's exclusions are not applied, and the built-in default set fills the gap
+/// exactly as it would for a session that had set nothing. The assertion is on the REPLY's attribution,
+/// because that is the part a caller reads to explain where they landed.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_session_step_filter_is_used_when_a_step_names_none_and_never_merged_when_it_does() {
+    let Some(jdk) =
+        jdk_or_skip("a_session_step_filter_is_used_when_a_step_names_none_and_never_merged_when_it_does")
+    else {
+        return;
+    };
+    // Not `mut`: this test never calls `probe.attach`, which is the only `&mut self` method on it — the
+    // attach below is a raw `debug.attach` carrying the session step filter this test is about.
+    let probe = Probe::launch(&jdk, "StepFilterProbe").expect("launch StepFilterProbe");
+    let mut server = Server::start().expect("start server");
+
+    // Attach with a session step filter of our own, rather than through `probe.attach`. `[]` would be the
+    // interesting empty case; here it is a real list, so arm 1 can tell it apart from the built-in set.
+    let attach_reply = server.call(
+        "debug.attach",
+        serde_json::json!({
+            "host": "127.0.0.1",
+            "port": probe.port,
+            "step_exclude_classes": ["java.*", "com.acme.nothing.*"],
+        }),
+    );
+    assert_contains_all(
+        "attach reports the session step filter it just set",
+        &attach_reply,
+        &["Connected", "Session step filter", "com.acme.nothing.*", "not merged into it"],
+    );
+
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("tick 1 "))
+        .expect("probe never reached its second tick, so StepFilterProbe never loaded");
+
+    let src = probe_source("StepFilterProbe");
+    let sort_line = probe_line(&src, "// BP1");
+    server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "StepFilterProbe", "line": sort_line}),
+    );
+
+    // ARM 1 — a step naming nothing uses the session's list, says so, and attributes it to the session
+    // rather than to this call.
+    server
+        .wait_for_event(&format!("\"line\":{sort_line}"), EVENT_TIMEOUT)
+        .expect("breakpoint on the sort line never fired");
+    let inherited_reply = server.call("debug.step_into", serde_json::json!({}));
+    assert_contains_all(
+        "a step naming no filter takes the session's and says whose it is",
+        &inherited_reply,
+        &["session step filter", "com.acme.nothing.*", "the session's step_exclude_classes"],
+    );
+    assert!(
+        !inherited_reply.contains("the default set"),
+        "the built-in set must not be claimed when a session default was used: {inherited_reply}"
+    );
+    server.wait_for_event("\"event\":\"step\"", EVENT_TIMEOUT).expect("inherited step never reported");
+    let landed = server.last_event();
+    assert!(
+        landed.contains("StepFilterProbe"),
+        "the session excluded java.*, so this step must land back in the probe:\n{landed}"
+    );
+
+    // ARM 2 — a step naming its own exclusions uses exactly those, and the reply stops crediting the
+    // session. `[]` here is the strongest form: under a merge the session's `java.*` would survive it.
+    server.call("debug.continue", serde_json::json!({}));
+    server
+        .wait_for_event(&format!("\"line\":{sort_line}"), EVENT_TIMEOUT)
+        .expect("breakpoint on the sort line never fired a second time");
+    let overridden_reply = server.call("debug.step_into", serde_json::json!({"exclude_classes": []}));
+    assert!(
+        overridden_reply.contains("No class filter"),
+        "an explicitly empty list must override the session default entirely: {overridden_reply}"
+    );
+    assert!(
+        !overridden_reply.contains("session step filter"),
+        "a call that named its own filter must not report using the session's: {overridden_reply}"
+    );
+    server.wait_for_event("\"event\":\"step\"", EVENT_TIMEOUT).expect("overriding step never reported");
+    let into_jdk = server.last_event();
+    assert!(
+        into_jdk.contains("java."),
+        "exclude_classes:[] against a session that excludes java.* must still land in the JDK — if it \
+         does not, the two lists were merged, which is the failure this test exists for:\n{into_jdk}"
+    );
+
+    // ARM 3 — the half-and-half case. `only_classes` alone must not pick up the session's exclusions.
+    server.call("debug.continue", serde_json::json!({}));
+    server
+        .wait_for_event(&format!("\"line\":{sort_line}"), EVENT_TIMEOUT)
+        .expect("breakpoint on the sort line never fired a third time");
+    let half_reply = server.call("debug.step_into", serde_json::json!({"only_classes": ["StepFilterProbe"]}));
+    assert!(
+        !half_reply.contains("com.acme.nothing.*"),
+        "naming only_classes must not drag the session's exclude_classes in with it: {half_reply}"
+    );
+    assert!(
+        !half_reply.contains("session step filter"),
+        "this call named a filter, so the reply must not credit the session: {half_reply}"
+    );
+    assert_contains_all(
+        "the exclusions fall back to the built-in set, exactly as for a session that set none",
+        &half_reply,
+        &["the default set", "Stepping ONLY within", "StepFilterProbe"],
+    );
+
+    server.panic_reset();
+}
+
 /// TRACE-8 (#72) on the path a caller actually drives: **clearing a traced stop point must not leave the
 /// hit thread frozen.**
 ///
