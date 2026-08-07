@@ -83,6 +83,300 @@ async fn arm_single_exception_pattern(
     ))
 }
 
+/// A condition as the update reply shows it: backticked, or the word for its absence (BP-9, #159).
+///
+/// `(none)` rather than an empty string, because "the condition is now nothing" and "the condition is now
+/// the empty string" are different claims and only one of them is reachable here.
+fn render_optional_condition(c: Option<&str>) -> String {
+    c.map_or_else(|| "(none)".to_string(), |c| format!("`{c}`"))
+}
+
+/// A hit count as the update reply shows it — `(none)` when there is none (BP-9, #159).
+fn render_optional_count(n: Option<i32>) -> String {
+    n.map_or_else(|| "(none)".to_string(), |n| n.to_string())
+}
+
+/// One armed stop point's editable state, whichever collection owns it (BP-9, #159).
+///
+/// A snapshot rather than a handle, because the six collections hold six different value types that only
+/// happen to share these field NAMES — there is no trait over them and inventing one to save this struct
+/// would be a larger change than the tool. Read once, decided on, then written back by
+/// [`apply_stop_point_edit`].
+struct EditableStopPoint {
+    /// What to call it in the reply — the kind, not the id.
+    kind: &'static str,
+    condition: Option<String>,
+    hit_count: Option<i32>,
+    spent: bool,
+    /// Monitor stop points have no `condition` field at all, and `debug.set_monitor_stop` takes none.
+    /// #159's acceptance criteria list monitor among the kinds whose condition can be changed; that
+    /// premise does not hold, and the refusal below says so rather than silently accepting the argument.
+    supports_condition: bool,
+    /// A `bpset_` family: the members that also have to be written, and the set record new members will
+    /// inherit from when they load.
+    family_members: Vec<String>,
+}
+
+/// Read the editable state of `id`, or say why it has none.
+fn read_editable_stop_point(
+    session: &crate::session::DebugSession,
+    id: &str,
+) -> Result<EditableStopPoint, String> {
+    let mk = |kind, condition: Option<String>, hit_count, spent, supports_condition| EditableStopPoint {
+        kind,
+        condition,
+        hit_count,
+        spent,
+        supports_condition,
+        family_members: Vec::new(),
+    };
+    if let Some(b) = session.breakpoints.get(id) {
+        return Ok(mk("line breakpoint", b.condition.clone(), b.arm.hit_count, b.spent, true));
+    }
+    if let Some(e) = session.exception_requests.get(id) {
+        return Ok(mk("exception stop point", e.condition.clone(), e.hit_count, e.spent, true));
+    }
+    if let Some(w) = session.watchpoints.get(id) {
+        return Ok(mk("field watchpoint", w.condition.clone(), w.hit_count, w.spent, true));
+    }
+    if let Some(m) = session.method_exits.get(id) {
+        return Ok(mk("method-exit stop point", m.condition.clone(), m.hit_count, m.spent, true));
+    }
+    if let Some(m) = session.monitor_requests.get(id) {
+        return Ok(mk("monitor stop point", None, m.hit_count, m.spent, false));
+    }
+    if let Some(set) = session.pattern_sets.get(id) {
+        let mut e = mk("wildcard family", set.condition.clone(), set.hit_count, false, true);
+        e.family_members.clone_from(&set.members);
+        return Ok(e);
+    }
+    if let Some(pb) = session.pending_breakpoints.iter().find(|p| p.bp_id == id) {
+        // Deferred is EDITABLE, unlike toggling. A pending breakpoint holds no request to silence, which
+        // is why `enabled_state_of` refuses it — but it does hold the definition it will arm with, so
+        // editing the condition it will arm with is exactly what this tool is for, and it costs nothing.
+        return Ok(mk("deferred breakpoint", pb.condition.clone(), pb.hit_count, false, true));
+    }
+    Err(format!("Stop point not found: {id}. debug.list_stop_points shows every id this session holds."))
+}
+
+/// One field's requested change (BP-9, #159) — the three states the tool's argument pair encodes.
+///
+/// A named enum rather than `Option<Option<T>>`, which is what this was first and which clippy flags with
+/// exactly the right advice: *use a custom enum if you need to distinguish all 3 cases*. We do, and the
+/// distinction is the part of this tool most easily got wrong, so it is worth a type that says the three
+/// state names out loud.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FieldEdit<T> {
+    /// The caller named neither the field nor its `clear_` flag.
+    Leave,
+    /// `clear_<field>: true` — remove it.
+    Clear,
+    /// A new value.
+    Set(T),
+}
+
+impl<T> FieldEdit<T> {
+    /// Whether the caller asked for this field at all — what decides if the reply mentions it.
+    const fn asked(&self) -> bool {
+        !matches!(self, Self::Leave)
+    }
+}
+
+/// Apply one edit to a field, leaving it untouched when nothing was asked.
+fn put_condition(dst: &mut Option<String>, edit: &FieldEdit<String>) {
+    match edit {
+        FieldEdit::Leave => {}
+        FieldEdit::Clear => *dst = None,
+        FieldEdit::Set(v) => *dst = Some(v.clone()),
+    }
+}
+
+/// See [`put_condition`]; separate only because the two fields have different types.
+const fn put_hit_count(dst: &mut Option<i32>, edit: &FieldEdit<i32>) {
+    match edit {
+        FieldEdit::Leave => {}
+        FieldEdit::Clear => *dst = None,
+        FieldEdit::Set(v) => *dst = Some(*v),
+    }
+}
+
+/// Write the edit back to whichever collection owns `id`.
+///
+/// The caller has already refused every contradictory combination, so this only applies.
+fn apply_stop_point_edit(
+    session: &mut crate::session::DebugSession,
+    id: &str,
+    condition: &FieldEdit<String>,
+    hit_count: &FieldEdit<i32>,
+) {
+    // A line breakpoint keeps its count inside `arm`, the definition a re-arm replays from — which is
+    // exactly why it has to be written there and not beside it: `rearm_stop_point` reads `arm`.
+    if let Some(b) = session.breakpoints.get_mut(id) {
+        put_condition(&mut b.condition, condition);
+        put_hit_count(&mut b.arm.hit_count, hit_count);
+        return;
+    }
+    if let Some(e) = session.exception_requests.get_mut(id) {
+        put_condition(&mut e.condition, condition);
+        put_hit_count(&mut e.hit_count, hit_count);
+        return;
+    }
+    if let Some(w) = session.watchpoints.get_mut(id) {
+        put_condition(&mut w.condition, condition);
+        put_hit_count(&mut w.hit_count, hit_count);
+        return;
+    }
+    if let Some(m) = session.method_exits.get_mut(id) {
+        put_condition(&mut m.condition, condition);
+        put_hit_count(&mut m.hit_count, hit_count);
+        return;
+    }
+    if let Some(m) = session.monitor_requests.get_mut(id) {
+        // No condition on this kind at all — see `EditableStopPoint::supports_condition`.
+        put_hit_count(&mut m.hit_count, hit_count);
+        return;
+    }
+    if let Some(pb) = session.pending_breakpoints.iter_mut().find(|p| p.bp_id == id) {
+        put_condition(&mut pb.condition, condition);
+        put_hit_count(&mut pb.hit_count, hit_count);
+        return;
+    }
+    if let Some(set) = session.pattern_sets.get_mut(id) {
+        put_condition(&mut set.condition, condition);
+        put_hit_count(&mut set.hit_count, hit_count);
+    }
+}
+
+/// Turn the tool's two argument pairs into two [`FieldEdit`]s, or say why they contradict.
+///
+/// Refused rather than resolved by precedence: a caller who sent both meant one of them, and guessing
+/// which would be a silent decision about what the stop point now fires on.
+fn parse_stop_point_edit(
+    a: &crate::args::UpdateStopPointArgs,
+) -> Result<(FieldEdit<String>, FieldEdit<i32>), String> {
+    if a.condition.is_some() && a.clear_condition {
+        return Err("Pass condition or clear_condition, not both — they ask for opposite things, and \
+                    picking one for you would silently decide what this stop point fires on."
+            .to_string());
+    }
+    if a.hit_count.is_some() && a.clear_hit_count {
+        return Err("Pass hit_count or clear_hit_count, not both.".to_string());
+    }
+    let condition = if a.clear_condition {
+        FieldEdit::Clear
+    } else {
+        a.condition.clone().map_or(FieldEdit::Leave, FieldEdit::Set)
+    };
+    let hit_count = if a.clear_hit_count {
+        FieldEdit::Clear
+    } else {
+        a.hit_count.map_or(FieldEdit::Leave, FieldEdit::Set)
+    };
+    Ok((condition, hit_count))
+}
+
+/// Whether `id` currently holds a live JDWP request, for any of the five kinds.
+fn is_armed(session: &crate::session::DebugSession, id: &str) -> bool {
+    session.breakpoints.get(id).is_some_and(|b| b.enabled)
+        || session.exception_requests.get(id).is_some_and(|e| e.enabled)
+        || session.watchpoints.get(id).is_some_and(|w| w.enabled)
+        || session.method_exits.get(id).is_some_and(|m| m.enabled)
+        || session.monitor_requests.get(id).is_some_and(|m| m.enabled)
+}
+
+/// Push a changed `hit_count` to the JVM, and report what it cost (BP-9, #159).
+///
+/// `hit_count` is JDWP's `Count` modifier: it lives on the event request and cannot be edited, so the
+/// request is cleared and re-set carrying the new value. Replayed through the same pair
+/// `debug.toggle_stop_point` uses rather than reimplemented, on the principle `debug.arm_stop_points`
+/// established — refusals that live in one place cannot drift from a second copy.
+async fn push_hit_count_to_the_wire(
+    session: &mut crate::session::DebugSession,
+    targets: &[String],
+) -> String {
+    let mut rearmed = 0usize;
+    for t in targets {
+        if is_armed(session, t) {
+            let _ = disable_stop_point(session, t).await;
+            if rearm_stop_point(session, t).await.is_ok() {
+                rearmed += 1;
+            }
+        }
+    }
+    format!(
+        "\n   ↻ hit_count is JDWP's Count modifier, so the request was replaced on {rearmed} stop \
+         point(s) to carry it. The id and the tally below are this server's and survived; the JVM's own \
+         count starts again from zero."
+    )
+}
+
+/// The refusals that depend on what the stop point IS, rather than on what was asked (BP-9, #159).
+fn refuse_uneditable(
+    id: &str,
+    before: &EditableStopPoint,
+    condition: &FieldEdit<String>,
+) -> Result<(), String> {
+    // ADR-0026: a spent stop point has already been deleted by the JVM. Clearing one sends nothing, and
+    // neither may this — an update that "succeeded" on a stop point that can never fire again is a reply
+    // that reads like a change and is not one.
+    if before.spent {
+        return Err(format!(
+            "{id} is SPENT — it reached its hit count and the JVM has already deleted the request, so \
+             there is nothing armed to update. Arm a new stop point with the condition you want; its id \
+             and tally start fresh either way, which is the case this tool cannot save you from."
+        ));
+    }
+    if condition.asked() && !before.supports_condition {
+        return Err(format!(
+            "{id} is a {} and takes no condition — debug.set_monitor_stop has no condition argument \
+             either, so there is none to change. Its hit_count can be updated.",
+            before.kind
+        ));
+    }
+    Ok(())
+}
+
+/// The `debug.update_stop_point` reply: what changed, from what, and what did not move (BP-9, #159).
+fn render_stop_point_update(
+    id: &str,
+    before: &EditableStopPoint,
+    after: &EditableStopPoint,
+    condition: &FieldEdit<String>,
+    hit_count: &FieldEdit<i32>,
+    family_members: usize,
+    wire: &str,
+) -> String {
+    let mut out = format!("✏️  Updated {id} ({}).", after.kind);
+    if condition.asked() {
+        let _ = write!(
+            out,
+            "\n   Condition: {} → {}",
+            render_optional_condition(before.condition.as_deref()),
+            render_optional_condition(after.condition.as_deref())
+        );
+    }
+    if hit_count.asked() {
+        let _ = write!(
+            out,
+            "\n   Hit count: {} → {}",
+            render_optional_count(before.hit_count),
+            render_optional_count(after.hit_count)
+        );
+    }
+    if family_members > 0 {
+        let _ = write!(
+            out,
+            "\n   Applied to {family_members} member(s) of the family, and to classes that load later."
+        );
+    }
+    out.push_str(wire);
+    out.push_str(
+        "\n   The id and the hit tally are unchanged — debug.list_stop_points shows the new values \
+         against the same counter.",
+    );
+    out
+}
+
 /// Whether the stop point `id` is currently armed, whichever of the five maps owns it.
 ///
 /// Extracted from `handle_toggle_stop_point` so that function stays under the complexity gate, but the
@@ -338,6 +632,7 @@ impl RequestHandler {
             "debug.list_stop_points" => self.handle_list_stop_points(args).await,
             "debug.clear_stop_point" => self.handle_clear_stop_point(args).await,
             "debug.toggle_stop_point" => self.handle_toggle_stop_point(args).await,
+            "debug.update_stop_point" => self.handle_update_stop_point(args).await,
             // BP-8 (#135). Cannot recurse: `ARMABLE_TOOLS` does not contain this tool, so a set cannot name
             // it, and the branch above is the only path back into the arming handlers.
             "debug.arm_stop_points" => self.handle_arm_stop_points(args).await,
@@ -1320,6 +1615,72 @@ impl RequestHandler {
         } else {
             format!("🔕 Disabled {id} ({what}) — its definition is kept; toggle it back on to re-arm.")
         })
+    }
+
+    /// Change an armed stop point's `condition` or `hit_count` without re-arming it (BP-9, #159).
+    ///
+    /// **What clear-and-re-set threw away.** Changing a condition meant `debug.clear_stop_point` then a
+    /// fresh `debug.set_*`, which allocated a NEW id — the caller-visible defect BP-3 (#6) already fixed
+    /// once for re-arming — and reset the hit tally that FILT-10 (#110) made the thing a listing reports
+    /// and TRACE-15 (#156) made trustworthy. Tightening a condition is iterative by nature (arm broad,
+    /// watch what fires, narrow), and the narrowing is precisely the moment you want to compare how often
+    /// the broad version fired against how often the narrow one does. That was the number the old path
+    /// deleted, at the moment of comparison.
+    ///
+    /// **A TOOL AND NOT ARGUMENTS ON `debug.toggle_stop_point`** (ADR-0045). ADR-0015's rule decides it:
+    /// *silence this* and *change what this decides on* are two questions, and the second is not a
+    /// bounding, filtering or rendering variation of the first. The practical half is sharper than the
+    /// principle — folding this in would make `toggle_stop_point`'s NAME wrong, and renaming a tool is
+    /// the silent downstream break `docs/toolkit-contract.md` exists about.
+    ///
+    /// **A condition change sends no packet; a hit count change sends several.** Conditions are evaluated
+    /// on this side, so changing one is a field write. `hit_count` is JDWP's `Count` modifier, which lives
+    /// on the event request and cannot be edited — so it is applied by replaying the existing
+    /// disable/re-arm path, the same one `debug.toggle_stop_point` uses. The id and the tally are ours and
+    /// survive; the JVM's own count restarts, because the request carrying it was replaced.
+    async fn handle_update_stop_point(&self, args: serde_json::Value) -> Result<String, String> {
+        let a: crate::args::UpdateStopPointArgs = crate::args::parse(&args)?;
+        let id = a.breakpoint_id.trim().to_string();
+        let (condition, hit_count) = parse_stop_point_edit(&a)?;
+        if !condition.asked() && !hit_count.asked() {
+            return Err(format!(
+                "Nothing to update on {id}. Pass condition / clear_condition, hit_count / \
+                 clear_hit_count, or both pairs. To silence it instead, use debug.toggle_stop_point."
+            ));
+        }
+
+        let session_guard =
+            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let mut session = session_guard.lock().await;
+
+        let before = read_editable_stop_point(&session, &id)?;
+        refuse_uneditable(&id, &before, &condition)?;
+        // The arming tools' own refusal, not a second copy of it: an invoking condition would execute
+        // debuggee code on every hit. Checked BEFORE anything is written, so an invalid condition leaves
+        // the stop point exactly as it was — armed, with its previous condition.
+        if let FieldEdit::Set(new) = &condition {
+            check_readonly_exprs(session.read_only, Some(new.as_str()), &[])?;
+        }
+
+        let members = before.family_members.clone();
+        apply_stop_point_edit(&mut session, &id, &condition, &hit_count);
+        // A family updates as ONE unit: the set record is what members loading later inherit, and every
+        // member already armed has its own copy to keep in step (FILT-3).
+        for m in &members {
+            apply_stop_point_edit(&mut session, m, &condition, &hit_count);
+        }
+
+        // Only a hit_count change has to reach the JVM; a condition is evaluated on this side.
+        let wire = if hit_count.asked() {
+            let targets: Vec<String> = if members.is_empty() { vec![id.clone()] } else { members.clone() };
+            push_hit_count_to_the_wire(&mut session, &targets).await
+        } else {
+            String::new()
+        };
+
+        let after = read_editable_stop_point(&session, &id)?;
+        drop(session);
+        Ok(render_stop_point_update(&id, &before, &after, &condition, &hit_count, members.len(), &wire))
     }
 
     async fn handle_continue(&self, args: serde_json::Value) -> Result<String, String> {

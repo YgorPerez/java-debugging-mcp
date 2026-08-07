@@ -600,6 +600,46 @@ pub struct ToggleBreakpointArgs {
     pub enabled: Option<bool>,
 }
 
+/// Arguments for `debug.update_stop_point` (BP-9, #159).
+///
+/// **Three states per field, spelled out rather than encoded.** `condition: "..."` sets it,
+/// `clear_condition: true` removes it, and omitting both leaves it alone. The alternative — absent means
+/// leave, `null` means remove — is idiomatic JSON and unreadable from the published schema, which shows
+/// only `["string","null"]` for both cases and puts the distinction in prose. On a surface whose callers
+/// are models reading the schema, the extra argument is cheaper than the ambiguity. Passing a field and
+/// its `clear_` flag together is refused rather than resolved by precedence.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateStopPointArgs {
+    /// Stop-point ID (`bp_…` / `exc_…` / `watch_…` / `mexit_…` / `mon_…` / `bpset_…`) from
+    /// `debug.list_stop_points`. Named `breakpoint_id` to match `debug.clear_stop_point` and
+    /// `debug.toggle_stop_point` exactly, so an id copied out of one call works in all three.
+    pub breakpoint_id: String,
+    /// The new condition. Omit to leave the current one alone; use `clear_condition` to remove it.
+    ///
+    /// Evaluated on this side, like the condition the arming tools take, so changing it sends **no JDWP
+    /// packet** — which is most of the point of this tool. It inherits the arming tools' refusals
+    /// unchanged: one that invokes is refused under `read_only` (ADR-0001), and one that cannot parse
+    /// leaves the stop point exactly as it was.
+    #[serde(default)]
+    pub condition: Option<String>,
+    /// Remove the condition entirely, so the stop point fires on every hit again.
+    #[serde(default)]
+    pub clear_condition: bool,
+    /// The new hit count — stop on the Nth hit and then be spent.
+    ///
+    /// **Unlike `condition`, this one costs a round trip.** `hit_count` is JDWP's `Count` modifier, which
+    /// lives on the event request and cannot be edited in place, so changing it clears the request and
+    /// sets a new one carrying the new count. The stop point's **id and hit tally survive** that, which
+    /// is the whole difference from doing it by hand with `debug.clear_stop_point` + `debug.set_*`. The
+    /// JVM's own count restarts, because it is a property of the request that was just replaced.
+    #[serde(default)]
+    pub hit_count: Option<i32>,
+    /// Remove the hit count, so the stop point fires indefinitely instead of being spent on the Nth hit.
+    #[serde(default)]
+    pub clear_hit_count: bool,
+}
+
 /// Arguments for `debug.get_traces`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

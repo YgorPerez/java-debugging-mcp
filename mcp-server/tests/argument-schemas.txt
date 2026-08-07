@@ -1,7 +1,7 @@
 # Every debug.* tool's ARGUMENT schemas, as advertised to callers. GENERATED — do not hand-edit:
 #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot
 #
-# 41 tools, 233 arguments.
+# 42 tools, 239 arguments.
 #
 # Each argument shows its full generated schema minus the description — so a changed type,
 # default, format, minimum or anyOf arm fails as loudly as a renamed field — then the description
@@ -1532,6 +1532,36 @@
 - enabled: {"default":null,"type":["boolean","null"]}
     Desired state: `false` clears the JDWP request but keeps the definition (`condition`, `trace_expr`) so it
     can be re-armed later; `true` re-arms it. Omit to flip the current state.
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
+
+## debug.update_stop_point
+- breakpoint_id: REQUIRED {"type":"string"}
+    Stop-point ID (`bp_…` / `exc_…` / `watch_…` / `mexit_…` / `mon_…` / `bpset_…`) from
+    `debug.list_stop_points`. Named `breakpoint_id` to match `debug.clear_stop_point` and
+    `debug.toggle_stop_point` exactly, so an id copied out of one call works in all three.
+- clear_condition: {"default":false,"type":"boolean"}
+    Remove the condition entirely, so the stop point fires on every hit again.
+- clear_hit_count: {"default":false,"type":"boolean"}
+    Remove the hit count, so the stop point fires indefinitely instead of being spent on the Nth hit.
+- condition: {"default":null,"type":["string","null"]}
+    The new condition. Omit to leave the current one alone; use `clear_condition` to remove it. Evaluated on
+    this side, like the condition the arming tools take, so changing it sends **no JDWP packet** — which is
+    most of the point of this tool. It inherits the arming tools' refusals unchanged: one that invokes is
+    refused under `read_only` (ADR-0001), and one that cannot parse leaves the stop point exactly as it was.
+- hit_count: {"default":null,"format":"int32","type":["integer","null"]}
+    The new hit count — stop on the Nth hit and then be spent. **Unlike `condition`, this one costs a round
+    trip.** `hit_count` is JDWP's `Count` modifier, which lives on the event request and cannot be edited in
+    place, so changing it clears the request and sets a new one carrying the new count. The stop point's **id
+    and hit tally survive** that, which is the whole difference from doing it by hand with
+    `debug.clear_stop_point` + `debug.set_*`. The JVM's own count restarts, because it is a property of the
+    request that was just replaced.
 - session_id: {"default":null,"type":["string","null"]}
     Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
     recently attached one — which is what every example here assumes. Give it when more than one JVM is

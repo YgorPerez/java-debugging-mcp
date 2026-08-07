@@ -5082,6 +5082,25 @@ fn list_sessions_names_every_attachment_and_flags_a_dead_one() {
     assert!(!after.contains(&first_id), "the disconnected session must be gone:\n{after}");
 }
 
+/// The `Hits: N` a `debug.list_stop_points` entry reports for one stop-point id (BP-9, #159).
+///
+/// Read out of the LISTING rather than out of any reply the update itself produced: the tally surviving is
+/// a fact about what the session still holds, and a tool that reported its own number would be asserting
+/// about itself.
+fn hits_of(listing: &str, id: &str) -> Option<u64> {
+    let mut lines = listing.lines().skip_while(|l| !l.contains(id));
+    lines.next()?;
+    for l in lines {
+        if l.contains("bp_") || l.contains("exc_") || l.contains("watch_") {
+            break; // the next entry started; this one had no tally
+        }
+        if let Some(rest) = l.trim().strip_prefix("Hits: ") {
+            return rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok();
+        }
+    }
+    None
+}
+
 /// Which session `debug.list_sessions` marks as current — the line carrying `← current`.
 ///
 /// Read through the LISTING rather than from the switch's own reply, deliberately: the listing resolves
@@ -12306,6 +12325,105 @@ fn step_into_skips_the_jdk_by_default_and_steps_into_it_when_asked() {
          code — either the comparator the JDK calls back into, or the next line — and not inside \
          java.util:\n{filtered}"
     );
+
+    server.panic_reset();
+}
+
+/// BP-9 (#159): narrowing a condition keeps the stop point's id AND its hit tally.
+///
+/// **The tally is the assertion, and it is the whole issue.** Changing a condition used to mean
+/// `debug.clear_stop_point` + a fresh `debug.set_*`: a new id, and a counter back at zero. FILT-10 (#110)
+/// made that counter the thing a listing reports and TRACE-15 (#156) made `Hits: 0` distinguishable from
+/// *fired constantly and was discarded* — and the clear-and-re-set path threw the number away at exactly
+/// the moment a caller wants it, which is when comparing how often the broad condition fired against how
+/// often the narrow one does.
+///
+/// `trace: true` throughout, so the probe keeps running and the tally accumulates without freezing a VM
+/// for the length of the test.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn narrowing_a_condition_keeps_the_stop_points_id_and_its_hit_tally() {
+    let Some(jdk) = jdk_or_skip("narrowing_a_condition_keeps_the_stop_points_id_and_its_hit_tally") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "CondProbe").expect("launch CondProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    let line = probe_line(&probe_source("CondProbe"), "// BP1");
+    // Broad on purpose: true on every hit, so the tally moves and there is something to preserve.
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "CondProbe", "line": line, "condition": "n >= 0", "trace": true,
+        }),
+    );
+    let bp_id = armed.split_whitespace().find(|w| w.starts_with("bp_")).map_or_else(
+        || panic!("no bp_ id in the arming reply:\n{armed}"),
+        |w| w.trim_end_matches([':', ',', ')', '.']).to_string(),
+    );
+
+    probe.send_line("go").expect("cue the worker");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| work_index(l).is_some_and(|n| n >= 20))
+        .expect("the worker never reached its 20th hit");
+
+    let hits_before = hits_of(&server.call("debug.list_stop_points", serde_json::json!({})), &bp_id)
+        .expect("the listing must report a tally for the armed stop point");
+    assert!(hits_before > 0, "the broad condition must have fired before the narrowing: {hits_before}");
+
+    // THE CALL UNDER TEST.
+    let updated = server.call(
+        "debug.update_stop_point",
+        serde_json::json!({"breakpoint_id": &bp_id, "condition": "n == 999999999"}),
+    );
+    assert_contains_all(
+        "the update names the stop point and both sides of the change",
+        &updated,
+        &[&bp_id, "Condition:", "n >= 0", "n == 999999999"],
+    );
+
+    let listing = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert!(
+        listing.contains(&bp_id),
+        "the id must survive the update — a new one is the defect BP-3 fixed once already:\n{listing}"
+    );
+    assert!(listing.contains("n == 999999999"), "the listing must show the new condition:\n{listing}");
+    let hits_after = hits_of(&listing, &bp_id).expect("the listing must still report a tally");
+    assert!(
+        hits_after >= hits_before,
+        "the hit tally was reset by the update: {hits_before} before, {hits_after} after. That number is \
+         the entire point of #159 — a clear-and-re-set would have put it back to 0."
+    );
+
+    // Clearing the condition is a third state, distinct from omitting the field.
+    let cleared = server.call(
+        "debug.update_stop_point",
+        serde_json::json!({"breakpoint_id": &bp_id, "clear_condition": true}),
+    );
+    assert_contains_all(
+        "clearing reports the removal rather than a new value",
+        &cleared,
+        &["n == 999999999", "(none)"],
+    );
+    assert!(
+        hits_of(&server.call("debug.list_stop_points", serde_json::json!({})), &bp_id)
+            .is_some_and(|h| h >= hits_after),
+        "clearing the condition must not reset the tally either"
+    );
+
+    // The refusals that must not touch anything.
+    let both = server.call(
+        "debug.update_stop_point",
+        serde_json::json!({"breakpoint_id": &bp_id, "condition": "n > 1", "clear_condition": true}),
+    );
+    assert!(both.contains("not both"), "a field and its clear_ flag together must be refused: {both}");
+    let nothing = server.call("debug.update_stop_point", serde_json::json!({"breakpoint_id": &bp_id}));
+    assert!(nothing.contains("Nothing to update"), "an empty update must be refused: {nothing}");
+    let missing = server
+        .call("debug.update_stop_point", serde_json::json!({"breakpoint_id": "bp_nope", "condition": "x"}));
+    assert!(missing.contains("not found"), "an unknown id must be refused: {missing}");
 
     server.panic_reset();
 }

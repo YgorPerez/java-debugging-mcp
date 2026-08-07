@@ -89,7 +89,7 @@ actually loaded — the only way to find a generated proxy or a shaded class. `d
 `debug.list_fields` render signatures as Java source types with generics. `debug.source` settles
 whether your checkout is the code that is running.
 
-**41 tools in total** — see the [tool reference](docs/tools.md).
+**42 tools in total** — see the [tool reference](docs/tools.md).
 
 ## Install
 

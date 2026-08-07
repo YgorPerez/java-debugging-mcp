@@ -99,7 +99,7 @@ downstream pin has that the docs never name*. Turned around, it reads: a decisio
 no comparison names is a decision that will be taken again.
 
 **Read off `src/tools/*.ts` at tag `v1.3.0` on 7 Aug 2026** — the `server.tool(…)` registrations rather than
-the README, the same standard as the table above. **46 tools**, against **41** in this column at 0.20.0 (40 when this section was written on 7 Aug; SESS-1, #157, added `debug.set_current_session` the same day, which is the row below marked open). MIT,
+the README, the same standard as the table above. **46 tools**, against **42** in this column at 0.20.0 (40 when this section was written on 7 Aug; `debug.set_current_session` and `debug.update_stop_point` landed the same day, from SESS-1 #157 and BP-9 #159 — two of the four rows this section had marked open). MIT,
 not archived, last push 5 Aug 2026. Every one of the 46 is in exactly one table below; the counts are stated
 so that claim is checkable rather than asserted.
 
@@ -116,7 +116,7 @@ read-only mode. Neither list is a gap in the other project.
 The arrow points the other way in exactly one place, and it is the reason #157 exists: holding several
 long-lived JVMs at once makes *which session am I talking to* a real question, and here it is not a tool.
 
-### Has a counterpart here — 27 of 46
+### Has a counterpart here — 28 of 46
 
 | xdebug-mcp | here |
 | --- | --- |
@@ -125,6 +125,7 @@ long-lived JVMs at once makes *which session am I talking to* a real question, a
 | `set_call_breakpoint` | `debug.set_line_stop {method}` |
 | `remove_breakpoint` | `debug.clear_stop_point` |
 | `list_breakpoints` | `debug.list_stop_points` |
+| `update_breakpoint` | `debug.update_stop_point` (BP-9, ADR-0045) — and it keeps the stop point's id and hit tally, which is the half that took the work |
 | `continue` | `debug.continue` |
 | `step_into` / `step_over` / `step_out` | `debug.step_into` / `debug.step_over` / `debug.step_out` |
 | `detach` | `debug.disconnect` |
@@ -155,7 +156,7 @@ alternative already written down; none of them is an unbuilt feature.
 | `start_coverage` / `stop_coverage` / `get_coverage_report` | the same file — JDWP has no coverage command set either, and the same no-agent promise applies |
 | `get_function_history` | [`.out-of-scope/method-entry-events.md`](../.out-of-scope/method-entry-events.md) (METH-1) — `METHOD_ENTRY` filters by *class*, not by method, so it is the noisiest event in JDWP. *What called this?* is answered by a traced stop point's caller chain instead (TRACE-5), at one site rather than every method on the class |
 
-### Open here, each with its issue — 5 of 46
+### Open here, each with its issue — 4 of 46
 
 Each of these came out of the 7 Aug 2026 comparison and is filed rather than settled.
 
@@ -163,7 +164,6 @@ Each of these came out of the 7 Aug 2026 comparison and is filed rather than set
 | --- | --- |
 | `set_active_session` | **#157** (SESS-1) — the current session cannot be changed, so a second attach is the only way back to a JVM already held |
 | `add_step_filter` / `list_step_filters` | **#158** (STEP-2) — the step filter is the one session preference that must be restated on every call |
-| `update_breakpoint` | **#159** (BP-9) — narrowing a condition means clearing the stop point, which discards its id and its hit tally |
 | `capture_request_context` | **#160** (DISC-15) — *what did this request carry?* costs six invoking evaluates on a thread you had to suspend |
 
 ### No counterpart, deliberately — 2 of 46

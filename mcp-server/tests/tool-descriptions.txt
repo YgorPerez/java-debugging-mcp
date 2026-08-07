@@ -1195,3 +1195,30 @@ classes; re-arming a family that is still FULL deliberately does not put its wat
 so), without losing its condition/trace_expr — disabling clears the JDWP request but keeps the definition,
 enabling re-arms it at the same location. Pass enabled:false/true, or omit to flip. Handy to quiet a chatty
 breakpoint on a shared JVM without having to retype it.
+
+## debug.update_stop_point
+Change an armed stop point's condition or hit_count IN PLACE, keeping its id and its hit tally. Works on bp_ /
+exc_ / watch_ / mexit_ / mon_ / bpset_ ids and on a deferred breakpoint waiting for its class. THE POINT IS
+THE TALLY. Changing a condition used to mean debug.clear_stop_point followed by a fresh debug.set_*, which
+allocated a NEW id — so a bp_ you had written down stopped meaning anything — and reset the hit count that
+debug.list_stop_points reports. Tightening a condition is iterative by nature: arm broad, watch what fires,
+narrow. The narrowing is exactly the moment you want to compare how often the broad version fired against how
+often the narrow one does, and that is the number the old path deleted at the moment of comparison. A bpset_
+family also re-walked every loaded class and re-installed its class-load watch, which is the expensive half of
+arming, spent to change one string. THREE STATES PER FIELD, SPELLED OUT: condition:"…" sets it,
+clear_condition:true removes it, omitting both leaves it alone — and the same for hit_count / clear_hit_count.
+Passing a field and its clear_ flag together is REFUSED rather than resolved by precedence, because guessing
+which you meant would silently decide what the stop point fires on. A CONDITION CHANGE SENDS NO JDWP PACKET; A
+HIT_COUNT CHANGE SENDS SEVERAL. Conditions are evaluated on this side, so changing one is free and instant.
+hit_count is JDWP's Count modifier, which lives on the event request and cannot be edited — so the request is
+cleared and re-set carrying the new count. Your id and tally survive that; the JVM's own count restarts, and
+the reply says so. THE ARMING TOOLS' REFUSALS APPLY UNCHANGED, because it is their code rather than a second
+copy: a condition that invokes is refused under read_only exactly as at arming (ADR-0001), and an invalid one
+leaves the stop point exactly as it was — armed, with its previous condition. A SPENT stop point is refused
+(ADR-0026): it reached its hit count, the JVM has already deleted the request, and an update that reported
+success on one that can never fire again would read like a change and not be one. A MONITOR stop point takes
+no condition — debug.set_monitor_stop has no such argument — so its hit_count updates and a condition is
+refused with that said. A bpset_ family updates as one unit: every current member takes the new value, and so
+do classes that load later. This does NOT change a stop point's LOCATION — that is a different stop point, and
+clear + set is correct for it — nor trace, trace_expr, the trace bounds, or thread/instance filters. To
+silence one without changing what it decides on, use debug.toggle_stop_point.
