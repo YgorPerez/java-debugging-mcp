@@ -110,13 +110,14 @@ runs *during* startup, since it holds the VM before its first instruction.
 | Platform | Asset |
 | --- | --- |
 | Linux x86_64 | `jdwp-mcp-<tag>-linux-x86_64` |
+| Linux ARM64 | `jdwp-mcp-<tag>-linux-aarch64` |
 | macOS (Apple Silicon) | `jdwp-mcp-<tag>-macos-aarch64` |
 | macOS (Intel) | `jdwp-mcp-<tag>-macos-x86_64` |
 | Windows x86_64 | `jdwp-mcp-<tag>-windows-x86_64.exe` |
 
-The Linux build is statically linked against musl, so it runs on any x86_64 Linux whatever the
-distribution's glibc — including an app server older than the machine you downloaded it on. Every
-release ships a `SHA256SUMS` covering all four assets:
+Both Linux builds are statically linked against musl, so they run on any Linux of that architecture
+whatever the distribution's glibc — including an app server older than the machine you downloaded it on.
+Every release ships a `SHA256SUMS` covering all five assets:
 
 ```bash
 tag=v0.17.0
