@@ -131,11 +131,23 @@ the crate must exist first. **The first version of each crate is published by ha
 configured in the crates.io UI, and every release after that is this workflow. Recorded here because it is the
 one step in this decision that no amount of workflow YAML can take on.
 
-**Done at v0.20.0**, and the sequence is worth keeping because it is the one nobody gets to rehearse: tag and
-release normally (the `publish` job fails at auth, as designed and as the release notes said in advance);
-`cargo publish --workspace` by hand from the tagged commit; configure the publisher on **both** crate settings
-pages — owner `YgorPerez`, repo `java-debugging-mcp`, workflow `release.yml`, **environment blank**, since the
-job declares no `environment:` and that field is an exact-match claim.
+**Done at v0.20.0, so releases from `0.21.0` publish themselves and nothing needs a token.** The sequence is
+worth keeping because it is the one nobody gets to rehearse: tag and release normally (the `publish` job
+fails at auth, as designed and as the release notes said in advance); `cargo publish --workspace` by hand
+from the tagged commit; configure the publisher on **both** crate settings pages — owner `YgorPerez`, repo
+`java-debugging-mcp`, workflow `release.yml`, **environment blank**, since the job declares no
+`environment:` and that field is an exact-match claim.
+
+**The config was verified rather than assumed, and the method generalises to any credential-less auth.**
+Re-running v0.20.0's `publish` job after the config landed moved the failure from
+`No Trusted Publishing config found` at the auth step to `crate jdwp-mcp@0.20.0 already exists` at
+`cargo publish`. The job is red both times — **the signal is which step**, and auth was the only part in
+doubt. Without that re-run the config would have been "configured" in the sense this repo distrusts: nobody
+had exercised it, and the first exercise would have been the next release.
+
+**v0.20.0's release run therefore keeps a permanently red `publish` job.** That is history rather than a
+fault and its release notes said so in advance; a published version cannot be replaced, so re-running it
+can only ever fail. Read it as the record of the bootstrap, not as a broken release.
 
 Two things went wrong that the plan had not predicted, neither of them about this design:
 

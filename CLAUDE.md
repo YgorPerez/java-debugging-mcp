@@ -409,42 +409,21 @@ gates, commits and tags — deliberately stopping before the push — and the co
 which bump, the release body (which *is* the release notes, so the toolkit can read it), the tag push, the
 downstream pin and skill audit, and the issue closes.
 
-**A tag now also publishes to crates.io, and that step is the one thing here nothing can undo** (REL-5,
-ADR-0043). `cargo install jdwp-mcp` is why; the release binaries stay the better path for anyone who would
-rather not compile, so this **added** a channel rather than replacing one. Three things follow that are worth
-knowing before you cut one:
-
-**The library is `java-debugging-jdwp-client` on crates.io, not `jdwp-client`** — that name was taken in
-September 2025 by an unrelated project, which is the same collision `scripts/semver-check.sh` was written
-around. `[lib] name` is still `jdwp_client`, so the rename touches no source file, but `-p jdwp-client` is
-now a package name nothing answers to. **`cargo clean -p` on a name no package has cleans nothing and exits
-0**, which is how that would have gone unnoticed in `rust-doctor.yml`.
-
-**`[workspace.dependencies].jdwp-client` carries a `version` that must equal `[workspace.package].version`**,
-and `release.sh` bumps both in one step — do not bump by hand. It is *not* a silent hazard, which is worth
-saying because this file briefly claimed it was: cargo validates a path dependency's `version` against the
-path package at resolution, so a mismatch fails the next `cargo check` with `failed to select a version for
-the requirement`, long before anything is tagged. A test written to pin the two numbers together was deleted
-for guarding what the compiler already checks (ADR-0043 records both the wrong claim and the measurement).
-
-**The bootstrap is DONE — it happened at v0.20.0 and does not happen again.** Publishing uses Trusted
-Publishing (OIDC, no stored token, keeping this repo's no-secrets property), and crates.io has no equivalent
-of PyPI's pending publishers: a trusted publisher is configured *on* a crate, so the crate must exist first.
-So `0.20.0` of both crates was published by hand and the publishers configured afterwards; **releases from
-`0.21.0` publish themselves** and nothing needs a token. Verified rather than assumed: re-running v0.20.0's
-`publish` job after the config landed moved the failure from `No Trusted Publishing config found` at the auth
-step to `crate jdwp-mcp@0.20.0 already exists` at `cargo publish` — auth green, which is the only part that
-was in doubt.
-**v0.20.0's release run therefore has a permanently red `publish` job**, and that is history rather than a
-fault; its release notes say so. Do not re-run it expecting green — a published version cannot be replaced.
-If you ever bootstrap another crate here, it must be `--workspace`: `cargo package -p jdwp-mcp` alone fails
-with `no matching package named java-debugging-jdwp-client` until the client is actually on the index, because only the workspace form stands
-up the temporary registry that resolves the sibling.
-
 It leads with the four traps that have actually cost time, so read them rather than rediscovering them. The
 worst is that a non-interactive `release.sh` writes only the commit **subject**, and repairing that means
 **re-tagging** — an annotated tag names one commit, and amending leaves the tag pointing at an object no
 longer on the branch.
+
+**A tag also publishes both crates to crates.io** (REL-5, ADR-0043) — the one step here nothing can undo,
+since a version can be yanked but keeps its number forever. It runs last for that reason, over OIDC with no
+stored token, and needs nothing from you: the manual bootstrap happened at v0.20.0. ADR-0043 has the
+sequence if it ever has to be done again, and `/release` step 5 has what to do when that job goes red.
+
+**The library's package name is `java-debugging-jdwp-client`, not `jdwp-client`** — the obvious name belongs
+to an unrelated project on crates.io, the collision `scripts/semver-check.sh` was built around. `[lib] name`
+is still `jdwp_client`, so imports are untouched, but **anything taking a `-p` package name wants the long
+one**: `cargo clean -p jdwp-client` cleans nothing and exits 0, leaving the stale-cache step in
+`rust-doctor.yml` **vacuous** while it still reads as passing.
 
 **`server.json` is the MCP registry manifest and `release.sh` bumps it** (REL-3, #137). It carries its own
 `version`, so a manifest left behind tells a searcher a release exists that was never published — the
