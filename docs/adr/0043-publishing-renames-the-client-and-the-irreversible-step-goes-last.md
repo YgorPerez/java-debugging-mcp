@@ -128,9 +128,30 @@ writing post-mortems about, and the reason `.github/actions/setup-rust` prints `
 
 crates.io has no equivalent of PyPI's "pending publishers". A trusted publisher is configured *on* a crate, so
 the crate must exist first. **The first version of each crate is published by hand**, then the publisher is
-configured in the crates.io UI, and every release after that is this workflow. Until that happens the job
-fails at the auth step on every tag. Recorded here because it is the one step in this decision that no amount
-of workflow YAML can take on.
+configured in the crates.io UI, and every release after that is this workflow. Recorded here because it is the
+one step in this decision that no amount of workflow YAML can take on.
+
+**Done at v0.20.0**, and the sequence is worth keeping because it is the one nobody gets to rehearse: tag and
+release normally (the `publish` job fails at auth, as designed and as the release notes said in advance);
+`cargo publish --workspace` by hand from the tagged commit; configure the publisher on **both** crate settings
+pages — owner `YgorPerez`, repo `java-debugging-mcp`, workflow `release.yml`, **environment blank**, since the
+job declares no `environment:` and that field is an exact-match claim.
+
+Two things went wrong that the plan had not predicted, neither of them about this design:
+
+- **crates.io refuses to publish from an account with no verified email**, which is an account-level
+  requirement nothing in a manifest or workflow can reveal. It failed at the *first* upload and published
+  neither crate, so the workspace ordering held under a real failure rather than only under `--dry-run`.
+- **The crates.io web API lagged the sparse index by minutes.** `cargo publish` printed `Published` while
+  `/api/v1/crates/jdwp-mcp` still answered 404. The index is what `cargo` resolves against and it was correct
+  immediately; verify there, not against the API — `/api/v1/` is the *slower* of the two and reads like
+  failure while it catches up.
+
+Verified end to end rather than from the success message: the published index entry carries
+`"package": "java-debugging-jdwp-client"` beside the `jdwp-client` key, so a stranger's resolution reaches
+this crate and not bonk-dev's — the single most dangerous thing the rename could have got wrong — and
+`cargo install jdwp-mcp --version 0.20.0 --locked` into a clean root compiled both crates from the registry
+and produced a binary that runs.
 
 Note the first publish must be `cargo publish --workspace`, not two `-p` invocations. **Measured:**
 `cargo package -p jdwp-mcp` fails with `no matching package named java-debugging-jdwp-client found` until the

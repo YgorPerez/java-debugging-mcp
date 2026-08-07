@@ -427,13 +427,18 @@ path package at resolution, so a mismatch fails the next `cargo check` with `fai
 the requirement`, long before anything is tagged. A test written to pin the two numbers together was deleted
 for guarding what the compiler already checks (ADR-0043 records both the wrong claim and the measurement).
 
-**The first publish of each crate has to be done manually and cannot be automated.** Publishing uses Trusted
+**The bootstrap is DONE — it happened at v0.20.0 and does not happen again.** Publishing uses Trusted
 Publishing (OIDC, no stored token, keeping this repo's no-secrets property), and crates.io has no equivalent
 of PyPI's pending publishers: a trusted publisher is configured *on* a crate, so the crate must exist first.
-Until someone runs `cargo publish --workspace` from a laptop and configures the publisher in the crates.io
-UI, **the publish job fails at the auth step on every tag** — a red at the end of an otherwise green release.
-It must be `--workspace`: `cargo package -p jdwp-mcp` alone fails with `no matching package named
-java-debugging-jdwp-client` until the client is actually on the index, because only the workspace form stands
+So `0.20.0` of both crates was published by hand and the publishers configured afterwards; **releases from
+`0.21.0` publish themselves** and nothing needs a token. Verified rather than assumed: re-running v0.20.0's
+`publish` job after the config landed moved the failure from `No Trusted Publishing config found` at the auth
+step to `crate jdwp-mcp@0.20.0 already exists` at `cargo publish` — auth green, which is the only part that
+was in doubt.
+**v0.20.0's release run therefore has a permanently red `publish` job**, and that is history rather than a
+fault; its release notes say so. Do not re-run it expecting green — a published version cannot be replaced.
+If you ever bootstrap another crate here, it must be `--workspace`: `cargo package -p jdwp-mcp` alone fails
+with `no matching package named java-debugging-jdwp-client` until the client is actually on the index, because only the workspace form stands
 up the temporary registry that resolves the sibling.
 
 It leads with the four traps that have actually cost time, so read them rather than rediscovering them. The

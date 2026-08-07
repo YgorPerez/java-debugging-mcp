@@ -171,10 +171,11 @@ its number forever (ADR-0043). Two failures there mean different things:
 
 - **`crate version is already uploaded`** — it worked. The version is on crates.io and cannot be replaced.
   Do not re-run, do not try to force it; note it and move on.
-- **A failure at the auth step** — most likely nobody has done the manual bootstrap. crates.io has no
-  pending publishers, so the first version of each crate must be published by hand and the trusted publisher
-  configured afterwards in the crates.io UI. The rest of the release is unaffected and already shipped; do
-  that bootstrap, then publish this version manually rather than re-tagging:
+- **A failure at the auth step** — the trusted publisher config is gone or no longer matches. It was set up
+  at v0.20.0 and verified working, so this is a regression rather than the bootstrap: check both crates'
+  settings pages still name owner `YgorPerez`, repo `java-debugging-mcp`, workflow `release.yml` and a
+  **blank** environment. The rest of the release is unaffected and already shipped; publish this version by
+  hand rather than re-tagging:
 
   ```bash
   cargo publish --workspace   # --workspace, not two -p runs: see ADR-0043
