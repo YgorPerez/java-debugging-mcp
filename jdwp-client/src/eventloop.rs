@@ -20,8 +20,8 @@ const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Request to send a command and get reply
 pub struct CommandRequest {
-    pub packet: CommandPacket,
-    pub reply_tx: oneshot::Sender<JdwpResult<ReplyPacket>>,
+    pub(crate) packet: CommandPacket,
+    pub(crate) reply_tx: oneshot::Sender<JdwpResult<ReplyPacket>>,
 }
 
 /// Handle to the event loop for sending commands and receiving events.
@@ -37,7 +37,12 @@ pub struct CommandRequest {
 /// - Events should be consumed from a single task/clone
 ///
 /// # Example
-/// ```no_run
+///
+/// `ignore` rather than `no_run` since CLEAN-2 (#170): a doctest compiles as an EXTERNAL crate, and both
+/// types below are `pub(crate)` now (ADR-0044), so it can no longer be compiled here. Kept rather than
+/// deleted — `--document-private-items` still renders it, and this is the one place the single-consumer
+/// rule above is shown rather than stated. Moving it to a unit test would restore the compile check.
+/// ```ignore
 /// # use jdwp_client::EventLoopHandle;
 /// # use jdwp_client::protocol::CommandPacket;
 /// # async fn demo(event_loop: EventLoopHandle, cmd1: CommandPacket, cmd2: CommandPacket) {
@@ -74,7 +79,7 @@ impl EventLoopHandle {
     /// # Errors
     /// Returns a [`JdwpError`] if the event loop has shut down or the reply is lost before it arrives.
     /// Both cases name the reason the loop stopped when it recorded one.
-    pub async fn send_command(&self, packet: CommandPacket) -> JdwpResult<ReplyPacket> {
+    pub(crate) async fn send_command(&self, packet: CommandPacket) -> JdwpResult<ReplyPacket> {
         self.issue(packet).await?.reply().await
     }
 
@@ -91,15 +96,13 @@ impl EventLoopHandle {
     /// what this does **not** promise: the command has been handed over, not written. It is written when
     /// the loop next reaches `handle_outgoing_command`, and a write failure is reported to
     /// [`InFlight::reply`] rather than here.
-    pub async fn issue(&self, packet: CommandPacket) -> JdwpResult<InFlight> {
+    pub(crate) async fn issue(&self, packet: CommandPacket) -> JdwpResult<InFlight> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let id = packet.id;
-
         let request = CommandRequest { packet, reply_tx };
 
         self.command_tx.send(request).await.map_err(|_| self.lost("the command was never sent"))?;
 
-        Ok(InFlight { id, reply_rx, shutdown: Arc::clone(&self.shutdown) })
+        Ok(InFlight { reply_rx, shutdown: Arc::clone(&self.shutdown) })
     }
 
     /// See [`lost`].
@@ -108,13 +111,13 @@ impl EventLoopHandle {
     }
 
     /// Try to receive an event (non-blocking)
-    pub async fn try_recv_event(&self) -> Option<EventSet> {
+    pub(crate) async fn try_recv_event(&self) -> Option<EventSet> {
         let mut rx = self.event_rx.lock().await;
         rx.try_recv().ok()
     }
 
     /// Wait for the next event (blocking)
-    pub async fn recv_event(&self) -> Option<EventSet> {
+    pub(crate) async fn recv_event(&self) -> Option<EventSet> {
         let mut rx = self.event_rx.lock().await;
         rx.recv().await
     }
@@ -126,19 +129,21 @@ impl EventLoopHandle {
 /// writes them in that order, so a command issued first reaches the JVM first. Nothing says the JVM
 /// answers in that order — JDWP's own words are that the protocol *"is asynchronous; multiple command
 /// packets may be sent before the first reply packet is received"*, matched by an id that *"must be
-/// unique among all outstanding commands sent from one source"*. So this type carries its [`id`](Self::id):
-/// correlation is the claim being made, and ADR-0038 asserts it rather than assuming it.
+/// unique among all outstanding commands sent from one source"*. Correlation is therefore the claim being
+/// made, and ADR-0038 asserts it rather than assuming it: `route_reply` matches each reply to the pending
+/// command by that id, and `connection.rs`'s wave tests check three replies land on the right three
+/// commands. This type used to carry a copy of the id as well; CLEAN-2 (#170) removed it, because nothing
+/// read it and a second copy of a correlation key is not a second check of it.
 ///
 /// **Dropping one is safe, and that is a property of ADR-0018 rather than of this type.** Abandoning the
 /// wait does not abandon the command: the JVM still answers it, the reader task still consumes the whole
 /// packet, and `route_reply` finds the pending entry and discards the reply because nobody is listening.
 /// Framing cannot be lost that way, because framing does not live on this side of the channel. What
 /// dropping *does* cost is the work the JVM already did, which is why nothing here abandons a sibling on
-/// the strength of another's failure — see [`JdwpConnection::read_independently`](
-/// crate::JdwpConnection::read_independently).
+/// the strength of another's failure — see `JdwpConnection::read_independently`, which is crate-internal
+/// since ADR-0044 and so is no longer linkable from here.
 #[must_use = "an issued command is on its way to the debuggee; dropping this discards its reply"]
-pub struct InFlight {
-    id: u32,
+pub(crate) struct InFlight {
     reply_rx: oneshot::Receiver<JdwpResult<ReplyPacket>>,
     /// A clone of the loop's shutdown cell, so a reply that never arrives can be explained by the same
     /// mechanism [`EventLoopHandle::lost`] uses — including after the handle that issued it is gone.
@@ -146,19 +151,13 @@ pub struct InFlight {
 }
 
 impl InFlight {
-    /// The packet id this command was sent with, and the id its reply must carry.
-    #[must_use]
-    pub const fn id(&self) -> u32 {
-        self.id
-    }
-
     /// Wait for this command's reply.
     ///
     /// # Errors
     /// Returns a [`JdwpError`] if the reply is lost before it arrives — a write failure, a lapsed
     /// `REPLY_TIMEOUT`, or the loop shutting down — naming the reason the loop stopped when it
     /// recorded one.
-    pub async fn reply(self) -> JdwpResult<ReplyPacket> {
+    pub(crate) async fn reply(self) -> JdwpResult<ReplyPacket> {
         let Self { reply_rx, shutdown, .. } = self;
         reply_rx.await.map_err(|_| lost(&shutdown, "the command was sent and its reply was dropped"))?
     }
@@ -182,7 +181,7 @@ fn lost(shutdown: &std::sync::OnceLock<String>, what: &str) -> JdwpError {
 
 /// Start the event loop task
 #[must_use]
-pub fn spawn_event_loop(reader: OwnedReadHalf, writer: OwnedWriteHalf) -> EventLoopHandle {
+pub(crate) fn spawn_event_loop(reader: OwnedReadHalf, writer: OwnedWriteHalf) -> EventLoopHandle {
     let (command_tx, command_rx) = mpsc::channel(32);
     // Use larger buffer for events to avoid loss under load
     // Events are critical (breakpoints, exceptions) and shouldn't be dropped

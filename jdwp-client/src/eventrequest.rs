@@ -690,7 +690,7 @@ pub enum WatchKind {
 impl WatchKind {
     /// The JDWP event kind this watch registers as, used for both Set and Clear.
     #[must_use]
-    pub const fn event_kind(self) -> u8 {
+    pub(crate) const fn event_kind(self) -> u8 {
         match self {
             Self::Access => event_kinds::FIELD_ACCESS,
             Self::Modify => event_kinds::FIELD_MODIFICATION,

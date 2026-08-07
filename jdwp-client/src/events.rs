@@ -19,7 +19,7 @@ pub struct EventSet {
 /// Single event within an event set
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
-    pub kind: u8,
+    pub(crate) kind: u8,
     pub request_id: i32,
     pub details: EventKind,
 }
@@ -169,7 +169,7 @@ pub enum EventModifier {
 ///
 /// # Errors
 /// Returns a [`JdwpError`](crate::JdwpError) if the buffer does not contain enough bytes or is malformed.
-pub fn parse_event_packet(data: &[u8]) -> JdwpResult<EventSet> {
+pub(crate) fn parse_event_packet(data: &[u8]) -> JdwpResult<EventSet> {
     let mut buf = data;
 
     // Read suspend policy

@@ -81,7 +81,7 @@ pub struct VmCapabilitiesNew {
     /// refused: method *bodies* are all it will accept.
     pub can_add_method: bool,
     /// Whether the JVM lifts the method-bodies-only restriction entirely. `HotSpot` says no.
-    pub can_unrestrictedly_redefine_classes: bool,
+    pub(crate) can_unrestrictedly_redefine_classes: bool,
     /// Whether [`pop_frames`](JdwpConnection::pop_frames) will work — the other half of a useful swap,
     /// since a frame already on the stack keeps running the code it entered with.
     pub can_pop_frames: bool,

@@ -19,11 +19,18 @@ use tracing::{debug, info, warn};
 /// A `toString()` that cannot answer in two seconds is not worth freezing a shared JVM for, and the
 /// alternative measured 30-40s against a real `WildFly` before the event loop's generic reply timeout gave
 /// up. Deliberately far below that timeout so an invocation is bounded by *this* budget, not by it.
-pub const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 2000;
+pub(crate) const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 2000;
 
-/// How many commands [`JdwpConnection::read_independently`] may leave unanswered at once (PERF-1, #100).
+/// How many commands this crate's wave reads may leave unanswered at once (PERF-1, #100).
 ///
-/// **Named for [`InFlight`] rather than for a window, and it was `INDEPENDENT_READ_WINDOW` first.** Every
+/// **THIS CONSTANT IS PUBLIC AND THE PRIMITIVE IT BOUNDS IS NOT** (CLEAN-2, #170; ADR-0044). They look
+/// like a pair and are not. `read_independently` is internal — waves are issued by this crate's own
+/// operations — but `jdwp-mcp` chunks its thread list by *this number* so its suspension budget is
+/// checked once every window, which is real cross-crate use of the size and none at all of the method.
+/// A caller needs to know how wide the window is, not how to open one.
+///
+/// **Named for in-flight commands rather than for a window, and it was `INDEPENDENT_READ_WINDOW` first.**
+/// Every
 /// other "… window" in this codebase is a span of TIME — a capture window, a suspension window, an
 /// observation window, the escalation window, the window in which a watchpoint's old value is still readable
 /// — and this is a count of concurrent commands. Two axes on one word, in a `pub` constant, is the collision
@@ -245,7 +252,10 @@ impl JdwpConnection {
     /// or was never written. An error reply is `Ok` here and carries its error code, exactly as
     /// [`send_command`](Self::send_command) returns it; the caller still owes it a
     /// [`check_error`](ReplyPacket::check_error).
-    pub async fn read_independently(&self, packets: Vec<CommandPacket>) -> Vec<JdwpResult<ReplyPacket>> {
+    pub(crate) async fn read_independently(
+        &self,
+        packets: Vec<CommandPacket>,
+    ) -> Vec<JdwpResult<ReplyPacket>> {
         // Counted before anything is issued, from the window rather than from the socket — see
         // [`round_trips`](Self::round_trips) for why that is a bound and not a measurement.
         let waves = packets.len().div_ceil(MAX_READS_IN_FLIGHT);

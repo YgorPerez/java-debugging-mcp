@@ -13883,7 +13883,8 @@ const INVOKE_NEEDS_AN_EVENT: &str =
 /// connection borrowed mutably and awaits the reply, and a trace capture evaluates its expressions one
 /// after another in a single event pump, so this server never has two invocations of its own in flight on
 /// one thread. What it *can* leave behind is an invocation the DEBUGGEE is still running: the invoke budget
-/// ([`jdwp_client::connection::DEFAULT_INVOKE_TIMEOUT_MS`], 2000 ms) frees the debugger, and JDWP has no
+/// (`jdwp_client`'s `DEFAULT_INVOKE_TIMEOUT_MS`, 2000 ms — crate-internal since ADR-0044) frees the
+/// debugger, and JDWP has no
 /// way to cancel the call — the same asymmetry ADR-0036 was written about. The next invocation on that
 /// thread then earns this, which is why a timeout earlier in the same capture is named as the likeliest
 /// cause rather than a general "try again".

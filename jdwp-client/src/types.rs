@@ -4,19 +4,32 @@
 
 use serde::{Deserialize, Serialize};
 
-// Object IDs are 8 bytes in JDWP
+// Object IDs are 8 bytes in JDWP.
+//
+// SEVEN OF THESE ALIASES ARE UNREFERENCED, and they stay (CLEAN-2, #170; ADR-0044). They document JDWP's
+// id space — that a thread group, a string, a class loader and an array are all `objectID` on the wire and
+// are not interchangeable in the specification's intent. `#[allow(dead_code)]` per alias rather than on
+// the file, because unlike `commands.rs` the rest of this module is live code where "unused" does mean
+// something.
 pub type ObjectId = u64;
 pub type ThreadId = ObjectId;
-pub type ThreadGroupId = ObjectId;
-pub type StringId = ObjectId;
-pub type ClassLoaderId = ObjectId;
-pub type ClassObjectId = ObjectId;
-pub type ArrayId = ObjectId;
+#[allow(dead_code)]
+pub(crate) type ThreadGroupId = ObjectId;
+#[allow(dead_code)]
+pub(crate) type StringId = ObjectId;
+#[allow(dead_code)]
+pub(crate) type ClassLoaderId = ObjectId;
+#[allow(dead_code)]
+pub(crate) type ClassObjectId = ObjectId;
+#[allow(dead_code)]
+pub(crate) type ArrayId = ObjectId;
 
 pub type ReferenceTypeId = u64;
 pub type ClassId = ReferenceTypeId;
-pub type InterfaceId = ReferenceTypeId;
-pub type ArrayTypeId = ReferenceTypeId;
+#[allow(dead_code)]
+pub(crate) type InterfaceId = ReferenceTypeId;
+#[allow(dead_code)]
+pub(crate) type ArrayTypeId = ReferenceTypeId;
 
 pub type MethodId = u64;
 pub type FieldId = u64;
@@ -25,7 +38,7 @@ pub type FrameId = u64;
 // Location identifies a code position
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Location {
-    pub type_tag: u8, // 1=class, 2=interface, 3=array
+    pub(crate) type_tag: u8, // 1=class, 2=interface, 3=array
     pub class_id: ReferenceTypeId,
     pub method_id: MethodId,
     pub index: u64, // bytecode index (PC)
@@ -179,8 +192,8 @@ pub struct Variable {
 // Stack frame information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameInfo {
-    pub frame_id: FrameId,
-    pub location: Location,
+    pub(crate) frame_id: FrameId,
+    pub(crate) location: Location,
 }
 
 #[cfg(test)]

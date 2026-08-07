@@ -267,7 +267,8 @@ impl JdwpConnection {
     ///
     /// `Ok(None)` is the ordinary answer, not a degraded one, so two error codes are absorbed rather
     /// than propagated: [`ERR_ABSENT_INFORMATION`] for a class with no SMAP — which is nearly every
-    /// class — and [`ERR_NOT_IMPLEMENTED`] for a VM that lacks the optional
+    /// class — and `ERR_NOT_IMPLEMENTED` (crate-internal since ADR-0044, unlike the one above, which a
+    /// caller matches on inside `JdwpError::JdwpErrorCode`) for a VM that lacks the optional
     /// `canGetSourceDebugExtension` capability. Reporting either as an error would make the common
     /// case look broken.
     ///

@@ -79,7 +79,9 @@ pub mod types;
 pub mod vm;
 
 pub use connection::{JdwpConnection, MAX_READS_IN_FLIGHT};
-pub use eventloop::{spawn_event_loop, EventLoopHandle};
+#[allow(unused_imports)]
+// re-exported for the crate root's own convenience; ADR-0044 keeps both internal
+pub(crate) use eventloop::{spawn_event_loop, EventLoopHandle};
 pub use eventrequest::{EventFilters, MonitorKind, SuspendPolicy, WatchKind};
 pub use events::EventSet;
 pub use protocol::{JdwpError, JdwpResult};

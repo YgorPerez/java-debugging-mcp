@@ -54,7 +54,11 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [[example]]
 name = "probe_heap_queries"
-path = "examples/probe_heap_queries.rs"
+path = "../examples/probe_heap_queries.rs"
+
+[[example]]
+name = "probe_monitor_events"
+path = "../examples/probe_monitor_events.rs"
 
 # EVERY `../examples/` target below is silently dropped from the published `.crate`, because `cargo
 # package` copies nothing from outside the package root. It warns once per target and packages anyway —

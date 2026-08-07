@@ -25,7 +25,7 @@ pub struct Frame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Monitor {
     /// JDWP type tag of the monitor object (`'L'` for a plain object, `'['` for an array, …).
-    pub tag: u8,
+    pub(crate) tag: u8,
     pub object_id: ObjectId,
 }
 

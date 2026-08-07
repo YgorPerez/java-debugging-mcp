@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 /// Field value from an object
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldValue {
-    pub field_id: FieldId,
-    pub value: Value,
+    pub(crate) field_id: FieldId,
+    pub(crate) value: Value,
 }
 
 impl JdwpConnection {

@@ -101,7 +101,38 @@ more; it already scopes read-only as a guard against accident and not a security
 
 **`cargo hawk` becomes usable as a gate later, and deliberately is not one yet.** Adding a gate over 169
 findings is how a gate gets ignored — the same call CI-5 (#150) made about zizmor's 71. Once the count is
-zero and the surviving surface is declared in hawk's config, a gate is a follow-up worth having.
+low and the surviving surface is declared in hawk's config, a gate is a follow-up worth having.
+
+### What it actually came to: 169 → 20 (applied 2026-08-07)
+
+**Zero was never reachable, and the residue is the decision rather than the leftovers.** Every item on the
+Internal list above is now `pub(crate)`; hawk still reports 20, in three groups, and each is something this
+ADR chose:
+
+| | count | why hawk still reports it |
+|---|---:|---|
+| `JdwpConnection`'s own operations — `set_field_watch`, `set_method_exit_request`, `set_step`, `set_invoke_timeout_ms`, `invoke_timeout_ms`, `is_read_only` | 6 | **Supported by the rule at the top of this ADR.** hawk measures reachability from the binary, and `mcp-server` happens not to call these six. "The server does not call it" is not "the library does not implement it" — the same distinction the 130 constants turned on, one level up |
+| `reader::value_tags`, as a **module** | 1 | *Narrow the items, not the modules*, decided above. Every constant inside it is `pub(crate)`; hawk asks for the module too |
+| `hawk::unnecessary_restricted_visibility` — `pub(crate)` items whose uses all sit in one module | 13 | **A different question from the one this ADR answers.** It decided the `pub` / `pub(crate)` boundary — what leaves the crate. Whether a crate-internal item could be module-private is intra-crate tidying with no caller-visible component |
+
+So a future gate is `hawk::dead_public` and `hawk::unnecessary_public` with those seven declared, not a
+bare zero. That is the follow-up, and it is smaller than it looked from 169.
+
+**Three things the work turned up that the list above did not predict.**
+
+*The `dead_code` warnings are the cost of keeping the table.* 34 transcription items became `pub(crate)`
+and unused, so rustc reports them — and the gate fails on warnings. `commands.rs` carries one file-level
+`#![allow(dead_code)]` with the argument written at it; the seven id aliases carry one each, because unlike
+`commands.rs` the rest of `types.rs` is live code where *unused* still means something.
+
+*One deletion was nearly a mistake.* `ReplyPacket::id` is never read in the lib build and looked like dead
+plumbing — but three of `connection.rs`'s wave tests assert on it, with the message *"result N carries the
+wrong reply"*. That is ADR-0038's entire claim. It stays, with `#[allow(dead_code)]` and the reason at the
+field; `InFlight::id`, which really was unread, is gone.
+
+*The published package shipped two probes, not one.* `probe_monitor_events.rs` sat beside
+`probe_heap_queries.rs` inside the package root with no `[[example]]` entry, auto-discovered by cargo. Both
+moved to `../examples/`; the reason given above for the one covers the other exactly.
 
 ## Rejected
 

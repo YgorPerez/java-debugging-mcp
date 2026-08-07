@@ -97,7 +97,7 @@ pub enum JdwpError {
 }
 
 // JDWP handshake string
-pub const JDWP_HANDSHAKE: &[u8] = b"JDWP-Handshake";
+pub(crate) const JDWP_HANDSHAKE: &[u8] = b"JDWP-Handshake";
 
 // Packet structure:
 // length (4 bytes) - includes header
@@ -107,22 +107,35 @@ pub const JDWP_HANDSHAKE: &[u8] = b"JDWP-Handshake";
 // [Reply packet: error code (2 bytes)]
 // data (variable)
 
-pub const HEADER_SIZE: usize = 11;
-pub const REPLY_FLAG: u8 = 0x80;
+pub(crate) const HEADER_SIZE: usize = 11;
+pub(crate) const REPLY_FLAG: u8 = 0x80;
 
 #[derive(Debug, Clone)]
 pub struct CommandPacket {
-    pub id: u32,
-    pub command_set: u8,
-    pub command: u8,
+    pub(crate) id: u32,
+    pub(crate) command_set: u8,
+    pub(crate) command: u8,
     pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ReplyPacket {
-    pub id: u32,
+    /// The packet id this reply carries.
+    ///
+    /// **`dead_code` is allowed because the only readers are tests, and they are load-bearing ones**
+    /// (CLEAN-2, #170). Production code never reads it: `route_reply` correlates on the id the FRAMING
+    /// layer hands it, so this is the copy rather than the original, and rustc — which analyses the lib
+    /// build, where `#[cfg(test)]` does not exist — reports it unread.
+    ///
+    /// It stays because `connection.rs`'s wave tests assert on it three times, with the message
+    /// *"result N carries the wrong reply"*. That is the whole of ADR-0038's claim: a wave of
+    /// independent reads returns each reply to the command that asked for it. Deleting the field to
+    /// clear a warning would delete the only evidence for that invariant, which is the opposite of
+    /// what #170 is for.
+    #[allow(dead_code)]
+    pub(crate) id: u32,
     pub error_code: u16,
-    pub data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
 }
 
 impl CommandPacket {
@@ -132,7 +145,7 @@ impl CommandPacket {
     }
 
     #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let length = HEADER_SIZE + self.data.len();
         let mut buf = BytesMut::with_capacity(length);
 
@@ -157,7 +170,7 @@ pub const ERR_ABSENT_INFORMATION: u16 = 101;
 
 /// `NOT_IMPLEMENTED` — the VM never had the optional capability behind the command. Public for the
 /// same reason as [`ERR_ABSENT_INFORMATION`]: for an optional command it is an answer, not a fault.
-pub const ERR_NOT_IMPLEMENTED: u16 = 99;
+pub(crate) const ERR_NOT_IMPLEMENTED: u16 = 99;
 
 /// `INVALID_OBJECT` — the object id is not one this JVM currently knows.
 ///
@@ -260,7 +273,7 @@ impl ReplyPacket {
     ///
     /// # Errors
     /// Returns a [`JdwpError::JdwpErrorCode`] when the reply's error code is non-zero.
-    pub fn check_error(&self) -> JdwpResult<()> {
+    pub(crate) fn check_error(&self) -> JdwpResult<()> {
         if self.is_error() {
             Err(JdwpError::JdwpErrorCode(self.error_code, self.error_message().to_string()))
         } else {
@@ -274,7 +287,7 @@ impl ReplyPacket {
     }
 
     #[must_use]
-    pub fn error_message(&self) -> &'static str {
+    pub(crate) fn error_message(&self) -> &'static str {
         ERROR_MESSAGES
             .iter()
             .find(|&&(code, _)| code == self.error_code)

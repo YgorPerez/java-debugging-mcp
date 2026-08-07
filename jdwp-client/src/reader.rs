@@ -26,22 +26,22 @@ use bytes::Buf;
 /// JDWP value tags (JDWP spec, `Value` / `TaggedObjectID`). Each is the ASCII code of the JNI type
 /// signature character, which is why they look arbitrary as numbers.
 pub mod value_tags {
-    pub const BYTE: u8 = 66; // 'B'
-    pub const CHAR: u8 = 67; // 'C'
-    pub const OBJECT: u8 = 76; // 'L'
-    pub const FLOAT: u8 = 70; // 'F'
-    pub const DOUBLE: u8 = 68; // 'D'
-    pub const INT: u8 = 73; // 'I'
-    pub const LONG: u8 = 74; // 'J'
-    pub const SHORT: u8 = 83; // 'S'
-    pub const VOID: u8 = 86; // 'V'
-    pub const BOOLEAN: u8 = 90; // 'Z'
-    pub const STRING: u8 = 115; // 's'
-    pub const THREAD: u8 = 116; // 't'
-    pub const THREAD_GROUP: u8 = 103; // 'g'
-    pub const CLASS_LOADER: u8 = 108; // 'l'
-    pub const CLASS_OBJECT: u8 = 99; // 'c'
-    pub const ARRAY: u8 = 91; // '['
+    pub(crate) const BYTE: u8 = 66; // 'B'
+    pub(crate) const CHAR: u8 = 67; // 'C'
+    pub(crate) const OBJECT: u8 = 76; // 'L'
+    pub(crate) const FLOAT: u8 = 70; // 'F'
+    pub(crate) const DOUBLE: u8 = 68; // 'D'
+    pub(crate) const INT: u8 = 73; // 'I'
+    pub(crate) const LONG: u8 = 74; // 'J'
+    pub(crate) const SHORT: u8 = 83; // 'S'
+    pub(crate) const VOID: u8 = 86; // 'V'
+    pub(crate) const BOOLEAN: u8 = 90; // 'Z'
+    pub(crate) const STRING: u8 = 115; // 's'
+    pub(crate) const THREAD: u8 = 116; // 't'
+    pub(crate) const THREAD_GROUP: u8 = 103; // 'g'
+    pub(crate) const CLASS_LOADER: u8 = 108; // 'l'
+    pub(crate) const CLASS_OBJECT: u8 = 99; // 'c'
+    pub(crate) const ARRAY: u8 = 91; // '['
 }
 
 /// Error unless `buf` holds at least `n` more bytes. `what` names the thing being read, so a
@@ -179,7 +179,7 @@ pub fn read_i64(buf: &mut &[u8]) -> JdwpResult<i64> {
 /// case by a wide margin, and left as `Some("")` it would travel all the way to a caller as a blank type.
 /// Normalising it here means every consumer sees the same `None` the absence deserves.
 #[must_use]
-pub fn some_if_present(s: String) -> Option<String> {
+pub(crate) fn some_if_present(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
