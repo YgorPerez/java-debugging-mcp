@@ -466,6 +466,20 @@ since a version can be yanked but keeps its number forever. It runs last for tha
 stored token, and needs nothing from you: the manual bootstrap happened at v0.20.0. ADR-0043 has the
 sequence if it ever has to be done again, and `/release` step 5 has what to do when that job goes red.
 
+**`scripts/toolkit-parity.py` diffs the toolkit's documented tools against the release it pins** (CI-8,
+#162), and it **reports, never gates** — nothing here depends on the toolkit and a check pointed at another
+repo that could block a change is what got two workflows deleted. It covers three of
+`docs/toolkit-contract.md`'s seven rows (a renamed/removed tool, a renamed argument, an added tool nobody
+names) and says at its own head which four it cannot. Every unresolvable input is **fatal**, because an
+empty diff from a run that read nothing is worse than a red. **There is no `schedule:` and that is a
+deviation the issue's premise forced**: `ygor-infotera/infotravel-dev-toolkit` is **private**, so the
+"public contents API" #162 assumed does not exist and a workflow's `GITHUB_TOKEN` cannot reach it. Turning
+the schedule on means adding **this repository's first secret** — the workflow header has the fine-grained
+scope and the `gh secret set` recipe that keeps the token out of a transcript. Run it locally meanwhile: it
+shells out to `gh api` and uses the auth you already have. Measured 7 Aug 2026 at **40 tools named
+downstream, 40 exported, no drift in either direction** — and its first run had a false positive worth
+knowing about, `debug.step_` from the glob `debug.step_*` in their prose.
+
 **A tag also publishes `tool-surface-<tag>.json`, so "what changed for callers" is two curls** (REL-8,
 #165). Every `debug.*` tool, its description and every argument's schema in one document. It is
 **built from the committed snapshots, never regenerated from the binary** — an asset re-derived at release

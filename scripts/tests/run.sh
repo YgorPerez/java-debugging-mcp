@@ -272,5 +272,37 @@ for how in tool-sets-disagree totals-disagree heading-shape-changed docs-table-d
         "$HERE/tool-surface/refuses-$how.expected" -- surface_against_broken "$how"
 done
 
+# ── toolkit-parity.py ───────────────────────────────────────────────────────────
+#
+# CI-8 (#162). The real run reads a PRIVATE repository over `gh api`, which no fixture can do and no CI
+# job here has a credential for — so what is pinned is the half that is pure: the scan's regexes, over a
+# committed stand-in for their prose, against THIS TREE's snapshots (`--surface WORKTREE`, which needs no
+# tags; a shallow checkout has none).
+#
+# The fixture's most important line is the glob. The first real run of this script reported `debug.step_`
+# as documentation for a tool nobody can call, because their prose says "weigh it the way you weigh
+# `debug.step_*`" and the name group stopped at the star. A parity check whose first output is a tool that
+# does not exist is one nobody reads twice.
+parity_fixture() {
+    python3 scripts/toolkit-parity.py --pin v0.0.0-fixture --surface WORKTREE \
+        --prose "$HERE/toolkit-parity/prose"
+}
+check "toolkit-parity: the scan's regexes over a fixed prose fixture" \
+    "$HERE/toolkit-parity/scan.expected" -- parity_fixture
+# EVERY UNRESOLVABLE INPUT IS FATAL, and this is the case the script exists to never get wrong: a clean
+# diff printed by a run that could not read one of its two sides is the DOC-15 (#145) failure — empty
+# reads like "nothing to report" everywhere it lands.
+check "toolkit-parity: a tag this clone does not have is fatal, not an empty diff" \
+    "$HERE/toolkit-parity/unresolvable-tag.expected" \
+    -- python3 scripts/toolkit-parity.py --pin v99.99.99 --prose "$HERE/toolkit-parity/prose"
+# A DEDICATED empty directory, and the first version pointed at `$WORK` itself — which by then held the
+# scratch trees the tool-surface cases build, one of which contains a copy of `docs/tools.md`. So the case
+# reported a clean 40-of-40 diff and looked like it had passed, while asserting nothing. Reading the
+# transcript is what caught it, which is the deal the header of this file states.
+mkdir -p "$WORK/no-prose-here"
+check "toolkit-parity: an empty prose set is fatal too" \
+    "$HERE/toolkit-parity/empty-prose.expected" \
+    -- python3 scripts/toolkit-parity.py --pin v0.0.0-fixture --surface WORKTREE --prose "$WORK/no-prose-here"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

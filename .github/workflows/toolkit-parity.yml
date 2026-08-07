@@ -1,0 +1,83 @@
+name: toolkit-parity
+
+# CI-8 (#162). Diffs the downstream toolkit's documented tool surface against the release it pins, and
+# reports. `scripts/toolkit-parity.py` is the whole of it; this file is how you run it from here.
+#
+# ## Which rows of docs/toolkit-contract.md it covers
+#
+# That table lists seven ways a change here reaches `ygor-infotera/infotravel-dev-toolkit` and says six of
+# them are silent. This covers three: a renamed or removed TOOL, a renamed ARGUMENT, and an ADDED tool
+# nobody downstream names — the quietest one, because nothing breaks. It cannot cover a corrupted
+# description (the snapshot tests catch that at the source), a changed REPLY, or a behaviour change behind
+# an unchanged name; the script's `--surface` mode prints the surface delta between their pin and this tree,
+# and that is a proxy, not a check. The release notes remain the mitigation for the other three.
+#
+# ## IT MUST NEVER GATE, and nothing here depends on it
+#
+# `docs/toolkit-contract.md` is explicit that this repo owes the toolkit no compatibility guarantee. A check
+# pointed at another repository that could block a change is the permanent-red-that-tested-nothing shape
+# `CLAUDE.md` deleted two scaffolded workflows over. So: no `push`, no `pull_request`, not in `ci-ok`'s
+# `needs`, and the script exits 0 on any diff it can compute. It exits non-zero only when it could not
+# compute one, because an empty diff from a run that read nothing is worse than a red.
+#
+# ## WHY THERE IS NO `schedule:` YET, which is a deviation from #162 and not an oversight
+#
+# #162 says to read their pin "over the public contents API". THERE IS NO SUCH THING HERE:
+# `ygor-infotera/infotravel-dev-toolkit` is **private** (`gh api repos/… --jq .private` → true, 7 Aug 2026).
+# A workflow's `GITHUB_TOKEN` is scoped to its own repository, so no `permissions:` block reaches theirs,
+# and a scheduled run would fail every morning at 06:00 — which is exactly the "permanent red that teaches
+# you to ignore red" this repo removed two workflows to avoid.
+#
+# To turn the schedule on, someone has to decide to add THE REPOSITORY'S FIRST SECRET. `CLAUDE.md` leans on
+# "this repo has no secrets" in three places, and REL-5 chose OIDC over a crates.io token for the same
+# reason, so this is a real decision rather than a step. What it needs:
+#
+#   1. A fine-grained PAT (or a GitHub App installation token) with **Contents: read** on
+#      `ygor-infotera/infotravel-dev-toolkit` and nothing else.
+#   2. `gh secret set TOOLKIT_READ_TOKEN --repo YgorPerez/java-debugging-mcp` — which reads the value from
+#      stdin or prompts for it, so the token never appears in a shell history, a file or a transcript.
+#   3. Uncomment the `schedule:` below and the `GH_TOKEN` line in the run step.
+#
+# Until then this is `workflow_dispatch` only: it runs when someone asks, and when it cannot read their
+# repository it says so and fails, which is honest for a manual run and unbearable for a daily one.
+
+on:
+  # schedule:
+  #   - cron: "17 6 * * 1" # Mondays, off the hour — see the note above before enabling this.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: toolkit-parity
+  cancel-in-progress: false
+
+jobs:
+  parity:
+    name: Their documented surface vs the release they pin
+    runs-on: ubuntu-latest
+    # CI-10 (#172). No measurement to derive from — this job has never run. It is two API reads and a
+    # regex over a few hundred KB of markdown, so the budget is reasoned: whatever this takes, ten minutes
+    # is not it. Replace the comment with an observation the first time it runs.
+    timeout-minutes: 10
+    steps:
+      # fetch-depth: 0 IS REQUIRED, not caution. The script reads this repo's committed snapshots AT THE
+      # PINNED TAG — the pin names a release, and what the toolkit documents is what that release exported.
+      # A depth-1 checkout has no tags, and the script fails loudly rather than falling back to the working
+      # tree, which would compare their docs against something no release ever published.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Diff their prose against the release they pin
+        shell: bash
+        env:
+          # `github.token` cannot read a private repository other than this one, so today this step FAILS
+          # with the script's own message naming which input it could not resolve. That is the intended
+          # behaviour of a manual run against a credential that is not there.
+          GH_TOKEN: ${{ github.token }}
+          # GH_TOKEN: ${{ secrets.TOOLKIT_READ_TOKEN }}   # <- and this instead, once the secret exists
+        run: |
+          scripts/toolkit-parity.py --markdown | tee -a "$GITHUB_STEP_SUMMARY"

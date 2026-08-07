@@ -1,0 +1,6 @@
+$ python3 scripts/toolkit-parity.py --pin v99.99.99 --prose scripts/tests/toolkit-parity/prose
+exit: 1
+--- stdout
+--- stderr
+toolkit-parity: could not resolve an input, so there is NO diff to report — cannot read mcp-server/tests/tool-descriptions.txt at v99.99.99: fatal: invalid object name 'v99.99.99'.
+       If v99.99.99 is not here, this clone is shallow or the tag was never pushed — either way there is nothing to compare against, and an empty diff would be a lie.

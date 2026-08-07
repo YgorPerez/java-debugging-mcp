@@ -1,0 +1,63 @@
+$ parity_fixture
+exit: 0
+--- stdout
+== toolkit parity vs WORKTREE
+
+40 tools exported at WORKTREE; 6 named in their prose.
+
+-- named downstream, absent from the pin (1)
+
+Documentation for a tool nobody can call. This is the row `set_breakpoint` sat in for
+weeks after VOCAB-1 (#20) renamed seven tools.
+
+  `debug.set_breakpoint` — named in SKILL.md
+
+-- exported by the pin, named nowhere downstream (35)
+
+A tool nobody will find: the quietest row in the table, because nothing breaks.
+
+  `debug.arm_stop_points`
+  `debug.check_stale`
+  `debug.clear_stop_point`
+  `debug.disconnect`
+  `debug.evaluate`
+  `debug.evaluate_chain`
+  `debug.export_investigation`
+  `debug.force_return`
+  `debug.get_last_event`
+  `debug.get_stack`
+  `debug.launch`
+  `debug.list_fields`
+  `debug.list_instances`
+  `debug.list_methods`
+  `debug.list_sessions`
+  `debug.list_stop_points`
+  `debug.list_threads`
+  `debug.panic`
+  `debug.pause`
+  `debug.pop_frame`
+  `debug.reload_class`
+  `debug.resume_thread`
+  `debug.run_named_query`
+  `debug.set_exception_stop`
+  `debug.set_field_stop`
+  `debug.set_method_exit_stop`
+  `debug.set_monitor_stop`
+  `debug.set_value`
+  `debug.source`
+  `debug.step_into`
+  `debug.step_out`
+  `debug.step_over`
+  `debug.suspend_thread`
+  `debug.thread_dump`
+  `debug.toggle_stop_point`
+
+-- argument keys their prose passes that the pin does not take (1)
+
+A documented example that would be refused. Read these before believing them: a key
+inside a nested object in their prose looks the same to this scan as a top-level one.
+
+  `debug.continue`: `nonexistent_key`, `thread_id`
+
+Three of the seven rows in `docs/toolkit-contract.md` are covered here. A reply's wording and a behaviour change behind an unchanged name are not, and nothing mechanical can reach them — the release notes are still the mitigation for those.
+--- stderr

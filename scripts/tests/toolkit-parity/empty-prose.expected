@@ -1,0 +1,5 @@
+$ python3 scripts/toolkit-parity.py --pin v0.0.0-fixture --surface WORKTREE --prose <work>/no-prose-here
+exit: 1
+--- stdout
+--- stderr
+toolkit-parity: could not resolve an input, so there is NO diff to report — no markdown under <work>/no-prose-here — an empty prose set would report every tool as unnamed.
