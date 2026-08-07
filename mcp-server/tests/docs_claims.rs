@@ -85,6 +85,13 @@ fn the_first_tool_line_in_rust_doctor_yml_is_the_health_jobs() {
 /// Every check `scripts/doctor.sh` tells you "GATES in CI" has to actually be a step in the gate. This is
 /// the direction that matters: the script's whole claim is that a clean local run is a green gate, and a
 /// line saying a check gates when it does not is worse than not mentioning it.
+///
+/// **What it cannot check is that the command RUNS**, and that gap has been paid for once. The zizmor step
+/// read `uvx zizmor` and this test asserted the workflow contained `uvx zizmor` — both true, and the step
+/// still exited 127 on every CI run, because GitHub's runners have no `uvx`. The two files agreed with each
+/// other about a command that did not exist. Consistency between a script and a workflow is worth asserting
+/// and is not the same as either of them working; only a real run tells you that, which is why the needle is
+/// now the full `run:` line and why the fix installs zizmor from the same pinned step as every other tool.
 #[test]
 fn every_check_doctor_says_gates_in_ci_is_a_step_in_rust_doctor_yml() {
     let wf = read(".github/workflows/rust-doctor.yml");
@@ -95,7 +102,7 @@ fn every_check_doctor_says_gates_in_ci_is_a_step_in_rust_doctor_yml() {
         ("documentation (rustdoc)", "cargo doc --workspace --no-deps --document-private-items"),
         ("dependency policy (cargo-deny)", "cargo deny check"),
         ("spelling (typos)", "typos"),
-        ("workflow lint (zizmor)", "uvx zizmor"),
+        ("workflow lint (zizmor)", "run: zizmor --persona=regular"),
     ] {
         assert!(
             doctor.contains(label),

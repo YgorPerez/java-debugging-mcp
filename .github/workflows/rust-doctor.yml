@@ -143,11 +143,14 @@ jobs:
       #   - coverage — `coverage.yml` owns it, produces `target/coverage/lcov.info`, and knows about the
       #     atexit-handler trap TEST-5 found. Generating coverage again here would double the test run to
       #     tell doctor something another workflow already publishes.
-      # cargo-shear is the one entry here that is NOT for a rust-doctor pass — see the step below.
+      # cargo-shear and zizmor are the two entries here that are NOT for a rust-doctor pass — see their
+      # steps below. Keeping every tool this job needs on this ONE `tool:` line is deliberate:
+      # `scripts/doctor.sh` reads it with `head -1` to work out which passes the gate really has the tool
+      # for, and a second install step would be invisible to it. Its comment says so at the line.
       - name: Install the tools the gate needs
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
-          tool: cargo-deny,cargo-machete,cargo-shear,typos
+          tool: cargo-deny,cargo-machete,cargo-shear,typos,zizmor
 
       - name: Run rust-doctor
         run: /tmp/rust-doctor --sarif --fail-on warning > rust-doctor.sarif
@@ -255,15 +258,24 @@ jobs:
       # future finding is genuinely acceptable, annotate it AT THE LINE with why — a `# zizmor: ignore[…]`
       # with no reason is how this turns into a file for silencing the tool.
       #
-      # `uvx` rather than an install step: zizmor is a Python tool, it is not one of rust-doctor's passes,
-      # and the health job's `tool:` list is read by scripts/doctor.sh with `head -1` — see the comment
-      # there before adding a second install step.
+      # INSTALLED ABOVE, NOT RUN THROUGH `uvx`, AND THE HISTORY IS THE WARNING. This step originally read
+      # `uvx zizmor …` on the reasoning that zizmor is a Python tool needing no install step. Both halves
+      # were wrong: zizmor is `zizmorcore/zizmor`, a Rust project that publishes prebuilt binaries, and
+      # GitHub's runners do not ship `uvx` — so the step exited **127, command not found**, on every run
+      # from the moment it was added. It never linted anything and it never passed.
+      #
+      # It went unnoticed because it landed during a GitHub Actions outage: no workflow ran for eight
+      # hours, so the red arrived long after the commit that caused it, and `scripts/doctor.sh` reported
+      # "would pass" locally because `uvx` IS commonly installed on a dev box. A tool that is downloaded
+      # on demand locally and absent in CI is the one shape where a local gate and the real gate can
+      # disagree silently — which is why it now comes from the same pinned install step as every other
+      # tool here, and `doctor.sh` prefers the same binary.
       #
       # `--persona=regular` is the default posture. `--pedantic` adds findings this repo would suppress
       # in bulk, which is the opposite of the point.
       - name: Lint the workflows (zizmor)
         if: always()
-        run: uvx zizmor --persona=regular .github/
+        run: zizmor --persona=regular .github/
 
       # A failing gate prints nothing useful: --sarif sends every finding to the file, so the step log
       # ends at "exit code 3" and the findings are only readable via the code-scanning API. Print them,

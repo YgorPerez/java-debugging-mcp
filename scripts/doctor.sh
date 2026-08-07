@@ -436,22 +436,40 @@ JS
     printf '%s\n' "        git config core.hooksPath .githooks"
   fi
 
-  # zizmor gates in CI beside this scan (CI-5, #150), and runs here for the same reason the blocks above
-  # do. `uvx` is how CI runs it too, so there is no separate binary to install and get out of step.
-  if command -v uvx >/dev/null 2>&1; then
+  # zizmor gates in CI beside this scan (CI-5, #150), and runs here for the same reason the blocks above do.
+  #
+  # A REAL `zizmor` ON PATH IS PREFERRED AND `uvx` IS THE FALLBACK, in that order on purpose. This used to
+  # run `uvx zizmor` only, on the stated grounds that "uvx is how CI runs it too, so there is no separate
+  # binary to get out of step". That was the opposite of the truth: GitHub's runners have no `uvx`, so CI's
+  # step exited 127 on every run while this one reported "would pass" — because a dev box usually *does* have
+  # `uvx`, which downloads zizmor on demand. The two verdicts disagreed for eight hours, and the Actions
+  # outage that hid the red is the only reason it took that long to notice.
+  #
+  # CI now installs zizmor through the same pinned install step as every other tool, so asking for the binary
+  # first is asking the question CI answers. `uvx` stays as a convenience for a machine that has uv and not
+  # zizmor, and the line says WHICH route ran — "would pass" from a different binary than the gate's is
+  # precisely the claim that misled here. The label itself stays exactly "workflow lint (zizmor)" because
+  # docs_claims.rs matches on it; the route goes in a trailing bracket rather than inside the parentheses.
+  zizmor_via=""
+  if command -v zizmor >/dev/null 2>&1; then
+    zizmor_via="zizmor"
+  elif command -v uvx >/dev/null 2>&1; then
+    zizmor_via="uvx zizmor"
+  fi
+  if [ -n "$zizmor_via" ]; then
     zizmor_status=0
-    zizmor_out="$(uvx zizmor --persona=regular .github/ 2>&1)" || zizmor_status=$?
+    zizmor_out="$($zizmor_via --persona=regular .github/ 2>&1)" || zizmor_status=$?
     if [ "$zizmor_status" -ne 0 ]; then
-      printf '\n%s\n' "workflow lint (zizmor): WOULD FAIL — this gates in CI."
+      printf '\n%s\n' "workflow lint (zizmor): WOULD FAIL — this gates in CI. [ran via ${zizmor_via}]"
       printf '%s\n' "$zizmor_out" | grep -E '^(error|warning)' | sed 's/^/      /'
       verdict=3
     else
-      printf '\n%s\n' "workflow lint (zizmor): would pass."
+      printf '\n%s\n' "workflow lint (zizmor): would pass. [ran via ${zizmor_via}]"
     fi
   else
-    printf '\n%s\n' "not looked at here — uvx is not installed, and zizmor GATES in CI."
-    printf '%s\n' "      A clean run above is therefore not a green gate. Install uv:"
-    printf '%s\n' "      https://docs.astral.sh/uv/getting-started/installation/"
+    printf '\n%s\n' "not looked at here — no zizmor and no uvx, and zizmor GATES in CI."
+    printf '%s\n' "      A clean run above is therefore not a green gate. Install the same binary CI uses:"
+    printf '%s\n' "        cargo install zizmor        # or: uv tool install zizmor"
   fi
 
   exit "$verdict"
