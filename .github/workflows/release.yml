@@ -44,6 +44,10 @@ jobs:
   version:
     name: Tag agrees with the manifest
     runs-on: ubuntu-latest
+    # CI-10 (#172). 7 s observed (3–7). It is deliberately toolchain-free, which is what makes it cheap
+    # enough to run before everything else — so this is the tightest budget in the repo and it is still
+    # forty times the measurement. See tests.yml's `changes` job for the general argument and the sourcing.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -75,6 +79,12 @@ jobs:
   # tests.yml is a JDK matrix as of TEST-11 (#36), so this one `needs:` now waits on every leg — 11, 17
   # and 21 — not on a single job. A called workflow succeeds only when all of its jobs do, and its
   # `fail-fast: false` only keeps the other legs running to report; it does not let a red leg through.
+  #
+  # NEITHER GATE JOB CARRIES A `timeout-minutes`, and that is the schema rather than an omission (CI-10,
+  # #172): a job that calls a reusable workflow with `uses:` accepts only name/uses/with/secrets/needs/if/
+  # permissions, and actionlint fails the file on anything else — verified by planting one. The budget for
+  # this work lives on the jobs INSIDE tests.yml and rust-doctor.yml, which all have one, so a hung
+  # integration leg is still killed in 20 minutes when it is reached through here.
   gate-tests:
     name: Gate (tests)
     needs: version
@@ -102,6 +112,11 @@ jobs:
     name: ${{ matrix.name }}
     needs: version
     runs-on: ${{ matrix.runner }}
+    # 192 s observed for the slowest slice, windows-x86_64 (the range across all slices and two releases is
+    # 93–192). Per-target caching means a release cut days after the last one usually finds its entry
+    # expired, so treat the cold build as the normal case rather than the exception. See tests.yml's
+    # `changes` job for the general argument.
+    timeout-minutes: 30
     strategy:
       # One platform failing should not hide whether the others would have built; with `needs` on the
       # release job a partial matrix still cannot publish.
@@ -202,6 +217,10 @@ jobs:
     name: Crates package cleanly
     needs: version
     runs-on: ubuntu-latest
+    # 62 s observed, from the one release that has run this job (v0.20.0, REL-5). It is cold by
+    # construction: `cargo publish --dry-run` builds each crate from the tarball it would send, in a temp
+    # directory the cargo cache does not reach.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -229,6 +248,9 @@ jobs:
     name: Publish the release
     needs: [version, gate-tests, gate-lint, build, package]
     runs-on: ubuntu-latest
+    # 12 s observed (8–12 across four releases). The variable part is network: downloading the platform
+    # binaries out of the artifact store and uploading them again to the releases API.
+    timeout-minutes: 15
     permissions:
       contents: write # create the release and upload its assets; nothing else is needed
     steps:
@@ -357,6 +379,12 @@ jobs:
     name: Publish to crates.io
     needs: [version, package, release]
     runs-on: ubuntu-latest
+    # NO SUCCESSFUL RUN TO DERIVE FROM, said out loud rather than dressed up as a measurement: the only run
+    # of this job so far failed at the auth step after 17 s, before the bootstrap in ADR-0043 was done. The
+    # budget is reasoned instead — two `cargo publish` calls, and cargo blocks between them waiting for the
+    # first crate to appear in the index, which is the slow and variable part. Replace this comment with a
+    # real observation the first time it succeeds.
+    timeout-minutes: 20
     permissions:
       # `id-token: write` is the entire grant, and it is not a write to the repository: it is what lets the
       # job ask GitHub for an OIDC token about itself. `contents: read` is the checkout.

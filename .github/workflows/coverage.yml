@@ -36,7 +36,11 @@ jobs:
   coverage:
     name: Region + line coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # CI-10 (#172). This was the ONE `timeout-minutes` in the whole repo, and it was a round 30 with no
+    # derivation. 216 s observed (213–216), so the real shape is 3.6 minutes: an instrumented build plus the
+    # entire unsharded `#[ignore]`d suite. 20 is that with room for a cold cache, and it is still five times
+    # the measurement. See tests.yml's `changes` job for why every job now carries one of these.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

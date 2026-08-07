@@ -216,6 +216,15 @@ and it is the point: pinning is undone by a bot that pulls a version the moment 
 is deliberately off**, because `main` has no branch protection (the API returns 404), so there is
 nothing required to gate on and auto-merge would mean merge-on-open.
 
+**Every job in `.github/` now has a `timeout-minutes`, derived at its own line** (CI-10, #172). It used to
+be one job in the whole repo, at a round 30; everything else ran under GitHub's default of **360
+minutes**. This suite's failure mode is a *wait* rather than an assertion — a probe JVM that never reaches
+its breakpoint, a suspended debuggee nobody resumes — and with `fail-fast: false` the bill was six hours
+of runner per hung leg. **Each number says what it was derived from**, because a bare one rots the way a
+written-down shard number does; where there is no measurement to derive from (the crates.io publish has
+never succeeded) the comment says *that* instead of inventing one. Note the two `uses:` jobs in
+`release.yml` carry **no** timeout: the schema forbids it on a reusable-workflow call.
+
 **Two git hooks are checked in, and they do nothing until you opt in** (LINT-6/#146, REL-4/#147):
 `git config core.hooksPath .githooks` — per-clone, because a commit cannot set it. `pre-commit` runs
 `cargo fmt --all --check`; `commit-msg` checks the subject against the types `release-notes.py`

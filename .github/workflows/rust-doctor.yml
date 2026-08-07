@@ -41,6 +41,11 @@ jobs:
   health:
     name: Health scan
     runs-on: ubuntu-latest
+    # CI-10 (#172). 69 s observed (58–69 across four runs). The full argument for why every job carries one
+    # of these, and how the numbers were derived, is at the `changes` job in tests.yml. The headroom here is
+    # for a cold dependency cache: the `cargo clean -p` step below forces a full re-lint of the WORKSPACE
+    # crates every run by design, so the only thing a warm cache ever saves is the dependency build.
+    timeout-minutes: 20
     permissions:
       contents: read
       security-events: write # upload SARIF to GitHub code scanning; scoped to this job (CI-5, #150)
@@ -367,6 +372,10 @@ jobs:
   semver:
     name: Public API vs the last tag
     runs-on: ubuntu-latest
+    # 33 s observed (21–33), and that figure is ALREADY the cold one — this job passes `cache: "false"`, so
+    # there is no warm case to be surprised by. The headroom is for cargo-semver-checks building rustdoc
+    # JSON twice, for the baseline tag and for HEAD. See tests.yml's `changes` job for the general argument.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

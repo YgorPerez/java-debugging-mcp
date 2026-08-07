@@ -53,6 +53,13 @@ jobs:
     # advisory, so a red run here is news rather than a broken build.
     name: Doctor on next stable (advisory — gates nothing)
     runs-on: ubuntu-latest
+    # CI-10 (#172). 8 s observed — BUT ONLY ON THE FAST PATH, and quoting that number as the budget would be
+    # the mistake this repo keeps writing post-mortems about. Every run so far has found the pin current and
+    # stopped at the comparison step; the scan path below has never executed. So the derivation is the gate's
+    # own `health` job, 69 s warm, times the fact that this one passes `cache: "false"` deliberately and
+    # therefore lints the whole dependency graph from scratch. See tests.yml's `changes` job for the
+    # general argument.
+    timeout-minutes: 30
 
     env:
       # Same reason as rust-doctor.yml: rust-doctor injects a temporary `<crate>/clippy.toml` into any

@@ -60,6 +60,23 @@ jobs:
   changes:
     name: What changed
     runs-on: ubuntu-latest
+    # CI-10 (#172). WHAT EVERY `timeout-minutes` IN THIS REPO IS FOR, said once here and pointed at from
+    # the other files. Until this landed, exactly one job in `.github/` had a timeout (coverage.yml, at a
+    # round 30) and every other one ran under GitHub's default of 360 minutes.
+    #
+    # It is a HANG DETECTOR, not a performance budget. This suite's failure mode is usually a wait rather
+    # than an assertion: a probe JVM that never reaches its breakpoint, a `dt_socket` accept that is never
+    # made, a suspended debuggee nobody resumes. None of those fails — they sit, and with `fail-fast: false`
+    # on the matrices the bill is per leg. Six hours of runner per hung leg is the current price.
+    #
+    # EVERY NUMBER IS DERIVED AND SAYS SO AT ITS OWN LINE, because a bare number here rots the way a
+    # written-down shard number does. The derivations come from the job durations of the runs on 7 Aug 2026
+    # (`gh api repos/.../actions/runs/<id>/jobs`), and the honest form is "104 s observed, 20 for headroom"
+    # rather than "20". Headroom is deliberately generous — the point is to catch a hang in minutes instead
+    # of hours, not to police a slow runner into a red build.
+    #
+    # 9 s observed here (4–9 across four runs). The only variable part is the `fetch-depth: 0` checkout.
+    timeout-minutes: 5
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
@@ -121,6 +138,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    # 40 s observed warm (35–40). The budget is for the case the measurement never shows: a cold cargo
+    # cache, where this is a full build of the workspace and its 98 dependencies before a test runs.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -163,6 +183,13 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    # 104 s observed for the slowest of the six legs (65–104 across four runs). THE ONE JOB CI-10 IS
+    # ACTUALLY ABOUT: every other timeout here is hygiene, and this is where a hang comes from. Each leg
+    # launches dozens of probe JVMs, `EVENT_TIMEOUT` waits are measured in tens of seconds, and #56, #64
+    # and #118 are open flakes whose shape is a wait rather than a failure. The headroom is wide because a
+    # cold cache means a full build first — but 20 minutes still turns six hours of held runner into ten
+    # times less than one leg's own build budget.
+    timeout-minutes: 20
     strategy:
       # One JDK failing must not hide whether the others would have passed: with a version matrix the
       # useful finding is almost always *which* versions broke, and fail-fast throws that away. It does
@@ -365,6 +392,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    # 26 s observed (25–26). `cargo check --workspace --all-targets` on a cold cache is the case the budget
+    # is for; this job installs a toolchain nothing else here uses, so its cache entry is the one most
+    # likely to be cold.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -415,6 +446,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    # 60 s observed — and this is the one job where the observation UNDERSTATES what the config permits, so
+    # deriving from it alone would be wrong. `-max_total_time=45 -runs=2000000` stops at whichever comes
+    # first, and every run so far has hit the run count; the ceiling the flags allow is three targets x 45 s
+    # = 135 s of fuzzing, on top of a nightly toolchain, a cargo-fuzz install and three
+    # sanitizer-instrumented builds. Budget for the ceiling, not for the happy path.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -480,6 +517,9 @@ jobs:
     if: always()
     needs: [changes, unit, integration, msrv, fuzz]
     runs-on: ubuntu-latest
+    # 4 s observed (2–4). It checks out nothing and greps a JSON blob. The timeout matters here anyway: this
+    # is the job branch protection would require, so it is the one whose absence blocks a merge.
+    timeout-minutes: 5
     steps:
       - name: Every leg passed or was deliberately skipped
         shell: bash
