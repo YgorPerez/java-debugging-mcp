@@ -22,7 +22,9 @@ tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-jdwp-client = { path = "../jdwp-client" }
+# Through the workspace table now, like every other dependency here, because publishing needs this one to
+# carry a version as well as a path — see the comment on the entry in the root Cargo.toml.
+jdwp-client.workspace = true
 schemars = "1"
 
 [dev-dependencies]

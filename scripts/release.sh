@@ -178,25 +178,52 @@ NOTE
 step "Bumping [workspace.package].version"
 
 if [ "$DRY_RUN" = 1 ]; then
-  echo "    would set version = \"$VERSION\" in Cargo.toml and server.json"
+  echo "    would set version = \"$VERSION\" in Cargo.toml ([workspace.package] and the jdwp-client entry)"
+  echo "    would set version = \"$VERSION\" in server.json"
   echo "    would refresh Cargo.lock, commit 'chore(release): $VERSION', and tag $TAG"
   step "Dry run complete — nothing changed"
   exit 0
 fi
 
-# Anchored to the [workspace.package] table rather than a bare version match: [workspace.dependencies]
-# below it is full of version strings, and a loose substitution would rewrite a dependency instead.
+# TWO versions in this file move together, and the second one is the newer trap.
+#
+# The first is [workspace.package].version, matched anchored to its table rather than by a bare version
+# search, because [workspace.dependencies] below it is full of version strings and a loose substitution
+# would rewrite a dependency instead.
+#
+# The second is a dependency, and it is bumped ON PURPOSE — the one exception to the sentence above.
+# `jdwp-client` is a sibling crate in this tree, and publishing (REL-5) forced its entry to carry a
+# `version` next to its `path`, because `cargo publish` rejects a bare path dependency. That version is a
+# statement about a crate this same release is republishing, so it is not a floor to leave alone: a `^0.x`
+# requirement matches only its own minor, so leaving `0.19.0` behind while the workspace goes to `0.20.0`
+# leaves `jdwp-mcp` requiring a client version nothing in the tree provides.
+#
+# That is caught immediately rather than subtly — cargo checks a path dependency's `version` against the
+# path package when it resolves — so the `cargo update` a few lines below would fail on a half-done bump
+# and this script would stop before tagging. The bump is here so that never happens, not because a stale
+# number could sneak past: it cannot.
 python3 - "$VERSION" <<'PY'
 import re, sys
 
 new = sys.argv[1]
 src = open("Cargo.toml").read()
+
 pattern = re.compile(r'(\[workspace\.package\]\s*\n(?:[^\[]*?\n)?)(version\s*=\s*")([^"]+)(")', re.M)
-out, n = pattern.subn(lambda m: f"{m.group(1)}{m.group(2)}{new}{m.group(4)}", src, count=1)
+src, n = pattern.subn(lambda m: f"{m.group(1)}{m.group(2)}{new}{m.group(4)}", src, count=1)
 if n != 1:
     sys.exit("could not find version under [workspace.package] — has Cargo.toml been restructured?")
-open("Cargo.toml", "w").write(out)
-print(f"    Cargo.toml: version = \"{new}\"")
+
+# Scoped to the jdwp-client line itself rather than to the table, so it cannot reach `serde` or `tokio` on
+# the lines below even if the entry is moved or the table is reordered.
+dep = re.compile(r'^(jdwp-client\s*=\s*\{[^}\n]*?version\s*=\s*")([^"]+)(")', re.M)
+src, n = dep.subn(lambda m: f"{m.group(1)}{new}{m.group(3)}", src, count=1)
+if n != 1:
+    sys.exit("could not find the versioned jdwp-client entry under [workspace.dependencies].\n"
+             "       If that dependency stopped carrying a version, `cargo publish` cannot work and this\n"
+             "       release would fail after tagging — fix the manifest rather than this script.")
+
+open("Cargo.toml", "w").write(src)
+print(f"    Cargo.toml: version = \"{new}\" ([workspace.package] and the jdwp-client dependency)")
 PY
 
 # server.json is the MCP registry manifest (REL-3, #137). It carries its own `version`, and a manifest that
@@ -236,8 +263,23 @@ git diff --quiet -- Cargo.lock &&
 
 # Belt and braces: reread the manifest and derive the tag from what is now on disk, so the thing being
 # tagged is the thing that was written. This is the check release.yml makes, made locally and earlier.
-WROTE="$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
-[ "$WROTE" = "$VERSION" ] || die "wrote '$WROTE' but expected '$VERSION' — refusing to tag a mismatch.
+# Read back through tomllib rather than trusting the regexes above: a substitution that matched the wrong
+# span still reports `n == 1`. The dependency is checked here as well as by the `cargo update` above
+# because this reports which number is wrong, where cargo's resolution error reports only that two of them
+# disagree — and this is the last point before a tag.
+WROTE="$(python3 - <<'PY'
+import tomllib
+ws = tomllib.load(open("Cargo.toml", "rb"))["workspace"]
+dep = ws["dependencies"]["jdwp-client"].get("version", "<no version key>")
+print(ws["package"]["version"], dep)
+PY
+)"
+read -r WROTE_PKG WROTE_DEP <<<"$WROTE"
+[ "$WROTE_PKG" = "$VERSION" ] || die "wrote '$WROTE_PKG' but expected '$VERSION' — refusing to tag a mismatch.
+       Cargo.toml has been modified; 'git checkout -- Cargo.toml Cargo.lock' restores it."
+[ "$WROTE_DEP" = "$VERSION" ] || die "the jdwp-client dependency says '$WROTE_DEP', but this release is '$VERSION'.
+       jdwp-mcp would require a client version nothing in this tree provides, so the workspace would not
+       even resolve — the bump above wrote one number and not the other.
        Cargo.toml has been modified; 'git checkout -- Cargo.toml Cargo.lock' restores it."
 
 step "Committing and tagging"

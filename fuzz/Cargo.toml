@@ -20,7 +20,15 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-jdwp-client = { path = "../jdwp-client" }
+# `package` is not optional since REL-5 renamed the client for crates.io: a path dependency whose KEY does
+# not match the package's own name is a hard resolution error, so without this line every fuzz target stops
+# building. It cannot go through `[workspace.dependencies]` like the other two crates do, because this is a
+# SEPARATE workspace on purpose (TEST-45, #153) — keeping nightly away from the crates the gate builds is
+# the whole reason `fuzz/` is excluded from the root workspace, and inheriting from it would undo that.
+#
+# No `version` here, unlike the root table's entry: this package sets `publish = false` above, so its
+# dependency never has to name anything a stranger could download.
+jdwp-client = { package = "java-debugging-jdwp-client", path = "../jdwp-client" }
 
 [[bin]]
 name = "reply_packet"

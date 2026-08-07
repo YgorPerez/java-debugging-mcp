@@ -43,6 +43,34 @@ categories = ["development-tools::debugging", "command-line-utilities"]
 # manifest table that silently fails to apply under the gate.
 
 [workspace.dependencies]
+# The intra-workspace dependency, and the ONE entry here whose version is not a floor but an exact
+# statement about a sibling crate in this tree.
+#
+# `path` is what every local build resolves through; `version` exists solely because `cargo publish`
+# refuses a package whose dependency is a bare path — it has to name something a consumer downloading
+# `jdwp-mcp` from crates.io can also download. Cargo uses `path` locally and rewrites the published
+# manifest to the `version` alone, so the two never both apply.
+#
+# `package` carries the crates.io rename (see jdwp-client/Cargo.toml for why the obvious name was
+# unavailable). Keeping the KEY as `jdwp-client` is what lets `mcp-server` go on saying
+# `jdwp-client.workspace = true`.
+#
+# **This version must equal [workspace.package].version above, and `scripts/release.sh` bumps both in one
+# step.** A `^0.x` requirement matches only its own minor, so leaving this behind while the workspace moves
+# on makes the requirement unsatisfiable by the very crate it points at.
+#
+# MEASURED, because the obvious guess about this is wrong and was briefly written down as fact: cargo
+# validates a path dependency's `version` against the path package at RESOLUTION, so the mismatch is not
+# some subtle thing that survives to the registry. Planting `version = "0.18.0"` here fails the next
+# `cargo check` outright:
+#
+#     error: failed to select a version for the requirement `java-debugging-jdwp-client = "^0.18.0"`
+#     candidate versions found which didn't match: 0.19.0
+#
+# So this needs no test pinning it and no warning beside it. It is load-bearing for `release.sh` — whose
+# `cargo update` step would fail on a half-done bump — and inert for everyone else.
+jdwp-client = { package = "java-debugging-jdwp-client", path = "jdwp-client", version = "0.19.0" }
+
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }

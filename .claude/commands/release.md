@@ -165,6 +165,21 @@ silently. If it is *not* filed, stop: that is a new failure and the release shou
 gh run rerun <run-id> --failed
 ```
 
+**The `publish` job (crates.io) is the exception to "re-run the failed jobs".** It is last on purpose,
+because a GitHub release can be deleted and cut again while a crates.io version can only be yanked and keeps
+its number forever (ADR-0043). Two failures there mean different things:
+
+- **`crate version is already uploaded`** — it worked. The version is on crates.io and cannot be replaced.
+  Do not re-run, do not try to force it; note it and move on.
+- **A failure at the auth step** — most likely nobody has done the manual bootstrap. crates.io has no
+  pending publishers, so the first version of each crate must be published by hand and the trusted publisher
+  configured afterwards in the crates.io UI. The rest of the release is unaffected and already shipped; do
+  that bootstrap, then publish this version manually rather than re-tagging:
+
+  ```bash
+  cargo publish --workspace   # --workspace, not two -p runs: see ADR-0043
+  ```
+
 ## 6. Verify what actually shipped
 
 ```bash
@@ -185,6 +200,22 @@ gh release view v<version> --json body --jq '.body' | head -40
 Your narrative first, then `## What's Changed`, then the compare link. A body that is *only* the compare
 link means the notes step published nothing — the old `--generate-notes` failure mode — and the toolkit
 audit in step 7 has nothing to read.
+
+Then confirm crates.io agrees, asking the **registry** rather than the workflow log — a green `publish` job
+and a version actually resolvable by `cargo install` are not the same claim, and the index takes a moment to
+catch up:
+
+```bash
+for c in jdwp-mcp java-debugging-jdwp-client; do
+  printf '%-30s ' "$c"
+  curl -s "https://crates.io/api/v1/crates/$c" | python3 -c \
+    'import sys,json; d=json.load(sys.stdin); print(d["crate"]["max_version"] if "crate" in d else "NOT PUBLISHED")'
+done
+```
+
+Both must print the version you just cut. `jdwp-mcp` alone matching means the workspace publish stopped
+between the two crates — the client goes up first, so this is the *less* likely half to be missing; check
+the `publish` job's log rather than assuming the index is lagging.
 
 ## 7. Propagate to infotravel-dev-toolkit
 

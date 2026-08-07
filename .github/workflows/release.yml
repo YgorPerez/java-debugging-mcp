@@ -4,10 +4,20 @@ name: release
 # GitHub release, so installing needs no Rust toolchain (REL-1, #34).
 #
 # The job order is the safety property, not a preference:
-#   version -> {gate-tests, gate-lint, build} -> release
+#   version -> {gate-tests, gate-lint, build, package} -> release -> publish
 # `version` is toolchain-free and finishes in seconds, so a tag that disagrees with the manifest costs
-# nothing and, more importantly, cannot reach a job that publishes. `release` is the only job able to
-# write to the repository and it waits on both gates.
+# nothing and, more importantly, cannot reach a job that publishes. `release` waits on both gates.
+#
+# `publish` (crates.io, REL-5) is deliberately LAST, and that is the one ordering here chosen for
+# reversibility rather than for speed. A GitHub release can be deleted and cut again; a crates.io version
+# can only be YANKED, and a yanked version still occupies its number forever. So the recoverable publish
+# goes first and the irreversible one goes last, which makes the bad case "crates.io is a release behind"
+# — fixable by re-running this job — instead of "0.20.0 exists on crates.io and nowhere else".
+#
+# `package` is the other half of that argument: it is a full `cargo publish --dry-run` running in parallel
+# with the binary matrix, and `release` waits on it. Packaging has its own failure modes that nothing else
+# in this pipeline exercises — a missing `description`, an unpublishable path dependency, a version already
+# taken — and every one of them is cheap before the tag is public and expensive after.
 #
 # The gates are CALLED here rather than assumed to have run: tests.yml and rust-doctor.yml trigger on
 # push-to-main and pull_request, so a tag ref fires neither. Without this a tag placed on a commit that
@@ -180,9 +190,44 @@ jobs:
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
+  # Everything the real publish does except the upload, so a packaging failure is found while the only cost
+  # of failing is a red run. `--dry-run` builds each crate from the tarball it would actually send, which is
+  # what catches the class of break that only exists inside a `.crate`: a source file cargo declines to copy,
+  # a dependency that resolves locally through `path` and has no `version` for a stranger to resolve, a
+  # required manifest field left empty.
+  #
+  # It does NOT catch a version already on crates.io — `--dry-run` skips that check. The publish job is
+  # where that surfaces, and it is why `release.sh` refuses to reuse a tag.
+  package:
+    name: Crates package cleanly
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          # `stable`, for the same reason the build matrix says so at its own call site: rust-toolchain.toml
+          # pins the GATE's compiler, and what is published should build on current Rust rather than on
+          # whatever version the lint pin happens to sit at.
+          toolchain: stable
+
+      # --workspace publishes both members and works out the order itself: `java-debugging-jdwp-client`
+      # cannot go second, because `jdwp-mcp` names it as a dependency. Doing that ordering by hand is a
+      # second copy of a fact cargo already knows.
+      #
+      # Twelve `warning: ignoring example ... is not included in the published package` lines are EXPECTED
+      # here — jdwp-client declares example targets under `../examples/`, outside its own package root, and
+      # they are deliberately not shipped. jdwp-client/Cargo.toml carries the full reason.
+      - name: cargo publish --dry-run
+        run: cargo publish --workspace --dry-run --locked
+
   release:
     name: Publish the release
-    needs: [version, gate-tests, gate-lint, build]
+    needs: [version, gate-tests, gate-lint, build, package]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release and upload its assets; nothing else is needed
@@ -289,3 +334,56 @@ jobs:
             *-*) flags+=(--prerelease) ;;
           esac
           gh release create "$GITHUB_REF_NAME" "${flags[@]}" dist/jdwp-mcp-* dist/SHA256SUMS
+
+  # Publishes both crates to crates.io, so `cargo install jdwp-mcp` works without a GitHub release asset
+  # (REL-5). This ADDS a channel; it does not replace the binaries above, which remain the better path for
+  # anyone who would rather not install a Rust toolchain and wait for a compile.
+  #
+  # ## Why there is no CARGO_REGISTRY_TOKEN
+  #
+  # This uses crates.io Trusted Publishing: GitHub mints a short-lived OIDC token, crates.io verifies it
+  # came from this repository and this workflow, and hands back an access token that expires. No credential
+  # is stored anywhere, which keeps true the thing CLAUDE.md notes about this repo having no secrets — the
+  # same property that made the scaffolded AI-review workflows fail five times in silence.
+  #
+  # ## The bootstrap, which is a REAL manual step and cannot be automated away
+  #
+  # crates.io has no equivalent of PyPI's "pending publishers": a trusted publisher is configured ON a
+  # crate, so the crate has to exist first. **The first version of each crate must be published by hand**,
+  # from a laptop, with a personal API token, and the publisher configured afterwards at
+  # <https://crates.io/crates/jdwp-mcp/settings> and the client's equivalent. Until that is done this job
+  # fails at the auth step on every tag. See docs/adr/0043 for the full sequence.
+  publish:
+    name: Publish to crates.io
+    needs: [version, package, release]
+    runs-on: ubuntu-latest
+    permissions:
+      # `id-token: write` is the entire grant, and it is not a write to the repository: it is what lets the
+      # job ask GitHub for an OIDC token about itself. `contents: read` is the checkout.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+
+      - name: Exchange the OIDC token for a crates.io token
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      # `--no-verify` because the `package` job already built both crates from their tarballs, and this run
+      # is publishing the same commit. Rebuilding here buys nothing and doubles the window in which a
+      # half-published workspace can exist.
+      #
+      # If this fails with "crate version is already uploaded", the version is already ON crates.io and the
+      # correct response is to leave it there and cut the next one — re-running will not help, and there is
+      # deliberately no `|| true` making that look like success. A published version cannot be replaced.
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --workspace --no-verify --locked

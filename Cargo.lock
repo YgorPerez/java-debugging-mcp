@@ -75,7 +75,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jdwp-client"
+name = "java-debugging-jdwp-client"
 version = "0.19.0"
 dependencies = [
  "bytes",
@@ -91,7 +91,7 @@ name = "jdwp-mcp"
 version = "0.19.0"
 dependencies = [
  "anyhow",
- "jdwp-client",
+ "java-debugging-jdwp-client",
  "schemars",
  "serde",
  "serde_json",

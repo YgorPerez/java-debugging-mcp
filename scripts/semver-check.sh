@@ -7,16 +7,31 @@
 #
 # ## Why a script and not `cargo semver-checks` in the workflow
 #
-# Because the tool's DEFAULT baseline is wrong here in a way that produces a confident green answer.
-# `cargo semver-checks` with no baseline compares against the crate's latest release on crates.io, and
-# `jdwp-client` there is <https://github.com/bonk-dev/jdwp-client> — an unrelated project that registered
-# the name in September 2025. Ours is unpublished (distribution is this repo's release binaries), so the
-# default run compares our crate against a stranger's and reports "no semver update required". That is why
-# rust-doctor's own semver pass stays uninstalled (`.github/workflows/rust-doctor.yml` says so at the
-# point of the decision): a pass that answers from the wrong package is worse than one that is skipped.
+# Because the tool's DEFAULT baseline is wrong here, and a git tag is right — for two different reasons
+# that arrived in that order.
 #
-# A git tag is the baseline that means something for an unpublished crate, and `--baseline-rev` is how you
-# ask for it. That flag is the whole reason this file exists; nothing else here is interesting.
+# ORIGINALLY the default was wrong because it answered from the wrong package. `cargo semver-checks` with
+# no baseline compares against the crate's latest release on crates.io, and `jdwp-client` there is
+# <https://github.com/bonk-dev/jdwp-client> — an unrelated project that registered the name in September
+# 2025. Ours was unpublished, so the default run compared our crate against a stranger's and reported "no
+# semver update required". That is why rust-doctor's own semver pass stays uninstalled
+# (`.github/workflows/rust-doctor.yml` says so at the point of the decision): a pass that answers from the
+# wrong package is worse than one that is skipped.
+#
+# THAT PARTICULAR TRAP IS GONE (REL-5, ADR-0043). The library is published as `java-debugging-jdwp-client`
+# — the collision above is now the reason for its NAME rather than the reason for this file — so a default
+# run would at last find our own package. Nothing here changes anyway, because the tag baseline was never
+# only a workaround:
+#
+#   - A registry baseline can only compare against a RELEASE. Between releases, which is where this check
+#     is read, the newest published version is the previous release; that is the same comparison
+#     `--baseline-rev` makes, reached less directly and only once the publish has actually landed.
+#   - It would make a LINT depend on the network and on a third party's uptime. `--baseline-rev` reads an
+#     object out of this repository.
+#   - It answers nothing on a commit whose version is not yet published, which is every commit this runs on.
+#
+# So `--baseline-rev` remains the flag this file exists for; what changed is that it is now a preference
+# with reasons rather than the only option that worked.
 #
 # ## What it covers, and what it does not
 #
@@ -127,6 +142,32 @@ if grep -qE "failed to build rustdoc|could not document|running cargo-doc on cra
   echo "(\`$BASELINE\`) rather than the working tree, the tag itself does not build, which is worth knowing"
   echo "separately."
   exit "${status:-1}"
+fi
+
+# The other way this checks nothing while exiting non-zero: the baseline has no package under the name the
+# working tree uses, so there is nothing to compare against. That is a RENAME, not a break — and it is
+# reported as `error: failed to retrieve local crate data from git revision`, which fell straight through to
+# the "public API broke" branch below and produced a confident finding about a comparison that never ran.
+# Found on REL-5's own rename (ADR-0043), which is the first time this repo has renamed a published crate.
+#
+# It exits 0, deliberately, including on the release path. A rename leaves nothing for any version number to
+# permit, so failing would block the release with a red that NO bump can clear — the permanent-red defect
+# this script's own header is written against. The message is the mitigation: it says what did not happen,
+# and it names the one state in which this is expected, so a rename nobody intended does not read as routine.
+#
+# This is self-clearing. Once a tag exists carrying the new name, that tag becomes the baseline and the
+# check resumes on its own; if this is still firing two releases later, the name is drifting every release and
+# that is the actual bug.
+if grep -qE "failed to retrieve local crate data from git revision|no crate named .* in baseline" "$OUT"; then
+  echo "**This did not check anything: the baseline has no crate under this name.** \`$BASELINE\` predates a"
+  echo "package rename, so there is no previous version of this API to compare against — which is not a"
+  echo "compatibility finding, and is not something a bigger version bump would resolve."
+  echo
+  echo "Expected exactly once, on the first release after a rename (REL-5 renamed \`jdwp-client\` to"
+  echo "\`java-debugging-jdwp-client\`; see ADR-0043). The next tag carries the new name and becomes a usable"
+  echo "baseline, so this clears itself. **If you did not rename anything, something else did** — check"
+  echo "\`[package] name\` in both members before going further."
+  exit 0
 fi
 
 if [ "$status" -ne 0 ]; then

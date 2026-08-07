@@ -129,11 +129,21 @@ chmod +x "jdwp-mcp-$tag-linux-x86_64"
 The macOS binaries are unsigned, so the first run needs `xattr -d com.apple.quarantine <file>` or
 Settings → Privacy & Security → "Open Anyway".
 
-**Or build from source** — needs Rust 1.82 or newer:
+**Or install from crates.io** — needs Rust 1.85 or newer, and compiles from source, so budget a few
+minutes the prebuilt binaries above do not cost you:
+
+```bash
+cargo install jdwp-mcp     # binary at ~/.cargo/bin/jdwp-mcp
+```
+
+**Or build from a clone** — same 1.85 floor:
 
 ```bash
 cargo build --release   # binary at target/release/jdwp-mcp
 ```
+
+The floor is 1.85 because it was *measured* rather than declared (BUILD-2): 1.82 and 1.83 fail on this
+workspace's own code, and 1.84 fails at dependency resolution before any of it is compiled.
 
 ### 3. Configure Claude Code
 

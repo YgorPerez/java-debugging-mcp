@@ -437,7 +437,9 @@ not.
 
 ## Consequences
 
-- `issue` / `InFlight` / `read_independently` are public API on an unpublished crate. `scripts/semver-check.sh`
+- `issue` / `InFlight` / `read_independently` are public API. That surface is now published, as
+  `java-debugging-jdwp-client` (ADR-0043), so it is reachable by strangers rather than only by `mcp-server` —
+  which raises the cost of breaking it without changing the analysis here. `scripts/semver-check.sh` still
   compares against the last release tag; additions are not breaking, and relaxing `send_command` to `&self`
   later would not be either.
 - The relay charges coalesced traffic once, which is exactly what a wave produces, so every figure above is

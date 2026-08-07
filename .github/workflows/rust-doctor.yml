@@ -96,7 +96,12 @@ jobs:
       # clean on the first run, before the target dir exists.
       - name: Force a full re-lint of the workspace crates
         shell: bash
-        run: cargo clean -p jdwp-client -p jdwp-mcp --target-dir target/rust-doctor || true
+        # `-p` takes the PACKAGE name, which is no longer the directory name for the client (REL-5): it is
+        # `java-debugging-jdwp-client` on crates.io. `cargo clean -p` on a name no package has is not an
+        # error — it cleans nothing and exits 0, and the `|| true` would have swallowed it regardless — so
+        # this would have gone on "passing" while quietly leaving the client's artifacts in place, which is
+        # the stale-cache case the step exists to prevent.
+        run: cargo clean -p java-debugging-jdwp-client -p jdwp-mcp --target-dir target/rust-doctor || true
 
       # --fail-on warning gates the build on warnings as well as errors (exit 3). It used to gate on
       # errors only, because there was a backlog of pedantic-clippy warnings to work through; that
@@ -133,11 +138,14 @@ jobs:
       #   - cargo-geiger — feeds `unsafe-dependency`, which rust-doctor.toml ignores at length: 21 warnings
       #     counting `unsafe` inside tokio/syn/serde, none of which anyone will replace. Installing it would
       #     spend build minutes producing findings we have already decided not to act on.
-      #   - cargo-semver-checks — its baseline is `jdwp-client` on crates.io, which is
-      #     bonk-dev/jdwp-client, an unrelated project that happens to hold the name. Ours are unpublished
-      #     (distribution is the release binaries), so the pass compares against a stranger's crate and
-      #     reports "no semver update required" — a confident answer built on the wrong package, which is
-      #     worse than a skip. rust-doctor's pass cannot be told to use a different baseline, so the check
+      #   - cargo-semver-checks — its baseline is the crate's latest crates.io RELEASE, which is the wrong
+      #     comparison here even now that we publish (REL-5, ADR-0043): between releases the newest
+      #     published version just is the previous tag, so the pass either repeats what the `semver` job
+      #     below already does or, on a commit whose version is not yet published, answers about nothing.
+      #     It was worse before the rename — `jdwp-client` on crates.io is bonk-dev/jdwp-client, an
+      #     unrelated project holding the name, so the pass compared against a stranger's crate and
+      #     reported "no semver update required", a confident answer built on the wrong package.
+      #     rust-doctor's pass cannot be told to use a different baseline, so the check
       #     it would have done is the `semver` job at the bottom of this file instead, against the last
       #     release TAG: 196 checks run that way, against 0 through this pass.
       #   - coverage — `coverage.yml` owns it, produces `target/coverage/lcov.info`, and knows about the
@@ -332,8 +340,10 @@ jobs:
   # than passing quietly, but a check whose default state is "could not run" is not a check.
   #
   # It runs `cargo semver-checks --baseline-rev <last tag>` and NOT the bare `cargo semver-checks` that
-  # rust-doctor's own semver pass would: the default baseline is the crate's latest crates.io release, and
-  # `jdwp-client` there belongs to bonk-dev/jdwp-client, an unrelated project holding the name. See
+  # rust-doctor's own semver pass would: the default baseline is the crate's latest crates.io RELEASE,
+  # which cannot answer for a commit between releases — the case this job runs on. Before REL-5 it was
+  # wrong in a louder way, comparing against bonk-dev/jdwp-client, an unrelated project that held the name
+  # our library has since been renamed away from. See
   # scripts/semver-check.sh for the whole argument, and for what this covers (jdwp-client's lib API —
   # jdwp-mcp is a [[bin]] and contributes nothing) versus what it cannot (the MCP tool surface, which is
   # what callers actually pin, and which only docs/toolkit-contract.md covers).

@@ -90,8 +90,9 @@ that did what it said.
 Three passes
 stay off deliberately and `rust-doctor.yml` says why at each one: `cargo-geiger` feeds the
 `unsafe-dependency` rule this repo ignores, `cargo-semver-checks` through *that* pass would compare against
-**bonk-dev's** unrelated `jdwp-client` on crates.io (ours are unpublished) and answer confidently from the
-wrong package — so the check lives in the `semver` job instead, via `scripts/semver-check.sh`, which uses the
+the latest crates.io **release**, which cannot answer for a commit between releases — and before REL-5 it was
+wrong more loudly than that, comparing against **bonk-dev's** unrelated `jdwp-client`, the name our library
+has since been renamed away from — so the check lives in the `semver` job instead, via `scripts/semver-check.sh`, which uses the
 last release **tag** as the baseline: 196 checks run that way against 0 through the pass. **It gates on the
 release path only** (CI-2, #122): `release.yml` passes `gate_semver: true`, so a broken public API blocks a tag,
 while a push to `main` or a PR gets the same finding printed — with the bump that would permit it — and
@@ -407,6 +408,33 @@ on a heredoc or an `echo` gets switched off within the day. Escape any deny with
 gates, commits and tags — deliberately stopping before the push — and the command is everything around it:
 which bump, the release body (which *is* the release notes, so the toolkit can read it), the tag push, the
 downstream pin and skill audit, and the issue closes.
+
+**A tag now also publishes to crates.io, and that step is the one thing here nothing can undo** (REL-5,
+ADR-0043). `cargo install jdwp-mcp` is why; the release binaries stay the better path for anyone who would
+rather not compile, so this **added** a channel rather than replacing one. Three things follow that are worth
+knowing before you cut one:
+
+**The library is `java-debugging-jdwp-client` on crates.io, not `jdwp-client`** — that name was taken in
+September 2025 by an unrelated project, which is the same collision `scripts/semver-check.sh` was written
+around. `[lib] name` is still `jdwp_client`, so the rename touches no source file, but `-p jdwp-client` is
+now a package name nothing answers to. **`cargo clean -p` on a name no package has cleans nothing and exits
+0**, which is how that would have gone unnoticed in `rust-doctor.yml`.
+
+**`[workspace.dependencies].jdwp-client` carries a `version` that must equal `[workspace.package].version`**,
+and `release.sh` bumps both in one step — do not bump by hand. It is *not* a silent hazard, which is worth
+saying because this file briefly claimed it was: cargo validates a path dependency's `version` against the
+path package at resolution, so a mismatch fails the next `cargo check` with `failed to select a version for
+the requirement`, long before anything is tagged. A test written to pin the two numbers together was deleted
+for guarding what the compiler already checks (ADR-0043 records both the wrong claim and the measurement).
+
+**The first publish of each crate has to be done manually and cannot be automated.** Publishing uses Trusted
+Publishing (OIDC, no stored token, keeping this repo's no-secrets property), and crates.io has no equivalent
+of PyPI's pending publishers: a trusted publisher is configured *on* a crate, so the crate must exist first.
+Until someone runs `cargo publish --workspace` from a laptop and configures the publisher in the crates.io
+UI, **the publish job fails at the auth step on every tag** — a red at the end of an otherwise green release.
+It must be `--workspace`: `cargo package -p jdwp-mcp` alone fails with `no matching package named
+java-debugging-jdwp-client` until the client is actually on the index, because only the workspace form stands
+up the temporary registry that resolves the sibling.
 
 It leads with the four traps that have actually cost time, so read them rather than rediscovering them. The
 worst is that a non-interactive `release.sh` writes only the commit **subject**, and repairing that means

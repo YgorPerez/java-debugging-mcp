@@ -1,5 +1,14 @@
 [package]
-name = "jdwp-client"
+# NOT `jdwp-client`, and the reason is a fact about crates.io rather than a preference: that name was
+# registered on 2025-09-10 by <https://github.com/bonk-dev/jdwp-client>, an unrelated project. It is the
+# same collision `scripts/semver-check.sh` was written around — there it makes the default baseline answer
+# from a stranger's package, here it makes the name simply unavailable. Prefixed with the repository name
+# so a searcher who finds the crate finds this project.
+#
+# `[lib] name` below keeps the RUST path `jdwp_client`, so this rename touches no source file. The two
+# names are independent on purpose: the registry name has to be globally unique, the import path only has
+# to be unique within a dependency graph.
+name = "java-debugging-jdwp-client"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -10,6 +19,12 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
+
+# Without this the lib target would be named after the package and every `use jdwp_client::...` in both
+# crates would have to become `use java_debugging_jdwp_client::...`.
+[lib]
+name = "jdwp_client"
+path = "src/lib.rs"
 
 [dependencies]
 serde.workspace = true
@@ -29,6 +44,14 @@ tokio = { workspace = true, features = ["test-util"] }
 name = "probe_heap_queries"
 path = "examples/probe_heap_queries.rs"
 
+# EVERY `../examples/` target below is silently dropped from the published `.crate`, because `cargo
+# package` copies nothing from outside the package root. It warns once per target and packages anyway —
+# twelve lines of `warning: ignoring example ... as ... is not included in the published package`, which
+# scroll past looking like a lint. That is the intended outcome, not a defect to fix: these are manual
+# probes you point at a live JVM, they are useless to someone consuming the library from crates.io, and
+# `cargo test` locally still builds them because a local build reads this manifest rather than a tarball.
+# Recorded here so the warnings are recognised rather than re-investigated at the one moment — a release —
+# when nobody has time to.
 [[example]]
 name = "test_connection"
 path = "../examples/test_connection.rs"
