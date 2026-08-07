@@ -3,7 +3,7 @@ exit: 0
 --- stdout
 == toolkit parity vs WORKTREE
 
-40 tools exported at WORKTREE; 6 named in their prose.
+41 tools exported at WORKTREE; 6 named in their prose.
 
 -- named downstream, absent from the pin (1)
 
@@ -12,7 +12,7 @@ weeks after VOCAB-1 (#20) renamed seven tools.
 
   `debug.set_breakpoint` — named in SKILL.md
 
--- exported by the pin, named nowhere downstream (35)
+-- exported by the pin, named nowhere downstream (36)
 
 A tool nobody will find: the quietest row in the table, because nothing breaks.
 
@@ -39,6 +39,7 @@ A tool nobody will find: the quietest row in the table, because nothing breaks.
   `debug.reload_class`
   `debug.resume_thread`
   `debug.run_named_query`
+  `debug.set_current_session`
   `debug.set_exception_stop`
   `debug.set_field_stop`
   `debug.set_method_exit_stop`

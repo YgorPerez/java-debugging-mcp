@@ -38,7 +38,9 @@ const SESSION_ID_DESC: &str = concat!(
     "the most recently attached one — which is what every example here assumes. Give it when more than one ",
     "JVM is attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the ",
     "whole reason a misspelling of this argument is now refused rather than ignored (DOC-9). ",
-    "`debug.list_sessions` accepts it and ignores it, having nothing to select.",
+    "`debug.list_sessions` accepts it and ignores it, having nothing to select. ",
+    "`debug.set_current_session` is the other way round: there it is REQUIRED and names the session to ",
+    "select, so it has no current-session default to fall back on (SESS-1).",
 );
 
 /// Publish `session_id` as an argument of every tool (DOC-9, #132).
@@ -105,6 +107,11 @@ fn session_tools() -> Vec<Tool> {
         Tool {
             name: "debug.list_sessions".to_string(),
             description: "List every live debug session — its host:port, whether it is the current one (all tools default to that), whether it is suspended, which threads it is holding one at a time with debug.suspend_thread and for how long (kept apart from SUSPENDED on purpose: that means the whole VM is stopped and nobody's requests are served, while a held worker leaves the JVM serving — and the remedies differ, debug.resume_thread against debug.continue), how many stop points/traces/events it holds, and how many JDWP packets it has cost. Use it when you have lost a session_id, or to check what is still attached before walking away. A session whose JVM has gone is shown as DEAD. A session that has hot-reloaded a class is flagged with the count, deliberately regardless of whose session it is: a session someone ELSE left behind is the case that matters, and this listing is the only place a third party can discover that a JVM is running installed bytecode.".to_string(),
+            input_schema: empty(),
+        },
+        Tool {
+            name: "debug.set_current_session".to_string(),
+            description: "Choose which JVM the tools address when they are given no session_id — the one thing about a multi-session setup that used to be decided by arrival order and could not be revisited. The current session is set by whichever attach or launch happened LAST, so attaching to a micro-service after the app server leaves the app server reachable only by repeating session_id on every single call, and the only ways back were to disconnect the newer session or re-attach the older one. WHY THIS IS WORTH A CALL RATHER THAN THE KEYSTROKES: a reply from the wrong JVM looks entirely normal. A misspelled session_id is refused for exactly that reason (DOC-9), but the same mistake is still reachable by leaving the argument OFF, where the call silently addresses the newest attach — so the safe spelling and the dangerous default disagree, and this is how you stop having to remember which. SESSION_ID IS REQUIRED HERE, and this is the one tool where it names WHAT TO SELECT rather than what to act on: there is no current-session fallback, because the current session is the thing being set. Get ids from debug.list_sessions, which marks the current one. IT TOUCHES NOTHING IN ANY DEBUGGEE — no JDWP packet is sent, nothing is suspended or resumed, no stop point moves; this is bookkeeping in this server about which session an omitted argument resolves to. An unknown id and a DEAD session are both REFUSED with the current session left exactly as it was, because a switch that quietly did nothing would leave you believing you had addressed a different JVM — which is the entire defect this closes. Selecting the session that is already current succeeds and says so. The reply names the session you switched to AND the one it displaced, so a wrong id shows up here instead of in the next tool's normal-looking output.".to_string(),
             input_schema: empty(),
         },
         Tool {

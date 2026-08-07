@@ -3,7 +3,7 @@ exit: 0
 --- stdout
 mcp-tool-surface v1 for v0.0.0-fixture
 $schema: https://raw.githubusercontent.com/YgorPerez/java-debugging-mcp/main/docs/tool-surface.schema.json
-40 tools, 232 arguments
+41 tools, 233 arguments
 tool_count agrees with len(tools): True
 argument_count agrees with the tools: True
 every tool has a non-empty description: True

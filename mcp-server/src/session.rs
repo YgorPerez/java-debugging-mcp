@@ -1749,6 +1749,24 @@ impl SessionManager {
         (rows, self.get_current_session_id().await)
     }
 
+    /// Make an already-registered session the current one (SESS-1, #157).
+    ///
+    /// The third writer of the current-session cell, beside registration and removal — and the first that
+    /// is not a side effect of the set of sessions changing. Returns the id it displaced, or `None` if
+    /// there was no current session.
+    ///
+    /// **Validation is the caller's**, deliberately: this is reached only after the handler has looked the
+    /// id up and found the session live, and duplicating the lookup here would mean two answers to
+    /// "does this session exist" that can disagree. What this owns is the write.
+    ///
+    /// Sends no JDWP packet and touches no debuggee. Selecting a session is a fact about this server's
+    /// bookkeeping, and a tool that reached the JVM to change which one is current would be able to fail
+    /// for reasons that have nothing to do with the question.
+    pub async fn make_current(&self, session_id: &str) -> Option<SessionId> {
+        let mut current = self.current_session.lock().await;
+        current.replace(session_id.to_string())
+    }
+
     pub async fn remove_session(&self, session_id: &str) {
         let mut sessions = self.sessions.lock().await;
 

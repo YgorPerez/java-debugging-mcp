@@ -292,6 +292,7 @@ impl RequestHandler {
             "debug.step_out" => self.handle_step_out(args).await,
             "debug.pause" => self.handle_pause(args).await,
             "debug.list_sessions" => self.handle_list_sessions(args).await,
+            "debug.set_current_session" => self.handle_set_current_session(args).await,
             "debug.disconnect" => self.handle_disconnect(args).await,
             "debug.panic" => self.handle_panic(args).await,
             _ => return None,
@@ -660,6 +661,89 @@ impl RequestHandler {
                 a.step_exclude_classes.as_deref(),
                 a.step_only_classes.as_deref(),
             ))
+    }
+
+    /// Choose which session an omitted `session_id` resolves to (SESS-1, #157).
+    ///
+    /// **The current session used to be a consequence of arrival order that could not be revisited.** It is
+    /// written when a session registers itself and cleared when one is removed, and nothing else touched it
+    /// — so attaching to a micro-service after the app server left the app server addressable only by
+    /// repeating `session_id` on every later call, and the only ways back were to disconnect the newer
+    /// session or re-attach the older one.
+    ///
+    /// That is worth a tool rather than keystrokes because of what DOC-9 (#132) established: a reply from
+    /// the wrong JVM looks entirely normal. DOC-9 made a *misspelled* `session_id` a refusal for exactly
+    /// that reason, and the same failure stayed reachable by **omission** — leave the argument off and the
+    /// call silently addresses the newest attach. Stating once which JVM you mean removes the case where
+    /// the safe spelling and the dangerous default disagree.
+    ///
+    /// A TOOL AND NOT A FLAG ON `debug.list_sessions`, by ADR-0015's rule: a flag may change how an answer
+    /// is bounded, filtered or rendered, not what the question was. `list_sessions` answers *what is
+    /// attached*; a `select` argument would make it answer *switch to this*. It is not ADR-0040's case
+    /// either — that rejected a second name for a question `trace_expr` already answered, and *which
+    /// session do omitted arguments resolve to* has no name today.
+    ///
+    /// `session_id` IS REQUIRED HERE, and it is the one tool where it names the subject rather than the
+    /// target. It stays an ordinary optional field in the published schema, because `tools.rs` injects it
+    /// uniformly and states its exceptions in prose rather than special-casing them — the argument its own
+    /// comment makes about `debug.list_sessions` accepting and ignoring it. So the requirement is enforced
+    /// here, and the refusal names what to call to get an id.
+    ///
+    /// Refuses an unknown id and a DEAD session, both leaving the current session untouched: a switch that
+    /// silently did nothing would leave the caller believing they had addressed a different JVM, which is
+    /// the whole defect. Selecting the session that is already current succeeds and says so.
+    async fn handle_set_current_session(&self, args: serde_json::Value) -> Result<String, String> {
+        // Read from the RAW arguments, like `resolve_session` does, because `crate::args::parse` strips
+        // `session_id` before deserializing — it is a typed field on no args struct. `NoArgs` is still
+        // parsed, for the unknown-argument strictness every other tool gets from `deny_unknown_fields`.
+        let wanted =
+            args.get(crate::args::SESSION_ID_ARG).and_then(|v| v.as_str()).map(str::to_owned).ok_or_else(
+                || {
+                    "debug.set_current_session needs a session_id — it is the one tool where that argument \
+                 names what to select rather than what to act on, so there is no current-session default \
+                 to fall back to. debug.list_sessions lists every id and marks the current one."
+                        .to_string()
+                },
+            )?;
+        crate::args::parse::<crate::args::NoArgs>(&args)?;
+
+        let Some(guard) = self.session_manager.get_session_by_id(&wanted).await else {
+            return Err(format!(
+                "No session {wanted}. The current session is unchanged. debug.list_sessions lists every \
+                 id — an id is only valid for the server process that issued it, so one from an earlier \
+                 run will not be found here."
+            ));
+        };
+        let (dead, endpoint) = {
+            let session = guard.lock().await;
+            (session_is_dead(&session), session.endpoint.clone())
+        };
+        if dead {
+            return Err(format!(
+                "{wanted} ({endpoint}) is DEAD — its JVM is gone, so the calls that would follow this \
+                 switch could not reach it. The current session is unchanged. debug.disconnect \
+                 {{session_id: \"{wanted}\"}} removes it from the listing."
+            ));
+        }
+
+        let previous = self.session_manager.make_current(&wanted).await;
+        if previous.as_deref() == Some(wanted.as_str()) {
+            return Ok(format!(
+                "{wanted} ({endpoint}) was already the current session. Nothing changed; calls that omit \
+                 session_id were already reaching it."
+            ));
+        }
+        // The displaced session is NAMED rather than merely dropped: a caller who passed the wrong id sees
+        // it here, in the one reply that is about the switch, instead of at the next tool's entirely
+        // normal-looking output against a JVM they did not mean.
+        let was = previous.map_or_else(
+            || " There was no current session before this.".to_string(),
+            |p| format!(" It was {p}, which is still attached and still reachable with session_id."),
+        );
+        Ok(format!(
+            "Current session is now {wanted} ({endpoint}). Calls that omit session_id reach it until \
+             another switch, another attach, or its removal.{was}"
+        ))
     }
 
     /// List every live session, so a caller who lost a `session_id` can find it again.
@@ -6088,6 +6172,19 @@ fn describe_trace_budget(trace: bool, budget: Option<u32>) -> String {
     )
 }
 
+/// Has this session's JVM gone?
+///
+/// Liveness comes from the event pump: it exits when the connection closes, so a finished task means the
+/// JVM is gone. That costs nothing to check, unlike a JDWP round trip — which could itself hang on a
+/// half-dead socket, exactly the case this is meant to diagnose.
+///
+/// Its own function since SESS-1 (#157), so `debug.set_current_session` refuses a dead session on the same
+/// evidence `debug.list_sessions` prints `DEAD` on. Two readings of "is this JVM still there" that could
+/// disagree would put a caller in front of a listing saying DEAD and a switch that accepted it.
+fn session_is_dead(s: &crate::session::DebugSession) -> bool {
+    s.event_listener_task.as_ref().is_some_and(tokio::task::JoinHandle::is_finished)
+}
+
 /// Format one session into the `debug.list_sessions` output, as a whole line including its newline.
 ///
 /// Liveness comes from the event pump: it exits when the connection closes, so a finished task means
@@ -6099,7 +6196,7 @@ fn render_session_line(
     current: Option<&crate::session::SessionId>,
 ) -> String {
     let is_current = current.is_some_and(|c| c == sid);
-    let dead = s.event_listener_task.as_ref().is_some_and(tokio::task::JoinHandle::is_finished);
+    let dead = session_is_dead(s);
     let state = if dead {
         "DEAD (JVM gone — debug.disconnect it)"
     } else if s.suspended_since.is_some() {

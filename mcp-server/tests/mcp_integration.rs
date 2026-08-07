@@ -5082,6 +5082,22 @@ fn list_sessions_names_every_attachment_and_flags_a_dead_one() {
     assert!(!after.contains(&first_id), "the disconnected session must be gone:\n{after}");
 }
 
+/// Which session `debug.list_sessions` marks as current — the line carrying `← current`.
+///
+/// Read through the LISTING rather than from the switch's own reply, deliberately: the listing resolves
+/// the current session through the same cell every tool with an omitted `session_id` reads. So this
+/// answers "where would an omitted argument go", not merely "what did the switch claim". A test built on
+/// the switch's reply would pass against an implementation that wrote a cell nothing consulted.
+fn current_marked_session(listing: &str) -> Option<String> {
+    // The id is bracketed — `  ▶ [session_abc] 127.0.0.1:5005 — running, …` — so this reads between the
+    // brackets rather than looking for a bare `session_` token, which the first version did and which
+    // found nothing at all.
+    let line = listing.lines().find(|l| l.contains("← current"))?;
+    let open = line.find('[')? + 1;
+    let close = line[open..].find(']')? + open;
+    Some(line[open..close].to_string())
+}
+
 /// Pull `session_id` out of an attach reply — `… (session: session_abc123)`.
 fn session_id_from(attach_reply: &str) -> Option<String> {
     let at = attach_reply.find("session: ")? + "session: ".len();
@@ -12292,6 +12308,118 @@ fn step_into_skips_the_jdk_by_default_and_steps_into_it_when_asked() {
     );
 
     server.panic_reset();
+}
+
+/// SESS-1 (#157): the current session can be CHOSEN, so an omitted `session_id` reaches the JVM the
+/// caller meant rather than the one that arrived last.
+///
+/// Two probes, which is the `run-microservice` shape the issue is about — neither JVM is on the other's
+/// classpath, so holding both at once is the normal case and not an exotic one.
+///
+/// EVERY ARM IS CHECKED THROUGH THE LISTING, not through the switch's own reply — see
+/// [`current_marked_session`]. And every refusal is followed by a re-read, because "the current session is
+/// unchanged" is the half of a refusal that matters: one that had already cleared the cell would be worse
+/// than having no tool at all.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn the_current_session_can_be_switched_and_an_omitted_session_id_follows_it() {
+    let Some(jdk) = jdk_or_skip("the_current_session_can_be_switched_and_an_omitted_session_id_follows_it")
+    else {
+        return;
+    };
+    let mut server = Server::start().expect("start server");
+
+    let first = Probe::launch(&jdk, "ExcProbe").expect("launch the first probe");
+    let first_id = session_id_from(&server.attach(first.port)).expect("no session id in attach reply");
+    let second = Probe::launch(&jdk, "WatchProbe").expect("launch the second probe");
+    let second_id = session_id_from(&server.attach(second.port)).expect("no session id in attach reply");
+    assert_ne!(first_id, second_id, "each attach must get its own session");
+
+    // Baseline: the SECOND attach is current. That is the behaviour this tool makes revisable, so if it
+    // is not true here the arms below prove nothing.
+    assert_eq!(
+        current_marked_session(&server.call("debug.list_sessions", serde_json::json!({}))).as_ref(),
+        Some(&second_id),
+        "the last attach should start out current"
+    );
+
+    // ARM 1 — switch back to the first. The reply names both, so a wrong id shows up here rather than in
+    // the next tool's normal-looking output.
+    let switched = server.call("debug.set_current_session", serde_json::json!({"session_id": &first_id}));
+    assert_contains_all(
+        "the switch names the session it selected and the one it displaced",
+        &switched,
+        &["Current session is now", &first_id, &second_id],
+    );
+    assert_eq!(
+        current_marked_session(&server.call("debug.list_sessions", serde_json::json!({}))).as_ref(),
+        Some(&first_id),
+        "an omitted session_id must now resolve to the first session"
+    );
+
+    // ARM 2 — and back, so this is not a one-way write or an accident of ordering.
+    server.call("debug.set_current_session", serde_json::json!({"session_id": &second_id}));
+    assert_eq!(
+        current_marked_session(&server.call("debug.list_sessions", serde_json::json!({}))).as_ref(),
+        Some(&second_id),
+        "the switch must work in both directions"
+    );
+
+    // Already current: accepted, and says so rather than pretending something moved.
+    let again = server.call("debug.set_current_session", serde_json::json!({"session_id": &second_id}));
+    assert!(
+        again.contains("already the current session"),
+        "selecting the current one is not an error: {again}"
+    );
+
+    // An unknown id is refused, and the selection survives it.
+    let refused = server.call("debug.set_current_session", serde_json::json!({"session_id": "session_nope"}));
+    assert!(refused.contains("No session"), "an unknown id must be refused: {refused}");
+    assert_eq!(
+        current_marked_session(&server.call("debug.list_sessions", serde_json::json!({}))).as_ref(),
+        Some(&second_id),
+        "a refused switch must leave the current session exactly as it was"
+    );
+
+    // Omitting the argument is refused rather than silently meaning "the current one" — this is the one
+    // tool where session_id names the subject, so there is nothing to fall back to.
+    let no_arg = server.call("debug.set_current_session", serde_json::json!({}));
+    assert!(no_arg.contains("needs a session_id"), "no current-session default here: {no_arg}");
+
+    // A DEAD session is refused too: the calls that would follow the switch could not reach it. Killed
+    // the same way `list_sessions_names_every_attachment_and_flags_a_dead_one` kills one — the event pump
+    // ends with the connection, so no round trip is needed and nothing can hang on a half-closed socket.
+    drop(first);
+    let mut listing = String::new();
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        listing = server.call("debug.list_sessions", serde_json::json!({}));
+        if listing.contains("DEAD") {
+            break;
+        }
+    }
+    assert!(listing.contains("DEAD"), "the first probe's session never went DEAD:\n{listing}");
+    let dead_refused = server.call("debug.set_current_session", serde_json::json!({"session_id": &first_id}));
+    assert_contains_all(
+        "a dead session is refused, on the same evidence the listing prints DEAD on",
+        &dead_refused,
+        &["DEAD", "current session is unchanged"],
+    );
+    assert_eq!(
+        current_marked_session(&server.call("debug.list_sessions", serde_json::json!({}))).as_ref(),
+        Some(&second_id),
+        "refusing a dead session must not disturb the live selection"
+    );
+
+    // Removing a NON-current session leaves the selection intact.
+    server.call("debug.disconnect", serde_json::json!({"session_id": first_id}));
+    assert_eq!(
+        current_marked_session(&server.call("debug.list_sessions", serde_json::json!({}))).as_ref(),
+        Some(&second_id),
+        "disconnecting a session that was not current must not move the selection"
+    );
+
+    drop(second);
 }
 
 /// STEP-3: `only_classes` on a step reaches the JVM at all.

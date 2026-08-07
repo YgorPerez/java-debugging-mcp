@@ -74,3 +74,9 @@ repository's first secret** — `.github/workflows/toolkit-parity.yml` has the f
 Measured 7 Aug 2026 at **40 tools named downstream, 40 exported, no drift in either direction** — and its
 first run had a false positive worth knowing about, `debug.step_` from the glob `debug.step_*` in their
 prose.
+
+**Expect one drift row at the next release.** It compares against the release the toolkit PINS, so a tool
+added to `main` does not move it — but SESS-1 (#157) added `debug.set_current_session` on 7 Aug and the
+toolkit names 40, so the run after that tag will report "an added tool nobody names" for it. That is the
+row working, not breaking: it is one of the three `docs/toolkit-contract.md` failures this check exists to
+catch, and the fix is a line in the toolkit's skill rather than anything here.

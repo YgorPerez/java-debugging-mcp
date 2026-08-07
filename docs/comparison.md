@@ -99,7 +99,7 @@ downstream pin has that the docs never name*. Turned around, it reads: a decisio
 no comparison names is a decision that will be taken again.
 
 **Read off `src/tools/*.ts` at tag `v1.3.0` on 7 Aug 2026** — the `server.tool(…)` registrations rather than
-the README, the same standard as the table above. **46 tools**, against **40** in this column at 0.20.0. MIT,
+the README, the same standard as the table above. **46 tools**, against **41** in this column at 0.20.0 (40 when this section was written on 7 Aug; SESS-1, #157, added `debug.set_current_session` the same day, which is the row below marked open). MIT,
 not archived, last push 5 Aug 2026. Every one of the 46 is in exactly one table below; the counts are stated
 so that claim is checkable rather than asserted.
 

@@ -1,7 +1,7 @@
 # Every debug.* tool's ARGUMENT schemas, as advertised to callers. GENERATED — do not hand-edit:
 #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot
 #
-# 40 tools, 232 arguments.
+# 41 tools, 233 arguments.
 #
 # Each argument shows its full generated schema minus the description — so a changed type,
 # default, format, minimum or anyOf arm fails as loudly as a renamed field — then the description
@@ -17,7 +17,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - set: REQUIRED {"type":"string"}
     A **stop-point set** from `debug.list_stop_points` with `export: true`, passed back verbatim. The
     surrounding fenced-json block is accepted, since that is how the export renders it.
@@ -45,7 +47,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - source_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
     Directories `debug.source` searches for a class's `.java` file, e.g. `["/srv/app/src/main/java"]`. A root
     is where the PACKAGE TREE starts, not the project root: the file is looked for at `<root>/<package as
@@ -104,7 +108,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.clear_stop_point
 - breakpoint_id: REQUIRED {"type":"string"}
@@ -114,7 +120,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.continue
 - session_id: {"default":null,"type":["string","null"]}
@@ -122,7 +130,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.disconnect
 - session_id: {"default":null,"type":["string","null"]}
@@ -130,7 +140,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.evaluate
 - expand_objects: {"default":false,"type":"boolean"}
@@ -188,7 +200,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID (optional; defaults to the last thread that hit a breakpoint).
 
@@ -215,7 +229,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID (optional; defaults to the last thread that hit a breakpoint).
 
@@ -225,7 +241,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.force_return
 - session_id: {"default":null,"type":["string","null"]}
@@ -233,7 +251,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Thread id (optional; defaults to last-hit thread). Must be suspended.
 - value: {"default":null,"type":["string","null"]}
@@ -252,7 +272,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.get_stack
 - expand_objects: {"default":false,"type":"boolean"}
@@ -275,7 +297,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID (optional; defaults to the last thread that hit a breakpoint/step).
 
@@ -294,7 +318,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - since: {"default":null,"format":"uint64","minimum":0,"type":["integer","null"]}
     Only snapshots newer than this sequence number, so a poller can ask for just what's new since its last
     read (the `#seq` shown on each record).
@@ -337,7 +363,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - source_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
     Directories `debug.source` searches for `.java` files — see `debug.attach`.
 - step_exclude_classes: {"default":null,"items":{"type":"string"},"type":["array","null"]}
@@ -393,7 +421,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.list_fields
 - class_name: REQUIRED {"type":"string"}
@@ -411,7 +441,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.list_instances
 - class_names: REQUIRED {"items":{"type":"string"},"type":"array"}
@@ -434,7 +466,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.list_methods
 - class_name: REQUIRED {"type":"string"}
@@ -452,7 +486,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.list_sessions
 - session_id: {"default":null,"type":["string","null"]}
@@ -460,7 +496,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.list_stop_points
 - export: {"default":false,"type":"boolean"}
@@ -471,7 +509,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.list_threads
 - limit: {"default":40,"format":"uint","minimum":0,"type":"integer"}
@@ -492,7 +532,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.panic
 - session_id: {"default":null,"type":["string","null"]}
@@ -500,7 +542,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.pause
 - session_id: {"default":null,"type":["string","null"]}
@@ -508,7 +552,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.pop_frame
 - frame: {"default":0,"format":"uint","minimum":0,"type":"integer"}
@@ -519,7 +565,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Thread id (optional; defaults to last-hit thread). Must be suspended.
 
@@ -541,7 +589,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Thread to check for frames still running the old bytecode after a successful swap (defaults to the
     last-hit thread). A redefinition does not touch frames already on the stack, so this is how the reply can
@@ -553,7 +603,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID to resume. Optional: with one thread held by `debug.suspend_thread` it defaults to that one,
     which is the case a caller is in almost every time. With several held it is required, and the reply lists
@@ -630,10 +682,22 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID (optional; defaults to the last thread that hit a breakpoint). Must be a thread suspended **by
     an event**, because running the query invokes methods.
+
+## debug.set_current_session
+- session_id: {"default":null,"type":["string","null"]}
+    Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
+    recently attached one — which is what every example here assumes. Give it when more than one JVM is
+    attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
+    reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 
 ## debug.set_exception_stop
 - caught: {"default":true,"type":"boolean"}
@@ -685,7 +749,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Only report throws on this thread (hex id, e.g. `0x2a`). On a busy app server with hundreds of threads,
     restricting to your request thread is the single biggest noise reduction — get the id from
@@ -807,7 +873,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Only report touches from this thread (hex id, e.g. `0x2a`). On a busy app server, restricting to your
     request thread is the single biggest noise reduction — get the id from `debug.list_threads {name_filter}`
@@ -936,7 +1004,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Only stop when this thread (hex id) hits it (optional).
 - trace: {"default":false,"type":"boolean"}
@@ -1056,7 +1126,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Only report returns on this thread (hex id, e.g. `0x2a`). On a busy app server this is the single biggest
     noise reduction for this event kind — get the id from `debug.list_threads` or `debug.thread_dump` first.
@@ -1185,7 +1257,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Only report events on this thread (hex id, e.g. `0x2a`) — JDWP's `ThreadOnly`, applied **inside the JVM**,
     so a non-matching event costs no packet and no capture (FILT-1). The cheap narrowing, and the one to reach
@@ -1252,7 +1326,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - target: REQUIRED {"type":"string"}
     What to write. A local variable name (`counter`), a static field (`ConfigDefaultUtils.dsInfra` or a
     fully-qualified `pkg.Class.field`), an instance field reached from a suspended frame (`this.status`,
@@ -1287,7 +1363,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - source_roots: {"default":null,"items":{"type":"string"},"type":["array","null"]}
     Directories to search for this call only, replacing the session's roots (set at `debug.attach` or by
     `JDWP_SOURCE_ROOTS`). Pass `[]` to skip reading any file and get only what the JVM knows.
@@ -1311,7 +1389,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID to step (optional; defaults to the last thread that hit a breakpoint).
 
@@ -1331,7 +1411,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID to step (optional; defaults to the last thread that hit a breakpoint).
 
@@ -1351,7 +1433,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: {"default":null,"type":["string","null"]}
     Thread ID to step (optional; defaults to the last thread that hit a breakpoint).
 
@@ -1361,7 +1445,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - thread_id: REQUIRED {"type":"string"}
     Thread ID to suspend, as `debug.list_threads` and `debug.thread_dump` print it (`0x7f2c…`).
 
@@ -1429,7 +1515,9 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
 - suspend: {"default":false,"type":"boolean"}
     Suspend the VM for the duration of the dump, then resume it and verify it is running again. Off by
     default, and that default is the point: JDWP can only read a **suspended** thread's stack and locks, so a
@@ -1449,4 +1537,6 @@
     recently attached one — which is what every example here assumes. Give it when more than one JVM is
     attached, because the reply of a tool that hit the wrong one looks entirely normal: that is the whole
     reason a misspelling of this argument is now refused rather than ignored (DOC-9). `debug.list_sessions`
-    accepts it and ignores it, having nothing to select.
+    accepts it and ignores it, having nothing to select. `debug.set_current_session` is the other way round:
+    there it is REQUIRED and names the session to select, so it has no current-session default to fall back on
+    (SESS-1).
