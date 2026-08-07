@@ -22,25 +22,34 @@
 //! Implements the subset of JDWP that practical debugging needs: connection management, breakpoint and
 //! event-request operations, stack and variable inspection, expression evaluation, and execution control.
 //!
-//! # This is not a supported public API
+//! # What is supported
 //!
-//! **The crate is published because `jdwp-mcp` depends on it, and for no other reason.** `cargo publish`
-//! rejects a bare path dependency, so a binary on crates.io requires its library to be there too; that
-//! requirement is the whole story of this listing.
+//! **The operations this library implements, and the types in their signatures.** That is the whole of it,
+//! and everything beneath them — the JDWP constant tables, the raw send, the event loop — is `pub(crate)`
+//! (ADR-0044).
 //!
-//! What follows from that, and it is worth reading before you build on this:
+//! So: [`JdwpConnection`] and its operations; [`JdwpError`] and `JdwpResult`; the values, locations,
+//! frames, fields, methods and events those operations return. If a `debug.*` tool in `jdwp-mcp` can do it,
+//! this crate exposes the primitive it is built on.
 //!
-//! - **The surface is shaped for one consumer.** These modules are the seams `jdwp-mcp` needed, exposed
-//!   where it needed them. They are not a curated library API, and several are public only because a
-//!   sibling module had to reach them.
-//! - **Anything here may change in any release**, including a patch one. The version gate in this
-//!   repository exists to keep the *version number* honest about what changed, not to promise that
-//!   nothing will.
-//! - **Nothing here is deprecated before it is removed**, because there is no deprecation cycle to run.
+//! **A JDWP command this crate does not implement is a pull request, not a workaround.** There is
+//! deliberately no public way to assemble and send an arbitrary `CommandPacket` — that would make the
+//! entire specification transcription part of the surface, and it would route around the read-only guard
+//! ADR-0001 puts on every mutating primitive.
 //!
-//! None of that means it will not work — it is the code a real debugger runs against real JVMs, and it
-//! is tested against JDK 11, 17 and 21. It means the cost of a break lands on you rather than on us, and
-//! that pinning an exact version is the only safe way to depend on it.
+//! ## What that promise is, and is not
+//!
+//! It is **not** a compatibility guarantee. The version gate in this repository keeps the version *number*
+//! honest about what changed; it does not promise that nothing will. There is no deprecation cycle, so
+//! nothing is deprecated before it is removed, and **pinning an exact version is still the right way to
+//! depend on this**.
+//!
+//! What it is: a statement that the surface above was *chosen*, so a break in it is a decision somebody
+//! made and wrote down rather than a side effect of refactoring an internal. Before ADR-0044 this crate
+//! declined to say even that — 169 public items existed that nothing outside it used, 130 of them a
+//! transcription of the JDWP specification, and no way to tell design from residue.
+//!
+//! It is the code a real debugger runs against real JVMs, tested against JDK 11, 17 and 21.
 //!
 //! If you want the debugger rather than the protocol layer, install `jdwp-mcp`.
 //!

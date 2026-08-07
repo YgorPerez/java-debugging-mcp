@@ -15,8 +15,14 @@ authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
 # The description is the one line a stranger reads in crates.io search results, before any decision to
-# click, so the "not a supported API" part belongs in it rather than only on the docs.rs front page.
-description = "JDWP protocol client for Java debugging — implementation detail of jdwp-mcp, not a supported API"
+# click, so the pinning advice belongs in it rather than only on the docs.rs front page.
+#
+# It used to read "implementation detail of jdwp-mcp, not a supported API", which ADR-0044 retired: the
+# library now supports the operations it implements, and saying "not supported" while shipping a surface
+# somebody could use was the position that let 169 unexamined public items accumulate. This is the third
+# of the three places that claim lived — the crate README and the crate-level `//!` are the others, and
+# all three had to move together.
+description = "JDWP protocol client for Java debugging — the operations behind jdwp-mcp. Pin an exact version"
 repository.workspace = true
 # NOT `readme.workspace = true`, which is the root README.md — an install-and-configure guide for the
 # jdwp-mcp MCP server. crates.io renders the readme as the crate's landing page, so inheriting it would

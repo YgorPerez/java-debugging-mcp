@@ -61,6 +61,22 @@ is recorded in the table as `AllowedStateChange` — it allocates in the debugge
 nine primitives this ADR's decision names. That is the classification it *has*, written down so the question
 is visible; changing it is a decision for this ADR, not for a test.
 
+**Amended by CLEAN-2 ([#170](https://github.com/YgorPerez/java-debugging-mcp/issues/170), ADR-0044).** "The
+wire" is the right idea and slightly the wrong word: the guard sits on the nine primitives above, not on the
+socket. `send_command` takes an arbitrary `CommandPacket` and carries no `guard_mutation`, so code inside
+this crate can send `ClassType.SetValues` on a read-only connection without ever meeting the flag.
+
+That is a hole, and it is a small one for a reason worth stating rather than leaving implied. ADR-0044 makes
+`send_command` `pub(crate)`, so it is reachable only from this crate — where SAFE-12's `WIRE_COMMANDS` table
+enumerates every command we can send and requires each to be classified, which is the check that would
+notice a new unguarded mutation. It is not reachable by a library consumer at all.
+
+It is not closed, and closing it was considered: `send_command` could classify its own packet against that
+same table and refuse a `Mutation` under read-only. Rejected for now because it would give a test fixture a
+production job, and because the sentence above is already true of the thing this ADR is about — a guard
+against **accident**. A raw send inside this crate is not an accident; it is a primitive someone wrote
+without adding it to the table, which the table itself is what catches.
+
 ## Rejected alternative
 
 Keeping the expression-text guard. It cannot be made complete, and the incompleteness was not theoretical —

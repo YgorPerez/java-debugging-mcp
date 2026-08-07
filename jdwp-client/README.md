@@ -6,21 +6,28 @@ A JDWP (Java Debug Wire Protocol) client — the transport and command layer beh
 It implements the subset of JDWP that practical debugging needs: connection management, breakpoint and
 event-request operations, stack and variable inspection, expression evaluation, and execution control.
 
-## This is not a supported public API
+## What is supported
 
-**It is published because `jdwp-mcp` depends on it, and for no other reason.** `cargo publish` rejects a
-bare path dependency, so a binary on crates.io requires its library to be there too. That requirement is
-the whole story of this listing.
+**The operations this library implements, and the types in their signatures** (ADR-0044). Everything
+beneath them — the JDWP constant tables, the raw packet send, the event loop — is internal.
 
-- **The surface is shaped for one consumer** — these modules are the seams `jdwp-mcp` needed, exposed
-  where it needed them, not a curated library API.
-- **Anything may change in any release**, including a patch one. The version check in the repository
-  keeps the version *number* honest about what changed; it does not promise that nothing will.
-- **Nothing is deprecated before removal**, because there is no deprecation cycle to run.
+So: `JdwpConnection` and its operations, `JdwpError`, and the values, locations, frames, fields, methods
+and events those operations return. If a `debug.*` tool in `jdwp-mcp` can do it, this crate exposes the
+primitive it is built on.
 
-None of that means it does not work — it is the code a real debugger runs against real JVMs, tested
-against JDK 11, 17 and 21. It means the cost of a break lands on you, and that pinning an exact version
-is the only safe way to depend on it.
+**A JDWP command this crate does not implement is a pull request, not a workaround.** There is deliberately
+no public way to assemble and send an arbitrary packet: that would make the whole specification
+transcription part of the surface, and it would route around the read-only guard the debugger puts on every
+mutating primitive.
+
+- **This is not a compatibility guarantee.** The version check in the repository keeps the version *number*
+  honest about what changed; it does not promise that nothing will.
+- **Nothing is deprecated before removal**, because there is no deprecation cycle to run. **Pin an exact
+  version.**
+- What the surface *is* is **chosen** — so a break in it is a decision somebody made and wrote down, rather
+  than a side effect of refactoring an internal.
+
+It is the code a real debugger runs against real JVMs, tested against JDK 11, 17 and 21.
 
 ## You probably want the debugger
 
