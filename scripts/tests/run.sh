@@ -10,7 +10,7 @@
 # `docs/toolkit-contract.md` names for five silent downstream failure modes. `sarif-for-code-scanning.py`
 # decides what reaches GitHub's security tab and what is withheld. `shard-plan.py` decides which tests run
 # in which leg. `test-timings.py` writes `timings.tsv`, which `shard-plan.py` then reads. None of them had
-# a test, while `.githooks/test.sh` is a 22-case matrix, `.claude/hooks/pre-bash-guard.test.sh` a 20-case
+# a test, while `.githooks/test.sh` is a 22-case matrix, `scripts/guard.test.sh` another
 # one, and `docs_claims.rs` asserts seven of CLAUDE.md's claims against the tree.
 #
 # ## The cost already paid, which is why release-notes.py leads

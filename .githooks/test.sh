@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Test matrix for the git hooks. Run: bash .githooks/test.sh
 #
-# Same reasoning as .claude/hooks/pre-bash-guard.test.sh, and the same weighting: the must-NOT-fire
+# Same reasoning as scripts/guard.test.sh, and the same weighting: the must-NOT-fire
 # cases are the half that matters. A commit-msg hook that rejects a subject the maintainer actually
 # writes is a hook that gets uninstalled the same day, and the check is worth far less than the commit.
 #

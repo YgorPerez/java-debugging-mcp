@@ -80,8 +80,8 @@ OTHER = "Other Changes"
 # commit landing a series of issues at once — it spans several categories by definition, so filing it
 # under any one of them would misreport it, and Other Changes with the type visible is the honest place.
 # They are listed here so `--list-types` reports the vocabulary the repo actually uses: a commit-msg hook
-# that rejected 23 of this repo's own 351 subjects would be uninstalled the same day, which is the test
-# `.claude/hooks/pre-bash-guard.test.sh` spends eleven of its twenty cases on.
+# that rejected 23 of this repo's own 351 subjects would be uninstalled the same day, which is the
+# weighting `scripts/guard.test.sh` gives most of its cases to.
 UNCATEGORISED_TYPES: tuple[str, ...] = ("merge",)
 
 # The trailing `(?:\+...)*` is this repo's compound form, and it was measured rather than imagined

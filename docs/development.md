@@ -249,9 +249,22 @@ their type stripped.
 Skip either hook with `git commit --no-verify`. That is deliberate: a hook you cannot skip during a
 rebase or a conflict resolution is a hook that gets uninstalled.
 
-**Agent sessions do not use these.** `.claude/hooks/pre-bash-guard.py` already denies `git commit` over
-a misformatted tree, which covers the `pre-commit` half for the path most commits here take. There is no
-agent-side equivalent of the `commit-msg` check.
+**Agent sessions do not use these.** `scripts/guard.py` already denies `git commit` over a misformatted
+tree, which covers the `pre-commit` half for the path most commits here take. There is no agent-side
+equivalent of the `commit-msg` check.
+
+**And the guard is not only an agent's, as of LINT-7 (#167).** Its rules used to live inside a Claude
+Code hook, so five of the seven held for one host and nothing else could check the tree against its own
+policy. They are in `scripts/guard.py` now, `.claude/hooks/pre-bash-guard.py` is an adapter over it, and
+any host — including you, at a shell — can ask:
+
+```bash
+scripts/guard.py check 'RUSTC_BOOTSTRAP=1 cargo test'   # allow | warn | ask | deny, with the reason
+bash scripts/guard.test.sh                              # the matrix
+```
+
+Nothing runs it for you outside Claude Code. That is the honest state rather than an oversight: the two
+git hooks above are the only automatic enforcement a plain clone has, and they are opt-in.
 
 ## Serena (semantic code navigation for agents)
 

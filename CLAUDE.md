@@ -428,14 +428,28 @@ Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/do
 
 ### Guardrails
 
-**Some of the traps above are now enforced rather than described.** `.claude/hooks/pre-bash-guard.py`
-runs on every Bash call and denies `RUSTC_BOOTSTRAP=1 cargo …` and a `git commit` over a misformatted
-tree, asks before `git push`, and warns on a soak loop against the working tree, a hardcoded
-`--shard N/M`, a `--test-threads` override, and unbounded workspace cargo output. Every rule is one
-already written down in this file — the hook adds no policy, it just stops the policy depending on
-somebody having read this far.
+**Some of the traps above are now enforced rather than described.** `scripts/guard.py` denies
+`RUSTC_BOOTSTRAP=1 cargo …` and a `git commit` over a misformatted tree, asks before `git push`, and
+warns on a soak loop against the working tree, a hardcoded `--shard N/M`, a `--test-threads` override,
+and unbounded workspace cargo output. Every rule is one already written down in this file — the guard
+adds no policy, it just stops the policy depending on somebody having read this far.
 
-**Two of those rules used to search the raw command line**, which the hook's own module docstring says
+**The rules moved out of `.claude/` and that is the whole of LINT-7 (#167).** They were a Claude Code
+`PreToolUse` hook and nothing else, so five of the seven held for exactly one host: a plain shell,
+another agent, or a script in CI got none of them, and the tree could not check itself against its own
+documented policy. `.claude/hooks/pre-bash-guard.py` is now an **adapter** — it calls `check()` and
+renders that host's JSON, and holds no rule. Any host can ask the same question:
+
+```bash
+scripts/guard.py check 'RUSTC_BOOTSTRAP=1 cargo test'   # prints the verdict; exits 20
+```
+
+**What a non-Claude host still does not get, said plainly:** nothing calls this automatically. The two
+checked-in git hooks cover the `cargo fmt` half of one rule and are opt-in per clone besides. So
+elsewhere this is a command you run rather than a guard that runs — which is still more than the nothing
+that was reachable before, and is why the entry point takes a command line and not a hook payload.
+
+**Two of those rules used to search the raw command line**, which the guard's own module docstring says
 not to do and for exactly the reason it gives: commands here routinely *mention* the guarded thing as
 data. Recording a soak result with `gh issue comment` made the guard fire on the prose it was writing
 about itself, and a rule that cries wolf on its own documentation is the fastest way to get the whole
@@ -444,10 +458,12 @@ needs a digit and `--shard` needs `N/M` — so a `grep` for the flag in the docs
 Three of the matrix's cases are that regression, and they were found in the wild rather than imagined.
 
 The rationale for each severity lives in `.claude/settings.json`'s comment block and is deliberately
-**not** repeated here; that file is the one place to change it. `bash .claude/hooks/pre-bash-guard.test.sh`
-is the 20-case matrix, and eleven of those cases assert the guard does *not* fire — a guard that trips
-on a heredoc or an `echo` gets switched off within the day. Escape any deny with
-`SKIP_JDWP_AGENT_GUARD=1` in the command itself.
+**not** repeated here; that file is the one place to change it, and it is where the matrix's case counts
+live too — a second copy of a number is what `docs_claims.rs` exists for, and it now asserts that one.
+`bash scripts/guard.test.sh` is the matrix, most of whose cases assert the guard does *not* fire — a
+guard that trips on a heredoc or an `echo` gets switched off within the day — with four more driving the
+adapter, because a `warn` rendered as a decision would start blocking commands meant to proceed. Escape
+any deny with `SKIP_JDWP_AGENT_GUARD=1` in the command itself.
 
 ## Releasing
 

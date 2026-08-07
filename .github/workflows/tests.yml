@@ -439,7 +439,7 @@ jobs:
   #
   # `+nightly` explicitly, never RUSTC_BOOTSTRAP: CLAUDE.md explains that the env var is hashed into the
   # build fingerprint and silently admits nightly-only features into an ordinary build, and
-  # .claude/hooks/pre-bash-guard.py denies it. `fuzz/` is a separate workspace so this toolchain cannot
+  # scripts/guard.py denies it (through .claude/hooks/pre-bash-guard.py, LINT-7/#167). `fuzz/` is a separate workspace so this toolchain cannot
   # reach the crates the gate builds.
   fuzz:
     name: Fuzz the wire read path

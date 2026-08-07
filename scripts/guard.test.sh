@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test matrix for pre-bash-guard.py. Run: bash .claude/hooks/pre-bash-guard.test.sh
+# Test matrix for scripts/guard.py. Run: bash scripts/guard.test.sh
 #
 # This file exists because the guard's two real bugs were both found here and neither was visible
 # in the code. `shlex.split` leaves `40);` as ONE token, so `;` never separated and the soak-loop
@@ -8,6 +8,12 @@
 #
 # Half the cases are must-NOT-fire, and they are the half that matters. A guard that fires on a
 # heredoc, an `echo`, or a `grep` of the docs is a guard that gets switched off within the day.
+#
+# IT DRIVES THE CHECKER DIRECTLY NOW (LINT-7, #167), not a Claude Code hook payload. That is the point
+# of the refactor: the rules are host-neutral, so their tests must be runnable by any host too. The last
+# three cases are the exception and they earn it — they go through `.claude/hooks/pre-bash-guard.py` to
+# prove the ADAPTER still renders each verdict into that host's JSON. Without them the translation could
+# break while every rule below stayed green, which is the same silence the rules themselves guard against.
 
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -18,21 +24,8 @@ fail=0
 check() {
   local want="$1" desc="$2" cmd="$3"
   local got
-  got=$(
-    printf '%s' "$cmd" | python3 -c "
-import json, sys
-print(json.dumps({'tool_name': 'Bash', 'cwd': '$PWD',
-                  'tool_input': {'command': sys.stdin.read()}}))" \
-      | python3 .claude/hooks/pre-bash-guard.py \
-      | python3 -c "
-import json, sys
-raw = sys.stdin.read().strip()
-if not raw:
-    print('allow')
-else:
-    h = json.loads(raw)['hookSpecificOutput']
-    print(h.get('permissionDecision', 'warn'))"
-  )
+  got=$(python3 scripts/guard.py check --json -- "$cmd" 2>/dev/null |
+    python3 -c "import json,sys; print(json.load(sys.stdin)['verdict'])")
   if [ "$got" = "$want" ]; then
     pass=$((pass + 1))
     printf '  ok   %-34s %s\n' "$desc" "$got"
@@ -77,6 +70,47 @@ check allow "heredoc naming BOOTSTRAP"      'cat <<EOF
 RUSTC_BOOTSTRAP=1 cargo test
 EOF'
 check allow "the wrapper script itself"     'scripts/integration-test.sh'
+check allow "the documented escape hatch"   'SKIP_JDWP_AGENT_GUARD=1 RUSTC_BOOTSTRAP=1 cargo test'
+
+# ── the adapter, which is the only part that is host-specific ───────────────────────────────────
+#
+# One case per verdict shape, because each maps to a DIFFERENT key in Claude Code's reply and getting
+# one of them wrong is invisible from the rules: `deny`/`ask` are a `permissionDecision`, `warn` is an
+# `additionalContext` with no decision at all (so the normal permission flow is untouched), and `allow`
+# is no output whatsoever. A `warn` rendered as a decision would start blocking commands that are meant
+# to proceed; an `allow` that printed anything would be a protocol error on every command in the session.
+echo
+echo "The Claude Code adapter renders each verdict into that host's JSON:"
+
+hook() {
+  local want="$1" desc="$2" cmd="$3"
+  local got
+  got=$(printf '%s' "$cmd" | python3 -c "
+import json, sys
+print(json.dumps({'tool_name': 'Bash', 'cwd': '$PWD',
+                  'tool_input': {'command': sys.stdin.read()}}))" |
+    python3 .claude/hooks/pre-bash-guard.py |
+    python3 -c "
+import json, sys
+raw = sys.stdin.read().strip()
+if not raw:
+    print('no-output')
+else:
+    out = json.loads(raw)['hookSpecificOutput']
+    print(out.get('permissionDecision') or ('additionalContext' if 'additionalContext' in out else '?'))")
+  if [ "$got" = "$want" ]; then
+    pass=$((pass + 1))
+    printf '  ok   %-34s %s\n' "$desc" "$got"
+  else
+    fail=$((fail + 1))
+    printf '  FAIL %-34s want %s, got %s\n' "$desc" "$want" "$got"
+  fi
+}
+
+hook deny              "deny -> permissionDecision"  'RUSTC_BOOTSTRAP=1 cargo test --workspace'
+hook ask               "ask -> permissionDecision"   'git push origin main'
+hook additionalContext "warn -> additionalContext"   'cargo build --workspace'
+hook no-output         "allow -> nothing at all"     'ls -la'
 
 echo
 if [ "$fail" -eq 0 ]; then

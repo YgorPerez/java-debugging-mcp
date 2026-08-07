@@ -194,6 +194,43 @@ fn the_tool_surface_document_and_its_schema_name_the_same_format() {
     );
 }
 
+/// The guard's rules live in `scripts/guard.py` and nothing else may hold a copy of them (LINT-7, #167),
+/// and `.claude/settings.json` is the one place its case counts are written down. Both are asserted here
+/// because both are the kind of claim that goes quietly wrong.
+///
+/// The adapter check is the sharper half. `.claude/hooks/pre-bash-guard.py` is allowed to translate and
+/// nothing more; the day it grows a rule of its own, two implementations start drifting, which is the
+/// defect the move was for. A rule is recognisable by the strings every rule here ends with.
+#[test]
+fn the_guard_has_one_implementation_and_settings_json_states_its_real_case_count() {
+    let matrix = read("scripts/guard.test.sh");
+    let cases = matrix.lines().filter(|l| l.starts_with("check ") || l.starts_with("hook ")).count();
+    assert!(cases > 20, "only {cases} cases in scripts/guard.test.sh — did the matrix lose its shape?");
+
+    let settings = read(".claude/settings.json");
+    assert!(
+        settings.contains(&format!("runs {cases} cases")),
+        "scripts/guard.test.sh has {cases} cases and .claude/settings.json does not say `runs {cases} \
+         cases`. That comment block is the ONE place the guard's rationale and counts live, which only \
+         works while the count is true."
+    );
+
+    let adapter = read(".claude/hooks/pre-bash-guard.py");
+    for smell in ["SKIP_JDWP_AGENT_GUARD", "shlex", "RUSTC_BOOTSTRAP", "--test-threads", "--shard"] {
+        assert!(
+            !adapter.contains(smell),
+            "the Claude Code adapter mentions {smell:?}, so it is holding policy rather than translating \
+             it. Every rule belongs in scripts/guard.py — a rule with two implementations is the drift \
+             LINT-7 (#167) moved them to avoid."
+        );
+    }
+    assert!(
+        adapter.contains("from guard import check"),
+        "the adapter no longer calls scripts/guard.py's check(). If the entry point was renamed, rename \
+         it here; if the adapter reimplemented it, that is the thing this test exists to refuse."
+    );
+}
+
 /// `rust-version` is the MSRV the `msrv` job builds on, and that job reads it out of the manifest with a
 /// sed rather than repeating it (BUILD-2, #142). An empty read there would install the empty string.
 #[test]

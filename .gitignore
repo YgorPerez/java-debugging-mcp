@@ -23,6 +23,12 @@
 # curated docs through `initial_prompt` in project.yml instead.
 .serena/memories/
 
+# Python bytecode. New as of LINT-7 (#167): nothing under scripts/ used to be IMPORTED, so no cache was
+# ever written there — `.claude/hooks/pre-bash-guard.py` now does `from guard import check`, and the
+# first run of it left a `scripts/__pycache__/` in `git status`.
+__pycache__/
+*.pyc
+
 # IDE
 .idea/
 .vscode/

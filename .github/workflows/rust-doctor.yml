@@ -342,7 +342,7 @@ jobs:
 
       # TEST-48 (#163). Four Python scripts decide what CI publishes — the release body, what reaches the
       # security tab, which tests run in which leg, and the timings file the sharding reads — and none of
-      # them had a test, while `.githooks/test.sh` is a 22-case matrix and `pre-bash-guard.test.sh` a
+      # them had a test, while `.githooks/test.sh` is a 22-case matrix and `scripts/guard.test.sh` a
       # 20-case one. The cost is on record: `release-notes.py` did not match the compound `fix(lint)+docs:`
       # subject, so 13 commits landed in PUBLISHED release notes with their type stripped, and it was the
       # commit-msg hook that found it rather than anything testing the script.

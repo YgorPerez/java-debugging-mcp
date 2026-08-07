@@ -708,7 +708,7 @@ mod tests {
     ///
     /// IT MATCHES A WHOLE LINE, NOT A SUBSTRING, and the first version did not — it searched the raw text
     /// and fired on this very doc comment the moment the comment mentioned the attribute it looks for.
-    /// That is the same defect `.claude/hooks/pre-bash-guard.py` carries a warning about: a check that
+    /// That is the same defect `scripts/guard.py` carries a warning about: a check that
     /// cries wolf on its own documentation is the fastest way to get it deleted. A real attribute is a
     /// line of its own; a mention is prose.
     fn crate_sources() -> Vec<(String, String)> {
