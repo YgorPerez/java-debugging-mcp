@@ -181,7 +181,12 @@ check "release-notes: --list-types, which the commit-msg hook consumes" \
 
 # ── sarif-for-code-scanning.py ──────────────────────────────────────────────────
 sarif() { python3 scripts/sarif-for-code-scanning.py "$@"; }
-check "sarif: resolve, re-anchor, ambiguity, and the withholding it exists for" \
+# The last two warnings in `mixed.in.sarif` are the floor CI-11 (#175) put under `reanchor()`. This
+# transcript pinned the defect on purpose until then — #163 put rewriting the scripts out of scope, and a
+# wrong answer on the record is worth more than an absent question — so the diff that fixed it is the one
+# place the change is legible. Both now reach `no such file under the workspace root or any crate`, which
+# was dead code for every relative uri, while `mcp-server/clippy.toml` re-anchors exactly as before.
+check "sarif: resolve, re-anchor, its floor, ambiguity, and the withholding it exists for" \
     "$HERE/sarif/mixed.expected" --artifact "$WORK/mixed.out.sarif" \
     -- sarif "$HERE/sarif/mixed.in.sarif" "$WORK/mixed.out.sarif"
 check "sarif: nothing survives the filter, and the empty upload is the point" \

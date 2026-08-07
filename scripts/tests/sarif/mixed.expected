@@ -1,7 +1,7 @@
 $ sarif scripts/tests/sarif/mixed.in.sarif <work>/mixed.out.sarif
 exit: 0
 --- stdout
-## rust-doctor → code scanning: published 5 of 8 result(s)
+## rust-doctor → code scanning: published 6 of 9 result(s)
 
 Withheld (below the `--fail-on warning` gate, so they never failed anything; the full SARIF
 is in the `rust-doctor-sarif` artifact and `scripts/doctor.sh --findings` prints locally):
@@ -16,7 +16,8 @@ published as-is and will not link to code at all:
 - cargo_common_metadata: ambiguous across crates (., jdwp-client, mcp-server): Cargo.toml
 - hardcoded-secrets: absolute path outside the workspace: /somewhere/else/src/main.rs
 - multiple_crate_versions: re-anchored to mcp-server/Cargo.toml
-- panic-in-library: re-anchored to Cargo.toml
+- panic-in-library: no such file under the workspace root or any crate: nowhere/at/all.rs
+- result-unit-error: no such file under the workspace root or any crate: totally_made_up.rs
 
 --- stderr
 --- artifact: mixed.out.sarif
@@ -30,7 +31,13 @@ published as-is and will not link to code at all:
     "The paths are real facts about THIS tree, deliberately. src/handlers.rs exists only under",
     "mcp-server, so it resolves; Cargo.toml exists at the root and in both members, so it is ambiguous.",
     "If the workspace is restructured this fixture goes red, which is correct - knowing where the files",
-    "are is the script whole job."
+    "are is the script whole job.",
+    "THE LAST TWO WARNINGS ARE CI-11 (#175). Both are unplaceable, by two different routes: one has",
+    "parents that simply hold no manifest, the other has no parent but the workspace root. Until #175",
+    "both re-anchored onto the root Cargo.toml and this transcript PINNED that, deliberately, because",
+    "TEST-48 (#163) put rewriting the scripts out of scope and an absent question is worse than a wrong",
+    "answer on the record. They now keep their own uri and say they could not be located, which is what",
+    "reanchor()'s docstring had claimed all along."
   ],
   "runs": [
     {
@@ -102,13 +109,32 @@ published as-is and will not link to code at all:
           "ruleId": "panic-in-library",
           "level": "warning",
           "message": {
-            "text": "a uri that is nowhere in the tree; re-anchors to the ROOT manifest, see the transcript"
+            "text": "a uri that is nowhere in the tree, with parents; published unchanged, CI-11"
           },
           "locations": [
             {
               "physicalLocation": {
                 "artifactLocation": {
-                  "uri": "Cargo.toml"
+                  "uri": "nowhere/at/all.rs"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "result-unit-error",
+          "level": "warning",
+          "message": {
+            "text": "a uri whose ONLY parent is the workspace root; the loop finds no candidate at all"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "totally_made_up.rs"
                 },
                 "region": {
                   "startLine": 1

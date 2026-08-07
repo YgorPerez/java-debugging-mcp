@@ -8,7 +8,13 @@
     "The paths are real facts about THIS tree, deliberately. src/handlers.rs exists only under",
     "mcp-server, so it resolves; Cargo.toml exists at the root and in both members, so it is ambiguous.",
     "If the workspace is restructured this fixture goes red, which is correct - knowing where the files",
-    "are is the script whole job."
+    "are is the script whole job.",
+    "THE LAST TWO WARNINGS ARE CI-11 (#175). Both are unplaceable, by two different routes: one has",
+    "parents that simply hold no manifest, the other has no parent but the workspace root. Until #175",
+    "both re-anchored onto the root Cargo.toml and this transcript PINNED that, deliberately, because",
+    "TEST-48 (#163) put rewriting the scripts out of scope and an absent question is worse than a wrong",
+    "answer on the record. They now keep their own uri and say they could not be located, which is what",
+    "reanchor()'s docstring had claimed all along."
   ],
   "runs": [
     {
@@ -95,11 +101,24 @@
         {
           "ruleId": "panic-in-library",
           "level": "warning",
-          "message": { "text": "a uri that is nowhere in the tree; re-anchors to the ROOT manifest, see the transcript" },
+          "message": { "text": "a uri that is nowhere in the tree, with parents; published unchanged, CI-11" },
           "locations": [
             {
               "physicalLocation": {
                 "artifactLocation": { "uri": "nowhere/at/all.rs", "uriBaseId": "%SRCROOT%" },
+                "region": { "startLine": 1 }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "result-unit-error",
+          "level": "warning",
+          "message": { "text": "a uri whose ONLY parent is the workspace root; the loop finds no candidate at all" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "totally_made_up.rs", "uriBaseId": "%SRCROOT%" },
                 "region": { "startLine": 1 }
               }
             }

@@ -72,10 +72,30 @@ def reanchor(rel: Path, root: Path) -> tuple[str, str] | None:
     For the one finding this happens to — a `<crate>/clippy.toml` rust-doctor created and deleted — the
     crate's `Cargo.toml` is not a consolation prize: `clippy::multiple_crate_versions` is *about* the
     dependency graph that manifest declares, so the alert lands closer to its subject than the temporary
-    config file ever was. Returns None when the parent is not a crate, because inventing a location for a
-    finding whose location is unknown is the thing this file exists to stop.
+    config file ever was.
+
+    THE WORKSPACE ROOT IS NOT A CANDIDATE, and that floor is the whole of CI-11 (#175). `rel.parents`
+    always ends in `.`, and the workspace root always has a `Cargo.toml` — so until this line existed the
+    function could not return None for any relative URI, and the docstring's claim that it did was the
+    only place the guarantee lived. Measured on this tree: `nowhere/at/all.rs`, `totally_made_up.rs` and
+    `a/b/c/d/e.rs` all came back `('Cargo.toml', 're-anchored to Cargo.toml')` — indistinguishable from
+    the clippy.toml case above, which is a *correct* re-anchor onto a manifest the finding is genuinely
+    about. A reader of the alert had no way to tell the two apart, so the fabricated one was the more
+    expensive of the two to publish.
+
+    Returns None instead, and the caller then publishes the URI untouched with a reason saying it could
+    not be located: inventing a location for a finding whose location is unknown is the thing this file
+    exists to stop. Every other parent still counts — `mcp-server/clippy.toml` re-anchors as before, and
+    so does a deleted source file under a member crate, because a member's manifest names a crate the
+    finding really was inside. Only the root is uninformative, because every unplaceable path reaches it.
     """
     for parent in rel.parents:
+        # `Path(".")` is the last element of every relative path's `.parents`, and it is the workspace
+        # root: the one parent whose manifest says nothing, because everything that fails to resolve
+        # arrives here. Skipped rather than special-cased at the call site, so the guarantee is a property
+        # of this function — the docstring above used to be the only thing asserting it.
+        if parent == Path("."):
+            continue
         manifest = root / parent / "Cargo.toml"
         if manifest.exists():
             return manifest.relative_to(root).as_posix(), f"re-anchored to {parent / 'Cargo.toml'}"
