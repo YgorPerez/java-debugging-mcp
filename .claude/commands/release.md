@@ -203,20 +203,42 @@ link means the notes step published nothing — the old `--generate-notes` failu
 audit in step 7 has nothing to read.
 
 Then confirm crates.io agrees, asking the **registry** rather than the workflow log — a green `publish` job
-and a version actually resolvable by `cargo install` are not the same claim, and the index takes a moment to
-catch up:
+and a version actually resolvable by `cargo install` are not the same claim.
+
+Ask the **sparse index**, which is what `cargo` itself resolves against, rather than `/api/v1/`. The API is
+the wrong instrument twice over: it rejects a request with no `User-Agent` — answering `200` with an
+`errors` body — and a check that looks only for the success shape renders that refusal as "not published".
+That false negative was delivered three times immediately after an irreversible publish (ADR-0043).
 
 ```bash
-for c in jdwp-mcp java-debugging-jdwp-client; do
-  printf '%-30s ' "$c"
-  curl -s "https://crates.io/api/v1/crates/$c" | python3 -c \
-    'import sys,json; d=json.load(sys.stdin); print(d["crate"]["max_version"] if "crate" in d else "NOT PUBLISHED")'
-done
+python3 - <<'PY'
+import json, urllib.request
+for name in ("jdwp-mcp", "java-debugging-jdwp-client"):
+    n = name.lower()
+    p = {1: f"1/{n}", 2: f"2/{n}", 3: f"3/{n[0]}/{n}"}.get(len(n), f"{n[:2]}/{n[2:4]}/{n}")
+    try:
+        body = urllib.request.urlopen(f"https://index.crates.io/{p}", timeout=20).read().decode()
+        vers = [json.loads(l)["vers"] for l in body.splitlines() if l.strip()]
+        print(f"{name:32} {vers[-1] if vers else 'no versions'}")
+    except urllib.error.HTTPError as e:
+        print(f"{name:32} {'NOT PUBLISHED' if e.code == 404 else f'COULD NOT ASK ({e.code})'}")
+    except Exception as e:                       # network, DNS, timeout
+        print(f"{name:32} COULD NOT ASK ({e})")
+PY
 ```
 
-Both must print the version you just cut. `jdwp-mcp` alone matching means the workspace publish stopped
-between the two crates — the client goes up first, so this is the *less* likely half to be missing; check
-the `publish` job's log rather than assuming the index is lagging.
+Both must print the version you just cut. **`COULD NOT ASK` is deliberately not `NOT PUBLISHED`** — only a
+`404` means absent, and folding the two together is the bug this recipe replaced.
+
+`jdwp-mcp` alone matching means the workspace publish stopped between the two crates — the client goes up
+first, so this is the *less* likely half to be missing; read the `publish` job's log.
+
+The strongest check, if you want it, is the user's own path — it resolves both crates from the registry,
+compiles, and produces a binary:
+
+```bash
+cargo install jdwp-mcp --version <version> --locked --root "$(mktemp -d)"
+```
 
 ## 7. Propagate to infotravel-dev-toolkit
 

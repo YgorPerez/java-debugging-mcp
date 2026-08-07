@@ -142,10 +142,19 @@ Two things went wrong that the plan had not predicted, neither of them about thi
 - **crates.io refuses to publish from an account with no verified email**, which is an account-level
   requirement nothing in a manifest or workflow can reveal. It failed at the *first* upload and published
   neither crate, so the workspace ordering held under a real failure rather than only under `--dry-run`.
-- **The crates.io web API lagged the sparse index by minutes.** `cargo publish` printed `Published` while
-  `/api/v1/crates/jdwp-mcp` still answered 404. The index is what `cargo` resolves against and it was correct
-  immediately; verify there, not against the API — `/api/v1/` is the *slower* of the two and reads like
-  failure while it catches up.
+- **A verification script reported both crates unpublished for twenty minutes after they were published**,
+  and the script was wrong rather than the registry. **crates.io refuses requests with no `User-Agent`** —
+  it answers `200` with an `{"errors": [...]}` body citing its data-access policy — and the check said
+  `if "crate" in d: ... else "NOT PUBLISHED"`, so a *refusal* rendered as an *absence*. This was diagnosed
+  as "the API lags the sparse index", written up in this ADR as a lesson, and committed. It is not true and
+  there is no lag; the entry is rewritten rather than deleted because the wrong version was believed for
+  three separate checks and survived into documentation.
+  The rule it earns is the one this repo keeps relearning in new costume: **an `else` branch that reports
+  absence must be reachable only by absence.** Any verification that folds "no" and "could not ask" into one
+  answer will eventually deliver the false negative at the least calm moment available — here, immediately
+  after an irreversible publish. `scripts/release-notes.py`'s "0 checks ran, so this verified nothing" and
+  `--findings`' skipped-pass list are the same rule applied where it was already understood.
+  Every crates.io curl in this repo now sends `-A`, and reads `errors` before `crate`.
 
 Verified end to end rather than from the success message: the published index entry carries
 `"package": "java-debugging-jdwp-client"` beside the `jdwp-client` key, so a stranger's resolution reaches
