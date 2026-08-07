@@ -32,6 +32,35 @@ of the repair and are worth keeping:
   `packets_sent()` rather than only on the error — "refused" and "sent nothing" are different claims, and
   only the second is the contract.
 
+**Amended by SAFE-12 ([#171](https://github.com/YgorPerez/java-debugging-mcp/issues/171)).** SAFE-9's
+repair added two wire tests, one per repaired primitive — which closes yesterday's hole and leaves the
+mechanism unchanged. Seven of the nine primitives still had none, and a tenth would have had none either.
+**The invariant is now checked rather than described**, by two tables in `connection.rs`'s test module that
+enumerate instead of listing:
+
+| check | catches | would it have caught SAFE-9? |
+|---|---|---|
+| `mutating_primitives()` + `the_table_names_every_guard_mutation_call_site` | a guarded primitive with no wire assertion; a reworded or removed guard | no |
+| `WIRE_COMMANDS` + `every_wire_command_this_crate_sends_is_classified` + `as_many_commands_are_classified_mutations_as_there_are_guards` | a mutating command sent with **no guard at all** | **yes** |
+
+The second is the one that matters, because SAFE-9's actual defect was a primitive with no client-side
+guard whatsoever, which leaves the set of `guard_mutation` literals unchanged and is therefore invisible to
+any check built on them. `WIRE_COMMANDS` classifies **every** JDWP command this crate can send as `Read`,
+`Mutation` or `AllowedStateChange`, so a new command turns the suite red until someone writes down which it
+is — and once it is written down as a mutation, the count assertion turns it red again until a guard exists.
+The third verdict is deliberate: `VirtualMachine.Suspend` is not a read, and filing it as one is how the
+next classification gets made carelessly.
+
+The cost is stated rather than discovered: adding **any** command to this crate, a read included, requires a
+line in that table. Same deal as `docs_claims.rs` (DOC-15) — a red is fixed by updating the table in the
+commit that caused it.
+
+All four failure modes were verified by planting them: deleting either of two `guard_mutation` calls, adding
+an unguarded mutating primitive, and adding a guarded one missing from the table. `VirtualMachine.CreateString`
+is recorded in the table as `AllowedStateChange` — it allocates in the debuggee heap and is not one of the
+nine primitives this ADR's decision names. That is the classification it *has*, written down so the question
+is visible; changing it is a decision for this ADR, not for a test.
+
 ## Rejected alternative
 
 Keeping the expression-text guard. It cannot be made complete, and the incompleteness was not theoretical —

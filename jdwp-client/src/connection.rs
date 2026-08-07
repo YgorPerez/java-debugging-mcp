@@ -471,6 +471,10 @@ impl TypeCache {
 mod tests {
     use super::*;
     use crate::protocol::{HEADER_SIZE, REPLY_FLAG};
+    use crate::types::Value;
+    use std::collections::BTreeSet;
+    use std::future::Future;
+    use std::pin::Pin;
 
     fn field(name: &str) -> FieldInfo {
         FieldInfo {
@@ -566,80 +570,424 @@ mod tests {
         port
     }
 
-    /// SAFE-9. These two primitives were gated in the MCP handlers that call them, which ADR-0001
-    /// forbids: the layer above does not decide what counts as mutation. The regression this test exists
-    /// to catch is invisible from an MCP tool test, because the handler's own check would pass it.
-    ///
-    /// `packets_sent()` is the assertion that matters. "Returned an error" would also be satisfied by a
-    /// primitive that sent its packet and then failed; "sent nothing" is the actual contract.
+    // ---------------------------------------------------------------------------------------------
+    // ADR-0001's invariant, checked (SAFE-9 #60, then SAFE-12 #171).
+    //
+    // "The MCP layer does not decide what counts as mutation; the wire does." SAFE-9 is the record of
+    // that invariant breaking with nothing failing: `redefine_classes` and `pop_frames` arrived gated in
+    // the MCP handlers that call them, which is invisible from an MCP tool test because the handler's
+    // own check passes it. SAFE-9's repair added the first wire-level tests read-only had ever had — but
+    // it added two, one per repaired primitive, which closes yesterday's hole and leaves the mechanism
+    // unchanged. Seven of the nine primitives still had none, and an eleventh would have had none either.
+    //
+    // WHAT IS HERE IS TWO CHECKS THAT ENUMERATE, and they catch different halves. Neither alone is
+    // enough, and the second is the one that would have caught SAFE-9:
+    //
+    //   1. `MUTATING_PRIMITIVES` — the table, with a companion test asserting its `what` strings are
+    //      EXACTLY the set of `guard_mutation("…")` literals in the crate's sources. A tenth primitive
+    //      that is guarded but untested fails; so does a renamed one.
+    //   2. `WIRE_COMMANDS` — every JDWP command this crate can send, each classified. A new command
+    //      cannot be sent without someone writing down whether it mutates, and the number classified
+    //      `Mutation` must equal the number of guard sites. So a mutating primitive added with NO guard
+    //      at all — which is precisely what SAFE-9 was — fails twice on the way to being right: once for
+    //      being unclassified, then again for being classified `Mutation` with no guard behind it.
+    //
+    // `packets_sent()` is the assertion that matters throughout. "Returned an error" would also be
+    // satisfied by a primitive that sent its packet and then failed; "sent nothing" is the contract, and
+    // it is what distinguishes a wire guard from a handler guard. It is also why none of this needs a JVM.
+    // ---------------------------------------------------------------------------------------------
+
     /// The timeout is not the assertion — it is what turns a missing guard from a 30-second hang on the
     /// event loop's reply timeout into an immediate, legible failure. A guard that is present refuses in
     /// microseconds and never approaches the budget.
     const REFUSAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
-    #[tokio::test]
-    async fn a_read_only_connection_refuses_a_redefinition_without_sending_a_packet() {
-        let port = deaf_jdwp_peer().await;
-        let mut conn = JdwpConnection::connect("127.0.0.1", port).await.expect("handshake with the peer");
-        conn.set_read_only(true);
-        let before = conn.packets_sent();
+    /// One mutating primitive, invoked with arguments that never have to be valid: every one of these
+    /// must fail before a packet leaves, so the peer never sees them and the ids mean nothing.
+    type Invoke = fn(JdwpConnection) -> Pin<Box<dyn Future<Output = JdwpResult<()>> + Send>>;
 
-        let err =
-            tokio::time::timeout(REFUSAL_BUDGET, conn.redefine_classes(&[(1, vec![0xCA, 0xFE, 0xBA, 0xBE])]))
-                .await
-                .expect("no refusal: the packet went to the peer and this is waiting for a reply")
-                .expect_err("a read-only connection must refuse a class redefinition");
+    /// Any tagged value; the four writes need one and none of them cares which.
+    fn int_value() -> Value {
+        Value { tag: crate::types::TypeTag::Int as u8, data: crate::types::ValueData::Int(1) }
+    }
 
-        assert!(matches!(err, JdwpError::ReadOnly(_)), "expected ReadOnly, got {err:?}");
-        assert_eq!(conn.packets_sent(), before, "refused, but the bytes went out anyway");
+    /// Every primitive `guard_mutation` protects, keyed by the exact `what` string its call site passes.
+    ///
+    /// The key is not decoration: `the_table_names_every_guard_mutation_call_site` compares this column
+    /// against the literals in the sources, so a new guard, a removed one or a reworded one all land here
+    /// as a failure naming the difference. That is the same deal `docs_claims.rs` (DOC-15) strikes — a red
+    /// here is fixed by updating the table in the same commit, not by loosening the test.
+    fn mutating_primitives() -> Vec<(&'static str, Invoke)> {
+        vec![
+            ("a class redefinition", |mut c| {
+                Box::pin(async move { c.redefine_classes(&[(1, vec![0xCA, 0xFE, 0xBA, 0xBE])]).await })
+            }),
+            ("a frame pop", |mut c| Box::pin(async move { c.pop_frames(1, 2).await })),
+            ("an instance method invocation", |mut c| {
+                Box::pin(async move { c.invoke_method(1, 2, 3, 4, vec![]).await.map(|_| ()) })
+            }),
+            ("a static method invocation", |mut c| {
+                Box::pin(async move { c.invoke_static_method(1, 2, 3, vec![]).await.map(|_| ()) })
+            }),
+            ("an array element write", |mut c| {
+                Box::pin(async move { c.set_array_values(1, 0, &[int_value()]).await })
+            }),
+            ("a local variable write", |mut c| {
+                Box::pin(async move { c.set_frame_value(1, 2, 0, &int_value()).await })
+            }),
+            ("a forced early return", |mut c| {
+                Box::pin(async move { c.force_early_return(1, &int_value()).await })
+            }),
+            ("a static field write", |mut c| {
+                Box::pin(async move { c.set_reference_values(1, vec![(1, int_value())]).await })
+            }),
+            ("an instance field write", |mut c| {
+                Box::pin(async move { c.set_object_values(1, vec![(1, int_value())]).await })
+            }),
+        ]
     }
 
     #[tokio::test]
-    async fn a_read_only_connection_refuses_a_frame_pop_without_sending_a_packet() {
+    async fn every_mutating_primitive_is_refused_at_the_wire_and_sends_nothing() {
         let port = deaf_jdwp_peer().await;
-        let mut conn = JdwpConnection::connect("127.0.0.1", port).await.expect("handshake with the peer");
+        let conn = JdwpConnection::connect("127.0.0.1", port).await.expect("handshake with the peer");
         conn.set_read_only(true);
-        let before = conn.packets_sent();
 
-        let err = tokio::time::timeout(REFUSAL_BUDGET, conn.pop_frames(1, 2))
-            .await
-            .expect("no refusal: the packet went to the peer and this is waiting for a reply")
-            .expect_err("a read-only connection must refuse a frame pop");
+        for (what, invoke) in mutating_primitives() {
+            let c = conn.clone();
+            let before = c.packets_sent();
+            let err = tokio::time::timeout(REFUSAL_BUDGET, invoke(c.clone()))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{what}: no refusal — the packet went to the peer and this is awaiting a reply")
+                })
+                .expect_err(&format!("a read-only connection must refuse {what}"));
 
-        assert!(matches!(err, JdwpError::ReadOnly(_)), "expected ReadOnly, got {err:?}");
-        assert_eq!(conn.packets_sent(), before, "refused, but the bytes went out anyway");
+            match &err {
+                JdwpError::ReadOnly(named) => assert_eq!(
+                    named, what,
+                    "{what}: refused, but named {named:?} — the table and the call site disagree"
+                ),
+                other => panic!("{what}: expected ReadOnly, got {other:?}"),
+            }
+            assert_eq!(c.packets_sent(), before, "{what}: refused, but the bytes went out anyway");
+        }
     }
 
     /// The other half of the contract: the flag is what refuses, not the primitive. Without this, a
-    /// primitive hard-wired to fail would pass the two tests above and nobody would notice that read-only
-    /// had stopped being a *mode*.
+    /// primitive hard-wired to fail would pass the test above and nobody would notice that read-only had
+    /// stopped being a *mode*.
     ///
     /// On a writable connection each primitive gets past the guard, sends, and then waits forever for a
     /// reply the deaf peer will never send — so the timeout *is* the pass condition, and `packets_sent()`
     /// proves it timed out with the bytes on the wire rather than somewhere short of it.
     #[tokio::test]
-    async fn the_same_primitives_send_when_the_connection_is_writable() {
+    async fn every_mutating_primitive_sends_when_the_connection_is_writable() {
         let port = deaf_jdwp_peer().await;
         let conn = JdwpConnection::connect("127.0.0.1", port).await.expect("handshake with the peer");
         assert!(!conn.is_read_only(), "a fresh connection must not be read-only");
         let budget = std::time::Duration::from_millis(250);
 
-        let mut a = conn.clone();
-        let defs = [(1, vec![0xCA, 0xFE, 0xBA, 0xBE])];
-        let before = a.packets_sent();
-        assert!(
-            tokio::time::timeout(budget, a.redefine_classes(&defs)).await.is_err(),
-            "a writable connection must get past the guard and wait for the peer's reply"
-        );
-        assert_eq!(a.packets_sent(), before + 1, "it waited without having sent anything");
+        for (what, invoke) in mutating_primitives() {
+            let c = conn.clone();
+            let before = c.packets_sent();
+            assert!(
+                tokio::time::timeout(budget, invoke(c.clone())).await.is_err(),
+                "{what}: a writable connection must get past the guard and wait for the peer's reply"
+            );
+            assert_eq!(c.packets_sent(), before + 1, "{what}: it waited without having sent anything");
+        }
+    }
 
-        let mut b = conn.clone();
-        let before = b.packets_sent();
-        assert!(
-            tokio::time::timeout(budget, b.pop_frames(1, 2)).await.is_err(),
-            "a writable connection must get past the guard and wait for the peer's reply"
+    /// Read a crate source file with its test module cut off.
+    ///
+    /// The truncation is what keeps these tests from reading themselves: this module names every guard
+    /// string and every command constant, so a scan that counted its own tables would agree with them no
+    /// matter what the crate did. Each file is asserted to have at most one test module, because a second
+    /// one further up would silently hide everything between them.
+    ///
+    /// IT MATCHES A WHOLE LINE, NOT A SUBSTRING, and the first version did not — it searched the raw text
+    /// and fired on this very doc comment the moment the comment mentioned the attribute it looks for.
+    /// That is the same defect `.claude/hooks/pre-bash-guard.py` carries a warning about: a check that
+    /// cries wolf on its own documentation is the fastest way to get it deleted. A real attribute is a
+    /// line of its own; a mention is prose.
+    fn crate_sources() -> Vec<(String, String)> {
+        const ATTR: &str = "#[cfg(test)]";
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read jdwp-client/src") {
+            let path = entry.expect("a directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().expect("a file name").to_string_lossy().into_owned();
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
+            let attrs: Vec<usize> =
+                src.lines().enumerate().filter(|(_, l)| l.trim() == ATTR).map(|(i, _)| i).collect();
+            assert!(
+                attrs.len() <= 1,
+                "{name} has {} lines that are exactly `{ATTR}` (at {attrs:?}); this helper cuts at the \
+                 first and would hide whatever lies between them",
+                attrs.len()
+            );
+            let cut = attrs.first().copied().unwrap_or(usize::MAX);
+            let body = src.lines().take(cut).collect::<Vec<_>>().join("\n");
+            out.push((name, body));
+        }
+        assert!(!out.is_empty(), "found no .rs files under jdwp-client/src");
+        out
+    }
+
+    /// Every `guard_mutation("…")` literal in the crate's non-test sources.
+    fn guard_literals() -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for (name, body) in crate_sources() {
+            for part in body.split("self.guard_mutation(\"").skip(1) {
+                let what = part.split('"').next().expect("an unterminated guard_mutation literal");
+                found.push((what.to_string(), name.clone()));
+            }
+        }
+        found
+    }
+
+    /// The enumerating half of the table. Without it the table is just a longer list, and a tenth
+    /// primitive added with a guard but no test would pass every assertion above.
+    #[test]
+    fn the_table_names_every_guard_mutation_call_site() {
+        let mut in_source: Vec<String> = guard_literals().into_iter().map(|(w, _)| w).collect();
+        in_source.sort();
+        let mut in_table: Vec<String> =
+            mutating_primitives().into_iter().map(|(w, _)| w.to_string()).collect();
+        in_table.sort();
+
+        assert_eq!(
+            in_source, in_table,
+            "the wire-level table and the crate's `guard_mutation` call sites have diverged. A guard with \
+             no table entry is a primitive nothing asserts is refused; a table entry with no guard is a \
+             test asserting a refusal that no longer exists. Fix it in the commit that caused it."
         );
-        assert_eq!(b.packets_sent(), before + 1, "it waited without having sent anything");
+        // A duplicated `what` would make the two lists agree while covering one site twice.
+        let mut unique = in_source.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), in_source.len(), "two guard sites share a `what` string: {in_source:?}");
+    }
+
+    /// How this crate treats a JDWP command it can send, for [`WIRE_COMMANDS`].
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Wire {
+        /// Reads debuggee state and changes nothing.
+        Read,
+        /// Mutates the debuggee. Must be behind `guard_mutation`.
+        Mutation,
+        /// Changes VM state but is deliberately permitted in read-only mode. A debugger that could not
+        /// suspend, resume, set an event request or disconnect would not be a read-only debugger, it
+        /// would be no debugger — ADR-0001 says as much where it lists what read-only leaves untouched.
+        /// Spelled out rather than filed under `Read`, because calling `VirtualMachine.Suspend` a read
+        /// is the kind of quiet inaccuracy that makes the next classification easy to get wrong.
+        AllowedStateChange,
+    }
+
+    /// EVERY JDWP COMMAND THIS CRATE CAN SEND, and what it is.
+    ///
+    /// This is the check that would have caught SAFE-9, and the table above is not: a mutating primitive
+    /// added with no `guard_mutation` at all leaves the guard literals unchanged, so nothing above it
+    /// notices. Here it shows up as an unclassified command, and once classified `Mutation` it fails
+    /// again for having no guard behind it.
+    ///
+    /// The cost is deliberate and worth stating: adding ANY new command to this crate — a read included —
+    /// turns this red until it is classified. That is the point rather than a side effect. It is the same
+    /// deal as the table above, and the reason the third verdict exists is so nobody is tempted to file a
+    /// suspend under `Read` to make the red go away.
+    ///
+    /// Keys are `<command set>/<command>` as they are WRITTEN at the call site, with `command_sets::` and
+    /// `crate::commands::` stripped. Textual rather than resolved, because a test that evaluated the
+    /// constants would need the crate's dispatch and would stop being able to see a site at all. Three
+    /// entries name a variable (`METHOD/command` and friends): those are the `with_generic` dispatch
+    /// helpers and the two-command thread read helper, whose alternatives are all reads.
+    const WIRE_COMMANDS: &[(&str, Wire)] = &[
+        ("ARRAY_REFERENCE/ARRAY_GET_VALUES", Wire::Read),
+        ("ARRAY_REFERENCE/ARRAY_LENGTH", Wire::Read),
+        ("ARRAY_REFERENCE/ARRAY_SET_VALUES", Wire::Mutation),
+        ("CLASS_TYPE/CLASS_TYPE_INVOKE_METHOD", Wire::Mutation),
+        ("CLASS_TYPE/CLASS_TYPE_SET_VALUES", Wire::Mutation),
+        ("CLASS_TYPE/CLASS_TYPE_SUPERCLASS", Wire::Read),
+        ("EVENT_REQUEST/event_commands::CLEAR", Wire::AllowedStateChange),
+        ("EVENT_REQUEST/event_commands::CLEAR_ALL_BREAKPOINTS", Wire::AllowedStateChange),
+        ("EVENT_REQUEST/event_commands::SET", Wire::AllowedStateChange),
+        ("METHOD/command", Wire::Read),
+        ("METHOD/method_commands::BYTECODES", Wire::Read),
+        ("METHOD/method_commands::LINE_TABLE", Wire::Read),
+        ("OBJECT_REFERENCE/object_reference_commands::GET_VALUES", Wire::Read),
+        ("OBJECT_REFERENCE/object_reference_commands::INVOKE_METHOD", Wire::Mutation),
+        ("OBJECT_REFERENCE/object_reference_commands::IS_COLLECTED", Wire::Read),
+        ("OBJECT_REFERENCE/object_reference_commands::REFERENCE_TYPE", Wire::Read),
+        ("OBJECT_REFERENCE/object_reference_commands::SET_VALUES", Wire::Mutation),
+        ("REFERENCE_TYPE/command", Wire::Read),
+        ("REFERENCE_TYPE/reference_type_commands::CLASS_LOADER", Wire::Read),
+        ("REFERENCE_TYPE/reference_type_commands::GET_VALUES", Wire::Read),
+        ("REFERENCE_TYPE/reference_type_commands::INSTANCES", Wire::Read),
+        ("REFERENCE_TYPE/reference_type_commands::INTERFACES", Wire::Read),
+        ("REFERENCE_TYPE/reference_type_commands::MODIFIERS", Wire::Read),
+        ("REFERENCE_TYPE/reference_type_commands::SIGNATURE", Wire::Read),
+        ("REFERENCE_TYPE/reference_type_commands::SOURCE_DEBUG_EXTENSION", Wire::Read),
+        ("REFERENCE_TYPE/reference_type_commands::SOURCE_FILE", Wire::Read),
+        // StackFrame.SetValues, written as a bare `2` with a comment at the call site.
+        ("STACK_FRAME/2", Wire::Mutation),
+        ("STACK_FRAME/stack_frame_commands::GET_VALUES", Wire::Read),
+        ("STACK_FRAME/stack_frame_commands::POP_FRAMES", Wire::Mutation),
+        ("STACK_FRAME/stack_frame_commands::THIS_OBJECT", Wire::Read),
+        ("STRING_REFERENCE/string_reference_commands::VALUE", Wire::Read),
+        ("THREAD_REFERENCE/command", Wire::Read),
+        ("THREAD_REFERENCE/thread_commands::CURRENT_CONTENDED_MONITOR", Wire::Read),
+        ("THREAD_REFERENCE/thread_commands::FORCE_EARLY_RETURN", Wire::Mutation),
+        ("THREAD_REFERENCE/thread_commands::FRAMES", Wire::Read),
+        ("THREAD_REFERENCE/thread_commands::OWNED_MONITORS", Wire::Read),
+        ("THREAD_REFERENCE/thread_commands::RESUME", Wire::AllowedStateChange),
+        ("THREAD_REFERENCE/thread_commands::SUSPEND", Wire::AllowedStateChange),
+        ("THREAD_REFERENCE/thread_commands::SUSPEND_COUNT", Wire::Read),
+        ("VIRTUAL_MACHINE/vm_commands::ALL_CLASSES", Wire::Read),
+        ("VIRTUAL_MACHINE/vm_commands::ALL_THREADS", Wire::Read),
+        ("VIRTUAL_MACHINE/vm_commands::CAPABILITIES", Wire::Read),
+        ("VIRTUAL_MACHINE/vm_commands::CAPABILITIES_NEW", Wire::Read),
+        ("VIRTUAL_MACHINE/vm_commands::CLASSES_BY_SIGNATURE", Wire::Read),
+        // Allocates a String in the debuggee heap, and is NOT behind the guard today. Recorded as the
+        // classification it has rather than the one it arguably deserves: ADR-0001's decision lists nine
+        // primitives and this is not one of them, and changing what counts as a mutation is a decision
+        // for that ADR, not for a test. It is here so the question is visible instead of absent.
+        ("VIRTUAL_MACHINE/vm_commands::CREATE_STRING", Wire::AllowedStateChange),
+        ("VIRTUAL_MACHINE/vm_commands::DISPOSE", Wire::AllowedStateChange),
+        ("VIRTUAL_MACHINE/vm_commands::INSTANCE_COUNTS", Wire::Read),
+        ("VIRTUAL_MACHINE/vm_commands::REDEFINE_CLASSES", Wire::Mutation),
+        ("VIRTUAL_MACHINE/vm_commands::RESUME", Wire::AllowedStateChange),
+        ("VIRTUAL_MACHINE/vm_commands::SUSPEND", Wire::AllowedStateChange),
+        ("VIRTUAL_MACHINE/vm_commands::VERSION", Wire::Read),
+    ];
+
+    /// Split the argument list of a `CommandPacket::new(` call, given the index just past its `(`.
+    ///
+    /// Depth-aware, because `i32::try_from(x).unwrap_or(y)` and friends appear inside these lists and a
+    /// naive comma split would cut one in half. Returns `None` if the parenthesis never closes, which is
+    /// a truncated file rather than a finding.
+    fn split_args(src: &str, start: usize) -> Option<Vec<String>> {
+        let (mut depth, mut cur, mut out) = (1usize, String::new(), Vec::new());
+        for ch in src[start..].chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        out.push(cur);
+                        return Some(out);
+                    }
+                }
+                _ => {}
+            }
+            if depth == 1 && ch == ',' {
+                out.push(std::mem::take(&mut cur));
+            } else {
+                cur.push(ch);
+            }
+        }
+        None
+    }
+
+    /// One `CommandPacket::new` argument, reduced to the key [`WIRE_COMMANDS`] is written in.
+    fn normalize_arg(raw: &str) -> String {
+        let mut s = String::new();
+        let mut rest = raw;
+        while let Some(open) = rest.find("/*") {
+            s.push_str(&rest[..open]);
+            s.push(' ');
+            rest = rest[open + 2..].split_once("*/").map_or("", |(_, after)| after);
+        }
+        s.push_str(rest);
+        let s: String = s
+            .lines()
+            .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let s = s.trim().trim_end_matches(',').trim();
+        s.strip_prefix("crate::commands::")
+            .or_else(|| s.strip_prefix("command_sets::"))
+            .unwrap_or(s)
+            .to_string()
+    }
+
+    /// Every `<set>/<command>` this crate constructs a packet for, in the shape [`WIRE_COMMANDS`] keys it.
+    fn wire_commands_in_source() -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for (name, body) in crate_sources() {
+            let mut at = 0;
+            while let Some(hit) = body[at..].find("CommandPacket::new(") {
+                let open = at + hit + "CommandPacket::new(".len();
+                at = open;
+                let args = split_args(&body, open)
+                    .unwrap_or_else(|| panic!("{name}: unbalanced CommandPacket::new( at byte {open}"));
+                let args: Vec<String> =
+                    args.iter().map(|a| normalize_arg(a)).filter(|a| !a.is_empty()).collect();
+                assert_eq!(
+                    args.len(),
+                    3,
+                    "{name}: CommandPacket::new took {} arguments, not 3 (id, set, command): {args:?}. \
+                     If its signature changed, this scan needs changing with it.",
+                    args.len()
+                );
+                found.push((format!("{}/{}", args[1], args[2]), name.clone()));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn every_wire_command_this_crate_sends_is_classified() {
+        // Sets rather than lists, because the same command is constructed in more than one file
+        // (EventRequest.Set and .Clear are each built in two) and the question here is which commands
+        // exist, not how many places build them. BTreeSet also orders the messages stably.
+        let in_source: BTreeSet<String> = wire_commands_in_source().into_iter().map(|(k, _)| k).collect();
+        let classified: BTreeSet<String> = WIRE_COMMANDS.iter().map(|(k, _)| (*k).to_string()).collect();
+
+        let unclassified: Vec<&String> = in_source.difference(&classified).collect();
+        assert!(
+            unclassified.is_empty(),
+            "this crate can send {unclassified:?}, and WIRE_COMMANDS does not say whether that mutates \
+             the debuggee. Classify it. If it is a mutation it also needs `guard_mutation` — ADR-0001, \
+             and SAFE-9 is the record of what skipping that costs."
+        );
+        let gone: Vec<&String> = classified.difference(&in_source).collect();
+        assert!(
+            gone.is_empty(),
+            "WIRE_COMMANDS classifies {gone:?}, which this crate no longer sends. A stale entry is how \
+             this table stops describing the code it is about."
+        );
+        assert_eq!(
+            classified.len(),
+            WIRE_COMMANDS.len(),
+            "WIRE_COMMANDS has a duplicate key, so one of its verdicts is unreachable"
+        );
+    }
+
+    /// The join between the two tables, and the assertion that closes SAFE-9's hole: a command classified
+    /// as a mutation with no guard behind it.
+    ///
+    /// A count rather than a mapping, because the key is textual and the guard's `what` is prose — there
+    /// is no honest way to join them per row. The count is enough: nine commands classified `Mutation`,
+    /// nine `guard_mutation` call sites, nine table entries, all asserted against each other, so a tenth
+    /// of any one of them without the other two is a failure that names which side is short.
+    #[test]
+    fn as_many_commands_are_classified_mutations_as_there_are_guards() {
+        let mutations: Vec<&str> =
+            WIRE_COMMANDS.iter().filter(|(_, w)| *w == Wire::Mutation).map(|(k, _)| *k).collect();
+        let guards = guard_literals();
+        assert_eq!(
+            mutations.len(),
+            guards.len(),
+            "{} commands are classified Mutation but there are {} `guard_mutation` call sites. Mutations: \
+             {mutations:?}; guards: {guards:?}. Either a mutating command is being sent unguarded — which \
+             is exactly SAFE-9 — or a guard protects something no longer classified as one.",
+            mutations.len(),
+            guards.len()
+        );
     }
 
     /// Which way round [`wave_peer`] answers a wave it has already read in full.

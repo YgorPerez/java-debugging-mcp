@@ -162,6 +162,19 @@ about. Regenerate with the **same** command as the other two snapshots —
 `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot` — and then **read the diff and put it in
 the release notes**, because that is a caller-visible change.
 
+**Adding a JDWP command to `jdwp-client` now costs a line in a table, including a read** (SAFE-12, #171).
+`WIRE_COMMANDS` in `connection.rs`'s test module classifies **every** command this crate can send as
+`Read`, `Mutation` or `AllowedStateChange`, and the suite goes red on one it has never heard of. That is
+the point rather than a side effect: ADR-0001 says read-only is enforced *at the wire*, and SAFE-9 (#60) is
+the record of that invariant breaking with **nothing failing**, because the two primitives arrived with no
+client-side guard at all — which leaves the set of `guard_mutation` literals unchanged and is therefore
+invisible to any check built on them. Classify it as a `Mutation` and a second assertion goes red until a
+`guard_mutation` exists behind it. There is a companion table of the nine mutating primitives whose
+refusals are asserted **on `packets_sent()`, not just on the error** — "refused" and "sent nothing" are
+different claims and only the second is the contract. All of it needs no JVM. Do not reach for a third
+verdict to make a red go away: `VirtualMachine.Suspend` is an `AllowedStateChange`, not a read, and the
+enum has that value so nobody has to lie.
+
 **The wire read path is fuzzed, and the half that matters runs on stable** (TEST-45, #153).
 `mcp-server/tests/malformed_wire.rs` rides on every `cargo test`: truncations and single-byte
 corruptions of the **real frames in the cassettes**, all 256 value tags against every short buffer, and
