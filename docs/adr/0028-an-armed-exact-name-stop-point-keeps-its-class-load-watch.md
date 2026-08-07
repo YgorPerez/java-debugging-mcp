@@ -133,7 +133,15 @@ as a side effect of a *read* is the implicit-invocation shape ADR-0001 exists to
   point after every redeploy, or arm with a wildcard so the family's watch keeps arming — is no longer
   needed, though both still work.
 * Every exact-name line stop point now holds one extra JDWP event request for its whole life. The cost is
-  one filter evaluation in the debuggee per class load, against one exact signature.
+  one filter evaluation in the debuggee per class load, against one exact signature — **a filter evaluation,
+  not an event.** The request carries a `ClassMatch` modifier, so a class that does not match raises nothing:
+  no packet, no suspension, no resume. An **event** costs those, and for an exact name only a redeploy of that
+  class produces one.
+
+  Spelled out because "per class load" was read as "an event per class load", which turns a per-redeploy cost
+  into a per-classload one. That misreading reached the downstream toolkit's glossary, where it sat as the
+  definition of half of its `arming cost` term, and from there into an argument for a per-load counter — which
+  has nothing to count, since non-matching loads raise nothing and matching ones are already reported.
 * Retired copies stay armed. That is deliberate: an undeployed module whose loader is genuinely
   unreachable takes its copy with it, and the case that costs time is the one where it does not. The
   listing says how many copies and how many arrived since, so a reader can tell.

@@ -554,6 +554,18 @@ says whose number it is.
 A request the debugger holds *instead of* a stop point, so a class it cannot arm yet can be armed the moment
 the JVM loads one. What makes a **deferred breakpoint** and a **wildcard family** possible, and the only
 reason either can reach past what is already **loaded**.
+
+**It costs a filter evaluation, not an event, and the difference is the whole of what it is cheap enough for.**
+The watch names a class pattern the **debuggee** itself tests as each class loads, so a class that does not
+match is never reported and costs no packet, no suspension and no resume. For an exact-name stop point that
+pattern is one signature, so the only thing that fires it is *that* class loading again — which is a redeploy
+(ADR-0028). A **wildcard family**'s pattern is broader and does fire per matching load, and every one of those
+is accounted for in the listing: armed, or no such method, or refused because the family is full.
+
+Written down because it was read the other way round — as an event per class *loaded* — which turns a
+per-redeploy cost into a per-classload one and makes the watch sound like something to ration. It also
+produced a wanted-but-unbuildable counter: there is nothing left to count, since the non-matching loads raise
+nothing and the matching ones are already reported.
 _Avoid_: class-prepare watch (`CLASS_PREPARE` is the JDWP event kind and the right name in code — a caller
 is thinking about a class loading, not about an event kind)
 
