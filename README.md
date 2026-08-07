@@ -127,6 +127,15 @@ sha256sum --ignore-missing -c SHA256SUMS   # macOS: shasum -a 256 -c SHA256SUMS 
 chmod +x "jdwp-mcp-$tag-linux-x86_64"
 ```
 
+That checksum proves the **download** arrived intact, not who built it: the manifest ships beside the
+binaries, so anything able to replace one could replace the other. Every asset also carries a signed
+build provenance statement naming the workflow, commit and run that produced it, which is the half a
+checksum cannot answer:
+
+```bash
+gh attestation verify "jdwp-mcp-$tag-linux-x86_64" --repo YgorPerez/java-debugging-mcp
+```
+
 The macOS binaries are unsigned, so the first run needs `xattr -d com.apple.quarantine <file>` or
 Settings → Privacy & Security → "Open Anyway".
 

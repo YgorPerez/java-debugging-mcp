@@ -315,7 +315,15 @@ jobs:
     # binaries out of the artifact store and uploading them again to the releases API.
     timeout-minutes: 15
     permissions:
-      contents: write # create the release and upload its assets; nothing else is needed
+      contents: write # create the release and upload its assets
+      # REL-7 (#164). The two grants build provenance needs and nothing more. `attestations: write` is what
+      # stores the signed statement and this is the only job in the repo that has it. `id-token: write` is
+      # not a write to the repository: it is what lets the job ask GitHub for an OIDC token about itself,
+      # and `publish` below already holds it for exactly the same reason — tokenless auth is the posture
+      # ADR-0043 chose for crates.io and this follows it. THE REPO STILL HAS NO SECRETS, and provenance was
+      # picked over signing keys so it stays that way.
+      id-token: write
+      attestations: write
     steps:
       # Checked out for ONE reason — `scripts/release-notes.py` builds the release body out of git history
       # — and it goes FIRST because `actions/checkout` clears its target directory. Put it after the
@@ -371,6 +379,39 @@ jobs:
         run: |
           sha256sum jdwp-mcp-* > SHA256SUMS
           cat SHA256SUMS
+
+      # REL-7 (#164). SHA256SUMS PROVES THE DOWNLOAD, NOT THE BUILD. The manifest and the binaries are
+      # produced by the same job and published together, so anything able to replace one can replace the
+      # other, and a consumer checking the hash learns only that the bytes match the list shipped beside
+      # them. The downstream toolkit installs these binaries onto other people's machines, which is why
+      # that gap is worth more than the usual amount of care.
+      #
+      # This attaches a signed statement to each asset naming the workflow, repository, commit and run that
+      # produced it, verifiable with:
+      #
+      #     gh attestation verify <asset> --repo YgorPerez/java-debugging-mcp
+      #
+      # WHERE IT SITS IS PART OF THE DESIGN. It attests what is published, in the job that publishes it —
+      # this job downloads artifacts into dist/ and runs no project code — rather than in the build matrix,
+      # where five separate statements would vouch for five files that still have to survive a trip through
+      # the artifact store to get here.
+      #
+      # IT ADDS NO FILE TO dist/. Attestations go to the attestations API, not to the release assets, so the
+      # "fail on anything in dist/ that is not a platform binary" guard above (REL-2, #41) is untouched and
+      # stays that way. That is why this step comes after it rather than before.
+      #
+      # SHA256SUMS IS DELIBERATELY NOT A SUBJECT. Once every binary it lists is individually attested, the
+      # manifest carries nothing of its own left to vouch for — a consumer who verifies the attestation does
+      # not need it, and one who only checks the hash is no worse off than today. Naming the same
+      # `jdwp-mcp-*` glob the checksum and upload steps use also keeps the three from disagreeing about what
+      # this release is.
+      #
+      # The consumer half — teaching `ensure-jdwp.sh` to run `gh attestation verify` — is the toolkit's, and
+      # belongs in the release notes rather than here.
+      - name: Attest the provenance of every published binary
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/jdwp-mcp-*
 
       # The release body, built here rather than by `--generate-notes`, which this step used to pass.
       #

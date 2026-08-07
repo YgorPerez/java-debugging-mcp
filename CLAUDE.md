@@ -442,6 +442,18 @@ since a version can be yanked but keeps its number forever. It runs last for tha
 stored token, and needs nothing from you: the manual bootstrap happened at v0.20.0. ADR-0043 has the
 sequence if it ever has to be done again, and `/release` step 5 has what to do when that job goes red.
 
+**A tag publishes five platform binaries now, not four, and each one carries signed build provenance**
+(REL-9/#173, REL-7/#164). Both are caller-visible and both need saying in the release notes. The new
+asset is **`jdwp-mcp-<tag>-linux-aarch64`**, built natively on `ubuntu-24.04-arm` and statically linked
+against musl like its x86_64 sibling; that name is the *interface* (`docs/toolkit-contract.md`), and it
+is what downstream's `jdwp-platforms` — which currently documents ARM Linux as "absent on purpose" — will
+match against `SHA256SUMS`. Provenance is the other half: `SHA256SUMS` proves the **download**, not the
+build, because the manifest ships beside the binaries it lists. `gh attestation verify <asset> --repo
+YgorPerez/java-debugging-mcp` answers the half a checksum cannot, over OIDC with **no stored token** and
+**no file added to `dist/`**, so REL-2's guard there is untouched. **The build matrix also runs its own
+output now** — initialize / `tools/list` over stdio, before the upload — on every slice except
+`x86_64-apple-darwin`, which is the one binary its own builder cannot execute.
+
 **The library's package name is `java-debugging-jdwp-client`, not `jdwp-client`** — the obvious name belongs
 to an unrelated project on crates.io, the collision `scripts/semver-check.sh` was built around. `[lib] name`
 is still `jdwp_client`, so imports are untouched, but **anything taking a `-p` package name wants the long
