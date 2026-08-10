@@ -1,0 +1,20 @@
+JDK in use: javac 21.0.12 at /home/x/.jdks/jdk-21 (found via JAVA_HOME)
+
+running 4 tests
+test b_medium ... ok <20.000s>
+test c_small ... ok <10.000s>
+test a_very_slow_one ... FAILED <70.000s>
+test g_no_duration_recorded ... ok
+
+failures:
+
+---- a_very_slow_one stdout ----
+
+thread 'a_very_slow_one' panicked at mcp-server/tests/mcp_integration.rs:1:1:
+the probe never reached the breakpoint
+
+
+failures:
+    a_very_slow_one
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.140s

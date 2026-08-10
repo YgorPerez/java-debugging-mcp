@@ -37,8 +37,27 @@
 # are small and are meant to be read in the diff; if a change to one is not explainable in the commit
 # message, it is a finding rather than a refresh.
 
+# ## Every fixture must be TRACKED, and this check is why the file says so
+#
+# The whole matrix reads committed inputs, so a fixture git is ignoring exists on the machine that wrote
+# it and nowhere else. That is not hypothetical: `.gitignore`'s blanket `*.log` swallowed
+# `test-timings/*.log` the day those cases were added (TEST-48, #163), `git add` skipped them without a
+# word, and four of the 23 cases were red in CI for five commits while every local run reported 23 passed.
+# A green local gate over a red remote one is the single failure shape this repo keeps writing
+# post-mortems about, so the check runs HERE, before any case, and fails on the machine that can fix it.
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)" || exit 1
+
+if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+    _ignored=$(git ls-files --others --ignored --exclude-standard -- scripts/tests/ 2>/dev/null || true)
+    if [ -n "$_ignored" ]; then
+        printf 'FAIL  fixtures git will not ship — CI checks out a tree without these:\n' >&2
+        printf '%s\n' "$_ignored" | sed 's/^/        /' >&2
+        printf '      They exist here and nowhere else, so this matrix would pass locally and fail in CI.\n' >&2
+        printf '      Track them (git add -f <path>) or add a negation to .gitignore.\n' >&2
+        exit 1
+    fi
+fi
 
 UPDATE=0
 [ "${1:-}" = "--update" ] && UPDATE=1

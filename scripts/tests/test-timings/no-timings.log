@@ -1,0 +1,7 @@
+JDK in use: javac 21.0.12 at /home/x/.jdks/jdk-21 (found via JAVA_HOME)
+
+running 2 tests
+test b_medium ... ok
+test c_small ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.230s

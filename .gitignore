@@ -39,6 +39,12 @@ __pycache__/
 
 # Debug
 *.log
+# …EXCEPT the test fixtures, which are inputs and not output (TEST-48, #163; caught at v0.21.0).
+# `*.log` above silently swallowed `scripts/tests/test-timings/*.log` when those fixtures were added, so
+# `scripts/tests/run.sh` passed locally — where the files exist because whoever wrote them made them —
+# and failed in CI, where a fresh checkout has neither. Four of its 23 cases were red for five commits
+# while every local run said 23 passed. `git add` gives no warning when it skips an ignored path.
+!scripts/tests/**/*.log
 
 # Agent worktrees (Claude Code) — nested checkouts, never part of the repo.
 .claude/worktrees/
