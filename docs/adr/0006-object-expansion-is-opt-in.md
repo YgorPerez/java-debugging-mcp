@@ -17,9 +17,18 @@ ADR originally described only the first as though it covered both.
 Two consequences of that difference, measured against a real `WildFly` (EVAL-5, #23) rather than reasoned:
 
 - **The shallow path is not always the cheap one.** `evaluate resp` on an Undertow response took ~40s;
-  `evaluate resp {expand_objects:true}` took **4ms**. Expansion walks fields and invokes nothing per node,
-  so opting into the "expensive" mode avoided the expensive call entirely. Anyone reasoning from "expansion
-  is the costly option" will get this backwards on framework objects.
+  `evaluate resp {expand_objects:true}` took **4ms**. Expansion walks fields rather than calling
+  `toString()`, so opting into the "expensive" mode avoided the expensive call entirely. Anyone reasoning
+  from "expansion is the costly option" will get this backwards on framework objects.
+
+  **Amended by EVAL-15 ([#179](https://github.com/YgorPerez/java-debugging-mcp/issues/179)), 10 Aug 2026:
+  this bullet said "walks fields and invokes nothing per node", and the "per node" overreached.** A node
+  that is a `Collection`, `Map` or `Optional` is read *by invoking it* — `toArray()`, or `entrySet()` plus
+  `getKey()`/`getValue()` per entry — whenever a thread is supplied to render with, which is exactly what
+  this ADR's own rejected alternative says expanding a collection costs. The measurement and the decision
+  both stand; what was wrong was a property claimed for the whole walk rather than for a plain object. The
+  four layouts this server can walk structurally (`KNOWN_LAYOUTS`) are not consulted on this path at all,
+  which is #179.
 - **A rendering invocation therefore needs a budget of its own.** `INVOKE_SINGLE_THREADED` runs only the
   target thread, so a `toString()` needing a monitor held by another suspended thread cannot finish. It is
   now bounded by `DEFAULT_INVOKE_TIMEOUT_MS` (2s) and the expiry is **reported in the rendered value**;

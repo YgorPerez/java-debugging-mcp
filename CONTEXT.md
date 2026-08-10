@@ -73,8 +73,12 @@ already reasoned its way to the same rule separately, and the chain walk's own n
 consequence unprompted.
 **`shallow` is not this word, and reading it as this word is the trap.** A shallow render calls `toString()`
 whenever it has a thread; a deep one walks fields. So the shallow/deep axis is close to the *inverse* of this
-one, which is why "read-only falls back to shallow" and "use `expand_objects`, which invokes nothing" are
-both true and read like a contradiction. Depth is not the question — whether a thread was supplied is.
+one, which is why "read-only falls back to shallow" and "use `expand_objects`, which does not call
+`toString()`" are both true and read like a contradiction. Depth is not the question — whether a thread was
+supplied is, **and that cuts both ways: a deep render that HAS a thread is not invoke-free either.** A
+`Collection`, `Map` or `Optional` node is read by invoking it — `toArray()`, or `entrySet()` plus
+`getKey()`/`getValue()` per entry — so the four sites listed above qualify because no thread reaches them,
+and `expand_objects` on a suspended frame is deliberately not among them (EVAL-15, #179).
 **Bounding the depth cannot substitute for it**, because on a JPA entity the first level is already the
 hazard: its own `toString()` routinely names its associations.
 _Avoid_: shallow (means depth here, and points the wrong way — see above), projection (JPA's own word for
