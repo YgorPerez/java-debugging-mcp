@@ -616,6 +616,24 @@ jobs:
       - name: Install an npm that can do trusted publishing
         run: npm install -g npm@11.6.2 # zizmor: ignore[adhoc-packages]
 
+      # TRUSTED PUBLISHING NEEDS NODE >= 22.14.0 AS WELL AS npm >= 11.5.1, and dropping `setup-node` above
+      # left the Node half to whatever the runner image happens to ship. That is an assumption, and this
+      # turns it into a checked fact with the remedy named — a publish job is the worst place to discover
+      # a too-old runtime, because the tag has already gone out. It also prints the version it found, per
+      # the rule in CLAUDE.md about quoting what a run printed rather than what it asked for.
+      - name: Check Node is new enough for trusted publishing
+        shell: bash
+        run: |
+          echo "Node in use: $(node --version)"
+          echo "npm in use:  $(npm --version)"
+          node -e '
+            const [maj, min] = process.versions.node.split(".").map(Number);
+            if (maj < 22 || (maj === 22 && min < 14)) {
+              console.error(`::error::npm trusted publishing needs Node >= 22.14.0; this runner has ${process.versions.node}. Pin one with actions/setup-node (no registry-url — that writes an .npmrc for the stored-token path this job avoids).`);
+              process.exit(1);
+            }
+          '
+
       # The binaries come from the release this tag just made, so npm publishes the SAME artefacts the
       # GitHub release does rather than a second build of the same commit. `SHA256SUMS` is verified for
       # each one: the toolkit already checks these downloads that way (docs/toolkit-contract.md), and an

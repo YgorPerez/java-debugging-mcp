@@ -34,6 +34,10 @@ sesion = "sesion"
 
 # ── Tokenizer artifacts. The word in the source is correct; typos splits it and flags a fragment.
 selec = "selec"        # the source says `SELECTs` — the plural of an all-caps SQL keyword
+nam = "nam"            # the source says `NAMEs` — the plural of an all-caps placeholder, in the
+                       # wizard library `scripts/bootstrap-npm.sh` copies verbatim from the /wizard
+                       # skill's template. That library is shared across wizards and is explicitly not
+                       # to be hand-edited, so the allowlist is the right end to fix this at.
 mis = "mis"            # the English prefix: "mis-set", "mis-read", "mis-reported", "mis-step"
 ands = "ands"          # a Rust identifier: `let ands = split_bool(s, '&')`, the boolean-tree parser
 

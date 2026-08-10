@@ -52,3 +52,11 @@ __pycache__/
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/Cargo.lock
+
+# The prebuilt binaries staged into the npm platform packages (REL-6, #168). They are build output —
+# `.github/workflows/release.yml` downloads them from the tag's own release before publishing, and
+# `scripts/bootstrap-npm.sh` does the same for the one manual bootstrap. Committing one would put a
+# ~5 MB binary in git history that is already an immutable release asset, and it would be stale the
+# moment the next tag builds. Only the six package.json files and the wrapper's bin/ are tracked.
+/npm/*/jdwp-mcp
+/npm/*/jdwp-mcp.exe

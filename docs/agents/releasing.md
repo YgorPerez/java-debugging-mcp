@@ -14,6 +14,8 @@ you consult during a release rather than carry into every session.
 | Build provenance | REL-7 (#164) | Over the binaries *and* the surface asset |
 | Both crates, to crates.io | REL-5 (ADR-0043) | Runs last, because it is the only irreversible step |
 | Six npm packages | REL-6 (#168) | The `jdwp-mcp` wrapper and one binary package per platform. Publishes **after** crates.io, and the wrapper goes **last of the six** — npm has no transaction, so making the package `npx` actually names the final one is what stops a half-published set being installable |
+
+**npm needs a one-time bootstrap, and `scripts/bootstrap-npm.sh` is it.** Trusted publishing attaches to a package that already exists, so the first version of all six is published by hand — the same bootstrap ADR-0043 records for crates.io. The wizard gates on the release carrying all five binaries first (v0.20.0 carried four; `linux-aarch64` arrived with REL-9), verifies them against `SHA256SUMS`, publishes platforms-then-wrapper, and walks the trusted-publisher form for each package. **Until it has run once, the `publish-npm` job fails on every tag** — deliberately, since a missing bootstrap must not look like a success.
 | The release body | v0.9.0 | Built by `scripts/release-notes.py`, not `--generate-notes` |
 
 ## crates.io runs last, on purpose
