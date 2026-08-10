@@ -213,6 +213,57 @@ cd "$(dirname "$0")/.."
 REPO_ROOT="$PWD"
 STAGING=""
 
+# already_published PKG VERSION — true when that exact version is on the registry.
+#
+# What makes a re-run safe. A published version can never be replaced, so a second attempt must SKIP what
+# already landed rather than fail on it: the first real run of this wizard died on package 1 of 5 with a
+# 2FA 403, and a wizard that cannot be resumed after a partial failure is a wizard you cannot use.
+already_published() {
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/$1/$2")
+  [[ "$code" == "200" ]]
+}
+
+# publish_one PKG — publish one package directory, with a fresh 2FA one-time password.
+#
+# `--otp` IS REQUIRED WHEN THE ACCOUNT ENFORCES 2FA FOR PUBLISHING, and a web `npm login` session does not
+# satisfy it. The first run of this wizard learned that the hard way: npm answered
+#   403 Forbidden — Two-factor authentication or granular access token with bypass 2fa enabled is required
+# and never prompted for anything. So the code is asked for HERE, per package, because a TOTP is
+# single-use and expires in about 30 seconds — one code cannot cover five publishes.
+#
+# Read hidden and never written anywhere. It is worth far less than a token (single-use, ~30 s) and is
+# still not something to leave on a screen.
+publish_one() {
+  local pkg="$1" version="$2" out status
+  if already_published "$pkg" "$version"; then
+    note "$pkg@$version is already on npm — skipping (a version cannot be republished)"
+    return 0
+  fi
+  say ""
+  step "npm publish $pkg@$version"
+  ask_secret NPM_OTP "6-digit code from your authenticator (blank if 2FA is off):"
+  local -a otp_arg=()
+  [[ -n "${NPM_OTP:-}" ]] && otp_arg=(--otp "$NPM_OTP")
+  status=0
+  out=$( cd "$REPO_ROOT/npm/$pkg" && npm publish --access public ${otp_arg[@]+"${otp_arg[@]}"} 2>&1 ) || status=$?
+  NPM_OTP=""
+  if [[ "$status" -eq 0 ]]; then
+    note "published $pkg@$version"
+    return 0
+  fi
+  printf '%s\n' "$out" | tail -6 | sed 's/^/      /' >&2
+  if printf '%s' "$out" | grep -q "Two-factor authentication"; then
+    warn "npm refused the publish for 2FA."
+    say  "Your account enforces 2FA for publishing, so each publish needs a CURRENT code — an expired or"
+    say  "already-used one fails the same way. Re-run and enter a fresh code when it asks."
+    say  "If you have no authenticator to hand, npmjs.com → Account → Two-factor authentication shows"
+    say  "the options; a granular token with 2FA bypass also works, but npm is restricting those and this"
+    say  "repo needs no token once trusted publishing is on."
+  fi
+  return 1
+}
+
 banner "Bootstrap jdwp-mcp on npm"
 
 # ── 1 ─────────────────────────────────────────────────────────────────────
@@ -343,17 +394,19 @@ say ""
 say "The wrapper is NOT published here. If one of these fails, nothing installable exists yet —"
 say "which is exactly the property that makes a half-finished run safe to abandon."
 say ""
-note "If your account has 2FA enabled, npm will prompt for a one-time password on EACH publish —"
-note "that is normal, and the prompt appears below rather than in a browser."
+note "If your account enforces 2FA for publishing, each publish needs a FRESH 6-digit code — npm does"
+note "not prompt for it, so this wizard asks and passes it as --otp. A code is single-use and lasts about"
+note "30 seconds, which is why it asks five times rather than once. Blank is fine if 2FA is off."
+note "Anything already on npm is skipped, so a re-run after a failure resumes rather than repeats."
 confirm "Publish these five now?" || { warn "stopped; nothing was published"; exit 1; }
 for entry in "${SLICES[@]}"; do
   IFS='|' read -r _slice pkg _bin <<<"$entry"
-  say ""
-  note "npm publish $pkg@$VERSION"
-  ( cd "$REPO_ROOT/npm/$pkg" && npm publish --access public ) \
-    || { warn "$pkg failed to publish. Fix it and re-run — the wrapper is still unpublished, so nothing is installable."; exit 1; }
+  publish_one "$pkg" "$VERSION" \
+    || { warn "$pkg did not publish. Re-run when you have fixed it — already-published packages are"; \
+         say  "      skipped on the next run, and the wrapper is still unpublished so nothing is installable."; \
+         exit 1; }
 done
-note "five platform packages published"
+note "all five platform packages are on npm"
 pause "Continue?"
 
 # ── 5 ─────────────────────────────────────────────────────────────────────
@@ -362,9 +415,9 @@ warn "ALSO IRREVERSIBLE, and this is the step that makes the set installable."
 say ""
 say "After this, 'npx jdwp-mcp@$VERSION' resolves and pulls exactly one of the five binaries."
 confirm "Publish $WRAPPER_PKG@$VERSION now?" || { warn "stopped; the platform packages are published but inert"; exit 1; }
-( cd "$REPO_ROOT/npm/$WRAPPER_PKG" && npm publish --access public ) \
-  || { warn "the wrapper failed to publish. The five platform packages are already up and are inert until it succeeds."; exit 1; }
-note "$WRAPPER_PKG@$VERSION published"
+publish_one "$WRAPPER_PKG" "$VERSION" \
+  || { warn "the wrapper did not publish. The five platform packages are up and inert until it does —"; \
+       say  "      re-run and they will be skipped."; exit 1; }
 pause "Continue?"
 
 # ── 6 ─────────────────────────────────────────────────────────────────────
