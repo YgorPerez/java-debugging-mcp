@@ -230,19 +230,15 @@ for tool in npm node gh jq shasum; do
 done
 [[ -n "${die_missing:-}" ]] && { warn "install the missing tool(s) and re-run."; exit 1; }
 
-# Trusted publishing needs BOTH, and the npm docs are explicit about the Node half.
-node -e '
-  const [maj, min] = process.versions.node.split(".").map(Number);
-  if (maj < 22 || (maj === 22 && min < 14)) {
-    console.error(`  Node ${process.versions.node} is too old — npm trusted publishing needs >= 22.14.0.`);
-    process.exit(1);
-  }
-' || { warn "upgrade Node, then re-run."; exit 1; }
 note "Node $(node --version), npm $(npm --version)"
+# NOT A GATE, and the distinction cost a correction: npm >= 11.5.1 and Node >= 22.14.0 are what OIDC
+# trusted publishing needs, which is the CI job's path. This bootstrap publishes from your login session
+# and needs neither, so an older toolchain is reported and allowed rather than refused. Blocking here
+# would stop a bootstrap that works fine.
 if [[ "$(printf '%s\n11.5.1\n' "$(npm --version)" | sort -V | head -1)" != "11.5.1" ]]; then
-  warn "npm $(npm --version) is older than 11.5.1, which trusted publishing needs."
-  say  "Fix with:  npm install -g npm@latest"
-  exit 1
+  warn "npm $(npm --version) is older than 11.5.1."
+  note "That is fine for this bootstrap. It matters only if you ever publish via OIDC by hand;"
+  note "the release workflow installs its own pinned npm and checks Node itself."
 fi
 
 VERSION=$(jq -r .version "$REPO_ROOT/npm/$WRAPPER_PKG/package.json")
@@ -330,6 +326,9 @@ for p in "${PLATFORM_PKGS[@]}"; do note "  $p"; done
 say ""
 say "The wrapper is NOT published here. If one of these fails, nothing installable exists yet —"
 say "which is exactly the property that makes a half-finished run safe to abandon."
+say ""
+note "If your account has 2FA enabled, npm will prompt for a one-time password on EACH publish —"
+note "that is normal, and the prompt appears below rather than in a browser."
 confirm "Publish these five now?" || { warn "stopped; nothing was published"; exit 1; }
 for entry in "${SLICES[@]}"; do
   IFS='|' read -r _slice pkg _bin <<<"$entry"
