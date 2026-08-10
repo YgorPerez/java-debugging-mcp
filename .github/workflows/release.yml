@@ -600,39 +600,47 @@ jobs:
         with:
           persist-credentials: false
 
-      # NO `actions/setup-node`, and its absence is deliberate twice over. The runner already ships Node,
-      # and the only thing that action would add here is `registry-url`, which exists to write an `.npmrc`
-      # carrying `NODE_AUTH_TOKEN` — the stored-token path this job is built to avoid. Dropping it also
-      # drops zizmor's `cache-poisoning` finding at its root rather than annotating it away: an action that
-      # can enable caching on the workflow that publishes artifacts is worth not having on this path.
+      # `setup-node` IS HERE, AND REMOVING IT WAS A MISTAKE THIS JOB PAID FOR ONCE. v0.21.0's run failed
+      # at the npm install with `EACCES: permission denied, mkdir '/usr/local/share/man/man5'` — a global
+      # install needs a writable prefix, which is one of the two things this action provides. The other is
+      # a PINNED Node: trusted publishing needs >= 22.14.0, and without this the job took whatever the
+      # runner image shipped and checked it afterwards. Both problems came from dropping the action to
+      # clear a low-confidence zizmor finding, which is the wrong trade — the finding is annotated below
+      # instead.
+      #
+      # NO `registry-url`, deliberately. That input exists to write an `.npmrc` carrying `NODE_AUTH_TOKEN`,
+      # which is the stored-token path this job is built to avoid, and npm's default registry is already
+      # the one we publish to. No `cache:` either, so the caching zizmor warns about is never switched on.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 # zizmor: ignore[cache-poisoning]
+        with:
+          node-version: "22.14.0"
 
-      # Trusted publishing is npm 11.5.1 and newer. The runner's bundled npm is older than that on every
-      # image so far, so this is not optional — and it is pinned rather than `@latest`, because "whatever
-      # npm is today" is the drift LINT-1 (#18) pinned clippy to avoid, on the one step that publishes.
+      # BEFORE the npm install, which is the other half of what v0.21.0 taught: the check was last, so a
+      # too-old Node would have produced npm's error rather than this one's. A guard after the thing it
+      # guards is not a guard. Prints what it found, per CLAUDE.md's rule about quoting a run.
+      - name: Check Node is new enough for trusted publishing
+        shell: bash
+        run: |
+          echo "Node in use: $(node --version)"
+          node -e '
+            const [maj, min] = process.versions.node.split(".").map(Number);
+            if (maj < 22 || (maj === 22 && min < 14)) {
+              console.error(`::error::npm trusted publishing needs Node >= 22.14.0; this runner has ${process.versions.node}. Raise node-version on the setup-node step above.`);
+              process.exit(1);
+            }
+          '
+
+      # Trusted publishing is npm 11.5.1 and newer, and the runner's bundled npm is older on every image so
+      # far. Pinned rather than `@latest`, because "whatever npm is today" is the drift LINT-1 (#18) pinned
+      # clippy to avoid, on the one step that publishes.
       #
       # zizmor's `adhoc-packages` is correct that this installs outside a lockfile and there is no lockfile
       # to put it in: it is the package manager itself, needed before any manifest is read. The exact pin
       # IS the mitigation, and it is reviewed like any other pinned tool version here.
       - name: Install an npm that can do trusted publishing
-        run: npm install -g npm@11.6.2 # zizmor: ignore[adhoc-packages]
-
-      # TRUSTED PUBLISHING NEEDS NODE >= 22.14.0 AS WELL AS npm >= 11.5.1, and dropping `setup-node` above
-      # left the Node half to whatever the runner image happens to ship. That is an assumption, and this
-      # turns it into a checked fact with the remedy named — a publish job is the worst place to discover
-      # a too-old runtime, because the tag has already gone out. It also prints the version it found, per
-      # the rule in CLAUDE.md about quoting what a run printed rather than what it asked for.
-      - name: Check Node is new enough for trusted publishing
-        shell: bash
-        run: |
-          echo "Node in use: $(node --version)"
+        run: | # zizmor: ignore[adhoc-packages]
+          npm install -g npm@11.6.2
           echo "npm in use:  $(npm --version)"
-          node -e '
-            const [maj, min] = process.versions.node.split(".").map(Number);
-            if (maj < 22 || (maj === 22 && min < 14)) {
-              console.error(`::error::npm trusted publishing needs Node >= 22.14.0; this runner has ${process.versions.node}. Pin one with actions/setup-node (no registry-url — that writes an .npmrc for the stored-token path this job avoids).`);
-              process.exit(1);
-            }
-          '
 
       # The binaries come from the release this tag just made, so npm publishes the SAME artefacts the
       # GitHub release does rather than a second build of the same commit. `SHA256SUMS` is verified for
