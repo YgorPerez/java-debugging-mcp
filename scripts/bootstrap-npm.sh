@@ -242,9 +242,13 @@ publish_one() {
   fi
   say ""
   step "npm publish $pkg@$version"
-  ask_secret NPM_OTP "6-digit code from your authenticator (blank if 2FA is off):"
   local -a otp_arg=()
-  [[ -n "${NPM_OTP:-}" ]] && otp_arg=(--otp "$NPM_OTP")
+  if [[ "${TOKEN_AUTH:-0}" == "1" ]]; then
+    note "authenticating with NPM_TOKEN — no code needed"
+  else
+    ask_secret NPM_OTP "6-digit code from your authenticator (blank if 2FA is off):"
+    [[ -n "${NPM_OTP:-}" ]] && otp_arg=(--otp "$NPM_OTP")
+  fi
   status=0
   out=$( cd "$REPO_ROOT/npm/$pkg" && npm publish --access public ${otp_arg[@]+"${otp_arg[@]}"} 2>&1 ) || status=$?
   NPM_OTP=""
@@ -342,15 +346,35 @@ pause "Preconditions look good. Continue?"
 
 # ── 2 ─────────────────────────────────────────────────────────────────────
 stage "Sign in to npm"
-say "This is the one credential in the whole procedure, and it stays in npm's own config —"
-say "it is never printed, never written to a file in this repo, and never passed on a command line."
-if npm whoami >/dev/null 2>&1; then
+say "This is the one credential in the whole procedure."
+say ""
+say "TWO WAYS IN, and which one you use decides whether the publishes need 2FA codes:"
+step "npm login (a browser session) — then each publish needs a fresh 6-digit code, because a web"
+say  "    session does not satisfy an account that enforces 2FA for publishing."
+step "NPM_TOKEN=… in the environment — a granular or automation token that bypasses 2FA, so no codes."
+say ""
+note "With NPM_TOKEN the token is written ONLY to a mode-0600 file in a temp dir, used as npm's"
+note "user config for this run, and deleted when the wizard exits. It never reaches this repo, never"
+note "appears on a command line, and is never echoed."
+
+if [[ -n "${NPM_TOKEN:-}" ]]; then
+  NPMRC="$(mktemp)"
+  chmod 600 "$NPMRC"
+  printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$NPMRC"
+  export NPM_CONFIG_USERCONFIG="$NPMRC"
+  trap 'rm -f "$NPMRC"; [[ -n "${STAGING:-}" ]] && rm -rf "$STAGING"' EXIT
+  note "using NPM_TOKEN from the environment"
+  TOKEN_AUTH=1
+elif npm whoami >/dev/null 2>&1; then
   note "already signed in as $(npm whoami)"
+  TOKEN_AUTH=0
 else
   step "A browser window will open for npm's login flow."
   npm login || { warn "login did not complete"; exit 1; }
+  TOKEN_AUTH=0
 fi
-WHO=$(npm whoami)
+WHO=$(npm whoami 2>/dev/null || echo "")
+[[ -z "$WHO" ]] && { warn "npm does not recognise these credentials — check the token or run npm login."; exit 1; }
 note "signed in as $WHO"
 if [[ "$WHO" != "ygorperez" ]]; then
   warn "expected ygorperez — you are $WHO."
@@ -363,7 +387,8 @@ stage "Stage the release binaries"
 say "Downloading the $TAG assets and verifying them against SHA256SUMS, then copying each into its"
 say "platform package. Nothing is published yet."
 STAGING=$(mktemp -d)
-trap 'rm -rf "$STAGING"' EXIT
+# Extends rather than replaces the stage-2 trap, which may hold an npmrc to delete.
+trap 'rm -rf "$STAGING"; [[ -n "${NPMRC:-}" ]] && rm -f "$NPMRC"' EXIT
 gh release download "$TAG" --dir "$STAGING" --pattern 'jdwp-mcp-*' --pattern 'SHA256SUMS'
 if command -v sha256sum >/dev/null 2>&1; then
   ( cd "$STAGING" && sha256sum --check --ignore-missing SHA256SUMS ) || { warn "checksum mismatch"; exit 1; }
@@ -394,9 +419,13 @@ say ""
 say "The wrapper is NOT published here. If one of these fails, nothing installable exists yet —"
 say "which is exactly the property that makes a half-finished run safe to abandon."
 say ""
-note "If your account enforces 2FA for publishing, each publish needs a FRESH 6-digit code — npm does"
-note "not prompt for it, so this wizard asks and passes it as --otp. A code is single-use and lasts about"
-note "30 seconds, which is why it asks five times rather than once. Blank is fine if 2FA is off."
+if [[ "${TOKEN_AUTH:-0}" == "1" ]]; then
+  note "Authenticating with NPM_TOKEN, so no 2FA codes are needed."
+else
+  note "Your account enforces 2FA for publishing and npm does not prompt for the code, so this wizard"
+  note "asks and passes it as --otp. A code is single-use and lasts about 30 seconds, which is why it asks"
+  note "once per package rather than once. Blank is fine if 2FA is off."
+fi
 note "Anything already on npm is skipped, so a re-run after a failure resumes rather than repeats."
 confirm "Publish these five now?" || { warn "stopped; nothing was published"; exit 1; }
 for entry in "${SLICES[@]}"; do
