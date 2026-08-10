@@ -218,6 +218,22 @@ banner "Bootstrap jdwp-mcp on npm"
 # ── 1 ─────────────────────────────────────────────────────────────────────
 stage "Preconditions"
 say "Checking the things that must already be true. Nothing is published in this stage."
+
+# A TTY IS A PRECONDITION, and finding that out at stage 4 is how this reads as a decision it did not make.
+# Run through a non-interactive stdin — a pipe, a CI step, an agent's shell, `!` in Claude Code — every
+# `pause` returns instantly on EOF and `confirm` sees an empty line, which it correctly treats as "no". The
+# run then prints "stopped; nothing was published", which is TRUE and sounds like somebody chose it. Six
+# irreversible publishes must not hinge on a prompt nobody could answer, in either direction.
+if [[ ! -t 0 ]]; then
+  warn "stdin is not a terminal, so the confirmation prompts cannot be answered."
+  say  "Every gate here would decline by default and the run would report itself stopped, which reads"
+  say  "like a decision rather than a missing keyboard. Run it from a real terminal:"
+  say  ""
+  say  "    cd $PWD && ./scripts/bootstrap-npm.sh"
+  say  ""
+  note "Nothing has been published or changed."
+  exit 1
+fi
 for tool in npm node gh jq shasum; do
   if command -v "$tool" >/dev/null 2>&1; then
     note "found $tool"
