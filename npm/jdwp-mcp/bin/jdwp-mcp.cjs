@@ -39,8 +39,12 @@ try {
   process.stderr.write(
     known
       ? `jdwp-mcp: ${pkg} is not installed, though this platform is supported.\n` +
-          `  The binary ships as an optional dependency, and an install run with --no-optional or\n` +
-          `  --omit=optional skips it. Reinstall without that flag, or build from source:\n` +
+          `  Two things cause that, and they need different fixes:\n` +
+          `    1. The install skipped optional dependencies (--no-optional / --omit=optional).\n` +
+          `       Reinstall without that flag.\n` +
+          `    2. ${pkg} is not on the registry for this version. Some versions ship a subset of\n` +
+          `       platforms; check https://www.npmjs.com/package/${pkg} and try a newer jdwp-mcp.\n` +
+          `  Either way this always works, and is fully supported:\n` +
           `    cargo install jdwp-mcp\n`
       : `jdwp-mcp: no prebuilt binary for ${process.platform}-${process.arch}.\n` +
           `  Prebuilt: ${supported.join(", ")}.\n` +
