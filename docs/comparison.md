@@ -99,9 +99,11 @@ downstream pin has that the docs never name*. Turned around, it reads: a decisio
 no comparison names is a decision that will be taken again.
 
 **Read off `src/tools/*.ts` at tag `v1.3.0` on 7 Aug 2026** — the `server.tool(…)` registrations rather than
-the README, the same standard as the table above. **46 tools**, against **42** in this column at 0.20.0 (40 when this section was written on 7 Aug; `debug.set_current_session` and `debug.update_stop_point` landed the same day, from SESS-1 #157 and BP-9 #159 — two of the four rows this section had marked open). MIT,
-not archived, last push 5 Aug 2026. Every one of the 46 is in exactly one table below; the counts are stated
-so that claim is checkable rather than asserted.
+the README, the same standard as the table above. **46 tools**, against **42** in this column at 0.21.0 (40
+when this section was written on 7 Aug; `debug.set_current_session` and `debug.update_stop_point` landed the
+same day, from SESS-1 #157 and BP-9 #159 — two of the four rows this section had marked open, and both have
+since moved out of that table). MIT, not archived, last push 5 Aug 2026. Every one of the 46 is in exactly
+one table below; the counts are stated so that claim is checkable rather than asserted.
 
 **One structural difference explains most of the delta, and it is not about either project's ambition.** A
 PHP debug session is one HTTP request. It begins when Xdebug connects and it is gone in milliseconds,
@@ -116,7 +118,7 @@ read-only mode. Neither list is a gap in the other project.
 The arrow points the other way in exactly one place, and it is the reason #157 exists: holding several
 long-lived JVMs at once makes *which session am I talking to* a real question, and here it is not a tool.
 
-### Has a counterpart here — 28 of 46
+### Has a counterpart here — 29 of 46
 
 | xdebug-mcp | here |
 | --- | --- |
@@ -136,6 +138,7 @@ long-lived JVMs at once makes *which session am I talking to* a real question, a
 | `evaluate` | `debug.evaluate` |
 | `get_source` | `debug.source` — which also answers the question PHP does not raise: *which file was this class compiled from*, read from the JVM rather than from disk |
 | `list_sessions` | `debug.list_sessions` |
+| `set_active_session` | `debug.set_current_session` (SESS-1, #157) — chooses which JVM an omitted `session_id` reaches, so a second attach is no longer the only way back to a JVM already held. Sends no JDWP packet |
 | `get_session_state` | `debug.list_sessions` for status, holds and counts, plus `debug.get_stack` for the position |
 | `close_session` | `debug.disconnect` |
 | `add_logpoint` / `remove_logpoint` | `trace: true` with `trace_expr`, on any of the five arming tools — cleared with `debug.clear_stop_point`, silenced without losing its expression by `debug.toggle_stop_point` |
@@ -144,7 +147,7 @@ long-lived JVMs at once makes *which session am I talking to* a real question, a
 | `load_debug_profile` | `debug.arm_stop_points` (ADR-0041) |
 | `export_session` / `capture_snapshot` | `debug.export_investigation` (ADR-0042) |
 
-### Settled against, with the file that settled it — 12 of 46
+### Settled against, with the file that settled it — 13 of 46
 
 **This is the table that stops the re-derivation.** Each row is a decision with an argument and a rejected
 alternative already written down; none of them is an unbuilt feature.
@@ -155,16 +158,15 @@ alternative already written down; none of them is an unbuilt feature.
 | `start_profiling` / `stop_profiling` / `get_profile_stats` / `get_memory_timeline` | [`.out-of-scope/profiling-and-coverage.md`](../.out-of-scope/profiling-and-coverage.md) (PROF-1, #140) — JDWP has no sampling and no allocation profiling; this is a gap in the wire protocol, not in the implementation. Reaching them means JFR, JVMTI or a bytecode-instrumenting agent, and the last two mean modifying the running application to measure it |
 | `start_coverage` / `stop_coverage` / `get_coverage_report` | the same file — JDWP has no coverage command set either, and the same no-agent promise applies |
 | `get_function_history` | [`.out-of-scope/method-entry-events.md`](../.out-of-scope/method-entry-events.md) (METH-1) — `METHOD_ENTRY` filters by *class*, not by method, so it is the noisiest event in JDWP. *What called this?* is answered by a traced stop point's caller chain instead (TRACE-5), at one site rather than every method on the class |
+| `capture_request_context` | [`.out-of-scope/request-context-in-one-call.md`](../.out-of-scope/request-context-in-one-call.md) (DISC-15, #160) — the measurement the issue staked itself on has only one side, because one thread runs one invocation at a time. Worse, two of the six reads are writes: `getSession()` creates a session and `getParameterMap()` consumes a form POST's body, so the tool would corrupt the request it was asked to explain — and bundling is precisely where a per-read hazard stops being visible |
 
-### Open here, each with its issue — 4 of 46
+### Open here, each with its issue — 2 of 46
 
 Each of these came out of the 7 Aug 2026 comparison and is filed rather than settled.
 
 | xdebug-mcp | issue |
 | --- | --- |
-| `set_active_session` | **#157** (SESS-1) — the current session cannot be changed, so a second attach is the only way back to a JVM already held |
 | `add_step_filter` / `list_step_filters` | **#158** (STEP-2) — the step filter is the one session preference that must be restated on every call |
-| `capture_request_context` | **#160** (DISC-15) — *what did this request carry?* costs six invoking evaluates on a thread you had to suspend |
 
 ### No counterpart, deliberately — 2 of 46
 
