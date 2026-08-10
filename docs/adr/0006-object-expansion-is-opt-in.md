@@ -23,12 +23,18 @@ Two consequences of that difference, measured against a real `WildFly` (EVAL-5, 
 
   **Amended by EVAL-15 ([#179](https://github.com/YgorPerez/java-debugging-mcp/issues/179)), 10 Aug 2026:
   this bullet said "walks fields and invokes nothing per node", and the "per node" overreached.** A node
-  that is a `Collection`, `Map` or `Optional` is read *by invoking it* — `toArray()`, or `entrySet()` plus
-  `getKey()`/`getValue()` per entry — whenever a thread is supplied to render with, which is exactly what
+  that is a `Collection`, `Map` or `Optional` was read *by invoking it* — `toArray()`, or `entrySet()` plus
+  `getKey()`/`getValue()` per entry — whenever a thread was supplied to render with, which is exactly what
   this ADR's own rejected alternative says expanding a collection costs. The measurement and the decision
-  both stand; what was wrong was a property claimed for the whole walk rather than for a plain object. The
-  four layouts this server can walk structurally (`KNOWN_LAYOUTS`) are not consulted on this path at all,
-  which is #179.
+  both stand; what was wrong was a property claimed for the whole walk rather than for a plain object.
+
+  **Since [ADR-0046](0046-a-recognised-layout-is-walked-and-a-container-that-is-neither-walked-nor-invoked-says-so.md)
+  the claim is true again, but only for four types and for a reason worth stating.** A `HashMap`,
+  `LinkedHashMap`, `ConcurrentHashMap` or `ArrayList` node is *walked* through its own fields and invokes
+  nothing; any other container still invokes, and a container that can do neither says which of the three
+  happened. So "expansion invokes code in the debuggee" — this ADR's title — remains the reason expansion
+  is opt-in, and the rejected alternative below remains the argument, because a caller cannot know in
+  advance which of the two kinds a field holds.
 - **A rendering invocation therefore needs a budget of its own.** `INVOKE_SINGLE_THREADED` runs only the
   target thread, so a `toString()` needing a monitor held by another suspended thread cannot finish. It is
   now bounded by `DEFAULT_INVOKE_TIMEOUT_MS` (2s) and the expiry is **reported in the rendered value**;

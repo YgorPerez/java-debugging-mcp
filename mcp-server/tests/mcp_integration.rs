@@ -4640,9 +4640,21 @@ fn get_stack_node_budget_bounds_the_whole_call() {
         stack.matches("node budget").count() == 1,
         "the exhaustion notice belongs once per call, not per local:\n{stack}"
     );
+    // The cap notice is the last thing the WALK writes, and it used to be the last thing in the reply.
+    // Since EVAL-15 (#179) the route notes trail the whole call after it — facts about HOW the values were
+    // read, not more expansion — so the anchor is "no frame was expanded after the cap" rather than
+    // "nothing was written after it". Anchoring on the end of the string would have made this test fail
+    // for a reply that obeys the cap perfectly.
+    let after_cap = stack
+        .rsplit_once("or inspect one value with debug.evaluate.")
+        .map_or_else(|| panic!("no cap notice to anchor on:\n{stack}"), |(_, rest)| rest.to_string());
     assert!(
-        stack.trim_end().ends_with("debug.evaluate."),
-        "expansion must stop at the cap, not carry on into later frames:\n{stack}"
+        after_cap.lines().all(|l| {
+            let t = l.trim();
+            t.is_empty() || t.starts_with('📐') || t.starts_with('⚙') || t.starts_with('🔍')
+        }),
+        "expansion must stop at the cap, not carry on into later frames — this followed the notice:\n\
+         {after_cap}\n\nfull reply:\n{stack}"
     );
     // Sanity: it did real work before giving up, rather than bailing on the first local.
     assert_contains_all("it expanded what it could", &stack, &["order = ", "id = (int) 42"]);
@@ -7225,7 +7237,16 @@ fn a_per_thread_suspended_frame_reads_and_writes_but_cannot_invoke() {
     );
     assert!(local.contains("worker-a"), "a local was not readable off the suspended frame: {local}");
 
-    // expand_objects reaches the map's CONTENTS by walking fields — no invocation anywhere.
+    // expand_objects reaches the map's ENTRIES by walking its own fields, and THE NOTE IS THE ASSERTION
+    // (EVAL-15, #179).
+    //
+    // This assertion used to be the two strings alone, and they could not tell the two routes apart —
+    // which is why it passed for a behaviour nobody wanted. The deep path attempted `entrySet()`, JDWP
+    // refused it on a thread suspended this way, and the fallback printed `LinkedHashMap`'s own
+    // `head`/`after` internals, in which every key and every value duly appears. Same substrings, a
+    // different answer to a different question. `read structurally` can only come from the walk, because
+    // the invoking path cannot run on this thread at all — so it is the only witness that separates them,
+    // exactly as it already does for the subscript below.
     let expanded = server.call(
         "debug.evaluate",
         serde_json::json!({
@@ -7236,9 +7257,9 @@ fn a_per_thread_suspended_frame_reads_and_writes_but_cannot_invoke() {
         }),
     );
     assert_contains_all(
-        "expand_objects reads fields, so it works where an invoke does not",
+        "a recognised layout is WALKED on a per-thread-suspended frame, and the reply names the route",
         &expanded,
-        &["layout-adturismo", "ADTURISMO"],
+        &["ADTURISMO", "→", "layout-adturismo", "read structurally", "nothing was invoked"],
     );
 
     // --- a Map subscript, which EVAL-10 (#92) turned from an invoke into a field walk ---

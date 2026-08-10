@@ -75,10 +75,14 @@ consequence unprompted.
 whenever it has a thread; a deep one walks fields. So the shallow/deep axis is close to the *inverse* of this
 one, which is why "read-only falls back to shallow" and "use `expand_objects`, which does not call
 `toString()`" are both true and read like a contradiction. Depth is not the question — whether a thread was
-supplied is, **and that cuts both ways: a deep render that HAS a thread is not invoke-free either.** A
-`Collection`, `Map` or `Optional` node is read by invoking it — `toArray()`, or `entrySet()` plus
-`getKey()`/`getValue()` per entry — so the four sites listed above qualify because no thread reaches them,
-and `expand_objects` on a suspended frame is deliberately not among them (EVAL-15, #179).
+supplied is, **and since EVAL-15 (#179) it is not the only question: a container's LAYOUT decides too.** A
+`HashMap`, `LinkedHashMap`, `ConcurrentHashMap` or `ArrayList` node is *walked* — its own fields, no
+invocation, no thread required — so a deep render of one is invoke-free however it was reached. Any other
+`Collection`, `Map` or `Optional` node is read by invoking it (`toArray()`, or `entrySet()` plus
+`getKey()`/`getValue()` per entry), which is why the four sites listed above are invoke-free for a *second*
+reason as well: no thread reaches them, so the invoking branch is unreachable there whatever the layout.
+**A container that is neither walked nor invoked is a third answer and says so** — what it renders is the
+object's internals, which is true about a different question (ADR-0046).
 **Bounding the depth cannot substitute for it**, because on a JPA entity the first level is already the
 hazard: its own `toString()` routinely names its associations.
 _Avoid_: shallow (means depth here, and points the wrong way — see above), projection (JPA's own word for

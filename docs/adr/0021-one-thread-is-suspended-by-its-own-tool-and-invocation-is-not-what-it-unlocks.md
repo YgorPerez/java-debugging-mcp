@@ -89,7 +89,7 @@ What a per-thread suspend *does* unlock, all measured against the probe rather t
 | --- | --- |
 | `debug.get_stack` with locals | **yes** — full stack, locals rendered |
 | `debug.evaluate` of a local or a field chain | **yes** (pass `frame_index`: a parked worker's frame 0 is native) |
-| `debug.evaluate {expand_objects:true}` | **yes** — it walks fields, reaching a `LinkedHashMap`'s entries through the map's own `table[]`/`head` internals. It *attempts* `entrySet()` first, and the refusal is what makes it a field walk: the row is true because the invocation is unavailable, not because none is issued (EVAL-15, [#179](https://github.com/YgorPerez/java-debugging-mcp/issues/179)) |
+| `debug.evaluate {expand_objects:true}` | **yes** — it walks fields, and reaches a `LinkedHashMap`'s **entries** as entries. When this table was measured it got there by accident: the deep path attempted `entrySet()`, the refusal below is what stopped it, and the fallback printed the map's `head`/`after` internals, in which the entries duly appear. [ADR-0046](0046-a-recognised-layout-is-walked-and-a-container-that-is-neither-walked-nor-invoked-says-so.md) makes the walk deliberate and first, and a container that is *not* one of the four walked layouts now says that what it printed is internals rather than contents (EVAL-15, [#179](https://github.com/YgorPerez/java-debugging-mcp/issues/179)) |
 | `debug.set_value` on a local | **yes** — proved by the probe printing the written value |
 | that thread's own monitors in `debug.thread_dump` | **yes** |
 | method invocation of any kind | **no** — `INVALID_THREAD`; needs an event suspension |

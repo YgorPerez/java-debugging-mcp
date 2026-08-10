@@ -1956,6 +1956,12 @@ impl RequestHandler {
         }
         drop(session);
         flush_hidden(&mut output, &mut state.hidden);
+        // EVAL-15 (#179): how a container local was reached is part of the answer here too, and one
+        // trailing note for the whole walk is the right granularity — a stack of forty frames holding a
+        // `HashMap` each would otherwise say the same sentence forty times.
+        if let Some((_, deep)) = &state.deep {
+            output.push_str(&deep.read_path.render());
+        }
 
         Ok(output)
     }
@@ -17344,20 +17350,39 @@ enum Walked<T> {
 /// than once per node. A treeified bin and a plain one are different classes, so one walk meets a
 /// handful of them at most.
 #[derive(Default)]
-struct FieldIds(std::collections::HashMap<(u64, &'static str), Option<u64>>);
+struct FieldIds {
+    ids: std::collections::HashMap<(u64, &'static str), Option<u64>>,
+    /// The runtime type of the object the walk starts at, when the caller has already resolved it
+    /// (PERF-2, #129).
+    ///
+    /// **Without this, a walk re-reads a type its caller read one packet earlier.** The deep renderer
+    /// resolves an object's type to decide what it is, then hands the object here — and [`Self::read`]
+    /// would ask `ObjectReference.ReferenceType` for the same id again, with nothing in between. That is
+    /// byte-for-byte the duplicate #129 removed from the render path, and
+    /// `a_rendered_object_is_asked_for_its_type_once` fails on it, correctly.
+    ///
+    /// Only the entry object needs it: every node reached *inside* a walk is a different object whose
+    /// type is genuinely unknown here, and one hint keeps this a hint rather than a second type cache.
+    known: Option<(u64, u64)>,
+}
 
 impl FieldIds {
+    /// A walk rooted at `obj`, whose runtime type the caller has already resolved.
+    fn rooted_at(obj: u64, type_id: u64) -> Self {
+        Self { known: Some((obj, type_id)), ids: std::collections::HashMap::new() }
+    }
+
     async fn id(
         &mut self,
         conn: &mut jdwp_client::JdwpConnection,
         type_id: u64,
         name: &'static str,
     ) -> Option<u64> {
-        if let Some(hit) = self.0.get(&(type_id, name)) {
+        if let Some(hit) = self.ids.get(&(type_id, name)) {
             return *hit;
         }
         let found = find_field(conn, type_id, name).await.ok().flatten();
-        self.0.insert((type_id, name), found);
+        self.ids.insert((type_id, name), found);
         found
     }
 
@@ -17372,7 +17397,10 @@ impl FieldIds {
         obj: u64,
         names: &[&'static str],
     ) -> Option<Vec<jdwp_client::types::Value>> {
-        let type_id = conn.get_object_reference_type(obj).await.ok()?;
+        let type_id = match self.known {
+            Some((rooted, type_id)) if rooted == obj => type_id,
+            _ => conn.get_object_reference_type(obj).await.ok()?,
+        };
         let mut fids = Vec::with_capacity(names.len());
         for n in names {
             fids.push(self.id(conn, type_id, n).await?);
@@ -18081,6 +18109,26 @@ impl ReadPath {
     /// Record that the read fell back to invoking, and why.
     fn invoked(&mut self, name: &str, why: &str) {
         self.push(format!("⚙️ read by invoking in the debuggee (needs a suspended thread): {name} {why}."));
+    }
+
+    /// A deep render met a container it neither walks structurally nor could invoke on, so what it
+    /// printed is the object's own internals rather than its contents (EVAL-15, #179).
+    ///
+    /// **This is the third verdict, and it exists because the first two cannot describe it.** The read
+    /// did not fail and it did not fall back to invoking — it printed something *true about a different
+    /// question*, which is the shape of answer this repo distrusts most: a `TreeMap` rendered as
+    /// `root`/`left`/`right` is not wrong, it is just not the entries the caller asked for, and nothing
+    /// in the output says so. `debug.suspend_thread` reaches this case for every container outside
+    /// [`KNOWN_LAYOUTS`], since the invocation the deep path would use is exactly what a non-event
+    /// suspension does not grant.
+    fn internals_only(&mut self, name: &str) {
+        self.push(format!(
+            "🔍 read as its own fields: {name} is not one of the layouts read structurally \
+             ({KNOWN_LAYOUTS}) and no invocation was available (that needs a thread suspended BY AN \
+             EVENT), so what is shown is the object's INTERNAL STRUCTURE and not its contents — the \
+             entries are in there, held the way the class holds them. A stop point on the code you want \
+             to ask about is what turns this into entries."
+        ));
     }
 
     /// The reason an unrecognised implementation gets, which is the commonest one by far.
@@ -21364,11 +21412,17 @@ struct DeepState {
     /// A map on `JdwpConnection` would be `TypeCache` with a weak key and would be wrong for ADR-0022's
     /// reason. This one is born and dies with one render.
     reads: ValueReads,
+    /// How each container node was reached, for the trailing notes (EVAL-15, #179).
+    ///
+    /// Here rather than as a parameter because a deep render is recursive through nine signatures and a
+    /// tenth argument threaded through all of them would be the same value in every frame. The notes are
+    /// deduped by [`ReadPath::push`], so a field tree holding forty `HashMap`s reports the path once.
+    read_path: ReadPath,
 }
 
 impl DeepState {
     fn new(budget: usize) -> Self {
-        Self { budget, path: Vec::new(), reads: ValueReads::none() }
+        Self { budget, path: Vec::new(), reads: ValueReads::none(), read_path: ReadPath::default() }
     }
 
     /// Whether the budget ran out during the render(s) so far.
@@ -21391,10 +21445,15 @@ async fn render_value_deep(
 ) -> String {
     let mut state = DeepState::new(DEEP_NODE_BUDGET);
     let body = render_node(conn, value, thread_id, opts, &mut state, 0).await;
+    // EVAL-15 (#179): the container notes trail the value, after the budget note, because both are facts
+    // about the render rather than parts of the value.
+    let notes = state.read_path.render();
     if state.exhausted() {
-        format!("{body}\n… node budget ({DEEP_NODE_BUDGET}) exhausted — raise max_depth only if needed")
+        format!(
+            "{body}\n… node budget ({DEEP_NODE_BUDGET}) exhausted — raise max_depth only if needed{notes}"
+        )
     } else {
-        body
+        format!("{body}{notes}")
     }
 }
 
@@ -21517,12 +21576,41 @@ async fn expand_object(
         }
         return render_array_deep(conn, id, name, thread_id, opts, state, depth).await;
     }
-    // Collections need method invocation, so only attempt them with a suspended thread.
-    if let Some(tid) = thread_id {
-        if let Some(rendered) = render_collection_deep(conn, id, type_id, name, tid, opts, state, depth).await
+    // EVAL-15 (#179): a recognised layout is WALKED, which runs nothing in the debuggee and therefore
+    // needs no suspended thread — so this is tried before anything that invokes, and the order is the
+    // whole fix. Only what this server does not recognise reaches the invoking path below.
+    let mut declined = None;
+    if let Some(layout) = recognise_layout(conn, type_id).await {
+        match render_layout_deep(conn, id, type_id, layout, name, thread_id, opts, state, depth).await {
+            Walked::Read(rendered) => {
+                state.read_path.walked(layout, name);
+                return rendered;
+            }
+            // An unfamiliar field layout, or a map resizing under the read. The reason is a fact about
+            // the debuggee, so it travels with whatever the fallback produces rather than being dropped.
+            Walked::Declined(why) => declined = Some(why),
+        }
+    }
+    // Collections need method invocation, so only attempt them with a suspended thread. Classification is
+    // by duck typing and costs cached method lookups, so it is also the cheapest way to know whether the
+    // field walk below is about to answer a different question than the one asked.
+    let kind = classify_container(conn, type_id, name).await;
+    if let (Some(k), Some(tid)) = (kind, thread_id) {
+        if let Some(rendered) =
+            render_collection_deep(conn, id, type_id, name, tid, k, opts, state, depth).await
         {
+            match &declined {
+                Some(why) => state.read_path.invoked(name, why),
+                None => state.read_path.unrecognised(name),
+            }
             return rendered;
         }
+    }
+    // A container that was neither walked nor invoked renders as its own internals, which is true about a
+    // different question — so it says so (the third verdict, `internals_only`). The commonest route here
+    // is a `debug.suspend_thread` frame, where the invoke above is refused rather than absent.
+    if kind.is_some() {
+        state.read_path.internals_only(name);
     }
     render_fields_deep(conn, id, type_id, name, thread_id, opts, state, depth).await
 }
@@ -21639,6 +21727,7 @@ async fn collect_instance_fields(
 ///
 /// Deliberately NOT memoised per type, though the verdict is a pure function of one: measured, it is
 /// free. See "Caching the container classification" in `docs/VARIABLE_INSPECTION_PLAN.md`.
+#[derive(Clone, Copy)]
 enum ContainerKind {
     /// Anything with `toArray()` + `size()` — `List`, `Set`, `Queue`, …
     Collection,
@@ -21690,8 +21779,96 @@ async fn classify_container(
     None
 }
 
-/// Element-level rendering for a collection, map, or `Optional`. `None` when the object isn't one (or
-/// its contents can't be read), so the caller falls back to field expansion.
+/// A recognised [`Layout`]'s contents on the deep path, walked through the object's own fields
+/// (EVAL-15, [#179](https://github.com/YgorPerez/java-debugging-mcp/issues/179)).
+///
+/// **This is the deep-render counterpart of [`structural_scan`], and it exists because the capability was
+/// present and unreachable from here.** The structural readers were wired to subscripts, slices and
+/// filters only, so `expand_objects` on a plain `HashMap` field invoked `entrySet()` to read a map this
+/// server can walk by `table[] → Node.key/value/next` without running anything. That made a deep read
+/// unavailable on a thread held by `debug.suspend_thread` — the invocation is refused there (ADR-0021) —
+/// which is the case the whole per-thread suspend exists to serve.
+///
+/// **It needs no thread at all**, which is what makes it more than a cost saving: the four
+/// [`KNOWN_LAYOUTS`] are now readable from a bare object handle with no suspended frame anywhere.
+///
+/// **The rendering is deliberately byte-identical to [`render_map_deep`]'s and
+/// [`render_elements_deep`]'s.** Which route a read took is reported in a note and never in the shape of
+/// the output — a caller comparing two replies must not have to know how each was obtained to compare
+/// them. The iteration order matches for the same reason: [`hash_map_entries`] walks the table, which is
+/// `entrySet()`'s order, and [`linked_map_entries`] walks `head`/`after`, which is the order that class
+/// exists for.
+#[allow(clippy::too_many_arguments)]
+async fn render_layout_deep(
+    conn: &mut jdwp_client::JdwpConnection,
+    id: u64,
+    type_id: u64,
+    layout: Layout,
+    name: &str,
+    thread_id: Option<u64>,
+    opts: DeepOpts,
+    state: &mut DeepState,
+    depth: usize,
+) -> Walked<String> {
+    // Rooted, so the walk does not re-read the type the renderer resolved a packet ago (PERF-2, #129).
+    let mut ids = FieldIds::rooted_at(id, type_id);
+    let entries = match layout {
+        // An `ArrayList` reaches a real array, which is what the invoking path gets out of `toArray()` —
+        // so it rejoins the shared renderer rather than formatting anything of its own.
+        Layout::ArrayList => {
+            return match array_list_backing(conn, &mut ids, id).await {
+                Ok(Walked::Read((arr, size))) => {
+                    let header = format!("{name}[{size}]");
+                    let rendered = match arr {
+                        Some(a) => {
+                            render_indexed_block(conn, &header, a, size, thread_id, opts, state, depth).await
+                        }
+                        None => Some(format!("{header} {{}}")),
+                    };
+                    Walked::Read(rendered.unwrap_or_else(|| format!("{header} {{}}")))
+                }
+                Ok(Walked::Declined(why)) => Walked::Declined(why),
+                // A wire failure is a decline here rather than an error: the deep renderer has no error
+                // channel, and falling back to the invoking path (or to fields) is a better answer than
+                // aborting a whole field tree over one node.
+                Err(e) => Walked::Declined(e),
+            };
+        }
+        Layout::HashMap => hash_map_entries(conn, &mut ids, id).await,
+        Layout::LinkedHashMap => linked_map_entries(conn, &mut ids, id).await,
+        Layout::ConcurrentHashMap => chm_entries(conn, &mut ids, id).await,
+    };
+    let (pairs, len) = match entries {
+        Ok(Walked::Read(v)) => v,
+        Ok(Walked::Declined(why)) => return Walked::Declined(why),
+        Err(e) => return Walked::Declined(e),
+    };
+    if len == 0 {
+        return Walked::Read(format!("{name}{{}} (0 entries)"));
+    }
+    let take = pairs.len().min(opts.child_limit);
+    let pad = indent(depth + 1);
+    let mut out = format!("{name}({len} entries) {{");
+    for (k, v) in pairs.iter().take(take) {
+        let kr = render_node_boxed(conn, k, thread_id, opts, state, depth + 1).await;
+        let vr = render_node_boxed(conn, v, thread_id, opts, state, depth + 1).await;
+        let _ = write!(out, "\n{pad}{kr} → {vr}");
+    }
+    // Against `len` and not against what was read: the walk is bounded by `SUBSCRIPT_SCAN_CAP` as well as
+    // by `child_limit`, and a map larger than the cap must still report how many it has.
+    let shown = i32::try_from(take).unwrap_or(i32::MAX);
+    if len > shown {
+        let _ = write!(out, "\n{pad}… +{} more entr(ies)", len - shown);
+    }
+    let _ = write!(out, "\n{}}}", indent(depth));
+    Walked::Read(out)
+}
+
+/// Element-level rendering for a collection, map, or `Optional`, by **invoking** on it — reached only for
+/// a container whose runtime type is not one of the [`KNOWN_LAYOUTS`] [`render_layout_deep`] walks.
+///
+/// `None` when the contents can't be read, which on a `debug.suspend_thread` frame is every time: the
+/// invocation is refused there, and the caller falls back to field expansion and says so.
 #[allow(clippy::too_many_arguments)]
 async fn render_collection_deep(
     conn: &mut jdwp_client::JdwpConnection,
@@ -21699,11 +21876,12 @@ async fn render_collection_deep(
     type_id: u64,
     name: &str,
     tid: u64,
+    kind: ContainerKind,
     opts: DeepOpts,
     state: &mut DeepState,
     depth: usize,
 ) -> Option<String> {
-    match classify_container(conn, type_id, name).await? {
+    match kind {
         ContainerKind::Optional => render_optional_deep(conn, id, type_id, tid, opts, state, depth).await,
         ContainerKind::Collection => {
             render_elements_deep(conn, id, type_id, name, tid, opts, state, depth).await

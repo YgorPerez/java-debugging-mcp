@@ -68,13 +68,22 @@ available under `read_only` and against a thread suspended by `debug.suspend_thr
 field to read, so EVAL-10 applies in full"*. That is false: a container's parsed parameters and headers are
 fields.
 
-It still does not reach them. An invoke-free deep read exists here for exactly four layouts —
-`KNOWN_LAYOUTS`: `HashMap`, `LinkedHashMap`, `ConcurrentHashMap`, `ArrayList`. For anything else,
-`classify_container` duck-types a map by `entrySet()` + `size()` and `render_collection_deep` invokes
-`entrySet()`/`toArray()` to read it, falling back to a field walk only when that invocation fails. On
-WildFly — the deployment this project is built around not freezing — the request's query parameters are a
+It still does not reach them, and this survived the one change that looked like it would fix it. An
+invoke-free deep read covers exactly four layouts — `KNOWN_LAYOUTS`: `HashMap`, `LinkedHashMap`,
+`ConcurrentHashMap`, `ArrayList`. For anything else, `classify_container` duck-types a map by `entrySet()`
++ `size()` and `render_collection_deep` **invokes** `entrySet()`/`toArray()` to read it. On WildFly — the
+deployment this project is built around not freezing — the request's query parameters are a
 `TreeMap<String, Deque<String>>` and its headers a `HeaderMap`, neither of which is on that list. So the
 field-read design lands back on invoking, and with it on a thread suspended by an event.
+
+**EVAL-15 ([#179](https://github.com/YgorPerez/java-debugging-mcp/issues/179), ADR-0046) fixed the
+mechanism and did not change this verdict, which is worth recording because it is the obvious thing to
+re-check.** When this file was written, `expand_objects` invoked on *every* container, including the four
+it could walk; it now walks those four first, needs no thread for them, and labels an unrecognised
+container's output as internals rather than contents. Every word of that is a real improvement and none of
+it moves Undertow's `TreeMap` and `HeaderMap` onto the list — and per ADR-0046's rejected alternatives, a
+generic walk of an unrecognised map is refused on purpose, because recognition by anything looser than an
+exact signature is how a confident wrong answer gets returned.
 
 *(Undertow's layouts here are read from knowledge of the container, not measured against the real 8180.
 That is the one claim in this file that a measurement could overturn, and the measurement is cheap.)*
