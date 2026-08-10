@@ -686,14 +686,66 @@ jobs:
       #
       # A version already on npm makes its `npm publish` fail, and that is left to fail for the reason the
       # cargo step above states — a published version cannot be replaced, and re-running will not help.
-      - name: Publish the five platform packages
+      # ONE BLOCKED NAME MUST NOT STRAND THE OTHERS, and this loop learned that from v0.21.0: npm's spam
+      # detection refused `jdwp-mcp-win32-x64` after the other four had published, and a fail-fast loop
+      # would have left those four on the registry with no wrapper pointing at them — unusable, because the
+      # wrapper is the only package `npx` names.
+      #
+      # A subset is safe in a way a half-published wrapper is not: an `optionalDependencies` entry that does
+      # not resolve is skipped silently by npm, so the platforms that published work completely, and the
+      # missing one gets the shim's message plus `cargo install`. And because the wrapper pins each platform
+      # at an exact version, publishing the missing package later makes the already-published wrapper find
+      # it, with no new release.
+      #
+      # SO: publish what can be published, then FAIL THE JOB naming what could not. There is deliberately no
+      # `|| true` — a subset shipping unnoticed is the thing this must not do, and in CI nobody can be asked
+      # to confirm, so the red run IS the confirmation being demanded after the fact. `publish-npm` is the
+      # last job and the release and crates.io have already shipped by here, so a red here blocks nothing —
+      # it is a flag, which is exactly what an incomplete platform set deserves.
+      - name: Publish the platform packages, then the wrapper last
+        shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          failed=()
           for pkg in jdwp-mcp-linux-x64 jdwp-mcp-linux-arm64 jdwp-mcp-darwin-arm64 jdwp-mcp-darwin-x64 jdwp-mcp-win32-x64; do
             echo "::group::npm publish $pkg"
-            ( cd "npm/$pkg" && npm publish --access public )
+            if ( cd "npm/$pkg" && npm publish --access public ); then
+              echo "published $pkg"
+            else
+              echo "::warning::$pkg did not publish"
+              failed+=("$pkg")
+            fi
             echo "::endgroup::"
           done
 
-      - name: Publish the wrapper, last
-        run: cd npm/jdwp-mcp && npm publish --access public
+          if [ "${#failed[@]}" -eq 5 ]; then
+            echo "::error::no platform package published, so there is nothing for a wrapper to point at. Not publishing the wrapper."
+            exit 1
+          fi
+
+          # The wrapper goes last, always, and only once at least one platform is up.
+          echo "::group::npm publish jdwp-mcp (the wrapper)"
+          ( cd npm/jdwp-mcp && npm publish --access public ) || {
+            echo "::error::the wrapper did not publish. The platform packages above are inert until it does."
+            exit 1
+          }
+          echo "::endgroup::"
+
+          if [ "${#failed[@]}" -ne 0 ]; then
+            {
+              echo "## npm: shipped ${#failed[@]} platform(s) short"
+              echo
+              echo "Published the wrapper and $(( 5 - ${#failed[@]} )) of 5 platform packages. Missing:"
+              for f in "${failed[@]}"; do echo "- \`$f\`"; done
+              echo
+              echo "Those platforms fall back to \`cargo install jdwp-mcp\`, which the launcher tells them."
+              echo "The wrapper pins each platform at this exact version, so publishing a missing one later"
+              echo "makes the already-published wrapper find it — no new release needed:"
+              echo
+              echo '```'
+              for f in "${failed[@]}"; do echo "( cd npm/$f && npm publish --access public )"; done
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::npm shipped without: ${failed[*]}. The wrapper IS published, so the other platforms work; this job is red so the gap is not missed."
+            exit 1
+          fi
