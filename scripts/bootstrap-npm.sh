@@ -428,21 +428,60 @@ else
 fi
 note "Anything already on npm is skipped, so a re-run after a failure resumes rather than repeats."
 confirm "Publish these five now?" || { warn "stopped; nothing was published"; exit 1; }
+# COLLECTED, NOT ABORTED ON. npm can refuse ONE name for reasons that have nothing to do with the others
+# — v0.21.0's `jdwp-mcp-win32-x64` was refused by spam detection after the other four had published with
+# the same token — and stopping there meant the four that worked were unusable, because the wrapper never
+# went out. Publishing a SUBSET is safe in a way a half-published wrapper is not: an `optionalDependencies`
+# entry that does not resolve is skipped silently by npm (measured), the other platforms work fully, and
+# the shim tells the missing platform what happened and points at `cargo install`.
+#
+# What must not happen is a subset shipping because nobody noticed. So every failure is named, and the
+# wrapper needs an explicit yes when the set is incomplete.
+FAILED_PKGS=()
 for entry in "${SLICES[@]}"; do
   IFS='|' read -r _slice pkg _bin <<<"$entry"
-  publish_one "$pkg" "$VERSION" \
-    || { warn "$pkg did not publish. Re-run when you have fixed it — already-published packages are"; \
-         say  "      skipped on the next run, and the wrapper is still unpublished so nothing is installable."; \
-         exit 1; }
+  publish_one "$pkg" "$VERSION" || FAILED_PKGS+=("$pkg")
 done
-note "all five platform packages are on npm"
+
+if (( ${#FAILED_PKGS[@]} == ${#PLATFORM_PKGS[@]} )); then
+  say ""
+  warn "not one platform package published, so there is nothing for a wrapper to point at."
+  say  "Fix the cause above and re-run; nothing has been published."
+  exit 1
+fi
+
+PARTIAL=0
+if (( ${#FAILED_PKGS[@]} )); then
+  PARTIAL=1
+  say ""
+  warn "${#FAILED_PKGS[@]} of ${#PLATFORM_PKGS[@]} did not publish: ${FAILED_PKGS[*]}"
+  say ""
+  say "Publishing the wrapper now ships $(( ${#PLATFORM_PKGS[@]} - ${#FAILED_PKGS[@]} )) of ${#PLATFORM_PKGS[@]} platforms. What that means:"
+  step "the platforms that DID publish work completely — npm skips an optional dependency it cannot resolve"
+  step "the missing ones get the shim's message naming both causes, and \`cargo install jdwp-mcp\`, which"
+  say  "    works on every platform and always has"
+  step "the gap closes WITHOUT a new release: the wrapper pins each platform at this exact version, so"
+  say  "    publishing the missing package at $VERSION later makes this wrapper find it"
+  say ""
+  note "The alternative is to stop here, fix the cause, and re-run — the four that published are inert"
+  note "until a wrapper points at them, so nothing is installable and nothing is wrong."
+  confirm "Ship $(( ${#PLATFORM_PKGS[@]} - ${#FAILED_PKGS[@]} )) of ${#PLATFORM_PKGS[@]} platforms?" \
+    || { warn "stopped. The published platform packages stay inert until a wrapper points at them."; exit 1; }
+else
+  note "all ${#PLATFORM_PKGS[@]} platform packages are on npm"
+fi
 pause "Continue?"
 
 # ── 5 ─────────────────────────────────────────────────────────────────────
 stage "Publish the wrapper, last"
 warn "ALSO IRREVERSIBLE, and this is the step that makes the set installable."
 say ""
-say "After this, 'npx jdwp-mcp@$VERSION' resolves and pulls exactly one of the five binaries."
+if (( PARTIAL )); then
+  say "After this, 'npx jdwp-mcp@$VERSION' resolves on the platforms that published, and reports itself"
+  say "honestly on: ${FAILED_PKGS[*]}"
+else
+  say "After this, 'npx jdwp-mcp@$VERSION' resolves and pulls exactly one of the five binaries."
+fi
 confirm "Publish $WRAPPER_PKG@$VERSION now?" || { warn "stopped; the platform packages are published but inert"; exit 1; }
 publish_one "$WRAPPER_PKG" "$VERSION" \
   || { warn "the wrapper did not publish. The five platform packages are up and inert until it does —"; \
@@ -485,6 +524,13 @@ else
   warn "npx could not start the published package."
   say  "npm's CDN can lag a minute or two after a publish; try again before assuming it is broken:"
   say  "  npx -y jdwp-mcp@$VERSION"
+fi
+if (( PARTIAL )); then
+  say ""
+  warn "SHIPPED WITHOUT: ${FAILED_PKGS[*]}"
+  say  "Close the gap with no new release, once npm accepts the name:"
+  for p in "${FAILED_PKGS[@]}"; do note "  ( cd npm/$p && npm publish --access public )"; done
+  note "The wrapper pins $VERSION exactly, so it finds them the moment they exist."
 fi
 say ""
 say "From here the tag workflow does it: the publish-npm job exchanges an OIDC token and publishes all"
