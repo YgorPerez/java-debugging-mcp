@@ -1,6 +1,6 @@
 {
   "name": "jdwp-mcp",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "description": "Native JDWP debugger as an MCP server: stop points, stack and variable inspection, expression evaluation.",
   "keywords": [
     "mcp",
@@ -30,10 +30,10 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "jdwp-mcp-linux-x64": "0.20.0",
-    "jdwp-mcp-linux-arm64": "0.20.0",
-    "jdwp-mcp-darwin-arm64": "0.20.0",
-    "jdwp-mcp-darwin-x64": "0.20.0",
-    "jdwp-mcp-win32-x64": "0.20.0"
+    "jdwp-mcp-linux-x64": "0.21.0",
+    "jdwp-mcp-linux-arm64": "0.21.0",
+    "jdwp-mcp-darwin-arm64": "0.21.0",
+    "jdwp-mcp-darwin-x64": "0.21.0",
+    "jdwp-mcp-win32-x64": "0.21.0"
   }
 }
