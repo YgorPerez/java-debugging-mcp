@@ -1,0 +1,20 @@
+{
+  "name": "jdwp-mcp-linux-arm64",
+  "version": "0.20.0",
+  "description": "Native JDWP debugger as an MCP server: stop points, stack and variable inspection, expression evaluation. (linux arm64 binary)",
+  "homepage": "https://github.com/YgorPerez/java-debugging-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YgorPerez/java-debugging-mcp.git"
+  },
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "jdwp-mcp"
+  ]
+}

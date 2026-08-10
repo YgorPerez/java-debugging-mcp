@@ -180,6 +180,7 @@ step "Bumping [workspace.package].version"
 if [ "$DRY_RUN" = 1 ]; then
   echo "    would set version = \"$VERSION\" in Cargo.toml ([workspace.package] and the jdwp-client entry)"
   echo "    would set version = \"$VERSION\" in server.json"
+  echo "    would set version = \"$VERSION\" in the 6 npm manifests, and repin the wrapper's optionalDependencies"
   echo "    would refresh Cargo.lock, commit 'chore(release): $VERSION', and tag $TAG"
   step "Dry run complete — nothing changed"
   exit 0
@@ -244,10 +245,40 @@ except FileNotFoundError:
 except json.JSONDecodeError as why:
     sys.exit(f"{path} is not valid JSON ({why}) — refusing to guess at a registry manifest")
 doc["version"] = new
+# REL-6 (#168): the `packages` block names the npm release, and a package entry pointing at a version that
+# was never published is the same defect as a stale top-level one, one level down.
+for pkg in doc.get("packages", []):
+    if "version" in pkg:
+        pkg["version"] = new
 with open(path, "w") as fh:
     json.dump(doc, fh, indent=2, ensure_ascii=False)
     fh.write("\n")
-print(f'    server.json: version = "{new}"')
+print(f'    server.json: version = "{new}" (and {len(doc.get("packages", []))} package entry/entries)')
+PY
+
+# The six npm manifests (REL-6, #168) — the wrapper and one per platform. Same argument as server.json
+# above, six times over, plus one extra: the wrapper PINS each platform package to an exact version, so a
+# bump that moved the manifests and not the pins would publish a wrapper installing the previous release's
+# binary. `every_npm_manifest_carries_the_crate_version` in docs_claims.rs asserts both halves.
+python3 - "$VERSION" <<'PY'
+import json, pathlib, sys
+
+new = sys.argv[1]
+root = pathlib.Path("npm")
+if not root.is_dir():
+    sys.exit(0)  # not having the npm packaging is a decision someone can make; a stale one is not
+touched = []
+for path in sorted(root.glob("*/package.json")):
+    try:
+        doc = json.loads(path.read_text())
+    except json.JSONDecodeError as why:
+        sys.exit(f"{path} is not valid JSON ({why}) — refusing to guess at a package manifest")
+    doc["version"] = new
+    if "optionalDependencies" in doc:
+        doc["optionalDependencies"] = {k: new for k in doc["optionalDependencies"]}
+    path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+    touched.append(path.parent.name)
+print(f'    npm: version = "{new}" in {len(touched)} manifest(s) ({", ".join(touched)})')
 PY
 
 # Cargo.lock records both workspace members' versions, is committed, and the release build uses --locked.
@@ -284,7 +315,7 @@ read -r WROTE_PKG WROTE_DEP <<<"$WROTE"
 
 step "Committing and tagging"
 
-git add Cargo.toml Cargo.lock server.json
+git add Cargo.toml Cargo.lock server.json npm
 
 # The subject only. Every release in this repo carries a written rationale in its commit body (0.4.0 is
 # the precedent), but it is prose about what shipped and this script has no way to know that — so it

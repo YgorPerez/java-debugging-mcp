@@ -9,5 +9,15 @@
     "source": "github",
     "id": "1278388521"
   },
-  "websiteUrl": "https://github.com/YgorPerez/java-debugging-mcp#readme"
+  "websiteUrl": "https://github.com/YgorPerez/java-debugging-mcp#readme",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "jdwp-mcp",
+      "version": "0.20.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
 }

@@ -1,0 +1,39 @@
+{
+  "name": "jdwp-mcp",
+  "version": "0.20.0",
+  "description": "Native JDWP debugger as an MCP server: stop points, stack and variable inspection, expression evaluation.",
+  "keywords": [
+    "mcp",
+    "jdwp",
+    "java",
+    "debugger",
+    "modelcontextprotocol"
+  ],
+  "homepage": "https://github.com/YgorPerez/java-debugging-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/YgorPerez/java-debugging-mcp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YgorPerez/java-debugging-mcp.git"
+  },
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "jdwp-mcp": "bin/jdwp-mcp.cjs"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "jdwp-mcp-linux-x64": "0.20.0",
+    "jdwp-mcp-linux-arm64": "0.20.0",
+    "jdwp-mcp-darwin-arm64": "0.20.0",
+    "jdwp-mcp-darwin-x64": "0.20.0",
+    "jdwp-mcp-win32-x64": "0.20.0"
+  }
+}

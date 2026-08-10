@@ -104,7 +104,18 @@ runs *during* startup, since it holds the VM before its first instruction.
 
 ### 2. Get the server
 
-**Download a prebuilt binary** — no Rust toolchain needed — from the
+**`npx`, if you have Node 18 or newer** — nothing to install, nothing to download at run time:
+
+```bash
+npx -y jdwp-mcp
+```
+
+The prebuilt binary arrives as an `optionalDependencies` package, so npm fetches exactly the one for your
+platform and there is no fetch when the server starts. Linux x64/arm64, macOS arm64/x64 and Windows x64
+are covered; anything else falls through to `cargo install` below, and the launcher says so rather than
+failing obscurely.
+
+**Or download a prebuilt binary** — no Node and no Rust toolchain needed — from the
 [latest release](https://github.com/YgorPerez/java-debugging-mcp/releases/latest):
 
 | Platform | Asset |
@@ -170,6 +181,20 @@ claude mcp add --scope project jdwp /path/to/jdwp-mcp
   "mcpServers": {
     "jdwp": {
       "command": "/path/to/jdwp-mcp",
+      "env": { "JDWP_READONLY": "0", "JDWP_WATCHDOG_SECS": "120" }
+    }
+  }
+}
+```
+
+Or with `npx`, if you installed it that way — no path to keep current:
+
+```json
+{
+  "mcpServers": {
+    "jdwp": {
+      "command": "npx",
+      "args": ["-y", "jdwp-mcp"],
       "env": { "JDWP_READONLY": "0", "JDWP_WATCHDOG_SECS": "120" }
     }
   }

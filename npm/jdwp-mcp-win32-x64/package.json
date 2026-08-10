@@ -1,0 +1,20 @@
+{
+  "name": "jdwp-mcp-win32-x64",
+  "version": "0.20.0",
+  "description": "Native JDWP debugger as an MCP server: stop points, stack and variable inspection, expression evaluation. (win32 x64 binary)",
+  "homepage": "https://github.com/YgorPerez/java-debugging-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YgorPerez/java-debugging-mcp.git"
+  },
+  "license": "MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "jdwp-mcp.exe"
+  ]
+}

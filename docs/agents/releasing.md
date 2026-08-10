@@ -13,6 +13,7 @@ you consult during a release rather than carry into every session.
 | `tool-surface-<tag>.json` | REL-8 (#165) | Deliberately **not** in `SHA256SUMS` |
 | Build provenance | REL-7 (#164) | Over the binaries *and* the surface asset |
 | Both crates, to crates.io | REL-5 (ADR-0043) | Runs last, because it is the only irreversible step |
+| Six npm packages | REL-6 (#168) | The `jdwp-mcp` wrapper and one binary package per platform. Publishes **after** crates.io, and the wrapper goes **last of the six** — npm has no transaction, so making the package `npx` actually names the final one is what stops a half-published set being installable |
 | The release body | v0.9.0 | Built by `scripts/release-notes.py`, not `--generate-notes` |
 
 ## crates.io runs last, on purpose

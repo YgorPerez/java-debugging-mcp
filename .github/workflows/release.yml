@@ -562,3 +562,112 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --workspace --no-verify --locked
+
+  # REL-6 (#168). `npx jdwp-mcp` — the install path an MCP server is expected to have, and the one this
+  # repo did not: `cargo install` wants a Rust toolchain and a few minutes, and the release binaries want a
+  # manual download, which is why the downstream toolkit ships `ensure-jdwp.sh` to do it for people.
+  #
+  # ONE WRAPPER PACKAGE PLUS FIVE PLATFORM PACKAGES, NO `postinstall` DOWNLOAD. Each platform package
+  # carries one prebuilt binary and declares its `os`/`cpu`, so npm installs exactly one of the five and
+  # `npx` needs no network at run time. The usual alternative — a `postinstall` that fetches from GitHub —
+  # is what makes `npx` unreliable behind a proxy, on an offline runner, or against a rate limit, and it
+  # fails at the moment somebody is trying to start a debugger.
+  #
+  # NO STORED TOKEN, WHICH IS AN ACCEPTANCE CRITERION OF #168 RATHER THAN A PREFERENCE. `id-token: write`
+  # lets this job ask GitHub for an OIDC token about itself, which npm exchanges for a short-lived
+  # publishing credential — the same property ADR-0043 chose for crates.io, and the reason this repository
+  # still has zero secrets. It requires trusted publishing configured on the registry side for all six
+  # packages, and npm >= 11.5.1 to use it.
+  #
+  # IT NEEDS THE BOOTSTRAP FIRST, exactly as crates.io did: trusted publishing attaches to a package that
+  # already exists, so the first version of each of the six is published by hand by the maintainer. Until
+  # then this job fails at the publish step, which is the honest outcome — there is deliberately no
+  # `|| true` making a missing bootstrap look like a success.
+  publish-npm:
+    name: Publish to npm
+    needs: [version, package, release, publish]
+    runs-on: ubuntu-latest
+    # NO SUCCESSFUL RUN TO DERIVE FROM — the same wording as the crates.io job above, and for the same
+    # reason: this has never run against a bootstrapped package. Reasoned instead: six `npm publish` calls
+    # against a registry that answers in seconds, plus five asset downloads of a ~5 MB binary each.
+    # Replace this with a real observation the first time it succeeds.
+    timeout-minutes: 15
+    permissions:
+      id-token: write # the OIDC exchange; NOT a write to this repository
+      contents: read # the checkout, and `gh release download` for the assets
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # NO `actions/setup-node`, and its absence is deliberate twice over. The runner already ships Node,
+      # and the only thing that action would add here is `registry-url`, which exists to write an `.npmrc`
+      # carrying `NODE_AUTH_TOKEN` — the stored-token path this job is built to avoid. Dropping it also
+      # drops zizmor's `cache-poisoning` finding at its root rather than annotating it away: an action that
+      # can enable caching on the workflow that publishes artifacts is worth not having on this path.
+
+      # Trusted publishing is npm 11.5.1 and newer. The runner's bundled npm is older than that on every
+      # image so far, so this is not optional — and it is pinned rather than `@latest`, because "whatever
+      # npm is today" is the drift LINT-1 (#18) pinned clippy to avoid, on the one step that publishes.
+      #
+      # zizmor's `adhoc-packages` is correct that this installs outside a lockfile and there is no lockfile
+      # to put it in: it is the package manager itself, needed before any manifest is read. The exact pin
+      # IS the mitigation, and it is reviewed like any other pinned tool version here.
+      - name: Install an npm that can do trusted publishing
+        run: npm install -g npm@11.6.2 # zizmor: ignore[adhoc-packages]
+
+      # The binaries come from the release this tag just made, so npm publishes the SAME artefacts the
+      # GitHub release does rather than a second build of the same commit. `SHA256SUMS` is verified for
+      # each one: the toolkit already checks these downloads that way (docs/toolkit-contract.md), and an
+      # npm package is a wider distribution than a manual download, not a narrower one.
+      - name: Stage the release binaries into the platform packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          gh release download "$TAG" --dir "$work" --pattern 'jdwp-mcp-*' --pattern 'SHA256SUMS'
+          ( cd "$work" && sha256sum --check --ignore-missing SHA256SUMS )
+          # slice -> package dir, binary name. The slice names are release ASSET names, which
+          # docs/toolkit-contract.md makes part of the interface — they are not free to rename here.
+          while read -r slice pkg bin; do
+            [ -z "$slice" ] && continue
+            src="$work/jdwp-mcp-${TAG}-${slice}"
+            [ "$bin" = "jdwp-mcp.exe" ] && src="${src}.exe"
+            if [ ! -f "$src" ]; then
+              echo "::error::$src is missing from the $TAG release — refusing to publish a platform package with no binary in it."
+              exit 1
+            fi
+            cp "$src" "npm/${pkg}/${bin}"
+            chmod +x "npm/${pkg}/${bin}"
+            echo "staged $slice -> npm/${pkg}/${bin}"
+          done <<'SLICES'
+          linux-x86_64 jdwp-mcp-linux-x64 jdwp-mcp
+          linux-aarch64 jdwp-mcp-linux-arm64 jdwp-mcp
+          macos-aarch64 jdwp-mcp-darwin-arm64 jdwp-mcp
+          macos-x86_64 jdwp-mcp-darwin-x64 jdwp-mcp
+          windows-x86_64 jdwp-mcp-win32-x64 jdwp-mcp.exe
+          SLICES
+
+      # THE WRAPPER IS PUBLISHED LAST, AND THAT ORDERING IS THE "ALL OR NONE" GUARANTEE. npm has no
+      # transaction across six packages, so the closest available thing is to make the package a caller
+      # actually names — `npx jdwp-mcp` — the final one. If any platform publish fails, the wrapper for
+      # this version never appears, `npx jdwp-mcp@<version>` does not resolve, and nobody can install a
+      # half-published set. The orphaned platform packages are inert: nothing depends on them until the
+      # wrapper exists.
+      #
+      # A version already on npm makes its `npm publish` fail, and that is left to fail for the reason the
+      # cargo step above states — a published version cannot be replaced, and re-running will not help.
+      - name: Publish the five platform packages
+        run: |
+          set -euo pipefail
+          for pkg in jdwp-mcp-linux-x64 jdwp-mcp-linux-arm64 jdwp-mcp-darwin-arm64 jdwp-mcp-darwin-x64 jdwp-mcp-win32-x64; do
+            echo "::group::npm publish $pkg"
+            ( cd "npm/$pkg" && npm publish --access public )
+            echo "::endgroup::"
+          done
+
+      - name: Publish the wrapper, last
+        run: cd npm/jdwp-mcp && npm publish --access public

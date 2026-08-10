@@ -392,6 +392,100 @@ fn the_registry_manifest_version_matches_the_crate() {
          published to searchers; a version there that was never released is worse than no listing. \
          scripts/release.sh bumps both — if this drifted, that step was skipped or removed."
     );
+
+    // REL-6 (#168). The `packages` block names the npm release the listing points at, and a package entry
+    // pointing at a version nobody published is the same defect one level down — worse, because a reader
+    // can act on it: `npx jdwp-mcp@<that>` is a command they will run.
+    for entry in manifest.split("\"registryType\"").skip(1) {
+        let pkg_version = entry
+            .split("\"version\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').nth(1))
+            .expect("a server.json package entry with no \"version\"");
+        assert_eq!(
+            pkg_version, crate_version,
+            "a server.json package entry says {pkg_version} and Cargo.toml says {crate_version}. The \
+             registry would advertise an install command for a version that does not exist."
+        );
+    }
+}
+
+/// Every npm manifest carries the crate's version, and the wrapper pins its platform packages to it
+/// exactly (REL-6, #168).
+///
+/// The same hazard `the_registry_manifest_version_matches_the_crate` guards for `server.json`, six more
+/// times over. #168 states it: *a manifest left behind tells a searcher a release exists that was never
+/// published, and a third version number is a third chance at that.* There are now eight numbers that
+/// must agree — `Cargo.toml`, `server.json` and six `package.json` files — and `scripts/release.sh` bumps
+/// all of them.
+///
+/// The `optionalDependencies` pins are the second half and the sharper one. If the wrapper asked for
+/// `jdwp-mcp-linux-x64@0.20.0` while the platform packages published `0.21.0`, `npx jdwp-mcp` would
+/// install the *previous* release's binary and report the previous release's tool surface — a failure
+/// with no error anywhere in it.
+#[test]
+fn every_npm_manifest_carries_the_crate_version() {
+    const PLATFORMS: [&str; 5] = [
+        "jdwp-mcp-linux-x64",
+        "jdwp-mcp-linux-arm64",
+        "jdwp-mcp-darwin-arm64",
+        "jdwp-mcp-darwin-x64",
+        "jdwp-mcp-win32-x64",
+    ];
+
+    let crate_version = read("Cargo.toml")
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("version")?
+                .trim()
+                .strip_prefix('=')?
+                .trim()
+                .strip_prefix('"')?
+                .split('"')
+                .next()
+        })
+        .map(str::to_owned)
+        .expect("no version in Cargo.toml");
+
+    let field = |json: &str, key: &str| -> Option<String> {
+        json.split(&format!("\"{key}\"")).nth(1)?.split('"').nth(1).map(str::to_owned)
+    };
+
+    for pkg in std::iter::once("jdwp-mcp").chain(PLATFORMS) {
+        let path = format!("npm/{pkg}/package.json");
+        let manifest = read(&path);
+        let declared = field(&manifest, "version").unwrap_or_else(|| panic!("no \"version\" in {path}"));
+        assert_eq!(
+            declared, crate_version,
+            "{path} says {declared} and Cargo.toml says {crate_version}. `npx {pkg}` would serve a \
+             version nobody released. scripts/release.sh bumps every npm manifest — if this drifted, \
+             that step was skipped or removed."
+        );
+    }
+
+    // The wrapper pins each platform package to an EXACT version, not a range: a caret would let npm
+    // resolve a newer binary than the wrapper was published with.
+    let wrapper = read("npm/jdwp-mcp/package.json");
+    let optional = wrapper.split("\"optionalDependencies\"").nth(1).unwrap_or_else(|| {
+        panic!(
+            "npm/jdwp-mcp/package.json has no optionalDependencies — that block IS \
+                                   how the platform binaries reach an installer"
+        )
+    });
+    for pkg in PLATFORMS {
+        let pinned = optional
+            .split(&format!("\"{pkg}\""))
+            .nth(1)
+            .and_then(|rest| rest.split('"').nth(1))
+            .unwrap_or_else(|| panic!("{pkg} is missing from the wrapper's optionalDependencies"));
+        assert_eq!(
+            pinned, crate_version,
+            "the wrapper pins {pkg} at {pinned} but this release is {crate_version}. `npx jdwp-mcp` \
+             would install the wrong release's binary and report its tool surface, with no error \
+             anywhere. An exact pin is required — a caret or a tilde is the same bug with a delay."
+        );
+    }
 }
 
 /// `.githooks/commit-msg` accepts exactly the vocabulary `release-notes.py` categorises on, by asking the
