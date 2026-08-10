@@ -488,6 +488,68 @@ fn every_npm_manifest_carries_the_crate_version() {
     }
 }
 
+/// Every script a workflow runs DIRECTLY is executable in git's index.
+///
+/// `scripts/sarif-for-code-scanning.py` lost mode 755 in 83c7c05 — an editor rewrote the file and git
+/// recorded 100644 — and `rust-doctor.yml` invokes it as `scripts/sarif-for-code-scanning.py`, so the step
+/// died with **exit 126**, "found but not executable". Nothing local caught it: `scripts/tests/run.sh`
+/// calls the same script as `python3 scripts/…`, which needs no mode bit, so the fixture matrix stayed
+/// green while CI could not start it at all.
+///
+/// The mode is a fact about the INDEX, not the working tree — `chmod +x` alone does not fix a committed
+/// 100644 — so this reads `git ls-files -s`, which is what a fresh checkout will get.
+#[test]
+fn every_script_a_workflow_runs_directly_is_executable() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let listing =
+        std::process::Command::new("git").args(["ls-files", "-s", "scripts/"]).current_dir(root).output();
+    let Ok(out) = listing else { return }; // no git (a vendored tarball) — nothing to assert against
+    if !out.status.success() {
+        return;
+    }
+    let modes: std::collections::HashMap<&str, &str> = std::str::from_utf8(&out.stdout)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (meta, path) = l.split_once('\t')?;
+            Some((path, meta.split_whitespace().next()?))
+        })
+        .collect();
+
+    // Every `scripts/…` token a workflow invokes with no interpreter in front of it.
+    let mut wanted: Vec<String> = Vec::new();
+    for wf in std::fs::read_dir(format!("{root}/.github/workflows")).into_iter().flatten().flatten() {
+        let body = std::fs::read_to_string(wf.path()).unwrap_or_default();
+        for line in body.lines() {
+            let t = line.trim().trim_start_matches("run:").trim().trim_start_matches("- ").trim();
+            for tok in t.split_whitespace() {
+                let tok = tok.trim_start_matches('$').trim_start_matches('(');
+                if let Some(rest) = tok.strip_prefix("scripts/") {
+                    // Only the direct form. `python3 scripts/x.py` and `bash scripts/x.sh` are fine at
+                    // any mode, and that difference is exactly what hid this bug.
+                    let first = t.split_whitespace().next().unwrap_or("");
+                    if first == tok && !rest.is_empty() {
+                        wanted.push(format!("scripts/{rest}"));
+                    }
+                }
+            }
+        }
+    }
+    wanted.sort();
+    wanted.dedup();
+    assert!(!wanted.is_empty(), "no directly-invoked scripts/ found — this test stopped looking");
+
+    for path in &wanted {
+        let Some(mode) = modes.get(path.as_str()) else { continue };
+        assert_eq!(
+            *mode, "100755",
+            "{path} is {mode} in git's index, and a workflow runs it directly — that is exit 126 on a \
+             fresh checkout. Fix with `git update-index --chmod=+x {path}`; `chmod +x` alone changes the \
+             working tree and not what CI clones."
+        );
+    }
+}
+
 /// `.githooks/commit-msg` accepts exactly the vocabulary `release-notes.py` categorises on, by asking the
 /// script for it (REL-4, #147). The flag it asks with is the whole mechanism.
 #[test]
