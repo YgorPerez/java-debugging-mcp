@@ -226,16 +226,23 @@ already_published() {
 
 # publish_one PKG — publish one package directory, with a fresh 2FA one-time password.
 #
-# `--otp` IS REQUIRED WHEN THE ACCOUNT ENFORCES 2FA FOR PUBLISHING, and a web `npm login` session does not
-# satisfy it. The first run of this wizard learned that the hard way: npm answered
-#   403 Forbidden — Two-factor authentication or granular access token with bypass 2fa enabled is required
-# and never prompted for anything. So the code is asked for HERE, per package, because a TOTP is
-# single-use and expires in about 30 seconds — one code cannot cover five publishes.
+# NPM'S OUTPUT IS STREAMED, NOT CAPTURED, AND THAT IS A BUG FIX RATHER THAN A STYLE CHOICE.
+# This used to be `out=$( … npm publish … 2>&1 )`. A command substitution buffers everything until the
+# process exits, and npm answers a publish it will not accept by starting a BROWSER flow: it prints an
+# auth URL and waits for the round trip. Captured, the URL is invisible until after the failure and the
+# wait cannot complete, so every attempt failed the same way with the real error — `code EOTP` — buried
+# six lines up in a buffer that was then truncated to `tail -6`. Three runs and two wrong diagnoses came
+# out of that on v0.22.0: the visible symptom said "authenticate in your browser", so the account looked
+# logged out when it was not. A publish is interactive; let the human see it happen.
 #
-# Read hidden and never written anywhere. It is worth far less than a token (single-use, ~30 s) and is
-# still not something to leave on a screen.
+# WHAT NPM ACTUALLY REQUIRES HERE, measured on v0.22.0 against npm 11.17.0. All three local paths were
+# refused with `EOTP`: a web `npm login` session (`npm whoami` answered correctly), an `--otp` code, and
+# an access token. Meanwhile the SAME publish succeeded from CI for the three packages that have a
+# trusted publisher, with a provenance statement. So on this account a laptop cannot publish at all and
+# OIDC is the only path that works — which is what stage 6 exists to set up, and the reason this wizard
+# should be a bootstrap nobody needs twice.
 publish_one() {
-  local pkg="$1" version="$2" out status
+  local pkg="$1" version="$2" out status log
   if already_published "$pkg" "$version"; then
     note "$pkg@$version is already on npm — skipping (a version cannot be republished)"
     return 0
@@ -244,26 +251,34 @@ publish_one() {
   step "npm publish $pkg@$version"
   local -a otp_arg=()
   if [[ "${TOKEN_AUTH:-0}" == "1" ]]; then
-    note "authenticating with NPM_TOKEN — no code needed"
+    note "authenticating with NPM_TOKEN"
   else
-    ask_secret NPM_OTP "6-digit code from your authenticator (blank if 2FA is off):"
+    ask_secret NPM_OTP "6-digit code from your authenticator (blank if you have none):"
     [[ -n "${NPM_OTP:-}" ]] && otp_arg=(--otp "$NPM_OTP")
   fi
-  status=0
-  out=$( cd "$REPO_ROOT/npm/$pkg" && npm publish --access public ${otp_arg[@]+"${otp_arg[@]}"} 2>&1 ) || status=$?
+  log="$(mktemp)"
+  # `set +e` around the pipeline, so a refusal is a return value rather than an exit, and PIPESTATUS is
+  # read before anything else can clobber it.
+  set +e
+  ( cd "$REPO_ROOT/npm/$pkg" && npm publish --access public ${otp_arg[@]+"${otp_arg[@]}"} 2>&1 ) | tee "$log"
+  status=${PIPESTATUS[0]}
+  set -e
+  out="$(cat "$log")"; rm -f "$log"
   NPM_OTP=""
   if [[ "$status" -eq 0 ]]; then
     note "published $pkg@$version"
     return 0
   fi
-  printf '%s\n' "$out" | tail -6 | sed 's/^/      /' >&2
-  if printf '%s' "$out" | grep -q "Two-factor authentication"; then
-    warn "npm refused the publish for 2FA."
-    say  "Your account enforces 2FA for publishing, so each publish needs a CURRENT code — an expired or"
-    say  "already-used one fails the same way. Re-run and enter a fresh code when it asks."
-    say  "If you have no authenticator to hand, npmjs.com → Account → Two-factor authentication shows"
-    say  "the options; a granular token with 2FA bypass also works, but npm is restricting those and this"
-    say  "repo needs no token once trusted publishing is on."
+  if printf '%s' "$out" | grep -qE "code EOTP|one-time password|Two-factor authentication"; then
+    warn "npm will not accept a publish from this machine, whatever credential it is given."
+    say  'EOTP here does not mean "your code was wrong" — it is also what npm answers to a web login'
+    say  "session and to an access token without 2FA bypass, and npm is restricting those tokens. All"
+    say  "three were tried on v0.22.0 and all three got this."
+    say  ""
+    say  "The path that works is TRUSTED PUBLISHING, which is stage 6 of this wizard and needs no secret:"
+    step "if the package EXISTS, configure its trusted publisher and let $WORKFLOW_FILE publish it"
+    step "if it does NOT exist yet, that is the bootstrap problem this wizard was written for — and npm"
+    say  "    now has to accept the very first publish before a trusted publisher can be attached"
   fi
   return 1
 }
@@ -420,12 +435,19 @@ say "The wrapper is NOT published here. If one of these fails, nothing installab
 say "which is exactly the property that makes a half-finished run safe to abandon."
 say ""
 if [[ "${TOKEN_AUTH:-0}" == "1" ]]; then
-  note "Authenticating with NPM_TOKEN, so no 2FA codes are needed."
+  note "Authenticating with NPM_TOKEN."
 else
-  note "Your account enforces 2FA for publishing and npm does not prompt for the code, so this wizard"
-  note "asks and passes it as --otp. A code is single-use and lasts about 30 seconds, which is why it asks"
-  note "once per package rather than once. Blank is fine if 2FA is off."
+  note "A code is single-use and lasts about 30 seconds, which is why this asks once per package rather"
+  note "than once. Leave it blank if you have no authenticator."
 fi
+# SAY THE ODDS BEFORE THE IRREVERSIBLE PROMPT, not after the failure. Measured on v0.22.0 against
+# npm 11.17.0: a web login session, an `--otp` code and an access token were each refused with `EOTP`,
+# while CI published the same artefacts over OIDC. If that is still npm's posture, every publish below
+# fails and the useful stage is 6.
+warn "npm may refuse a publish from this machine whatever credential you give it."
+say  "On v0.22.0 all three local paths — web login, --otp, access token — answered EOTP, while the"
+say  "packages with a trusted publisher went out from CI without one. If that happens again, skip to"
+say  "stage 6 and let $WORKFLOW_FILE do it: a package that already exists never needs this wizard."
 note "Anything already on npm is skipped, so a re-run after a failure resumes rather than repeats."
 confirm "Publish these five now?" || { warn "stopped; nothing was published"; exit 1; }
 # COLLECTED, NOT ABORTED ON. npm can refuse ONE name for reasons that have nothing to do with the others
@@ -463,8 +485,19 @@ if (( ${#FAILED_PKGS[@]} )); then
   step "the gap closes WITHOUT a new release: the wrapper pins each platform at this exact version, so"
   say  "    publishing the missing package at $VERSION later makes this wrapper find it"
   say ""
-  note "The alternative is to stop here, fix the cause, and re-run — the four that published are inert"
-  note "until a wrapper points at them, so nothing is installable and nothing is wrong."
+  # "NOTHING IS WRONG" IS ONLY TRUE ON A FIRST BOOTSTRAP, so it is checked rather than asserted. Once the
+  # wrapper for this version exists — which it does whenever CI got that far and only the platforms failed,
+  # the v0.22.0 case — the gap is already live for anyone on the missing platform, and telling someone to
+  # calmly stop and fix the cause would be describing a different situation than the one they are in.
+  if already_published "$WRAPPER_PKG" "$VERSION"; then
+    warn "$WRAPPER_PKG@$VERSION IS ALREADY ON NPM, so stopping does not leave things quiet."
+    say  "It pins each platform at exactly $VERSION, so \`npx $WRAPPER_PKG\` on ${FAILED_PKGS[*]} is"
+    say  "resolving to nothing RIGHT NOW and falling through to the shim's message. Publishing the"
+    say  "missing package is what closes that, and it needs no new release."
+  else
+    note "The alternative is to stop here, fix the cause, and re-run — the platforms that published are"
+    note "inert until a wrapper points at them, so nothing is installable and nothing is wrong yet."
+  fi
   confirm "Ship $(( ${#PLATFORM_PKGS[@]} - ${#FAILED_PKGS[@]} )) of ${#PLATFORM_PKGS[@]} platforms?" \
     || { warn "stopped. The published platform packages stay inert until a wrapper points at them."; exit 1; }
 else
