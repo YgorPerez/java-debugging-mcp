@@ -12815,7 +12815,7 @@ fn span_monitor_event(
 /// **A closing half whose duration is unknown is dropped once a threshold is set**, and this was the other
 /// way round until JDK 11 disagreed. The reasoning for keeping it — "a snapshot saying the lock was acquired
 /// with the duration unavailable beats a silence" — is sound with no threshold and wrong with one: a caller
-/// who asked for blocks over 200 ms has said what they want to see, and an unmeasurable pair may have
+/// who asked for blocks over 200 ms has said what they want to see, and an UNMEASURED pair may have
 /// lasted 1 ms. Reporting it breaks the only promise the argument makes.
 ///
 /// It is not a hypothetical, which is how it was found. The first closing events after arming routinely have
@@ -12835,7 +12835,8 @@ const fn monitor_hit_is_recordable(spec: MonitorTraceSpec, span: MonitorSpan) ->
 }
 
 /// The `blocked_for` / `waited_for` detail a closed pair adds to its snapshot, and the honest note an
-/// unmeasurable or unpaired one adds instead (DUMP-7, ADR-0035).
+/// unmeasurable, unmeasured or unpaired one adds instead (DUMP-7, ADR-0035). The first two are one letter
+/// apart in the reply and opposite in what a caller does about them — see `CONTEXT.md`.
 ///
 /// **Every wording here says who measured it.** The figure is this server's own, taken between two events
 /// neither of which carries a time, so it includes the capture latency of the opening half (~0.86 ms per

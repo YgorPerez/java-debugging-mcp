@@ -15847,8 +15847,11 @@ fn a_paired_monitor_snapshot_carries_a_debugger_measured_duration() {
     );
 
     // Polled on the MEASURED wording, not on `blocked_for=`, and the difference is a real race rather than
-    // pedantry: with no threshold set an *unmeasurable* pair is kept (its start predates the arming, because
-    // those threads were already blocked), and it carries a `blocked_for=` too. Waiting on the weaker needle
+    // pedantry: with no threshold set an **unmeasured** pair is kept (its start predates the arming, because
+    // those threads were already blocked), and it carries a `blocked_for=` too. That word is exact — the
+    // reply says `<not measured — no matching start was seen>`, which is a different state from
+    // `<not measurable — the other half of this pair is not armed>`, and this comment used to name the
+    // second while describing the first. Both are in `CONTEXT.md`. Waiting on the weaker needle
     // returned as soon as the first such snapshot landed and then asserted a figure that had not arrived —
     // which flaked on JDK 11 under full-suite contention and passed everywhere else. `wait_for_traces`'
     // contract is that the needle must be something only the expected record has.
@@ -15873,7 +15876,7 @@ fn a_paired_monitor_snapshot_carries_a_debugger_measured_duration() {
         .unwrap_or_else(|| {
             panic!(
                 "no snapshot carried a debugger-measured duration for FastLock or SlowLock. A \
-                 `blocked_for=` alone is not enough — an unmeasurable pair has one too, and a NotifyLock \
+                 `blocked_for=` alone is not enough — an UNMEASURED pair has one too, and a NotifyLock \
                  re-acquisition is a measured pair whose duration this test has made no claim about.\n  \
                  traces: {}",
                 server.call("debug.get_traces", serde_json::json!({}))

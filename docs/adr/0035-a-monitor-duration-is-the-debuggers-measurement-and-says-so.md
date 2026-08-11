@@ -71,7 +71,9 @@ Two consequences of it are stated at arming time rather than left to be discover
 - **A pair whose duration could not be measured is dropped.** This started out the other way round, on the
   reasoning that "the lock was acquired, duration unavailable" beats a silence. That is right with no
   threshold and wrong with one: a caller who asked for blocks over 200 ms has said what they want, and an
-  unmeasurable pair may have lasted 1 ms.
+  **unmeasured** pair may have lasted 1 ms. (That word is exact: no matching start was seen. A pair whose
+  duration is *unmeasurable* is the other case — only one half armed, or a suspending stop point — and its
+  reply names the fix. `CONTEXT.md` keeps the two apart, because this line used to name the wrong one.)
 
 `Hits` is counted **before** the threshold, which is what keeps the resulting silence readable: `Hits: 900`
 beside no snapshots means "contended constantly, never for that long", and `Hits: 0` means nothing contended

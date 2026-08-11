@@ -523,7 +523,8 @@ _Avoid_: monitor bracket (see below), monitor cycle (nothing repeats)
 **A duration is a property of the pair, never of an event**, because no monitor event carries one — see
 **debugger-measured** below. Arming one half is legitimate and cheaper: it answers "is anything blocking at
 all" for one request instead of two, and its snapshots say the duration was not measurable rather than
-printing a zero.
+printing a zero. That is one of two reasons a pair can carry no figure, and they are not interchangeable —
+see **unmeasurable / unmeasured** below.
 
 **The two pairs are named apart** (`blocked_for`, `waited_for`) rather than sharing one `elapsed`. Blocking
 is involuntary and a long one is a fault; `wait()` is voluntary and a long one is often a healthy idle worker.
@@ -556,8 +557,29 @@ parser splits on `.` at bracket depth and reports unbalanced brackets. A second 
 same file is a homonym, not a synonym, so the word is left where it already works. "Open" and "close" still read
 better with it than with *pair*, and that is not enough.
 
-**Debugger-measured**:
-A figure this server computed rather than read off the wire, labelled as such wherever it is printed. A
+**Unmeasurable** / **unmeasured** (of a **monitor pair**):
+Two different answers to "why is there no duration here", one letter apart in the reply and opposite in what
+a caller should do about them. **Unmeasurable**: no figure is *possible* for this arming, and the caller can
+change that — only one half of the pair is armed, or the stop point suspends, so the freeze between the two
+halves would *be* the duration. The reply names the fix (`arm the other half`, `trace:true`).
+**Unmeasured**: a figure was possible and this occurrence has none — no matching start was seen, because the
+pair opened before the stop point did, or the pending entry was evicted. Nothing to fix; it is a fact about
+that pair.
+_Avoid_: **unmeasurable** as an umbrella for both (the loose use this entry exists to stop — see below),
+zero, `0ms` (a duration that was not established is not a short one, which is the whole of **Monitor pair**'s
+"rather than printing a zero")
+
+**The word was already doing both jobs, and the reply text was the thing keeping them apart.** `<not
+measurable — the other half of this pair is not armed>` and `<not measured — no matching start was seen>` are
+distinct strings that tests match on exactly, so the code has never confused them. The *prose* has: ADR-0035
+and a threshold comment both say "an unmeasurable pair may have lasted 1 ms" about the second kind, and a
+test comment called a start-predates-arming pair "unmeasurable" while asserting on `<not measured`. A reader
+who greps the word they were given lands on the other case.
+
+**Which one you have decides whether a threshold is lying to you**, which is why this is worth a name rather
+than a footnote. A pair with no figure is dropped when a `min_duration_ms` is set (ADR-0035), so a caller
+asking for blocks over 200 ms never sees either kind. If they were **unmeasurable**, the silence is the
+arming's fault and fixable; if **unmeasured**, the silence is honest. Same empty output, opposite next step.
 **reported** figure is the debuggee's own account — a line number, a returned value, a `timed_out` flag — and
 the two must never be printed as though they were the same kind of thing.
 _Avoid_: elapsed; measured (unqualified — the point of the term is *whose* measurement it is)
