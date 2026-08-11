@@ -860,9 +860,9 @@ budget — filters after the event has already crossed the wire.
 *described* as filtering — "what you READ, not what crosses the wire". Both are already-shipped caller surface,
 so the glossary records the gap instead of asserting a purity the schema does not have, exactly as **Stop
 point** does for `bp_`/`breakpoint_id`. The reserved sense of the noun is still the debuggee's.
-Two hazards, each with its own term: a filter the debuggee accepts and does not apply is **inert**, and a
-filter naming an object or thread the debuggee has collected simply stops matching, which reads as *the code
-never ran*.
+Two hazards, each with its own term: a filter the debuggee accepts and does not apply is **inert**, and one
+it applied and can no longer match, because the thread or object it names is gone, is **unmatchable**. Both
+are silent, and both read as *the code never ran*.
 **The second hazard does not apply to an ARMED `InstanceOnly` filter, and the reason is a third fact about
 filters that is easy to get backwards.** Measured on Temurin 17/21/25 (FILT-9, ADR-0027): an armed
 `InstanceOnly` modifier holds a **strong** reference to its object, so the debuggee cannot collect what the
@@ -911,8 +911,10 @@ invisible in the protocol. ADR-0027 measured it; nothing chose it.
 The consequence a caller pays is real either way: an armed scoped stop point retains that object **and
 everything it references** on **the shared 8180**, which is why every arm reply states it rather than
 leaving it to the ADR. The consequence they *gain* is that while armed, the filter cannot silently stop
-matching — the debuggee cannot collect what it is holding — so the **vanished** hazard moves to the
-disable-then-re-arm cycle and lives nowhere else.
+matching — the debuggee cannot collect what it is holding — so for an `InstanceOnly` filter the
+**unmatchable** hazard moves to the disable-then-re-arm cycle and lives nowhere else. That reprieve belongs
+to this pin alone: a `ThreadOnly` filter buys none of it, which is why FILT-2 is a standing check rather
+than a note about one cycle.
 _Avoid_: pinned, on its own and unqualified (the bare word is on **held thread**'s avoid list for a
 different and still-correct reason — a *pinned thread* is an application state, and these are objects),
 retention, leak (the first is vague about who is holding, and the second says the debuggee is at fault for
@@ -1102,6 +1104,33 @@ mislead — so nothing turns on the missing term until it recurs.
 _Avoid_: unsupported (the debuggee took it — an unsupported modifier is one it *refuses*, which is the
 honest case and needs no word), ignored (true but reads as ours to fix)
 
+**Unmatchable**:
+A **filter** the debuggee applied and can no longer match, because the thread or object it names is gone.
+The request is still armed and the debuggee is still honouring it; nothing will ever satisfy it again.
+
+**Inert**'s opposite number, and the two are worth stating as a pair because their symptom is identical and
+their answer is the reverse. An inert filter was **never** in effect; an unmatchable one **was**, and its
+subject stopped existing. Both produce silence that reads as *the code never ran*, and the protocol reports
+neither.
+Which one you have decides the remedy, and nothing in the hit record can decide it — there is no hit. An
+unmatchable filter is re-armed against a live id and works again; an inert one will do the same nothing on
+the next arm and has to be refused up front.
+
+**On a `ThreadOnly` filter this is the ordinary case rather than the exotic one**, because a thread id is a
+weak reference and a pool retires its workers — see **vanished**. On an `InstanceOnly` filter it cannot
+happen *while armed*, the modifier being itself a strong reference (**filter pin**); there it lands on the
+disable → re-arm cycle instead, where the pin has been released. That asymmetry is why the two are checked
+by different commands and reported in different sentences.
+
+**It is reported rather than left to silence, which is most of why it earns a word.** `list_stop_points`
+marks the row `⚠️ FILTER THREAD 0x… IS GONE — this can never fire again`, `get_traces` says an empty buffer
+*cannot record anything* rather than *no hits*, and arming afresh with the stale id is refused as `not a
+live thread` rather than a bare `INVALID_OBJECT` (FILT-2). A caller who reads any of those three is being
+told the difference; one who reads only the absence of hits is not.
+_Avoid_: dead (on **finished**'s avoid list for reading as a fault, and here the pool retiring a worker is
+it doing its job), stale (taken by **stale bytecode**, and it suggests a refresh where the remedy is a
+re-arm), broken (nothing is — the filter did exactly what it was asked, to a subject that left)
+
 **Disarming stops future hits, not hits that already exist.** A stop point can be armed and gone while hits
 it caused are still unhandled — see **in-flight hit**. Treating "disarmed" as "silent" is what froze a
 debuggee in #72.
@@ -1176,7 +1205,7 @@ Listed by the JVM and already gone by the time the debugger asked about it — t
 is nothing to name or describe. A thread id is a weak reference, so on a pool that retires workers this is
 the ordinary case rather than the exotic one, and it is a third reason a dump is short, alongside the
 `limit` and the suspension budget. Distinct from **finished**: a finished thread is still readable as a
-row, a vanished one is only a count.
+row, a vanished one is only a count. A **filter** naming one is **unmatchable** from that moment.
 _Avoid_: dropped, lost (both suggest the debugger mislaid it)
 
 **Held thread**:
