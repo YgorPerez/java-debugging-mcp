@@ -36,9 +36,10 @@ line we cannot tokenize is one we must not guess about.
 
 **Quote-awareness covers the `echo` and never covered the heredoc**, and that gap was live for as long
 as this paragraph has claimed otherwise: a heredoc body is not quoted, so every line of it was lexed as
-though it were a command. `strip_heredoc_bodies` is what makes the sentence above true, and the rule it
-kept tripping was the soak loop firing on `git commit` messages. Note that a rule reading the RAW string
-— `LOOP_KEYWORD` — still sees a body, which is why that rule is only ever half of a test.
+though it were a command. `strip_heredoc_bodies` runs in `check` before anything reads the string, which
+is what makes the sentence above true of raw-string rules and the escape hatch as well as of the token
+walk. It cost two bugs in opposite directions: the soak-loop rule fired on `git commit` messages, and a
+message that merely MENTIONED `SKIP_JDWP_AGENT_GUARD=1` stood the entire guard down.
 
 TWO SEVERITIES, AND THE SPLIT IS DELIBERATE:
 
@@ -113,7 +114,21 @@ def check(command: str, cwd: str | Path | None = None) -> tuple[str, str]:
     is the same string in every host: a rule whose wording depends on where it fired is a rule two
     people describe differently.
     """
-    if not command or "SKIP_JDWP_AGENT_GUARD=1" in command:
+    if not command:
+        return "allow", ""
+
+    # BEFORE ANYTHING READS THE STRING, including the escape hatch below. A heredoc body is data on its
+    # way to a program's stdin, and every check here — the token walk, the raw-string ones, and the
+    # escape — was reading it as though it were part of the command.
+    #
+    # The escape is the case that matters most, and it is the reverse of a false positive: a body that
+    # merely MENTIONS `SKIP_JDWP_AGENT_GUARD=1` used to stand the whole guard down. So a commit message
+    # explaining the escape hatch — which the messages in this repo do — turned the guard off for its own
+    # commit, and `RUSTC_BOOTSTRAP=1 cargo test <<EOF … SKIP_… … EOF` was allowed outright. Found by
+    # noticing that a commit which should have tripped the soak rule went through *too* quietly.
+    command = strip_heredoc_bodies(command)
+
+    if "SKIP_JDWP_AGENT_GUARD=1" in command:
         return "allow", ""
 
     here = Path(str(cwd or os.getcwd())).resolve()
@@ -399,8 +414,13 @@ def strip_heredoc_bodies(command: str) -> str:
             if line.strip() == pending[0]:
                 pending.pop(0)
             continue
-        kept.append(line)
-        pending.extend(match.group("delim") for match in HEREDOC_START.finditer(line))
+        found = list(HEREDOC_START.finditer(line))
+        # The OPERATOR goes with its body, which is what makes this idempotent — and idempotence is
+        # load-bearing, not tidiness. Leaving `<<EOF` behind would make a second pass queue `EOF`, find
+        # no terminator (the first pass took it), and swallow every remaining line. A `<<` with nothing
+        # after it is meaningless anyway.
+        kept.append(HEREDOC_START.sub("", line) if found else line)
+        pending.extend(match.group("delim") for match in found)
     return "\n".join(kept)
 
 
@@ -411,9 +431,8 @@ def command_positions(command: str) -> list[list[str]] | None:
     Populates the module-level raw segments as a side effect, so rules that need the env prefix
     (`bootstraps_cargo`, `overrides_test_threads`) can see it while the rest get it stripped.
 
-    Heredoc bodies are removed first — see [`strip_heredoc_bodies`], and note that a rule reading the
-    RAW string (the loop keyword, for one) still sees them, which is why that rule is only ever half of
-    a test.
+    Heredoc bodies are stripped again here even though [`check`] has already done it — the function is
+    idempotent for exactly this reason, so a direct caller cannot get the unprotected behaviour.
     """
     global _RAW_SEGMENTS
     command = strip_heredoc_bodies(command)

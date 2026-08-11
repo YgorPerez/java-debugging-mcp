@@ -82,6 +82,14 @@ EOF'
 check allow "heredoc quoting a shard"      'gh issue comment 118 --body-file - <<EOF
 The recipe said; --shard 1/2 and it had moved.
 EOF'
+# THE SAME BUG IN THE OTHER DIRECTION, and this is the one that mattered. The escape hatch was tested
+# with `in command` against the RAW line, so a heredoc body that merely MENTIONED it stood the whole
+# guard down — and the commit messages in this repo mention it, because every deny names it. A commit
+# explaining the escape therefore ran with no guard at all, and the deny below was allowed outright.
+# Found by noticing a commit that should have tripped the soak rule went through TOO quietly.
+check deny  "escape merely quoted in a body" 'RUSTC_BOOTSTRAP=1 cargo test <<EOF
+every deny documents SKIP_JDWP_AGENT_GUARD=1 as its escape
+EOF'
 check allow "the wrapper script itself"     'scripts/integration-test.sh'
 check allow "the documented escape hatch"   'SKIP_JDWP_AGENT_GUARD=1 RUSTC_BOOTSTRAP=1 cargo test'
 
