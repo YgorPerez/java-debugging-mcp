@@ -3,7 +3,7 @@
   "name": "io.github.YgorPerez/java-debugging-mcp",
   "title": "Java Debugger (JDWP)",
   "description": "Native JDWP debugger: stop points, stack and variable inspection, expression evaluation.",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "repository": {
     "url": "https://github.com/YgorPerez/java-debugging-mcp",
     "source": "github",
@@ -14,7 +14,7 @@
     {
       "registryType": "npm",
       "identifier": "jdwp-mcp",
-      "version": "0.21.0",
+      "version": "0.22.0",
       "transport": {
         "type": "stdio"
       }
