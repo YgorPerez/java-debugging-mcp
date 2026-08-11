@@ -15852,12 +15852,30 @@ fn a_paired_monitor_snapshot_carries_a_debugger_measured_duration() {
     // returned as soon as the first such snapshot landed and then asserted a figure that had not arrived —
     // which flaked on JDK 11 under full-suite contention and passed everywhere else. `wait_for_traces`'
     // contract is that the needle must be something only the expected record has.
+    // Scoped to the two locks whose hold time this test knows (TEST-50, #182). `MonitorProbe` contends on
+    // four locks and only Fast (60ms) and Slow (400ms) are held for a duration anything here has claimed,
+    // so reading a figure off any other one would be asserting about a number nobody promised.
+    //
+    // **This narrowing is a guard, NOT the diagnosis, and the difference is recorded because the last
+    // wording here guessed and was wrong for a year.** The obvious suspect was a `NotifyLock` waiter
+    // re-acquiring the monitor its notifier still holds — a real contended pair, legitimately a millisecond
+    // or two. Measured on JDK 21 over an 8-second window: **21 FastLock pairs at 60–61ms and 4 SlowLock
+    // pairs at 400–401ms, and no contended pair on NotifyLock or TimeoutLock at all.** So that suspect is
+    // out, the distribution is tight and bimodal with no short outliers, and `measured=[8]`/`measured=[9]`
+    // remain unexplained. What the scoping buys is that the assertion below can no longer be *misread* as
+    // being about a lock it never covered.
+    let measured_on_a_known_lock = |line: &str| {
+        line.contains("measured by the DEBUGGER across both events")
+            && (line.contains("MonitorProbe$FastLock@0x") || line.contains("MonitorProbe$SlowLock@0x"))
+    };
     let traces = server
-        .wait_for_traces("measured by the DEBUGGER across both events", EVENT_TIMEOUT)
+        .wait_for_traces_where(EVENT_TIMEOUT, |traces| traces.lines().any(measured_on_a_known_lock))
         .unwrap_or_else(|| {
             panic!(
-                "no snapshot carried a debugger-measured duration. A `blocked_for=` alone is not enough — an \
-                 unmeasurable pair has one too.\n  traces: {}",
+                "no snapshot carried a debugger-measured duration for FastLock or SlowLock. A \
+                 `blocked_for=` alone is not enough — an unmeasurable pair has one too, and a NotifyLock \
+                 re-acquisition is a measured pair whose duration this test has made no claim about.\n  \
+                 traces: {}",
                 server.call("debug.get_traces", serde_json::json!({}))
             )
         });
@@ -15869,25 +15887,37 @@ fn a_paired_monitor_snapshot_carries_a_debugger_measured_duration() {
         &["<pending — this is where it started"],
     );
 
-    // A real figure, and one that matches the probe's own hold time. FastLock is held 60ms and SlowLock
-    // 400ms, so anything under 10ms would mean the pairing matched the wrong two events.
+    // A real figure, and one that matches the probe's own hold time — read ONLY off the two locks that
+    // have one (TEST-50, #182). Parsing every `blocked_for=` in the buffer is what made this test read a
+    // NotifyLock re-acquisition and call it an arithmetic fault.
     let measured: Vec<i64> = traces
         .lines()
+        .filter(|l| measured_on_a_known_lock(l))
         .filter_map(|l| {
             let (_, after) = l.split_once("blocked_for=")?;
             after.split("ms ").next()?.trim().parse().ok()
         })
         .collect();
-    // >= 10ms, and the probe is what makes that a sound inference rather than a hopeful one: each holder waits
-    // for its contender to report BLOCKED before it starts counting its hold, so a measured block is >= the
-    // 60ms (fast) or 400ms (slow) hold on any runner. Before that, the contender's own 1ms spin could be
-    // descheduled deep into the hold window and block legitimately briefly — CI reported `measured=[8]` on
-    // JDK 11 while five other legs passed, and the old wording here blamed the pairing for it.
+    // >= 10ms, and TWO things make that a sound inference rather than a hopeful one. The probe's holders wait
+    // for their contender to report BLOCKED before counting the hold (TEST-38, #96), so a Fast/Slow block is
+    // >= 60ms on any runner rather than a function of when a 1ms spin got descheduled. And the lines read
+    // above are Fast/Slow only (TEST-50, #182), so no other lock's duration can arrive here at all.
+    //
+    // The wording matters, because this message has been wrong once already: it asserted that runner load
+    // was ruled out and therefore any short figure was "a pairing or arithmetic fault", which sent the next
+    // reader hunting a logic bug that was never there. The figure was right; the LOCK was not the one the
+    // sentence was about. So this says what is checked and leaves the conclusion to whoever reads the data.
     assert!(
         measured.iter().any(|ms| *ms >= 10),
-        "no measured block reached 10ms. The probe now guarantees >= 60ms by waiting for its contender to be \
-         BLOCKED before timing the hold, so this is a pairing or arithmetic fault rather than runner load. \
-         measured={measured:?}"
+        "no FastLock or SlowLock block reached 10ms, though the probe holds them 60ms and 400ms and does not \
+         start counting until its contender is BLOCKED. measured={measured:?} — Fast/Slow only, so a figure \
+         from another lock cannot reach this list.\n\
+         \n  READ THE PROBE OUTPUT BELOW FIRST. An `awaitBlocked CAP HIT` line means the holder gave up \
+         waiting for its contender and timed nothing, which makes a short block correct and this assertion \
+         the thing that is wrong. NO such line means the cap is exonerated and the fault is on our side of \
+         the wire — which is the half that has never yet been established (TEST-50, #182).\n\
+         \n  traces: {traces}\n  probe output: {:?}",
+        probe.output()
     );
 
     assert_still_ticking(&probe, before, "a paired monitor snapshot left the VM suspended");

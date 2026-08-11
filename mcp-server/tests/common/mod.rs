@@ -2225,10 +2225,25 @@ impl Server {
     /// Traces arrive without suspending anything, so unlike `wait_for_event` there is no hit to
     /// synchronise on — a test either polls or races the debuggee.
     pub fn wait_for_traces(&mut self, needle: &str, timeout: Duration) -> Option<String> {
+        self.wait_for_traces_where(timeout, |traces| traces.contains(needle))
+    }
+
+    /// [`Self::wait_for_traces`] where "the record I am waiting for" is not one substring (TEST-50, #182).
+    ///
+    /// **Needed because "the record I want" can be a conjunction, and a single substring cannot express
+    /// one.** `MonitorProbe` contends on four locks and only two have a hold time its tests know, so
+    /// waiting on "a measured pair exists" could return on a pair the assertion had made no claim about.
+    /// Whether that ever actually happened is unresolved (#182) — this exists so the question cannot be
+    /// begged either way.
+    pub fn wait_for_traces_where(
+        &mut self,
+        timeout: Duration,
+        matches: impl Fn(&str) -> bool,
+    ) -> Option<String> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             let traces = self.call("debug.get_traces", serde_json::json!({}));
-            if traces.contains(needle) {
+            if matches(&traces) {
                 return Some(traces);
             }
             std::thread::sleep(Duration::from_millis(150));

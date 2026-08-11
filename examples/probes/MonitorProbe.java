@@ -155,6 +155,18 @@ public class MonitorProbe {
         while (t.getState() != Thread.State.BLOCKED && System.currentTimeMillis() < deadline) {
             sleep(1);
         }
+        // SAY SO WHEN THE CAP WINS (TEST-50, #182). Past the cap the hold proceeds with nobody queued, so
+        // the contender blocks somewhere inside the hold and its measured block is short — legitimately,
+        // and for a reason no test could previously tell apart from a mispairing. Two CI failures reported
+        // `measured=[8]` and `measured=[9]` with no way to check this, and measuring the probe on an idle
+        // box cannot settle it: 25 pairs came back at 60/61ms and 400/401ms with no short outlier at all.
+        // So this prints, once per occurrence, and a failing test dumps the probe's output next to the
+        // figure. If a future failure shows no such line, the cap is exonerated and the fault is on our
+        // side of the wire.
+        if (t.getState() != Thread.State.BLOCKED) {
+            System.out.println("awaitBlocked CAP HIT after " + BLOCK_WAIT_CAP_MS + "ms: "
+                + t.getName() + " never reached BLOCKED, so this hold is untimed and its block will be short");
+        }
     }
 
     /** Queue on a lock that is demonstrably owned, then acquire it once the holder lets go. */
