@@ -33,6 +33,29 @@ EVT-2 (#32) sharpened this. Push notifications assume one client with one lifeti
 on a single `notifications/initialized` and feeds one outbound queue owned by one writer task. With
 several clients, "notify the caller" stops having an obvious referent.
 
+**Corrected by MCP-1 (#180, ADR-0047), 11 Aug 2026: the verdict stands and two of the arguments above
+have moved, in opposite directions.** Worth stating precisely, because someone will otherwise notice
+the drift on their own and read it as the refusal expiring.
+
+*The decisive reason is aimed one word off.* MCP `2026-07-28` tells clients not to treat the stdio
+process as the boundary of a piece of work, and servers not to infer context from a connection at all
+— so "client lifetime is session lifetime" was never a property stdio guaranteed, only a convention
+stdio clients happened to follow, and the revision withdraws even that. What actually differs over
+HTTP is **concurrency**, not lifetime: several clients at once, with no obvious referent for "the
+caller". This file's own reopening bar already says exactly that — *a use case that genuinely needs
+more than one concurrent client* — so the bar was better aimed than the reason it was written under.
+
+*The EVT-2 argument is the one that weakened.* A client on `2026-07-28` gets no push at all: the
+notification is request-scoped and a JDWP hit belongs to no request, so its alerts go to stderr. The
+"one outbound queue, one referent" objection therefore applies only to legacy clients now.
+
+*And the mechanics got easier, which changes nothing here.* The same revision deleted `Mcp-Session-Id`
+and SSE stream resumability — two of the fiddliest parts of the HTTP transport. Cheaper to build was
+never the objection.
+
+Net: unchanged. Read the bar below rather than the reasons above, and note that `session` is a defined
+term in `CONTEXT.md` since MCP-1 precisely because this file's use of it is the loaded one.
+
 ```rust
 // The single-writer invariant EVT-2 rests on. One channel, one owner, one client:
 let (out_tx, mut out_rx) = mpsc::channel::<String>(NOTIFY_CAPACITY);

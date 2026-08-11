@@ -1002,10 +1002,42 @@ impl RequestHandler {
             ""
         };
         Ok(format!(
-            "Connected to JVM at {host}:{port} (session: {session_id}){ro}{}{}",
+            "Connected to JVM at {host}:{port} (session: {session_id}){ro}{}{}{}",
             describe_session_default(&session_exprs, session_expr_note.as_deref()),
-            describe_session_step_filter(a.step_exclude_classes.as_deref(), a.step_only_classes.as_deref())
+            describe_session_step_filter(a.step_exclude_classes.as_deref(), a.step_only_classes.as_deref()),
+            self.describe_new_session_ambiguity(&session_id).await
         ))
+    }
+
+    /// Say when this attach or launch has made an omitted `session_id` ambiguous (MCP-1, ADR-0048).
+    ///
+    /// **Reported where the ambiguity is CREATED, not on every later reply**, and that placement is the
+    /// decision. A second live session is the moment the **current session** default stops being
+    /// obviously right, it is the moment a caller can act on it, and it is one site instead of the
+    /// thirty-nine that resolve a session. Repeating it on every subsequent reply would also be the
+    /// kind of noise a reader learns to skip, which is the opposite of reporting.
+    ///
+    /// The hazard is specific rather than theoretical: MCP 2026-07-28 permits a client to interleave
+    /// unrelated work on one process, so two conversations can each attach, and a `debug.force_return`
+    /// or `debug.resume_thread` that omits `session_id` then resolves against whichever attach happened
+    /// last — a write to a debuggee nobody asked about, and one of them may be the shared 8180.
+    ///
+    /// Empty while one session is live, which is the overwhelmingly common case and unambiguous by
+    /// construction.
+    async fn describe_new_session_ambiguity(&self, just_opened: &str) -> String {
+        let (sessions, _) = self.session_manager.list().await;
+        if sessions.len() < 2 {
+            return String::new();
+        }
+        format!(
+            "\n   ⚠️  {} sessions are now live, so an OMITTED session_id is no longer unambiguous: it \
+             resolves against the CURRENT session, which this call just made {just_opened}. Pass \
+             session_id explicitly while more than one is attached — debug.list_sessions names them, \
+             debug.set_current_session changes which one a bare call reaches. This matters most for \
+             debug.force_return, debug.resume_thread and debug.set_value, where the wrong session means \
+             writing to a JVM you were not asking about.",
+            sessions.len()
+        )
     }
 
     /// The session's `trace_expr` default, read without holding a stop-point handler's own guard.
@@ -1204,7 +1236,8 @@ impl RequestHandler {
             + &describe_session_step_filter(
                 a.step_exclude_classes.as_deref(),
                 a.step_only_classes.as_deref(),
-            ))
+            )
+            + &self.describe_new_session_ambiguity(&session_id).await)
     }
 
     /// Choose which session an omitted `session_id` resolves to (SESS-1, #157).

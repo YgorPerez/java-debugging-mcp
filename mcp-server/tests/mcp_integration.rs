@@ -12469,10 +12469,28 @@ fn the_current_session_can_be_switched_and_an_omitted_session_id_follows_it() {
     let mut server = Server::start().expect("start server");
 
     let first = Probe::launch(&jdk, "ExcProbe").expect("launch the first probe");
-    let first_id = session_id_from(&server.attach(first.port)).expect("no session id in attach reply");
+    let first_reply = server.attach(first.port);
+    let first_id = session_id_from(&first_reply).expect("no session id in attach reply");
     let second = Probe::launch(&jdk, "WatchProbe").expect("launch the second probe");
-    let second_id = session_id_from(&server.attach(second.port)).expect("no session id in attach reply");
+    let second_reply = server.attach(second.port);
+    let second_id = session_id_from(&second_reply).expect("no session id in attach reply");
     assert_ne!(first_id, second_id, "each attach must get its own session");
+
+    // ADR-0048: the SECOND attach is the moment an omitted session_id stops being unambiguous, so that is
+    // where it is reported — once, where a caller can act on it, rather than on every later reply.
+    //
+    // The first attach must stay silent, and that half is the assertion that keeps this honest: a warning
+    // on every attach would be noise a reader learns to skip, which is the opposite of reporting. It is
+    // also what makes the common case — one session, unambiguous by construction — cost nothing.
+    assert!(
+        !first_reply.contains("sessions are now live"),
+        "one session is unambiguous, so the first attach must not warn:\n{first_reply}"
+    );
+    assert_contains_all(
+        "the second attach says an omitted session_id is now ambiguous, and where that is a WRITE",
+        &second_reply,
+        &["2 sessions are now live", "session_id", "debug.force_return", "debug.set_current_session"],
+    );
 
     // Baseline: the SECOND attach is current. That is the behaviour this tool makes revisable, so if it
     // is not true here the arms below prove nothing.

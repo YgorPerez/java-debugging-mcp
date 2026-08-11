@@ -111,6 +111,32 @@ though it ended the call), orphaned (discouraged for an **in-flight hit** alread
 same reason — it suggests something that may be dropped), hung (suggests the debuggee is stuck, when it is
 usually only slow)
 
+**Session**:
+One live attachment to one **debuggee**, named by a `session_id` this server minted and handed back. Several
+may be live at once (`debug.list_sessions`), which is why the id exists at all.
+
+**Defined late, and only because the protocol took the word away.** Every entry below used it undefined and
+one of them says out loud that it is "separately loaded here"; that was survivable while it had one meaning.
+MCP `2026-07-28` removed protocol-level sessions outright — no `Mcp-Session-Id`, and *an open connection,
+such as a STDIO process, is not a conversation or session* — so the word now names something the protocol
+says does not exist, and the two meanings must be told apart:
+
+- **A session here is a JVM attachment.** It is application state, it is addressed by an explicit id passed
+  as an ordinary tool argument, and that is exactly the shape the stateless revision *prescribes* for state
+  spanning requests. `session_id` is not a protocol session and never was.
+- **An MCP session is gone.** Nothing here has one, and a reader who conflates them will conclude this
+  server leans on connection-scoped state, which would make it non-conformant. It does not.
+
+**The one place the distinction bites is an OMITTED `session_id`**, which resolves against the **current
+session** — a value an earlier request established. That is application state inferred from a previous
+request rather than passed on this one, and it is the only thing in this vocabulary the stateless model has
+an opinion about. ADR-0048 keeps it, on the reading that the rule governs protocol context and not a tool's
+arguments, and has `debug.attach` say so the moment a **second** session makes an omitted id ambiguous —
+because two interleaved conversations can otherwise send a write to the JVM the other one attached.
+_Avoid_: MCP session (abolished by `2026-07-28`, and the reason this entry exists), connection, process,
+stream (none of them is a session — the identification is what the revision denies), conversation (the
+client's, and it may interleave unrelated work on one process)
+
 **Attached** / **launched**:
 Whose JVM it is — the fact every safety default here is derived from. An **attached** debuggee was started by
 somebody else and is *presumed* shared, so suspending it may be stalling a request nobody told you about,
@@ -943,8 +969,14 @@ The armed stop points of a session written as the list of `debug.set_*` calls th
 the client stores: this server writes no file and reads none (ADR-0041).
 
 Its own term because it is neither the live set nor a listing of one, but a *description* of one — which
-survives the process the live set dies with. Under stdio the client's lifetime **is** the session's, so
-tomorrow's investigation starts with no stop points at all.
+survives the process the live set dies with. The live set dies with the process, so tomorrow's investigation
+starts with no stop points at all.
+
+This used to read "under stdio the client's lifetime **is** the session's", and MCP `2026-07-28` is why it no
+longer does: a client is now told *not* to treat the stdio process as the boundary of a piece of work, so an
+identity that read as a fact about the transport is at most a fact about one client's habits. The
+consequence is unchanged and the argument for exporting is stronger — if the process boundary is nobody's
+unit of work, a description that outlives it is the only thing that can be.
 
 **It carries what the caller asked for, never what the resolver worked out.** The line or the method they named,
 not the method a line turned out to sit in. Written down because the first version had it the other way round —

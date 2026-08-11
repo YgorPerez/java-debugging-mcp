@@ -56,8 +56,13 @@ names no filter of its own uses it, so the container/JDK/ORM exclusion list is s
 every step — and a step that DOES name exclude_classes or only_classes uses exactly what it named, with this
 default not merged in. Optional trace_expr does the same for stop points that name none. Concurrent sessions
 are supported: the newest becomes current, every tool takes an optional session_id, and debug.list_sessions
-finds one you lost. Attaching suspends nothing and changes nothing in the debuggee — though a JVM started with
-suspend=y is already frozen at startup waiting for you, and debug.continue is what releases it.
+finds one you lost. WHILE MORE THAN ONE IS LIVE, PASS session_id EXPLICITLY: an omitted one resolves against
+the CURRENT session, which is whichever attach happened last — so two pieces of work sharing this server can
+each attach and then send a call to the other's JVM. debug.force_return, debug.resume_thread and
+debug.set_value are where that is a WRITE to a debuggee you were not asking about. This reply says so the
+moment a second session makes an omitted id ambiguous, and debug.set_current_session changes which one a bare
+call reaches (ADR-0048). Attaching suspends nothing and changes nothing in the debuggee — though a JVM started
+with suspend=y is already frozen at startup waiting for you, and debug.continue is what releases it.
 
 ## debug.check_stale
 Is the JVM running the code you just compiled, or an older build? Compares the line tables the JVM holds for a
@@ -336,8 +341,9 @@ server's stdout is the MCP transport — the last lines come back from debug.dis
 JVM dies during startup, which is what turns "could not connect" into "your classpath was wrong, here is what
 java said". Optional step_exclude_classes / step_only_classes set the session's step filter the same way
 debug.attach does (STEP-2) — a default for every debug.step_* call that names none, never merged into one that
-does. NOT for app servers: a long-running deployment should be started however it normally is and attached to
-with debug.attach.
+does. A launch also becomes the CURRENT session, so if one was already live an omitted session_id now resolves
+to this new one — the reply says so, and passing session_id explicitly is the fix (ADR-0048). NOT for app
+servers: a long-running deployment should be started however it normally is and attached to with debug.attach.
 
 ## debug.list_classes
 List the classes the debuggee has actually LOADED — the first step when you do not already know the
