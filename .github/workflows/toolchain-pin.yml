@@ -53,21 +53,27 @@ jobs:
     # advisory, so a red run here is news rather than a broken build.
     name: Doctor on next stable (advisory — gates nothing)
     runs-on: ubuntu-latest
-    # CI-10 (#172). 8 s observed — BUT ONLY ON THE FAST PATH, and quoting that number as the budget would be
-    # the mistake this repo keeps writing post-mortems about. Every run so far has found the pin current and
-    # stopped at the comparison step; the scan path below has never executed on a runner. So the derivation
-    # is the gate's own `health` job, 69 s warm, times the fact that this one passes `cache: "false"`
-    # deliberately and therefore lints the whole dependency graph from scratch. See tests.yml's `changes`
-    # job for the general argument.
+    # CI-10 (#172). 62 s observed ON THE SLOW PATH — the one this job exists for — with 20 for headroom, the
+    # same shape as every other cold job here. See tests.yml's `changes` job for the general argument.
     #
-    # STILL NOT RE-DERIVED FROM A RUNNER, and BUILD-3 (#174) asked for that. What exists is the scan path
-    # run for the first time end to end — `scripts/doctor.sh --sarif --fail-on none`, 41 s, 122 KB of SARIF,
-    # 183 results — on a 16-core dev box with a warm cargo cache and the PINNED toolchain. That figure says
-    # the plumbing works and says almost nothing about this job's budget, which is a cold runner on a
-    # toolchain it has just installed. Left at 30 until a `workflow_dispatch` run against a lowered pin
-    # produces the real one: replacing a reasoned budget with a measurement from a gentler machine is the
-    # same error as reasoning one, with a number attached to make it look otherwise.
-    timeout-minutes: 30
+    # RE-DERIVED FROM A RUNNER, which is what BUILD-3 (#174) asked for and what the previous 30 could not
+    # claim. Every scheduled run had found the pin current and stopped at the comparison step in ~8 s, so
+    # the scan below had never executed on a runner and the budget was reasoned from the gate's `health`
+    # job instead. Run 31506222675 (2026-08-11) forced it: `workflow_dispatch` on a throwaway branch whose
+    # only change was `channel = "1.96.0"`, making `behind` true. Every step ran.
+    #
+    #   Rust in use: 1.97.1 (asked for 'stable', from the call site)   <- the request governed, not the pin
+    #   scan step 49 s · whole job 62 s · SARIF 133,828 B, 201 results, driver rust-doctor 0.2.0
+    #
+    # Both halves of that are load-bearing. The `Rust in use:` line is why the number means anything —
+    # rust-toolchain.toml outranks `rustup default`, so a job that asked for `stable` and silently got the
+    # pin would have produced a figure for the wrong compiler. And the SARIF was read back from the
+    # artifact rather than inferred from the green tick: 201 results all at `note` level is why the run
+    # reported "clean", whereas an empty SARIF would have reported the same thing and taken the same time.
+    #
+    # 49 s of the 62 is the scan, cold — this job passes `cache: "false"` deliberately, so there is no warm
+    # case to be surprised by. A run WITH findings adds only the formatting of up to 50 rows.
+    timeout-minutes: 20
 
     env:
       # Same reason as rust-doctor.yml: rust-doctor injects a temporary `<crate>/clippy.toml` into any
