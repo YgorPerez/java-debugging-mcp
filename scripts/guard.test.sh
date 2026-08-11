@@ -69,6 +69,19 @@ check allow "unbalanced quote"              'echo "unterminated'
 check allow "heredoc naming BOOTSTRAP"      'cat <<EOF
 RUSTC_BOOTSTRAP=1 cargo test
 EOF'
+# THE CASE ABOVE WAS PASSING BY ACCIDENT, and these two are why it needed company. Its body holds no
+# `;`, so the whole line lexed as ONE segment whose argv[0] is `cat` — nothing about the heredoc was
+# being skipped, the body simply never started a segment of its own. Add a semicolon, which every
+# commit message in this repo has, and the body's second half becomes an argv beginning `cargo test`.
+# Found in the wild: the soak-loop rule fired on a `git commit` whose body said
+# "Verified: cargo fmt clean; cargo test 319 passed" and whose prose happened to contain "while".
+check allow "commit message quoting a run" 'git commit -F - <<'"'"'EOF'"'"'
+One site, not thirty-nine, while a caller can act.
+Verified: cargo fmt clean; cargo test 319 passed, 0 failed.
+EOF'
+check allow "heredoc quoting a shard"      'gh issue comment 118 --body-file - <<EOF
+The recipe said; --shard 1/2 and it had moved.
+EOF'
 check allow "the wrapper script itself"     'scripts/integration-test.sh'
 check allow "the documented escape hatch"   'SKIP_JDWP_AGENT_GUARD=1 RUSTC_BOOTSTRAP=1 cargo test'
 

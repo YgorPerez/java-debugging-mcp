@@ -34,6 +34,12 @@ stay data, while chained and env-prefixed real invocations (`cargo build && git 
 `A=1 cargo test`) are still seen. An unbalanced quote returns None and the guard stands down: a
 line we cannot tokenize is one we must not guess about.
 
+**Quote-awareness covers the `echo` and never covered the heredoc**, and that gap was live for as long
+as this paragraph has claimed otherwise: a heredoc body is not quoted, so every line of it was lexed as
+though it were a command. `strip_heredoc_bodies` is what makes the sentence above true, and the rule it
+kept tripping was the soak loop firing on `git commit` messages. Note that a rule reading the RAW string
+— `LOOP_KEYWORD` — still sees a body, which is why that rule is only ever half of a test.
+
 TWO SEVERITIES, AND THE SPLIT IS DELIBERATE:
 
   deny()  — the command is silently wrong. It will appear to work and produce an answer that is
@@ -90,6 +96,10 @@ SHARD_VALUE = re.compile(r"^(\d+)/(\d+)$")
 # `--test-threads=16`. The bare `--test-threads` form is matched by token with a digit required after it.
 THREADS_JOINED = re.compile(r"^--test-threads=\d+$")
 LOOP_KEYWORD = re.compile(r"\b(for|while|until)\b")
+
+# The start of a heredoc: `<<WORD`, `<<'WORD'`, `<<"WORD"`, or the tab-stripping `<<-WORD`. The
+# `(?!<)` is load-bearing — `<<<` is a here-STRING, which is one line with no body to skip.
+HEREDOC_START = re.compile(r"<<(?!<)-?\s*(?P<q>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_]*)(?P=q)")
 
 
 def check(command: str, cwd: str | Path | None = None) -> tuple[str, str]:
@@ -349,14 +359,64 @@ def find_repo_root(cwd: Path) -> Path | None:
     return None
 
 
+def strip_heredoc_bodies(command: str) -> str:
+    """Drop the BODY of every heredoc, keeping the command that opened it.
+
+    **This makes good on a promise the module docstring above already makes.** It says the reason for a
+    token walk is that this repo's commands routinely *mention* the guarded thing as data — "a heredoc
+    writing a doc, an `echo` of a recipe" — and that `shlex` being quote-aware keeps those as data. That
+    is true of the `echo`, whose recipe is inside quotes. It was never true of the heredoc: a body is not
+    quoted, so every line of it was lexed as though it were a command.
+
+    Found in the wild, twice in one session, on the shape every commit message in this repo has:
+
+        git commit -F - <<'EOF'
+        One site, not thirty-nine, while a caller can act.
+        Verified: cargo fmt clean; cargo test 319 passed, 0 failed.
+        EOF
+
+    `;` starts a segment, so `cargo test 319 passed` became an argv whose first two tokens are `cargo`
+    and `test`; `while` in the prose satisfied the loop keyword; and the soak-loop rule fired on a
+    `git commit`. Every token-scoped rule had the same exposure — the fix is here, in the parse, rather
+    than in any one rule.
+
+    A body is data being passed to a program's stdin, so no rule should ever read it. The one form where
+    that is arguable is `bash <<EOF`, where the body really is commands — and it does not matter, because
+    this guard is advisory by construction: every deny documents `SKIP_JDWP_AGENT_GUARD=1` as its escape,
+    so there is nothing here to smuggle past. A false positive is the expensive failure, and CLAUDE.md
+    says why: a guard that trips on a heredoc gets switched off within the day.
+
+    The terminator is matched with `strip()` rather than at column 0 as POSIX requires for a plain `<<`.
+    Deliberately lenient: erring toward skipping more of a body can only reduce false positives, while
+    being strict about indentation would leave them in.
+    """
+    kept: list[str] = []
+    # Delimiters awaiting their bodies, in the order the shell will consume them — `cmd <<A <<B` reads
+    # A's body first, then B's.
+    pending: list[str] = []
+    for line in command.split("\n"):
+        if pending:
+            if line.strip() == pending[0]:
+                pending.pop(0)
+            continue
+        kept.append(line)
+        pending.extend(match.group("delim") for match in HEREDOC_START.finditer(line))
+    return "\n".join(kept)
+
+
 def command_positions(command: str) -> list[list[str]] | None:
     """Split a command line into the argv of each pipeline/list segment.
 
     Returns None when the line cannot be tokenized — an unbalanced quote means we should not guess.
     Populates the module-level raw segments as a side effect, so rules that need the env prefix
     (`bootstraps_cargo`, `overrides_test_threads`) can see it while the rest get it stripped.
+
+    Heredoc bodies are removed first — see [`strip_heredoc_bodies`], and note that a rule reading the
+    RAW string (the loop keyword, for one) still sees them, which is why that rule is only ever half of
+    a test.
     """
     global _RAW_SEGMENTS
+    command = strip_heredoc_bodies(command)
     try:
         # `punctuation_chars=True` is what makes `;`, `|`, `&&` separate tokens. Plain
         # `shlex.split` splits on whitespace only, so `$(seq 40); do cargo test` yields the single
