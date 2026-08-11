@@ -2983,25 +2983,116 @@ fn a_thread_filter_holds_against_a_real_pool_of_reused_threads() {
          probe's last heartbeat: {:?}\n{threads}",
         probe.output().iter().rev().find(|l| tick_pool_size(l).is_some())
     );
-    let target = threads
-        .lines()
-        .find_map(|l| l.strip_prefix("0x").map(|_| l.split_whitespace().next().unwrap_or("")))
-        .filter(|t| t.starts_with("0x"))
-        .unwrap_or_else(|| panic!("no pool worker id in:\n{threads}"))
-        .to_string();
-
-    let armed = server.call(
-        "debug.set_exception_stop",
-        serde_json::json!({
-            "class_pattern": "PoolProbe$PoolException",
-            "trace": true, "trace_max_hits": 0, "thread_id": target,
-        }),
-    );
-    assert!(armed.contains("exc_"), "filtered exception breakpoint failed to arm: {armed}");
-
-    let traces = server.wait_for_traces("PoolProbe.doWork", EVENT_TIMEOUT).unwrap_or_else(|| {
-        panic!("{}", diagnose_missing_trace(&mut server, &probe, base, &target));
+    // TEST-49 (#178): the worker this filter pins to is chosen from a HIT, not from the listing above.
+    //
+    // This test was the un-fixed twin of TEST-42 (#127). Its neighbour
+    // `a_filter_pinned_to_a_retired_thread_reports_itself_as_dead` used to take
+    // `debug.list_threads`'s first `pool-worker` and then wait `EVENT_TIMEOUT` for *that* worker to throw;
+    // it timed out about 1 run in 24, and its message blamed the filter for the test's own choice of
+    // thread. #127 inverted the selection — arm UNFILTERED, take the thread off the first recorded hit —
+    // so that the chosen worker is by construction one that runs `doWork`. This test kept the old shape,
+    // and #178 is the same defect arriving on CI: a listing proves only that a thread EXISTED when the
+    // listing was taken, and `PoolProbe` retires an idle worker after `KEEP_ALIVE_MS`.
+    //
+    // So the selection is fixed the way it was fixed next door, rather than a retry being wrapped around
+    // the selection that is known to be wrong.
+    let setup_by = std::time::Instant::now() + EVENT_TIMEOUT;
+    let (mut target, mut armed_id) = scout_and_arm(&mut server, &probe, setup_by).unwrap_or_else(|| {
+        panic!(
+            "no scouted worker survived long enough to be armed within {EVENT_TIMEOUT:?}, so the filter was \
+             never pointed at anything — a SETUP failure rather than a filtering one. The probe's last \
+             heartbeat: {:?}",
+            probe.output().iter().rev().find(|l| tick_pool_size(l).is_some())
+        )
     });
+
+    // A scouted worker was serving a task moments ago, which makes retirement unlikely — not impossible.
+    // Under the contention that produced #178 the submit loop itself starves and the pool churns
+    // wholesale, so the residual race is covered too: when the JVM says the filter's thread is GONE, the
+    // test re-scouts and re-arms instead of failing.
+    //
+    // A re-arm happens on that reading and never on any other, which is what keeps this from being the
+    // whole-test retry the issue rejected. A retry would hide a genuine filter regression; this cannot,
+    // because the two readings are told apart by asking the JVM which one it is — a filter dropping events
+    // it should keep leaves its thread ALIVE, and a live thread is never re-armed away from. The worker's
+    // identity is incidental to what is asserted below ("exactly ONE thread out of 200"), which is why
+    // re-arming is sound at all; pinning one particular pool worker is the part that races.
+    //
+    // The budget is a DEADLINE rather than a per-attempt slice. An earlier draft gave each of three
+    // attempts `EVENT_TIMEOUT / 3`, which is wrong in both directions: a worker retired at t=1s still
+    // burned 8s before the re-arm, and a healthy worker that had not been handed a task within 8s would
+    // have been called a filter regression on the strength of a budget nobody measured. `LIVENESS_POLL`
+    // bounds how long a dead pin goes unnoticed; it is far over the ~150 ms a live worker needs (200
+    // workers, ~1333 throws/s), so a healthy run pays nothing — the first poll returns the traces.
+    //
+    // Both branches below were exercised against a real JVM before this shipped, by temporarily driving
+    // `PoolProbe`'s `quiesce`/`resume` cues under the armed filter (recovers: one re-arm, 10.6s) and by
+    // temporarily pinning to the live-but-never-throwing `cue-reader` thread (fails at 25s with zero
+    // re-arms, which is the regression this must never absorb). A recovery path nobody has run is the
+    // thing that put this test here.
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+    let mut rearms = 0u32;
+    let mut armed_at = std::time::Instant::now();
+    let traces = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if let Some(t) = server.wait_for_traces("PoolProbe.doWork", LIVENESS_POLL.min(left)) {
+            break t;
+        }
+
+        // Nothing recorded yet. Which of the two readings this is decides whether re-arming is honest, so
+        // ask the SERVER, which volunteers the answer: a request whose filter thread has died says "FILTER
+        // THREAD 0x… IS GONE" in its own row (FILT-2). That is the authoritative signal and the only one
+        // that licenses a re-arm.
+        //
+        // An earlier draft inferred it instead, from the target's absence from a `debug.list_threads`
+        // listing filtered to `name~"pool-worker"` — which cannot tell "retired" from "did not match the
+        // name filter", and duly re-armed away from a live thread that was never going to throw. That is
+        // the exact regression-hiding the issue forbids, and it took a negative control to see it.
+        let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+        if !reports_a_dead_filter(&listed, &armed_id) {
+            // The thread the filter names is alive and the site throws on every task, so a filter that
+            // works has had its chance. Keep waiting on THIS id while the budget lasts: this is the reading
+            // the test exists to catch, and re-arming away from it would hide it.
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing was recorded within the {EVENT_TIMEOUT:?} budget and the filtered thread {target} \
+                 is STILL ALIVE — watched for {:?} of it, after {rearms} re-arm(s). With no re-arm that \
+                 reading is the filter dropping events it should have kept, which is the regression this \
+                 test exists to catch; after a re-arm the budget may instead have gone on workers the pool \
+                 kept retiring, and the `pool=` heartbeat below says which (TEST-49, #178).\n{}",
+                armed_at.elapsed(),
+                diagnose_missing_trace(&mut server, &probe, base, &target, &armed_id)
+            );
+            continue;
+        }
+
+        // FILT-2's documented case: the pool retired the thread the filter is pinned to, so the stop point
+        // can never fire again and the server says exactly that, unprompted. This is the branch that acts
+        // on that diagnosis instead of reporting it as a failure.
+        //
+        // A worker can throw and THEN be retired, and `wait_for_traces` last read the buffer up to 150 ms
+        // before this listing, so read it once more before concluding the filter never fired.
+        let settled = server.call("debug.get_traces", serde_json::json!({}));
+        if settled.contains("PoolProbe.doWork") {
+            break settled;
+        }
+        rearms += 1;
+        // Clear first: two filtered requests on the same site would make "exactly ONE thread reported"
+        // ambiguous about which filter did the excluding.
+        server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": armed_id}));
+        let Some((next, id)) = scout_and_arm(&mut server, &probe, deadline) else {
+            panic!(
+                "the pool retired the filtered worker {rearms} time(s) and the {EVENT_TIMEOUT:?} budget ran \
+                 out before one survived long enough to throw, so the filter was never given a chance to \
+                 hold. That is a probe/load problem rather than a filtering one — the pool is churning \
+                 workers faster than a task reaches one. Check the probe's `pool=` heartbeat before looking \
+                 at the filter.\n{}",
+                diagnose_missing_trace(&mut server, &probe, base, &target, &armed_id)
+            )
+        };
+        (target, armed_id) = (next, id);
+        armed_at = std::time::Instant::now();
+    };
 
     // The assertion that matters: exactly ONE thread reported, out of 200 running the same code.
     let seen: std::collections::BTreeSet<&str> = traces
@@ -4824,12 +4915,19 @@ fn subscript_writes_and_map_entry_filters() {
 /// them: the stop-point listing (armed? disabled? filtered to a dead thread?), the unfiltered trace
 /// buffer (did the site fire at all, for anyone?), and the probe's own tick counter (is the debuggee
 /// still working?). Nothing here fixes the flake; it makes its next sighting worth having.
-fn diagnose_missing_trace(server: &mut Server, probe: &Probe, base_tick: i64, target: &str) -> String {
+fn diagnose_missing_trace(
+    server: &mut Server,
+    probe: &Probe,
+    base_tick: i64,
+    target: &str,
+    armed_id: &str,
+) -> String {
     let stop_points = server.call("debug.list_stop_points", serde_json::json!({}));
     let all_traces = server.call("debug.get_traces", serde_json::json!({}));
-    let threads =
-        server.call("debug.list_threads", serde_json::json!({"name_filter": "pool-worker", "limit": 400}));
-    let target_alive = threads.lines().any(|l| l.starts_with(target));
+    // Read off the stop-point listing rather than a name-filtered thread listing, so this line and the
+    // re-arm decision in TEST-49 can never disagree — the two were sourced differently once, and a message
+    // that says "GONE" beneath a verdict of "STILL ALIVE" is worse than no line at all.
+    let filter_dead = reports_a_dead_filter(&stop_points, armed_id);
     let now = highest_tick(probe);
     let advanced = now.is_some_and(|n| n > base_tick);
 
@@ -4837,17 +4935,158 @@ fn diagnose_missing_trace(server: &mut Server, probe: &Probe, base_tick: i64, ta
         "the filtered stop point never recorded a throw from PoolProbe.doWork within {EVENT_TIMEOUT:?}. \
          Which of these is true decides what to look at next:\n  \
          (1) the debuggee: tick was {base_tick}, is now {now:?} — {}\n  \
-         (2) the filter's thread {target}: {} in the pool listing. A pool that retires idle workers \
+         (2) the filter's thread {target}, as {armed_id} reports it: {}. A pool that retires idle workers \
          invalidates the id, and the stop point then reports nothing at all (FILT-2)\n  \
          (3) the request: does the listing below show it armed and enabled, or disarmed?\n{stop_points}\n  \
          (4) the throw site: the UNFILTERED trace buffer holds {} record(s) — if it is empty the site \
          never fired for anyone (a probe problem), if it has records from other threads the filter is \
          what dropped them (a filtering problem)\n{}",
         if advanced { "still running" } else { "NOT advancing, so nothing could have thrown" },
-        if target_alive { "still alive" } else { "GONE" },
+        if filter_dead { "GONE, so this filter can never fire again" } else { "still alive" },
         all_traces.lines().filter(|l| l.contains("thread=")).count(),
         head_of(&all_traces),
     )
+}
+
+/// Whether the stop point `id` reports its thread filter as pinned to a thread that no longer exists.
+///
+/// The server volunteers this, unprompted — `⚠️  FILTER THREAD 0x… IS GONE` (FILT-2) — and it is the
+/// authoritative answer to the only question that licenses a re-arm in TEST-49 (#178). It beats inferring
+/// death from a thread's absence from a listing, and beats inferring it from silence, which is what the
+/// diagnostic was built to stop anyone doing.
+///
+/// Scoped to one row the way [`trace_cost_line`] is: a row is two spaces and a glyph, its details are the
+/// lines below it indented further, and matching the whole listing would credit one stop point with
+/// another's dead filter.
+fn reports_a_dead_filter(listing: &str, id: &str) -> bool {
+    let header = format!("[{id}]");
+    let mut lines = listing.lines().skip_while(|l| !l.contains(&header));
+    if lines.next().is_none() {
+        return false; // no such row: not a dead filter, and the caller's budget will run out and say so
+    }
+    lines.take_while(|l| l.starts_with("   ")).any(|l| l.contains("IS GONE"))
+}
+
+/// A dead filter is credited to the stop point that HAS one, and to no other (TEST-49, #178).
+///
+/// Needs no JDK: the input is a rendering this file already asserts on elsewhere. It is a test rather than
+/// a comment because this predicate is what licenses a re-arm, and both ways of getting it wrong are
+/// silent. Reading one row's warning off another's would re-arm away from a live thread — hiding exactly
+/// the filter regression the test exists to catch — and missing a real warning would spend the budget
+/// waiting on a thread that cannot ever fire.
+#[test]
+fn a_dead_filter_warning_belongs_only_to_the_stop_point_that_carries_it() {
+    let listing = "\
+Stop points (2):
+  ⚡ [exc_1] exception PoolProbe$PoolException (caught+uncaught) (trace) thread=0x6
+    ⚠️  FILTER THREAD 0x6 IS GONE — this can never fire again; re-arm with a live thread_id
+     Hits: 0
+  ⚡ [exc_2] exception PoolProbe$PoolException (caught+uncaught) (trace) thread=0x140
+     Hits: 12
+";
+    assert!(reports_a_dead_filter(listing, "exc_1"), "exc_1 carries the warning");
+    assert!(!reports_a_dead_filter(listing, "exc_2"), "exc_2's row is healthy and must not inherit it");
+    assert!(!reports_a_dead_filter(listing, "exc_9"), "a stop point that is not listed has no dead filter");
+    // The order must not matter either: a healthy row ABOVE a dead one is the case a naive scan gets right
+    // by luck, so the same listing is checked with the rows swapped.
+    let swapped = "\
+Stop points (2):
+  ⚡ [exc_2] exception PoolProbe$PoolException (caught+uncaught) (trace) thread=0x140
+     Hits: 12
+  ⚡ [exc_1] exception PoolProbe$PoolException (caught+uncaught) (trace) thread=0x6
+    ⚠️  FILTER THREAD 0x6 IS GONE — this can never fire again; re-arm with a live thread_id
+";
+    assert!(reports_a_dead_filter(swapped, "exc_1"), "exc_1 still carries it when listed second");
+    assert!(!reports_a_dead_filter(swapped, "exc_2"), "exc_2 must not reach past its own row");
+}
+
+/// How long a filter pinned to a retired worker may go unnoticed, and the floor under a re-scout.
+///
+/// One constant for both because they are the same quantity seen twice: it is the granularity at which the
+/// pool's churn is observed, so starting a scout with less than this left is starting one that cannot be
+/// given a fair chance to finish.
+const LIVENESS_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A pool worker that is demonstrably running `PoolProbe.doWork`, taken from a recorded HIT (TEST-42).
+///
+/// Arms UNFILTERED for a single hit, reads the thread off it, then clears both the request and the buffer
+/// so everything recorded afterwards is the caller's filtered request and nothing else. Whichever worker
+/// throws first is by construction one the pool is feeding, which a `debug.list_threads` pick is not:
+/// a listing proves only that a thread EXISTED when the listing was taken.
+fn scout_a_working_worker(server: &mut Server, probe: &Probe, within: std::time::Duration) -> String {
+    let scout = server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({
+            "class_pattern": "PoolProbe$PoolException",
+            // `doWork` throws on every task of a 100-task batch, so an unbounded scout would capture
+            // hundreds of hits a second to no purpose. One is all that is needed to name a live worker.
+            "trace": true, "trace_max_hits": 1,
+        }),
+    );
+    let scout_id =
+        stop_id(&scout, "exc_").unwrap_or_else(|| panic!("the unfiltered scout arm failed: {scout}"));
+    let observed = server.wait_for_traces("PoolProbe.doWork", within).unwrap_or_else(|| {
+        panic!(
+            "no pool worker threw at all within {within:?}, so the probe is not producing exceptions — a \
+             SETUP failure, which says nothing about the filter\n  output: {:?}",
+            probe.output()
+        )
+    });
+    let target = traced_thread(&observed, "PoolProbe.doWork")
+        .unwrap_or_else(|| panic!("a recorded hit carried no thread= id:\n{observed}"));
+    server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": scout_id}));
+    server.call("debug.get_traces", serde_json::json!({"clear": true}));
+    target
+}
+
+/// Arm the traced, thread-filtered exception stop point, returning its `exc_` id — or `None` when the pool
+/// retired `target` first.
+///
+/// A stale id is refused by name (`not a live thread`, FILT-2) rather than with a bare JDWP code, so the
+/// two outcomes are distinguishable and only one of them is a defect. Anything else is a real arm failure
+/// and panics, because a test that shrugged at those would assert nothing.
+fn arm_pool_exception_filter(server: &mut Server, target: &str) -> Option<String> {
+    let armed = server.call(
+        "debug.set_exception_stop",
+        serde_json::json!({
+            "class_pattern": "PoolProbe$PoolException",
+            "trace": true, "trace_max_hits": 0, "thread_id": target,
+        }),
+    );
+    match stop_id(&armed, "exc_") {
+        Some(id) => Some(id),
+        None if armed.contains("not a live thread") => None,
+        None => {
+            panic!("the filtered arm on {target} failed for a reason other than a retired thread: {armed}")
+        }
+    }
+}
+
+/// Scout a live worker and pin the filtered stop point to it, retrying until `deadline`.
+///
+/// Both halves of one race are absorbed here, because they are the same race seen at two moments: the pool
+/// can retire the scouted worker between its hit and the arm, and it can retire it after the arm (FILT-2,
+/// which the caller handles by calling this again). Returning the pair keeps the id and the thread it is
+/// pinned to from ever drifting apart — a re-arm that updated one and not the other would clear the wrong
+/// request and leave two filters on the site.
+///
+/// `None` means the budget ran out, which is the caller's to describe: it knows how many re-arms preceded
+/// it, and that count is what separates a churning pool from a filter that never fired.
+fn scout_and_arm(
+    server: &mut Server,
+    probe: &Probe,
+    deadline: std::time::Instant,
+) -> Option<(String, String)> {
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left <= LIVENESS_POLL {
+            return None;
+        }
+        let target = scout_a_working_worker(server, probe, left);
+        if let Some(id) = arm_pool_exception_filter(server, &target) {
+            return Some((target, id));
+        }
+    }
 }
 
 /// How many `stable-worker-*` threads the debuggee has alive right now, read straight from the JVM.
