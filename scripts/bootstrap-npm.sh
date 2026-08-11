@@ -253,7 +253,9 @@ publish_one() {
   if [[ "${TOKEN_AUTH:-0}" == "1" ]]; then
     note "authenticating with NPM_TOKEN"
   else
-    ask_secret NPM_OTP "6-digit code from your authenticator (blank if you have none):"
+    # Blank is the RIGHT answer on a security key, not a fallback: WebAuthn is a browser round trip npm
+    # starts on its own, and passing --otp with it sends a code npm never asked for.
+    ask_secret NPM_OTP "6-digit code from your authenticator (BLANK if you use a security key):"
     [[ -n "${NPM_OTP:-}" ]] && otp_arg=(--otp "$NPM_OTP")
   fi
   log="$(mktemp)"
@@ -269,16 +271,27 @@ publish_one() {
     note "published $pkg@$version"
     return 0
   fi
-  if printf '%s' "$out" | grep -qE "code EOTP|one-time password|Two-factor authentication"; then
-    warn "npm will not accept a publish from this machine, whatever credential it is given."
-    say  'EOTP here does not mean "your code was wrong" — it is also what npm answers to a web login'
-    say  "session and to an access token without 2FA bypass, and npm is restricting those tokens. All"
-    say  "three were tried on v0.22.0 and all three got this."
+  if printf '%s' "$out" | grep -q "spam detection"; then
+    warn "npm refused the NAME, not the credential — and this is the one failure re-running cannot fix."
+    say  "Everything else worked: you authenticated, the tarball is real, and the sibling packages go"
+    say  "out on the same account. Only npm support can clear the heuristic:"
+    step "https://npmjs.com/support — quote the 403 above and this package name"
     say  ""
-    say  "The path that works is TRUSTED PUBLISHING, which is stage 6 of this wizard and needs no secret:"
-    step "if the package EXISTS, configure its trusted publisher and let $WORKFLOW_FILE publish it"
-    step "if it does NOT exist yet, that is the bootstrap problem this wizard was written for — and npm"
-    say  "    now has to accept the very first publish before a trusted publisher can be attached"
+    say  "Meanwhile nothing is broken for anyone: npm skips an optionalDependencies entry it cannot"
+    say  "resolve, so the other platforms install normally and this one gets the shim's message and"
+    say  "\`cargo install jdwp-mcp\`, which works on every platform. The wrapper pins $VERSION exactly,"
+    say  "so publishing this name later — whenever support clears it — needs no new release."
+  elif printf '%s' "$out" | grep -qE "code EOTP|one-time password|Two-factor authentication"; then
+    warn "npm wants a second factor and did not get one it could use."
+    say  "Which one you need depends on how your account does 2FA, and the two are not interchangeable:"
+    step "SECURITY KEY (WebAuthn): npm prints an \`Authenticate your account at: …\` URL and WAITS."
+    say  "    Pass NO --otp, run this in a real terminal, and open the URL when it appears. Anything"
+    say  "    that captures stdout — a pipe, \$( ), an agent's shell — breaks the wait, and the run then"
+    say  "    fails looking like a refusal. That was the whole of v0.22.0's confusion."
+    step "AUTHENTICATOR APP (TOTP): the 6-digit code this wizard asks for, entered fresh per package."
+    say  ""
+    say  "A token does NOT substitute for either: npm restricts 2FA-bypass tokens for publishing, and"
+    say  "on v0.22.0 a web session and an access token were refused identically with EOTP."
   fi
   return 1
 }
