@@ -21,6 +21,33 @@ use std::time::Duration;
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
+const INVALID_PARAMS: i64 = -32602;
+const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// The version whose per-request metadata this server serves statelessly (MCP-1).
+const MODERN: &str = "2026-07-28";
+/// The revision `initialize` negotiates, for clients that predate the stateless model.
+const LEGACY: &str = "2024-11-05";
+
+/// The `params` a stateless request carries: its own protocol version and capabilities, every time.
+///
+/// Written out here rather than borrowed from the crate, on purpose. These are **wire** constants — a
+/// client on the other side of a pipe has no access to our types — so a test that imported them could
+/// not catch a rename, which is the one failure the downstream toolkit cannot see either
+/// (`docs/toolkit-contract.md`).
+fn stateless(version: &str, extra: &serde_json::Value) -> serde_json::Value {
+    let mut meta = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": { "name": "stdio_protocol.rs", "version": "0" },
+    });
+    if let (Some(m), Some(e)) = (meta.as_object_mut(), extra.as_object()) {
+        for (k, v) in e {
+            m.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::json!({ "_meta": meta })
+}
 
 /// The `error.code` of a reply, or a panic naming what came back instead.
 fn error_code(reply: &serde_json::Value, what: &str) -> i64 {
@@ -177,4 +204,185 @@ fn a_final_request_without_a_trailing_newline_is_answered_at_eof() {
     let reply = server.read_reply().expect("reply to an unterminated request");
     assert_eq!(reply["id"], 7, "an unterminated final line must still be answered: {reply}");
     assert!(reply["result"]["tools"].is_array(), "and answered properly, not with an error: {reply}");
+}
+
+// ---------------------------------------------------------------------------
+// MCP-1: the 2026-07-28 stateless surface, alongside the `initialize` handshake.
+//
+// The property under test throughout is DUAL-ERA: every case below asserts the new behaviour without
+// asserting away the old one, because the old one is what every client using this server today speaks —
+// including the pinned downstream toolkit, whose failure modes are mostly silent
+// (`docs/toolkit-contract.md`). A revision bump that quietly stopped answering `initialize` would look
+// exactly like success from in here.
+// ---------------------------------------------------------------------------
+
+/// `server/discover` is the one RPC a 2026-07-28 server MUST implement, and on stdio it is also the
+/// probe a dual-era client uses to decide whether to fall back to `initialize`.
+///
+/// So the assertion that matters is not merely "it answers" but that it answers with a **`DiscoverResult`
+/// rather than an error**: those are the two outcomes the client's fallback rule turns on, and any error
+/// here — including a well-meaning one — is read as "this server is legacy".
+#[test]
+fn the_discovery_probe_answers_with_a_result_and_not_an_error() {
+    let mut server = Server::start().expect("start server");
+    let reply =
+        server.request("server/discover", stateless(MODERN, &serde_json::json!({}))).expect("discover");
+
+    assert!(reply.get("error").is_none(), "a probe answered with an error reads as a LEGACY server: {reply}");
+    let result = &reply["result"];
+    assert_eq!(result["resultType"], "complete", "every result carries its type: {reply}");
+    let versions = result["supportedVersions"].as_array().expect("supportedVersions must be an array");
+    assert!(
+        versions.iter().any(|v| v == MODERN),
+        "the probe must name the version it serves, or a client has nothing to select: {reply}"
+    );
+    assert!(result["capabilities"]["tools"].is_object(), "tools capability must be declared: {reply}");
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "jdwp-mcp",
+        "the server identifies itself in the result, there being no handshake to do it in: {reply}"
+    );
+    assert!(result["ttlMs"].is_u64() && result["cacheScope"] == "public", "CacheableResult: {reply}");
+
+    // NOT declared, and this is a claim about behaviour rather than tidiness: a stateless client's
+    // alerts go to stderr because the protocol has nowhere legal to put them, so declaring `logging`
+    // here would promise notifications that can never arrive.
+    assert!(
+        result["capabilities"]["logging"].is_null(),
+        "logging must not be declared to a client that cannot legally be sent any: {reply}"
+    );
+}
+
+/// A version this server does not serve is answered with the list to retry from — the client's entire
+/// recovery path is to pick from it, so an error that only said "no" would strand it.
+#[test]
+fn an_unserved_version_is_told_what_to_retry_with() {
+    let mut server = Server::start().expect("start server");
+    let reply = server
+        .request("tools/list", stateless("1900-01-01", &serde_json::json!({})))
+        .expect("versioned call");
+
+    assert_eq!(
+        error_code(&reply, "an unsupported version"),
+        UNSUPPORTED_PROTOCOL_VERSION,
+        "must be the spec's own code, since a dual-era client uses it to tell modern from legacy: {reply}"
+    );
+    let data = &reply["error"]["data"];
+    assert_eq!(data["requested"], "1900-01-01", "the error must name what was asked for: {reply}");
+    assert!(
+        data["supported"].as_array().is_some_and(|s| s.iter().any(|v| v == MODERN)),
+        "and what to use instead: {reply}"
+    );
+    assert_still_serving(&mut server, "an unsupported protocol version");
+}
+
+/// The dual-era rule, in one test: a missing protocol version is a **legacy** request everywhere it
+/// could be one, and malformed only where it could not.
+///
+/// `tools/list` with no `_meta` is exactly what every client that works today sends, so refusing it
+/// would be the regression this whole change has to avoid. `server/discover` exists only in the modern
+/// era, so there is nothing else a missing field there could mean.
+#[test]
+fn a_missing_protocol_version_is_legacy_except_where_it_cannot_be() {
+    let mut server = Server::start().expect("start server");
+
+    let bare = server.request("tools/list", serde_json::json!({})).expect("bare tools/list");
+    assert!(
+        bare["result"]["tools"].as_array().is_some_and(|t| !t.is_empty()),
+        "a request with no _meta is a legacy request and must be served: {bare}"
+    );
+
+    let probe = server.request("server/discover", serde_json::json!({})).expect("bare discover");
+    assert_eq!(
+        error_code(&probe, "discover without _meta"),
+        INVALID_PARAMS,
+        "a modern-only method with no version is malformed, not legacy: {probe}"
+    );
+}
+
+/// Capabilities are required on a stateless request, and "declared none" has to be distinguishable from
+/// "did not say" for the rule that a server MUST NOT rely on an undeclared capability to mean anything.
+#[test]
+fn a_stateless_request_must_declare_its_capabilities() {
+    let mut server = Server::start().expect("start server");
+    let reply = server
+        .request(
+            "tools/list",
+            serde_json::json!({ "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN } }),
+        )
+        .expect("call with no capabilities");
+
+    assert_eq!(
+        error_code(&reply, "no clientCapabilities"),
+        INVALID_PARAMS,
+        "a required field that is absent is malformed: {reply}"
+    );
+    assert_still_serving(&mut server, "a request with no declared capabilities");
+}
+
+/// An unrecognised log level is refused by name rather than accepted and ignored. Accepting it would be
+/// a silent promise to filter by something this server cannot honour.
+#[test]
+fn an_unrecognised_log_level_is_refused_rather_than_ignored() {
+    let mut server = Server::start().expect("start server");
+    let extra = serde_json::json!({ "io.modelcontextprotocol/logLevel": "chatty" });
+    let reply = server.request("tools/list", stateless(MODERN, &extra)).expect("call with a bad log level");
+
+    assert_eq!(error_code(&reply, "a bogus log level"), INVALID_PARAMS, "{reply}");
+
+    // And a real one is accepted, so the check above is discriminating rather than blanket.
+    let good = serde_json::json!({ "io.modelcontextprotocol/logLevel": "warning" });
+    let ok = server.request("tools/list", stateless(MODERN, &good)).expect("call with a real log level");
+    assert!(ok["result"]["tools"].is_array(), "a valid RFC 5424 level must be accepted: {ok}");
+}
+
+/// `resultType` and `serverInfo` ride on **every** result, in both eras.
+///
+/// Both eras deliberately: the fields are inert to a client that predates them (a result is an open
+/// object in every revision), and one stamped path cannot drift from another the way two would.
+#[test]
+fn every_result_carries_its_type_and_the_servers_identity() {
+    let mut server = Server::start().expect("start server");
+    let stateless_list =
+        server.request("tools/list", stateless(MODERN, &serde_json::json!({}))).expect("modern");
+    let legacy_list = server.request("tools/list", serde_json::json!({})).expect("legacy");
+    let handshake = server
+        .request("initialize", serde_json::json!({"protocolVersion": LEGACY, "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}))
+        .expect("initialize");
+
+    for (what, reply) in
+        [("stateless", &stateless_list), ("legacy", &legacy_list), ("initialize", &handshake)]
+    {
+        assert_eq!(reply["result"]["resultType"], "complete", "{what} result needs a resultType: {reply}");
+        assert_eq!(
+            reply["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "jdwp-mcp",
+            "{what} result needs serverInfo: {reply}"
+        );
+    }
+
+    // The list is cacheable and its order is fixed, which is what lets a client cache it at all.
+    assert!(stateless_list["result"]["ttlMs"].is_u64(), "tools/list must be cacheable: {stateless_list}");
+    assert_eq!(
+        stateless_list["result"]["tools"], legacy_list["result"]["tools"],
+        "the tool list MUST NOT vary by era or by connection state"
+    );
+}
+
+/// The legacy handshake still works, still negotiates its own revision, and still declares `logging` —
+/// the capability is true for this era, where the notifications really are sent.
+#[test]
+fn the_legacy_handshake_is_untouched() {
+    let mut server = Server::start().expect("start server");
+    let reply = server
+        .request("initialize", serde_json::json!({"protocolVersion": LEGACY, "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}))
+        .expect("initialize");
+
+    let result = &reply["result"];
+    assert_eq!(result["protocolVersion"], LEGACY, "the handshake must still negotiate its revision: {reply}");
+    assert!(result["capabilities"]["tools"].is_object(), "{reply}");
+    assert!(
+        result["capabilities"]["logging"].is_object(),
+        "a legacy client is still pushed notifications, so the capability is still true: {reply}"
+    );
+    assert!(result["instructions"].as_str().is_some_and(|s| s.contains("debug.attach")), "{reply}");
+    assert_still_serving(&mut server, "the legacy handshake");
 }

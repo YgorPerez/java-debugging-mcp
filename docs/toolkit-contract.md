@@ -76,6 +76,17 @@ Ordered by how *quietly* it breaks, because that is what decides whether it need
 Six of seven are silent. So the rule is not "avoid breaking them" — it is **say what changed, in the release
 notes, in caller-visible terms**.
 
+**MCP-1 (ADR-0047) is the "Change behaviour behind an existing name" row, and it is the worst kind: the one
+where the docs still look right.** Supporting MCP `2026-07-28` added no tool and renamed nothing, so every
+table above is unmoved — and yet whether a caller is *pushed* a `notifications/message` when a stop point
+fires now depends on which protocol revision their client speaks, because the newer one makes that
+notification request-scoped and a JDWP hit belongs to no request. Nothing about the toolkit breaks: the
+`initialize` handshake is still served, so a client on it behaves exactly as before, and `debug.get_last_event`
+was always the record rather than the hint. What has to be said out loud is the conditional — **a skill that
+tells a reader "the server will tell you when it hits" is now true for one era and false for the other**, and
+`debug.get_last_event`'s own description carries the corrected version. Check any skill prose that promises a
+push, not just prose that names a tool.
+
 **PERF-1 (#100) is the "Change what a reply says" row, and it is the mild version of it.** A dump's cost line
 now reads `Cost: 763 JDWP packet(s) in ~180 round trip(s), 1.54ms each` where it used to read
 `Cost: 763 JDWP packet(s), 4.89ms each`. Nothing was renamed and nothing was removed — a clause was added

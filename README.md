@@ -251,8 +251,18 @@ Both are covered in full, with the rest of the shared-instance rules, in the
 
 ## Status
 
-✅ **Functionally complete** — 38 debug tools, integrated and validated against live JVMs on JDK 11,
+✅ **Functionally complete** — 42 debug tools, integrated and validated against live JVMs on JDK 11,
 17 and 21.
+
+**Two MCP revisions, on stdio.** [`2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28)
+is served statelessly — every request carries its own protocol version and capabilities in `_meta`, and
+`server/discover` reports what this server supports — and `2024-11-05` is still negotiated through the
+`initialize` handshake, so clients that predate the stateless model keep working unchanged. One
+consequence is worth knowing before you rely on it: a client on `2026-07-28` receives **no**
+`notifications/message` when a stop point fires, because that revision makes the notification
+request-scoped and a JDWP hit belongs to no request. The alert goes to the server's stderr, and
+`debug.get_last_event` is how you learn a hit happened — see
+[ADR-0047](docs/adr/0047-two-eras-are-served-and-an-alert-has-nowhere-legal-to-go-in-the-newer-one.md).
 
 The JDWP client implements the VirtualMachine, ReferenceType, ClassType, Method, ObjectReference,
 StringReference, ArrayReference, ThreadReference, StackFrame and EventRequest command sets this needs,

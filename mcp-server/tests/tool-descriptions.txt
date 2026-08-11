@@ -277,12 +277,17 @@ watchpoint hit the field with its old → new value. On JDK 15+ an NPE's message
 itself ("because the return value of X.getY() is null"), so it is usually the diagnosis rather than a
 restatement of the type. Absent when the exception carries no message — the key is omitted rather than
 reported empty. Events are buffered, so a burst of hits isn't lost: the reply says how many older ones are
-pending — pass limit to read them (oldest first), drain:true to discard what you've read. [suspended] says
-whether the VM is stopped waiting for you. An [escalation] line appears only in one situation, and it is a
-state worth recognising: a stop point with a condition matched, and suspending the rest of the VM afterwards
-did not succeed — so the hit is real and the frame is readable, but the application may still be running
-underneath it. The line says which, checked against the JVM rather than assumed, and [suspended] agrees with
-it.
+pending — pass limit to read them (oldest first), drain:true to discard what you've read. THIS IS THE ONLY WAY
+A STATELESS CLIENT LEARNS A HIT HAPPENED, and that is a protocol fact rather than a preference (MCP-1): on MCP
+2026-07-28 and later there is no legal channel for an unsolicited notifications/message — it is
+request-scoped, and a JDWP hit belongs to no request — so the push a client on the older initialize handshake
+receives does not exist for you, and the same text goes to the server's STDERR instead. The buffer was always
+the record and the push always a hint, so nothing here is lost; what changes is that POLLING IS NOT OPTIONAL.
+After arming a suspending stop point, come back and ask. [suspended] says whether the VM is stopped waiting
+for you. An [escalation] line appears only in one situation, and it is a state worth recognising: a stop point
+with a condition matched, and suspending the rest of the VM afterwards did not succeed — so the hit is real
+and the frame is readable, but the application may still be running underneath it. The line says which,
+checked against the JVM rather than assumed, and [suspended] agrees with it.
 
 ## debug.get_stack
 Get stack frames (compact: one line per frame `#i class.method:line`, locals indented beneath). A local whose

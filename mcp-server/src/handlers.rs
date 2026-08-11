@@ -17,6 +17,28 @@ use tracing::{debug, info, warn};
 /// Serialize an internal response struct into a JSON value, mapping the
 /// (practically impossible) serialization failure to a JSON-RPC internal error
 /// rather than panicking.
+/// This server's name, as it appears in `serverInfo` in both eras.
+const SERVER_NAME: &str = "jdwp-mcp";
+
+/// The `instructions` string, shared by `initialize` and `server/discover` so the two cannot drift.
+const INSTRUCTIONS: &str = "JDWP debugging server for Java applications. \
+     Start by using debug.attach to connect to a JVM, \
+     then use debug.set_line_stop, debug.get_stack, etc.";
+
+/// A required `_meta` field the request did not carry (MCP-1). `-32602`, per the spec: a request
+/// missing a required field is malformed rather than unsupported.
+fn missing_meta_field(key: &str) -> JsonRpcError {
+    JsonRpcError {
+        code: INVALID_PARAMS,
+        message: format!(
+            "Missing required request metadata `_meta[\"{key}\"]`. Every request in a stateless \
+             protocol version carries its own version and capabilities; a client using the \
+             `initialize` handshake instead should send that first."
+        ),
+        data: None,
+    }
+}
+
 fn to_json<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, JsonRpcError> {
     serde_json::to_value(value).map_err(|e| JsonRpcError {
         code: INTERNAL_ERROR,
@@ -444,22 +466,32 @@ impl RequestHandler {
     }
 
     pub async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
-        let result = match request.method.as_str() {
-            "initialize" => Self::handle_initialize(request.params),
-            "tools/list" => Self::handle_list_tools(),
-            "tools/call" => self.handle_call_tool(request.params).await,
-            _ => Err(JsonRpcError {
-                code: METHOD_NOT_FOUND,
-                message: format!("Method not found: {}", request.method),
-                data: None,
-            }),
+        let result = match self.check_request_metadata(&request) {
+            Err(e) => Err(e),
+            Ok(()) => match request.method.as_str() {
+                "server/discover" => Self::handle_discover(),
+                "initialize" => {
+                    // The handshake itself is the era signal, ahead of `notifications/initialized`: a
+                    // hit can land between the two, and it must not go to stderr for a client that is
+                    // about to start reading notifications.
+                    self.alerter.note_era(crate::protocol::Era::Legacy);
+                    Self::handle_initialize(request.params)
+                }
+                "tools/list" => Self::handle_list_tools(),
+                "tools/call" => self.handle_call_tool(request.params).await,
+                _ => Err(JsonRpcError {
+                    code: METHOD_NOT_FOUND,
+                    message: format!("Method not found: {}", request.method),
+                    data: None,
+                }),
+            },
         };
 
         match result {
             Ok(value) => JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,
-                result: Some(value),
+                result: Some(Self::stamp_result(value)),
                 error: None,
             },
             Err(error) => JsonRpcResponse {
@@ -489,6 +521,131 @@ impl RequestHandler {
         }
     }
 
+    /// Check the per-request protocol metadata 2026-07-28 puts in `_meta`, before dispatch (MCP-1).
+    ///
+    /// **The absence of `_meta` is not an error, and that is the whole of dual-era support.** A legacy
+    /// client sends `tools/list` with no `_meta` at all — the suite has done exactly that since before
+    /// this revision existed — and the spec's own compatibility matrix requires a dual-era server to
+    /// serve it. So a request with no `io.modelcontextprotocol/protocolVersion` is a legacy request,
+    /// which is the reading that keeps every client that works today working.
+    ///
+    /// `server/discover` is the exception, because it is the one method that exists only in the modern
+    /// era: there is nothing for a missing field there to mean except a malformed request.
+    fn check_request_metadata(&self, request: &JsonRpcRequest) -> Result<(), JsonRpcError> {
+        use crate::protocol::{
+            LOG_LEVELS, META_CLIENT_CAPABILITIES, META_LOG_LEVEL, META_PROTOCOL_VERSION,
+            MODERN_PROTOCOL_VERSIONS, UNSUPPORTED_PROTOCOL_VERSION,
+        };
+        let meta = request.params.as_ref().and_then(|p| p.get("_meta"));
+        let version = meta.and_then(|m| m.get(META_PROTOCOL_VERSION)).and_then(serde_json::Value::as_str);
+        let Some(version) = version else {
+            if request.method == "server/discover" {
+                return Err(missing_meta_field(META_PROTOCOL_VERSION));
+            }
+            return Ok(());
+        };
+
+        if !MODERN_PROTOCOL_VERSIONS.contains(&version) {
+            // The reply names what to retry with, because the client's whole recovery path is to pick
+            // from this list — an error that only said "no" would strand it. `initialize` is not in the
+            // list on purpose: it is a handshake, not a version a `_meta` field can select.
+            return Err(JsonRpcError {
+                code: UNSUPPORTED_PROTOCOL_VERSION,
+                message: format!(
+                    "Unsupported protocol version: {version}. This server serves {} statelessly, and \
+                     {} through the `initialize` handshake.",
+                    MODERN_PROTOCOL_VERSIONS.join(", "),
+                    crate::protocol::LEGACY_PROTOCOL_VERSION
+                ),
+                data: Some(json!({ "supported": MODERN_PROTOCOL_VERSIONS, "requested": version })),
+            });
+        }
+
+        // Required on every modern request, and its absence is malformed rather than merely unhelpful:
+        // a server MUST NOT rely on a capability the client has not declared, which only means anything
+        // if "declared none" and "did not say" are told apart. An empty object is the former.
+        if meta.and_then(|m| m.get(META_CLIENT_CAPABILITIES)).is_none() {
+            return Err(missing_meta_field(META_CLIENT_CAPABILITIES));
+        }
+
+        // An unrecognised log level is `-32602` by name in the spec. Checked even though nothing here
+        // emits request-scoped logs, because accepting a level this server cannot honour would be a
+        // silent promise — and silence reading as an answer is the thing this codebase is built against.
+        if let Some(level) = meta.and_then(|m| m.get(META_LOG_LEVEL)) {
+            if !level.as_str().is_some_and(|s| LOG_LEVELS.contains(&s)) {
+                return Err(JsonRpcError {
+                    code: INVALID_PARAMS,
+                    message: format!("Invalid {META_LOG_LEVEL}: expected one of {}", LOG_LEVELS.join(", ")),
+                    data: None,
+                });
+            }
+        }
+
+        // Logged once per transition, not per request, and it is the one thing worth saying out loud
+        // here: which era a peer opened in decides where its alerts can go, and an operator who sees a
+        // JDWP hit on stderr instead of in their client needs this line to know why. `clientInfo` is
+        // self-reported and never acted on — display, logging and debugging only, per the spec.
+        if self.alerter.note_era(crate::protocol::Era::Modern) {
+            let client = meta
+                .and_then(|m| m.get(crate::protocol::META_CLIENT_INFO))
+                .map_or_else(|| "unidentified".to_string(), ToString::to_string);
+            info!(
+                "stateless client ({version}): {client} — alerts go to stderr, debug.get_last_event to poll"
+            );
+        }
+        Ok(())
+    }
+
+    /// Stamp the two fields every 2026-07-28 result carries onto whatever a handler built (MCP-1).
+    ///
+    /// **Central, so no handler can forget it.** `resultType` is REQUIRED on every result, and a reply
+    /// missing it is one a conforming client MUST treat as invalid — a per-handler convention would be
+    /// one `tools/call` return path away from a protocol violation, and this file has several.
+    ///
+    /// Stamped on legacy replies too, deliberately. A result is an open object in every revision, so
+    /// both keys are inert to a client that predates them, and the alternative — two shapes selected by
+    /// remembered era — is exactly the state the stateless model exists to remove. Clients on earlier
+    /// revisions are told to read an absent `resultType` as `"complete"`, never to reject a present one.
+    fn stamp_result(mut value: serde_json::Value) -> serde_json::Value {
+        let Some(obj) = value.as_object_mut() else { return value };
+        obj.entry("resultType").or_insert_with(|| json!("complete"));
+        let info = json!({ "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") });
+        match obj.entry("_meta") {
+            serde_json::map::Entry::Vacant(slot) => {
+                slot.insert(json!({ crate::protocol::META_SERVER_INFO: info }));
+            }
+            serde_json::map::Entry::Occupied(mut held) => {
+                if let Some(m) = held.get_mut().as_object_mut() {
+                    m.entry(crate::protocol::META_SERVER_INFO).or_insert(info);
+                }
+            }
+        }
+        value
+    }
+
+    /// `server/discover` (MCP-1): the versions, capabilities and identity a client can read before
+    /// sending anything else. A 2026-07-28 server **MUST** implement it, and on stdio it doubles as the
+    /// probe a dual-era client uses to decide whether to fall back to `initialize`.
+    ///
+    /// **It does not declare `logging`, and `initialize` still does.** The capability describes what the
+    /// server will do for *this* peer, and the answer genuinely differs: a modern client's alerts go to
+    /// stderr, because the protocol has nowhere legal to put them. Declaring a capability whose
+    /// notifications can never be sent would be the silent promise this codebase refuses to make.
+    fn handle_discover() -> Result<serde_json::Value, JsonRpcError> {
+        let result = crate::protocol::DiscoverResult {
+            supported_versions: crate::protocol::MODERN_PROTOCOL_VERSIONS
+                .iter()
+                .map(|&v| v.to_string())
+                .collect(),
+            capabilities: ServerCapabilities { tools: ToolsCapability {}, logging: None },
+            instructions: Some(INSTRUCTIONS.to_string()),
+            ttl_ms: crate::protocol::CACHE_TTL_MS,
+            cache_scope: crate::protocol::CACHE_SCOPE.to_string(),
+        };
+
+        to_json(&result)
+    }
+
     fn handle_initialize(params: Option<serde_json::Value>) -> Result<serde_json::Value, JsonRpcError> {
         let _params: InitializeParams =
             serde_json::from_value(params.unwrap_or_else(|| json!({}))).map_err(|e| JsonRpcError {
@@ -498,32 +655,36 @@ impl RequestHandler {
             })?;
 
         let result = InitializeResult {
-            protocol_version: "2024-11-05".to_string(),
+            protocol_version: crate::protocol::LEGACY_PROTOCOL_VERSION.to_string(),
             capabilities: ServerCapabilities {
                 tools: ToolsCapability {},
-                // EVT-2. Declared unconditionally: whether anything is actually pushed depends on
-                // JDWP_ALERTS, but the capability describes what this server can do, not how
+                // EVT-2. Declared unconditionally *for this era*: whether anything is actually pushed
+                // depends on JDWP_ALERTS, but the capability describes what this server can do, not how
                 // it happens to be configured — and a client that sees it may still ignore every
-                // notification, which is exactly what best-effort means here.
+                // notification, which is exactly what best-effort means here. `server/discover` does
+                // NOT declare it, because a stateless client's alerts cannot go on the wire at all
+                // (MCP-1).
                 logging: Some(crate::protocol::LoggingCapability {}),
             },
             server_info: ServerInfo {
-                name: "jdwp-mcp".to_string(),
+                name: SERVER_NAME.to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
-            instructions: Some(
-                "JDWP debugging server for Java applications. \
-                Start by using debug.attach to connect to a JVM, \
-                then use debug.set_line_stop, debug.get_stack, etc."
-                    .to_string(),
-            ),
+            instructions: Some(INSTRUCTIONS.to_string()),
         };
 
         to_json(&result)
     }
 
+    /// `tools/list`. The order is the order `get_tools()` builds, which is fixed at compile time — so
+    /// the "SHOULD be deterministic across requests" rule of 2026-07-28 holds by construction rather
+    /// than by sorting here, and a client's cache and an LLM's prompt cache both stay warm.
     fn handle_list_tools() -> Result<serde_json::Value, JsonRpcError> {
-        let result = ListToolsResult { tools: tools::get_tools() };
+        let result = ListToolsResult {
+            tools: tools::get_tools(),
+            ttl_ms: crate::protocol::CACHE_TTL_MS,
+            cache_scope: crate::protocol::CACHE_SCOPE.to_string(),
+        };
 
         to_json(&result)
     }

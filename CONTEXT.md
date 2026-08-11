@@ -726,17 +726,29 @@ singular is a member of one, and conflating them is the defect above)
 
 **Event**:
 One member of an **event set**: a hit that suspended the debuggee and is reported to the caller, who is
-expected to resume it. Reported **two** ways, and both always happen: recorded in a bounded buffer the caller polls, and pushed as an
+expected to resume it. Reported **two** ways: recorded in a bounded buffer the caller polls, and pushed as an
 alert. The buffer is the record; the alert is a hint that one exists.
+**Only the buffer is unconditional**, and that changed under this project rather than being designed:
+MCP 2026-07-28 makes `notifications/message` request-scoped, and a hit belongs to no request, so a caller
+on that revision gets no push at all and the alert goes to the server's stderr (MCP-1, ADR-0047). The
+sentence that used to read "both always happen" was true for two years and is the kind of claim worth
+dating.
 
 **Alert**:
 Something the debugger says without being asked, because the debuggee's state changed under the caller —
 a stop point suspending the VM, or the watchdog resuming it and disarming whatever froze it. Best-effort
 by definition: an alert may be dropped, and everything one carries is also readable by asking, so nothing
 depends on one arriving.
+**That last clause is why this concept survived a protocol revision removing its channel.** MCP
+2026-07-28 has nowhere legal to put an alert — `notifications/message` is request-scoped and a hit belongs
+to no request — so for a caller on that revision an alert is written to the server's **stderr** and read
+back with `debug.get_last_event`. "Best-effort, and never the record" was load-bearing rather than modest:
+had anything been designed to depend on the push, the revision would have removed a feature instead of a
+transport (MCP-1, ADR-0047).
 _Avoid_: notification (JSON-RPC's word for any id-less message, including the inbound ones this server
 receives — the wire method stays `notifications/message` because that name belongs to the protocol, not
-to this concept)
+to this concept), push (names one of the two channels an alert now has, and the one a modern caller never
+sees)
 
 **Snapshot**:
 A hit that was recorded without suspending: its location, thread, in-scope locals, caller chain, and
