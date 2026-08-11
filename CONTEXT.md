@@ -137,6 +137,33 @@ _Avoid_: MCP session (abolished by `2026-07-28`, and the reason this entry exist
 stream (none of them is a session — the identification is what the revision denies), conversation (the
 client's, and it may interleave unrelated work on one process)
 
+**Era** (**modern** / **legacy** / **dual-era**):
+Which MCP contract a caller is being served under. **Modern** is `2026-07-28` and later, where every request
+carries its own version and capabilities in `_meta` and there is no handshake; **legacy** is `2025-11-25` and
+earlier, established by an `initialize` handshake. A server answering both is **dual-era**, and this one is.
+
+Not our coinage — these are the specification's own three words, adopted rather than invented so that a
+reader can carry them between the spec, the ADRs and the code without translating.
+
+**It names something a caller can feel, which is why it is here and not only in an ADR.** The era decides
+whether a stop point's **alert** is pushed at all: on the modern era `notifications/message` is
+request-scoped and a hit belongs to no request, so the push has nowhere legal to go and the alert is written
+to the server's **stderr** instead, leaving `debug.get_last_event` as how a hit is learned. Same server,
+same stop point, two different caller experiences — a difference no tool description can carry, because it
+is a property of the peer rather than of the tool.
+
+Which era a caller is on is decided by how they open and by nothing else: a request bearing
+`_meta['io.modelcontextprotocol/protocolVersion']` is modern, an `initialize` is legacy. **A request with
+neither is read as legacy rather than as malformed**, which is an interpretation rather than a quotation —
+the spec would call a *modern* request missing a required field `-32602`, and the reading turns on a request
+with no `_meta` at all not being identifiable as modern in the first place (ADR-0047; revisited in MCP-2,
+[#185](https://github.com/YgorPerez/java-debugging-mcp/issues/185), which proposes accepting only the modern
+era).
+_Avoid_: version, revision (those are the dated strings — `2026-07-28` is a revision, modern is the era it
+belongs to, and a caller can be on the modern era through more than one revision), protocol (too broad; JDWP
+is also a protocol here and the two are never the same subject), mode (suggests something this server was
+configured into, when it is something the caller chose)
+
 **Attached** / **launched**:
 Whose JVM it is — the fact every safety default here is derived from. An **attached** debuggee was started by
 somebody else and is *presumed* shared, so suspending it may be stalling a request nobody told you about,
@@ -776,21 +803,20 @@ singular is a member of one, and conflating them is the defect above)
 One member of an **event set**: a hit that suspended the debuggee and is reported to the caller, who is
 expected to resume it. Reported **two** ways: recorded in a bounded buffer the caller polls, and pushed as an
 alert. The buffer is the record; the alert is a hint that one exists.
-**Only the buffer is unconditional**, and that changed under this project rather than being designed:
-MCP 2026-07-28 makes `notifications/message` request-scoped, and a hit belongs to no request, so a caller
-on that revision gets no push at all and the alert goes to the server's stderr (MCP-1, ADR-0047). The
-sentence that used to read "both always happen" was true for two years and is the kind of claim worth
-dating.
+**Only the buffer is unconditional**, and that changed under this project rather than being designed: the
+modern **era** makes `notifications/message` request-scoped, and a hit belongs to no request, so a caller
+there gets no push at all and the alert goes to the server's stderr (MCP-1, ADR-0047). The sentence that
+used to read "both always happen" was true for two years and is the kind of claim worth dating.
 
 **Alert**:
 Something the debugger says without being asked, because the debuggee's state changed under the caller —
 a stop point suspending the VM, or the watchdog resuming it and disarming whatever froze it. Best-effort
 by definition: an alert may be dropped, and everything one carries is also readable by asking, so nothing
 depends on one arriving.
-**That last clause is why this concept survived a protocol revision removing its channel.** MCP
-2026-07-28 has nowhere legal to put an alert — `notifications/message` is request-scoped and a hit belongs
-to no request — so for a caller on that revision an alert is written to the server's **stderr** and read
-back with `debug.get_last_event`. "Best-effort, and never the record" was load-bearing rather than modest:
+**That last clause is why this concept survived a protocol revision removing its channel.** The modern
+**era** has nowhere legal to put an alert — `notifications/message` is request-scoped and a hit belongs to
+no request — so for a caller there an alert is written to the server's **stderr** and read back with
+`debug.get_last_event`. "Best-effort, and never the record" was load-bearing rather than modest:
 had anything been designed to depend on the push, the revision would have removed a feature instead of a
 transport (MCP-1, ADR-0047).
 _Avoid_: notification (JSON-RPC's word for any id-less message, including the inbound ones this server
