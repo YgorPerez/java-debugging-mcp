@@ -158,6 +158,29 @@ impl Alerter {
         Era::from_u8(self.era.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Queue one notification the **protocol requires**, waiting for capacity rather than dropping it.
+    ///
+    /// **The opposite discipline to [`Self::alert`], and the difference is the point.** An alert is a
+    /// hint whose content is also readable by asking, so dropping one under backpressure is correct. A
+    /// `notifications/subscriptions/acknowledged` is neither optional nor recoverable: the spec says it
+    /// **MUST** be the first message on a subscription, and a client that never sees it is waiting for
+    /// something that will not come. So this `.await`s for room, exactly as a response does, and is not
+    /// gated on era or on `JDWP_ALERTS` — neither of those is about protocol-required traffic.
+    ///
+    /// Still goes through the one channel and the one writer, so ADR-0012 is intact: ordering against
+    /// the response that follows it comes from the channel being FIFO, not from timing.
+    pub async fn send_required(&self, method: &str, params: serde_json::Value) -> bool {
+        let note = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params: Some(params),
+        };
+        let Ok(line) = serde_json::to_string(&note) else {
+            return false;
+        };
+        self.tx.send(line).await.is_ok()
+    }
+
     /// Emit one `notifications/message`, or account for it if that is not possible.
     ///
     /// Returns whether it was queued, which is what the tests assert on — the caller has nothing
@@ -396,6 +419,7 @@ pub const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabi
 pub const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
 pub const META_LOG_LEVEL: &str = "io.modelcontextprotocol/logLevel";
 pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+pub const META_SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
 
 /// The syslog levels of RFC 5424, which is the closed set `io.modelcontextprotocol/logLevel` may name.
 pub const LOG_LEVELS: [&str; 8] =

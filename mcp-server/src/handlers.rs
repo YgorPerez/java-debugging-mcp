@@ -12,7 +12,7 @@ use crate::tools;
 use crate::value_reads::ValueReads;
 use serde_json::json;
 use std::fmt::Write as _;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Serialize an internal response struct into a JSON value, mapping the
 /// (practically impossible) serialization failure to a JSON-RPC internal error
@@ -470,6 +470,7 @@ impl RequestHandler {
             Err(e) => Err(e),
             Ok(()) => match request.method.as_str() {
                 "server/discover" => Self::handle_discover(),
+                "subscriptions/listen" => self.handle_subscriptions_listen(&request.id).await,
                 "initialize" => {
                     // The handshake itself is the era signal, ahead of `notifications/initialized`: a
                     // hit can land between the two, and it must not go to stderr for a client that is
@@ -477,7 +478,7 @@ impl RequestHandler {
                     self.alerter.note_era(crate::protocol::Era::Legacy);
                     Self::handle_initialize(request.params)
                 }
-                "tools/list" => Self::handle_list_tools(),
+                "tools/list" => Self::handle_list_tools(request.params.as_ref()),
                 "tools/call" => self.handle_call_tool(request.params).await,
                 _ => Err(JsonRpcError {
                     code: METHOD_NOT_FOUND,
@@ -512,8 +513,35 @@ impl RequestHandler {
                 // protocol violation rather than a helpful early warning.
                 self.alerter.arm();
             }
+            // MCP-1: a cancellation cannot be honoured here, and saying so is the whole of the fix.
+            //
+            // The spec asks a server to stop work on a cancelled request "as soon as practical". This
+            // process reads one line, processes it to completion, and only then reads the next — so a
+            // cancellation is ALWAYS read after the request it names has already been answered. There is
+            // never an in-flight request for it to reach. That is not an oversight to tidy up later:
+            // honouring it means dispatching requests concurrently, and concurrent `debug.*` calls
+            // against one JDWP connection would put a `debug.continue` mid-flight against a
+            // `debug.evaluate`, which is exactly what ADR-0003's suspend counting and ADR-0009's dump
+            // budget assume cannot happen. Trading that for a SHOULD would be a bad bargain.
+            //
+            // The exposure is bounded rather than open-ended: an invoke is capped at
+            // DEFAULT_INVOKE_TIMEOUT_MS and a JDWP reply at the event loop's own timeout, so the longest
+            // a cancelled request can keep running is that, not forever.
+            //
+            // The "MUST NOT send any further messages for it" half IS satisfied, and for the same
+            // structural reason: the response went out before this notification was read, so nothing
+            // follows the cancellation. Logged at `info` rather than `debug` so an operator who cancelled
+            // and watched it complete anyway can see why, which is the honest version of this.
             "notifications/cancelled" => {
-                debug!("Request cancelled");
+                let which = notification
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("requestId"))
+                    .map_or_else(|| "an unnamed request".to_string(), ToString::to_string);
+                info!(
+                    "cancellation for {which} arrived after it was answered — this server processes one \
+                     request at a time, so there is never an in-flight request to stop (MCP-1, ADR-0047)"
+                );
             }
             _ => {
                 warn!("Unknown notification: {}", notification.method);
@@ -646,6 +674,46 @@ impl RequestHandler {
         to_json(&result)
     }
 
+    /// `subscriptions/listen` (MCP-1): acknowledge the subscription, honour nothing, and close it.
+    ///
+    /// **The honoured set is empty, and it is empty for a structural reason rather than a missing
+    /// feature.** The filter has exactly four types — `toolsListChanged`, `promptsListChanged`,
+    /// `resourcesListChanged`, `resourceSubscriptions` — and this server can never fire any of them:
+    /// there are no resources and no prompts, and the tool list is a compiled-in vector, so the set of
+    /// tools cannot change while the process lives. The spec's own rule for that case is to omit
+    /// unsupported types from the acknowledgment, which leaves `{}`.
+    ///
+    /// So the stream is opened and closed in one exchange: the mandatory
+    /// `notifications/subscriptions/acknowledged` first, then the graceful-closure empty result the spec
+    /// defines for a server ending a subscription on its own initiative. Holding the request open
+    /// instead would mean parking a JSON-RPC id forever to deliver nothing — a client would wait on it
+    /// through every reconnect, and on stdio it would have to re-send after each one anyway.
+    ///
+    /// **This is answered rather than refused deliberately.** `-32601` was the previous behaviour and it
+    /// is the one answer a client cannot act on: subscribe-and-notify is one of the three message
+    /// patterns the base protocol requires, so "method not found" reads as a server that does not speak
+    /// the revision, rather than one with nothing to say.
+    async fn handle_subscriptions_listen(
+        &self,
+        id: &serde_json::Value,
+    ) -> Result<serde_json::Value, JsonRpcError> {
+        // MUST be the first message on the subscription, and MUST carry its id — which is the JSON-RPC
+        // id of this request, because on stdio every subscription shares the one channel and that field
+        // is the only thing a client can demultiplex by.
+        let meta = json!({ crate::protocol::META_SUBSCRIPTION_ID: id });
+        self.alerter
+            .send_required(
+                "notifications/subscriptions/acknowledged",
+                json!({ "_meta": meta, "notifications": {} }),
+            )
+            .await;
+
+        // The graceful close. An empty result correlated by the same id is how the spec distinguishes
+        // "this subscription ended cleanly" from "the transport dropped", and the difference decides
+        // whether a client reconnects.
+        Ok(json!({ "_meta": meta }))
+    }
+
     fn handle_initialize(params: Option<serde_json::Value>) -> Result<serde_json::Value, JsonRpcError> {
         let _params: InitializeParams =
             serde_json::from_value(params.unwrap_or_else(|| json!({}))).map_err(|e| JsonRpcError {
@@ -679,7 +747,27 @@ impl RequestHandler {
     /// `tools/list`. The order is the order `get_tools()` builds, which is fixed at compile time — so
     /// the "SHOULD be deterministic across requests" rule of 2026-07-28 holds by construction rather
     /// than by sorting here, and a client's cache and an LLM's prompt cache both stay warm.
-    fn handle_list_tools() -> Result<serde_json::Value, JsonRpcError> {
+    ///
+    /// **Every tool comes back in one page, so any `cursor` is refused (MCP-1).** This reply never
+    /// carries a `nextCursor`, and a cursor is an opaque token a server *minted* — so a cursor arriving
+    /// here is one this server never issued, whatever it contains. `-32602`, which is what the spec asks
+    /// for an invalid cursor, and refusing beats ignoring: a client that believes it is paginating would
+    /// otherwise read page one forever and never learn why.
+    fn handle_list_tools(params: Option<&serde_json::Value>) -> Result<serde_json::Value, JsonRpcError> {
+        // A null cursor is an absent one. Note that an EMPTY STRING is not: the spec is explicit that
+        // `""` is a valid cursor and must not be read as the end of results, so it reaches the refusal
+        // below like any other value this server did not mint.
+        if let Some(cursor) = params.and_then(|p| p.get("cursor")).filter(|c| !c.is_null()) {
+            return Err(JsonRpcError {
+                code: INVALID_PARAMS,
+                message: format!(
+                    "Unknown cursor {cursor}. tools/list returns every tool in a single page and never \
+                     issues a nextCursor, so there is no cursor from this server to continue from — ask \
+                     again without one."
+                ),
+                data: None,
+            });
+        }
         let result = ListToolsResult {
             tools: tools::get_tools(),
             ttl_ms: crate::protocol::CACHE_TTL_MS,

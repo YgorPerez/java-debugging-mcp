@@ -386,3 +386,93 @@ fn the_legacy_handshake_is_untouched() {
     assert!(result["instructions"].as_str().is_some_and(|s| s.contains("debug.attach")), "{reply}");
     assert_still_serving(&mut server, "the legacy handshake");
 }
+
+/// `subscriptions/listen` is answered, not refused — and the acknowledgment comes **first**.
+///
+/// Ordering is the assertion that carries the weight: the spec says the acknowledgment MUST be the first
+/// message on a subscription, and on stdio everything shares one channel, so "first" is a property of the
+/// line order and nothing else. A server that queued the response first would look correct in every field
+/// and still be wrong.
+///
+/// The honoured set is empty because none of the four filter types can ever fire here: no resources, no
+/// prompts, and a compiled-in tool list. So the subscription is opened and closed in one exchange, which
+/// is what the spec's graceful-closure result is for.
+#[test]
+fn a_subscription_is_acknowledged_first_and_then_closed_gracefully() {
+    let mut server = Server::start().expect("start server");
+    server
+        .send_raw(&format!(
+            r#"{{"jsonrpc":"2.0","id":31,"method":"subscriptions/listen","params":{}}}"#,
+            serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "notifications": { "toolsListChanged": true, "resourcesListChanged": true },
+            })
+        ))
+        .expect("write subscriptions/listen");
+
+    let ack = server.read_reply().expect("an acknowledgment");
+    assert_eq!(
+        ack["method"], "notifications/subscriptions/acknowledged",
+        "the acknowledgment must be the FIRST message on the subscription, before the response: {ack}"
+    );
+    assert!(ack.get("id").is_none(), "an acknowledgment is a notification and carries no id: {ack}");
+    assert_eq!(
+        ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 31,
+        "it must carry the subscription id, which is the listen request's own id: {ack}"
+    );
+    assert_eq!(
+        ack["params"]["notifications"],
+        serde_json::json!({}),
+        "nothing here can ever fire, so the honoured set is empty rather than echoed back: {ack}"
+    );
+
+    let closed = server.read_reply().expect("the graceful-closure result");
+    assert_eq!(closed["id"], 31, "the close is the response to the listen request: {closed}");
+    assert_eq!(closed["result"]["resultType"], "complete", "{closed}");
+    assert_eq!(
+        closed["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 31,
+        "an empty result correlated by id is how a clean end is told from a dropped transport: {closed}"
+    );
+    assert!(
+        closed["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "jdwp-mcp",
+        "and the central stamp still applies to it: {closed}"
+    );
+    assert_still_serving(&mut server, "a subscription");
+}
+
+/// A cursor this server never minted is refused rather than ignored (MCP-1).
+///
+/// `tools/list` returns every tool in one page and never issues a `nextCursor`, so any cursor is one the
+/// client did not get from here. Ignoring it would leave a client that believes it is paginating reading
+/// page one forever with no way to find out — the silence-as-answer failure this codebase is built
+/// against. An empty string is included on purpose: the spec is explicit that `""` is a valid cursor and
+/// must not be read as the end of results, so it is refused like any other.
+#[test]
+fn a_cursor_this_server_never_issued_is_refused() {
+    let mut server = Server::start().expect("start server");
+    for cursor in [serde_json::json!("eyJwYWdlIjogMn0="), serde_json::json!("")] {
+        let mut params = stateless(MODERN, &serde_json::json!({}));
+        if let Some(o) = params.as_object_mut() {
+            o.insert("cursor".to_string(), cursor.clone());
+        }
+        let reply = server.request("tools/list", params).expect("paginated tools/list");
+        assert_eq!(
+            error_code(&reply, &format!("cursor {cursor}")),
+            INVALID_PARAMS,
+            "an unknown cursor is -32602, not a silently ignored argument: {reply}"
+        );
+    }
+
+    // A null cursor is an ABSENT cursor, not an invalid one — otherwise a client that serialises its
+    // optional fields as null could never list tools at all.
+    let mut params = stateless(MODERN, &serde_json::json!({}));
+    if let Some(o) = params.as_object_mut() {
+        o.insert("cursor".to_string(), serde_json::Value::Null);
+    }
+    let reply = server.request("tools/list", params).expect("null-cursor tools/list");
+    assert!(reply["result"]["tools"].is_array(), "a null cursor must read as absent: {reply}");
+    assert!(reply["result"].get("nextCursor").is_none(), "one page means no nextCursor: {reply}");
+}

@@ -84,6 +84,27 @@ anything been built to depend on the push, this would have been a capability los
 The capability describes what this server will do for *this* peer, and the answer genuinely differs;
 declaring notifications that can never arrive would be the silent promise this codebase exists to refuse.
 
+### Answering with nothing beats refusing, twice
+
+Two methods this server has nothing to offer are **answered** rather than refused, and in both cases the
+refusal was the answer a client could not act on.
+
+`subscriptions/listen` acknowledges the subscription with an **empty** honoured set and then closes it
+gracefully. The filter has exactly four types — `toolsListChanged`, `promptsListChanged`,
+`resourcesListChanged`, `resourceSubscriptions` — and none can ever fire here: no resources, no prompts,
+and a compiled-in tool vector, so the set of tools cannot change while the process lives. The spec's rule
+for that case is to omit unsupported types from the acknowledgment, which leaves `{}`. `-32601` was the
+previous behaviour, and subscribe-and-notify is one of the three message patterns the base protocol
+requires — so "method not found" reads as *a server that does not speak this revision* rather than one with
+nothing to say. Holding the request open instead would park a JSON-RPC id forever to deliver nothing, and
+on stdio a client must re-subscribe after any reconnect anyway.
+
+`tools/list` **refuses** a `cursor` with `-32602` instead of ignoring one. Every tool comes back in a single
+page and no `nextCursor` is ever issued, so a cursor arriving here is one this server never minted, whatever
+it contains. Ignoring it would leave a client that believes it is paginating reading page one forever with
+no way to discover why — silence reading as an answer. A `null` cursor is treated as absent; an empty string
+is not, because the spec is explicit that `""` is a valid cursor and must not be read as the end of results.
+
 ### Every result is stamped in one place
 
 `resultType: "complete"` and `_meta['io.modelcontextprotocol/serverInfo']` are added centrally in
@@ -135,3 +156,26 @@ consumer sees in exchange for nothing.
   bounds staleness after an *upgrade*, not after a change.
 - Nothing in `jdwp-client` changed, and no JDWP command was added: this revision is entirely about the MCP
   side of the process (SAFE-12's table is untouched).
+
+### `notifications/cancelled` is not honoured, and that is a decision rather than a gap
+
+The spec asks a server to stop work on a cancelled request *as soon as practical*. This one cannot, and the
+reason is structural: the message loop reads one line, processes it to completion, and only then reads the
+next — so a cancellation is **always** read after the request it names has already been answered. There is
+never an in-flight request for it to reach.
+
+Honouring it means dispatching requests concurrently, and that is the trade being refused. Concurrent
+`debug.*` calls against one JDWP connection would allow a `debug.continue` mid-flight against a
+`debug.evaluate` — precisely what ADR-0003's suspend counting and ADR-0009's dump budget are written on the
+assumption cannot happen. Buying a SHOULD with that is a bad bargain in a debugger whose safety model
+assumes a serial caller.
+
+Two things make it tolerable rather than merely refused. The exposure is **bounded**: an invoke is capped by
+`DEFAULT_INVOKE_TIMEOUT_MS` and a JDWP reply by the event loop's own timeout, so the longest a cancelled
+request runs is that, not indefinitely. And the accompanying **MUST** — *MUST NOT send any further messages
+for a cancelled request* — is satisfied for the same structural reason: the response went out before the
+cancellation was read, so nothing follows it.
+
+What changed is that the handler now says so at `info` instead of `debug`, naming the request. An operator
+who cancels and watches the call complete anyway should be able to find out why from the log rather than
+from this file.
