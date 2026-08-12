@@ -1328,7 +1328,7 @@ impl RequestHandler {
         // Parsed before the session is resolved, and not inside `base` below, so a malformed `instance_id`
         // is still refused ahead of "no active debug session" — the order every caller has seen.
         let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
-        let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
+        let max_classes = clamped_max_classes(a.max_classes);
 
         let session_guard = self
             .resolve_session(&args)
@@ -1382,11 +1382,7 @@ impl RequestHandler {
 
         // Anything that CAN produce several stop points gets the per-pattern breakdown, because partial
         // success is the normal outcome and an error would discard the patterns that worked.
-        let index = if patterns.iter().any(|p| is_wildcard(p)) {
-            load_class_index(&mut session.connection).await?
-        } else {
-            Vec::new()
-        };
+        let index = class_index_for(&mut session.connection, &patterns).await?;
         let mut outcomes = Vec::with_capacity(patterns.len());
         for p in &patterns {
             let spec = base.for_pattern(p);
@@ -3659,7 +3655,7 @@ impl RequestHandler {
             a.trace_expr.clone(),
             &session.trace_exprs,
         );
-        let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
+        let max_classes = clamped_max_classes(a.max_classes);
 
         // The catch-all and the one named class keep exactly the reply they have always had.
         if patterns.len() <= 1 && !patterns.first().is_some_and(|p| is_wildcard(p)) {
@@ -3679,11 +3675,7 @@ impl RequestHandler {
         }
 
         // Several patterns, or a wildcard: one exc_ per resolved class, and a row per class (FILT-3/FILT-4).
-        let index = if patterns.iter().any(|p| is_wildcard(p)) {
-            load_class_index(&mut session.connection).await?
-        } else {
-            Vec::new()
-        };
+        let index = class_index_for(&mut session.connection, &patterns).await?;
         let mut batches = Vec::with_capacity(patterns.len());
         // Built once rather than per pattern: it is the same for every one of them, which is what the
         // struct exists to say.
@@ -3750,7 +3742,7 @@ impl RequestHandler {
             a.trace_expr.clone(),
             &session.trace_exprs,
         );
-        let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
+        let max_classes = clamped_max_classes(a.max_classes);
         let arm = FieldArm {
             field_name: &field_name,
             kinds: &kinds,
@@ -3777,11 +3769,7 @@ impl RequestHandler {
         }
 
         // Several classes, or a wildcard: one watch per kind per class that HAS the field (FILT-3/FILT-4).
-        let index = if classes.iter().any(|p| is_wildcard(p)) {
-            load_class_index(&mut session.connection).await?
-        } else {
-            Vec::new()
-        };
+        let index = class_index_for(&mut session.connection, &classes).await?;
         let limits = BatchLimits {
             instance_filter,
             max_classes,
@@ -15782,6 +15770,32 @@ async fn load_class_index(conn: &mut jdwp_client::JdwpConnection) -> Result<Vec<
     Ok(out)
 }
 
+/// The class index a **batch** needs, or an empty one when nothing in it can expand.
+///
+/// Three of the five arming handlers asked this question in the same four lines (CLEAN-5, #188). The guard
+/// is the *point* of the call rather than an optimisation over it: the index is thousands of entries on a
+/// real app server and a batch of exact class names has no use for any of them (ADR-0010), so three copies
+/// were three chances for one of them to load it unconditionally and nothing to notice.
+async fn class_index_for(
+    conn: &mut jdwp_client::JdwpConnection,
+    patterns: &[String],
+) -> Result<Vec<(String, u64)>, String> {
+    if patterns.iter().any(|p| is_wildcard(p)) {
+        load_class_index(conn).await
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// The `max_classes` ceiling a **batch** expands under, with the floor that keeps it meaningful.
+///
+/// Clamped low as well as high, and the floor is the half worth a word: `0` would match classes and then
+/// arm none of them, which reads to a caller as the *pattern* having failed rather than the argument.
+/// Written once because it stood at three of the five arming handlers (CLEAN-5, #188).
+fn clamped_max_classes(requested: usize) -> usize {
+    requested.clamp(1, crate::args::MAX_CLASSES_CEILING)
+}
+
 /// The tightest JDWP `ClassMatch` that is a **superset** of `pattern`, and whether it had to widen.
 ///
 /// JDWP's `ClassMatch` understands an exact name, `prefix*`, or `*suffix` — and nothing else. Our matcher
@@ -25825,7 +25839,7 @@ mod tests {
     /// the test-that-cannot-fail shape US-11 hit in #187 (`LISTING_ORDER` asserted against a hand-written
     /// copy of itself). Which kind reaches this is a JVM question and stays with the arm-and-hit tests;
     /// that it is reached from exactly one place is asserted by
-    /// `the_clamp_and_note_block_has_exactly_one_caller`.
+    /// `every_shared_arming_step_has_exactly_one_caller`.
     #[test]
     fn one_resolution_answers_every_shared_trace_concern() {
         let session = vec!["s1".to_string(), "s2".to_string()];
@@ -25867,30 +25881,46 @@ mod tests {
         assert!(arm.note.is_none(), "a suspending stop point captures nothing, so no clamp applies");
     }
 
-    /// CLEAN-5 (#188): the clamp-and-note block has one caller, and this is what keeps it that way.
+    /// CLEAN-5 (#188): each shared arming step has one caller, and this is what keeps it that way.
     ///
-    /// It stood verbatim at five arming handlers, and one of the five differed for a correctness reason
-    /// recorded only in prose — that handler read the **session default** before taking its own guard,
-    /// because the other four already held theirs and re-locking would deadlock. Five copies of a sequence
-    /// where one copy is load-bearing is the shape that deadlocks the day a sixth kind is added by copying
-    /// the wrong template, so a sixth *copy* is the regression worth catching.
+    /// The clamp-and-note block stood verbatim at five arming handlers, and one of the five differed for a
+    /// correctness reason recorded only in prose — that handler read the **session default** before taking
+    /// its own guard, because the other four already held theirs and re-locking would deadlock. Five copies
+    /// of a sequence where one copy is load-bearing is the shape that deadlocks the day a sixth kind is
+    /// added by copying the wrong template, so a sixth *copy* is the regression worth catching.
+    ///
+    /// `load_class_index` is here for the opposite failure. It stood behind a wildcard guard at three
+    /// handlers, and the guard is the point of the call rather than an optimisation over it: unguarded, it
+    /// reads thousands of entries that a batch of exact class names has no use for (ADR-0010). A fourth
+    /// caller is how that guard goes missing.
     ///
     /// Scanned against this file's own source, the way
     /// `no_caller_facing_message_has_source_indentation_baked_into_it` is, because the alternative is a
-    /// reply assertion per kind and each of those needs a live JVM: the block runs under the session
-    /// guard, so nothing can reach it without a socket (ADR-0049). A source scan is the only thing here
+    /// reply assertion per kind and each of those needs a live JVM: these steps run under the session
+    /// guard, so nothing can reach them without a socket (ADR-0049). A source scan is the only thing here
     /// that notices a copy.
     #[test]
-    fn the_clamp_and_note_block_has_exactly_one_caller() {
+    fn every_shared_arming_step_has_exactly_one_caller() {
         let src = include_str!("handlers.rs");
         // The tests below call these helpers directly and legitimately, so only production code counts.
         let production = src.split("\n#[cfg(test)]\n").next().expect("this file has a test module");
+
+        // The ceiling is reached only through `clamped_max_classes`, which is where the floor of 1 lives —
+        // a bare `clamp(0, …)` elsewhere would arm nothing and read as the pattern having failed.
+        let ceilings: Vec<&str> = production.lines().filter(|l| l.contains("MAX_CLASSES_CEILING")).collect();
+        assert_eq!(
+            ceilings.len(),
+            1,
+            "`MAX_CLASSES_CEILING` must be applied only by `clamped_max_classes`, so the floor travels \
+             with the ceiling. Found: {ceilings:#?}"
+        );
 
         for name in [
             "clamp_trace_frames",
             "clamp_trace_max_length",
             "resolve_trace_exprs",
             "describe_took_session_default",
+            "load_class_index",
         ] {
             let call = format!("{name}(");
             let definition = format!("fn {call}");
@@ -25903,9 +25933,9 @@ mod tests {
             assert_eq!(
                 callers.len(),
                 1,
-                "`{name}` must be reached only through `TraceArm::resolve`, so a sixth stop-point kind \
-                 cannot re-copy the block the five were collapsed into. Found {} call site(s): \
-                 {callers:#?}",
+                "`{name}` is a shared arming step and must have exactly one caller, so a sixth \
+                 stop-point kind cannot re-copy what the five were collapsed into. Found {} call \
+                 site(s): {callers:#?}",
                 callers.len()
             );
         }
