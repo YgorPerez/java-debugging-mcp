@@ -117,3 +117,6 @@ first·   ⚠️  second
 
 ## discarded_exits/mixed
  · exits discarded: 3214·       ↳ 3214 exit(s) of other methods of this class were delivered and dropped as well, and the debuggee paid for each of them — JDWP has no method-name modifier, so a ClassMatch delivers every method. Narrowing `class_pattern` is the only thing that reduces it; the `method` filter is applied here, after the cost.
+
+## no_session_refusal
+No active debug session. Use debug.attach first.

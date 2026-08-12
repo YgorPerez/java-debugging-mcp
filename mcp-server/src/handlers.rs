@@ -26,6 +26,21 @@ const INSTRUCTIONS: &str = "JDWP debugging server for Java applications. \
      Start by using debug.attach to connect to a JVM, \
      then use debug.set_line_stop, debug.get_stack, etc.";
 
+/// What every tool says when a call names no resolvable session — one sentence for all 35 of them
+/// (DOC-18, #193).
+///
+/// A `const` rather than a literal inside [`RequestHandler::require_session`], for a reason the literal
+/// could not serve: `reply-fragments.txt` pins the wording of caller-visible prose, and everything in that
+/// snapshot is reached by calling a **pure** function. `require_session` is `async` and needs a
+/// `RequestHandler`, so the sentence was unpinnable while it lived in that body — which is exactly how two
+/// wordings of one condition survived long enough to be a ticket. Named here, it is one string that both
+/// the refusal and the snapshot read.
+///
+/// The recovery step is the point. A refusal naming only the condition leaves a caller to guess, and the 29
+/// tools that used to say just `"No active debug session"` were the likelier first contact — a caller who
+/// learned `debug.attach` from `debug.set_line_stop` did not learn it from `debug.get_stack`.
+const NO_SESSION_REFUSAL: &str = "No active debug session. Use debug.attach first.";
+
 /// A required `_meta` field the request did not carry (MCP-1). `-32602`, per the spec: a request
 /// missing a required field is malformed rather than unsupported.
 fn missing_meta_field(key: &str) -> JsonRpcError {
@@ -430,10 +445,20 @@ impl RequestHandler {
     /// The session a call names, or the refusal that says there is none — the fallible half of
     /// [`Self::resolve_session`].
     ///
-    /// One sentence, in one place. It is caller-visible text that stood written out at six sites (CLEAN-5,
-    /// #188), five of them the arming handlers, and `docs/toolkit-contract.md` is why that matters: a reply
-    /// a downstream skill is written against must not be able to drift between copies, and six copies of a
-    /// refusal is six chances for one of them to be reworded alone.
+    /// One sentence, in one place, for all 35 tools that can refuse this. It is caller-visible text that
+    /// stood written out at six sites (CLEAN-5, #188), five of them the arming handlers, and
+    /// `docs/toolkit-contract.md` is why that matters: a reply a downstream skill is written against must
+    /// not be able to drift between copies, and six copies of a refusal is six chances for one of them to
+    /// be reworded alone.
+    ///
+    /// **The other 29 said less, and which sentence a caller got depended only on which tool they reached
+    /// for** (DOC-18, #193). They refused the identical condition with a bare `"No active debug session"`
+    /// and no recovery step, so a caller who learned `debug.attach` from `debug.set_line_stop` did not
+    /// learn it from `debug.get_stack` — the tool they are likelier to hit first. Routing them here is a
+    /// **behaviour change**, not a refactor: the sentence 29 tools return is different now, which is why it
+    /// moved `reply-fragments.txt` and earned its own commit and release note rather than being folded into
+    /// #188's refactor. The hint is the whole value of a refusal a caller can act on and it costs nothing
+    /// on the 29 that lacked it.
     ///
     /// Returns the `Arc` rather than a lock, so the guard is still taken at the call site. Locking here
     /// would mean returning a guard borrowed from a mutex this function owns; `lock_owned` would work, but
@@ -443,9 +468,7 @@ impl RequestHandler {
         &self,
         args: &serde_json::Value,
     ) -> Result<std::sync::Arc<tokio::sync::Mutex<crate::session::DebugSession>>, String> {
-        self.resolve_session(args)
-            .await
-            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())
+        self.resolve_session(args).await.ok_or_else(|| NO_SESSION_REFUSAL.to_string())
     }
 
     pub async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
@@ -1410,8 +1433,7 @@ impl RequestHandler {
         // One argument of its own since BP-8 (#135); the parse is still also the unknown-argument check every
         // other tool gets from its own `deny_unknown_fields` struct (DOC-9, #132).
         let a: crate::args::ListStopPointsArgs = crate::args::parse(&args)?;
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
 
         let mut session = session_guard.lock().await;
 
@@ -1593,8 +1615,7 @@ impl RequestHandler {
     /// (ADR-0041) declined. What it does instead is *say* how many snapshots are already gone.
     async fn handle_export_investigation(&self, args: serde_json::Value) -> Result<String, String> {
         crate::args::parse::<crate::args::NoArgs>(&args)?;
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
 
         // One round trip, and the only one this tool makes. Worth it: "which JVM was this?" is the first
@@ -1674,8 +1695,7 @@ impl RequestHandler {
         let a: crate::args::ClearBreakpointArgs = crate::args::parse(&args)?;
         let bp_id = a.breakpoint_id.as_str();
 
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
 
         let mut session = session_guard.lock().await;
 
@@ -1715,8 +1735,7 @@ impl RequestHandler {
         let a: crate::args::ToggleBreakpointArgs = crate::args::parse(&args)?;
         let id = a.breakpoint_id.trim().to_string();
 
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
 
         // A wildcard family toggles as a unit (FILT-3): its members AND its watch for future classes, or
@@ -1798,8 +1817,7 @@ impl RequestHandler {
             ));
         }
 
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
 
         let before = read_editable_stop_point(&session, &id)?;
@@ -1836,8 +1854,7 @@ impl RequestHandler {
         // Takes no arguments of its own, so this is purely the unknown-argument check every other
         // tool gets from its own `deny_unknown_fields` struct (DOC-9, #132).
         crate::args::parse::<crate::args::NoArgs>(&args)?;
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
 
         let mut session = session_guard.lock().await;
 
@@ -1881,8 +1898,7 @@ impl RequestHandler {
         depth: jdwp_client::extra::StepDepth,
         label: &str,
     ) -> Result<String, String> {
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
 
         let a: crate::args::StepArgs = crate::args::parse(&args)?;
@@ -1923,8 +1939,7 @@ impl RequestHandler {
         // Takes no arguments of its own, so this is purely the unknown-argument check every other
         // tool gets from its own `deny_unknown_fields` struct (DOC-9, #132).
         crate::args::parse::<crate::args::NoArgs>(&args)?;
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
 
         if let Some((req, _)) = session.pending_step.take() {
@@ -1989,8 +2004,7 @@ impl RequestHandler {
     }
 
     async fn handle_get_stack(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
 
         let mut session = session_guard.lock().await;
 
@@ -2123,8 +2137,7 @@ impl RequestHandler {
         let frame_index = a.frame_index;
         let max_len = a.max_result_length;
 
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         // Read-only: invocation is refused by the connection itself (SAFE-6), so nothing here needs to
         // guess from the expression text — which used to miss `List.get` subscripts and `toString()`
@@ -2213,8 +2226,7 @@ impl RequestHandler {
         // Same `#<charset>` selector `debug.evaluate` takes, stripped before resolution (EVAL-7).
         let (expression, bytes) = split_charset(a.expression.trim())?;
 
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         let thread_id = crate::args::parse_thread_id(a.thread_id.as_deref()).or(session.last_thread);
         let conn = &mut session.connection;
@@ -2249,8 +2261,7 @@ impl RequestHandler {
     }
 
     async fn handle_list_threads(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
 
         let mut session = session_guard.lock().await;
 
@@ -2355,8 +2366,7 @@ impl RequestHandler {
     /// matched-against-loaded and shows a page — truncating loudly, per DUMP-1, so a page is never
     /// mistaken for the whole answer.
     async fn handle_list_classes(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
 
         let mut session = session_guard.lock().await;
 
@@ -2409,8 +2419,7 @@ impl RequestHandler {
     /// type is the most intricate machinery in this server, and composing arguments for it blind means
     /// a refused argument sends you back to guessing.
     async fn handle_list_methods(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
 
         let mut session = session_guard.lock().await;
 
@@ -2432,8 +2441,7 @@ impl RequestHandler {
     /// duplication is of *shape*, not logic: the resolver, the type renderer and the superclass walk
     /// below are the same functions DISC-2 uses.
     async fn handle_list_fields(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
 
         let mut session = session_guard.lock().await;
 
@@ -2480,8 +2488,7 @@ impl RequestHandler {
                 .to_string());
         }
 
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         let conn = &mut session.connection;
 
@@ -2582,8 +2589,7 @@ impl RequestHandler {
         // Every parameter ambiguity is settled here, before the debuggee is touched.
         let plan = plan_query_parameters(&a)?;
 
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         if session.read_only {
             return Err("🔒 read-only: running a named query INVOKES methods in the debuggee — \
@@ -2655,8 +2661,7 @@ impl RequestHandler {
     /// The two genuinely empty-handed cases are the errors: the class is not loaded, or it is loaded
     /// and carries no `SourceFile` attribute at all.
     async fn handle_source(&self, args: serde_json::Value) -> Result<String, String> {
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
 
         let mut session = session_guard.lock().await;
 
@@ -2764,8 +2769,7 @@ impl RequestHandler {
             return Err("class_name is required (e.g. com.example.OrderService)".to_string());
         }
 
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
 
         let roots: Vec<std::path::PathBuf> = a.class_roots.as_ref().map_or_else(
@@ -2806,8 +2810,7 @@ impl RequestHandler {
                         Drop one of the two."
                 .to_string());
         }
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
 
         let before = session.connection.packets_sent();
@@ -2911,8 +2914,7 @@ impl RequestHandler {
         // Takes no arguments of its own, so this is purely the unknown-argument check every other
         // tool gets from its own `deny_unknown_fields` struct (DOC-9, #132).
         crate::args::parse::<crate::args::NoArgs>(&args)?;
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
 
         let mut session = session_guard.lock().await;
 
@@ -2981,8 +2983,7 @@ impl RequestHandler {
     ///    "suspended" is that the JVM is now still, and it is not.
     async fn handle_suspend_thread(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::SuspendThreadArgs = crate::args::parse(&args)?;
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
 
         let tid =
@@ -3046,8 +3047,7 @@ impl RequestHandler {
     /// matrix reads to tell an honest failure from a false success.
     async fn handle_resume_thread(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::ResumeThreadArgs = crate::args::parse(&args)?;
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
 
         let tid = match a.thread_id.as_deref() {
@@ -3223,8 +3223,7 @@ impl RequestHandler {
 
     async fn handle_get_last_event(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::GetLastEventArgs = crate::args::parse(&args)?;
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
 
         let mut session = session_guard.lock().await;
 
@@ -3307,8 +3306,7 @@ impl RequestHandler {
         let value_str = a.value.as_str();
         let frame_index = a.frame_index;
 
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         if session.read_only {
             return Err(readonly_refusal("set_value writes to the JVM"));
@@ -3353,8 +3351,7 @@ impl RequestHandler {
     async fn handle_force_return(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::ForceReturnArgs = crate::args::parse(&args)?;
 
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         if session.read_only {
             return Err(readonly_refusal("force_return changes what the JVM does"));
@@ -3438,8 +3435,7 @@ impl RequestHandler {
             return Err("class_name is required (e.g. com.example.OrderService)".to_string());
         }
 
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         if session.read_only && !a.dry_run {
             return Err(readonly_refusal(
@@ -3534,8 +3530,7 @@ impl RequestHandler {
     async fn handle_pop_frame(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::PopFrameArgs = crate::args::parse(&args)?;
 
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         if session.read_only {
             return Err(readonly_refusal(
@@ -3926,8 +3921,7 @@ impl RequestHandler {
 
     async fn handle_get_traces(&self, args: serde_json::Value) -> Result<String, String> {
         let a: crate::args::GetTracesArgs = crate::args::parse(&args)?;
-        let session_guard =
-            self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
 
         // FILT-2: the reader of an empty (or quiet) trace buffer is exactly who needs telling that a
@@ -25497,6 +25491,12 @@ mod tests {
         case("discarded_exits/clean", describe_discarded_exits(Some("reservar"), 7, 0));
         case("discarded_exits/mixed", describe_discarded_exits(Some("reservar"), 7, 3214));
 
+        // DOC-18 (#193). Not a renderer — a bare `const` — and pinned anyway, because it is the most widely
+        // returned sentence in the server: 35 tools refuse with it. It was NOT in this file while two
+        // wordings of it existed, and that absence is why nobody noticed the second one. A snapshot entry is
+        // what makes a third wording a diff somebody reads rather than a thing a caller discovers.
+        case("no_session_refusal", NO_SESSION_REFUSAL.to_string());
+
         out
     }
 
@@ -26087,9 +26087,15 @@ mod tests {
     /// that notices a copy.
     ///
     /// The "no active debug session" refusal is checked as *text*, not as a call, because that is the shape
-    /// its duplication took: it stood written out at six sites. It is caller-visible, so
-    /// `docs/toolkit-contract.md` applies — a downstream skill is written against the wording, and six
-    /// copies is six chances for one to be reworded alone.
+    /// its duplication took: it stood written out at six sites, and 29 more tools refused the same condition
+    /// with a shorter sentence carrying no recovery step. It is caller-visible, so
+    /// `docs/toolkit-contract.md` applies — a downstream skill is written against the wording, and a copy is
+    /// a chance for one to be reworded alone.
+    ///
+    /// Since DOC-18 (#193) unified those 35, this checks **two** things rather than one: that the sentence
+    /// appears once, and that the *bare* short form appears **nowhere**. The second is the one that earns its
+    /// keep going forward — a third wording is how this started, and one assertion that the old form is gone
+    /// is cheaper than noticing a new one by reading.
     ///
     /// **What it cannot catch, stated because a guard trusted past its reach is worse than none.** A sixth
     /// handler that *inlines* `requested.clamp(1, …)` or the note fold, rather than calling the helper,
@@ -26103,16 +26109,8 @@ mod tests {
         // The tests below call these helpers directly and legitimately, so only production code counts.
         let production = src.split("\n#[cfg(test)]\n").next().expect("this file has a test module");
 
-        // Caller-visible text, so it is one string and not six. `require_session` is the only place that
+        // Caller-visible text, so it is one string and not 35. `require_session` is the only place that
         // may say it; a handler writing it out again is the drift this catches.
-        //
-        // Matched on the WHOLE sentence, and the reason is a finding rather than a detail: 29 other tools
-        // refuse the same condition with a shorter `"No active debug session"` and no `debug.attach` hint.
-        // Two wordings for one failure is a caller-visible inconsistency, but settling it moves
-        // `reply-fragments.txt`, so it is a behaviour change with its own commit and its own release note
-        // (`docs/toolkit-contract.md`) rather than something a refactor may quietly fold in — DOC-18 (#193).
-        // Until that lands this guards the six that were identical, and a substring match would fail on the
-        // 29. **Delete this paragraph with the workaround** when #193 makes one wording of them.
         let refusals: Vec<&str> = production
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
@@ -26121,8 +26119,28 @@ mod tests {
         assert_eq!(
             refusals.len(),
             1,
-            "this refusal must be written once, in `require_session`, because a downstream skill is written \
-             against its wording. Found: {refusals:#?}"
+            "this refusal must be written once, as `NO_SESSION_REFUSAL`, because a downstream skill is \
+             written against its wording. Reach it through `require_session`. Found: {refusals:#?}"
+        );
+
+        // The half that guards the future rather than the past: the bare short form, closing quote included
+        // so this is the COMPLETE string literal and not a prefix of the sentence above. 29 tools said this
+        // until DOC-18 (#193), and a new handler is likelier to reinvent the short one than to retype the
+        // long one — it is the shorter thing to write and it reads complete.
+        //
+        // `"No active debug session to disconnect"` is a deliberate survivor and does not match this: it is
+        // a different sentence for a caller who asked to disconnect, and #193 put every other refusal's
+        // wording out of scope rather than sweeping one it had not thought about.
+        let short_form: Vec<&str> = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains(r#""No active debug session""#))
+            .collect();
+        assert!(
+            short_form.is_empty(),
+            "this is the wording DOC-18 (#193) removed from 29 tools: it names the condition and not the \
+             recovery step, so a caller learns `debug.attach` only from whichever tool they happened to \
+             reach for first. Call `require_session` instead. Found: {short_form:#?}"
         );
 
         // The ceiling is reached only through `clamped_max_classes`, which is where the floor of 1 lives —
