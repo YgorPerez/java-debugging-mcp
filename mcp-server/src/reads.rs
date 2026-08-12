@@ -7,8 +7,8 @@
 //! `#[ignore]`d tests were paying a `javac`, a JVM launch and a listen wait to assert on how a signature
 //! renders, without ever making the debuggee *do* anything (CLEAN-7, #190).
 //!
-//! [`Reads`] is the narrowest thing that removes the JVM from those: the class and member metadata a
-//! render needs, and nothing else. Two adapters satisfy it — the live connection, and a [`StatedDebuggee`] that
+//! [`Reads`](crate::reads::Reads) is the narrowest thing that removes the JVM from those: the class and member metadata a
+//! render needs, and nothing else. Two adapters satisfy it — the live connection, and a [`StatedDebuggee`](crate::reads::StatedDebuggee) that
 //! answers from data.
 //!
 //! # What it is allowed to carry
