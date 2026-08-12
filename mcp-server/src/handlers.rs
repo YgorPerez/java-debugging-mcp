@@ -9168,7 +9168,7 @@ fn descriptor_candidates(class_name: &str) -> Vec<String> {
 /// What a method listing had to go to the debuggee for (DISC-2), separated from how it renders.
 ///
 /// The split is CLEAN-7 (#190)'s: everything below this line is a pure function of these two values, so
-/// the rendered listing can be asserted from a stated [`crate::reads::Fixture`] and needs no JVM. It also
+/// the rendered listing can be asserted from a stated [`crate::reads::StatedDebuggee`] and needs no JVM. It also
 /// keeps the session guard held for exactly as long as it was before — the handler reads, drops the lock,
 /// then renders — which a single `reads → String` function would quietly have changed.
 #[cfg_attr(test, derive(Debug))]
@@ -10832,7 +10832,7 @@ fn drift_caveat_from_tables(
 /// The whole of `debug.check_stale` below the session lookup (DISC-7, DISC-9, DISC-13).
 ///
 /// Lifted out of the handler by CLEAN-7 (#190) so the verdicts can be driven from a stated
-/// [`crate::reads::Fixture`] and a temporary tree. The subject here is which verdict a given pair of
+/// [`crate::reads::StatedDebuggee`] and a temporary tree. The subject here is which verdict a given pair of
 /// worlds produces, and that never needed a JVM — it needed a class file on disk and a set of line
 /// tables, both of which are things a test can state.
 ///
@@ -29523,7 +29523,7 @@ mod tests {
 /// `list_fields_renders_java_declarations_and_marks_static` and the two DISC-12 generic-listing tests
 /// carry in `mcp_integration.rs`, where each pays a `javac`, a JVM launch and a listen wait to check how a
 /// signature renders — while never making the debuggee do anything. The subject there is the RENDERING,
-/// and a [`crate::reads::Fixture`] states the debuggee's answer directly.
+/// and a [`crate::reads::StatedDebuggee`] states the debuggee's answer directly.
 ///
 /// **The probe tests stay.** They are what would notice a real JVM answering differently — the twin shape
 /// ADR-0014 states as design for `disc2_method_listing` / `disc5_field_listing`, applied one level up.
@@ -29532,7 +29532,7 @@ mod tests {
 #[cfg(test)]
 mod discovery_listing_tests {
     use super::*;
-    use crate::reads::{Fixture, FixtureClass, Reads};
+    use crate::reads::{Reads, StatedClass, StatedDebuggee};
     use jdwp_client::reftype::{FieldInfo, MethodInfo};
 
     const ACC_PUBLIC: i32 = 0x0001;
@@ -29585,18 +29585,18 @@ mod discovery_listing_tests {
         }
     }
 
-    async fn methods_of(fx: &Fixture, a: &crate::args::ListMethodsArgs) -> String {
-        let read = read_method_listing(&mut Reads::Fixture(fx), a).await.expect("a stated class resolves");
+    async fn methods_of(vm: &StatedDebuggee, a: &crate::args::ListMethodsArgs) -> String {
+        let read = read_method_listing(&mut Reads::Stated(vm), a).await.expect("a stated class resolves");
         render_method_listing(&read, a)
     }
 
-    async fn fields_of(fx: &Fixture, a: &crate::args::ListFieldsArgs) -> String {
-        let read = read_field_listing(&mut Reads::Fixture(fx), a).await.expect("a stated class resolves");
+    async fn fields_of(vm: &StatedDebuggee, a: &crate::args::ListFieldsArgs) -> String {
+        let read = read_field_listing(&mut Reads::Stated(vm), a).await.expect("a stated class resolves");
         render_field_listing(&read, a)
     }
 
-    fn eval_probe() -> Fixture {
-        Fixture::new(vec![FixtureClass::new("LEvalProbe;", 10).with_methods(vec![
+    fn eval_probe() -> StatedDebuggee {
+        StatedDebuggee::new(vec![StatedClass::new("LEvalProbe;", 10).with_methods(vec![
             m("twice", "(I)I", ACC_PUBLIC | ACC_STATIC_BIT),
             m("greet", "(Ljava/lang/String;)Ljava/lang/String;", ACC_PUBLIC | ACC_STATIC_BIT),
             m("main", "([Ljava/lang/String;)V", ACC_PUBLIC | ACC_STATIC_BIT),
@@ -29634,15 +29634,15 @@ mod discovery_listing_tests {
     /// The `name_filter` note is part of the reply, and an empty match says how to widen it.
     #[tokio::test]
     async fn a_filtered_method_listing_states_its_filter_and_says_when_nothing_matched() {
-        let fx = eval_probe();
+        let vm = eval_probe();
         let mut a = method_args("EvalProbe");
         a.name_filter = Some("twice".to_string());
-        let hit = methods_of(&fx, &a).await;
+        let hit = methods_of(&vm, &a).await;
         assert!(hit.contains("name~\"twice\""), "the filter is echoed:\n{hit}");
         assert!(hit.contains("twice(int)") && !hit.contains("greet"), "filtered:\n{hit}");
 
         a.name_filter = Some("nosuchthing".to_string());
-        let miss = methods_of(&fx, &a).await;
+        let miss = methods_of(&vm, &a).await;
         assert!(
             miss.contains("No method name matched. Drop name_filter to see the whole class."),
             "an empty filtered listing says how to widen it:\n{miss}"
@@ -29662,19 +29662,17 @@ mod discovery_listing_tests {
     /// The superclass walk and its `[from …]` attribution, which only `inherited:true` turns on.
     #[tokio::test]
     async fn an_inherited_listing_attributes_each_row_to_the_class_that_declares_it() {
-        let fx = Fixture::new(vec![
-            FixtureClass::new("LChild;", 1)
-                .with_methods(vec![m("own", "()V", ACC_PUBLIC)])
-                .with_superclass(2),
-            FixtureClass::new("LParent;", 2).with_methods(vec![m("inheritedOne", "()V", ACC_PUBLIC)]),
+        let vm = StatedDebuggee::new(vec![
+            StatedClass::new("LChild;", 1).with_methods(vec![m("own", "()V", ACC_PUBLIC)]).with_superclass(2),
+            StatedClass::new("LParent;", 2).with_methods(vec![m("inheritedOne", "()V", ACC_PUBLIC)]),
         ]);
 
-        let plain = methods_of(&fx, &method_args("Child")).await;
+        let plain = methods_of(&vm, &method_args("Child")).await;
         assert!(!plain.contains("inheritedOne"), "the default answer is what the class declares:\n{plain}");
 
         let mut a = method_args("Child");
         a.inherited = true;
-        let walked = methods_of(&fx, &a).await;
+        let walked = methods_of(&vm, &a).await;
         assert!(walked.contains(" +inherited"), "the walk is stated in the header:\n{walked}");
         assert!(walked.contains("void inheritedOne()  [from Parent]"), "attribution:\n{walked}");
         assert!(
@@ -29686,13 +29684,13 @@ mod discovery_listing_tests {
     /// DISC-5's rendering claims: statics lead, because those are the ones readable with no instance.
     #[tokio::test]
     async fn a_field_listing_renders_java_declarations_and_puts_the_statics_first() {
-        let fx = Fixture::new(vec![FixtureClass::new("LEvalProbe;", 10).with_fields(vec![
+        let vm = StatedDebuggee::new(vec![StatedClass::new("LEvalProbe;", 10).with_fields(vec![
             f("seq", "I", ACC_PUBLIC),
             f("infra", "Ljava/lang/String;", ACC_PUBLIC | ACC_STATIC_BIT),
             f("LIMIT", "I", ACC_PUBLIC | ACC_STATIC_BIT | ACC_FINAL),
             f("words", "[Ljava/lang/String;", ACC_PUBLIC | ACC_STATIC_BIT),
         ])]);
-        let out = fields_of(&fx, &field_args("EvalProbe")).await;
+        let out = fields_of(&vm, &field_args("EvalProbe")).await;
 
         for wanted in [
             "static java.lang.String infra",
@@ -29720,7 +29718,7 @@ mod discovery_listing_tests {
     /// asserted what a LISTING looks like, because reaching a listing meant launching a JVM.
     #[tokio::test]
     async fn a_generic_signature_replaces_the_erased_type_and_falls_back_where_there_is_none() {
-        let fx = Fixture::new(vec![FixtureClass::new("LGenericProbe;", 10)
+        let vm = StatedDebuggee::new(vec![StatedClass::new("LGenericProbe;", 10)
             .with_fields(vec![
                 generic_f("lines", "Ljava/util/List;", "Ljava/util/List<Ljava/lang/String;>;", ACC_PUBLIC),
                 f("plain", "Ljava/util/List;", ACC_PUBLIC),
@@ -29735,7 +29733,7 @@ mod discovery_listing_tests {
                 m("size", "(Ljava/util/List;)I", ACC_PUBLIC),
             ])]);
 
-        let fields = fields_of(&fx, &field_args("GenericProbe")).await;
+        let fields = fields_of(&vm, &field_args("GenericProbe")).await;
         assert!(
             fields.contains("java.util.List<java.lang.String> lines"),
             "the type argument is the whole point of DISC-12:\n{fields}"
@@ -29746,7 +29744,7 @@ mod discovery_listing_tests {
              {fields}"
         );
 
-        let methods = methods_of(&fx, &method_args("GenericProbe")).await;
+        let methods = methods_of(&vm, &method_args("GenericProbe")).await;
         assert!(
             methods.contains("firstOf(java.util.List<T>)"),
             "a type variable renders as itself rather than as its erasure:\n{methods}"
@@ -29761,10 +29759,10 @@ mod discovery_listing_tests {
     /// a class the JVM has simply not reached yet.
     #[tokio::test]
     async fn a_class_the_debuggee_never_loaded_is_told_apart_from_a_wrong_name() {
-        let fx = Fixture::new(vec![FixtureClass::new("LEvalProbe;", 10)]);
-        let err = read_method_listing(&mut Reads::Fixture(&fx), &method_args("com.example.Missing"))
+        let vm = StatedDebuggee::new(vec![StatedClass::new("LEvalProbe;", 10)]);
+        let err = read_method_listing(&mut Reads::Stated(&vm), &method_args("com.example.Missing"))
             .await
-            .expect_err("a class the fixture does not state is not loaded");
+            .expect_err("a class the stated debuggee does not state is not loaded");
         assert!(err.contains("is not loaded in the debuggee"), "{err}");
         assert!(
             err.contains("debug.list_classes with filter \"*.Missing\""),
@@ -29773,21 +29771,19 @@ mod discovery_listing_tests {
     }
 
     /// A listing costs one resolve plus, per class walked, a signature read and one member read — the
-    /// traffic-shape claim, assertable with no socket because the fixture counts what it served.
+    /// traffic-shape claim, assertable with no socket because the stated debuggee counts what it served.
     #[tokio::test]
     async fn an_inherited_listing_reads_once_per_class_per_question() {
-        let fx = Fixture::new(vec![
-            FixtureClass::new("LChild;", 1)
-                .with_methods(vec![m("own", "()V", ACC_PUBLIC)])
-                .with_superclass(2),
-            FixtureClass::new("LParent;", 2).with_methods(vec![m("up", "()V", ACC_PUBLIC)]),
+        let vm = StatedDebuggee::new(vec![
+            StatedClass::new("LChild;", 1).with_methods(vec![m("own", "()V", ACC_PUBLIC)]).with_superclass(2),
+            StatedClass::new("LParent;", 2).with_methods(vec![m("up", "()V", ACC_PUBLIC)]),
         ]);
         let mut a = method_args("Child");
         a.inherited = true;
-        let _ = methods_of(&fx, &a).await;
+        let _ = methods_of(&vm, &a).await;
         // 1 classes_by_signature + per class (signature, methods, superclass) × 2 classes.
         assert_eq!(
-            fx.reads(),
+            vm.reads(),
             7,
             "an inherited walk should cost one resolve and three reads per class; a change here is a \
              change in what the debuggee is asked for, which is worth noticing deliberately"
@@ -29809,31 +29805,24 @@ mod discovery_listing_tests {
 #[cfg(test)]
 mod source_freshness_section_tests {
     use super::*;
-    use crate::reads::{Fixture, Reads};
+    use crate::reads::{Reads, StatedDebuggee};
 
-    fn no_reads() -> Fixture {
-        Fixture::new(Vec::new())
+    fn no_reads() -> StatedDebuggee {
+        StatedDebuggee::new(Vec::new())
     }
 
-    async fn section(class_roots: &[std::path::PathBuf], fx: &Fixture) -> String {
+    async fn section(class_roots: &[std::path::PathBuf], vm: &StatedDebuggee) -> String {
         let source = (std::path::PathBuf::from("/tmp/Order.java"), 120usize);
-        source_freshness_section(
-            &mut Reads::Fixture(fx),
-            "com.example.Order",
-            10,
-            class_roots,
-            &source,
-            false,
-        )
-        .await
+        source_freshness_section(&mut Reads::Stated(vm), "com.example.Order", 10, class_roots, &source, false)
+            .await
     }
 
     /// With no class roots there is no `.class` to compare against, and the reply has to say that rather
     /// than stay quiet — silence here reads as "checked, and fine".
     #[tokio::test]
     async fn no_class_roots_is_reported_as_could_not_check_and_names_the_three_ways_to_set_them() {
-        let fx = no_reads();
-        let out = section(&[], &fx).await;
+        let vm = no_reads();
+        let out = section(&[], &vm).await;
 
         assert!(!out.is_empty(), "an unchecked axis must not render as silence:\n{out}");
         assert!(out.contains("no class roots are configured"), "{out}");
@@ -29845,7 +29834,7 @@ mod source_freshness_section_tests {
             "the one mistake this argument attracts is pointing it at src/main/java, so the reply says \
              which of the two it wants:\n{out}"
         );
-        assert_eq!(fx.reads(), 0, "this branch decides before it asks the debuggee anything");
+        assert_eq!(vm.reads(), 0, "this branch decides before it asks the debuggee anything");
     }
 
     /// A configured root with nothing in it is a different answer from no root at all, and the resolver's
@@ -29853,15 +29842,15 @@ mod source_freshness_section_tests {
     #[tokio::test]
     async fn a_class_root_that_does_not_hold_the_class_quotes_the_resolvers_own_message() {
         let empty = tempfile::tempdir().expect("a temporary class root");
-        let fx = no_reads();
-        let out = section(&[empty.path().to_path_buf()], &fx).await;
+        let vm = no_reads();
+        let out = section(&[empty.path().to_path_buf()], &vm).await;
 
         assert!(!out.is_empty(), "{out}");
         assert!(
             out.contains("com/example/Order.class") || out.contains("com\\example\\Order.class"),
             "the reply names the path it looked for, which is what makes a wrong root diagnosable:\n{out}"
         );
-        assert_eq!(fx.reads(), 0, "nothing is asked of the debuggee before a file is found");
+        assert_eq!(vm.reads(), 0, "nothing is asked of the debuggee before a file is found");
     }
 
     /// A file at the right path that is not a class file is a failed or partial build, and it is reported
@@ -29873,8 +29862,8 @@ mod source_freshness_section_tests {
         tokio::fs::create_dir_all(&pkg).await.expect("the package tree");
         tokio::fs::write(pkg.join("Order.class"), b"public class Order {}").await.expect("a decoy");
 
-        let fx = no_reads();
-        let out = section(&[root.path().to_path_buf()], &fx).await;
+        let vm = no_reads();
+        let out = section(&[root.path().to_path_buf()], &vm).await;
 
         assert!(out.contains("could not read"), "{out}");
         assert!(out.contains("as a class file"), "the verdict is about the file, not the bytecode:\n{out}");
@@ -29883,7 +29872,7 @@ mod source_freshness_section_tests {
             "a file this side could not parse proves nothing about the JVM, and claiming drift would send \
              the reader to redeploy something that is not the problem:\n{out}"
         );
-        assert_eq!(fx.reads(), 0, "still no question reaches the debuggee");
+        assert_eq!(vm.reads(), 0, "still no question reaches the debuggee");
     }
 }
 
@@ -29894,7 +29883,7 @@ mod source_freshness_section_tests {
 /// invocation and a redeploy, which is why `classfile.rs`'s 272 lines of hostile-input parsing had 2
 /// tests and the verdicts above them had none.
 ///
-/// Both worlds are now stated: [`crate::reads::Fixture`] for the running one, `classfile::build` for the
+/// Both worlds are now stated: [`crate::reads::StatedDebuggee`] for the running one, `classfile::build` for the
 /// compiled one. That reaches two branches a JDK matrix could never reach at all — a JVM that answers
 /// `canGetBytecodes: false`, which no leg provides, and an exact agreement between the two sides, which
 /// on a probe depends on the compile the harness happened to produce.
@@ -29902,7 +29891,7 @@ mod source_freshness_section_tests {
 mod check_stale_report_tests {
     use super::*;
     use crate::classfile::build::{class_file, Method as BuiltMethod};
-    use crate::reads::{Fixture, FixtureClass, Reads};
+    use crate::reads::{Reads, StatedClass, StatedDebuggee};
     use jdwp_client::reftype::MethodInfo;
 
     const CLASS: &str = "com.example.Order";
@@ -29922,24 +29911,24 @@ mod check_stale_report_tests {
 
     /// The JVM's side, shaped so DISC-13's redefine forecast is QUIET.
     ///
-    /// The forecast is a separate question and it answers unconditionally, so a fixture that left the
+    /// The forecast is a separate question and it answers unconditionally, so a stated debuggee that left the
     /// class's modifiers and superclass unstated would put "Redefine WILL BE REFUSED" on top of every
     /// staleness reply below — noise from an unstated world rather than a finding. `0x0021` is
     /// `ACC_PUBLIC | ACC_SUPER`, which is what `classfile::build` emits.
-    fn loaded_class(methods: Vec<MethodInfo>) -> FixtureClass {
-        FixtureClass::new("Lcom/example/Order;", TYPE_ID)
+    fn loaded_class(methods: Vec<MethodInfo>) -> StatedClass {
+        StatedClass::new("Lcom/example/Order;", TYPE_ID)
             .with_methods(methods)
             .with_modifiers(0x0021)
             .with_superclass(OBJECT_ID)
     }
 
-    fn object() -> FixtureClass {
-        FixtureClass::new("Ljava/lang/Object;", OBJECT_ID)
+    fn object() -> StatedClass {
+        StatedClass::new("Ljava/lang/Object;", OBJECT_ID)
     }
 
     /// One class with one method, whose line table the caller states.
-    fn running(lines: &[(u64, i32)]) -> Fixture {
-        Fixture::new(vec![
+    fn running(lines: &[(u64, i32)]) -> StatedDebuggee {
+        StatedDebuggee::new(vec![
             loaded_class(vec![running_method("total", "()I", TOTAL)]).with_line_table(TOTAL, lines),
             object(),
         ])
@@ -29957,7 +29946,7 @@ mod check_stale_report_tests {
 
     /// Write the compiled side to a temporary class root and run the whole check against it.
     async fn check(
-        fx: &Fixture,
+        vm: &StatedDebuggee,
         built: &[BuiltMethod],
         bytecode: bool,
     ) -> (Result<String, String>, tempfile::TempDir) {
@@ -29966,7 +29955,7 @@ mod check_stale_report_tests {
         tokio::fs::create_dir_all(&pkg).await.expect("the package tree");
         tokio::fs::write(pkg.join("Order.class"), class_file(CLASS, built)).await.expect("the build");
         let roots = vec![root.path().to_path_buf()];
-        let out = check_stale_report(&mut Reads::Fixture(fx), &args(bytecode), CLASS, &roots).await;
+        let out = check_stale_report(&mut Reads::Stated(vm), &args(bytecode), CLASS, &roots).await;
         (out, root)
     }
 
@@ -29974,8 +29963,8 @@ mod check_stale_report_tests {
     /// because a line-table match is not proof that no body changed.
     #[tokio::test]
     async fn a_build_the_jvm_is_already_running_is_reported_as_agreeing() {
-        let fx = running(&[(0, 41), (8, 42)]);
-        let (out, _root) = check(&fx, &[BuiltMethod::new("total", "()I", &[(0, 41), (8, 42)])], false).await;
+        let vm = running(&[(0, 41), (8, 42)]);
+        let (out, _root) = check(&vm, &[BuiltMethod::new("total", "()I", &[(0, 41), (8, 42)])], false).await;
         let out = out.expect("the class resolves and the build parses");
 
         assert!(
@@ -29989,9 +29978,9 @@ mod check_stale_report_tests {
     /// else, and nothing else on this tool surface can say so.
     #[tokio::test]
     async fn a_line_that_moved_between_the_build_and_the_jvm_is_reported_as_drift() {
-        let fx = running(&[(0, 41), (8, 42)]);
+        let vm = running(&[(0, 41), (8, 42)]);
         // The same method, recompiled after something above it grew by three lines.
-        let (out, _root) = check(&fx, &[BuiltMethod::new("total", "()I", &[(0, 44), (8, 45)])], false).await;
+        let (out, _root) = check(&vm, &[BuiltMethod::new("total", "()I", &[(0, 44), (8, 45)])], false).await;
         let out = out.expect("both sides parse");
 
         assert!(
@@ -30009,8 +29998,8 @@ mod check_stale_report_tests {
     /// otherwise every abstract method in an interface reads as a stale build.
     #[tokio::test]
     async fn an_abstract_method_is_not_drift() {
-        let fx = Fixture::new(vec![loaded_class(vec![running_method("shape", "()V", 90)]), object()]);
-        let (out, _root) = check(&fx, &[BuiltMethod::bodyless("shape", "()V")], false).await;
+        let vm = StatedDebuggee::new(vec![loaded_class(vec![running_method("shape", "()V", 90)]), object()]);
+        let (out, _root) = check(&vm, &[BuiltMethod::bodyless("shape", "()V")], false).await;
         let out = out.expect("both sides parse");
 
         assert!(
@@ -30023,7 +30012,7 @@ mod check_stale_report_tests {
     /// tables agree here, so this is exactly the case the default check is blind to.
     #[tokio::test]
     async fn a_changed_body_behind_an_unchanged_line_table_is_caught_only_by_the_bytecode_pass() {
-        let fx = Fixture::new(vec![
+        let vm = StatedDebuggee::new(vec![
             loaded_class(vec![running_method("total", "()I", TOTAL)])
                 .with_line_table(TOTAL, &[(0, 41)])
                 .with_bytecode(TOTAL, &[0x03, 0xAC]), // iconst_0; ireturn
@@ -30033,7 +30022,7 @@ mod check_stale_report_tests {
 
         // The default pass compares line tables, which AGREE — so it reports a match, and is explicit
         // that a match means "no line moved" rather than "byte-for-byte identical".
-        let without = check(&fx, &built, false).await.0.expect("both sides parse");
+        let without = check(&vm, &built, false).await.0.expect("both sides parse");
         assert!(
             without.contains("matches your build"),
             "line tables agree, so the default is clean:\n{without}"
@@ -30045,7 +30034,7 @@ mod check_stale_report_tests {
         );
 
         // The opt-in pass adds the evidence that can see this edit, and reverses the verdict.
-        let with = check(&fx, &built, true).await.0.expect("both sides parse");
+        let with = check(&vm, &built, true).await.0.expect("both sides parse");
         assert!(with.contains("STALE"), "the body changed, and bytecode is what can see it:\n{with}");
         assert!(
             with.contains("total()I — code differs at bytecode index 0"),
@@ -30070,8 +30059,8 @@ mod check_stale_report_tests {
     /// unreachable-in-practice shape ADR-0014 built its JDWP-1.5 cassette for.
     #[tokio::test]
     async fn a_jvm_that_cannot_read_bytecode_says_so_instead_of_failing() {
-        let fx = running(&[(0, 41)]).without_bytecode_capability();
-        let (out, _root) = check(&fx, &[BuiltMethod::new("total", "()I", &[(0, 41)])], true).await;
+        let vm = running(&[(0, 41)]).without_bytecode_capability();
+        let (out, _root) = check(&vm, &[BuiltMethod::new("total", "()I", &[(0, 41)])], true).await;
         let out = out.expect("a missing capability is an answer, not an error");
 
         assert!(
@@ -30096,9 +30085,9 @@ mod check_stale_report_tests {
         .await
         .expect("the decoy");
 
-        let fx = running(&[(0, 41)]);
+        let vm = running(&[(0, 41)]);
         let err =
-            check_stale_report(&mut Reads::Fixture(&fx), &args(false), CLASS, &[root.path().to_path_buf()])
+            check_stale_report(&mut Reads::Stated(&vm), &args(false), CLASS, &[root.path().to_path_buf()])
                 .await
                 .expect_err("a file declaring another class settles nothing");
 
@@ -30111,10 +30100,10 @@ mod check_stale_report_tests {
     /// to "what the check cost" would report the debugger's overhead as the debuggee's price.
     #[tokio::test]
     async fn the_opt_in_bytecode_pass_costs_more_reads_and_the_report_says_so() {
-        let fx = running(&[(0, 41)]);
-        let before = fx.reads();
-        let _ = check(&fx, &[BuiltMethod::new("total", "()I", &[(0, 41)])], false).await;
-        let cheap = fx.reads() - before;
+        let vm = running(&[(0, 41)]);
+        let before = vm.reads();
+        let _ = check(&vm, &[BuiltMethod::new("total", "()I", &[(0, 41)])], false).await;
+        let cheap = vm.reads() - before;
 
         let fx2 = running(&[(0, 41)]);
         let _ = check(&fx2, &[BuiltMethod::new("total", "()I", &[(0, 41)])], true).await;
@@ -30146,7 +30135,7 @@ mod check_stale_report_tests {
 #[cfg(test)]
 mod unfetched_tests {
     use super::*;
-    use crate::reads::{Fixture, FixtureClass, FixtureObject, Reads};
+    use crate::reads::{Reads, StatedClass, StatedDebuggee, StatedObject};
     use jdwp_client::reftype::FieldInfo;
     use jdwp_client::types::ValueData;
 
@@ -30173,25 +30162,25 @@ mod unfetched_tests {
     /// `RealHibernateProbe$Order$HibernateProxy$bVJLgnEW`. It is stated here rather than invented because
     /// the name is the COST GATE — a made-up name would pass the gate for the wrong reason and the test
     /// would stop proving that the gate lets a real proxy through.
-    fn proxy_world(initialized: Option<bool>) -> Fixture {
+    fn proxy_world(initialized: Option<bool>) -> StatedDebuggee {
         let initialiser_fields =
             initialized.map(|_| vec![field("initialized", "Z", INITIALIZED)]).unwrap_or_default();
-        let mut init_object = FixtureObject::new(INIT_OBJ, INIT_TYPE);
+        let mut init_object = StatedObject::new(INIT_OBJ, INIT_TYPE);
         if let Some(flag) = initialized {
             init_object = init_object.with_field(INITIALIZED, ValueData::Boolean(flag));
         }
-        Fixture::new(vec![
-            FixtureClass::new("LRealHibernateProbe$Order$HibernateProxy$bVJLgnEW;", PROXY_TYPE)
+        StatedDebuggee::new(vec![
+            StatedClass::new("LRealHibernateProbe$Order$HibernateProxy$bVJLgnEW;", PROXY_TYPE)
                 .with_fields(vec![field("$$_hibernate_interceptor", "Ljava/lang/Object;", HANDLER_FIELD)])
-                // The marker interface is what DECIDES; the fixture states it as a superclass-reachable
+                // The marker interface is what DECIDES; the stated debuggee states it as a superclass-reachable
                 // type exactly as the lattice walk would find it.
                 .with_interface(HIBERNATE_IFACE_ID),
-            FixtureClass::new(HIBERNATE_PROXY_IFACE, HIBERNATE_IFACE_ID),
-            FixtureClass::new("Lorg/hibernate/proxy/pojo/bytebuddy/ByteBuddyInterceptor;", INIT_TYPE)
+            StatedClass::new(HIBERNATE_PROXY_IFACE, HIBERNATE_IFACE_ID),
+            StatedClass::new("Lorg/hibernate/proxy/pojo/bytebuddy/ByteBuddyInterceptor;", INIT_TYPE)
                 .with_fields(initialiser_fields),
         ])
         .with_objects(vec![
-            FixtureObject::new(PROXY_OBJ, PROXY_TYPE).with_field(HANDLER_FIELD, ValueData::Object(INIT_OBJ)),
+            StatedObject::new(PROXY_OBJ, PROXY_TYPE).with_field(HANDLER_FIELD, ValueData::Object(INIT_OBJ)),
             init_object,
         ])
     }
@@ -30201,8 +30190,8 @@ mod unfetched_tests {
     /// An uninitialised proxy is the third answer, and it is reported rather than resolved through.
     #[tokio::test]
     async fn an_uninitialised_proxy_is_unfetched_and_nothing_is_resolved_through_it() {
-        let fx = proxy_world(Some(false));
-        let state = hibernate_lazy_state(&mut Reads::Fixture(&fx), PROXY_OBJ, PROXY_TYPE).await;
+        let vm = proxy_world(Some(false));
+        let state = hibernate_lazy_state(&mut Reads::Stated(&vm), PROXY_OBJ, PROXY_TYPE).await;
 
         assert!(
             matches!(state, LazyState::Unfetched(LazyShape::EntityProxy)),
@@ -30222,8 +30211,8 @@ mod unfetched_tests {
     /// byte-identical, because it is the answer for every non-Hibernate JVM too.
     #[tokio::test]
     async fn an_initialised_proxy_reads_as_loaded_and_changes_nothing() {
-        let fx = proxy_world(Some(true));
-        let state = hibernate_lazy_state(&mut Reads::Fixture(&fx), PROXY_OBJ, PROXY_TYPE).await;
+        let vm = proxy_world(Some(true));
+        let state = hibernate_lazy_state(&mut Reads::Stated(&vm), PROXY_OBJ, PROXY_TYPE).await;
         assert!(matches!(state, LazyState::Loaded), "a fetched proxy is an ordinary object");
     }
 
@@ -30234,8 +30223,8 @@ mod unfetched_tests {
     /// proxy whose initialiser is missing a field that every real Hibernate puts there.
     #[tokio::test]
     async fn a_proxy_whose_flag_cannot_be_read_says_it_cannot_tell_rather_than_guessing() {
-        let fx = proxy_world(None);
-        let state = hibernate_lazy_state(&mut Reads::Fixture(&fx), PROXY_OBJ, PROXY_TYPE).await;
+        let vm = proxy_world(None);
+        let state = hibernate_lazy_state(&mut Reads::Stated(&vm), PROXY_OBJ, PROXY_TYPE).await;
 
         let LazyState::Unknown(why) = state else {
             panic!("a lazy value whose flag is unreadable must not be reported as either of the other two");
@@ -30253,10 +30242,10 @@ mod unfetched_tests {
     /// object.
     #[tokio::test]
     async fn a_class_named_like_a_proxy_that_implements_nothing_is_not_one() {
-        let fx = Fixture::new(vec![FixtureClass::new("LImposter$HibernateProxy$xx;", PROXY_TYPE)])
-            .with_objects(vec![FixtureObject::new(PROXY_OBJ, PROXY_TYPE)]);
+        let vm = StatedDebuggee::new(vec![StatedClass::new("LImposter$HibernateProxy$xx;", PROXY_TYPE)])
+            .with_objects(vec![StatedObject::new(PROXY_OBJ, PROXY_TYPE)]);
 
-        let state = hibernate_lazy_state(&mut Reads::Fixture(&fx), PROXY_OBJ, PROXY_TYPE).await;
+        let state = hibernate_lazy_state(&mut Reads::Stated(&vm), PROXY_OBJ, PROXY_TYPE).await;
         assert!(
             matches!(state, LazyState::Loaded),
             "the interface decides; a generated class NAME is a library naming strategy and the check \
@@ -30270,13 +30259,13 @@ mod unfetched_tests {
     /// authoritative check on every link took a 5-link chain from 34 packets to 49 (+44%).
     #[tokio::test]
     async fn an_ordinary_class_is_not_a_candidate_and_costs_one_read() {
-        let fx = Fixture::new(vec![FixtureClass::new("Lcom/example/Order;", PROXY_TYPE)])
-            .with_objects(vec![FixtureObject::new(PROXY_OBJ, PROXY_TYPE)]);
+        let vm = StatedDebuggee::new(vec![StatedClass::new("Lcom/example/Order;", PROXY_TYPE)])
+            .with_objects(vec![StatedObject::new(PROXY_OBJ, PROXY_TYPE)]);
 
-        let state = hibernate_lazy_state(&mut Reads::Fixture(&fx), PROXY_OBJ, PROXY_TYPE).await;
+        let state = hibernate_lazy_state(&mut Reads::Stated(&vm), PROXY_OBJ, PROXY_TYPE).await;
         assert!(matches!(state, LazyState::Loaded));
         assert_eq!(
-            fx.reads(),
+            vm.reads(),
             1,
             "the name gate must cost exactly the one signature read and stop. A lattice walk here is the \
              44% round-trip tax #86 refused to charge every non-Hibernate JVM."

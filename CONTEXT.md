@@ -1501,7 +1501,35 @@ into a shape no JVM here could be asked to produce. See ADR-0014.
 was meant — a cassette is not a captured hit and not a committed baseline — which is the argument for the note
 rather than against it.)
 _Avoid_: mock, stub, fixture (the first two suggest something written to satisfy the test; a cassette is a
-transcript of a real session, and its authority comes from that)
+transcript of a real session, and its authority comes from that). Its counterpart for the written kind is
+**stated** below — the word `fixture` is avoided for **both**, and that entry records why.
+
+**Stated** (of a debuggee, a class, an object, an answer):
+A debuggee's answers **written down** rather than recorded, and served as typed values rather than as bytes.
+The counterpart to a **cassette**, and the two differ in where their authority comes from: a cassette is a
+transcript, so it is authoritative because it really happened; a stated debuggee is authored, so it is
+authoritative because a reader can see exactly what is being claimed.
+
+**Which to reach for is decided by what the test's subject is.** Where the *debuggee's answer* is the
+subject, record — a stated one cannot notice a real JVM disagreeing. Where *how the answer renders* is the
+subject, state it: the shapes worth testing are a member that carries a generic signature and one that does
+not, a two-deep superclass chain, a JVM that answers `canGetBytecodes: false`. Those are shapes you write,
+and going looking for a JVM that exhibits one is how a branch ends up never executing anywhere.
+
+**It reaches worlds no probe and no matrix leg can.** Two branches had never run on any machine before they
+were stated: a JVM without `canGetBytecodes` (every JDK in the estate has it) and a Hibernate proxy whose
+`initialized` field is absent (every real Hibernate puts it there). ADR-0014 had already found the same need
+at the byte seam and described its answer as *"not a recording; it is a world that was written down"* — this
+is that idea with a name, one seam up. See ADR-0049.
+
+_Avoid_: **fixture** — the word this repo is most likely to reach for and the one to refuse. It already
+means six unrelated things here (a cassette in `docs/development.md`, a Java **probe** in the same file and
+in ADR-0013, the SMAP text and the cassette files in ADR-0014, the Python scripts' input/output matrix in
+`docs/agents/testing.md`, and a generic test double in ADR-0001), which is why **cassette** above avoids it
+too. Naming a *type* `Fixture` made seven, and the rename was caught while it was still free — the
+`inherited` defect `CLAUDE.md` records, one word doing unrelated jobs, arriving by a different route.
+Also avoid mock and stub: both suggest something that answers in order to satisfy an assertion, where this
+answers in order to state a world; and **snapshot**, which is taken twice over already.
 
 **Miss**:
 A request a cassette has no recorded answer for. Never answered — the connection is dropped and the command

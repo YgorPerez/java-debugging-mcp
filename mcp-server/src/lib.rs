@@ -61,7 +61,7 @@ pub mod handlers;
 pub mod protocol;
 /// The read seam under the renderers (CLEAN-7, ADR-0049).
 ///
-/// `pub` rather than private for a mechanical reason rather than an intent to publish: the `Fixture`
+/// `pub` rather than private for a mechanical reason rather than an intent to publish: the `StatedDebuggee`
 /// half is exercised only from `#[cfg(test)]` code, so behind a private module every one of its items
 /// is dead code in a non-test build and the gate says so. It is `#[doc(hidden)]` and unsupported like
 /// everything else here — see the crate docs.

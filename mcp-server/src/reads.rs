@@ -8,7 +8,7 @@
 //! renders, without ever making the debuggee *do* anything (CLEAN-7, #190).
 //!
 //! [`Reads`] is the narrowest thing that removes the JVM from those: the class and member metadata a
-//! render needs, and nothing else. Two adapters satisfy it — the live connection, and a [`Fixture`] that
+//! render needs, and nothing else. Two adapters satisfy it — the live connection, and a [`StatedDebuggee`] that
 //! answers from data.
 //!
 //! # What it is allowed to carry
@@ -32,28 +32,28 @@
 //!
 //! In the live adapter, untouched. `guard_mutation` and the mutating primitives are on `JdwpConnection`
 //! and stay there; every call below forwards to a command already classified `Read` by `WIRE_COMMANDS` in
-//! `connection.rs`'s test module. The fixture has no wire and so has nothing to guard. **No new
+//! `connection.rs`'s test module. The stated debuggee has no wire and so has nothing to guard. **No new
 //! `CommandPacket::new` call site is added by this module** — that is what keeps SAFE-12's source scan
 //! (and with it SAFE-9's invariant) exactly as authoritative as it was.
 //!
-//! # Why the fixtures are written and not recorded
+//! # Why the stated debuggees are written and not recorded
 //!
 //! ADR-0014 already chose a recorded seam, keyed by the request, at the level of framed JDWP bytes. That
 //! is the right seam for what it does and the wrong altitude for this: a recording there replays bytes and
 //! gives back no typed answer, so a test that wants "a class with these two methods" would have to spell
 //! it in hex. Building a *second* recording pipeline is the mistake ADR-0014 argued against in its own
-//! rejected alternatives. These fixtures are data a reader can review.
+//! rejected alternatives. These stated debuggees are data a reader can review.
 
 use jdwp_client::reftype::{FieldInfo, MethodInfo};
 use jdwp_client::vm::ClassInfo;
 use jdwp_client::JdwpResult;
 
-/// One class as a fixture states it — what the debuggee would have answered about it.
+/// One class as a stated debuggee states it — what the debuggee would have answered about it.
 ///
 /// Written by hand as data. Every field corresponds to exactly one command's answer, so a reader can see
 /// what a test is claiming the JVM said without decoding anything.
 #[derive(Debug, Clone, Default)]
-pub struct FixtureClass {
+pub struct StatedClass {
     /// The JNI signature, e.g. `LEvalProbe;`. This is the key `classes_by_signature` matches on.
     pub signature: String,
     /// The reference type id this class answers to. Any distinct number will do; they are opaque.
@@ -75,14 +75,14 @@ pub struct FixtureClass {
     pub bytecodes: Vec<(u64, Vec<u8>)>,
     /// `ReferenceType.Modifiers` — the access flag word.
     pub modifiers: i32,
-    /// `ReferenceType.Interfaces`, as reference type ids this fixture also states.
+    /// `ReferenceType.Interfaces`, as reference type ids this stated debuggee also states.
     pub interfaces: Vec<u64>,
     /// `ref_type_tag`: 1 = class, 2 = interface, 3 = array. Defaults to a class.
     pub tag: u8,
 }
 
-impl FixtureClass {
-    /// A class with a signature and an id and nothing else — the base every fixture starts from.
+impl StatedClass {
+    /// A class with a signature and an id and nothing else — the base every stated debuggee starts from.
     #[must_use]
     pub fn new(signature: &str, type_id: u64) -> Self {
         Self { signature: signature.to_string(), type_id, tag: 1, ..Self::default() }
@@ -147,13 +147,13 @@ impl FixtureClass {
     }
 }
 
-/// One live object as a fixture states it: its type, and the fields a read would find on it.
+/// One live object as a stated debuggee states it: its type, and the fields a read would find on it.
 ///
-/// Separate from [`FixtureClass`] because an object and its type are different things and ADR-0032's
+/// Separate from [`StatedClass`] because an object and its type are different things and ADR-0032's
 /// whole finding rests on that: the lazy-state flag lives on an *instance* three classes up, and reading
 /// it off the wrong one is the silent wrong answer the check exists to prevent.
 #[derive(Debug, Clone, Default)]
-pub struct FixtureObject {
+pub struct StatedObject {
     pub object_id: u64,
     /// What `ObjectReference.ReferenceType` answers for it.
     pub type_id: u64,
@@ -161,7 +161,7 @@ pub struct FixtureObject {
     pub fields: Vec<(u64, jdwp_client::types::ValueData)>,
 }
 
-impl FixtureObject {
+impl StatedObject {
     #[must_use]
     pub const fn new(object_id: u64, type_id: u64) -> Self {
         Self { object_id, type_id, fields: Vec::new() }
@@ -174,7 +174,7 @@ impl FixtureObject {
     }
 }
 
-/// The JDWP tag byte for a stated value, so a fixture's reply carries the same tag a real one would.
+/// The JDWP tag byte for a stated value, so a stated debuggee's reply carries the same tag a real one would.
 const fn tag_of(data: &jdwp_client::types::ValueData) -> u8 {
     use jdwp_client::types::ValueData as V;
     match data {
@@ -197,15 +197,15 @@ const fn tag_of(data: &jdwp_client::types::ValueData) -> u8 {
 /// the answer is. Where the JVM's own answer is the subject, keep the probe — see the twin pattern
 /// ADR-0014 states as design, and the ADR for this seam.
 #[derive(Debug)]
-pub struct Fixture {
-    classes: Vec<FixtureClass>,
+pub struct StatedDebuggee {
+    classes: Vec<StatedClass>,
     /// What `VirtualMachine.Capabilities` answers. Defaults to a JVM that can do everything, because
     /// that is the ordinary case and a test asking for the other one should have to say so — see
-    /// [`Fixture::without_bytecode_capability`].
+    /// [`StatedDebuggee::without_bytecode_capability`].
     capabilities: jdwp_client::vm::VmCapabilities,
-    /// The live objects this debuggee holds. Empty for a fixture whose subject is class metadata only.
-    objects: Vec<FixtureObject>,
-    /// How many reads have been served. The fixture twin of `JdwpConnection::packets_sent`, so a
+    /// The live objects this debuggee holds. Empty for a stated debuggee whose subject is class metadata only.
+    objects: Vec<StatedObject>,
+    /// How many reads have been served. The stated debuggee twin of `JdwpConnection::packets_sent`, so a
     /// traffic-shape claim ("independent reads share one round trip") can be asserted with no socket.
     ///
     /// An atomic rather than a `Cell` for one reason, and it is not contention: the handler futures this
@@ -215,9 +215,9 @@ pub struct Fixture {
     reads: std::sync::atomic::AtomicU64,
 }
 
-impl Fixture {
+impl StatedDebuggee {
     #[must_use]
-    pub const fn new(classes: Vec<FixtureClass>) -> Self {
+    pub const fn new(classes: Vec<StatedClass>) -> Self {
         Self {
             classes,
             capabilities: jdwp_client::vm::VmCapabilities {
@@ -236,7 +236,7 @@ impl Fixture {
 
     /// State the live objects this debuggee holds (ADR-0032).
     #[must_use]
-    pub fn with_objects(mut self, objects: Vec<FixtureObject>) -> Self {
+    pub fn with_objects(mut self, objects: Vec<StatedObject>) -> Self {
         self.objects = objects;
         self
     }
@@ -253,7 +253,7 @@ impl Fixture {
         self
     }
 
-    /// How many reads this fixture has answered since it was built.
+    /// How many reads this stated debuggee has answered since it was built.
     #[must_use]
     pub fn reads(&self) -> u64 {
         self.reads.load(std::sync::atomic::Ordering::Relaxed)
@@ -263,7 +263,7 @@ impl Fixture {
         self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn by_id(&self, type_id: u64) -> Option<&FixtureClass> {
+    fn by_id(&self, type_id: u64) -> Option<&StatedClass> {
         self.classes.iter().find(|c| c.type_id == type_id)
     }
 }
@@ -276,7 +276,7 @@ pub enum Reads<'a> {
     /// The debuggee, through the connection that owns the read-only guard.
     Live(&'a mut jdwp_client::JdwpConnection),
     /// Data, for a test whose subject is how the answer renders.
-    Fixture(&'a Fixture),
+    Stated(&'a StatedDebuggee),
 }
 
 impl<'a> Reads<'a> {
@@ -288,14 +288,14 @@ impl<'a> Reads<'a> {
     /// Every loaded class whose JNI signature is exactly `signature` (`VirtualMachine.ClassesBySignature`).
     ///
     /// # Errors
-    /// Propagates the connection's error on the live path. A fixture cannot fail: a signature it does not
+    /// Propagates the connection's error on the live path. A stated debuggee cannot fail: a signature it does not
     /// hold is an empty answer, which is what the debuggee says about a class it has not loaded.
     pub async fn classes_by_signature(&mut self, signature: &str) -> JdwpResult<Vec<ClassInfo>> {
         match self {
             Self::Live(conn) => conn.classes_by_signature(signature).await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                Ok(fx
+            Self::Stated(vm) => {
+                vm.charge();
+                Ok(vm
                     .classes
                     .iter()
                     .filter(|c| c.signature == signature)
@@ -317,9 +317,9 @@ impl<'a> Reads<'a> {
     pub async fn get_signature(&mut self, type_id: u64) -> JdwpResult<String> {
         match self {
             Self::Live(conn) => conn.get_signature(type_id).await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                Ok(fx.by_id(type_id).map(|c| c.signature.clone()).unwrap_or_default())
+            Self::Stated(vm) => {
+                vm.charge();
+                Ok(vm.by_id(type_id).map(|c| c.signature.clone()).unwrap_or_default())
             }
         }
     }
@@ -331,9 +331,9 @@ impl<'a> Reads<'a> {
     pub async fn get_methods(&mut self, type_id: u64) -> JdwpResult<Vec<MethodInfo>> {
         match self {
             Self::Live(conn) => conn.get_methods(type_id).await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                Ok(fx.by_id(type_id).map(|c| c.methods.clone()).unwrap_or_default())
+            Self::Stated(vm) => {
+                vm.charge();
+                Ok(vm.by_id(type_id).map(|c| c.methods.clone()).unwrap_or_default())
             }
         }
     }
@@ -345,9 +345,9 @@ impl<'a> Reads<'a> {
     pub async fn get_fields(&mut self, type_id: u64) -> JdwpResult<Vec<FieldInfo>> {
         match self {
             Self::Live(conn) => conn.get_fields(type_id).await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                Ok(fx.by_id(type_id).map(|c| c.fields.clone()).unwrap_or_default())
+            Self::Stated(vm) => {
+                vm.charge();
+                Ok(vm.by_id(type_id).map(|c| c.fields.clone()).unwrap_or_default())
             }
         }
     }
@@ -359,9 +359,9 @@ impl<'a> Reads<'a> {
     pub async fn get_superclass(&mut self, type_id: u64) -> JdwpResult<Option<u64>> {
         match self {
             Self::Live(conn) => conn.get_superclass(type_id).await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                Ok(fx.by_id(type_id).and_then(|c| c.superclass))
+            Self::Stated(vm) => {
+                vm.charge();
+                Ok(vm.by_id(type_id).and_then(|c| c.superclass))
             }
         }
     }
@@ -373,9 +373,9 @@ impl<'a> Reads<'a> {
     pub async fn get_class_loader(&mut self, type_id: u64) -> JdwpResult<Option<u64>> {
         match self {
             Self::Live(conn) => conn.get_class_loader(type_id).await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                Ok(fx.by_id(type_id).and_then(|c| c.class_loader))
+            Self::Stated(vm) => {
+                vm.charge();
+                Ok(vm.by_id(type_id).and_then(|c| c.class_loader))
             }
         }
     }
@@ -390,12 +390,12 @@ impl<'a> Reads<'a> {
     pub async fn get_object_reference_type(&mut self, object_id: u64) -> JdwpResult<u64> {
         match self {
             Self::Live(conn) => conn.get_object_reference_type(object_id).await,
-            Self::Fixture(fx) => {
-                fx.charge();
+            Self::Stated(vm) => {
+                vm.charge();
                 // A stated object knows its own type. Falling back to the id itself is what keeps
-                // `describe_class_loaders` on its `0x…` branch for a fixture that states no objects,
+                // `describe_class_loaders` on its `0x…` branch for a stated debuggee that states no objects,
                 // which is the shape a rendering test asserts on anyway.
-                Ok(fx.objects.iter().find(|o| o.object_id == object_id).map_or(object_id, |o| o.type_id))
+                Ok(vm.objects.iter().find(|o| o.object_id == object_id).map_or(object_id, |o| o.type_id))
             }
         }
     }
@@ -403,12 +403,12 @@ impl<'a> Reads<'a> {
     /// One method's line table (`Method.LineTable`).
     ///
     /// The **source drift** verdicts (DISC-7) compare this against the `LineNumberTable` parsed out of a
-    /// `.class` on disk, so it is a read a render needs and one a fixture can state — including the two
+    /// `.class` on disk, so it is a read a render needs and one a stated debuggee can state — including the two
     /// absent shapes that mean *not comparable*: an `ABSENT_INFORMATION` error for an abstract or native
     /// method, and a valid reply with **zero entries** for a `-g:none` class.
     ///
     /// # Errors
-    /// Propagates the connection's error on the live path. A fixture states a table or states none; a
+    /// Propagates the connection's error on the live path. A stated debuggee states a table or states none; a
     /// stated-none is the empty table, which is the `-g:none` shape. The `ABSENT_INFORMATION` shape is
     /// the JVM's and stays with the probe.
     pub async fn get_line_table(
@@ -418,9 +418,9 @@ impl<'a> Reads<'a> {
     ) -> JdwpResult<jdwp_client::method::LineTable> {
         match self {
             Self::Live(conn) => conn.get_line_table(type_id, method_id).await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                let lines = fx
+            Self::Stated(vm) => {
+                vm.charge();
+                let lines = vm
                     .by_id(type_id)
                     .and_then(|c| c.line_tables.iter().find(|(m, _)| *m == method_id))
                     .map(|(_, t)| t.clone())
@@ -438,14 +438,14 @@ impl<'a> Reads<'a> {
     /// edit that changed a body without moving one. It reads code rather than running it.
     ///
     /// # Errors
-    /// Propagates the connection's error on the live path. A fixture states bytes or states none, and
+    /// Propagates the connection's error on the live path. A stated debuggee states bytes or states none, and
     /// stating none is the empty slice.
     pub async fn get_bytecodes(&mut self, type_id: u64, method_id: u64) -> JdwpResult<Vec<u8>> {
         match self {
             Self::Live(conn) => conn.get_bytecodes(type_id, method_id).await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                Ok(fx
+            Self::Stated(vm) => {
+                vm.charge();
+                Ok(vm
                     .by_id(type_id)
                     .and_then(|c| c.bytecodes.iter().find(|(m, _)| *m == method_id))
                     .map(|(_, b)| b.clone())
@@ -461,9 +461,9 @@ impl<'a> Reads<'a> {
     pub async fn get_modifiers(&mut self, type_id: u64) -> JdwpResult<i32> {
         match self {
             Self::Live(conn) => conn.get_modifiers(type_id).await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                Ok(fx.by_id(type_id).map_or(0, |c| c.modifiers))
+            Self::Stated(vm) => {
+                vm.charge();
+                Ok(vm.by_id(type_id).map_or(0, |c| c.modifiers))
             }
         }
     }
@@ -475,9 +475,9 @@ impl<'a> Reads<'a> {
     pub async fn get_interfaces(&mut self, type_id: u64) -> JdwpResult<Vec<u64>> {
         match self {
             Self::Live(conn) => conn.get_interfaces(type_id).await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                Ok(fx.by_id(type_id).map(|c| c.interfaces.clone()).unwrap_or_default())
+            Self::Stated(vm) => {
+                vm.charge();
+                Ok(vm.by_id(type_id).map(|c| c.interfaces.clone()).unwrap_or_default())
             }
         }
     }
@@ -486,7 +486,7 @@ impl<'a> Reads<'a> {
     ///
     /// Asked before the command it gates, per `VmCapabilities`' own rule: a JVM without the capability
     /// answers `NOT_IMPLEMENTED`, and "this JVM cannot tell us" is a better report than an error code.
-    /// A fixture states them, so **the cannot-tell branch is reachable without finding a JVM that lacks
+    /// A stated debuggee states them, so **the cannot-tell branch is reachable without finding a JVM that lacks
     /// the capability** — which is the branch that was previously untestable at any price.
     ///
     /// # Errors
@@ -494,9 +494,9 @@ impl<'a> Reads<'a> {
     pub async fn capabilities(&mut self) -> JdwpResult<jdwp_client::vm::VmCapabilities> {
         match self {
             Self::Live(conn) => conn.capabilities().await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                Ok(fx.capabilities)
+            Self::Stated(vm) => {
+                vm.charge();
+                Ok(vm.capabilities)
             }
         }
     }
@@ -512,8 +512,8 @@ impl<'a> Reads<'a> {
     pub async fn implements_interface(&mut self, type_id: u64, wanted: &str) -> JdwpResult<bool> {
         match self {
             Self::Live(conn) => conn.implements_interface(type_id, wanted).await,
-            Self::Fixture(fx) => {
-                fx.charge();
+            Self::Stated(vm) => {
+                vm.charge();
                 // The same shape as the live walk: superclasses × interfaces, bounded, `seen`-guarded
                 // for the diamonds that make an interface graph a lattice.
                 let mut seen = std::collections::HashSet::new();
@@ -522,7 +522,7 @@ impl<'a> Reads<'a> {
                     if !seen.insert(id) {
                         continue;
                     }
-                    let Some(class) = fx.by_id(id) else { continue };
+                    let Some(class) = vm.by_id(id) else { continue };
                     if class.signature == wanted {
                         return Ok(true);
                     }
@@ -542,9 +542,9 @@ impl<'a> Reads<'a> {
     /// first. Present here so that check can be driven without a JVM.
     ///
     /// # Errors
-    /// Propagates the connection's error on the live path. A fixture answers with whatever it states for
+    /// Propagates the connection's error on the live path. A stated debuggee answers with whatever it states for
     /// each field id, in the order asked, and omits an id it does not state — the same shape a JVM
-    /// cannot produce, so a test asserting on a partial reply is asserting on the fixture rather than on
+    /// cannot produce, so a test asserting on a partial reply is asserting on the stated debuggee rather than on
     /// the debuggee.
     pub async fn get_object_values(
         &mut self,
@@ -553,9 +553,9 @@ impl<'a> Reads<'a> {
     ) -> JdwpResult<Vec<jdwp_client::types::Value>> {
         match self {
             Self::Live(conn) => conn.get_object_values(object_id, field_ids).await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                let Some(object) = fx.objects.iter().find(|o| o.object_id == object_id) else {
+            Self::Stated(vm) => {
+                vm.charge();
+                let Some(object) = vm.objects.iter().find(|o| o.object_id == object_id) else {
                     return Ok(Vec::new());
                 };
                 Ok(field_ids
@@ -570,28 +570,28 @@ impl<'a> Reads<'a> {
     /// How many JDWP packets have gone down this connection.
     ///
     /// The one method here that is not a read: it is how a traffic-shape claim states itself, and
-    /// ADR-0049 keeps the fixture's tally beside the connection's for SAFE-9's reason — "rendered
+    /// ADR-0049 keeps the stated debuggee's tally beside the connection's for SAFE-9's reason — "rendered
     /// correctly" and "asked for the right things" are different claims.
     #[must_use]
     pub fn packets_sent(&self) -> u32 {
         match self {
             Self::Live(conn) => conn.packets_sent(),
-            Self::Fixture(fx) => u32::try_from(fx.reads()).unwrap_or(u32::MAX),
+            Self::Stated(vm) => u32::try_from(vm.reads()).unwrap_or(u32::MAX),
         }
     }
 
     /// The source file a type was compiled from (`ReferenceType.SourceFile`).
     ///
     /// # Errors
-    /// Propagates the connection's error on the live path. A fixture that states no source file answers
+    /// Propagates the connection's error on the live path. A stated debuggee that states no source file answers
     /// with an empty string rather than failing — the JVM's own answer for a class with no `SourceFile`
     /// attribute is an `ABSENT_INFORMATION` error, so a test that needs *that* shape keeps its probe.
     pub async fn get_source_file(&mut self, type_id: u64) -> JdwpResult<String> {
         match self {
             Self::Live(conn) => conn.get_source_file(type_id).await,
-            Self::Fixture(fx) => {
-                fx.charge();
-                Ok(fx.by_id(type_id).and_then(|c| c.source_file.clone()).unwrap_or_default())
+            Self::Stated(vm) => {
+                vm.charge();
+                Ok(vm.by_id(type_id).and_then(|c| c.source_file.clone()).unwrap_or_default())
             }
         }
     }
@@ -611,15 +611,15 @@ mod tests {
         }
     }
 
-    /// A fixture answers about the class it states and stays quiet about one it does not — which is what
+    /// A stated debuggee answers about the class it states and stays quiet about one it does not — which is what
     /// the debuggee says about a class it has not loaded, and the reason `resolve_loaded_class_for_read`
     /// can be driven to its "not loaded" branch with no JVM.
     #[tokio::test]
-    async fn a_fixture_answers_only_about_the_classes_it_states() {
-        let fx = Fixture::new(vec![
-            FixtureClass::new("LEvalProbe;", 10).with_methods(vec![method("twice", "(I)I", 0x0009)])
+    async fn a_stated_debuggee_answers_only_about_the_classes_it_states() {
+        let vm = StatedDebuggee::new(vec![
+            StatedClass::new("LEvalProbe;", 10).with_methods(vec![method("twice", "(I)I", 0x0009)])
         ]);
-        let mut reads = Reads::Fixture(&fx);
+        let mut reads = Reads::Stated(&vm);
 
         let found = reads.classes_by_signature("LEvalProbe;").await.unwrap();
         assert_eq!(found.len(), 1);
@@ -627,23 +627,23 @@ mod tests {
 
         assert!(
             reads.classes_by_signature("LNeverLoaded;").await.unwrap().is_empty(),
-            "a signature the fixture does not state must come back empty, not as an error — an error \
+            "a signature the stated debuggee does not state must come back empty, not as an error — an error \
              here would send the resolver down its failure path instead of its not-loaded path"
         );
         assert_eq!(reads.get_methods(10).await.unwrap().len(), 1);
         assert!(reads.get_methods(999).await.unwrap().is_empty());
     }
 
-    /// The read tally is the fixture's twin of `packets_sent`, and it is what makes a traffic-shape
+    /// The read tally is the stated debuggee's twin of `packets_sent`, and it is what makes a traffic-shape
     /// claim assertable without a socket.
     #[tokio::test]
-    async fn a_fixture_counts_the_reads_it_serves() {
-        let fx = Fixture::new(vec![FixtureClass::new("LEvalProbe;", 10)]);
-        let mut reads = Reads::Fixture(&fx);
-        assert_eq!(fx.reads(), 0);
+    async fn a_stated_debuggee_counts_the_reads_it_serves() {
+        let vm = StatedDebuggee::new(vec![StatedClass::new("LEvalProbe;", 10)]);
+        let mut reads = Reads::Stated(&vm);
+        assert_eq!(vm.reads(), 0);
         let _ = reads.get_signature(10).await.unwrap();
         let _ = reads.get_methods(10).await.unwrap();
-        assert_eq!(fx.reads(), 2, "each read served is one charged");
+        assert_eq!(vm.reads(), 2, "each read served is one charged");
     }
 
     /// A stated line table comes back as stated, and an unstated method comes back EMPTY rather than as
@@ -654,10 +654,10 @@ mod tests {
     /// drift.
     #[tokio::test]
     async fn a_stated_line_table_comes_back_and_an_unstated_method_comes_back_empty() {
-        let fx = Fixture::new(vec![FixtureClass::new("LOrder;", 10)
+        let vm = StatedDebuggee::new(vec![StatedClass::new("LOrder;", 10)
             .with_methods(vec![method("total", "()I", 0x0001)])
             .with_line_table(77, &[(0, 41), (8, 42), (19, 44)])]);
-        let mut reads = Reads::Fixture(&fx);
+        let mut reads = Reads::Stated(&vm);
 
         let stated = reads.get_line_table(10, 77).await.unwrap();
         assert_eq!(
@@ -669,20 +669,20 @@ mod tests {
         let unstated = reads.get_line_table(10, 999).await.unwrap();
         assert!(
             unstated.lines.is_empty(),
-            "a method the fixture states no table for is the `-g:none` shape — an EMPTY table, not an \
+            "a method the stated debuggee states no table for is the `-g:none` shape — an EMPTY table, not an \
              error, because those are two different not-comparable cases and only one of them is this one"
         );
     }
 
-    /// A superclass walk ends where the fixture says it ends, so the `inherited:true` path has a
+    /// A superclass walk ends where the stated debuggee says it ends, so the `inherited:true` path has a
     /// terminating chain with no JVM.
     #[tokio::test]
     async fn a_stated_superclass_chain_terminates() {
-        let fx = Fixture::new(vec![
-            FixtureClass::new("LChild;", 1).with_superclass(2),
-            FixtureClass::new("LParent;", 2),
+        let vm = StatedDebuggee::new(vec![
+            StatedClass::new("LChild;", 1).with_superclass(2),
+            StatedClass::new("LParent;", 2),
         ]);
-        let mut reads = Reads::Fixture(&fx);
+        let mut reads = Reads::Stated(&vm);
         assert_eq!(reads.get_superclass(1).await.unwrap(), Some(2));
         assert_eq!(reads.get_superclass(2).await.unwrap(), None, "the top of a stated chain is the end");
     }

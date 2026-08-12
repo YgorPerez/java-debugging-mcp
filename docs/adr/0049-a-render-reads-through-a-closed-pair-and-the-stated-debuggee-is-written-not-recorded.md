@@ -1,4 +1,4 @@
-# 0049 — A render reads through a closed pair of adapters, and the fixture is written rather than recorded
+# 0049 — A render reads through a closed pair of adapters, and the stated debuggee is written rather than recorded
 
 ## Context
 
@@ -26,8 +26,16 @@ need is **above** the one it chose rather than instead of it.
 ## Decision
 
 **A narrow, invoke-free read interface under the renderers and above the connection, satisfied by exactly
-two adapters: the live connection, and a fixture written as data.** It lives in `mcp-server/src/reads.rs`
-as `Reads`, and the data side is `Fixture` / `FixtureClass`.
+two adapters: the live connection, and a **stated debuggee** written as data.** It lives in
+`mcp-server/src/reads.rs` as `Reads`, and the data side is `StatedDebuggee` / `StatedClass` /
+`StatedObject`.
+
+**The word is `stated`, not `stated debuggee`, and that is a decision rather than a preference.** `CONTEXT.md`
+lists `stated debuggee` in the `_Avoid_` line of its **Cassette** entry, and the tree already used it for six
+unrelated things — a cassette, a Java probe, the SMAP text, the Python scripts' input/output matrix, and
+twice as a generic test double. Naming a type that made seven, which is the `inherited` defect `CLAUDE.md`
+records, caught while the rename was still free. `CONTEXT.md` now carries **Stated** as the counterpart to
+**Cassette**.
 
 ### Invoke-free reads, and nothing else
 
@@ -61,9 +69,9 @@ module, and **this seam adds no `CommandPacket::new` call site**. SAFE-12's sour
 sites; leaving them untouched is what keeps it as authoritative as it was, and is why no fourth verdict is
 needed (SAFE-12 records why a fourth is not the way to make a red go away).
 
-The fixture has no wire and therefore nothing to guard.
+The stated debuggee has no wire and therefore nothing to guard.
 
-### Fixtures are written, not recorded
+### A stated debuggee is written, not recorded
 
 They are stated as data — a class with these methods, these fields, this superclass — and reviewed as
 data. Building a second recording pipeline is the mistake ADR-0014 already argued against in its own
@@ -81,9 +89,9 @@ The rule this ADR adds: **use a twin wherever the JVM's answer is the subject, a
 where the subject is purely how the answer renders.** Speed must not quietly replace fidelity, so the
 probe tests are not deleted when a fast test arrives beside them.
 
-### The fixture counts what it served
+### The stated debuggee counts what it served
 
-`Fixture::reads()` is the fixture twin of `JdwpConnection::packets_sent()`, for the same reason SAFE-9
+`StatedDebuggee::reads()` is the stated debuggee twin of `JdwpConnection::packets_sent()`, for the same reason SAFE-9
 asserts on packets sent rather than on a returned error: *refused* and *sent nothing* are different
 claims, and so are *rendered correctly* and *asked for the right things*. It makes a traffic-shape claim
 assertable without a socket.
@@ -96,14 +104,14 @@ call. Both are more machinery than two adapters justify, and neither gives the c
 
 **Widening the cassette seam to answer typed reads.** Would reuse existing machinery. It changes what a
 cassette *is* — ADR-0014's whole decision is that a cassette is keyed by the request and answers in bytes,
-and its miss behaviour, its record mode and its four checked-in fixtures all rest on that. A typed
+and its miss behaviour, its record mode and its four checked-in stated debuggees all rest on that. A typed
 answer would be a second mechanism sharing a name with the first.
 
 **Making `JdwpConnection` itself fakeable** (a second constructor, an inner enum over "socket" and "data").
-It puts a test fixture inside the type that holds the read-only guard and the event loop, which is exactly
-the "give a test fixture a production job" that ADR-0001's CLEAN-2 amendment declined for `send_command`.
+It puts a test stated debuggee inside the type that holds the read-only guard and the event loop, which is exactly
+the "give a test stated debuggee a production job" that ADR-0001's CLEAN-2 amendment declined for `send_command`.
 
-**Recording the fixtures from a probe.** See above: the shapes worth testing are the ones you state, and a
+**Recording the stated debuggees from a probe.** See above: the shapes worth testing are the ones you state, and a
 recording of a real class carries everything about that class rather than the one property under test.
 
 ## Consequences
@@ -114,7 +122,7 @@ recording of a real class carries everything about that class rather than the on
 - **The interface is small enough to read in one screen**, which is what makes "narrow" checkable rather
   than claimed. It is meant to stay that way: a renderer that needs something outside the set is evidence
   it is not one of the 30, not a reason to widen the set.
-- **Two adapters means two things to keep honest.** The fixture answers what a debuggee would answer, and
+- **Two adapters means two things to keep honest.** The stated debuggee answers what a debuggee would answer, and
   where it cannot the difference is stated at the method — `get_source_file` on a class with no
   `SourceFile` attribute is an `ABSENT_INFORMATION` *error* from a real JVM, and a test that needs that
   shape keeps its probe.
@@ -131,16 +139,16 @@ things did, and they resist for the same reason: their subject is not how an ans
 **The two round-trip-cost assertions cannot move, and should not.**
 `a_wide_result_set_costs_a_bounded_number_of_round_trips_per_row` and
 `a_realistic_rows_string_and_association_reads_share_a_round_trip` drive a probe through `LatencyRelay` and
-measure **milliseconds of wire time** at an injected RTT. A fixture has no wire, so there is nothing to
+measure **milliseconds of wire time** at an injected RTT. A stated debuggee has no wire, so there is nothing to
 measure — PERF-1's claim is that independent reads overlap *on a real socket*, which is a property of the
-socket and the event loop rather than of a renderer. `Fixture::reads()` answers the neighbouring question
+socket and the event loop rather than of a renderer. `StatedDebuggee::reads()` answers the neighbouring question
 (how many reads were asked for) and deliberately not this one. These are the clearest case of ADR-0014's
 rule that a cassette complements the probe suite and must not replace it.
 
 **A literal shared assertion body across the two adapters needs a seam this one does not own.** ADR-0014's
 twin — `disc2_method_listing` called by a probe test and a cassette test — works because both adapters
-produce a *tool reply*, through `Server`. A fixture cannot: `debug.list_methods` reaches its renderer
-through `DebugSession::connection`, so a fixture-backed tool call would mean a fixture-backed **session**.
+produce a *tool reply*, through `Server`. A stated debuggee cannot: `debug.list_methods` reaches its renderer
+through `DebugSession::connection`, so a tool call backed by a stated debuggee would mean a **session** backed by a stated debuggee.
 That is `connection`'s seam, which CLEAN-6 (#189) explicitly reserves and #190 puts out of scope. So the
 fast tests assert the same claims as their probe twins from beside them rather than through one body, and
 can drift from them. Closing that is a decision about where a session's connection comes from, not about
