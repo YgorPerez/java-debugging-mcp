@@ -409,3 +409,186 @@ mod tests {
         assert!(utf8(&pool, 2).is_err(), "the second slot of a Long is unusable, not the next constant");
     }
 }
+
+/// A `.class` file assembled from a stated shape, for tests (CLEAN-7, #190).
+///
+/// DISC-7 compares the JVM's line tables against a compiled `.class` on disk, so every verdict it can
+/// reach needs a real class file to exist. Until this, reaching one meant running `javac` — which is why
+/// `classfile.rs` had 2 tests for 272 lines of hostile-input parsing and the *verdicts* above it had
+/// none.
+///
+/// **Assembled rather than checked in**, and for ADR-0049's reason: the shapes worth testing are the ones
+/// you state — this method has moved a line, that one has none, this one has no `Code` at all — and a
+/// recorded artefact of a real class carries everything about that class instead of the one property
+/// under test. A reader can see the whole world a test is claiming, in the test.
+///
+/// It emits only what [`parse`] reads. A JVM would reject the result; nothing here ever gives one to a
+/// JVM, and pretending otherwise would mean carrying a stack-map generator to no end.
+#[cfg(test)]
+pub mod build {
+    /// One method to emit.
+    pub struct Method {
+        pub name: &'static str,
+        pub descriptor: &'static str,
+        pub access_flags: u16,
+        /// `(start_pc, line)` pairs. Empty with `has_code` emits a `Code` attribute carrying no
+        /// `LineNumberTable`, which is the `-g:none` third state.
+        pub lines: Vec<(u16, u16)>,
+        /// `false` emits a `method_info` with no `Code` attribute at all — abstract or native.
+        pub has_code: bool,
+        pub code: Vec<u8>,
+    }
+
+    impl Method {
+        /// An ordinary method with a line table.
+        pub fn new(name: &'static str, descriptor: &'static str, lines: &[(u16, u16)]) -> Self {
+            Self {
+                name,
+                descriptor,
+                access_flags: 0x0001,
+                lines: lines.to_vec(),
+                has_code: true,
+                code: vec![0xB1], // `return`
+            }
+        }
+
+        /// Code, but no `LineNumberTable` — the `-g:none` shape.
+        pub fn stripped(name: &'static str, descriptor: &'static str) -> Self {
+            Self { lines: Vec::new(), ..Self::new(name, descriptor, &[]) }
+        }
+
+        /// No `Code` attribute at all — abstract or native, and never drift.
+        pub fn bodyless(name: &'static str, descriptor: &'static str) -> Self {
+            Self { has_code: false, code: Vec::new(), ..Self::new(name, descriptor, &[]) }
+        }
+
+        pub fn with_code(mut self, code: &[u8]) -> Self {
+            self.code = code.to_vec();
+            self
+        }
+    }
+
+    fn utf8(out: &mut Vec<u8>, s: &str) {
+        out.push(1); // CONSTANT_Utf8
+        out.extend_from_slice(&u16::try_from(s.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    /// Emit a class file declaring `this_class` (dotted) with these methods and no fields.
+    ///
+    /// The constant pool is laid out in one fixed order so the indices below are readable constants
+    /// rather than the output of a symbol table: 1 = this class's name, 2 = its `Class`, 3/4 the same for
+    /// `java/lang/Object`, 5 = `"Code"`, 6 = `"LineNumberTable"`, then a name and a descriptor per
+    /// method.
+    pub fn class_file(this_class: &str, methods: &[Method]) -> Vec<u8> {
+        let internal = this_class.replace('.', "/");
+        let mut pool = Vec::new();
+        utf8(&mut pool, &internal);
+        pool.extend_from_slice(&[7, 0, 1]); // CONSTANT_Class -> 1
+        utf8(&mut pool, "java/lang/Object");
+        pool.extend_from_slice(&[7, 0, 3]); // CONSTANT_Class -> 3
+        utf8(&mut pool, "Code");
+        utf8(&mut pool, "LineNumberTable");
+        let mut next = 7u16;
+        let mut slots = Vec::with_capacity(methods.len());
+        for m in methods {
+            utf8(&mut pool, m.name);
+            utf8(&mut pool, m.descriptor);
+            slots.push((next, next + 1));
+            next += 2;
+        }
+
+        let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 65];
+        out.extend_from_slice(&next.to_be_bytes()); // constant_pool_count = last index + 1
+        out.extend_from_slice(&pool);
+        out.extend_from_slice(&0x0021u16.to_be_bytes()); // ACC_PUBLIC | ACC_SUPER
+        out.extend_from_slice(&2u16.to_be_bytes()); // this_class
+        out.extend_from_slice(&4u16.to_be_bytes()); // super_class
+        out.extend_from_slice(&0u16.to_be_bytes()); // interfaces_count
+        out.extend_from_slice(&0u16.to_be_bytes()); // fields_count
+
+        out.extend_from_slice(&u16::try_from(methods.len()).unwrap().to_be_bytes());
+        for (m, (name_idx, desc_idx)) in methods.iter().zip(slots) {
+            out.extend_from_slice(&m.access_flags.to_be_bytes());
+            out.extend_from_slice(&name_idx.to_be_bytes());
+            out.extend_from_slice(&desc_idx.to_be_bytes());
+            if !m.has_code {
+                out.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+                continue;
+            }
+            out.extend_from_slice(&1u16.to_be_bytes()); // attributes_count: Code
+
+            let mut code_attr: Vec<u8> = Vec::with_capacity(12 + m.code.len() + 8 * m.lines.len());
+            code_attr.extend_from_slice(&1u16.to_be_bytes()); // max_stack
+            code_attr.extend_from_slice(&1u16.to_be_bytes()); // max_locals
+            code_attr.extend_from_slice(&u32::try_from(m.code.len()).unwrap().to_be_bytes());
+            code_attr.extend_from_slice(&m.code);
+            code_attr.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+            if m.lines.is_empty() {
+                code_attr.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+            } else {
+                code_attr.extend_from_slice(&1u16.to_be_bytes()); // attributes_count: LineNumberTable
+                code_attr.extend_from_slice(&6u16.to_be_bytes()); // "LineNumberTable"
+                let body_len = 2 + 4 * u32::try_from(m.lines.len()).unwrap();
+                code_attr.extend_from_slice(&body_len.to_be_bytes());
+                code_attr.extend_from_slice(&u16::try_from(m.lines.len()).unwrap().to_be_bytes());
+                for &(start_pc, line) in &m.lines {
+                    code_attr.extend_from_slice(&start_pc.to_be_bytes());
+                    code_attr.extend_from_slice(&line.to_be_bytes());
+                }
+            }
+            out.extend_from_slice(&5u16.to_be_bytes()); // "Code"
+            out.extend_from_slice(&u32::try_from(code_attr.len()).unwrap().to_be_bytes());
+            out.extend_from_slice(&code_attr);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::build::{class_file, Method};
+    use super::parse;
+
+    /// The builder is only worth having if what it emits is what [`parse`] reads, so this round-trips
+    /// every shape the verdicts above distinguish. A builder that quietly emitted something else would
+    /// make every test built on it green and meaningless — this repo's recurring failure.
+    #[test]
+    fn what_the_builder_emits_is_what_the_parser_reads() {
+        let bytes = class_file(
+            "com.example.Order",
+            &[
+                Method::new("total", "()I", &[(0, 41), (8, 42)]),
+                Method::stripped("hidden", "()V"),
+                Method::bodyless("abstractOne", "()V"),
+            ],
+        );
+        let c = parse(&bytes).expect("the builder emits a parseable class file");
+
+        assert_eq!(c.this_class, "com.example.Order", "dotted, as parse renders it");
+        assert_eq!(c.super_class.as_deref(), Some("java.lang.Object"));
+        assert!(c.interfaces.is_empty());
+        assert!(c.fields.is_empty());
+        assert_eq!(c.methods.len(), 3);
+
+        let total = &c.methods[0];
+        assert_eq!((total.name.as_str(), total.descriptor.as_str()), ("total", "()I"));
+        assert_eq!(total.lines, vec![(0, 41), (8, 42)]);
+        assert!(total.has_code && total.has_line_table);
+
+        // The three states the staleness comparison turns on, each distinct.
+        let stripped = &c.methods[1];
+        assert!(stripped.has_code, "-g:none has code");
+        assert!(!stripped.has_line_table, "…and no LineNumberTable, which is not the same as no code");
+        let bodyless = &c.methods[2];
+        assert!(!bodyless.has_code, "an abstract method has no Code attribute and is never drift");
+    }
+
+    /// The bytecode DISC-9 compares is carried through verbatim.
+    #[test]
+    fn stated_bytecode_survives_the_round_trip() {
+        let bytes = class_file("A", &[Method::new("f", "()V", &[(0, 1)]).with_code(&[0x03, 0x3C, 0xB1])]);
+        let c = parse(&bytes).expect("parseable");
+        assert_eq!(c.methods[0].code, vec![0x03, 0x3C, 0xB1]);
+    }
+}

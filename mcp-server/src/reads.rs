@@ -71,6 +71,12 @@ pub struct FixtureClass {
     /// `Method.LineTable`, per method id. A method absent from this list has an EMPTY table, which is
     /// the `-g:none` shape rather than an error — see [`Reads::get_line_table`].
     pub line_tables: Vec<(u64, Vec<jdwp_client::method::LineTableEntry>)>,
+    /// `Method.Bytecodes`, per method id (DISC-9). A method absent from this list has no bytes.
+    pub bytecodes: Vec<(u64, Vec<u8>)>,
+    /// `ReferenceType.Modifiers` — the access flag word.
+    pub modifiers: i32,
+    /// `ReferenceType.Interfaces`, as reference type ids this fixture also states.
+    pub interfaces: Vec<u64>,
     /// `ref_type_tag`: 1 = class, 2 = interface, 3 = array. Defaults to a class.
     pub tag: u8,
 }
@@ -100,6 +106,27 @@ impl FixtureClass {
         self
     }
 
+    /// State an interface this type implements, by the reference type id of the interface.
+    #[must_use]
+    pub fn with_interface(mut self, type_id: u64) -> Self {
+        self.interfaces.push(type_id);
+        self
+    }
+
+    /// State the access-flag word `ReferenceType.Modifiers` answers.
+    #[must_use]
+    pub const fn with_modifiers(mut self, modifiers: i32) -> Self {
+        self.modifiers = modifiers;
+        self
+    }
+
+    /// State one method's bytecode (DISC-9).
+    #[must_use]
+    pub fn with_bytecode(mut self, method_id: u64, code: &[u8]) -> Self {
+        self.bytecodes.push((method_id, code.to_vec()));
+        self
+    }
+
     /// State one method's line table as `(bytecode index, source line)` pairs.
     ///
     /// A method with no entry here has an EMPTY table rather than an error, which is the `-g:none`
@@ -120,14 +147,64 @@ impl FixtureClass {
     }
 }
 
+/// One live object as a fixture states it: its type, and the fields a read would find on it.
+///
+/// Separate from [`FixtureClass`] because an object and its type are different things and ADR-0032's
+/// whole finding rests on that: the lazy-state flag lives on an *instance* three classes up, and reading
+/// it off the wrong one is the silent wrong answer the check exists to prevent.
+#[derive(Debug, Clone, Default)]
+pub struct FixtureObject {
+    pub object_id: u64,
+    /// What `ObjectReference.ReferenceType` answers for it.
+    pub type_id: u64,
+    /// `(field id, value)`, as `ObjectReference.GetValues` would answer.
+    pub fields: Vec<(u64, jdwp_client::types::ValueData)>,
+}
+
+impl FixtureObject {
+    #[must_use]
+    pub const fn new(object_id: u64, type_id: u64) -> Self {
+        Self { object_id, type_id, fields: Vec::new() }
+    }
+
+    #[must_use]
+    pub fn with_field(mut self, field_id: u64, value: jdwp_client::types::ValueData) -> Self {
+        self.fields.push((field_id, value));
+        self
+    }
+}
+
+/// The JDWP tag byte for a stated value, so a fixture's reply carries the same tag a real one would.
+const fn tag_of(data: &jdwp_client::types::ValueData) -> u8 {
+    use jdwp_client::types::ValueData as V;
+    match data {
+        V::Byte(_) => b'B',
+        V::Char(_) => b'C',
+        V::Float(_) => b'F',
+        V::Double(_) => b'D',
+        V::Int(_) => b'I',
+        V::Long(_) => b'J',
+        V::Short(_) => b'S',
+        V::Boolean(_) => b'Z',
+        V::Object(_) => b'L',
+        V::Void => b'V',
+    }
+}
+
 /// A debuggee stated as data: the classes it has loaded and what it would say about each.
 ///
 /// The counterpart to a probe JVM for anything whose subject is how an answer *renders* rather than what
 /// the answer is. Where the JVM's own answer is the subject, keep the probe — see the twin pattern
 /// ADR-0014 states as design, and the ADR for this seam.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Fixture {
     classes: Vec<FixtureClass>,
+    /// What `VirtualMachine.Capabilities` answers. Defaults to a JVM that can do everything, because
+    /// that is the ordinary case and a test asking for the other one should have to say so — see
+    /// [`Fixture::without_bytecode_capability`].
+    capabilities: jdwp_client::vm::VmCapabilities,
+    /// The live objects this debuggee holds. Empty for a fixture whose subject is class metadata only.
+    objects: Vec<FixtureObject>,
     /// How many reads have been served. The fixture twin of `JdwpConnection::packets_sent`, so a
     /// traffic-shape claim ("independent reads share one round trip") can be asserted with no socket.
     ///
@@ -141,7 +218,39 @@ pub struct Fixture {
 impl Fixture {
     #[must_use]
     pub const fn new(classes: Vec<FixtureClass>) -> Self {
-        Self { classes, reads: std::sync::atomic::AtomicU64::new(0) }
+        Self {
+            classes,
+            capabilities: jdwp_client::vm::VmCapabilities {
+                can_watch_field_modification: true,
+                can_watch_field_access: true,
+                can_get_bytecodes: true,
+                can_get_synthetic_attribute: true,
+                can_get_owned_monitor_info: true,
+                can_get_current_contended_monitor: true,
+                can_get_monitor_info: true,
+            },
+            objects: Vec::new(),
+            reads: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// State the live objects this debuggee holds (ADR-0032).
+    #[must_use]
+    pub fn with_objects(mut self, objects: Vec<FixtureObject>) -> Self {
+        self.objects = objects;
+        self
+    }
+
+    /// A JVM that answers `canGetBytecodes: false`.
+    ///
+    /// The reason this is a builder rather than a test poking a field: DISC-9's "this JVM cannot tell us"
+    /// branch was previously reachable only by finding a JVM without the capability, which no leg of the
+    /// JDK matrix provides — so the branch had never executed anywhere. It is the same class of
+    /// unreachable-in-practice path ADR-0014 built its JDWP-1.5 cassette for.
+    #[must_use]
+    pub const fn without_bytecode_capability(mut self) -> Self {
+        self.capabilities.can_get_bytecodes = false;
+        self
     }
 
     /// How many reads this fixture has answered since it was built.
@@ -283,10 +392,10 @@ impl<'a> Reads<'a> {
             Self::Live(conn) => conn.get_object_reference_type(object_id).await,
             Self::Fixture(fx) => {
                 fx.charge();
-                // A fixture states loaders as ids, not as objects with their own types. Answering with
-                // the id itself keeps `describe_class_loaders` on its `0x…` branch, which is the shape a
-                // rendering test is asserting on anyway.
-                Ok(object_id)
+                // A stated object knows its own type. Falling back to the id itself is what keeps
+                // `describe_class_loaders` on its `0x…` branch for a fixture that states no objects,
+                // which is the shape a rendering test asserts on anyway.
+                Ok(fx.objects.iter().find(|o| o.object_id == object_id).map_or(object_id, |o| o.type_id))
             }
         }
     }
@@ -320,6 +429,154 @@ impl<'a> Reads<'a> {
                 let end = lines.last().map_or(0, |e| e.line_code_index);
                 Ok(jdwp_client::method::LineTable { start, end, lines })
             }
+        }
+    }
+
+    /// A method's bytecode (`Method.Bytecodes`).
+    ///
+    /// DISC-9's second evidence: line tables catch a build where lines have MOVED, and this catches an
+    /// edit that changed a body without moving one. It reads code rather than running it.
+    ///
+    /// # Errors
+    /// Propagates the connection's error on the live path. A fixture states bytes or states none, and
+    /// stating none is the empty slice.
+    pub async fn get_bytecodes(&mut self, type_id: u64, method_id: u64) -> JdwpResult<Vec<u8>> {
+        match self {
+            Self::Live(conn) => conn.get_bytecodes(type_id, method_id).await,
+            Self::Fixture(fx) => {
+                fx.charge();
+                Ok(fx
+                    .by_id(type_id)
+                    .and_then(|c| c.bytecodes.iter().find(|(m, _)| *m == method_id))
+                    .map(|(_, b)| b.clone())
+                    .unwrap_or_default())
+            }
+        }
+    }
+
+    /// A type's access flags (`ReferenceType.Modifiers`).
+    ///
+    /// # Errors
+    /// Propagates the connection's error on the live path.
+    pub async fn get_modifiers(&mut self, type_id: u64) -> JdwpResult<i32> {
+        match self {
+            Self::Live(conn) => conn.get_modifiers(type_id).await,
+            Self::Fixture(fx) => {
+                fx.charge();
+                Ok(fx.by_id(type_id).map_or(0, |c| c.modifiers))
+            }
+        }
+    }
+
+    /// The interfaces a type declares (`ReferenceType.Interfaces`).
+    ///
+    /// # Errors
+    /// Propagates the connection's error on the live path.
+    pub async fn get_interfaces(&mut self, type_id: u64) -> JdwpResult<Vec<u64>> {
+        match self {
+            Self::Live(conn) => conn.get_interfaces(type_id).await,
+            Self::Fixture(fx) => {
+                fx.charge();
+                Ok(fx.by_id(type_id).map(|c| c.interfaces.clone()).unwrap_or_default())
+            }
+        }
+    }
+
+    /// The original seven capabilities (`VirtualMachine.Capabilities`).
+    ///
+    /// Asked before the command it gates, per `VmCapabilities`' own rule: a JVM without the capability
+    /// answers `NOT_IMPLEMENTED`, and "this JVM cannot tell us" is a better report than an error code.
+    /// A fixture states them, so **the cannot-tell branch is reachable without finding a JVM that lacks
+    /// the capability** — which is the branch that was previously untestable at any price.
+    ///
+    /// # Errors
+    /// Propagates the connection's error on the live path.
+    pub async fn capabilities(&mut self) -> JdwpResult<jdwp_client::vm::VmCapabilities> {
+        match self {
+            Self::Live(conn) => conn.capabilities().await,
+            Self::Fixture(fx) => {
+                fx.charge();
+                Ok(fx.capabilities)
+            }
+        }
+    }
+
+    /// Does this type implement `wanted` (a JNI interface signature)?
+    ///
+    /// Walks superclasses and interfaces, which is a lattice rather than a tree — ADR-0032 uses this as
+    /// the DECISION for whether an object is a Hibernate lazy value, because a generated class name is a
+    /// library naming strategy while the interface is API.
+    ///
+    /// # Errors
+    /// Propagates the connection's error on the live path.
+    pub async fn implements_interface(&mut self, type_id: u64, wanted: &str) -> JdwpResult<bool> {
+        match self {
+            Self::Live(conn) => conn.implements_interface(type_id, wanted).await,
+            Self::Fixture(fx) => {
+                fx.charge();
+                // The same shape as the live walk: superclasses × interfaces, bounded, `seen`-guarded
+                // for the diamonds that make an interface graph a lattice.
+                let mut seen = std::collections::HashSet::new();
+                let mut queue = vec![type_id];
+                while let Some(id) = queue.pop() {
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    let Some(class) = fx.by_id(id) else { continue };
+                    if class.signature == wanted {
+                        return Ok(true);
+                    }
+                    queue.extend(class.interfaces.iter().copied());
+                    queue.extend(class.superclass);
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// Read fields off one object (`ObjectReference.GetValues`).
+    ///
+    /// A field read, which invokes nothing — and the distinction ADR-0032 turns on: a field read on an
+    /// *uninitialised* proxy returns the proxy's own inherited copy, which is never populated, so this
+    /// is the read whose answer is a wrong answer with no error at all unless the lazy state is checked
+    /// first. Present here so that check can be driven without a JVM.
+    ///
+    /// # Errors
+    /// Propagates the connection's error on the live path. A fixture answers with whatever it states for
+    /// each field id, in the order asked, and omits an id it does not state — the same shape a JVM
+    /// cannot produce, so a test asserting on a partial reply is asserting on the fixture rather than on
+    /// the debuggee.
+    pub async fn get_object_values(
+        &mut self,
+        object_id: u64,
+        field_ids: Vec<u64>,
+    ) -> JdwpResult<Vec<jdwp_client::types::Value>> {
+        match self {
+            Self::Live(conn) => conn.get_object_values(object_id, field_ids).await,
+            Self::Fixture(fx) => {
+                fx.charge();
+                let Some(object) = fx.objects.iter().find(|o| o.object_id == object_id) else {
+                    return Ok(Vec::new());
+                };
+                Ok(field_ids
+                    .iter()
+                    .filter_map(|id| object.fields.iter().find(|(f, _)| f == id))
+                    .map(|(_, data)| jdwp_client::types::Value { tag: tag_of(data), data: data.clone() })
+                    .collect())
+            }
+        }
+    }
+
+    /// How many JDWP packets have gone down this connection.
+    ///
+    /// The one method here that is not a read: it is how a traffic-shape claim states itself, and
+    /// ADR-0049 keeps the fixture's tally beside the connection's for SAFE-9's reason — "rendered
+    /// correctly" and "asked for the right things" are different claims.
+    #[must_use]
+    pub fn packets_sent(&self) -> u32 {
+        match self {
+            Self::Live(conn) => conn.packets_sent(),
+            Self::Fixture(fx) => u32::try_from(fx.reads()).unwrap_or(u32::MAX),
         }
     }
 

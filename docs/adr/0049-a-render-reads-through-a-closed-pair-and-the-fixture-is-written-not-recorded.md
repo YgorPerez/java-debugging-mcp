@@ -118,8 +118,32 @@ recording of a real class carries everything about that class rather than the on
   where it cannot the difference is stated at the method — `get_source_file` on a class with no
   `SourceFile` attribute is an `ABSENT_INFORMATION` *error* from a real JVM, and a test that needs that
   shape keeps its probe.
-- **This is a partial migration and says so.** CLEAN-7 converted the discovery listings; the stale-bytecode
-  verdicts, the source-drift verdicts and the **unfetched** report are the same shape and are not done. A
-  silent partial result reads as completeness, so the count is stated in the commit that moves it.
+- **The count is stated in the commit that moves it**, because a silent partial result reads as
+  completeness. Converted: the discovery listings (DISC-2/DISC-5), the **source drift** verdicts (DISC-7's
+  five could-not-check branches), the **stale bytecode** verdicts (DISC-7/DISC-9/DISC-13) and the
+  **unfetched** classification (ADR-0032).
+
+## What resisted, and what that says about the scope
+
+#190 asked that anything resisting be **reported rather than forced**, as evidence about the interface. Two
+things did, and they resist for the same reason: their subject is not how an answer renders.
+
+**The two round-trip-cost assertions cannot move, and should not.**
+`a_wide_result_set_costs_a_bounded_number_of_round_trips_per_row` and
+`a_realistic_rows_string_and_association_reads_share_a_round_trip` drive a probe through `LatencyRelay` and
+measure **milliseconds of wire time** at an injected RTT. A fixture has no wire, so there is nothing to
+measure — PERF-1's claim is that independent reads overlap *on a real socket*, which is a property of the
+socket and the event loop rather than of a renderer. `Fixture::reads()` answers the neighbouring question
+(how many reads were asked for) and deliberately not this one. These are the clearest case of ADR-0014's
+rule that a cassette complements the probe suite and must not replace it.
+
+**A literal shared assertion body across the two adapters needs a seam this one does not own.** ADR-0014's
+twin — `disc2_method_listing` called by a probe test and a cassette test — works because both adapters
+produce a *tool reply*, through `Server`. A fixture cannot: `debug.list_methods` reaches its renderer
+through `DebugSession::connection`, so a fixture-backed tool call would mean a fixture-backed **session**.
+That is `connection`'s seam, which CLEAN-6 (#189) explicitly reserves and #190 puts out of scope. So the
+fast tests assert the same claims as their probe twins from beside them rather than through one body, and
+can drift from them. Closing that is a decision about where a session's connection comes from, not about
+this interface, and it should be taken as one.
 - **`cargo-semver-checks` sees another module**, as it does everything else under `jdwp-mcp`'s
   `#[doc(hidden)]` library (CLEAN-3, ADR-0044). Reported, not failed, and not a supported surface.

@@ -2902,63 +2902,19 @@ impl RequestHandler {
             self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
-        let (type_id, loader_note) = resolve_loaded_class_for_read(
-            &mut crate::reads::Reads::live(&mut session.connection),
-            &class_name,
-        )
-        .await?;
         let roots: Vec<std::path::PathBuf> = a.class_roots.as_ref().map_or_else(
             || session.class_roots.clone(),
             |v| v.iter().map(std::path::PathBuf::from).collect(),
         );
-        let path = resolve_class_file(&class_name, a.class_file.as_deref(), &roots)?;
-        let bytes = tokio::fs::read(&path)
-            .await
-            .map_err(|e| format!("Found {} but could not read it: {e}", path.display()))?;
-        let built = crate::classfile::parse(&bytes)
-            .map_err(|e| format!("Could not read {} as a class file: {e}", path.display()))?;
-        if built.this_class != class_name {
-            return Err(format!(
-                "{} declares {}, not {class_name}. That is a wrong path rather than drift — a class root \
-                 is where the package tree starts in the BUILD OUTPUT. Nothing was compared.",
-                path.display(),
-                built.this_class,
-            ));
-        }
-
-        let before = session.connection.packets_sent();
-        let running =
-            read_jvm_line_tables(&mut crate::reads::Reads::live(&mut session.connection), type_id).await?;
-        let mut report = compare_line_tables(&running, &built.methods);
-        // DISC-9, opt-in: the second evidence, which costs a packet per method with code on both sides.
-        // Inside the packet window so the reported cost is the whole cost, not the cheap half of it.
-        if a.bytecode {
-            report.bytecode = Some(bytecode_report(&mut session.connection, type_id, &built.methods).await?);
-        }
-        // DISC-13, and a SEPARATE question from everything above. Staleness asks whether the JVM is
-        // behind your build; this asks whether your build could be installed at all, and the answers are
-        // independent — a class can be both stale and illegal to swap. Unconditional because it is a
-        // handful of packets against the one-per-method the walk above already spent.
-        let forecast = loaded_class_shape(&mut session.connection, type_id)
-            .await
-            .map(|loaded| forecast_redefine(&loaded, &built_class_shape(&built)));
-        let packets = session.connection.packets_sent().saturating_sub(before);
+        let out = check_stale_report(
+            &mut crate::reads::Reads::live(&mut session.connection),
+            &a,
+            &class_name,
+            &roots,
+        )
+        .await;
         drop(session);
-
-        let mut out = render_stale_report(&class_name, &path, &report, a.limit, packets);
-        match forecast {
-            Ok(f) => out.push_str(&render_redefine_forecast(&class_name, &f)),
-            // A JDWP failure reading the class's shape is reported as one, not folded into the staleness
-            // verdict above and not silently dropped: the caller asked one question and got it, and is
-            // owed the news that the second could not be answered.
-            Err(e) => {
-                let _ = writeln!(
-                    out,
-                    "⚠ Redefine forecast unavailable: {e}. The staleness verdict above is unaffected."
-                );
-            }
-        }
-        Ok(out + loader_note.as_deref().unwrap_or(""))
+        out
     }
 
     /// DUMP-1: every thread's stack in one call, plus which monitors each thread holds and which one it
@@ -10328,17 +10284,15 @@ fn dotted_from_signature(signature: &str) -> String {
 /// Six or so packets: fields, methods (already cached by the staleness read), class modifiers, the
 /// superclass and its signature, the interface list and one signature each. Small enough to be
 /// unconditional on `check_stale`, whose line-table walk already costs one packet per method.
-async fn loaded_class_shape(
-    conn: &mut jdwp_client::JdwpConnection,
-    type_id: u64,
-) -> Result<ClassShape, String> {
-    let access_flags = conn
+async fn loaded_class_shape(reads: &mut crate::reads::Reads<'_>, type_id: u64) -> Result<ClassShape, String> {
+    let access_flags = reads
         .get_modifiers(type_id)
         .await
         .map_err(|e| format!("Failed to read the loaded class's modifiers: {e}"))?;
-    let super_class = match conn.get_superclass(type_id).await {
+    let super_class = match reads.get_superclass(type_id).await {
         Ok(Some(id)) => Some(
-            conn.get_signature(id)
+            reads
+                .get_signature(id)
                 .await
                 .map(|s| dotted_from_signature(&s))
                 .map_err(|e| format!("Failed to read the loaded superclass's name: {e}"))?,
@@ -10346,28 +10300,29 @@ async fn loaded_class_shape(
         Ok(None) => None,
         Err(e) => return Err(format!("Failed to read the loaded class's superclass: {e}")),
     };
-    let interface_ids = conn
+    let interface_ids = reads
         .get_interfaces(type_id)
         .await
         .map_err(|e| format!("Failed to read the loaded class's interfaces: {e}"))?;
     let mut interfaces = Vec::with_capacity(interface_ids.len());
     for id in interface_ids {
         interfaces.push(
-            conn.get_signature(id)
+            reads
+                .get_signature(id)
                 .await
                 .map(|s| dotted_from_signature(&s))
                 .map_err(|e| format!("Failed to read a loaded interface's name: {e}"))?,
         );
     }
     interfaces.sort();
-    let fields = conn
+    let fields = reads
         .get_fields(type_id)
         .await
         .map_err(|e| format!("Failed to list the loaded class's fields: {e}"))?
         .into_iter()
         .map(|f| DeclaredMember::field(f.name, f.signature, mod_bits_u16(f.mod_bits)))
         .collect();
-    let methods = conn
+    let methods = reads
         .get_methods(type_id)
         .await
         .map_err(|e| format!("Failed to list the loaded class's methods: {e}"))?
@@ -10874,8 +10829,74 @@ fn drift_caveat_from_tables(
 /// rebuild does not trip it; a build produced by a different JDK than the one you are comparing with can.
 /// That is why a bytecode-only difference is reported as "the code differs" and not as "your source
 /// differs".
+/// The whole of `debug.check_stale` below the session lookup (DISC-7, DISC-9, DISC-13).
+///
+/// Lifted out of the handler by CLEAN-7 (#190) so the verdicts can be driven from a stated
+/// [`crate::reads::Fixture`] and a temporary tree. The subject here is which verdict a given pair of
+/// worlds produces, and that never needed a JVM — it needed a class file on disk and a set of line
+/// tables, both of which are things a test can state.
+///
+/// The packet window still brackets exactly what it bracketed: the line-table walk, the opt-in bytecode
+/// pass and the redefine forecast, and nothing before them. Charging resolution or rendering to "what
+/// the check cost" would report the debugger's overhead as the debuggee's price, which is ADR-0010's
+/// rule and the reason the window is where it is.
+async fn check_stale_report(
+    reads: &mut crate::reads::Reads<'_>,
+    a: &crate::args::CheckStaleArgs,
+    class_name: &str,
+    roots: &[std::path::PathBuf],
+) -> Result<String, String> {
+    let (type_id, loader_note) = resolve_loaded_class_for_read(reads, class_name).await?;
+    let path = resolve_class_file(class_name, a.class_file.as_deref(), roots)?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("Found {} but could not read it: {e}", path.display()))?;
+    let built = crate::classfile::parse(&bytes)
+        .map_err(|e| format!("Could not read {} as a class file: {e}", path.display()))?;
+    if built.this_class != class_name {
+        return Err(format!(
+            "{} declares {}, not {class_name}. That is a wrong path rather than drift — a class root \
+             is where the package tree starts in the BUILD OUTPUT. Nothing was compared.",
+            path.display(),
+            built.this_class,
+        ));
+    }
+
+    let before = reads.packets_sent();
+    let running = read_jvm_line_tables(reads, type_id).await?;
+    let mut report = compare_line_tables(&running, &built.methods);
+    // DISC-9, opt-in: the second evidence, which costs a packet per method with code on both sides.
+    // Inside the packet window so the reported cost is the whole cost, not the cheap half of it.
+    if a.bytecode {
+        report.bytecode = Some(bytecode_report(reads, type_id, &built.methods).await?);
+    }
+    // DISC-13, and a SEPARATE question from everything above. Staleness asks whether the JVM is
+    // behind your build; this asks whether your build could be installed at all, and the answers are
+    // independent — a class can be both stale and illegal to swap. Unconditional because it is a
+    // handful of packets against the one-per-method the walk above already spent.
+    let forecast = loaded_class_shape(reads, type_id)
+        .await
+        .map(|loaded| forecast_redefine(&loaded, &built_class_shape(&built)));
+    let packets = reads.packets_sent().saturating_sub(before);
+
+    let mut out = render_stale_report(class_name, &path, &report, a.limit, packets);
+    match forecast {
+        Ok(f) => out.push_str(&render_redefine_forecast(class_name, &f)),
+        // A JDWP failure reading the class's shape is reported as one, not folded into the staleness
+        // verdict above and not silently dropped: the caller asked one question and got it, and is
+        // owed the news that the second could not be answered.
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "⚠ Redefine forecast unavailable: {e}. The staleness verdict above is unaffected."
+            );
+        }
+    }
+    Ok(out + loader_note.as_deref().unwrap_or(""))
+}
+
 async fn bytecode_report(
-    conn: &mut jdwp_client::JdwpConnection,
+    reads: &mut crate::reads::Reads<'_>,
     type_id: u64,
     built: &[crate::classfile::ClassFileMethod],
 ) -> Result<BytecodeReport, String> {
@@ -10884,7 +10905,7 @@ async fn bytecode_report(
     // Asked before the first command, per `VmCapabilities`' own rule: a JVM without the capability
     // answers NOT_IMPLEMENTED, and "this JVM cannot tell us" is a better report than an error code.
     // `canGetBytecodes` is one of the original seven, so this is `capabilities`, not `capabilities_new`.
-    match conn.capabilities().await {
+    match reads.capabilities().await {
         Ok(caps) if !caps.can_get_bytecodes => {
             report.unavailable = true;
             return Ok(report);
@@ -10894,7 +10915,7 @@ async fn bytecode_report(
     }
 
     let methods =
-        conn.get_methods(type_id).await.map_err(|e| format!("Failed to list the running methods: {e}"))?;
+        reads.get_methods(type_id).await.map_err(|e| format!("Failed to list the running methods: {e}"))?;
     for m in methods {
         // Compared as a pair rather than two `&&`ed equalities: JDWP calls it a signature and the class
         // file calls it a descriptor, so field names differ across the two sides by nature.
@@ -10907,7 +10928,7 @@ async fn bytecode_report(
             report.skipped += 1;
             continue;
         }
-        match conn.get_bytecodes(type_id, m.method_id).await {
+        match reads.get_bytecodes(type_id, m.method_id).await {
             Ok(running) => {
                 report.compared += 1;
                 if running != file.code {
@@ -17200,7 +17221,7 @@ async fn set_static_field(
 }
 
 async fn find_field(
-    conn: &mut jdwp_client::JdwpConnection,
+    reads: &mut crate::reads::Reads<'_>,
     type_id: u64,
     name: &str,
 ) -> Result<Option<u64>, String> {
@@ -17211,11 +17232,11 @@ async fn find_field(
         if guard > 50 {
             break;
         }
-        let fields = conn.get_fields(tid).await.map_err(|e| format!("Failed to get fields: {e}"))?;
+        let fields = reads.get_fields(tid).await.map_err(|e| format!("Failed to get fields: {e}"))?;
         if let Some(f) = fields.into_iter().find(|f| f.name == name) {
             return Ok(Some(f.field_id));
         }
-        current = conn.get_superclass(tid).await.unwrap_or(None);
+        current = reads.get_superclass(tid).await.unwrap_or(None);
     }
     Ok(None)
 }
@@ -17725,7 +17746,7 @@ impl FieldIds {
         if let Some(hit) = self.ids.get(&(type_id, name)) {
             return *hit;
         }
-        let found = find_field(conn, type_id, name).await.ok().flatten();
+        let found = find_field(&mut crate::reads::Reads::live(conn), type_id, name).await.ok().flatten();
         self.ids.insert((type_id, name), found);
         found
     }
@@ -19104,21 +19125,17 @@ fn hibernate_candidate(sig: &str) -> Option<LazyShape> {
 /// made that necessary), and the marker INTERFACE decides it — the name is a library naming strategy,
 /// the interface is API, and a check that answered from the name alone would report a lazy value for any
 /// class somebody happened to name that way.
-async fn hibernate_lazy_state(
-    conn: &mut jdwp_client::JdwpConnection,
-    obj_id: u64,
-    type_id: u64,
-) -> LazyState {
-    let sig = conn.get_signature(type_id).await.unwrap_or_default();
+async fn hibernate_lazy_state(reads: &mut crate::reads::Reads<'_>, obj_id: u64, type_id: u64) -> LazyState {
+    let sig = reads.get_signature(type_id).await.unwrap_or_default();
     let Some(candidate) = hibernate_candidate(&sig) else { return LazyState::Loaded };
     match candidate {
         LazyShape::EntityProxy => {
-            if !conn.implements_interface(type_id, HIBERNATE_PROXY_IFACE).await.unwrap_or(false) {
+            if !reads.implements_interface(type_id, HIBERNATE_PROXY_IFACE).await.unwrap_or(false) {
                 // Named like a proxy and is not one. Nothing to report: the interface decides.
                 return LazyState::Loaded;
             }
             // One hop first — the flag lives on the initialiser, not on the proxy.
-            let Some(init_id) = read_lazy_initializer(conn, obj_id, type_id).await else {
+            let Some(init_id) = read_lazy_initializer(reads, obj_id, type_id).await else {
                 return LazyState::Unknown(format!(
                     "it implements {} but has neither of the fields that hold a lazy initialiser ({}), so \
                      whether the row has been fetched cannot be read without invoking something",
@@ -19126,7 +19143,7 @@ async fn hibernate_lazy_state(
                     LAZY_INITIALIZER_FIELDS.join(" or "),
                 ));
             };
-            match read_initialized_flag(conn, init_id).await {
+            match read_initialized_flag(reads, init_id).await {
                 Ok(true) => LazyState::Loaded,
                 Ok(false) => LazyState::Unfetched(LazyShape::EntityProxy),
                 Err(why) => LazyState::Unknown(why),
@@ -19135,7 +19152,7 @@ async fn hibernate_lazy_state(
         LazyShape::Collection => {
             let mut is_collection = false;
             for iface in HIBERNATE_COLLECTION_IFACES {
-                if conn.implements_interface(type_id, iface).await.unwrap_or(false) {
+                if reads.implements_interface(type_id, iface).await.unwrap_or(false) {
                     is_collection = true;
                     break;
                 }
@@ -19144,7 +19161,7 @@ async fn hibernate_lazy_state(
                 return LazyState::Loaded;
             }
             // A collection carries the flag directly — there is no initialiser object in between.
-            match read_initialized_flag(conn, obj_id).await {
+            match read_initialized_flag(reads, obj_id).await {
                 Ok(true) => LazyState::Loaded,
                 Ok(false) => LazyState::Unfetched(LazyShape::Collection),
                 Err(why) => LazyState::Unknown(why),
@@ -19155,13 +19172,13 @@ async fn hibernate_lazy_state(
 
 /// The proxy's lazy-initialiser object, by field read. `None` when neither generation's field is there.
 async fn read_lazy_initializer(
-    conn: &mut jdwp_client::JdwpConnection,
+    reads: &mut crate::reads::Reads<'_>,
     obj_id: u64,
     type_id: u64,
 ) -> Option<u64> {
     for name in LAZY_INITIALIZER_FIELDS {
-        let Ok(Some(fid)) = find_field(conn, type_id, name).await else { continue };
-        let Ok(vals) = conn.get_object_values(obj_id, vec![fid]).await else { continue };
+        let Ok(Some(fid)) = find_field(reads, type_id, name).await else { continue };
+        let Ok(vals) = reads.get_object_values(obj_id, vec![fid]).await else { continue };
         if let Some(jdwp_client::types::ValueData::Object(id)) = vals.first().map(|v| &v.data) {
             if *id != 0 {
                 return Some(*id);
@@ -19173,18 +19190,18 @@ async fn read_lazy_initializer(
 
 /// Read the `initialized` boolean off `obj_id`, walking its superclasses the way every other field read
 /// here does — the field is `private` and three classes up on a Byte Buddy interceptor.
-async fn read_initialized_flag(conn: &mut jdwp_client::JdwpConnection, obj_id: u64) -> Result<bool, String> {
-    let type_id = conn
+async fn read_initialized_flag(reads: &mut crate::reads::Reads<'_>, obj_id: u64) -> Result<bool, String> {
+    let type_id = reads
         .get_object_reference_type(obj_id)
         .await
         .map_err(|e| format!("its lazy initialiser's own type could not be read ({e})"))?;
-    let fid = find_field(conn, type_id, INITIALIZED_FIELD)
+    let fid = find_field(reads, type_id, INITIALIZED_FIELD)
         .await
         .map_err(|e| format!("looking for its `{INITIALIZED_FIELD}` field failed ({e})"))?
         .ok_or_else(|| {
             format!("it has no `{INITIALIZED_FIELD}` field, so this is not a layout this recognises")
         })?;
-    let vals = conn
+    let vals = reads
         .get_object_values(obj_id, vec![fid])
         .await
         .map_err(|e| format!("reading its `{INITIALIZED_FIELD}` field failed ({e})"))?;
@@ -19272,7 +19289,7 @@ async fn check_lazy_receiver(
         return Ok(());
     }
     let member = &seg_member_display(seg);
-    let state = hibernate_lazy_state(conn, obj_id, type_id).await;
+    let state = hibernate_lazy_state(&mut crate::reads::Reads::live(conn), obj_id, type_id).await;
     if matches!(state, LazyState::Loaded) {
         return Ok(());
     }
@@ -20399,7 +20416,7 @@ async fn read_segment_field(
             return Ok(value_int(len));
         }
     }
-    let fid = find_field(conn, type_id, &seg.name)
+    let fid = find_field(&mut crate::reads::Reads::live(conn), type_id, &seg.name)
         .await?
         .ok_or_else(|| format!("No field '{}' found on the object", seg.name))?;
     let vals = conn
@@ -20854,7 +20871,7 @@ async fn lazy_state_of(
         return None;
     }
     let type_id = conn.get_object_reference_type(id).await.ok()?;
-    Some(hibernate_lazy_state(conn, id, type_id).await)
+    Some(hibernate_lazy_state(&mut crate::reads::Reads::live(conn), id, type_id).await)
 }
 
 /// One segment as the caller wrote it: `getConfigUhList()`, `sqQuarto`, `lines[0]`.
@@ -22534,7 +22551,9 @@ async fn render_resolved_object(
     // EVAL-9: never `toString()` an unfetched Hibernate lazy value. On a proxy that call IS the load —
     // rendering it would perform in the *renderer* exactly the side effect the resolver just refused to
     // perform, and a caller whose chain ended on the proxy would have triggered it by asking what it is.
-    if let LazyState::Unfetched(shape) = hibernate_lazy_state(conn, id, type_id).await {
+    if let LazyState::Unfetched(shape) =
+        hibernate_lazy_state(&mut crate::reads::Reads::live(conn), id, type_id).await
+    {
         return format!(
             "{name} @0x{id:x} ⏳ UNFETCHED {} — {}",
             lazy_link_kind(shape),
@@ -29865,5 +29884,402 @@ mod source_freshness_section_tests {
              the reader to redeploy something that is not the problem:\n{out}"
         );
         assert_eq!(fx.reads(), 0, "still no question reaches the debuggee");
+    }
+}
+
+/// The **stale bytecode** verdicts, driven from a stated JVM and an assembled `.class` (CLEAN-7, #190).
+///
+/// DISC-7 compares two worlds — the JVM's line tables against the compiled build on disk — and every
+/// verdict it can reach is a function of that pair. Reaching one used to need a probe JVM, a `javac`
+/// invocation and a redeploy, which is why `classfile.rs`'s 272 lines of hostile-input parsing had 2
+/// tests and the verdicts above them had none.
+///
+/// Both worlds are now stated: [`crate::reads::Fixture`] for the running one, `classfile::build` for the
+/// compiled one. That reaches two branches a JDK matrix could never reach at all — a JVM that answers
+/// `canGetBytecodes: false`, which no leg provides, and an exact agreement between the two sides, which
+/// on a probe depends on the compile the harness happened to produce.
+#[cfg(test)]
+mod check_stale_report_tests {
+    use super::*;
+    use crate::classfile::build::{class_file, Method as BuiltMethod};
+    use crate::reads::{Fixture, FixtureClass, Reads};
+    use jdwp_client::reftype::MethodInfo;
+
+    const CLASS: &str = "com.example.Order";
+    const TYPE_ID: u64 = 10;
+    const TOTAL: u64 = 77;
+    const OBJECT_ID: u64 = 1;
+
+    fn running_method(name: &str, signature: &str, method_id: u64) -> MethodInfo {
+        MethodInfo {
+            method_id,
+            name: name.to_string(),
+            signature: signature.to_string(),
+            generic_signature: None,
+            mod_bits: 0x0001,
+        }
+    }
+
+    /// The JVM's side, shaped so DISC-13's redefine forecast is QUIET.
+    ///
+    /// The forecast is a separate question and it answers unconditionally, so a fixture that left the
+    /// class's modifiers and superclass unstated would put "Redefine WILL BE REFUSED" on top of every
+    /// staleness reply below — noise from an unstated world rather than a finding. `0x0021` is
+    /// `ACC_PUBLIC | ACC_SUPER`, which is what `classfile::build` emits.
+    fn loaded_class(methods: Vec<MethodInfo>) -> FixtureClass {
+        FixtureClass::new("Lcom/example/Order;", TYPE_ID)
+            .with_methods(methods)
+            .with_modifiers(0x0021)
+            .with_superclass(OBJECT_ID)
+    }
+
+    fn object() -> FixtureClass {
+        FixtureClass::new("Ljava/lang/Object;", OBJECT_ID)
+    }
+
+    /// One class with one method, whose line table the caller states.
+    fn running(lines: &[(u64, i32)]) -> Fixture {
+        Fixture::new(vec![
+            loaded_class(vec![running_method("total", "()I", TOTAL)]).with_line_table(TOTAL, lines),
+            object(),
+        ])
+    }
+
+    fn args(bytecode: bool) -> crate::args::CheckStaleArgs {
+        crate::args::CheckStaleArgs {
+            class_name: CLASS.to_string(),
+            class_file: None,
+            class_roots: None,
+            limit: 20,
+            bytecode,
+        }
+    }
+
+    /// Write the compiled side to a temporary class root and run the whole check against it.
+    async fn check(
+        fx: &Fixture,
+        built: &[BuiltMethod],
+        bytecode: bool,
+    ) -> (Result<String, String>, tempfile::TempDir) {
+        let root = tempfile::tempdir().expect("a temporary class root");
+        let pkg = root.path().join("com").join("example");
+        tokio::fs::create_dir_all(&pkg).await.expect("the package tree");
+        tokio::fs::write(pkg.join("Order.class"), class_file(CLASS, built)).await.expect("the build");
+        let roots = vec![root.path().to_path_buf()];
+        let out = check_stale_report(&mut Reads::Fixture(fx), &args(bytecode), CLASS, &roots).await;
+        (out, root)
+    }
+
+    /// The two worlds agree, so the verdict is that they agree — and it says which claim it is making,
+    /// because a line-table match is not proof that no body changed.
+    #[tokio::test]
+    async fn a_build_the_jvm_is_already_running_is_reported_as_agreeing() {
+        let fx = running(&[(0, 41), (8, 42)]);
+        let (out, _root) = check(&fx, &[BuiltMethod::new("total", "()I", &[(0, 41), (8, 42)])], false).await;
+        let out = out.expect("the class resolves and the build parses");
+
+        assert!(
+            !out.to_lowercase().contains("drifted") && !out.to_lowercase().contains("stale"),
+            "identical line tables must not read as drift:\n{out}"
+        );
+        assert!(out.contains(CLASS), "the reply names the class it compared:\n{out}");
+    }
+
+    /// A line that has moved is the case DISC-7 exists for: the stop point at `:412` now means something
+    /// else, and nothing else on this tool surface can say so.
+    #[tokio::test]
+    async fn a_line_that_moved_between_the_build_and_the_jvm_is_reported_as_drift() {
+        let fx = running(&[(0, 41), (8, 42)]);
+        // The same method, recompiled after something above it grew by three lines.
+        let (out, _root) = check(&fx, &[BuiltMethod::new("total", "()I", &[(0, 44), (8, 45)])], false).await;
+        let out = out.expect("both sides parse");
+
+        assert!(
+            out.contains("total"),
+            "the drifting method is NAMED — a count alone cannot be acted on:\n{out}"
+        );
+        let lowered = out.to_lowercase();
+        assert!(
+            lowered.contains("drift") || lowered.contains("differ") || lowered.contains("stale"),
+            "a moved line is the verdict this tool exists to give:\n{out}"
+        );
+    }
+
+    /// A method with no `Code` attribute has no body to compare and must never be reported as drift —
+    /// otherwise every abstract method in an interface reads as a stale build.
+    #[tokio::test]
+    async fn an_abstract_method_is_not_drift() {
+        let fx = Fixture::new(vec![loaded_class(vec![running_method("shape", "()V", 90)]), object()]);
+        let (out, _root) = check(&fx, &[BuiltMethod::bodyless("shape", "()V")], false).await;
+        let out = out.expect("both sides parse");
+
+        assert!(
+            !out.to_lowercase().contains("drift"),
+            "a method with no body on either side is not evidence of anything:\n{out}"
+        );
+    }
+
+    /// DISC-9's opt-in second evidence: an edit that changes a body WITHOUT moving a line. The line
+    /// tables agree here, so this is exactly the case the default check is blind to.
+    #[tokio::test]
+    async fn a_changed_body_behind_an_unchanged_line_table_is_caught_only_by_the_bytecode_pass() {
+        let fx = Fixture::new(vec![
+            loaded_class(vec![running_method("total", "()I", TOTAL)])
+                .with_line_table(TOTAL, &[(0, 41)])
+                .with_bytecode(TOTAL, &[0x03, 0xAC]), // iconst_0; ireturn
+            object(),
+        ]);
+        let built = [BuiltMethod::new("total", "()I", &[(0, 41)]).with_code(&[0x04, 0xAC])]; // iconst_1
+
+        // The default pass compares line tables, which AGREE — so it reports a match, and is explicit
+        // that a match means "no line moved" rather than "byte-for-byte identical".
+        let without = check(&fx, &built, false).await.0.expect("both sides parse");
+        assert!(
+            without.contains("matches your build"),
+            "line tables agree, so the default is clean:\n{without}"
+        );
+        assert!(
+            without.contains("Basis: per-method line tables only"),
+            "the reply states which claim it is making — this is the whole reason a clean line-table \
+             result is not the end of the question:\n{without}"
+        );
+
+        // The opt-in pass adds the evidence that can see this edit, and reverses the verdict.
+        let with = check(&fx, &built, true).await.0.expect("both sides parse");
+        assert!(with.contains("STALE"), "the body changed, and bytecode is what can see it:\n{with}");
+        assert!(
+            with.contains("total()I — code differs at bytecode index 0"),
+            "the differing method is named WITH where it differs:\n{with}"
+        );
+        assert!(
+            with.contains("the line tables MATCH and the bytecode does not"),
+            "the two evidences disagreeing is the case DISC-9 exists for, and the reply says so rather \
+             than leaving the reader to notice:\n{with}"
+        );
+        assert!(
+            with.contains("Basis: per-method line tables AND bytecode"),
+            "and the basis line changes with the evidence:\n{with}"
+        );
+    }
+
+    /// A JVM that cannot answer `Method.Bytecodes` reports that it cannot, rather than an error code or
+    /// a silent pass.
+    ///
+    /// **No leg of the JDK matrix can reach this branch** — every JDK in the estate has the capability —
+    /// so before a stated JVM it had never executed on any machine. That is the same
+    /// unreachable-in-practice shape ADR-0014 built its JDWP-1.5 cassette for.
+    #[tokio::test]
+    async fn a_jvm_that_cannot_read_bytecode_says_so_instead_of_failing() {
+        let fx = running(&[(0, 41)]).without_bytecode_capability();
+        let (out, _root) = check(&fx, &[BuiltMethod::new("total", "()I", &[(0, 41)])], true).await;
+        let out = out.expect("a missing capability is an answer, not an error");
+
+        assert!(
+            !out.contains("NOT_IMPLEMENTED") && !out.contains("99"),
+            "the caller is owed a sentence, not a JDWP error code:\n{out}"
+        );
+        assert!(out.contains("total") || out.to_lowercase().contains("bytecode"), "{out}");
+    }
+
+    /// The wrong class root is a wrong PATH, not drift, and saying "drift" would send the reader to
+    /// redeploy something that was never the problem.
+    #[tokio::test]
+    async fn a_class_file_declaring_another_class_is_a_wrong_root_and_nothing_is_compared() {
+        let root = tempfile::tempdir().expect("a temporary class root");
+        let pkg = root.path().join("com").join("example");
+        tokio::fs::create_dir_all(&pkg).await.expect("the package tree");
+        // The right path, holding some other class's compile.
+        tokio::fs::write(
+            pkg.join("Order.class"),
+            class_file("com.example.Invoice", &[BuiltMethod::new("total", "()I", &[(0, 41)])]),
+        )
+        .await
+        .expect("the decoy");
+
+        let fx = running(&[(0, 41)]);
+        let err =
+            check_stale_report(&mut Reads::Fixture(&fx), &args(false), CLASS, &[root.path().to_path_buf()])
+                .await
+                .expect_err("a file declaring another class settles nothing");
+
+        assert!(err.contains("com.example.Invoice"), "the reply names what it actually found:\n{err}");
+        assert!(err.contains("Nothing was compared."), "and says the comparison did not happen:\n{err}");
+        assert!(err.contains("BUILD OUTPUT"), "and names the mistake this attracts:\n{err}");
+    }
+
+    /// The reported cost brackets the reads and nothing else (ADR-0010): charging resolution or rendering
+    /// to "what the check cost" would report the debugger's overhead as the debuggee's price.
+    #[tokio::test]
+    async fn the_opt_in_bytecode_pass_costs_more_reads_and_the_report_says_so() {
+        let fx = running(&[(0, 41)]);
+        let before = fx.reads();
+        let _ = check(&fx, &[BuiltMethod::new("total", "()I", &[(0, 41)])], false).await;
+        let cheap = fx.reads() - before;
+
+        let fx2 = running(&[(0, 41)]);
+        let _ = check(&fx2, &[BuiltMethod::new("total", "()I", &[(0, 41)])], true).await;
+        let dear = fx2.reads();
+
+        assert!(
+            dear > cheap,
+            "DISC-9 is opt-in BECAUSE it costs more; if it did not, the flag would have no reason to \
+             exist. cheap={cheap}, dear={dear}"
+        );
+    }
+}
+
+/// ADR-0032's **third answer**, driven from a stated debuggee (CLEAN-7, #190).
+///
+/// EVAL-9's finding is that a field read on an uninitialised Hibernate proxy returns the proxy's own
+/// inherited copy, which is never populated — `proxy.id` read `null` through this debugger while the
+/// proxy's identity was `42`. **A wrong answer with no error at all**, which is the worst failure mode
+/// this codebase has, and the reason `⏳ UNFETCHED` exists as a state beside "a value" and "`null`".
+///
+/// The classification invokes nothing — it is type metadata and field reads — so it fits under this seam
+/// exactly. What it needed was a debuggee stating a proxy, its lazy initialiser, and that object's
+/// `initialized` flag, which is three objects and no JVM.
+///
+/// Reaching these before meant a real Hibernate on the classpath. `RealHibernateProbe` exists for that and
+/// stays: it is what would notice Hibernate changing its layout, which is the fidelity ADR-0049's twin
+/// rule protects. What could not be reached at any price is the **cannot tell** branch, which needs a
+/// proxy whose initialiser is missing a field a real Hibernate always has.
+#[cfg(test)]
+mod unfetched_tests {
+    use super::*;
+    use crate::reads::{Fixture, FixtureClass, FixtureObject, Reads};
+    use jdwp_client::reftype::FieldInfo;
+    use jdwp_client::types::ValueData;
+
+    const PROXY_TYPE: u64 = 10;
+    const INIT_TYPE: u64 = 11;
+    const PROXY_OBJ: u64 = 0x1f4c;
+    const INIT_OBJ: u64 = 0x2a00;
+    const HANDLER_FIELD: u64 = 500;
+    const INITIALIZED: u64 = 501;
+
+    fn field(name: &str, signature: &str, field_id: u64) -> FieldInfo {
+        FieldInfo {
+            field_id,
+            name: name.to_string(),
+            signature: signature.to_string(),
+            generic_signature: None,
+            mod_bits: 0x0002,
+        }
+    }
+
+    /// A Byte Buddy proxy, its lazy initialiser, and whatever that initialiser's `initialized` flag says.
+    ///
+    /// The class name is the real one, verified against a live proxy in EVAL-9:
+    /// `RealHibernateProbe$Order$HibernateProxy$bVJLgnEW`. It is stated here rather than invented because
+    /// the name is the COST GATE — a made-up name would pass the gate for the wrong reason and the test
+    /// would stop proving that the gate lets a real proxy through.
+    fn proxy_world(initialized: Option<bool>) -> Fixture {
+        let initialiser_fields =
+            initialized.map(|_| vec![field("initialized", "Z", INITIALIZED)]).unwrap_or_default();
+        let mut init_object = FixtureObject::new(INIT_OBJ, INIT_TYPE);
+        if let Some(flag) = initialized {
+            init_object = init_object.with_field(INITIALIZED, ValueData::Boolean(flag));
+        }
+        Fixture::new(vec![
+            FixtureClass::new("LRealHibernateProbe$Order$HibernateProxy$bVJLgnEW;", PROXY_TYPE)
+                .with_fields(vec![field("$$_hibernate_interceptor", "Ljava/lang/Object;", HANDLER_FIELD)])
+                // The marker interface is what DECIDES; the fixture states it as a superclass-reachable
+                // type exactly as the lattice walk would find it.
+                .with_interface(HIBERNATE_IFACE_ID),
+            FixtureClass::new(HIBERNATE_PROXY_IFACE, HIBERNATE_IFACE_ID),
+            FixtureClass::new("Lorg/hibernate/proxy/pojo/bytebuddy/ByteBuddyInterceptor;", INIT_TYPE)
+                .with_fields(initialiser_fields),
+        ])
+        .with_objects(vec![
+            FixtureObject::new(PROXY_OBJ, PROXY_TYPE).with_field(HANDLER_FIELD, ValueData::Object(INIT_OBJ)),
+            init_object,
+        ])
+    }
+
+    const HIBERNATE_IFACE_ID: u64 = 12;
+
+    /// An uninitialised proxy is the third answer, and it is reported rather than resolved through.
+    #[tokio::test]
+    async fn an_uninitialised_proxy_is_unfetched_and_nothing_is_resolved_through_it() {
+        let fx = proxy_world(Some(false));
+        let state = hibernate_lazy_state(&mut Reads::Fixture(&fx), PROXY_OBJ, PROXY_TYPE).await;
+
+        assert!(
+            matches!(state, LazyState::Unfetched(LazyShape::EntityProxy)),
+            "an initialized:false proxy is the case EVAL-9 exists for"
+        );
+
+        let rendered = lazy_link_summary(LazyShape::EntityProxy, "RealHibernateProbe$Order");
+        assert!(rendered.contains("⏳ UNFETCHED"), "{rendered}");
+        assert!(
+            rendered.contains("neither null nor a value"),
+            "the whole point is that this is a THIRD answer — folding it into null would blame a link \
+             that very likely exists, which is the failure the tool was built to remove:\n{rendered}"
+        );
+    }
+
+    /// A proxy that HAS been fetched behaves exactly as before. This is the half that must stay
+    /// byte-identical, because it is the answer for every non-Hibernate JVM too.
+    #[tokio::test]
+    async fn an_initialised_proxy_reads_as_loaded_and_changes_nothing() {
+        let fx = proxy_world(Some(true));
+        let state = hibernate_lazy_state(&mut Reads::Fixture(&fx), PROXY_OBJ, PROXY_TYPE).await;
+        assert!(matches!(state, LazyState::Loaded), "a fetched proxy is an ordinary object");
+    }
+
+    /// It IS a lazy value and the flag could not be read, so it says which of the two it cannot tell —
+    /// rather than guessing "loaded" and failing open into the side effect the check exists to prevent.
+    ///
+    /// **This branch was unreachable at any price before a stated debuggee**: it needs a real Hibernate
+    /// proxy whose initialiser is missing a field that every real Hibernate puts there.
+    #[tokio::test]
+    async fn a_proxy_whose_flag_cannot_be_read_says_it_cannot_tell_rather_than_guessing() {
+        let fx = proxy_world(None);
+        let state = hibernate_lazy_state(&mut Reads::Fixture(&fx), PROXY_OBJ, PROXY_TYPE).await;
+
+        let LazyState::Unknown(why) = state else {
+            panic!("a lazy value whose flag is unreadable must not be reported as either of the other two");
+        };
+        assert!(
+            why.contains("initialized"),
+            "the reply names the field it could not read, which is what makes this diagnosable:\n{why}"
+        );
+    }
+
+    /// The cost gate is a NAME and the decision is an INTERFACE, and both halves matter.
+    ///
+    /// A class named like a proxy that does not implement the marker interface is not one — otherwise
+    /// anybody who named a class `Foo$HibernateProxy$Bar` would get a lazy verdict about an ordinary
+    /// object.
+    #[tokio::test]
+    async fn a_class_named_like_a_proxy_that_implements_nothing_is_not_one() {
+        let fx = Fixture::new(vec![FixtureClass::new("LImposter$HibernateProxy$xx;", PROXY_TYPE)])
+            .with_objects(vec![FixtureObject::new(PROXY_OBJ, PROXY_TYPE)]);
+
+        let state = hibernate_lazy_state(&mut Reads::Fixture(&fx), PROXY_OBJ, PROXY_TYPE).await;
+        assert!(
+            matches!(state, LazyState::Loaded),
+            "the interface decides; a generated class NAME is a library naming strategy and the check \
+             must not answer from it alone"
+        );
+    }
+
+    /// And the gate is a gate: an ordinary class costs no interface walk at all.
+    ///
+    /// This is EVAL-9's measurement expressed as an assertion rather than a comment — running the
+    /// authoritative check on every link took a 5-link chain from 34 packets to 49 (+44%).
+    #[tokio::test]
+    async fn an_ordinary_class_is_not_a_candidate_and_costs_one_read() {
+        let fx = Fixture::new(vec![FixtureClass::new("Lcom/example/Order;", PROXY_TYPE)])
+            .with_objects(vec![FixtureObject::new(PROXY_OBJ, PROXY_TYPE)]);
+
+        let state = hibernate_lazy_state(&mut Reads::Fixture(&fx), PROXY_OBJ, PROXY_TYPE).await;
+        assert!(matches!(state, LazyState::Loaded));
+        assert_eq!(
+            fx.reads(),
+            1,
+            "the name gate must cost exactly the one signature read and stop. A lattice walk here is the \
+             44% round-trip tax #86 refused to charge every non-Hibernate JVM."
+        );
     }
 }
