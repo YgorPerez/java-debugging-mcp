@@ -1335,7 +1335,7 @@ impl RequestHandler {
             .await
             .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
         let mut session = session_guard.lock().await;
-        let trace_arm = TraceArm::resolve(&a, &session.trace_exprs);
+        let resolved = ResolvedTrace::resolve(&a, &session.trace_exprs);
         // One definition, pointed at each pattern in turn below.
         let base = BreakpointSpec {
             class_pattern: String::new(),
@@ -1347,10 +1347,10 @@ impl RequestHandler {
             instance_filter,
             condition: a.condition.clone(),
             trace: a.trace,
-            trace_expr: trace_arm.exprs,
-            trace_budget: trace_budget_for(a.trace, a.trace_max_hits),
-            trace_frames: trace_arm.frames,
-            trace_max_length: trace_arm.max_length,
+            trace_expr: resolved.exprs,
+            trace_budget: resolved.budget,
+            trace_frames: resolved.frames,
+            trace_max_length: resolved.max_length,
             suspend_policy,
         };
 
@@ -1363,7 +1363,7 @@ impl RequestHandler {
         // call returns, or every caller and skill written against it would have to be re-read.
         if let (1, Some(only)) = (patterns.len(), patterns.first().filter(|p| !is_wildcard(p))) {
             let spec = base.for_pattern(only);
-            let out = arm_single_named(&mut session, &spec, trace_arm.note.as_deref()).await;
+            let out = arm_single_named(&mut session, &spec, resolved.note.as_deref()).await;
             drop(session);
             return out;
         }
@@ -1380,9 +1380,9 @@ impl RequestHandler {
         let overridden = describe_overridden_traces(&overridden_traces(&session));
         drop(session);
 
-        Ok(render_pattern_outcomes(&base, &patterns, &outcomes, trace_arm.note.as_deref(), max_classes)
+        Ok(render_pattern_outcomes(&base, &patterns, &outcomes, resolved.note.as_deref(), max_classes)
             + &overridden
-            + trace_arm.session_default_note.as_str())
+            + resolved.session_default_note.as_str())
     }
 
     async fn handle_list_stop_points(&self, args: serde_json::Value) -> Result<String, String> {
@@ -3630,7 +3630,7 @@ impl RequestHandler {
         // instance, none from its twin (FILT-9, ADR-0027).
         check_instance_filter_supported(&mut session.connection, instance_filter).await?;
         check_thread_filter(&mut session.connection, thread_filter).await?;
-        let trace_arm = TraceArm::resolve(&a, &session.trace_exprs);
+        let resolved = ResolvedTrace::resolve(&a, &session.trace_exprs);
         let max_classes = clamped_max_classes(a.max_classes);
 
         // The catch-all and the one named class keep exactly the reply they have always had.
@@ -3640,10 +3640,10 @@ impl RequestHandler {
                 &a,
                 patterns.first().map(String::as_str),
                 StopFilters { thread: thread_filter, instance: instance_filter },
-                &trace_arm.exprs,
-                trace_arm.frames,
-                trace_arm.max_length,
-                trace_arm.note.as_deref(),
+                &resolved.exprs,
+                resolved.frames,
+                resolved.max_length,
+                resolved.note.as_deref(),
             )
             .await;
             drop(session);
@@ -3659,9 +3659,9 @@ impl RequestHandler {
             instance_filter,
             max_classes,
             thread_filter,
-            trace_expr: trace_arm.exprs,
-            trace_frames: trace_arm.frames,
-            trace_max_length: trace_arm.max_length,
+            trace_expr: resolved.exprs,
+            trace_frames: resolved.frames,
+            trace_max_length: resolved.max_length,
         };
         for p in &patterns {
             batches.push(exception_rows_for_pattern(&mut session, &a, p, &index, &limits).await);
@@ -3674,10 +3674,10 @@ impl RequestHandler {
                 &a,
                 thread_filter,
                 instance_filter,
-                trace_arm.frames,
-                trace_arm.note.as_deref()
+                resolved.frames,
+                resolved.note.as_deref()
             ),
-            trace_arm.session_default_note
+            resolved.session_default_note
         );
         Ok(render_batch_arming("exception stop(s)", &batches, max_classes, &trailer))
     }
@@ -3710,16 +3710,15 @@ impl RequestHandler {
         let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
         check_instance_filter_supported(&mut session.connection, instance_filter).await?;
         check_thread_filter(&mut session.connection, thread_filter).await?;
-        let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
-        let trace_arm = TraceArm::resolve(&a, &session.trace_exprs);
+        let resolved = ResolvedTrace::resolve(&a, &session.trace_exprs);
         let max_classes = clamped_max_classes(a.max_classes);
         let arm = FieldArm {
             field_name: &field_name,
             kinds: &kinds,
-            trace_expr: &trace_arm.exprs,
-            trace_budget,
-            trace_frames: trace_arm.frames,
-            trace_max_length: trace_arm.max_length,
+            trace_expr: &resolved.exprs,
+            trace_budget: resolved.budget,
+            trace_frames: resolved.frames,
+            trace_max_length: resolved.max_length,
         };
 
         // One named class keeps exactly the reply it has always had.
@@ -3731,7 +3730,7 @@ impl RequestHandler {
                 &arm,
                 thread_filter,
                 instance_filter,
-                trace_arm.note.as_deref(),
+                resolved.note.as_deref(),
             )
             .await;
             drop(session);
@@ -3746,9 +3745,9 @@ impl RequestHandler {
             thread_filter,
             // Cloned, alone among the four batch kinds, because `arm` above borrows the same list for the
             // length of this call — as it did before `TraceArm` owned it.
-            trace_expr: trace_arm.exprs.clone(),
-            trace_frames: trace_arm.frames,
-            trace_max_length: trace_arm.max_length,
+            trace_expr: resolved.exprs.clone(),
+            trace_frames: resolved.frames,
+            trace_max_length: resolved.max_length,
         };
         let mut batches = Vec::with_capacity(classes.len());
         for pattern in &classes {
@@ -3758,13 +3757,13 @@ impl RequestHandler {
 
         let trailer = field_batch_trailer(
             &a,
-            trace_budget,
+            resolved.budget,
             thread_filter,
             instance_filter,
-            trace_arm.frames,
-            trace_arm.note.as_deref(),
+            resolved.frames,
+            resolved.note.as_deref(),
         );
-        let trailer = format!("{trailer}{}", trace_arm.session_default_note);
+        let trailer = format!("{trailer}{}", resolved.session_default_note);
         Ok(render_batch_arming("watchpoint(s)", &batches, max_classes, &trailer))
     }
 
@@ -3804,19 +3803,18 @@ impl RequestHandler {
         let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
         refuse_instance_filter_on_method_exit(instance_filter)?;
         check_thread_filter(&mut session.connection, thread_filter).await?;
-        let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
-        let trace_arm = TraceArm::resolve(&a, &session.trace_exprs);
+        let resolved = ResolvedTrace::resolve(&a, &session.trace_exprs);
 
         let mexit = MethodExitArm {
             instance_filter,
             with_return_value,
             thread_filter,
-            trace_expr: trace_arm.exprs,
-            trace_budget,
-            trace_frames: trace_arm.frames,
-            trace_max_length: trace_arm.max_length,
+            trace_expr: resolved.exprs,
+            trace_budget: resolved.budget,
+            trace_frames: resolved.frames,
+            trace_max_length: resolved.max_length,
         };
-        let (extra, mode) = describe_method_exit_arm(&a, method.as_ref(), &mexit, trace_arm.note.as_deref());
+        let (extra, mode) = describe_method_exit_arm(&a, method.as_ref(), &mexit, resolved.note.as_deref());
 
         // One pattern keeps exactly the reply it has always had — including a WILDCARD one, which has
         // always worked here: JDWP's `ClassMatch` does the matching, so a pattern costs one request and
@@ -3838,7 +3836,7 @@ impl RequestHandler {
         }
         drop(session);
 
-        let trailer = format!("{mode}{extra}{}", trace_arm.session_default_note);
+        let trailer = format!("{mode}{extra}{}", resolved.session_default_note);
         Ok(render_batch_arming("method-exit request(s)", &batches, 0, &trailer))
     }
 
@@ -3880,18 +3878,17 @@ impl RequestHandler {
             None => None,
         };
 
-        let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
-        let trace_arm = TraceArm::resolve(&a, &session.trace_exprs);
+        let resolved = ResolvedTrace::resolve(&a, &session.trace_exprs);
 
         let arm = MonitorArm {
             thread_filter,
             monitor_class: a.monitor_class.clone(),
             monitor_class_id,
             min_duration_ms: a.min_duration_ms,
-            trace_expr: trace_arm.exprs,
-            trace_budget,
-            trace_frames: trace_arm.frames,
-            trace_max_length: trace_arm.max_length,
+            trace_expr: resolved.exprs,
+            trace_budget: resolved.budget,
+            trace_frames: resolved.frames,
+            trace_max_length: resolved.max_length,
         };
 
         let armed = match arm_monitor_kinds(&mut session, &a, &kinds, &arm).await {
@@ -3909,9 +3906,9 @@ impl RequestHandler {
             .collect();
         Ok(format!(
             "✅ Monitor contention reporting armed{}\n{}\n{}",
-            trace_arm.session_default_note,
+            resolved.session_default_note,
             rows.join("\n"),
-            describe_monitor_arm(&a, &kinds, &arm, caps, trace_arm.note.as_deref()),
+            describe_monitor_arm(&a, &kinds, &arm, caps, resolved.note.as_deref()),
         ))
     }
 
@@ -5148,27 +5145,34 @@ fn merge_clamp_notes(first: Option<String>, second: Option<String>) -> Option<St
     }
 }
 
-/// The five `trace_*` arguments every arming tool takes, named once so its resolution is one call.
+/// The five `trace_*` arguments every arming tool takes, named once so their resolution is one call.
 ///
-/// The argument type of each of the five `set_*_stop` tools carries these exact fields, with these exact
-/// types. Passing them positionally instead put five arguments at each of five call sites — which measured
-/// *longer* than the duplicated block `TraceArm` was extracted to remove, and left the five handlers bigger
-/// than they started (#188's US-9 asks for the reverse).
+/// The argument type of each of the five `set_*_stop` tools carries these exact five fields, with these
+/// exact types. Passing them positionally instead put five arguments at each of five call sites — which
+/// measured *longer* than the duplicated block [`ResolvedTrace`] was extracted to remove, and left the five
+/// handlers bigger than they started (#188's US-9 asks for the reverse).
 ///
-/// It is also the compile-time half of US-11: a sixth kind whose arguments do not implement this cannot
-/// call [`TraceArm::resolve`], so it cannot reach the arming path without settling its trace budget the
-/// way the other five do.
+/// **What it does and does not guarantee.** A sixth kind whose arguments implement this gets the whole
+/// resolution for free, and cannot get a *subset* of it: there is no way to reach one clamp without the
+/// notice that reports it. What a trait cannot do is force a sixth handler to call
+/// [`ResolvedTrace::resolve`] at all — nothing here makes that unskippable, and the thing that would is the
+/// single arming path #188 asks for and this does not yet build. The guard against skipping it is
+/// `every_shared_arming_step_has_exactly_one_caller`, which is a source scan and says so.
 trait TraceArgs {
     fn trace(&self) -> bool;
     fn trace_frames(&self) -> usize;
     fn trace_max_length(&self) -> Option<usize>;
+    fn trace_max_hits(&self) -> Option<u32>;
     fn trace_expr(&self) -> Option<crate::args::TraceExprs>;
 }
 
 /// One [`TraceArgs`] impl per arming tool's argument type.
 ///
-/// A macro because all five are the same four field reads, and five hand-written copies would be the exact
-/// duplication the trait exists to remove — one level down, where nothing would notice them drifting.
+/// A macro because all five are the same five field reads, and five hand-written copies would be the exact
+/// duplication the trait exists to remove — one level down, where nothing would notice them drifting. No
+/// two of the five methods can be transposed by mistake: `bool`, `usize`, `Option<usize>`, `Option<u32>` and
+/// `Option<TraceExprs>` are five distinct types, so a wrong field is a compile error rather than a silently
+/// swapped argument.
 macro_rules! impl_trace_args {
     ($($t:ident),+ $(,)?) => {
         $(impl TraceArgs for crate::args::$t {
@@ -5180,6 +5184,9 @@ macro_rules! impl_trace_args {
             }
             fn trace_max_length(&self) -> Option<usize> {
                 self.trace_max_length
+            }
+            fn trace_max_hits(&self) -> Option<u32> {
+                self.trace_max_hits
             }
             fn trace_expr(&self) -> Option<crate::args::TraceExprs> {
                 self.trace_expr.clone()
@@ -5198,33 +5205,46 @@ impl_trace_args!(
 
 /// Everything a caller's `trace_*` arguments settle before a stop point of any kind is armed.
 ///
-/// Resolved in one place because it was resolved in five, verbatim (CLEAN-5, #188): the two clamps, the
-/// **session default**, and the two notices that report both. A clamp that is applied and not reported is
-/// the silent narrowing each clamp exists to prevent, so the notices travel with the values rather than
-/// being the next line at each call site — five copies of "apply it, then remember to say so" is five
-/// chances to keep only the first half.
+/// Resolved in one place because it was resolved in five, verbatim (CLEAN-5, #188): the two ceiling clamps,
+/// the **session default** (whose own resolution can clamp a third time, on `MAX_TRACE_EXPRS`), the **trace
+/// budget**, and the notices that report every clamp that fired. A clamp applied and not reported is the
+/// silent narrowing each clamp exists to prevent, so the notices travel as fields beside the values they
+/// describe rather than as the next line at each call site — five copies of "apply it, then remember to say
+/// so" is five chances to keep only the first half.
 ///
 /// **The session default arrives as a value, and that is the lock ordering made structural.**
-/// `set_line_stop` used to read it through a helper that resolved and locked the session itself, because
-/// it clamped *before* taking its own guard while the other four clamped while holding theirs — doing it
-/// the other four's way would have re-locked the same mutex and deadlocked. That asymmetry was documented
-/// in one of the five copies and enforced in none. This function cannot lock anything, having no session
-/// to lock, so all five now read the field the same way under their own guard and the deadlock has no
-/// shape left to take.
-struct TraceArm {
-    /// Caller depth for a trace snapshot, clamped to `MAX_TRACE_FRAMES`.
+/// `set_line_stop` used to read it through a helper that resolved and locked the session itself, because it
+/// clamped *before* taking its own guard while the other four clamped while holding theirs — doing it the
+/// other four's way would have re-locked the same mutex and deadlocked. That asymmetry was documented in one
+/// of the five copies and enforced in none. [`ResolvedTrace::resolve`] cannot lock anything, having no
+/// session to lock, so all five now read the field the same way under their own guard and the deadlock has
+/// no shape left to take.
+///
+/// The test that would have caught the old shape is a JVM one — arm any kind on a session that has a
+/// `trace_expr` **session default** set, and a handler holding its guard while re-entering the session would
+/// hang rather than fail. It is deliberately not written: the ordering can no longer be *expressed* wrongly
+/// here, so such a test would assert a property of a function signature, and #188's Testing Decisions ask
+/// for this sentence in its place. What remains conventional is *where each handler takes its guard*, which
+/// is the single arming path #188 asks for and this does not yet build.
+struct ResolvedTrace {
+    /// Caller depth for a trace snapshot: clamped to `MAX_TRACE_FRAMES`, and `0` whenever `trace` is unset,
+    /// since a suspending stop point hands over a live thread and has nothing to snapshot.
     frames: usize,
-    /// Per-value rendering cap, clamped to `MAX_TRACE_LENGTH`.
+    /// Per-value rendering cap: clamped to `MAX_TRACE_LENGTH`, and `None` whenever `trace` is unset. `None`
+    /// is not "no cap" — it means unset, and stands for two different per-slot defaults in `trace_lengths`.
     max_length: Option<usize>,
     /// What the stop point records: the caller's own list, or the **session default** when it named none.
     exprs: Vec<String>,
-    /// Both clamp notices, folded into the single `note` slot every arm reply already renders.
+    /// The **trace budget** in hits, `None` for unbounded — which is also every non-traced stop point.
+    budget: Option<u32>,
+    /// Every clamp notice that fired, folded into the single `note` slot each arm reply already renders.
+    /// Up to three: the two ceilings above and `MAX_TRACE_EXPRS` from the expression list.
     note: Option<String>,
     /// The sentence that says the **session default** was taken, or empty when it was not.
     session_default_note: String,
 }
 
-impl TraceArm {
+impl ResolvedTrace {
     /// Resolve one arming call's trace arguments against the session's default expression list.
     ///
     /// `session_default` is [`crate::session::DebugSession::trace_exprs`], read by the caller under the
@@ -5241,6 +5261,7 @@ impl TraceArm {
             frames,
             max_length,
             exprs,
+            budget: trace_budget_for(a.trace(), a.trace_max_hits()),
             note: merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note),
             session_default_note,
         }
@@ -25824,22 +25845,27 @@ mod tests {
 
     /// CLEAN-5 (#188): one resolution answers every shared trace concern, whichever kind is being armed.
     ///
-    /// The five arming handlers used to answer these four questions each for itself, in five copies of the
-    /// same five lines. There is one implementation now, so this asserts the *concerns* and not the kinds:
-    /// running it five times over would be five passes through one code path wearing five names, which is
-    /// the test-that-cannot-fail shape US-11 hit in #187 (`LISTING_ORDER` asserted against a hand-written
-    /// copy of itself). Which kind reaches this is a JVM question and stays with the arm-and-hit tests;
-    /// that it is reached from exactly one place is asserted by
-    /// `every_shared_arming_step_has_exactly_one_caller`.
+    /// The five arming handlers used to answer these questions each for itself, in five copies of the same
+    /// lines. There is one implementation now, so this asserts the *concerns* and not the kinds: running it
+    /// five times over would be five passes through one code path wearing five names, which is the
+    /// test-that-cannot-fail shape US-11 hit in #187 (`LISTING_ORDER` asserted against a hand-written copy
+    /// of itself). Which kind reaches this is a JVM question and stays with the arm-and-hit tests; that it
+    /// is reached from exactly one place is asserted by `every_shared_arming_step_has_exactly_one_caller`.
+    ///
+    /// **What this deliberately does not cover**, because #188's arming path is only partly built: the two
+    /// concerns its Testing Decisions name beside these — a partial **batch** and a refusal — still run
+    /// through five separate per-kind paths, so they are asserted per kind by the JVM suite and cannot be
+    /// folded in here until there is one path to fold them into.
     #[test]
     fn one_resolution_answers_every_shared_trace_concern() {
-        // Declared here rather than as a shared helper: the five real argument types reach `resolve`
-        // through `impl_trace_args!`, and each of those impls is already proven by a handler that calls
-        // it — a swap between two of the four is impossible, since no two share a type.
+        // Declared here rather than as a shared helper: each of the five real argument types reaches
+        // `resolve` through `impl_trace_args!` and is already proven by a handler that calls it, and no two
+        // of the five methods can be transposed by mistake because no two share a type.
         struct Args {
             trace: bool,
             frames: usize,
             max_length: Option<usize>,
+            max_hits: Option<u32>,
             exprs: Option<crate::args::TraceExprs>,
         }
         impl TraceArgs for Args {
@@ -25852,6 +25878,9 @@ mod tests {
             fn trace_max_length(&self) -> Option<usize> {
                 self.max_length
             }
+            fn trace_max_hits(&self) -> Option<u32> {
+                self.max_hits
+            }
             fn trace_expr(&self) -> Option<crate::args::TraceExprs> {
                 self.exprs.clone()
             }
@@ -25860,32 +25889,40 @@ mod tests {
             trace,
             frames,
             max_length,
+            max_hits: None,
             exprs: None,
         };
 
         let session = vec!["s1".to_string(), "s2".to_string()];
 
         // Nothing to clamp and nothing named: the session default, said out loud.
-        let arm = TraceArm::resolve(&args(true, 3, Some(500)), &session);
+        let arm = ResolvedTrace::resolve(&args(true, 3, Some(500)), &session);
         assert_eq!((arm.frames, arm.max_length), (3, Some(500)), "within both caps, verbatim");
         assert_eq!(arm.exprs, session, "a stop point naming none records the session's list");
         assert!(arm.note.is_none(), "nothing was clamped, so nothing may be reported");
         assert!(
             arm.session_default_note.contains("session default"),
-            "an inherited list has to be visible in the reply: {}",
+            "a list taken from the session has to be visible in the reply: {}",
             arm.session_default_note
         );
+        assert_eq!(arm.budget, Some(DEFAULT_TRACE_BUDGET), "an unnamed budget is the default, not unbounded");
 
         // The caller's own list: kept exactly, and claimed by nobody.
         let own = crate::args::TraceExprs::Many(vec!["mine".to_string()]);
-        let arm =
-            TraceArm::resolve(&Args { trace: true, frames: 3, max_length: None, exprs: Some(own) }, &session);
+        let arm = ResolvedTrace::resolve(
+            &Args { trace: true, frames: 3, max_length: None, max_hits: Some(0), exprs: Some(own) },
+            &session,
+        );
         assert_eq!(arm.exprs, vec!["mine".to_string()], "naming a list keeps exactly that list");
-        assert!(arm.session_default_note.is_empty(), "nothing was inherited, so nothing may say it was");
+        assert!(
+            arm.session_default_note.is_empty(),
+            "the session default was not taken, so nothing may say it was"
+        );
+        assert_eq!(arm.budget, None, "0 is the one spelling of unbounded a caller can ask for");
 
         // Both ceilings exceeded on one call: both clamps applied, and BOTH reported. This is the pair
         // that used to depend on five handlers each remembering to fold two notes into one slot.
-        let arm = TraceArm::resolve(&args(true, MAX_TRACE_FRAMES + 1, Some(MAX_TRACE_LENGTH + 1)), &[]);
+        let arm = ResolvedTrace::resolve(&args(true, MAX_TRACE_FRAMES + 1, Some(MAX_TRACE_LENGTH + 1)), &[]);
         assert_eq!(arm.frames, MAX_TRACE_FRAMES);
         assert_eq!(arm.max_length, Some(MAX_TRACE_LENGTH));
         let note = arm.note.expect("two clamps must produce a note, not silence");
@@ -25897,9 +25934,10 @@ mod tests {
         );
 
         // Not tracing: nothing is captured, so there is no depth and no length to bound — and therefore
-        // no clamp to report even though both arguments were over their ceiling.
-        let arm = TraceArm::resolve(&args(false, MAX_TRACE_FRAMES + 1, Some(MAX_TRACE_LENGTH + 1)), &[]);
-        assert_eq!((arm.frames, arm.max_length), (0, None));
+        // no clamp to report even though both arguments were over their ceiling. The budget goes with them:
+        // a suspending stop point cannot flood, so it is unbounded rather than defaulted.
+        let arm = ResolvedTrace::resolve(&args(false, MAX_TRACE_FRAMES + 1, Some(MAX_TRACE_LENGTH + 1)), &[]);
+        assert_eq!((arm.frames, arm.max_length, arm.budget), (0, None, None));
         assert!(arm.note.is_none(), "a suspending stop point captures nothing, so no clamp applies");
     }
 
@@ -25921,6 +25959,14 @@ mod tests {
     /// reply assertion per kind and each of those needs a live JVM: these steps run under the session
     /// guard, so nothing can reach them without a socket (ADR-0049). A source scan is the only thing here
     /// that notices a copy.
+    ///
+    /// **Three things it cannot catch, stated because a guard trusted past its reach is worse than none.**
+    /// A sixth handler that *inlines* `requested.clamp(1, …)` or the note fold rather than calling these
+    /// helpers passes; so does one that re-copies the five-line session-resolve-and-guard block, which is
+    /// what US-5 is really about. Both are the single arming path #188 asks for and this does not yet build.
+    /// And `trace_budget_for` is absent from the list on purpose: [`ResolvedTrace`] is its only caller on
+    /// the *arming* side, but three reply renderers legitimately recompute it from the same arguments for
+    /// display, so "exactly one" is the wrong assertion rather than a failing one.
     #[test]
     fn every_shared_arming_step_has_exactly_one_caller() {
         let src = include_str!("handlers.rs");
@@ -25929,7 +25975,13 @@ mod tests {
 
         // The ceiling is reached only through `clamped_max_classes`, which is where the floor of 1 lives —
         // a bare `clamp(0, …)` elsewhere would arm nothing and read as the pattern having failed.
-        let ceilings: Vec<&str> = production.lines().filter(|l| l.contains("MAX_CLASSES_CEILING")).collect();
+        let ceilings: Vec<&str> = production
+            .lines()
+            // Same exclusion as the loop below: a `//` or `///` line naming the constant is prose, and a
+            // guard that goes red when someone documents the rule it enforces gets switched off.
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("MAX_CLASSES_CEILING"))
+            .collect();
         assert_eq!(
             ceilings.len(),
             1,
