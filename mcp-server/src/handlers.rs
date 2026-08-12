@@ -427,6 +427,27 @@ impl RequestHandler {
         }
     }
 
+    /// The session a call names, or the refusal that says there is none — the fallible half of
+    /// [`Self::resolve_session`].
+    ///
+    /// One sentence, in one place. It is caller-visible text that stood written out at six sites (CLEAN-5,
+    /// #188), five of them the arming handlers, and `docs/toolkit-contract.md` is why that matters: a reply
+    /// a downstream skill is written against must not be able to drift between copies, and six copies of a
+    /// refusal is six chances for one of them to be reworded alone.
+    ///
+    /// Returns the `Arc` rather than a lock, so the guard is still taken at the call site. Locking here
+    /// would mean returning a guard borrowed from a mutex this function owns; `lock_owned` would work, but
+    /// the caller's `let mut session = ….lock().await` is one line and every arming handler needs the
+    /// session for the rest of its body, so there is nothing to hide.
+    async fn require_session(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<std::sync::Arc<tokio::sync::Mutex<crate::session::DebugSession>>, String> {
+        self.resolve_session(args)
+            .await
+            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())
+    }
+
     pub async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         let result = match self.check_request_metadata(&request) {
             Err(e) => Err(e),
@@ -1330,10 +1351,7 @@ impl RequestHandler {
         let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
         let max_classes = clamped_max_classes(a.max_classes);
 
-        let session_guard = self
-            .resolve_session(&args)
-            .await
-            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         let resolved = ResolvedTrace::resolve(&a, &session.trace_exprs);
         // One definition, pointed at each pattern in turn below.
@@ -1495,10 +1513,7 @@ impl RequestHandler {
 
         // Resolved once and up front so a set is never half-armed against one session and half against
         // another, and so "no session" is one refusal rather than N identical ones.
-        let session_guard = self
-            .resolve_session(&args)
-            .await
-            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
+        let session_guard = self.require_session(&args).await?;
 
         let session_id = args.get("session_id").cloned();
         let mut outcomes: Vec<(String, crate::stop_point_set::ArmOutcome)> =
@@ -3609,10 +3624,7 @@ impl RequestHandler {
         }
         let patterns = a.class_pattern.as_ref().map(crate::args::ClassPatterns::list).unwrap_or_default();
 
-        let session_guard = self
-            .resolve_session(&args)
-            .await
-            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         // FILT-6 (#83): the condition too, now that these three kinds can carry one. It was `None` here
         // because there was nothing to check, not because a condition is exempt.
@@ -3693,10 +3705,7 @@ impl RequestHandler {
         }
         let field_name = a.field_name.trim().to_string();
 
-        let session_guard = self
-            .resolve_session(&args)
-            .await
-            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         // FILT-6 (#83): the condition too, now that these three kinds can carry one. It was `None` here
         // because there was nothing to check, not because a condition is exempt.
@@ -3782,10 +3791,7 @@ impl RequestHandler {
         }
         refuse_counted_method_filter(a.hit_count, method.as_deref())?;
 
-        let session_guard = self
-            .resolve_session(&args)
-            .await
-            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         // FILT-6 (#83): the condition too, now that these three kinds can carry one. It was `None` here
         // because there was nothing to check, not because a condition is exempt.
@@ -3858,10 +3864,7 @@ impl RequestHandler {
         // Every refusal before anything is armed, so a rejected call leaves the debuggee untouched.
         refuse_bad_monitor_arming(&a, &kinds)?;
 
-        let session_guard = self
-            .resolve_session(&args)
-            .await
-            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
+        let session_guard = self.require_session(&args).await?;
         let mut session = session_guard.lock().await;
         // No `condition` on this kind (see `find_traced_request`), so only the trace expressions can invoke.
         check_readonly_exprs(session.read_only, None, &crate::args::trace_exprs(a.trace_expr.clone()))?;
@@ -25960,18 +25963,43 @@ mod tests {
     /// guard, so nothing can reach them without a socket (ADR-0049). A source scan is the only thing here
     /// that notices a copy.
     ///
-    /// **Three things it cannot catch, stated because a guard trusted past its reach is worse than none.**
-    /// A sixth handler that *inlines* `requested.clamp(1, …)` or the note fold rather than calling these
-    /// helpers passes; so does one that re-copies the five-line session-resolve-and-guard block, which is
-    /// what US-5 is really about. Both are the single arming path #188 asks for and this does not yet build.
-    /// And `trace_budget_for` is absent from the list on purpose: [`ResolvedTrace`] is its only caller on
+    /// The "no active debug session" refusal is checked as *text*, not as a call, because that is the shape
+    /// its duplication took: it stood written out at six sites. It is caller-visible, so
+    /// `docs/toolkit-contract.md` applies — a downstream skill is written against the wording, and six
+    /// copies is six chances for one to be reworded alone.
+    ///
+    /// **What it cannot catch, stated because a guard trusted past its reach is worse than none.** A sixth
+    /// handler that *inlines* `requested.clamp(1, …)` or the note fold, rather than calling the helper,
+    /// passes — closing that needs the single arming path #188 asks for, which is only partly built. And
+    /// `trace_budget_for` is absent from the call list on purpose: [`ResolvedTrace`] is its only caller on
     /// the *arming* side, but three reply renderers legitimately recompute it from the same arguments for
-    /// display, so "exactly one" is the wrong assertion rather than a failing one.
+    /// display, so "exactly one" would be the wrong assertion rather than a failing one.
     #[test]
     fn every_shared_arming_step_has_exactly_one_caller() {
         let src = include_str!("handlers.rs");
         // The tests below call these helpers directly and legitimately, so only production code counts.
         let production = src.split("\n#[cfg(test)]\n").next().expect("this file has a test module");
+
+        // Caller-visible text, so it is one string and not six. `require_session` is the only place that
+        // may say it; a handler writing it out again is the drift this catches.
+        //
+        // Matched on the WHOLE sentence, and the reason is a finding rather than a detail: about thirty
+        // other tools refuse the same condition with a shorter `"No active debug session"` and no
+        // `debug.attach` hint. Two wordings for one failure is a caller-visible inconsistency, but settling
+        // it changes replies, so it is a behaviour change with its own commit and its own release note
+        // (`docs/toolkit-contract.md`) and not something a refactor may quietly fold in. Until then this
+        // guards the six that were identical, and a substring match here would fail on the thirty.
+        let refusals: Vec<&str> = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("No active debug session. Use debug.attach first."))
+            .collect();
+        assert_eq!(
+            refusals.len(),
+            1,
+            "this refusal must be written once, in `require_session`, because a downstream skill is written \
+             against its wording. Found: {refusals:#?}"
+        );
 
         // The ceiling is reached only through `clamped_max_classes`, which is where the floor of 1 lives —
         // a bare `clamp(0, …)` elsewhere would arm nothing and read as the pattern having failed.
