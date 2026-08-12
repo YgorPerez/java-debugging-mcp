@@ -468,10 +468,23 @@ impl DebugSession {
 
     /// Whether any tracked stop point currently holds `req_id` as its live JDWP request.
     ///
-    /// **All five kinds, which it did not used to be.** Written as four hand-repeated clauses it silently
-    /// omitted the monitor kind — the sentence above said "any tracked stop point" and the code meant
-    /// four of them. Nothing failed, because the omission only shows when the debuggee *reuses* a request
-    /// id, which is exactly the case this guard exists for. One collection, one clause (CLEAN-4).
+    /// **All five kinds, which it did not used to be — and that is a behaviour change, not a refactor.**
+    /// Written as four hand-repeated clauses it silently omitted the monitor kind: the sentence above said
+    /// "any tracked stop point" and the code meant four of them. It fell out of CLEAN-4's one collection
+    /// and landed in that commit, which is the wrong place for it — a change in behaviour behind an
+    /// existing name belongs in a commit of its own, because `scripts/release-notes.py` builds the
+    /// published changelog from commit **subjects** and a `refactor(…)` subject does not say this
+    /// happened. This paragraph is the record it should have had.
+    ///
+    /// What changes: the guard's whole job is to stop [`Self::was_traced_and_disarmed`] matching on
+    /// membership alone, because request ids are allocated by the *debuggee* and **recur**. With the
+    /// monitor kind missing, a disarmed traced monitor request whose id the JVM had since reissued to a
+    /// live one would answer `true` — and the hit it named would be resumed and dropped rather than
+    /// surfaced. That is the same failure the list exists to prevent, pointing the other way, on one kind.
+    ///
+    /// **It has no test, and the reason is the seam rather than an oversight.** Reaching this needs a
+    /// `DebugSession`, which owns a `JdwpConnection` and cannot be built without a socket (ADR-0049).
+    /// CLEAN-6 (#189) is where that moves; the JVM-free assertion belongs there.
     fn owns_live_request(&self, req_id: i32) -> bool {
         self.stop_points.values().any(|sp| sp.owns_request(req_id))
             // A deferred breakpoint's CLASS_PREPARE is a live request too, and arming the real breakpoint
