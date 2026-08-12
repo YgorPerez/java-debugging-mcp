@@ -7900,7 +7900,7 @@ fn monitor_stops(
 ///
 /// It matches on [`ArmedOn`] a second time, for the reply rather than the wire — two kinds carry a tail
 /// that needs the session (a family slot, a widowed partner), so the reply cannot be a pure method on the
-/// payload the way [`ArmedOn::toggle_label`] is.
+/// payload the way [`ArmedOn::describe`] is.
 ///
 /// The bookkeeping is the caller's to remove, and that is not tidiness: a line breakpoint still returns
 /// `Err` when its wire call fails rather than reporting a clear that did not happen, so its entry has to
@@ -13000,7 +13000,7 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
         s.request_ids.clear();
         s.enabled = false;
     }
-    Some(sp.rescue_label())
+    Some(sp.describe_for_rescue())
 }
 
 /// Disable the stop point with this caller-facing id: clear its JDWP request, keep its definition.
@@ -13023,7 +13023,7 @@ async fn disable_stop_point(session: &mut crate::session::DebugSession, id: &str
         s.request_ids.clear();
         s.enabled = false;
     }
-    Ok(sp.armed_on.toggle_label())
+    Ok(sp.armed_on.describe())
 }
 
 /// Re-arm the disabled stop point with this caller-facing id from its stored definition, keeping the
@@ -13067,7 +13067,7 @@ async fn rearm_stop_point(session: &mut crate::session::DebugSession, id: &str) 
             s.armed_on = armed_on;
         }
     }
-    Ok(sp.armed_on.toggle_label())
+    Ok(sp.armed_on.describe())
 }
 
 /// What one kind's re-arm produced.
@@ -25407,15 +25407,17 @@ mod tests {
 
         let described: Vec<String> = StopPointKind::LISTING_ORDER
             .iter()
-            .map(|k| build::armed("id_1", *k).armed_on.toggle_label())
+            .map(|k| build::armed("id_1", *k).armed_on.describe())
             .collect();
         let mut unique = described.clone();
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), described.len(), "two kinds toggle-describe alike: {described:?}");
 
-        let disarmed: Vec<String> =
-            StopPointKind::LISTING_ORDER.iter().map(|k| build::armed("id_1", *k).rescue_label()).collect();
+        let disarmed: Vec<String> = StopPointKind::LISTING_ORDER
+            .iter()
+            .map(|k| build::armed("id_1", *k).describe_for_rescue())
+            .collect();
         for note in &disarmed {
             assert!(note.contains("id_1"), "a rescue note has to name the id it disarmed:\n{note}");
         }

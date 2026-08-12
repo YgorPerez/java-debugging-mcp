@@ -118,7 +118,7 @@ impl StopPointKind {
 /// decide something **shared**, which is the shape that made `spent` five beliefs.
 ///
 /// So the matches that legitimately exist, and what each is for:
-///  - [`Self::wire_noun`], [`Self::toggle_label`] and [`StopPoint::rescue_label`] here — pure functions of
+///  - [`Self::wire_noun`], [`Self::describe`] and [`StopPoint::describe_for_rescue`] here — pure functions of
 ///    the payload, which is why they are methods on it rather than five-arm matches in a caller;
 ///  - `clear_stop_point_requests` — the per-kind JDWP `Clear`, the one #187 named;
 ///  - `clear_one_stop_point` — that call's per-kind reply, which carries a per-kind tail for two kinds;
@@ -158,11 +158,20 @@ impl ArmedOn {
 
     /// How `debug.toggle_stop_point` names this stop point in the sentence that reports what it did.
     ///
+    /// **`describe_`, not `label_`, and that is a rule rather than a preference.** On this surface `label`
+    /// already means *the word for a kind* — [`StopPointKind::label`], `WatchKind::label`,
+    /// `MonitorKind::label` — and `CONTEXT.md` uses it in a third sense again for the **debugger-measured**
+    /// provenance marker. These two name *one particular stop point*, which is a different job, and calling
+    /// them `toggle_label`/`rescue_label` put both meanings inside one expression: `format!("monitor {}",
+    /// mon.kind.label())` in a function called `toggle_label`. That is the `inherited` collision `CLAUDE.md`
+    /// records, arriving by a third route. `describe_*` is this crate's verb for rendering reply prose and
+    /// has 35 other users.
+    ///
     /// Short, because that reply has already printed the id beside it. Its twin
-    /// [`StopPoint::rescue_label`] is the long form, and the two are separate rather than one function
+    /// [`StopPoint::describe_for_rescue`] is the long form, and the two are separate rather than one function
     /// with a verbosity flag because they answer to different readers — see there.
     #[must_use]
-    pub fn toggle_label(&self) -> String {
+    pub fn describe(&self) -> String {
         match self {
             Self::Line(bp) => format!("{}:{}", bp.class_pattern, bp.line),
             Self::Exception(er) => format!("exception {}", er.class_pattern),
@@ -363,13 +372,13 @@ impl StopPoint {
     /// How a **rescue note** names this stop point after the watchdog (SAFE-2) or a spent trace budget
     /// (TRACE-3) disarmed it.
     ///
-    /// The long form of [`ArmedOn::toggle_label`], and separate from it rather than the same function with
+    /// The long form of [`ArmedOn::describe`], and separate from it rather than the same function with
     /// a flag, because the two answer to different readers. A toggle reply has already printed the id and
     /// the caller just asked for the thing by name; a rescue note reaches a caller who **was not there**,
     /// on a line with nothing else on it, so it has to carry the id and say what kind of thing was turned
     /// off. Collapsing them would make one of the two wrong.
     #[must_use]
-    pub fn rescue_label(&self) -> String {
+    pub fn describe_for_rescue(&self) -> String {
         match &self.armed_on {
             ArmedOn::Line(bp) => format!("breakpoint {} at {}:{}", self.id, bp.class_pattern, bp.line),
             ArmedOn::Exception(er) => format!("exception breakpoint {} ({})", self.id, er.class_pattern),
@@ -999,21 +1008,21 @@ mod tests {
         }
     }
 
-    /// The two labels are the same five kinds in two voices, and neither may borrow the other's: a toggle
-    /// reply prints the id beside its label, a rescue note has nothing else on the line.
+    /// The two descriptions are the same five kinds in two voices, and neither may borrow the other's: a
+    /// toggle reply prints the id beside its own, a rescue note has nothing else on the line.
     #[test]
-    fn a_rescue_label_names_the_id_and_a_toggle_label_does_not() {
+    fn a_rescue_description_names_the_id_and_a_toggle_description_does_not() {
         for kind in StopPointKind::LISTING_ORDER {
             let sp = build::armed("id_1", kind);
             assert!(
-                sp.rescue_label().contains("id_1"),
+                sp.describe_for_rescue().contains("id_1"),
                 "{kind:?}: a caller who was away is told only this:\n{}",
-                sp.rescue_label()
+                sp.describe_for_rescue()
             );
             assert!(
-                !sp.armed_on.toggle_label().contains("id_1"),
+                !sp.armed_on.describe().contains("id_1"),
                 "{kind:?}: the toggle reply has already printed the id:\n{}",
-                sp.armed_on.toggle_label()
+                sp.armed_on.describe()
             );
         }
     }

@@ -515,8 +515,9 @@ the window for doing it cheaply does not reopen.
 Two things deliberately did **not** change, so this is not re-filed as an inconsistency: the caller-facing
 argument names (`breakpoint_id` on clear/toggle, `bp_id` on `get_traces`) and the ids themselves, which are
 still `bp_1` / `exc_2` / `watch_modify_3` / `mexit_4` / `mon_blocked_5` — see **Stop-point id**; and the internal type names
-(`BreakpointInfo`, `SetBreakpointArgs`, …), which can follow the glossary whenever someone is in there
-anyway. Renaming an argument breaks callers for no gain the tool name has not already delivered.
+(`SetBreakpointArgs`, …), which can follow the glossary whenever someone is in there
+anyway — as `BreakpointInfo` and its four per-kind siblings did in CLEAN-4 (#187), becoming the one
+`StopPoint` this entry is the umbrella for. Renaming an argument breaks callers for no gain the tool name has not already delivered.
 The *concepts* below keep their own names: a line breakpoint is still a breakpoint.
 
 **Line breakpoint**:

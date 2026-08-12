@@ -370,6 +370,28 @@ pub struct Redefinition {
     pub popped_since: bool,
 }
 
+/// The methods a handler reaches a session through, rather than touching its fields.
+///
+/// **They share a verb vocabulary, and it is written down here because the next thing to touch this file
+/// will add twenty more** (CLEAN-6, #189, whose whole subject is the ratio of direct field touches to
+/// mediated calls). A convention nobody has stated is one that drifts on the commit that doubles it.
+///
+/// - **`note_…`** — record that something happened, so a later reply can report it. The session is not
+///   acting; it is remembering. `note_redefinition`, `note_watchdog`, `note_disarmed_traced`,
+///   `note_trace_disarm`, `note_pop`.
+/// - **`mark_…`** — set a session state that something else will read as a fact about the VM.
+///   `mark_suspended`, `mark_resumed`.
+/// - **`open_…` / `close_…`** — one half of a pair's lifetime, where the other half completes it.
+///   `open_monitor_pair`, `close_monitor_pair`.
+/// - **`push_…`** — append to a **bounded** ring buffer, with eviction counted rather than silent.
+///   `push_event`.
+/// - **`register_…`** — add to a collection under an id the value itself carries. `register_stop_point`.
+/// - Everything else is a query and reads as one: `was_traced_and_disarmed`, `watchdog_note_for`,
+///   `classify_throw`, `next_stop_id`.
+///
+/// This is a naming convention and deliberately not an ADR: nothing here is surprising to a reader who
+/// sees it, and nobody chose it against a real alternative. It is written where the next method will be
+/// added, which is the only place it would have been read.
 impl DebugSession {
     /// Record a successful redefinition of `class_name` (SWAP-2). Repeated swaps of one class collapse
     /// into a count, and any earlier pop stops counting — a pop applies to the bytecode that was live
