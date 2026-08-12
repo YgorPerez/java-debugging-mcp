@@ -120,9 +120,28 @@ jobs:
       # *unpublished* on 2026-07-29, so `npx -y rust-doctor@0.2.0` began failing with ETARGET and this gate
       # could not run at all while nothing in the repo had changed. Same version, same binary, a source that
       # takes a deliberate act to remove. `scripts/doctor.sh` fetches identically, so local and CI agree.
+      #
+      # RETRIED, because this step failing does not fail *loudly* — it fails CONFUSINGLY. `Run
+      # rust-doctor` below carries no `if:`, so a transport blip here skips the scan, no `rust-doctor.sarif`
+      # is written, and the job reports through three cascading errors ending in "rust-doctor gate failed"
+      # — a sentence about the code, produced by a download. `--retry-all-errors` is the load-bearing flag:
+      # plain `--retry` ignores a `curl: (22)` HTTP error, and a 503 from the release CDN is exactly what
+      # was observed. Measured on 2026-08-12: three failures in one afternoon across two commits, `(56)
+      # Connection died` and `(22) ... 503`, every one cleared by `gh run rerun --failed` with the tree
+      # untouched.
+      #
+      # IT DOES NOT PAPER OVER BUILD-1's FAILURE, and the cost of making sure is measured rather than
+      # assumed. `--retry-all-errors` retries a 404 too, so a withdrawn release fails LATER, not never:
+      # ~10 s against ~1.9 s for a bare request, over three local runs against a deliberately absent tag,
+      # still reporting `(22) ... 404`. `--retry-max-time 30` is the ceiling on that. Ten seconds once, to
+      # stop losing whole runs, and the message a withdrawn release produces is unchanged.
+      #
+      # (One of those three runs failed with `(56) Connection died` instead — the flake reproducing itself
+      # unprompted while being measured, which is as good an argument for the retry as the CI runs were.)
       - name: Fetch rust-doctor
         run: |
-          curl -fsSL -o /tmp/rd.tar.gz \
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 30 \
+            -o /tmp/rd.tar.gz \
             "https://github.com/arthjean/rust-doctor/releases/download/v0.2.0/rust-doctor-x86_64-unknown-linux-gnu.tar.gz"
           tar xzf /tmp/rd.tar.gz -C /tmp
           /tmp/rust-doctor --version
@@ -314,10 +333,16 @@ jobs:
       # for the same reason BUILD-1 (#66) moved that one off npm. Its absence from that `tool:` line is
       # harmless to `scripts/doctor.sh`, which reads the line only to answer "does the SCAN have this
       # cargo-* tool" — actionlint backs no rust-doctor pass.
+      #
+      # RETRIED for the reason on `Fetch rust-doctor`, and this is the step that actually cost the time: it
+      # sits after the scan, so its blip fails an otherwise-green job. Same flags, because CI-9 put this
+      # fetch in the shape of that one deliberately and two downloads that drift are two things to reason
+      # about.
       - name: Fetch actionlint
         if: always()
         run: |
-          curl -fsSL -o /tmp/actionlint.tar.gz \
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 30 \
+            -o /tmp/actionlint.tar.gz \
             "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
           tar xzf /tmp/actionlint.tar.gz -C /tmp actionlint
           /tmp/actionlint --version

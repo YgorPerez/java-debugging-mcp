@@ -67,7 +67,16 @@ if [ ! -x "$RUST_DOCTOR_BIN" ]; then
   # that later runs would treat as good.
   RD_TMP="$(mktemp -d)"
   trap 'rm -rf "$RD_TMP"' EXIT
-  if ! curl -fsSL "$RD_URL" -o "$RD_TMP/rd.${RD_EXT}"; then
+  # Retried on the same flags as `.github/workflows/rust-doctor.yml`, because this script and that
+  # workflow fetch identically on purpose and a retry only one of them has is a difference to rediscover.
+  # Both flags earn their place against a different observed failure: plain `--retry` covers the `503`
+  # from the release CDN (5xx is transient by curl's own list) but NOT the `(56) Connection died`, which
+  # needs `--retry-all-errors`. Both took the CI gate down on 2026-08-12.
+  #
+  # The cost is that a withdrawn release — BUILD-1's actual failure — now fails in ~10 s rather than ~2 s,
+  # measured locally against an absent tag, still with the `404` this message is written for.
+  if ! curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 30 \
+    "$RD_URL" -o "$RD_TMP/rd.${RD_EXT}"; then
     echo "error: could not download $RD_URL" >&2
     echo "       If the release moved or was withdrawn, see BUILD-1 (#66) — the npm distribution was" >&2
     echo "       already lost this way. Set RUST_DOCTOR_BIN to a binary you have." >&2

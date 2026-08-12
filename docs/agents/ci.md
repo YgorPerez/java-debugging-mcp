@@ -54,6 +54,36 @@ Note the two `uses:` jobs in `release.yml` carry **no** timeout: the schema forb
 reusable-workflow call, and actionlint fails the file on one. Their budget lives on the jobs inside the
 called workflows.
 
+## A red `rust-doctor` is sometimes a download, and it does not read like one
+
+`rust-doctor.yml` curls two prebuilt binaries from GitHub releases — the scanner itself and `actionlint` —
+because neither is available through the pinned `taiki-e/install-action` (BUILD-1, #66 for the first; CI-9's
+comment for the second). **Both are retried**, `--retry 3 --retry-all-errors --retry-delay 2
+--retry-max-time 30`, and the reason is legibility rather than flake-tolerance.
+
+Neither fetch fails *loudly*. `Run rust-doctor` carries no `if:`, so a blip on the first one skips the scan,
+no `rust-doctor.sarif` is written, and the job ends in three cascading errors — a `FileNotFoundError`, then
+`sarif-for-code-scanning.py` correctly refusing to publish an empty result set, then a missing upload path —
+under the heading **"rust-doctor gate failed"**. That sentence is about the code, and a download produced it.
+The `actionlint` fetch is worse in practice because it sits *after* the scan, so its blip fails a job that
+had already passed everything it checks.
+
+Observed 2026-08-12: **three failures in one afternoon** across two commits, `curl: (56) Connection died` and
+`curl: (22) ... 503`, every one cleared by `gh run rerun --failed` against an untouched tree. Both flags earn
+their place on a different one of those — plain `--retry` covers the `503` (5xx is transient by curl's own
+list) but not the `(56)`, which needs `--retry-all-errors`.
+
+**The cost is a slower failure when a release genuinely goes away**, which is BUILD-1's actual event and so
+worth measuring rather than waving at: `--retry-all-errors` retries a 404 too, so an absent tag fails in
+~10 s against ~1.9 s for a bare request, still reporting `404`. Ten seconds once, against losing whole runs.
+
+`scripts/doctor.sh` carries the same flags, because it fetches the same binary the same way on purpose and a
+retry only one of them has is a difference for someone to rediscover.
+
+**When `rust-doctor` is red, read the FIRST failing step** — `gh run view <id> --log-failed | head` — not the
+SARIF errors at the bottom. `scripts/doctor.sh --findings` cannot reproduce a fetch failure and will keep
+saying `would pass`, correctly: `actionlint` backs no rust-doctor pass at all.
+
 ## The toolkit parity workflow does not run on a schedule
 
 CI-8 (#162). `scripts/toolkit-parity.py` diffs the downstream toolkit's documented tools against the
