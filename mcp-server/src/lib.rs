@@ -68,6 +68,7 @@ pub mod protocol;
 #[doc(hidden)]
 pub mod reads;
 mod session;
+mod stop_point;
 mod stop_point_set;
 mod tools;
 mod value_reads;

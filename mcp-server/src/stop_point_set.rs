@@ -43,6 +43,7 @@
 //! set carries the *caller's* description — class name, line, field name — and re-resolves it on the way back,
 //! which is what makes a set usable against a redeployed build rather than only against the same process.
 
+use crate::stop_point::{ArmedOn, StopPoint, StopPointKind};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
@@ -132,6 +133,16 @@ fn sorted_by_id<T>(map: &HashMap<String, T>) -> Vec<(&String, &T)> {
     rows
 }
 
+/// This session's stop points of one kind, in the same order (see [`sorted_by_id`]).
+fn sorted_of_kind(
+    session: &crate::session::DebugSession,
+    kind: StopPointKind,
+) -> Vec<&crate::stop_point::StopPoint> {
+    let mut rows: Vec<_> = session.stop_points.values().filter(|sp| sp.kind() == kind).collect();
+    rows.sort_by_key(|sp| id_order(&sp.id));
+    rows
+}
+
 /// The arguments every kind shares, written into `args` in one place.
 ///
 /// `trace_max_hits` carries the budget **that is left**, not the one originally asked for, because the
@@ -178,12 +189,23 @@ pub fn export(session: &crate::session::DebugSession) -> Export {
     let mut b = Builder::default();
     // Families first: each one owns member breakpoints that must not also be exported by exact name.
     let members = b.push_families(session);
-    b.push_breakpoints(session, &members);
-    b.push_pending(session);
-    b.push_exceptions(session);
-    b.push_watchpoints(session);
-    b.push_method_exits(session);
-    b.push_monitors(session);
+    // One pass over the one collection, in the order [`StopPointKind::LISTING_ORDER`] declares — the same
+    // order `list_stop_points` groups by, so a set and a listing cannot disagree about what came first.
+    // It was seven per-kind passes over five maps (CLEAN-4).
+    for kind in StopPointKind::LISTING_ORDER {
+        if kind == StopPointKind::Monitor {
+            // Folded rather than listed one by one — see [`Builder::push_monitors`].
+            b.push_monitors(session);
+        } else {
+            for sp in sorted_of_kind(session, kind) {
+                b.push_stop_point(sp, &members);
+            }
+        }
+        // Deferred breakpoints export as ordinary line stops, and go where the line stops go.
+        if kind == StopPointKind::Line {
+            b.push_pending(session);
+        }
+    }
     b.finish()
 }
 
@@ -234,7 +256,7 @@ impl Builder {
         }
     }
 
-    /// Wildcard families, and the `bp_` ids they own so [`Self::push_breakpoints`] can skip them.
+    /// Wildcard families, and the `bp_` ids they own so [`Self::push_stop_point`] can skip them.
     ///
     /// A family is ONE wildcard call that armed N breakpoints, so exporting both would re-arm the same
     /// locations twice — once through the pattern and once by exact name, which is BP-5's duplicate-stop-point
@@ -245,7 +267,12 @@ impl Builder {
             members.extend(fam.members.iter());
             // The family keeps the pattern and the behaviour but not the locator — its members carry that, and
             // they are all re-pointed from one spec, so they all requested the same one.
-            let line = fam.members.iter().find_map(|m| session.breakpoints.get(m)).and_then(|b| b.arm_line);
+            let line = fam
+                .members
+                .iter()
+                .find_map(|m| session.stop_points.get(m))
+                .and_then(StopPoint::line)
+                .and_then(|b| b.arm_line);
             if line.is_none() && fam.method.is_none() {
                 self.dropped.undescribable.push(id.clone());
                 continue;
@@ -273,45 +300,6 @@ impl Builder {
             self.push("debug.set_line_stop", id, fam.enabled, fam.trace, args);
         }
         members
-    }
-
-    fn push_breakpoints(
-        &mut self,
-        session: &crate::session::DebugSession,
-        family_members: &HashSet<&String>,
-    ) {
-        for (id, bp) in sorted_by_id(&session.breakpoints) {
-            if family_members.contains(id) {
-                continue;
-            }
-            // `arm_line`/`arm_method` and NOT `line`/`method`: the latter pair is what the resolver concluded,
-            // and writing a resolved method into a requested field narrows the entry against any build where
-            // that line has moved. See `BreakpointInfo::arm_line` for the full reasoning.
-            if bp.arm_line.is_none() && bp.arm_method.is_none() {
-                self.dropped.undescribable.push(id.clone());
-                continue;
-            }
-            let mut args = Map::new();
-            args.insert("class_pattern".to_string(), json!(bp.class_pattern));
-            if let Some(l) = bp.arm_line {
-                args.insert("line".to_string(), json!(l));
-            }
-            if let Some(m) = &bp.arm_method {
-                args.insert("method".to_string(), json!(m));
-            }
-            write_common(
-                &mut args,
-                bp.arm.hit_count,
-                bp.condition.as_deref(),
-                bp.trace,
-                &bp.trace_expr,
-                bp.trace_budget,
-                bp.trace_frames,
-                bp.trace_max_length,
-            );
-            self.drop_filters(id, bp.arm.instance_filter, bp.arm.thread_filter);
-            self.push("debug.set_line_stop", id, bp.enabled && !bp.spent, bp.trace, args);
-        }
     }
 
     /// Deferred breakpoints, as ordinary line stops.
@@ -344,83 +332,86 @@ impl Builder {
         }
     }
 
-    fn push_exceptions(&mut self, session: &crate::session::DebugSession) {
-        for (id, er) in sorted_by_id(&session.exception_requests) {
-            let mut args = Map::new();
-            // An empty pattern is the every-exception form, which the argument spells as an absent
-            // `class_pattern` rather than an empty string.
-            if !er.class_pattern.is_empty() {
-                args.insert("class_pattern".to_string(), json!(er.class_pattern));
+    /// One stop point, as the `debug.set_*` call that would recreate it.
+    ///
+    /// **One function, not four.** The tool name and the locator arguments are all that differ between the
+    /// kinds; the shared arguments were already written in one place by [`write_common`], and since CLEAN-4
+    /// the values it reads come off one type rather than four that happened to agree on field names.
+    fn push_stop_point(&mut self, sp: &StopPoint, family_members: &HashSet<&String>) {
+        let mut args = Map::new();
+        let tool = match &sp.armed_on {
+            ArmedOn::Line(bp) => {
+                // A family is ONE wildcard call that armed N breakpoints, so exporting a member by exact
+                // name as well would re-arm the same location twice.
+                if family_members.contains(&sp.id) {
+                    return;
+                }
+                // `arm_line`/`arm_method` and NOT `line`/`method`: the latter pair is what the resolver
+                // concluded, and writing a resolved method into a requested field narrows the entry against
+                // any build where that line has moved. See `LineBreakpoint::arm_line` for the reasoning.
+                if bp.arm_line.is_none() && bp.arm_method.is_none() {
+                    self.dropped.undescribable.push(sp.id.clone());
+                    return;
+                }
+                args.insert("class_pattern".to_string(), json!(bp.class_pattern));
+                if let Some(l) = bp.arm_line {
+                    args.insert("line".to_string(), json!(l));
+                }
+                if let Some(m) = &bp.arm_method {
+                    args.insert("method".to_string(), json!(m));
+                }
+                "debug.set_line_stop"
             }
-            args.insert("caught".to_string(), json!(er.caught));
-            args.insert("uncaught".to_string(), json!(er.uncaught));
-            write_common(
-                &mut args,
-                er.hit_count,
-                er.condition.as_deref(),
-                er.trace,
-                &er.trace_expr,
-                er.trace_budget,
-                er.trace_frames,
-                er.trace_max_length,
-            );
-            self.drop_filters(id, er.instance_filter, er.thread_filter);
-            self.push("debug.set_exception_stop", id, er.enabled && !er.spent, er.trace, args);
-        }
-    }
-
-    fn push_watchpoints(&mut self, session: &crate::session::DebugSession) {
-        for (id, wp) in sorted_by_id(&session.watchpoints) {
-            let mut args = Map::new();
-            args.insert("class_name".to_string(), json!(wp.class_name));
-            args.insert("field_name".to_string(), json!(wp.field_name));
-            // One watch is one kind, so exactly one of the two is true. A caller who armed both got two
-            // watchpoints and gets two entries, which re-arm to the same pair.
-            args.insert("modify".to_string(), json!(wp.kind == jdwp_client::WatchKind::Modify));
-            args.insert("access".to_string(), json!(wp.kind == jdwp_client::WatchKind::Access));
-            write_common(
-                &mut args,
-                wp.hit_count,
-                wp.condition.as_deref(),
-                wp.trace,
-                &wp.trace_expr,
-                wp.trace_budget,
-                wp.trace_frames,
-                wp.trace_max_length,
-            );
-            self.drop_filters(id, wp.instance_filter, wp.thread_filter);
-            self.push("debug.set_field_stop", id, wp.enabled && !wp.spent, wp.trace, args);
-        }
-    }
-
-    fn push_method_exits(&mut self, session: &crate::session::DebugSession) {
-        for (id, me) in sorted_by_id(&session.method_exits) {
-            let mut args = Map::new();
-            args.insert("class_pattern".to_string(), json!(me.class_pattern));
-            if let Some(m) = &me.method {
-                args.insert("method".to_string(), json!(m));
+            ArmedOn::Exception(er) => {
+                // An empty pattern is the every-exception form, which the argument spells as an absent
+                // `class_pattern` rather than an empty string.
+                if !er.class_pattern.is_empty() {
+                    args.insert("class_pattern".to_string(), json!(er.class_pattern));
+                }
+                args.insert("caught".to_string(), json!(er.caught));
+                args.insert("uncaught".to_string(), json!(er.uncaught));
+                "debug.set_exception_stop"
             }
-            if !me.exclude_classes.is_empty() {
-                args.insert("exclude_classes".to_string(), json!(me.exclude_classes));
+            ArmedOn::Watchpoint(wp) => {
+                args.insert("class_name".to_string(), json!(wp.class_name));
+                args.insert("field_name".to_string(), json!(wp.field_name));
+                // One watch is one kind, so exactly one of the two is true. A caller who armed both got two
+                // watchpoints and gets two entries, which re-arm to the same pair.
+                args.insert("modify".to_string(), json!(wp.kind == jdwp_client::WatchKind::Modify));
+                args.insert("access".to_string(), json!(wp.kind == jdwp_client::WatchKind::Access));
+                "debug.set_field_stop"
             }
-            write_common(
-                &mut args,
-                me.hit_count,
-                me.condition.as_deref(),
-                me.trace,
-                &me.trace_expr,
-                me.trace_budget,
-                me.trace_frames,
-                me.trace_max_length,
-            );
-            self.drop_filters(id, me.instance_filter, me.thread_filter);
-            self.push("debug.set_method_exit_stop", id, me.enabled && !me.spent, me.trace, args);
-        }
+            ArmedOn::MethodExit(me) => {
+                args.insert("class_pattern".to_string(), json!(me.class_pattern));
+                if let Some(m) = &me.method {
+                    args.insert("method".to_string(), json!(m));
+                }
+                if !me.exclude_classes.is_empty() {
+                    args.insert("exclude_classes".to_string(), json!(me.exclude_classes));
+                }
+                "debug.set_method_exit_stop"
+            }
+            // Regrouped into the calls that armed them — see [`Self::push_monitors`], which is why this
+            // one kind is not reached from here.
+            ArmedOn::Monitor(_) => return,
+        };
+        write_common(
+            &mut args,
+            sp.hit_count,
+            sp.condition.as_deref(),
+            sp.trace,
+            &sp.trace_expr,
+            sp.trace_budget,
+            sp.trace_frames,
+            sp.trace_max_length,
+        );
+        self.drop_filters(&sp.id, sp.instance_filter, sp.thread_filter);
+        self.push(tool, &sp.id, sp.enabled && !sp.spent, sp.trace, args);
     }
 
     /// Monitor requests, **regrouped into the calls that armed them**.
     ///
-    /// One `MonitorRequestInfo` is one kind, so a caller who armed the contended pair has two records.
+    /// One monitor stop point is one event kind, so a caller who armed the contended pair has two records.
     /// Exporting them as two calls would be wrong rather than merely verbose: `min_duration_ms` is **refused
     /// on a lone half** of a pair, because a duration is measured across two events and a single-kind request
     /// can never record one. Two entries would therefore be refused on the way back in, on a set this server
@@ -428,38 +419,42 @@ impl Builder {
     ///
     /// So records that agree on every setting are folded into one call carrying every kind they cover.
     fn push_monitors(&mut self, session: &crate::session::DebugSession) {
-        let mut groups: Vec<(String, Vec<&crate::session::MonitorRequestInfo>)> = Vec::new();
-        for (id, mon) in sorted_by_id(&session.monitor_requests) {
+        let mut groups: Vec<(String, Vec<&StopPoint>)> = Vec::new();
+        for sp in sorted_of_kind(session, StopPointKind::Monitor) {
+            let Some(mon) = sp.monitor() else { continue };
             let key = format!(
                 "{:?}|{:?}|{:?}|{}|{:?}|{}|{:?}|{:?}",
-                mon.thread_filter,
+                sp.thread_filter,
                 mon.monitor_class,
                 mon.min_duration_ms,
-                mon.trace,
-                mon.hit_count,
-                mon.trace_frames,
-                mon.trace_max_length,
-                mon.trace_expr
+                sp.trace,
+                sp.hit_count,
+                sp.trace_frames,
+                sp.trace_max_length,
+                sp.trace_expr
             );
             if let Some((_, found)) = groups.iter_mut().find(|(k, _)| *k == key) {
-                found.push(mon);
+                found.push(sp);
             } else {
-                groups.push((key, vec![mon]));
+                groups.push((key, vec![sp]));
             }
             // Named against its own id even though the entry is shared, because that is the id the caller saw.
-            self.drop_filters(id, None, mon.thread_filter);
+            self.drop_filters(&sp.id, None, sp.thread_filter);
         }
 
         for (_, members) in groups {
             let Some(first) = members.first() else { continue };
             let mut args = Map::new();
-            let kinds: Vec<&str> = members.iter().map(|m| m.kind.label()).collect();
+            let kinds: Vec<&str> =
+                members.iter().filter_map(|m| m.monitor()).map(|m| m.kind.label()).collect();
             args.insert("kinds".to_string(), json!(kinds));
-            if let Some(c) = &first.monitor_class {
-                args.insert("monitor_class".to_string(), json!(c));
-            }
-            if let Some(n) = first.min_duration_ms {
-                args.insert("min_duration_ms".to_string(), json!(n));
+            if let Some(mon) = first.monitor() {
+                if let Some(c) = &mon.monitor_class {
+                    args.insert("monitor_class".to_string(), json!(c));
+                }
+                if let Some(n) = mon.min_duration_ms {
+                    args.insert("min_duration_ms".to_string(), json!(n));
+                }
             }
             write_common(
                 &mut args,
