@@ -59,6 +59,8 @@ mod generics;
 pub mod handlers;
 #[doc(hidden)]
 pub mod protocol;
+#[doc(hidden)]
+pub mod reads;
 mod session;
 mod stop_point_set;
 #[doc(hidden)]

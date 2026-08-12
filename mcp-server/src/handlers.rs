@@ -2549,50 +2549,9 @@ impl RequestHandler {
         let mut session = session_guard.lock().await;
 
         let a: crate::args::ListMethodsArgs = crate::args::parse(&args)?;
-        let class_name = a.class_name.trim();
-        if class_name.is_empty() {
-            return Err("class_name is required (e.g. com.example.OrderService)".to_string());
-        }
-        let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
-        let limit = a.limit.max(1);
-
-        let (target_id, loader_note) =
-            resolve_loaded_class_for_read(&mut session.connection, class_name).await?;
-
-        let mut rows =
-            collect_method_rows(&mut session.connection, target_id, a.inherited, name_filter.as_deref())
-                .await?;
+        let read = read_method_listing(&mut crate::reads::Reads::live(&mut session.connection), &a).await?;
         drop(session);
-
-        // Sorted by rendered form so overloads land together, which is the comparison being made.
-        rows.sort_by(|x, y| x.1.cmp(&y.1));
-        let matched = rows.len();
-        let shown = matched.min(limit);
-
-        let mut note = String::new();
-        if let Some(f) = &name_filter {
-            let _ = write!(note, " name~\"{f}\"");
-        }
-        if a.inherited {
-            note.push_str(" +inherited");
-        }
-
-        let mut output = format!("{shown}/{matched} method(s) on {class_name}{note}:\n");
-        for (owner, rendered) in rows.iter().take(limit) {
-            let _ = if a.inherited && &**owner != class_name {
-                writeln!(output, "{rendered}  [from {owner}]")
-            } else {
-                writeln!(output, "{rendered}")
-            };
-        }
-        if matched > shown {
-            let _ = writeln!(output, "… +{} more (raise limit or use name_filter)", matched - shown);
-        }
-        if matched == 0 && name_filter.is_some() {
-            output.push_str("No method name matched. Drop name_filter to see the whole class.\n");
-        }
-
-        Ok(output + loader_note.as_deref().unwrap_or(""))
+        Ok(render_method_listing(&read, &a))
     }
 
     /// DISC-5: the fields of one loaded class — the other half of the question `list_methods` answers.
@@ -2613,54 +2572,9 @@ impl RequestHandler {
         let mut session = session_guard.lock().await;
 
         let a: crate::args::ListFieldsArgs = crate::args::parse(&args)?;
-        let class_name = a.class_name.trim();
-        if class_name.is_empty() {
-            return Err("class_name is required (e.g. com.example.OrderService)".to_string());
-        }
-        let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
-        let limit = a.limit.max(1);
-
-        let (target_id, loader_note) =
-            resolve_loaded_class_for_read(&mut session.connection, class_name).await?;
-
-        let mut rows =
-            collect_field_rows(&mut session.connection, target_id, a.inherited, name_filter.as_deref())
-                .await?;
+        let read = read_field_listing(&mut crate::reads::Reads::live(&mut session.connection), &a).await?;
         drop(session);
-
-        // Statics first, then by name. Not the rendered form `list_methods` sorts on: that would order
-        // fields by their *type* (`boolean` before `java.lang.String`), which is nobody's question. The
-        // static block leads because those are the ones readable with no instance and no suspended
-        // thread — the case this tool exists for — and a listing cut off at `limit` should spend its
-        // budget on them first.
-        rows.sort_by(|x, y| y.is_static.cmp(&x.is_static).then_with(|| x.name.cmp(&y.name)));
-        let matched = rows.len();
-        let shown = matched.min(limit);
-
-        let mut note = String::new();
-        if let Some(f) = &name_filter {
-            let _ = write!(note, " name~\"{f}\"");
-        }
-        if a.inherited {
-            note.push_str(" +inherited");
-        }
-
-        let mut output = format!("{shown}/{matched} field(s) on {class_name}{note}:\n");
-        for row in rows.iter().take(limit) {
-            let _ = if a.inherited && &*row.owner != class_name {
-                writeln!(output, "{}  [from {}]", row.rendered, row.owner)
-            } else {
-                writeln!(output, "{}", row.rendered)
-            };
-        }
-        if matched > shown {
-            let _ = writeln!(output, "… +{} more (raise limit or use name_filter)", matched - shown);
-        }
-        if matched == 0 {
-            output.push_str(&explain_no_fields(name_filter.is_some(), a.inherited));
-        }
-
-        Ok(output + loader_note.as_deref().unwrap_or(""))
+        Ok(render_field_listing(&read, &a))
     }
 
     /// DISC-10: which objects of these types are alive right now, as handles an expression can start
@@ -2731,7 +2645,7 @@ impl RequestHandler {
         // precise type, and "which of the two deployments' copies did you count?" has to be answerable.
         let mut loader_notes: Vec<String> = Vec::new();
         for name in names {
-            match resolve_loaded_class_for_read(conn, &name).await {
+            match resolve_loaded_class_for_read(&mut crate::reads::Reads::live(conn), &name).await {
                 Ok((id, note)) => {
                     if let Some(n) = note {
                         loader_notes.push(n);
@@ -2886,8 +2800,11 @@ impl RequestHandler {
             return Err("class_name is required (e.g. com.example.OrderService)".to_string());
         }
 
-        let (type_id, loader_note) =
-            resolve_loaded_class_for_read(&mut session.connection, &class_name).await?;
+        let (type_id, loader_note) = resolve_loaded_class_for_read(
+            &mut crate::reads::Reads::live(&mut session.connection),
+            &class_name,
+        )
+        .await?;
         let file_name = match session.connection.get_source_file(type_id).await {
             Ok(f) => f,
             Err(jdwp_client::JdwpError::JdwpErrorCode(code, _))
@@ -2985,8 +2902,11 @@ impl RequestHandler {
             self.resolve_session(&args).await.ok_or_else(|| "No active debug session".to_string())?;
         let mut session = session_guard.lock().await;
 
-        let (type_id, loader_note) =
-            resolve_loaded_class_for_read(&mut session.connection, &class_name).await?;
+        let (type_id, loader_note) = resolve_loaded_class_for_read(
+            &mut crate::reads::Reads::live(&mut session.connection),
+            &class_name,
+        )
+        .await?;
         let roots: Vec<std::path::PathBuf> = a.class_roots.as_ref().map_or_else(
             || session.class_roots.clone(),
             |v| v.iter().map(std::path::PathBuf::from).collect(),
@@ -3710,8 +3630,11 @@ impl RequestHandler {
             ));
         }
 
-        let (type_id, loader_note) =
-            resolve_loaded_class_for_read(&mut session.connection, &class_name).await?;
+        let (type_id, loader_note) = resolve_loaded_class_for_read(
+            &mut crate::reads::Reads::live(&mut session.connection),
+            &class_name,
+        )
+        .await?;
         let caps = session
             .connection
             .capabilities_new()
@@ -9190,12 +9113,12 @@ fn split_loader_selector(dotted: &str) -> (&str, Option<u64>) {
 /// Today's choice (`.first()`) is kept when there is no selector, so nothing that worked stops working.
 /// What changes is that the reply says the choice was made.
 async fn resolve_loaded_class_for_read(
-    conn: &mut jdwp_client::JdwpConnection,
+    reads: &mut crate::reads::Reads<'_>,
     class_name: &str,
 ) -> Result<(u64, Option<String>), String> {
     let (class_name, want_loader) = split_loader_selector(class_name);
     for signature in descriptor_candidates(class_name) {
-        let found = conn
+        let found = reads
             .classes_by_signature(&signature)
             .await
             .map_err(|e| format!("Failed to resolve {class_name}: {e}"))?;
@@ -9204,7 +9127,7 @@ async fn resolve_loaded_class_for_read(
         }
         let ids: Vec<u64> = found.iter().map(|c| c.type_id).collect();
         if let Some(want) = want_loader {
-            let labels = describe_class_loaders(conn, &ids).await;
+            let labels = describe_class_loaders(reads, &ids).await;
             // Matched on the label, which is where the id the caller copied was printed. A miss is an
             // error rather than a silent fallback to the first copy — pinning a read and being given a
             // different one is the bug this argument exists to prevent.
@@ -9221,7 +9144,7 @@ async fn resolve_loaded_class_for_read(
         }
         let Some((&first_id, rest_ids)) = ids.split_first() else { continue };
         if !rest_ids.is_empty() {
-            let labels = describe_class_loaders(conn, &ids).await;
+            let labels = describe_class_loaders(reads, &ids).await;
             return Ok((
                 first_id,
                 Some(format!(
@@ -9293,8 +9216,138 @@ fn descriptor_candidates(class_name: &str) -> Vec<String> {
 ///
 /// Split out of the handler because the superclass walk is the only real logic in it — the rest is
 /// argument handling and formatting, and the two do not need to be read together.
+/// What a method listing had to go to the debuggee for (DISC-2), separated from how it renders.
+///
+/// The split is CLEAN-7 (#190)'s: everything below this line is a pure function of these two values, so
+/// the rendered listing can be asserted from a stated [`crate::reads::Fixture`] and needs no JVM. It also
+/// keeps the session guard held for exactly as long as it was before — the handler reads, drops the lock,
+/// then renders — which a single `reads → String` function would quietly have changed.
+#[cfg_attr(test, derive(Debug))]
+struct MethodListing {
+    /// `(declaring class, rendered signature)`, unsorted: the order is a rendering decision.
+    rows: Vec<(std::sync::Arc<str>, String)>,
+    /// The multi-classloader warning, when the name resolved to more than one copy.
+    loader_note: Option<String>,
+}
+
+/// The debuggee half of `debug.list_methods`: resolve the class, walk it, render each member.
+async fn read_method_listing(
+    reads: &mut crate::reads::Reads<'_>,
+    a: &crate::args::ListMethodsArgs,
+) -> Result<MethodListing, String> {
+    let class_name = a.class_name.trim();
+    if class_name.is_empty() {
+        return Err("class_name is required (e.g. com.example.OrderService)".to_string());
+    }
+    let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
+    let (target_id, loader_note) = resolve_loaded_class_for_read(reads, class_name).await?;
+    let rows = collect_method_rows(reads, target_id, a.inherited, name_filter.as_deref()).await?;
+    Ok(MethodListing { rows, loader_note })
+}
+
+/// The reply half of `debug.list_methods` — pure, and byte-for-byte what the handler always produced.
+fn render_method_listing(read: &MethodListing, a: &crate::args::ListMethodsArgs) -> String {
+    let class_name = a.class_name.trim();
+    let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
+    let limit = a.limit.max(1);
+
+    // Sorted by rendered form so overloads land together, which is the comparison being made.
+    let mut rows = read.rows.clone();
+    rows.sort_by(|x, y| x.1.cmp(&y.1));
+    let matched = rows.len();
+    let shown = matched.min(limit);
+
+    let mut note = String::new();
+    if let Some(f) = &name_filter {
+        let _ = write!(note, " name~\"{f}\"");
+    }
+    if a.inherited {
+        note.push_str(" +inherited");
+    }
+
+    let mut output = format!("{shown}/{matched} method(s) on {class_name}{note}:\n");
+    for (owner, rendered) in rows.iter().take(limit) {
+        let _ = if a.inherited && &**owner != class_name {
+            writeln!(output, "{rendered}  [from {owner}]")
+        } else {
+            writeln!(output, "{rendered}")
+        };
+    }
+    if matched > shown {
+        let _ = writeln!(output, "… +{} more (raise limit or use name_filter)", matched - shown);
+    }
+    if matched == 0 && name_filter.is_some() {
+        output.push_str("No method name matched. Drop name_filter to see the whole class.\n");
+    }
+
+    output + read.loader_note.as_deref().unwrap_or("")
+}
+
+/// The DISC-5 counterpart of [`MethodListing`], split for the same reason.
+struct FieldListing {
+    rows: Vec<FieldRow>,
+    loader_note: Option<String>,
+}
+
+/// The debuggee half of `debug.list_fields`.
+async fn read_field_listing(
+    reads: &mut crate::reads::Reads<'_>,
+    a: &crate::args::ListFieldsArgs,
+) -> Result<FieldListing, String> {
+    let class_name = a.class_name.trim();
+    if class_name.is_empty() {
+        return Err("class_name is required (e.g. com.example.OrderService)".to_string());
+    }
+    let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
+    let (target_id, loader_note) = resolve_loaded_class_for_read(reads, class_name).await?;
+    let rows = collect_field_rows(reads, target_id, a.inherited, name_filter.as_deref()).await?;
+    Ok(FieldListing { rows, loader_note })
+}
+
+/// The reply half of `debug.list_fields` — pure, and byte-for-byte what the handler always produced.
+fn render_field_listing(read: &FieldListing, a: &crate::args::ListFieldsArgs) -> String {
+    let class_name = a.class_name.trim();
+    let name_filter = a.name_filter.as_deref().filter(|s| !s.is_empty()).map(str::to_lowercase);
+    let limit = a.limit.max(1);
+
+    // Statics first, then by name. Not the rendered form `list_methods` sorts on: that would order
+    // fields by their *type* (`boolean` before `java.lang.String`), which is nobody's question. The
+    // static block leads because those are the ones readable with no instance and no suspended
+    // thread — the case this tool exists for — and a listing cut off at `limit` should spend its
+    // budget on them first.
+    let mut rows: Vec<&FieldRow> = read.rows.iter().collect();
+    rows.sort_by(|x, y| y.is_static.cmp(&x.is_static).then_with(|| x.name.cmp(&y.name)));
+    let matched = rows.len();
+    let shown = matched.min(limit);
+
+    let mut note = String::new();
+    if let Some(f) = &name_filter {
+        let _ = write!(note, " name~\"{f}\"");
+    }
+    if a.inherited {
+        note.push_str(" +inherited");
+    }
+
+    let mut output = format!("{shown}/{matched} field(s) on {class_name}{note}:\n");
+    for row in rows.iter().take(limit) {
+        let _ = if a.inherited && &*row.owner != class_name {
+            writeln!(output, "{}  [from {}]", row.rendered, row.owner)
+        } else {
+            writeln!(output, "{}", row.rendered)
+        };
+    }
+    if matched > shown {
+        let _ = writeln!(output, "… +{} more (raise limit or use name_filter)", matched - shown);
+    }
+    if matched == 0 {
+        output.push_str(&explain_no_fields(name_filter.is_some(), a.inherited));
+    }
+
+    output + read.loader_note.as_deref().unwrap_or("")
+}
+
 async fn collect_method_rows(
-    conn: &mut jdwp_client::JdwpConnection,
+    reads: &mut crate::reads::Reads<'_>,
     start: u64,
     inherited: bool,
     name_filter: Option<&str>,
@@ -9305,9 +9358,9 @@ async fn collect_method_rows(
         // `Arc<str>`, not `String`: every method of a class repeats its declaring class, so a plain
         // clone per row re-heap-allocates the same name once for each method — a refcount bump instead.
         let owner: std::sync::Arc<str> = std::sync::Arc::from(
-            decode_signature(&conn.get_signature(type_id).await.unwrap_or_default()).as_str(),
+            decode_signature(&reads.get_signature(type_id).await.unwrap_or_default()).as_str(),
         );
-        let methods = conn
+        let methods = reads
             .get_methods(type_id)
             .await
             .map_err(|e| format!("Failed to read the methods of {owner}: {e}"))?;
@@ -9328,7 +9381,7 @@ async fn collect_method_rows(
         if !inherited {
             break;
         }
-        current = conn
+        current = reads
             .get_superclass(type_id)
             .await
             .map_err(|e| format!("Failed to walk the superclass chain: {e}"))?;
@@ -9360,7 +9413,7 @@ struct FieldRow {
 /// "what does this type declare", which is the smaller question and the one a caller holding only a
 /// class name asked. `inherited:true` is how you ask the bigger one.
 async fn collect_field_rows(
-    conn: &mut jdwp_client::JdwpConnection,
+    reads: &mut crate::reads::Reads<'_>,
     start: u64,
     inherited: bool,
     name_filter: Option<&str>,
@@ -9371,9 +9424,9 @@ async fn collect_field_rows(
         // `Arc<str>` for the same reason as the method walk: every field of a class repeats its
         // declaring class, and a clone per row would re-allocate that name once per field.
         let owner: std::sync::Arc<str> = std::sync::Arc::from(
-            decode_signature(&conn.get_signature(type_id).await.unwrap_or_default()).as_str(),
+            decode_signature(&reads.get_signature(type_id).await.unwrap_or_default()).as_str(),
         );
-        let fields = conn
+        let fields = reads
             .get_fields(type_id)
             .await
             .map_err(|e| format!("Failed to read the fields of {owner}: {e}"))?;
@@ -9394,7 +9447,7 @@ async fn collect_field_rows(
         if !inherited {
             break;
         }
-        current = conn
+        current = reads
             .get_superclass(type_id)
             .await
             .map_err(|e| format!("Failed to walk the superclass chain: {e}"))?;
@@ -12431,7 +12484,8 @@ async fn rearm_later_copies(session: &mut crate::session::DebugSession, cp_ref: 
         class_ids.extend(fresh.extra_locations.iter().map(|l| l.class_id));
         let mut seen = std::collections::HashSet::new();
         class_ids.retain(|id| seen.insert(*id));
-        let loaders = describe_class_loaders(&mut session.connection, &class_ids).await;
+        let loaders =
+            describe_class_loaders(&mut crate::reads::Reads::live(&mut session.connection), &class_ids).await;
 
         let Some(info) = session.breakpoints.get_mut(&bp_id) else { continue };
         info.request_ids.push(primary);
@@ -15253,14 +15307,14 @@ impl ArmedBreakpoint {
 ///
 /// A loader whose type will not read degrades to the bare id rather than dropping the entry: the count
 /// has to stay right, since it is what tells the caller their class is loaded more than once.
-async fn describe_class_loaders(conn: &mut jdwp_client::JdwpConnection, class_ids: &[u64]) -> Vec<String> {
+async fn describe_class_loaders(reads: &mut crate::reads::Reads<'_>, class_ids: &[u64]) -> Vec<String> {
     let mut out = Vec::with_capacity(class_ids.len());
     for (i, &cid) in class_ids.iter().enumerate() {
-        let label = match conn.get_class_loader(cid).await {
+        let label = match reads.get_class_loader(cid).await {
             Ok(None) => "bootstrap".to_string(),
             Ok(Some(loader)) => {
-                let named = match conn.get_object_reference_type(loader).await {
-                    Ok(lt) => conn.get_signature(lt).await.ok().map(|s| decode_internal_name(&s)),
+                let named = match reads.get_object_reference_type(loader).await {
+                    Ok(lt) => reads.get_signature(lt).await.ok().map(|s| decode_internal_name(&s)),
                     Err(_) => None,
                 };
                 named.map_or_else(|| format!("0x{loader:x}"), |n| format!("{n}@0x{loader:x}"))
@@ -15469,7 +15523,7 @@ async fn arm_and_insert(
     // Only when there is an ambiguity to report: naming a loader costs three round trips per copy, and
     // the single-copy case is nearly every class.
     let loaders = if loader_count > 1 {
-        describe_class_loaders(&mut session.connection, class_type_ids).await
+        describe_class_loaders(&mut crate::reads::Reads::live(&mut session.connection), class_type_ids).await
     } else {
         Vec::new()
     };
@@ -20958,7 +21012,8 @@ async fn resolve_static_head(
                     // Only when a LATER copy answered. Copy #0 answering is the ordinary case and says
                     // nothing worth a line.
                     if i > 0 {
-                        let labels = describe_class_loaders(conn, &copies).await;
+                        let labels =
+                            describe_class_loaders(&mut crate::reads::Reads::live(conn), &copies).await;
                         path.answered_by_later_copy(&dotted, &member.name, i, &labels);
                     }
                     return Ok((v, k + 1));
@@ -20981,7 +21036,7 @@ async fn resolve_static_head(
         }
         // Absent from EVERY copy, which is a different and more useful answer than absent from one:
         // it rules the stale-copy explanation out rather than leaving the reader to suspect it.
-        let labels = describe_class_loaders(conn, &copies).await;
+        let labels = describe_class_loaders(&mut crate::reads::Reads::live(conn), &copies).await;
         return Err(format!(
             "'{dotted}' is loaded {} times — one class per classloader — and NONE of the {} copies has a \
              {absent}. All {} were searched, so this is not the retired-deployment copy answering for the \
@@ -21128,7 +21183,7 @@ async fn resolve_class_copies_by_dotted(
         }
         if let Some(want) = want_loader {
             let ids: Vec<u64> = classes.iter().map(|c| c.type_id).collect();
-            let labels = describe_class_loaders(conn, &ids).await;
+            let labels = describe_class_loaders(&mut crate::reads::Reads::live(conn), &ids).await;
             let needle = format!("0x{want:x}");
             // A miss is an error, never a quiet fall back to the first copy: being handed a different
             // copy than the one you pinned is precisely the failure the selector exists to prevent.
@@ -29434,5 +29489,283 @@ mod tests {
         assert_eq!(java_hash(&ArgLit::Char(97)), Some(97));
         assert_eq!(java_hash(&ArgLit::Double(1.5)), None);
         assert_eq!(java_hash(&ArgLit::Float(1.5)), None);
+    }
+}
+
+/// The rendered discovery listings, asserted from stated data rather than from a probe JVM (CLEAN-7, #190).
+///
+/// These are the assertions `list_methods_renders_java_signatures_and_marks_static`,
+/// `list_fields_renders_java_declarations_and_marks_static` and the two DISC-12 generic-listing tests
+/// carry in `mcp_integration.rs`, where each pays a `javac`, a JVM launch and a listen wait to check how a
+/// signature renders — while never making the debuggee do anything. The subject there is the RENDERING,
+/// and a [`crate::reads::Fixture`] states the debuggee's answer directly.
+///
+/// **The probe tests stay.** They are what would notice a real JVM answering differently — the twin shape
+/// ADR-0014 states as design for `disc2_method_listing` / `disc5_field_listing`, applied one level up.
+/// What is new here is coverage the old shape could not express at all: `generics.rs` is 318 lines of
+/// recursive descent whose *rendered listing* had no test, only its parser.
+#[cfg(test)]
+mod discovery_listing_tests {
+    use super::*;
+    use crate::reads::{Fixture, FixtureClass, Reads};
+    use jdwp_client::reftype::{FieldInfo, MethodInfo};
+
+    const ACC_PUBLIC: i32 = 0x0001;
+    const ACC_STATIC_BIT: i32 = 0x0008;
+    const ACC_FINAL: i32 = 0x0010;
+
+    fn m(name: &str, signature: &str, mod_bits: i32) -> MethodInfo {
+        MethodInfo {
+            method_id: 1,
+            name: name.to_string(),
+            signature: signature.to_string(),
+            generic_signature: None,
+            mod_bits,
+        }
+    }
+
+    fn generic_m(name: &str, signature: &str, generic: &str, mod_bits: i32) -> MethodInfo {
+        MethodInfo { generic_signature: Some(generic.to_string()), ..m(name, signature, mod_bits) }
+    }
+
+    fn f(name: &str, signature: &str, mod_bits: i32) -> FieldInfo {
+        FieldInfo {
+            field_id: 1,
+            name: name.to_string(),
+            signature: signature.to_string(),
+            generic_signature: None,
+            mod_bits,
+        }
+    }
+
+    fn generic_f(name: &str, signature: &str, generic: &str, mod_bits: i32) -> FieldInfo {
+        FieldInfo { generic_signature: Some(generic.to_string()), ..f(name, signature, mod_bits) }
+    }
+
+    fn method_args(class_name: &str) -> crate::args::ListMethodsArgs {
+        crate::args::ListMethodsArgs {
+            class_name: class_name.to_string(),
+            name_filter: None,
+            inherited: false,
+            limit: 100,
+        }
+    }
+
+    fn field_args(class_name: &str) -> crate::args::ListFieldsArgs {
+        crate::args::ListFieldsArgs {
+            class_name: class_name.to_string(),
+            name_filter: None,
+            inherited: false,
+            limit: 100,
+        }
+    }
+
+    async fn methods_of(fx: &Fixture, a: &crate::args::ListMethodsArgs) -> String {
+        let read = read_method_listing(&mut Reads::Fixture(fx), a).await.expect("a stated class resolves");
+        render_method_listing(&read, a)
+    }
+
+    async fn fields_of(fx: &Fixture, a: &crate::args::ListFieldsArgs) -> String {
+        let read = read_field_listing(&mut Reads::Fixture(fx), a).await.expect("a stated class resolves");
+        render_field_listing(&read, a)
+    }
+
+    fn eval_probe() -> Fixture {
+        Fixture::new(vec![FixtureClass::new("LEvalProbe;", 10).with_methods(vec![
+            m("twice", "(I)I", ACC_PUBLIC | ACC_STATIC_BIT),
+            m("greet", "(Ljava/lang/String;)Ljava/lang/String;", ACC_PUBLIC | ACC_STATIC_BIT),
+            m("main", "([Ljava/lang/String;)V", ACC_PUBLIC | ACC_STATIC_BIT),
+            m("pick", "(I)Ljava/lang/String;", ACC_PUBLIC),
+            m("<init>", "()V", ACC_PUBLIC),
+            m("<clinit>", "()V", ACC_STATIC_BIT),
+        ])])
+    }
+
+    /// DISC-2's rendering claims, with no JVM: Java source types rather than JVM descriptors, `static`
+    /// where it is, `<clinit>` omitted and `<init>` kept.
+    #[tokio::test]
+    async fn a_method_listing_renders_java_types_and_omits_the_static_initialiser() {
+        let out = methods_of(&eval_probe(), &method_args("EvalProbe")).await;
+
+        for wanted in [
+            "static int twice(int)",
+            "static java.lang.String greet(java.lang.String)",
+            "static void main(java.lang.String[])",
+            "java.lang.String pick(int)",
+        ] {
+            assert!(out.contains(wanted), "missing {wanted:?} from:\n{out}");
+        }
+        assert!(!out.contains("(I)"), "raw JVM descriptors must not leak into the listing:\n{out}");
+        assert!(
+            !out.contains("<clinit>"),
+            "the static initialiser cannot be called and cannot be broken on, so it is not listed:\n{out}"
+        );
+        assert!(out.contains("<init>"), "a constructor IS a target for evaluate and a stop point:\n{out}");
+        // The instance overload is the one with no `static` marker.
+        assert!(!out.contains("static java.lang.String pick(int)"), "pick is an instance method:\n{out}");
+        assert!(out.starts_with("5/5 method(s) on EvalProbe:\n"), "header:\n{out}");
+    }
+
+    /// The `name_filter` note is part of the reply, and an empty match says how to widen it.
+    #[tokio::test]
+    async fn a_filtered_method_listing_states_its_filter_and_says_when_nothing_matched() {
+        let fx = eval_probe();
+        let mut a = method_args("EvalProbe");
+        a.name_filter = Some("twice".to_string());
+        let hit = methods_of(&fx, &a).await;
+        assert!(hit.contains("name~\"twice\""), "the filter is echoed:\n{hit}");
+        assert!(hit.contains("twice(int)") && !hit.contains("greet"), "filtered:\n{hit}");
+
+        a.name_filter = Some("nosuchthing".to_string());
+        let miss = methods_of(&fx, &a).await;
+        assert!(
+            miss.contains("No method name matched. Drop name_filter to see the whole class."),
+            "an empty filtered listing says how to widen it:\n{miss}"
+        );
+    }
+
+    /// `limit` truncates and says how many it kept back — the line a caller acts on.
+    #[tokio::test]
+    async fn a_truncated_listing_reports_what_it_held_back() {
+        let mut a = method_args("EvalProbe");
+        a.limit = 2;
+        let out = methods_of(&eval_probe(), &a).await;
+        assert!(out.starts_with("2/5 method(s) on EvalProbe:\n"), "header counts both:\n{out}");
+        assert!(out.contains("… +3 more (raise limit or use name_filter)"), "the held-back line:\n{out}");
+    }
+
+    /// The superclass walk and its `[from …]` attribution, which only `inherited:true` turns on.
+    #[tokio::test]
+    async fn an_inherited_listing_attributes_each_row_to_the_class_that_declares_it() {
+        let fx = Fixture::new(vec![
+            FixtureClass::new("LChild;", 1)
+                .with_methods(vec![m("own", "()V", ACC_PUBLIC)])
+                .with_superclass(2),
+            FixtureClass::new("LParent;", 2).with_methods(vec![m("inheritedOne", "()V", ACC_PUBLIC)]),
+        ]);
+
+        let plain = methods_of(&fx, &method_args("Child")).await;
+        assert!(!plain.contains("inheritedOne"), "the default answer is what the class declares:\n{plain}");
+
+        let mut a = method_args("Child");
+        a.inherited = true;
+        let walked = methods_of(&fx, &a).await;
+        assert!(walked.contains(" +inherited"), "the walk is stated in the header:\n{walked}");
+        assert!(walked.contains("void inheritedOne()  [from Parent]"), "attribution:\n{walked}");
+        assert!(
+            !walked.contains("void own()  [from"),
+            "a row the asked-for class declares carries no attribution:\n{walked}"
+        );
+    }
+
+    /// DISC-5's rendering claims: statics lead, because those are the ones readable with no instance.
+    #[tokio::test]
+    async fn a_field_listing_renders_java_declarations_and_puts_the_statics_first() {
+        let fx = Fixture::new(vec![FixtureClass::new("LEvalProbe;", 10).with_fields(vec![
+            f("seq", "I", ACC_PUBLIC),
+            f("infra", "Ljava/lang/String;", ACC_PUBLIC | ACC_STATIC_BIT),
+            f("LIMIT", "I", ACC_PUBLIC | ACC_STATIC_BIT | ACC_FINAL),
+            f("words", "[Ljava/lang/String;", ACC_PUBLIC | ACC_STATIC_BIT),
+        ])]);
+        let out = fields_of(&fx, &field_args("EvalProbe")).await;
+
+        for wanted in [
+            "static java.lang.String infra",
+            "static final int LIMIT",
+            "static java.lang.String[] words",
+            "int seq",
+        ] {
+            assert!(out.contains(wanted), "missing {wanted:?} from:\n{out}");
+        }
+        assert!(!out.contains("Ljava/lang/String;"), "raw descriptors must not leak:\n{out}");
+
+        let seq_at = out.find("\nint seq").expect("the instance field is listed");
+        for static_field in ["static java.lang.String infra", "static final int LIMIT"] {
+            assert!(
+                out.find(static_field).is_some_and(|s| s < seq_at),
+                "every static must precede the instance field:\n{out}"
+            );
+        }
+    }
+
+    /// DISC-12 (#95): a member's **generic** type replaces the erased one where the class file carries
+    /// it, and falls back to the descriptor where it does not.
+    ///
+    /// This is the test `generics.rs` did not have. Its 7 unit tests drive the parser; none of them
+    /// asserted what a LISTING looks like, because reaching a listing meant launching a JVM.
+    #[tokio::test]
+    async fn a_generic_signature_replaces_the_erased_type_and_falls_back_where_there_is_none() {
+        let fx = Fixture::new(vec![FixtureClass::new("LGenericProbe;", 10)
+            .with_fields(vec![
+                generic_f("lines", "Ljava/util/List;", "Ljava/util/List<Ljava/lang/String;>;", ACC_PUBLIC),
+                f("plain", "Ljava/util/List;", ACC_PUBLIC),
+            ])
+            .with_methods(vec![
+                generic_m(
+                    "firstOf",
+                    "(Ljava/util/List;)Ljava/lang/Object;",
+                    "<T:Ljava/lang/Object;>(Ljava/util/List<TT;>;)TT;",
+                    ACC_PUBLIC,
+                ),
+                m("size", "(Ljava/util/List;)I", ACC_PUBLIC),
+            ])]);
+
+        let fields = fields_of(&fx, &field_args("GenericProbe")).await;
+        assert!(
+            fields.contains("java.util.List<java.lang.String> lines"),
+            "the type argument is the whole point of DISC-12:\n{fields}"
+        );
+        assert!(
+            fields.contains("java.util.List plain"),
+            "with no generic signature the answer is byte-identical to what it was before DISC-12:\n\
+             {fields}"
+        );
+
+        let methods = methods_of(&fx, &method_args("GenericProbe")).await;
+        assert!(
+            methods.contains("firstOf(java.util.List<T>)"),
+            "a type variable renders as itself rather than as its erasure:\n{methods}"
+        );
+        assert!(
+            methods.contains("int size(java.util.List)"),
+            "the fallback is the design, not a degradation:\n{methods}"
+        );
+    }
+
+    /// The not-loaded branch, which is a rendering decision too: it says how to tell a wrong name from
+    /// a class the JVM has simply not reached yet.
+    #[tokio::test]
+    async fn a_class_the_debuggee_never_loaded_is_told_apart_from_a_wrong_name() {
+        let fx = Fixture::new(vec![FixtureClass::new("LEvalProbe;", 10)]);
+        let err = read_method_listing(&mut Reads::Fixture(&fx), &method_args("com.example.Missing"))
+            .await
+            .expect_err("a class the fixture does not state is not loaded");
+        assert!(err.contains("is not loaded in the debuggee"), "{err}");
+        assert!(
+            err.contains("debug.list_classes with filter \"*.Missing\""),
+            "the reply has to name the way to tell the two causes apart:\n{err}"
+        );
+    }
+
+    /// A listing costs one resolve plus, per class walked, a signature read and one member read — the
+    /// traffic-shape claim, assertable with no socket because the fixture counts what it served.
+    #[tokio::test]
+    async fn an_inherited_listing_reads_once_per_class_per_question() {
+        let fx = Fixture::new(vec![
+            FixtureClass::new("LChild;", 1)
+                .with_methods(vec![m("own", "()V", ACC_PUBLIC)])
+                .with_superclass(2),
+            FixtureClass::new("LParent;", 2).with_methods(vec![m("up", "()V", ACC_PUBLIC)]),
+        ]);
+        let mut a = method_args("Child");
+        a.inherited = true;
+        let _ = methods_of(&fx, &a).await;
+        // 1 classes_by_signature + per class (signature, methods, superclass) × 2 classes.
+        assert_eq!(
+            fx.reads(),
+            7,
+            "an inherited walk should cost one resolve and three reads per class; a change here is a \
+             change in what the debuggee is asked for, which is worth noticing deliberately"
+        );
     }
 }
