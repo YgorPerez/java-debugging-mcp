@@ -15812,9 +15812,10 @@ fn lone_exact_pattern(patterns: &[String]) -> Option<&String> {
 
 /// The one class pattern a call names, wildcard or not — [`lone_exact_pattern`] without the wildcard clause.
 ///
-/// `debug.set_method_exit_stop`'s rule, and only its: JDWP's `ClassMatch` does the matching there, so one
-/// pattern is one request whatever it contains, and it covers classes that load later. That is why this tool
-/// needed nothing from FILT-3 and why a wildcard is not refused here.
+/// `debug.set_method_exit_stop`'s rule, and only its, because a **method-exit request** is the one kind that
+/// does not **expand** — so a wildcard here is still one request and there is nothing to refuse. *Why* it
+/// does not expand belongs to `CONTEXT.md`'s **Expansion** entry and is not restated here: this comment said
+/// it a second time for one commit, which is the two-places-one-fact shape DOC-17 (#169) exists to stop.
 fn lone_pattern(patterns: &[String]) -> Option<&String> {
     match patterns {
         [only] => Some(only),
@@ -15824,10 +15825,14 @@ fn lone_pattern(patterns: &[String]) -> Option<&String> {
 
 /// Whether `debug.set_exception_stop` takes its single-request path: at most one pattern, and not a wildcard.
 ///
-/// *At most* rather than exactly one, because naming no class is this kind's **catch-all** — every exception
-/// on one request — and that is the reply it has always given. The other four kinds require a class pattern,
-/// so none of them has a zero case to admit. Returns a `bool` and not the pattern, because the caller needs
-/// the distinction between "no class" and "this class" that [`lone_exact_pattern`] collapses.
+/// *At most* rather than exactly one, because naming no class is this kind's **catch-all** (`CONTEXT.md`) —
+/// and that is the reply it has always given. The other four kinds refuse an empty pattern list, so this is
+/// the only zero case on the surface. Returns a `bool` and not the pattern, because the caller needs the
+/// distinction between "no class" and "this class" that [`lone_exact_pattern`] collapses.
+///
+/// The glossary entry carries the trap this name walks into: **catch-all** is *not* about the `caught`
+/// argument next to it on the same tool, and a catch-all armed with `caught:false` reports only uncaught
+/// throws.
 fn takes_lone_exception_path(patterns: &[String]) -> bool {
     match patterns {
         [] => true,
@@ -26101,12 +26106,13 @@ mod tests {
         // Caller-visible text, so it is one string and not six. `require_session` is the only place that
         // may say it; a handler writing it out again is the drift this catches.
         //
-        // Matched on the WHOLE sentence, and the reason is a finding rather than a detail: about thirty
-        // other tools refuse the same condition with a shorter `"No active debug session"` and no
-        // `debug.attach` hint. Two wordings for one failure is a caller-visible inconsistency, but settling
-        // it changes replies, so it is a behaviour change with its own commit and its own release note
-        // (`docs/toolkit-contract.md`) and not something a refactor may quietly fold in. Until then this
-        // guards the six that were identical, and a substring match here would fail on the thirty.
+        // Matched on the WHOLE sentence, and the reason is a finding rather than a detail: 29 other tools
+        // refuse the same condition with a shorter `"No active debug session"` and no `debug.attach` hint.
+        // Two wordings for one failure is a caller-visible inconsistency, but settling it moves
+        // `reply-fragments.txt`, so it is a behaviour change with its own commit and its own release note
+        // (`docs/toolkit-contract.md`) rather than something a refactor may quietly fold in — DOC-18 (#193).
+        // Until that lands this guards the six that were identical, and a substring match would fail on the
+        // 29. **Delete this paragraph with the workaround** when #193 makes one wording of them.
         let refusals: Vec<&str> = production
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))

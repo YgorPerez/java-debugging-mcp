@@ -721,6 +721,24 @@ the call. A **method-exit request** does not expand at all: JDWP's own `ClassMat
 request covers every class the pattern matches *including ones that load later*. That is why it alone has no
 `max_classes`, and why it accepted patterns long before the other three did.
 
+**Catch-all**:
+An exception stop point that names no exception class, so it reports every throw the debuggee raises.
+
+**It is not about `caught`, and that is the trap.** Both words sit on the same tool and mean unrelated
+things: `caught`/`uncaught` select which *throws* to report, this selects which *types* — all of them. So a
+catch-all armed with `caught:false` reports only the `uncaught` ones, and reading the term as "all the caught
+ones" gets it precisely backwards rather than merely vaguely.
+
+**It is one request that cannot expand**, which places it beside **Batch** and **Expansion** rather than
+under either: a batch is many patterns, an expansion is one wildcard becoming many stop points, and this is
+no pattern at all, staying one. Of the four kinds that take a class pattern it is the only one admitting an
+*empty* list — the other three refuse one — so it is the single input on which their "one request, or a
+batch?" rules have to disagree for a reason that is nothing to do with wildcards. A **monitor stop point** is
+not in that family at all: it takes no class pattern, and its optional `monitor_class` is a **filter**.
+_Avoid_: unfiltered (a **filter** still applies and still narrows what a catch-all reports — an `InstanceOnly`
+one is measured to *work* on an exception request, ADR-0027), untargeted (fits **Expansion**'s "needs a
+concrete target", but reads as that same filter case)
+
 ### Hits, and where they go
 
 **Hit**:
