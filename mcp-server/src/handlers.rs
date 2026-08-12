@@ -1382,7 +1382,7 @@ impl RequestHandler {
         // ONE EXACT CLASS KEEPS THE REPLY IT HAS ALWAYS HAD, down to the wording — including the error
         // when it fails. FILT-4 widened what this tool accepts; it must not have widened what the ordinary
         // call returns, or every caller and skill written against it would have to be re-read.
-        if let (1, Some(only)) = (patterns.len(), patterns.first().filter(|p| !is_wildcard(p))) {
+        if let Some(only) = lone_exact_pattern(&patterns) {
             let spec = base.for_pattern(only);
             let out = arm_single_named(&mut session, &spec, resolved.note.as_deref()).await;
             drop(session);
@@ -3652,7 +3652,7 @@ impl RequestHandler {
         let max_classes = clamped_max_classes(a.max_classes);
 
         // The catch-all and the one named class keep exactly the reply they have always had.
-        if patterns.len() <= 1 && !patterns.first().is_some_and(|p| is_wildcard(p)) {
+        if takes_lone_exception_path(&patterns) {
             let out = arm_single_exception_pattern(
                 &mut session,
                 &a,
@@ -3740,7 +3740,7 @@ impl RequestHandler {
         };
 
         // One named class keeps exactly the reply it has always had.
-        if let (1, Some(only)) = (classes.len(), classes.first().filter(|c| !is_wildcard(c))) {
+        if let Some(only) = lone_exact_pattern(&classes) {
             let out = arm_field_on_named_class(
                 &mut session,
                 &a,
@@ -3834,7 +3834,7 @@ impl RequestHandler {
         // One pattern keeps exactly the reply it has always had — including a WILDCARD one, which has
         // always worked here: JDWP's `ClassMatch` does the matching, so a pattern costs one request and
         // covers classes that load later. That is why this tool needed nothing from FILT-3.
-        if let (1, Some(class_pattern)) = (patterns.len(), patterns.first()) {
+        if let Some(class_pattern) = lone_pattern(&patterns) {
             let (mexit_id, request_id) =
                 arm_one_method_exit(&mut session, &a, class_pattern, method.as_ref(), &mexit).await?;
             drop(session);
@@ -15791,6 +15791,51 @@ fn is_wildcard(pattern: &str) -> bool {
     pattern.contains('*')
 }
 
+/// The one exact class name a call names, when a single exact name is all it names.
+///
+/// `debug.set_line_stop`'s and `debug.set_field_stop`'s rule for taking the single-request path, which is
+/// the reply both gave before FILT-4 widened what they accept. FILT-4 must not have widened what the
+/// *ordinary* call returns, or every caller and skill written against it would have to be re-read.
+///
+/// **The other two batching kinds spell this differently on purpose**, and the differences are load-bearing
+/// rather than drift — which is why all three rules are named instead of inlined as four similar-looking
+/// expressions that have to be diffed to be understood (CLEAN-5, #188, US-8):
+/// - `debug.set_exception_stop` takes the path for *no* pattern too, its **catch-all** having no class to
+///   name — [`takes_lone_exception_path`].
+/// - `debug.set_method_exit_stop` takes it for a wildcard as well — [`lone_pattern`].
+fn lone_exact_pattern(patterns: &[String]) -> Option<&String> {
+    match patterns {
+        [only] if !is_wildcard(only) => Some(only),
+        _ => None,
+    }
+}
+
+/// The one class pattern a call names, wildcard or not — [`lone_exact_pattern`] without the wildcard clause.
+///
+/// `debug.set_method_exit_stop`'s rule, and only its: JDWP's `ClassMatch` does the matching there, so one
+/// pattern is one request whatever it contains, and it covers classes that load later. That is why this tool
+/// needed nothing from FILT-3 and why a wildcard is not refused here.
+fn lone_pattern(patterns: &[String]) -> Option<&String> {
+    match patterns {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
+/// Whether `debug.set_exception_stop` takes its single-request path: at most one pattern, and not a wildcard.
+///
+/// *At most* rather than exactly one, because naming no class is this kind's **catch-all** — every exception
+/// on one request — and that is the reply it has always given. The other four kinds require a class pattern,
+/// so none of them has a zero case to admit. Returns a `bool` and not the pattern, because the caller needs
+/// the distinction between "no class" and "this class" that [`lone_exact_pattern`] collapses.
+fn takes_lone_exception_path(patterns: &[String]) -> bool {
+    match patterns {
+        [] => true,
+        [only] => !is_wildcard(only),
+        _ => false,
+    }
+}
+
 /// The JNI signature for a dotted class name.
 fn signature_for_dotted(dotted: &str) -> String {
     if dotted.starts_with('L') && dotted.ends_with(';') {
@@ -25973,6 +26018,48 @@ mod tests {
         let arm = ResolvedTrace::resolve(&args(false, MAX_TRACE_FRAMES + 1, Some(MAX_TRACE_LENGTH + 1)), &[]);
         assert_eq!((arm.frames, arm.max_length, arm.budget), (0, None, None));
         assert!(arm.note.is_none(), "a suspending stop point captures nothing, so no clamp applies");
+    }
+
+    /// CLEAN-5 (#188): the three single-request rules differ, and each difference is the reply of a
+    /// different tool.
+    ///
+    /// Four arming handlers decided "is this one request or a batch?" with four inline expressions, two of
+    /// them byte-identical and the other two differing in ways invisible without a diff. Named, the
+    /// differences are assertable — and this is the assertion that they stay different, because collapsing
+    /// any pair of them changes a reply: a wildcard would stop expanding for line and field stops, or start
+    /// being refused for method-exit ones, or the exception **catch-all** would take the batch path and
+    /// render a per-class breakdown of no classes.
+    #[test]
+    fn each_kind_keeps_its_own_rule_for_one_request_versus_a_batch() {
+        let exact = vec!["com.example.Order".to_string()];
+        let wild = vec!["com.example.*".to_string()];
+        let two = vec!["com.example.Order".to_string(), "com.example.Cart".to_string()];
+
+        // Line and field: exactly one, and not a wildcard. A wildcard is what FILT-3/FILT-4 expand.
+        assert_eq!(lone_exact_pattern(&exact), Some(&exact[0]), "one exact name is the ordinary call");
+        assert_eq!(lone_exact_pattern(&wild), None, "a wildcard must reach the expanding path");
+        assert_eq!(lone_exact_pattern(&two), None, "two patterns are a batch however exact they are");
+        assert_eq!(lone_exact_pattern(&[]), None, "these kinds refuse an empty pattern list upstream");
+
+        // Method-exit: one pattern, wildcard or not — JDWP's `ClassMatch` matches it server-side, so there
+        // is nothing to expand. This is the one difference that would silently *refuse* a working call.
+        assert_eq!(lone_pattern(&wild), Some(&wild[0]), "a wildcard is one ClassMatch request here");
+        assert_eq!(lone_pattern(&exact), Some(&exact[0]));
+        assert_eq!(lone_pattern(&two), None, "two patterns are two requests");
+
+        // Exception: at most one, because naming no class is the catch-all rather than a missing argument.
+        assert!(takes_lone_exception_path(&[]), "no class is the catch-all, not an empty batch");
+        assert!(takes_lone_exception_path(&exact));
+        assert!(!takes_lone_exception_path(&wild), "a wildcard resolves to one request per class");
+        assert!(!takes_lone_exception_path(&two));
+
+        // The distinction that matters most, stated as a comparison rather than left to the reader: the
+        // empty list is the ONLY input on which the exception rule and the other two disagree in a way
+        // that is not about wildcards.
+        assert!(
+            takes_lone_exception_path(&[]) && lone_exact_pattern(&[]).is_none(),
+            "the catch-all is exception-only; sharing one rule would give it a batch reply"
+        );
     }
 
     /// CLEAN-5 (#188): each shared arming step has one caller, and this is what keeps it that way.
