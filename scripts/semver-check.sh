@@ -142,6 +142,54 @@ grep -E "Checking|Summary|checks:|^ *--- failure|^error" "$OUT" || cat "$OUT"
 echo '```'
 echo
 
+# The baseline has no LIBRARY for a package that has one now — the sibling of the rename below, and it has
+# to be tested BEFORE the compile-error branch because it arrives wrapped in the same
+# `failed to build rustdoc`.
+#
+# `--workspace` asks for every member and builds rustdoc for both sides. A member that was `[[bin]]`-only
+# at the baseline has no rustdoc to build there, which cargo-semver-checks reports as
+# `no library targets found in package X` and then escalates to `failed to build rustdoc for crate X`. Read
+# through the branch below, that says "fix the build" about a tree that builds perfectly well.
+#
+# It is neither a break nor a build failure: there is no previous version of that API because there was no
+# API, so no version bump resolves it and failing would be a red that stays red until the next release —
+# the permanent-red defect this file's header is written against. Self-clearing for the reason the rename
+# is: the next tag carries the `[lib]` and becomes a usable baseline.
+#
+# **Found the hard way.** CLEAN-3 (#186) gave `jdwp-mcp` a library and updated this file's "what it covers"
+# section to say the package had arrived in the report — which was true of the working tree and not of any
+# baseline that predates it. Nothing caught it for seven commits, because nothing had been pushed; the
+# first push after it went red here, on a workspace whose every other check was green.
+#
+# The working tree is asked whether it really has the library, so that the opposite case — someone REMOVING
+# a `[lib]`, where the baseline is right and the tree is not — still falls through to the failure below.
+if grep -q "no library targets found in package" "$OUT"; then
+  MISSING="$(sed -n 's/.*no library targets found in package `\([^`]*\)`.*/\1/p' "$OUT" | sort -u)"
+  HAS_LIB_NOW="$(
+    cargo metadata --no-deps --format-version 1 2>/dev/null |
+      python3 -c '
+import json, sys
+meta = json.load(sys.stdin)
+print("\n".join(p["name"] for p in meta["packages"] if any(t["kind"] == ["lib"] for t in p["targets"])))
+' 2>/dev/null || true
+  )"
+  gained=""
+  for pkg in $MISSING; do
+    if printf '%s\n' "$HAS_LIB_NOW" | grep -qx "$pkg"; then gained="$gained $pkg"; fi
+  done
+  if [ -n "$gained" ]; then
+    echo "**This did not check anything for$gained: the baseline has no library there.** \`$BASELINE\`"
+    echo "predates the \`[lib]\`, so there is no previous version of that API to compare against — which is"
+    echo "not a compatibility finding, and is not something a bigger version bump would resolve."
+    echo
+    echo "Expected exactly once per package that gains a library (CLEAN-3, #186 gave \`jdwp-mcp\` one). The"
+    echo "next tag carries it and becomes a usable baseline, so this clears itself. **Every other package"
+    echo "in the report above was compared normally** — read their result, not this paragraph, for whether"
+    echo "the API moved."
+    exit 0
+  fi
+fi
+
 # A crate that does not build is not a crate with a broken API, and saying the second when the first is
 # true sends the reader looking for a compatibility problem that isn't there. cargo-semver-checks builds
 # rustdoc for both sides, so either side failing to compile arrives through the same non-zero exit.
