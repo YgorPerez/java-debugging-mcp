@@ -44,6 +44,27 @@ impl StopPointKind {
     pub const LISTING_ORDER: [Self; 5] =
         [Self::Line, Self::Exception, Self::Watchpoint, Self::MethodExit, Self::Monitor];
 
+    /// Where this kind sits in [`Self::LISTING_ORDER`] — the sort key `handlers::in_listing_order`
+    /// groups a listing by.
+    ///
+    /// A `match` rather than a search of the array, and that is the point: **it is the trip-wire for a
+    /// sixth kind.** Adding a variant stops this compiling, which is the one thing that will send whoever
+    /// adds it looking for the other places a kind has to be named by hand — `LISTING_ORDER` itself, and
+    /// the five `count_of_kind` calls behind `list_stop_points`' header line and `debug.panic`'s reply,
+    /// neither of which can be made generic because both wordings name the kinds one by one.
+    /// `the_listing_order_covers_every_kind_once` is the half the compiler cannot do: it catches a rank
+    /// being given and the array left alone.
+    #[must_use]
+    pub const fn listing_rank(self) -> usize {
+        match self {
+            Self::Line => 0,
+            Self::Exception => 1,
+            Self::Watchpoint => 2,
+            Self::MethodExit => 3,
+            Self::Monitor => 4,
+        }
+    }
+
     /// What a reply calls this kind — the kind, not the id (BP-9, #159).
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -90,9 +111,25 @@ impl StopPointKind {
 /// filters) lives on [`StopPoint`] and is declared once. Everything here is a location, a class, a field,
 /// a method or a monitor event kind: what the arming call chose, and what a re-arm has to reproduce.
 ///
-/// **If a `match` on this appears outside the wire layer and the listing's kind grouping, the payload is
-/// in the wrong place.** That is the rule CLEAN-4 was filed to establish, and the accessors below are how
-/// a caller reaches one kind's payload without one.
+/// **The rule is where the payload lives, not how many times it is matched on.** #187 phrased it as "the
+/// per-kind wire call is the only match", and that phrasing did not survive contact: *rendering* is per
+/// kind by nature — five kinds describe themselves in five wordings, and no amount of moving fields
+/// changes that. What the rule actually catches is a match that reaches for a payload field in order to
+/// decide something **shared**, which is the shape that made `spent` five beliefs.
+///
+/// So the matches that legitimately exist, and what each is for:
+///  - [`Self::wire_noun`], [`Self::toggle_label`] and [`StopPoint::rescue_label`] here — pure functions of
+///    the payload, which is why they are methods on it rather than five-arm matches in a caller;
+///  - `clear_stop_point_requests` — the per-kind JDWP `Clear`, the one #187 named;
+///  - `clear_one_stop_point` — that call's per-kind reply, which carries a per-kind tail for two kinds;
+///  - `render_stop_point_line` — the listing's kind grouping, which #187 asked for explicitly;
+///  - `stop_points_on` and `stop_point_set::Builder::push_stop_point` — a class-scoped description and the
+///    `debug.set_*` tool plus its locator arguments.
+///
+/// None of them decides shared state. A new one that does is the sign this doc used to claim to be about.
+///
+/// The accessors below are how a caller reaches one kind's payload without a match at all, and they are
+/// the reason the list above is six and not twenty.
 #[derive(Debug, Clone)]
 pub enum ArmedOn {
     Line(LineBreakpoint),
@@ -119,6 +156,22 @@ impl ArmedOn {
         }
     }
 
+    /// How `debug.toggle_stop_point` names this stop point in the sentence that reports what it did.
+    ///
+    /// Short, because that reply has already printed the id beside it. Its twin
+    /// [`StopPoint::rescue_label`] is the long form, and the two are separate rather than one function
+    /// with a verbosity flag because they answer to different readers — see there.
+    #[must_use]
+    pub fn toggle_label(&self) -> String {
+        match self {
+            Self::Line(bp) => format!("{}:{}", bp.class_pattern, bp.line),
+            Self::Exception(er) => format!("exception {}", er.class_pattern),
+            Self::Watchpoint(wp) => format!("watch {}.{}", wp.class_name, wp.field_name),
+            Self::MethodExit(me) => format!("method-exit {}", me.class_pattern),
+            Self::Monitor(mon) => format!("monitor {}", mon.kind.label()),
+        }
+    }
+
     /// Which kind this is, with the payload stripped off.
     #[must_use]
     pub const fn kind(&self) -> StopPointKind {
@@ -137,11 +190,12 @@ impl ArmedOn {
 /// Keyed in [`DebugSession::stop_points`](crate::session::DebugSession::stop_points) by its
 /// [**stop-point id**](Self::id), which is the caller's handle on it and is not a JDWP **request id**
 /// (ADR-0005).
+// Three bools — `enabled`, `spent`, `trace` — and each is an independent property of the JDWP request as
+// the protocol defines it (armed / spent by the debuggee / traced) rather than a parameter bag that wants
+// splitting up. The five records this replaces each carried four or five and an
+// `#[allow(clippy::struct_excessive_bools)]` to go with it; collapsing them dropped the duplicates and the
+// allow with them.
 #[derive(Debug, Clone)]
-// Four bools, and each is an independent property of the JDWP request as the protocol defines it (armed /
-// spent by the debuggee / traced, plus whatever the kind adds) rather than a parameter bag that wants
-// splitting up. The five records this replaces each carried the same allow for the same reason.
-#[allow(clippy::struct_excessive_bools)]
 pub struct StopPoint {
     /// The caller-facing id — `bp_1`, `exc_2`, `watch_modify_3`, `mexit_4`, `mon_blocked_5`.
     ///
@@ -287,14 +341,48 @@ impl StopPoint {
     /// Takes the stop point rather than `(enabled, spent, armed_glyph)`, which is what it used to take:
     /// three loose values in an order a call site could get wrong, computed at five call sites that each
     /// had to remember which glyph belonged to their kind.
+    ///
+    /// **Spent is read first, and that ordering is the enforcement.** ADR-0026's first consequence is that
+    /// a spent stop point must never be listed as armed. `enabled` and `spent` are two fields, so
+    /// `enabled && spent` is *representable* even though nothing constructs it — every path that sets
+    /// `spent` clears `enabled` in the same breath. Testing `enabled` first, as this did, made ADR-0026
+    /// hold by that convention rather than by anything here; testing `spent` first makes the rule the
+    /// type's, and the convention merely tidy. [`Self::state_suffix`] follows the same order for the same
+    /// reason.
     #[must_use]
     pub const fn glyph(&self) -> &'static str {
-        if self.enabled {
-            self.kind().armed_glyph()
-        } else if self.spent {
+        if self.spent {
             "⏹"
+        } else if self.enabled {
+            self.kind().armed_glyph()
         } else {
             "✗"
+        }
+    }
+
+    /// How a **rescue note** names this stop point after the watchdog (SAFE-2) or a spent trace budget
+    /// (TRACE-3) disarmed it.
+    ///
+    /// The long form of [`ArmedOn::toggle_label`], and separate from it rather than the same function with
+    /// a flag, because the two answer to different readers. A toggle reply has already printed the id and
+    /// the caller just asked for the thing by name; a rescue note reaches a caller who **was not there**,
+    /// on a line with nothing else on it, so it has to carry the id and say what kind of thing was turned
+    /// off. Collapsing them would make one of the two wrong.
+    #[must_use]
+    pub fn rescue_label(&self) -> String {
+        match &self.armed_on {
+            ArmedOn::Line(bp) => format!("breakpoint {} at {}:{}", self.id, bp.class_pattern, bp.line),
+            ArmedOn::Exception(er) => format!("exception breakpoint {} ({})", self.id, er.class_pattern),
+            ArmedOn::Watchpoint(wp) => {
+                format!("watchpoint {} ({}.{})", self.id, wp.class_name, wp.field_name)
+            }
+            ArmedOn::MethodExit(me) => format!(
+                "method-exit request {} ({}{})",
+                self.id,
+                me.class_pattern,
+                me.method.as_ref().map_or_else(|| ".*".to_string(), |m| format!(".{m}"))
+            ),
+            ArmedOn::Monitor(mon) => format!("monitor request {} ({})", self.id, mon.kind.label()),
         }
     }
 
@@ -311,7 +399,7 @@ impl StopPoint {
     /// and `clear_stop_point` on it tried to clear a request the JVM had removed.
     #[must_use]
     pub const fn state_suffix(&self) -> &'static str {
-        if self.enabled {
+        if !self.spent && self.enabled {
             ""
         } else if self.spent {
             " — SPENT (its hit_count fired, and the JVM deleted the request itself — nothing is armed. \
@@ -884,6 +972,48 @@ mod tests {
                 spent.clear_note().contains("nothing was sent to the debuggee"),
                 "{kind:?}: ADR-0026 — a clear that sent no packet has to say so:\n{}",
                 spent.clear_note()
+            );
+        }
+    }
+
+    /// ADR-0026's first consequence — "such a stop point must not be listed as armed" — held only by
+    /// convention until CLEAN-4's review: `enabled` and `spent` are two `pub` fields, so `enabled && spent`
+    /// is representable, and the renderers tested `enabled` first. Nothing constructs that state (every
+    /// path that spends a stop point clears `enabled` in the same breath), which is exactly why nothing
+    /// would have caught the day something did.
+    #[test]
+    fn a_spent_stop_point_never_reads_as_armed_even_if_enabled_says_otherwise() {
+        for kind in StopPointKind::LISTING_ORDER {
+            let mut contradictory = build::armed("id_1", kind);
+            contradictory.spent = true; // and `enabled` deliberately left true
+            assert_eq!(
+                contradictory.glyph(),
+                "⏹",
+                "{kind:?}: spent wins, or a listing claims the JVM still holds a request it deleted"
+            );
+            assert!(
+                contradictory.state_suffix().contains("SPENT"),
+                "{kind:?}: {}",
+                contradictory.state_suffix()
+            );
+        }
+    }
+
+    /// The two labels are the same five kinds in two voices, and neither may borrow the other's: a toggle
+    /// reply prints the id beside its label, a rescue note has nothing else on the line.
+    #[test]
+    fn a_rescue_label_names_the_id_and_a_toggle_label_does_not() {
+        for kind in StopPointKind::LISTING_ORDER {
+            let sp = build::armed("id_1", kind);
+            assert!(
+                sp.rescue_label().contains("id_1"),
+                "{kind:?}: a caller who was away is told only this:\n{}",
+                sp.rescue_label()
+            );
+            assert!(
+                !sp.armed_on.toggle_label().contains("id_1"),
+                "{kind:?}: the toggle reply has already printed the id:\n{}",
+                sp.armed_on.toggle_label()
             );
         }
     }

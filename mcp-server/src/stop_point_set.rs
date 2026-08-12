@@ -209,12 +209,16 @@ pub fn export(session: &crate::session::DebugSession) -> Export {
     b.finish()
 }
 
-/// The accumulator the seven per-kind passes write into.
+/// The accumulator the export's passes write into.
 ///
 /// A struct rather than a closure over local counters, and not for style: `export` was one function holding a
 /// `FnMut` that borrowed three counters mutably, which meant every pass had to be inline (the borrow outlives
 /// any attempt to split them out) and the whole thing came to 165 lines at cyclomatic complexity 25. Both of
-/// this repo's limits, and both were telling the truth — seven kinds is seven readable functions.
+/// this repo's limits, and both were telling the truth.
+///
+/// It was seven passes, one per kind plus the two things that are not stop points. CLEAN-4 left three:
+/// [`Self::push_families`], [`Self::push_pending`] and [`Self::push_stop_point`], plus
+/// [`Self::push_monitors`] for the one kind whose records are regrouped into the calls that armed them.
 #[derive(Default)]
 struct Builder {
     entries: Vec<Value>,

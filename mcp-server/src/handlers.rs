@@ -7045,34 +7045,62 @@ fn render_pattern_set_line(output: &mut String, set: &crate::session::PatternSto
     }
 }
 
-/// Every stop point of every kind, in the order `debug.list_stop_points` reports them.
+/// Stop points grouped by kind in the order a listing reports them, stable within a kind.
 ///
-/// Families come after the individual breakpoints deliberately: their members ARE some of those `bp_` lines,
-/// and the family line is what explains why one call produced nine of them — and what to clear to undo it.
+/// **Pure, and separate from the rendering, because this is the part worth asserting.** The grouping used
+/// to be a property of the five map fields on `DebugSession` — five per-kind loops, so reordering those
+/// fields would have reordered a caller's listing with nothing failing. It is now something this function
+/// states, and `the_listing_groups_kinds_in_the_declared_order` says so over a collection it writes down
+/// itself.
+///
+/// It takes the stop points rather than the session for exactly that reason: a `DebugSession` owns a
+/// `JdwpConnection` and cannot be built without a socket, so nothing above this line can be exercised
+/// without a JVM (ADR-0049 — CLEAN-6 is where that seam moves, and #187's "a session built in memory" has
+/// to wait for it).
+///
+/// **Stable**, so order *within* a kind is the `HashMap` order it has always been, and stays as
+/// unspecified as it was.
+fn in_listing_order<'a>(points: impl Iterator<Item = &'a StopPoint>) -> Vec<&'a StopPoint> {
+    let mut rows: Vec<&StopPoint> = points.collect();
+    rows.sort_by_key(|sp| sp.kind().listing_rank());
+    rows
+}
+
+/// Every stop point of every kind, in the order `debug.list_stop_points` reports them.
 fn render_every_stop_point(output: &mut String, session: &crate::session::DebugSession, dead: &FilterHealth) {
-    for kind in StopPointKind::LISTING_ORDER {
-        for sp in stop_points_of(session, kind) {
-            render_stop_point_line(output, sp, session, dead);
+    // The deferred breakpoints and the wildcard families are not stop points and never will be, but they
+    // belong with the line breakpoints and go directly after them: a family's members ARE some of those
+    // `bp_` lines, and the family line is what explains why one call produced nine of them — and what to
+    // clear to undo it. So they are emitted at the moment the listing leaves the line group.
+    let mut asides_pending = true;
+    for sp in in_listing_order(session.stop_points.values()) {
+        if asides_pending && sp.kind() != StopPointKind::Line {
+            render_line_asides(output, session, dead);
+            asides_pending = false;
         }
-        // The deferred breakpoints and the wildcard families go with the line breakpoints, and after them.
-        // A family's members ARE some of those `bp_` lines, and the family line is what explains why one
-        // call produced nine of them — and what to clear to undo it.
-        if kind == StopPointKind::Line {
-            for pb in &session.pending_breakpoints {
-                render_pending_line(output, pb, dead);
-            }
-            for set in session.pattern_sets.values() {
-                render_pattern_set_line(output, set, dead);
-            }
-        }
+        render_stop_point_line(output, sp, session, dead);
+    }
+    if asides_pending {
+        render_line_asides(output, session, dead);
+    }
+}
+
+/// The deferred breakpoints and the wildcard families, in the one place `render_every_stop_point` emits
+/// them — see there for why they sit where they do.
+fn render_line_asides(output: &mut String, session: &crate::session::DebugSession, dead: &FilterHealth) {
+    for pb in &session.pending_breakpoints {
+        render_pending_line(output, pb, dead);
+    }
+    for set in session.pattern_sets.values() {
+        render_pattern_set_line(output, set, dead);
     }
 }
 
 /// One stop point's listing entry, dispatched to the renderer for its kind.
 ///
-/// **The one `match` on [`ArmedOn`] outside the wire layer**, and it is the kind grouping itself: the two
-/// lines every kind ends with are written once, here, so a sixth kind cannot be added with the hit tally or
-/// the trace cost forgotten.
+/// The listing's kind grouping, which #187 asked for explicitly — see [`ArmedOn`] for why this is one of
+/// the matches on it that legitimately exist. The two lines every kind ends with are written once, here,
+/// so a sixth kind cannot be added with the hit tally or the trace cost forgotten.
 fn render_stop_point_line(
     output: &mut String,
     sp: &StopPoint,
@@ -7870,6 +7898,10 @@ fn monitor_stops(
 /// sent for a **request id** the debuggee may have since reissued, and [`StopPoint::clear_note`] says so
 /// (ADR-0026).
 ///
+/// It matches on [`ArmedOn`] a second time, for the reply rather than the wire — two kinds carry a tail
+/// that needs the session (a family slot, a widowed partner), so the reply cannot be a pure method on the
+/// payload the way [`ArmedOn::toggle_label`] is.
+///
 /// The bookkeeping is the caller's to remove, and that is not tidiness: a line breakpoint still returns
 /// `Err` when its wire call fails rather than reporting a clear that did not happen, so its entry has to
 /// survive the failure. The other four have always swallowed the error, and levelling the two is a
@@ -7913,10 +7945,10 @@ async fn clear_one_stop_point(
 /// Send the JDWP `Clear` for every live request this stop point holds, naming the event kind it was armed
 /// with.
 ///
-/// **The per-kind wire call, and the one `match` on [`ArmedOn`] outside the listing's kind grouping**
-/// (CLEAN-4). JDWP keys requests by (eventKind, requestID) and the kinds are separate keys, so a `Clear`
-/// naming the wrong one looks up nothing, reports success, and leaves a possibly-suspending stop point
-/// armed that nothing on this side can find again. That rule used to be restated in six places.
+/// **The per-kind wire call** — the one #187 named, and the only match on [`ArmedOn`] that touches the
+/// debuggee (CLEAN-4). JDWP keys requests by (eventKind, requestID) and the kinds are separate keys, so a
+/// `Clear` naming the wrong one looks up nothing, reports success, and leaves a possibly-suspending stop
+/// point armed that nothing on this side can find again. That rule used to be restated in six places.
 ///
 /// A disabled or **spent** stop point holds no live request, so the loop simply does not run — nothing is
 /// sent for a **request id** the debuggee may have since reissued (ADR-0026).
@@ -12968,26 +13000,7 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
         s.request_ids.clear();
         s.enabled = false;
     }
-    Some(describe_disarmed(&sp))
-}
-
-/// How the watchdog and the trace-budget path name the stop point they just disarmed (SAFE-2, TRACE-3).
-///
-/// Longer than [`describe_stop_point`] and deliberately so: this appears in a rescue note the caller reads
-/// **after** the fact, with nothing else on the line to say what kind of thing was turned off.
-fn describe_disarmed(sp: &StopPoint) -> String {
-    match &sp.armed_on {
-        ArmedOn::Line(bp) => format!("breakpoint {} at {}:{}", sp.id, bp.class_pattern, bp.line),
-        ArmedOn::Exception(er) => format!("exception breakpoint {} ({})", sp.id, er.class_pattern),
-        ArmedOn::Watchpoint(wp) => format!("watchpoint {} ({}.{})", sp.id, wp.class_name, wp.field_name),
-        ArmedOn::MethodExit(me) => format!(
-            "method-exit request {} ({}{})",
-            sp.id,
-            me.class_pattern,
-            me.method.as_ref().map_or_else(|| ".*".to_string(), |m| format!(".{m}"))
-        ),
-        ArmedOn::Monitor(mon) => format!("monitor request {} ({})", sp.id, mon.kind.label()),
-    }
+    Some(sp.rescue_label())
 }
 
 /// Disable the stop point with this caller-facing id: clear its JDWP request, keep its definition.
@@ -13010,19 +13023,7 @@ async fn disable_stop_point(session: &mut crate::session::DebugSession, id: &str
         s.request_ids.clear();
         s.enabled = false;
     }
-    Ok(describe_stop_point(&sp))
-}
-
-/// How a toggle reply names one stop point: the short description `disable` and `rearm` hand back, which
-/// `debug.toggle_stop_point` prints verbatim.
-fn describe_stop_point(sp: &StopPoint) -> String {
-    match &sp.armed_on {
-        ArmedOn::Line(bp) => format!("{}:{}", bp.class_pattern, bp.line),
-        ArmedOn::Exception(er) => format!("exception {}", er.class_pattern),
-        ArmedOn::Watchpoint(wp) => format!("watch {}.{}", wp.class_name, wp.field_name),
-        ArmedOn::MethodExit(me) => format!("method-exit {}", me.class_pattern),
-        ArmedOn::Monitor(mon) => format!("monitor {}", mon.kind.label()),
-    }
+    Ok(sp.armed_on.toggle_label())
 }
 
 /// Re-arm the disabled stop point with this caller-facing id from its stored definition, keeping the
@@ -13066,7 +13067,7 @@ async fn rearm_stop_point(session: &mut crate::session::DebugSession, id: &str) 
             s.armed_on = armed_on;
         }
     }
-    Ok(describe_stop_point(&sp))
+    Ok(sp.armed_on.toggle_label())
 }
 
 /// What one kind's re-arm produced.
@@ -25346,6 +25347,52 @@ mod tests {
         assert!(refuse_counted_method_filter(None, None).is_ok());
     }
 
+    /// US-11 of #187: "the `list_stop_points` kind grouping asserted rather than inherited from how the
+    /// data happens to be stored, so that a storage change cannot silently reorder a reply."
+    ///
+    /// This asserts [`in_listing_order`], which is what `render_every_stop_point` iterates — not
+    /// `LISTING_ORDER` against a copy of itself. The collection is written down in a deliberately wrong
+    /// order, which is the case the old shape could not produce a test for at all: the grouping used to be
+    /// a property of five separate `DebugSession` fields, so there was nothing to hand a listing but the
+    /// order they happened to be declared in.
+    ///
+    /// The renderer itself still cannot be called without a JVM — a `DebugSession` owns a
+    /// `JdwpConnection` (ADR-0049), and #187's "a session built in memory" arrives with CLEAN-6. This is
+    /// the whole of the ordering decision, factored out so that at least that much needs no socket.
+    #[test]
+    fn the_listing_groups_kinds_in_the_declared_order() {
+        use crate::stop_point::build;
+        use crate::stop_point::StopPointKind::{Exception, Line, MethodExit, Monitor, Watchpoint};
+
+        // Every kind, and two of one of them, in an order no listing should ever print.
+        let stated = [
+            build::armed("mon_blocked_6", Monitor),
+            build::armed("watch_modify_3", Watchpoint),
+            build::armed("bp_1", Line),
+            build::armed("mexit_4", MethodExit),
+            build::armed("exc_2", Exception),
+            build::armed("bp_5", Line),
+        ];
+
+        let listed: Vec<StopPointKind> =
+            in_listing_order(stated.iter()).into_iter().map(StopPoint::kind).collect();
+        assert_eq!(
+            listed,
+            vec![Line, Line, Exception, Watchpoint, MethodExit, Monitor],
+            "the listing groups by kind in LISTING_ORDER, whatever order the stop points are held in"
+        );
+
+        // Within a kind, nothing is promised beyond what the storage gives — and nothing is REORDERED
+        // either. A sort that was not stable would shuffle two breakpoints against each other, which is a
+        // reply moving under a caller for no reason anyone could name.
+        let lines: Vec<&str> = in_listing_order(stated.iter())
+            .into_iter()
+            .filter(|sp| sp.kind() == Line)
+            .map(|sp| sp.id.as_str())
+            .collect();
+        assert_eq!(lines, vec!["bp_1", "bp_5"], "stable within a kind: the order they were held in");
+    }
+
     /// FILT-8's three states are asserted on the type now, across all five kinds, in
     /// `stop_point::tests::the_state_matrix_reads_the_same_on_every_kind` — the cross-product could not be
     /// written while the rules took three loose booleans (CLEAN-4). What is left here is the *reply
@@ -25360,17 +25407,15 @@ mod tests {
 
         let described: Vec<String> = StopPointKind::LISTING_ORDER
             .iter()
-            .map(|k| describe_stop_point(&build::armed("id_1", *k)))
+            .map(|k| build::armed("id_1", *k).armed_on.toggle_label())
             .collect();
         let mut unique = described.clone();
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), described.len(), "two kinds toggle-describe alike: {described:?}");
 
-        let disarmed: Vec<String> = StopPointKind::LISTING_ORDER
-            .iter()
-            .map(|k| describe_disarmed(&build::armed("id_1", *k)))
-            .collect();
+        let disarmed: Vec<String> =
+            StopPointKind::LISTING_ORDER.iter().map(|k| build::armed("id_1", *k).rescue_label()).collect();
         for note in &disarmed {
             assert!(note.contains("id_1"), "a rescue note has to name the id it disarmed:\n{note}");
         }
