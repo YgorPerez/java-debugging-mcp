@@ -1002,20 +1002,6 @@ impl RequestHandler {
         )
     }
 
-    /// The session's `trace_expr` default, read without holding a stop-point handler's own guard.
-    ///
-    /// Only `handle_set_line_stop` needs this: it clamps its arguments before acquiring a session, while
-    /// the other four stop-point handlers already hold theirs at that point and read the field directly.
-    /// An absent session is an empty default rather than an error — the handler below reports "no active
-    /// session" far better than this could, and answering that question twice would mean two messages
-    /// disagreeing about which one is the caller's problem.
-    async fn session_trace_exprs(&self, args: &serde_json::Value) -> Vec<String> {
-        match self.resolve_session(args).await {
-            Some(guard) => guard.lock().await.trace_exprs.clone(),
-            None => Vec::new(),
-        }
-    }
-
     /// Create a session around an established connection and start the two tasks it cannot live without.
     ///
     /// Shared by `debug.attach` and `debug.launch` (LAUNCH-1), because everything below the connection is
@@ -1339,20 +1325,29 @@ impl RequestHandler {
         }
 
         let suspend_policy = suspend_policy_for_line(a.trace, a.condition.is_some());
-        let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
-        let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
-        // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
-        // re-deriving it from the argument and each reaching its own answer.
-        // EVAL-14 (#134). Read BEFORE this handler takes its own session guard, which it does
-        // further down — the other four stop-point handlers already hold theirs here and read
-        // `session.trace_exprs` directly. Calling the helper while holding that guard would
-        // re-lock the same mutex and deadlock, so the two paths differ on purpose.
-        let session_default = self.session_trace_exprs(&args).await;
-        let (trace_exprs, expr_note, took_session_default) =
-            resolve_trace_exprs(a.trace_expr.clone(), &session_default);
-        let session_default_note = describe_took_session_default(took_session_default, &trace_exprs);
-        let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
+        // Parsed before the session is resolved, and not inside `base` below, so a malformed `instance_id`
+        // is still refused ahead of "no active debug session" — the order every caller has seen.
+        let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
+
+        let session_guard = self
+            .resolve_session(&args)
+            .await
+            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
+        let mut session = session_guard.lock().await;
+        let TraceArm {
+            frames: trace_frames,
+            max_length: trace_max_length,
+            exprs: trace_exprs,
+            note: frames_note,
+            session_default_note,
+        } = TraceArm::resolve(
+            a.trace,
+            a.trace_frames,
+            a.trace_max_length,
+            a.trace_expr.clone(),
+            &session.trace_exprs,
+        );
         // One definition, pointed at each pattern in turn below.
         let base = BreakpointSpec {
             class_pattern: String::new(),
@@ -1361,7 +1356,7 @@ impl RequestHandler {
             method_hint: a.method.clone(),
             hit_count: a.hit_count,
             thread_filter: crate::args::parse_thread_id(a.thread_id.as_deref()),
-            instance_filter: parse_instance_filter(a.instance_id.as_deref())?,
+            instance_filter,
             condition: a.condition.clone(),
             trace: a.trace,
             trace_expr: trace_exprs.clone(),
@@ -1371,11 +1366,6 @@ impl RequestHandler {
             suspend_policy,
         };
 
-        let session_guard = self
-            .resolve_session(&args)
-            .await
-            .ok_or_else(|| "No active debug session. Use debug.attach first.".to_string())?;
-        let mut session = session_guard.lock().await;
         check_readonly_exprs(session.read_only, base.condition.as_deref(), &base.trace_expr)?;
         check_instance_filter_supported(&mut session.connection, base.instance_filter).await?;
         check_thread_filter(&mut session.connection, base.thread_filter).await?;
@@ -3656,15 +3646,19 @@ impl RequestHandler {
         // instance, none from its twin (FILT-9, ADR-0027).
         check_instance_filter_supported(&mut session.connection, instance_filter).await?;
         check_thread_filter(&mut session.connection, thread_filter).await?;
-        let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
-        let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
-        // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
-        // re-deriving it from the argument and each reaching its own answer.
-        // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
-        let (trace_exprs, expr_note, took_session_default) =
-            resolve_trace_exprs(a.trace_expr.clone(), &session.trace_exprs);
-        let session_default_note = describe_took_session_default(took_session_default, &trace_exprs);
-        let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
+        let TraceArm {
+            frames: trace_frames,
+            max_length: trace_max_length,
+            exprs: trace_exprs,
+            note: frames_note,
+            session_default_note,
+        } = TraceArm::resolve(
+            a.trace,
+            a.trace_frames,
+            a.trace_max_length,
+            a.trace_expr.clone(),
+            &session.trace_exprs,
+        );
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
 
         // The catch-all and the one named class keep exactly the reply they have always had.
@@ -3743,15 +3737,19 @@ impl RequestHandler {
         check_instance_filter_supported(&mut session.connection, instance_filter).await?;
         check_thread_filter(&mut session.connection, thread_filter).await?;
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
-        let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
-        let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
-        // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
-        // re-deriving it from the argument and each reaching its own answer.
-        // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
-        let (trace_exprs, expr_note, took_session_default) =
-            resolve_trace_exprs(a.trace_expr.clone(), &session.trace_exprs);
-        let session_default_note = describe_took_session_default(took_session_default, &trace_exprs);
-        let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
+        let TraceArm {
+            frames: trace_frames,
+            max_length: trace_max_length,
+            exprs: trace_exprs,
+            note: frames_note,
+            session_default_note,
+        } = TraceArm::resolve(
+            a.trace,
+            a.trace_frames,
+            a.trace_max_length,
+            a.trace_expr.clone(),
+            &session.trace_exprs,
+        );
         let max_classes = a.max_classes.clamp(1, crate::args::MAX_CLASSES_CEILING);
         let arm = FieldArm {
             field_name: &field_name,
@@ -3847,15 +3845,19 @@ impl RequestHandler {
         refuse_instance_filter_on_method_exit(instance_filter)?;
         check_thread_filter(&mut session.connection, thread_filter).await?;
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
-        let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
-        let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
-        // TRACE-11: clamped here, once, so every path below shares one already-bounded list instead of
-        // re-deriving it from the argument and each reaching its own answer.
-        // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
-        let (trace_exprs, expr_note, took_session_default) =
-            resolve_trace_exprs(a.trace_expr.clone(), &session.trace_exprs);
-        let session_default_note = describe_took_session_default(took_session_default, &trace_exprs);
-        let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
+        let TraceArm {
+            frames: trace_frames,
+            max_length: trace_max_length,
+            exprs: trace_exprs,
+            note: frames_note,
+            session_default_note,
+        } = TraceArm::resolve(
+            a.trace,
+            a.trace_frames,
+            a.trace_max_length,
+            a.trace_expr.clone(),
+            &session.trace_exprs,
+        );
 
         let mexit = MethodExitArm {
             instance_filter,
@@ -3931,13 +3933,19 @@ impl RequestHandler {
         };
 
         let trace_budget = trace_budget_for(a.trace, a.trace_max_hits);
-        let (trace_frames, depth_note) = clamp_trace_frames(a.trace, a.trace_frames);
-        let (trace_max_length, length_note) = clamp_trace_max_length(a.trace, a.trace_max_length);
-        // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
-        let (trace_exprs, expr_note, took_session_default) =
-            resolve_trace_exprs(a.trace_expr.clone(), &session.trace_exprs);
-        let session_default_note = describe_took_session_default(took_session_default, &trace_exprs);
-        let frames_note = merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note);
+        let TraceArm {
+            frames: trace_frames,
+            max_length: trace_max_length,
+            exprs: trace_exprs,
+            note: frames_note,
+            session_default_note,
+        } = TraceArm::resolve(
+            a.trace,
+            a.trace_frames,
+            a.trace_max_length,
+            a.trace_expr.clone(),
+            &session.trace_exprs,
+        );
 
         let arm = MonitorArm {
             thread_filter,
@@ -5200,6 +5208,63 @@ fn merge_clamp_notes(first: Option<String>, second: Option<String>) -> Option<St
         (Some(a), Some(b)) => Some(format!("{a}\n   ⚠️  {b}")),
         (Some(only), None) | (None, Some(only)) => Some(only),
         (None, None) => None,
+    }
+}
+
+/// Everything a caller's `trace_*` arguments settle before a stop point of any kind is armed.
+///
+/// Resolved in one place because it was resolved in five, verbatim (CLEAN-5, #188): the two clamps, the
+/// **session default**, and the two notices that report both. A clamp that is applied and not reported is
+/// the silent narrowing each clamp exists to prevent, so the notices travel with the values rather than
+/// being the next line at each call site — five copies of "apply it, then remember to say so" is five
+/// chances to keep only the first half.
+///
+/// **The session default arrives as a value, and that is the lock ordering made structural.**
+/// `set_line_stop` used to read it through a helper that resolved and locked the session itself, because
+/// it clamped *before* taking its own guard while the other four clamped while holding theirs — doing it
+/// the other four's way would have re-locked the same mutex and deadlocked. That asymmetry was documented
+/// in one of the five copies and enforced in none. This function cannot lock anything, having no session
+/// to lock, so all five now read the field the same way under their own guard and the deadlock has no
+/// shape left to take.
+struct TraceArm {
+    /// Caller depth for a trace snapshot, clamped to `MAX_TRACE_FRAMES`.
+    frames: usize,
+    /// Per-value rendering cap, clamped to `MAX_TRACE_LENGTH`.
+    max_length: Option<usize>,
+    /// What the stop point records: the caller's own list, or the **session default** when it named none.
+    exprs: Vec<String>,
+    /// Both clamp notices, folded into the single `note` slot every arm reply already renders.
+    note: Option<String>,
+    /// The sentence that says the **session default** was taken, or empty when it was not.
+    session_default_note: String,
+}
+
+impl TraceArm {
+    /// Resolve one arming call's trace arguments against the session's default expression list.
+    ///
+    /// `session_default` is [`crate::session::DebugSession::trace_exprs`], read by the caller under the
+    /// guard it already holds — see the type's note on why it is a value here and not a way to get one.
+    fn resolve(
+        trace: bool,
+        frames: usize,
+        max_length: Option<usize>,
+        exprs: Option<crate::args::TraceExprs>,
+        session_default: &[String],
+    ) -> Self {
+        // TRACE-11: clamped once, so every path below one arming handler shares an already-bounded list
+        // instead of re-deriving it from the argument and each reaching its own answer.
+        let (frames, depth_note) = clamp_trace_frames(trace, frames);
+        let (max_length, length_note) = clamp_trace_max_length(trace, max_length);
+        // EVAL-14 (#134): the caller's own list if they named one, otherwise the session's.
+        let (exprs, expr_note, took_session_default) = resolve_trace_exprs(exprs, session_default);
+        let session_default_note = describe_took_session_default(took_session_default, &exprs);
+        Self {
+            frames,
+            max_length,
+            exprs,
+            note: merge_clamp_notes(merge_clamp_notes(depth_note, length_note), expr_note),
+            session_default_note,
+        }
     }
 }
 
@@ -25750,6 +25815,100 @@ mod tests {
         assert_eq!(both.matches("⚠️").count(), 1, "the first warning sign is added by the renderer: {both}");
         let rendered = describe_trace_frames(true, 20, Some(&both), "hit frame only");
         assert_eq!(rendered.matches("⚠️").count(), 2, "two clamps read as two warnings: {rendered}");
+    }
+
+    /// CLEAN-5 (#188): one resolution answers every shared trace concern, whichever kind is being armed.
+    ///
+    /// The five arming handlers used to answer these four questions each for itself, in five copies of the
+    /// same five lines. There is one implementation now, so this asserts the *concerns* and not the kinds:
+    /// running it five times over would be five passes through one code path wearing five names, which is
+    /// the test-that-cannot-fail shape US-11 hit in #187 (`LISTING_ORDER` asserted against a hand-written
+    /// copy of itself). Which kind reaches this is a JVM question and stays with the arm-and-hit tests;
+    /// that it is reached from exactly one place is asserted by
+    /// `the_clamp_and_note_block_has_exactly_one_caller`.
+    #[test]
+    fn one_resolution_answers_every_shared_trace_concern() {
+        let session = vec!["s1".to_string(), "s2".to_string()];
+
+        // Nothing to clamp and nothing named: the session default, said out loud.
+        let arm = TraceArm::resolve(true, 3, Some(500), None, &session);
+        assert_eq!((arm.frames, arm.max_length), (3, Some(500)), "within both caps, verbatim");
+        assert_eq!(arm.exprs, session, "a stop point naming none records the session's list");
+        assert!(arm.note.is_none(), "nothing was clamped, so nothing may be reported");
+        assert!(
+            arm.session_default_note.contains("session default"),
+            "an inherited list has to be visible in the reply: {}",
+            arm.session_default_note
+        );
+
+        // The caller's own list: kept exactly, and claimed by nobody.
+        let own = crate::args::TraceExprs::Many(vec!["mine".to_string()]);
+        let arm = TraceArm::resolve(true, 3, None, Some(own), &session);
+        assert_eq!(arm.exprs, vec!["mine".to_string()], "naming a list keeps exactly that list");
+        assert!(arm.session_default_note.is_empty(), "nothing was inherited, so nothing may say it was");
+
+        // Both ceilings exceeded on one call: both clamps applied, and BOTH reported. This is the pair
+        // that used to depend on five handlers each remembering to fold two notes into one slot.
+        let arm = TraceArm::resolve(true, MAX_TRACE_FRAMES + 1, Some(MAX_TRACE_LENGTH + 1), None, &[]);
+        assert_eq!(arm.frames, MAX_TRACE_FRAMES);
+        assert_eq!(arm.max_length, Some(MAX_TRACE_LENGTH));
+        let note = arm.note.expect("two clamps must produce a note, not silence");
+        assert_eq!(
+            note.matches("clamped").count(),
+            2,
+            "a reply reporting one clamp and swallowing the other is the silent narrowing both clamps \
+             exist to prevent: {note}"
+        );
+
+        // Not tracing: nothing is captured, so there is no depth and no length to bound — and therefore
+        // no clamp to report even though both arguments were over their ceiling.
+        let arm = TraceArm::resolve(false, MAX_TRACE_FRAMES + 1, Some(MAX_TRACE_LENGTH + 1), None, &[]);
+        assert_eq!((arm.frames, arm.max_length), (0, None));
+        assert!(arm.note.is_none(), "a suspending stop point captures nothing, so no clamp applies");
+    }
+
+    /// CLEAN-5 (#188): the clamp-and-note block has one caller, and this is what keeps it that way.
+    ///
+    /// It stood verbatim at five arming handlers, and one of the five differed for a correctness reason
+    /// recorded only in prose — that handler read the **session default** before taking its own guard,
+    /// because the other four already held theirs and re-locking would deadlock. Five copies of a sequence
+    /// where one copy is load-bearing is the shape that deadlocks the day a sixth kind is added by copying
+    /// the wrong template, so a sixth *copy* is the regression worth catching.
+    ///
+    /// Scanned against this file's own source, the way
+    /// `no_caller_facing_message_has_source_indentation_baked_into_it` is, because the alternative is a
+    /// reply assertion per kind and each of those needs a live JVM: the block runs under the session
+    /// guard, so nothing can reach it without a socket (ADR-0049). A source scan is the only thing here
+    /// that notices a copy.
+    #[test]
+    fn the_clamp_and_note_block_has_exactly_one_caller() {
+        let src = include_str!("handlers.rs");
+        // The tests below call these helpers directly and legitimately, so only production code counts.
+        let production = src.split("\n#[cfg(test)]\n").next().expect("this file has a test module");
+
+        for name in [
+            "clamp_trace_frames",
+            "clamp_trace_max_length",
+            "resolve_trace_exprs",
+            "describe_took_session_default",
+        ] {
+            let call = format!("{name}(");
+            let definition = format!("fn {call}");
+            let callers: Vec<&str> = production
+                .lines()
+                // A `//` or `///` line is prose for a reader of the source, not a call.
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| l.contains(&call) && !l.contains(&definition))
+                .collect();
+            assert_eq!(
+                callers.len(),
+                1,
+                "`{name}` must be reached only through `TraceArm::resolve`, so a sixth stop-point kind \
+                 cannot re-copy the block the five were collapsed into. Found {} call site(s): \
+                 {callers:#?}",
+                callers.len()
+            );
+        }
     }
 
     // TRACE-5: the depth is visible in `list_stop_points` (so a slowed debuggee is explainable), and
