@@ -1373,8 +1373,11 @@ impl RequestHandler {
         };
 
         check_readonly_exprs(session.read_only, base.condition.as_deref(), &base.trace_expr)?;
-        check_instance_filter_supported(&mut session.connection, base.instance_filter).await?;
-        check_thread_filter(&mut session.connection, base.thread_filter).await?;
+        check_filters(
+            &mut session.connection,
+            StopFilters { thread: base.thread_filter, instance: base.instance_filter },
+        )
+        .await?;
 
         // ONE EXACT CLASS KEEPS THE REPLY IT HAS ALWAYS HAD, down to the wording — including the error
         // when it fails. FILT-4 widened what this tool accepts; it must not have widened what the ordinary
@@ -3640,8 +3643,11 @@ impl RequestHandler {
         // applies InstanceOnly on an EXCEPTION request. Measured on Temurin 17/21/25 against two live
         // instances throwing the same type from the same line — 26 records, all of them the filtered
         // instance, none from its twin (FILT-9, ADR-0027).
-        check_instance_filter_supported(&mut session.connection, instance_filter).await?;
-        check_thread_filter(&mut session.connection, thread_filter).await?;
+        check_filters(
+            &mut session.connection,
+            StopFilters { thread: thread_filter, instance: instance_filter },
+        )
+        .await?;
         let resolved = ResolvedTrace::resolve(&a, &session.trace_exprs);
         let max_classes = clamped_max_classes(a.max_classes);
 
@@ -3717,8 +3723,11 @@ impl RequestHandler {
 
         let thread_filter = crate::args::parse_thread_id(a.thread_id.as_deref());
         let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
-        check_instance_filter_supported(&mut session.connection, instance_filter).await?;
-        check_thread_filter(&mut session.connection, thread_filter).await?;
+        check_filters(
+            &mut session.connection,
+            StopFilters { thread: thread_filter, instance: instance_filter },
+        )
+        .await?;
         let resolved = ResolvedTrace::resolve(&a, &session.trace_exprs);
         let max_classes = clamped_max_classes(a.max_classes);
         let arm = FieldArm {
@@ -4234,6 +4243,28 @@ async fn object_is_gone(conn: &mut jdwp_client::JdwpConnection, oid: u64) -> boo
 struct StopFilters {
     thread: Option<u64>,
     instance: Option<u64>,
+}
+
+/// Both filter preconditions, in the order the caller sees, for the three kinds that take both.
+///
+/// `instance_id` is refused before `thread_id` is looked up. That order is what line, exception and field
+/// each had, at three sites, and it is caller-visible — a call naming both a filter this kind cannot apply
+/// and a thread that has since exited gets the instance refusal — so it is preserved here rather than
+/// reasoned about (CLEAN-5, #188).
+///
+/// **Nothing tests that order, which is the argument for this function rather than a caveat on it.** Flipping
+/// the two lines below leaves all 229 JVM tests and all 271 unit tests green — measured, not assumed. A
+/// property no test defends is one that survives only by being written down in few enough places to stay
+/// consistent, and three was already too many; one is the whole protection there is.
+///
+/// **The other two kinds are deliberately not routed through this**, and each for a reason that forcing them
+/// in would lose. `set_method_exit_stop` *refuses* an instance filter where these three check one, because
+/// `InstanceOnly` is accepted and never applied on a `METHOD_EXIT` request (measured **inert**, ADR-0027).
+/// `set_monitor_stop` takes no instance filter at all, and puts its capability refusal between the
+/// read-only check and the thread lookup. Both are domain orderings, not ceremony.
+async fn check_filters(conn: &mut jdwp_client::JdwpConnection, filters: StopFilters) -> Result<(), String> {
+    check_instance_filter_supported(conn, filters.instance).await?;
+    check_thread_filter(conn, filters.thread).await
 }
 
 /// Refuse `instance_id` on a stop point that has no `this` to match (FILT-9). **Measured inert.**
@@ -26023,6 +26054,9 @@ mod tests {
             "resolve_trace_exprs",
             "describe_took_session_default",
             "load_class_index",
+            // Its pair, `check_thread_filter`, is not here and cannot be: `set_method_exit_stop` and
+            // `set_monitor_stop` each call it alone, for the reasons on `check_filters`.
+            "check_instance_filter_supported",
         ] {
             let call = format!("{name}(");
             let definition = format!("fn {call}");
