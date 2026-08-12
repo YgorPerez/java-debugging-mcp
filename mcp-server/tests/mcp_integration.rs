@@ -22,7 +22,7 @@ mod common;
 use common::cassette::{cassette_path, rerecording, Cassette, CassetteRecorder, ReplayServer, RERECORD_ENV};
 use common::{
     assert_contains_all, jdk_or_skip, probe_line, probe_source, probe_source_path, refusal_verdict,
-    resume_verdict, EventFault, Fault, FaultRelay, Jdk, JvmState, LatencyRelay, Probe, Server,
+    resume_verdict, EventFault, Fault, FaultRelay, InProcess, Jdk, JvmState, LatencyRelay, Probe, Server,
     EVENT_KIND_BREAKPOINT, EVENT_TIMEOUT,
 };
 
@@ -16399,9 +16399,15 @@ fn a_jvm_that_cannot_report_monitor_events_is_told_so_with_the_fallback_named() 
 /// cheap test rather than five slow ones. Three of the five exist because a JDWP modifier does not mean
 /// what the argument reads like on this event kind (measured, ADR-0035) and two because a duration measured
 /// across a pair needs the pair.
+///
+/// It needs no process either, and since CLEAN-3 (#186) it does not spawn one. The doc comment above
+/// already said this never reaches the debuggee; the subject is a pure request→reply function, and
+/// [`InProcess`] crosses that same seam without a fork, two pipes and a handshake. The assertions are
+/// unchanged — which is the point, and the reason this is the one test converted here rather than the
+/// twenty-seven that could be.
 #[test]
 fn every_monitor_arming_refusal_explains_itself_before_touching_the_debuggee() {
-    let mut server = Server::start().expect("start server");
+    let mut server = InProcess::start();
 
     let cases: Vec<(serde_json::Value, Vec<&str>)> = vec![
         // InstanceOnly: accepted by HotSpot and ignored, so it is refused rather than passed through.

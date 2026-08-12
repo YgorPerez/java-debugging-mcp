@@ -180,7 +180,7 @@ it covers **42 tools and 239 arguments** by construction: each argument's full s
 argument — the same thing the tool description is one level up, and this file's insistence that an audit count
 **arguments** rather than tools is the reason it exists. It caught nothing before it was written because it did
 not exist: five argument descriptions changed in v0.14.1 and the suite showed no diff at all. Both snapshots
-regenerate with the one command, `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot`.
+regenerate with the one command, `UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot`.
 
 ## What to do when cutting a release
 

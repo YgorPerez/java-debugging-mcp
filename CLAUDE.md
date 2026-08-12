@@ -51,7 +51,7 @@ caller-visible jobs. The glossary carries **Session default** with that collisio
 the same commit.** `docs/toolkit-contract.md` is why: six of the seven ways a change here reaches the
 downstream toolkit are silent, and the notes are the only mitigation for most of them.
 
-**Regenerate a snapshot with `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot`, then read the
+**Regenerate a snapshot with `UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot`, then read the
 diff.** One command rewrites all three snapshots. Reading the diff *is* the mechanism — DOC-7 (#108)
 shipped interleaved gibberish in a release because nobody read a 4000-character line. The same rule applies
 to `scripts/tests/run.sh --update`.

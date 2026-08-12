@@ -35,8 +35,17 @@
 #
 # ## What it covers, and what it does not
 #
-# **Covers:** `jdwp-client`'s public API. That is the only lib target in the workspace — `jdwp-mcp` is a
-# `[[bin]]`, and cargo-semver-checks only reads libraries, so it contributes nothing to this check.
+# **Covers:** the public Rust API of both lib targets in the workspace — `jdwp-client` and, since CLEAN-3
+# (#186), `jdwp-mcp`. This ran `--workspace` all along, so the second package arrived in the report the day
+# it grew a `[lib]`; the sentence that used to stand here said `jdwp-mcp` was a `[[bin]]` contributing
+# nothing, and it stopped being true in the commit that added the library.
+#
+# **`jdwp-mcp`'s library is not a supported API** and its findings should be read that way. Every item it
+# exports is `#[doc(hidden)]` and exists so this repository's own tests can reach the request→reply path
+# in-process; `mcp-server/src/lib.rs` says so in its crate docs. `#[doc(hidden)]` does NOT hide an item from
+# cargo-semver-checks, so churn there will show up here — that is expected, it is reported rather than
+# failed between releases for the reason below, and the documented stance is the mitigation rather than the
+# attribute.
 #
 # **Does not cover the thing callers actually depend on**, which is the MCP tool surface: tool names,
 # argument names, reply shapes. Nothing in Rust's type system knows that `debug.set_line_stop` renamed an

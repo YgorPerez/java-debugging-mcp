@@ -1,5 +1,5 @@
 # Every debug.* tool description, word-wrapped at 110 columns. GENERATED — do not hand-edit:
-#     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot
+#     UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot
 #
 # This file exists so that a change to a tool description has to be READ by somebody. Two merges
 # in the v0.9.0 range interleaved two of these single-line string literals and shipped the

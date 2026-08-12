@@ -575,3 +575,75 @@ fn release_notes_still_offers_the_list_the_commit_msg_hook_asks_for() {
         );
     }
 }
+
+/// `scripts/semver-check.sh` runs `cargo semver-checks --workspace`, so what it covers is not a choice the
+/// script makes — it is "every package in this workspace with a lib target", and the header only restates
+/// it. That restatement rotted the moment CLEAN-3 (#186) gave `jdwp-mcp` a `[lib]`: the sentence there said
+/// `jdwp-client` was "the only lib target in the workspace — `jdwp-mcp` is a `[[bin]]` … so it contributes
+/// nothing to this check", which had been true right up to that commit and silently false after it.
+///
+/// This asserts both directions, because the claim is wrong either way round: if `mcp-server` has a lib
+/// target the header must say so, and if it ever loses one the header must stop saying so.
+#[test]
+fn semver_check_names_the_lib_targets_it_actually_reads() {
+    let script = read("scripts/semver-check.sh");
+    assert!(
+        script.contains("--workspace"),
+        "scripts/semver-check.sh no longer passes --workspace, so what it covers is now a choice the \
+         script makes rather than a fact about the manifests — and the reasoning below no longer applies."
+    );
+
+    let manifest = read("mcp-server/Cargo.toml");
+    let mcp_is_a_lib = manifest.contains("[lib]");
+    assert_eq!(
+        mcp_is_a_lib,
+        script.contains("`jdwp-mcp`"),
+        "mcp-server/Cargo.toml {} a [lib], and scripts/semver-check.sh's `Covers:` paragraph {} name \
+         `jdwp-mcp`. A --workspace run reads every lib target there is; a header that disagrees with the \
+         manifests is the claim #186 had to correct in the commit that falsified it.",
+        if mcp_is_a_lib { "has" } else { "does not have" },
+        if mcp_is_a_lib { "does not" } else { "still does" },
+    );
+
+    assert!(
+        !script.contains("the only lib target in the workspace"),
+        "scripts/semver-check.sh is back to claiming one lib target. There are two."
+    );
+}
+
+/// The snapshot regeneration command names a cargo target, and naming the wrong one is a VACUOUS PASS
+/// rather than an error: `cargo test --bin jdwp-mcp _snapshot` runs 0 tests and exits 0. It was the right
+/// command until CLEAN-3 (#186) moved the modules — and with them all 229 unit tests — behind a `[lib]`.
+///
+/// The command appears in 17 places, including the generated header of all three snapshot files, so this
+/// checks the one property that makes any of them true: the tests are in the target the command selects.
+/// `CLAUDE.md` calls reading the regenerated diff "the mechanism"; a command that regenerates nothing
+/// retires the mechanism while still printing `ok`.
+#[test]
+fn the_snapshot_regeneration_command_names_the_target_the_tests_are_in() {
+    let manifest = read("mcp-server/Cargo.toml");
+    assert!(
+        manifest.contains("[lib]"),
+        "mcp-server has no [lib], so the unit tests are back in the bin and every `-p jdwp-mcp --lib` \
+         below now runs 0 tests and exits 0."
+    );
+
+    for path in [
+        "CLAUDE.md",
+        "docs/tools.md",
+        "docs/toolkit-contract.md",
+        "mcp-server/src/tools.rs",
+        "mcp-server/src/handlers.rs",
+        "mcp-server/tests/tool-descriptions.txt",
+        "mcp-server/tests/argument-schemas.txt",
+        "mcp-server/tests/reply-fragments.txt",
+    ] {
+        let body = read(path);
+        assert!(
+            !body.contains("--bin jdwp-mcp"),
+            "{path} tells a reader to regenerate with `cargo test --bin jdwp-mcp`. The bin has no tests: \
+             that command runs 0 of them and exits 0, so the reader gets a green run and an unchanged \
+             snapshot. The working form is `cargo test -p jdwp-mcp --lib _snapshot`."
+        );
+    }
+}

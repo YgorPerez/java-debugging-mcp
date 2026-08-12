@@ -2374,3 +2374,89 @@ pub fn assert_contains_all(label: &str, got: &str, wants: &[&str]) {
     let missing: Vec<&str> = wants.iter().copied().filter(|w| !got.contains(w)).collect();
     assert!(missing.is_empty(), "{label}: missing {missing:?}\n  got: {got}");
 }
+
+/// The same server, reached in-process rather than through a pipe (CLEAN-3, #186).
+///
+/// [`Server`] above spawns `CARGO_BIN_EXE_jdwp-mcp` and talks JSON-RPC over stdio, which is the right
+/// harness for anything whose subject is the transport or the process — `stdio_protocol.rs`'s framing
+/// tests, and every test that needs a probe JVM, where the JVM dominates and the subprocess is free.
+///
+/// It is the wrong harness for a test that needs no debuggee at all. The refusal tables, the two verdict
+/// matrices and the cassette-free argument checks are assertions about a **pure function**: `handle_request`
+/// takes a request, returns a response, and performs no I/O. Reaching it through a fork, two pipes and a
+/// JSON-RPC handshake pays process startup to test something two frames below the pipe.
+///
+/// So this crosses the same seam — the MCP tool call — with the other adapter. Same `RequestHandler`, same
+/// routing, same replies; no process, no pipes, no `initialize` handshake to wait on.
+///
+/// **It does not replace [`Server`].** Anything that asserts on framing, on stderr, on exit status, or on
+/// what a real JVM answers keeps the process, because none of those exist here to be tested.
+pub struct InProcess {
+    /// Current-thread and owned by the harness, so a `#[test]` stays an ordinary sync function and the
+    /// converted tests read exactly as they did.
+    runtime: tokio::runtime::Runtime,
+    handler: jdwp_mcp::handlers::RequestHandler,
+    /// The alert channel's receiving half, held only so it stays open. `Alerter` drops an alert when the
+    /// queue is full and reports a send error when the receiver is gone; neither is this harness's
+    /// subject, and a closed channel would be a difference from the real process for no reason.
+    _alerts: tokio::sync::mpsc::Receiver<String>,
+    next_id: i64,
+}
+
+impl InProcess {
+    /// A handler with an armed alerter, ready for `tools/call`.
+    ///
+    /// No `initialize` is sent. The handshake is a protocol step the transport carries, and its own
+    /// behaviour (era selection, when pushing is allowed) is tested where it lives — through [`Server`],
+    /// against the process that actually performs it.
+    pub fn start() -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(jdwp_mcp::protocol::ALERT_CAPACITY);
+        let handler = jdwp_mcp::handlers::RequestHandler::new(jdwp_mcp::protocol::Alerter::new(tx));
+        Self { runtime, handler, _alerts: rx, next_id: 1 }
+    }
+
+    /// Send one request and return the parsed response — the in-process twin of [`Server::request`].
+    ///
+    /// This goes through `jdwp_mcp::handle_message`, the same function `main.rs`'s read loop calls, so the
+    /// parse-error and invalid-request branches are on this path too and a raw line can drive them.
+    ///
+    /// `&self` rather than [`Server::raw`]'s `&mut self`: there is no pipe to have exclusive access to,
+    /// and nothing here is sequenced by ownership. Callers hold a `mut` binding anyway for
+    /// [`request`](Self::request), which does advance the id counter.
+    pub fn raw(&self, line: &str) -> Result<serde_json::Value, String> {
+        let reply = self
+            .runtime
+            .block_on(jdwp_mcp::handle_message(&self.handler, line))
+            .map_err(|e| format!("handle_message: {e}"))?
+            .ok_or("the server answered nothing (a notification, or a line it stayed quiet about)")?;
+        serde_json::from_str(&reply).map_err(|e| format!("server produced a non-JSON reply ({e}): {reply:?}"))
+    }
+
+    /// Send one well-formed request and return the response — the in-process twin of [`Server::request`].
+    #[allow(clippy::needless_pass_by_value)] // same reason as `Server::request`: callers build `json!` inline
+    pub fn request(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        self.raw(&req.to_string())
+    }
+
+    /// Call one tool and return its text reply — the in-process twin of [`Server::call`], with the same
+    /// `<rpc error>` shape so an assertion written against one reads the same against the other.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn call(&mut self, tool: &str, args: serde_json::Value) -> String {
+        match self.request("tools/call", serde_json::json!({"name": tool, "arguments": args})) {
+            Ok(resp) => {
+                if let Some(err) = resp.get("error") {
+                    return format!("<rpc error> {err}");
+                }
+                resp["result"]["content"][0]["text"].as_str().unwrap_or("<no text>").to_string()
+            }
+            Err(e) => format!("<transport error> {e}"),
+        }
+    }
+}

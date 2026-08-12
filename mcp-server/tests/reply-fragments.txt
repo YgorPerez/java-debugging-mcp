@@ -1,5 +1,5 @@
 # Caller-visible reply FRAGMENTS from the pure renderers. GENERATED — do not hand-edit:
-#     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot
+#     UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot
 #
 # This file exists because 163 substring assertions cannot see a REWORDING, and a reworded
 # reply behind an unchanged tool name is the silent break docs/toolkit-contract.md is about.

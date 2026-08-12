@@ -11,6 +11,19 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+# The library is the request→reply path; the binary is the stdio adapter over it (CLEAN-3, #186).
+#
+# `name` is the crate name imports use and it is unchanged from what cargo would have defaulted to —
+# spelled out because the binary next to it differs by a hyphen and that has caught people out
+# elsewhere in this workspace (`cargo clean -p jdwp-client` cleans nothing and exits 0).
+#
+# **This library is not a supported API.** See `src/lib.rs`'s crate docs: the supported surface is the
+# MCP tool set, everything exported here is `#[doc(hidden)]`, and `cargo-semver-checks` now reads two
+# packages rather than one (`scripts/semver-check.sh`).
+[lib]
+name = "jdwp_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "jdwp-mcp"
 path = "src/main.rs"

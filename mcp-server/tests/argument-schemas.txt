@@ -1,5 +1,5 @@
 # Every debug.* tool's ARGUMENT schemas, as advertised to callers. GENERATED — do not hand-edit:
-#     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot
+#     UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot
 #
 # 42 tools, 239 arguments.
 #

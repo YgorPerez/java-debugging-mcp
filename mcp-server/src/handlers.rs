@@ -449,6 +449,7 @@ struct SessionDefaults<'a> {
 }
 
 impl RequestHandler {
+    #[must_use]
     pub fn new(alerter: crate::protocol::Alerter) -> Self {
         Self { session_manager: SessionManager::new(alerter.clone()), alerter }
     }
@@ -25513,7 +25514,7 @@ mod tests {
         let committed = std::fs::read_to_string(&path).unwrap_or_else(|why| {
             panic!(
                 "cannot read the reply-fragment snapshot at {}: {why}. Create it with \
-                 UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot",
+                 UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot",
                 path.display()
             )
         });
@@ -25537,7 +25538,7 @@ mod tests {
             };
             panic!(
                 "a caller-visible reply fragment changed without its snapshot being updated.\n\n{first}\n\n\
-                 If the change was deliberate: UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp \
+                 If the change was deliberate: UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib \
                  _snapshot, then READ THE DIFF — and say it in the release notes, because a reworded reply \
                  behind an unchanged tool name is a silent break downstream (docs/toolkit-contract.md)."
             );
@@ -25548,7 +25549,7 @@ mod tests {
     fn render_reply_fragment_snapshot() -> String {
         let mut out = String::from(
             "# Caller-visible reply FRAGMENTS from the pure renderers. GENERATED — do not hand-edit:\n\
-             #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot\n\
+             #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot\n\
              #\n\
              # This file exists because 163 substring assertions cannot see a REWORDING, and a reworded\n\
              # reply behind an unchanged tool name is the silent break docs/toolkit-contract.md is about.\n\

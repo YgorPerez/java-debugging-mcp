@@ -2,6 +2,9 @@
 // locally so `cargo clippy` surfaces exactly what CI does. rust-doctor enables
 // clippy's pedantic/nursery/cargo groups plus a curated set of restriction
 // lints via command-line flags; declaring them here keeps the two in sync.
+//
+// The same policy is declared in `lib.rs`, which is the root the unit tests compile under. Both roots
+// carry it because a crate attribute applies to one crate, and this package builds two.
 #![warn(clippy::pedantic, clippy::nursery)]
 #![warn(
     clippy::unwrap_used,
@@ -12,36 +15,20 @@
     clippy::print_stdout,
     clippy::print_stderr
 )]
-// Restriction lints above target production code; unit tests may panic on failure, so `unwrap`,
-// `expect`, indexing, and assertions are idiomatic there.
-#![cfg_attr(
-    test,
-    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic_in_result_fn)
-)]
-// JDWP MCP Server - Java debugging via Model Context Protocol
+// JDWP MCP Server — the stdio adapter.
 //
-// Provides LLM-friendly debugging tools for JVM applications via JDWP
+// Everything that turns a request into a reply lives in the library beside this file
+// (`jdwp_mcp::handle_message`), which performs no I/O. What stays here is transport and process
+// lifecycle: the stdin read loop, the single stdout-owning writer task, and shutdown. ADR-0012 makes
+// stdout ownership an invariant, and the invariant belongs with the task that holds it (CLEAN-3, #186).
 
 use anyhow::Result;
-use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, info};
 
-mod args;
-mod classfile;
-mod generics;
-mod handlers;
-mod protocol;
-mod session;
-mod stop_point_set;
-mod tools;
-mod value_reads;
-
-use handlers::RequestHandler;
-use protocol::{
-    Alerter, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ALERT_CAPACITY,
-    INVALID_REQUEST, PARSE_ERROR,
-};
+use jdwp_mcp::handle_message;
+use jdwp_mcp::handlers::RequestHandler;
+use jdwp_mcp::protocol::{Alerter, ALERT_CAPACITY};
 use tokio::sync::mpsc;
 
 /// How long to let the writer task drain after stdin closes, before giving up on it (EVT-2).
@@ -111,7 +98,9 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 debug!("Received: {}", line);
-                process_line(&handler, &out_tx, line).await?;
+                if let Some(response) = handle_message(&handler, line).await? {
+                    send_message(&out_tx, response).await?;
+                }
             }
             Err(e) => {
                 error!("Read error: {}", e);
@@ -131,28 +120,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Build a JSON-RPC error response with a null id (used for messages we couldn't parse or route).
-fn error_response(code: i32, message: &str) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: "2.0".to_string(),
-        id: serde_json::Value::Null,
-        result: None,
-        error: Some(JsonRpcError { code, message: message.to_string(), data: None }),
-    }
-}
-
-/// Name a JSON value's kind for an error message — what arrived instead of an object.
-const fn kind_of(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
-}
-
 /// Write one framed JSON-RPC message (line + newline) to stdout and flush.
 async fn write_message<W: AsyncWriteExt + Unpin>(stdout: &mut W, message: &str) -> Result<()> {
     debug!("Sending: {}", message);
@@ -166,58 +133,7 @@ async fn write_message<W: AsyncWriteExt + Unpin>(stdout: &mut W, message: &str) 
 ///
 /// `.await`s for capacity rather than dropping: this path carries **responses**, and a dropped
 /// response leaves a client waiting on a reply that will never come. Alerts take the
-/// try-send path in [`Alerter`] instead, where dropping is the correct behaviour.
+/// try-send path in `Alerter` instead, where dropping is the correct behaviour.
 async fn send_message(out: &mpsc::Sender<String>, message: String) -> Result<()> {
     out.send(message).await.map_err(|_| anyhow::anyhow!("stdout writer task has gone away"))
-}
-
-/// Parse and dispatch one incoming line: a request gets handled and answered; a notification is
-/// handled without a reply; anything unparseable yields a JSON-RPC error response.
-async fn process_line(handler: &RequestHandler, out: &mpsc::Sender<String>, line: &str) -> Result<()> {
-    let value: Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("Parse error: {}", e);
-            let response = serde_json::to_string(&error_response(PARSE_ERROR, "Parse error"))?;
-            return send_message(out, response).await;
-        }
-    };
-
-    // A top-level value that is not an object is neither a request nor a notification, and the
-    // distinction matters because of what the two silences mean. A notification is *supposed* to get no
-    // reply, so the branch below stays quiet for anything object-shaped without an `id`. A bare scalar or
-    // array has no `id` either, and used to fall into that same branch — parsed as a notification,
-    // failed, logged to stderr, answered with nothing. So `42` or `"hello"` (both valid JSON, so not a
-    // parse error) left a client waiting forever on a reply that was never coming, which is the one
-    // outcome worse than an error. JSON-RPC 2.0's own example for a non-object is an Invalid Request with
-    // a null id; found by TEST-9 (#25) while covering these arms.
-    if !value.is_object() {
-        error!("Not a JSON-RPC message: expected an object, got {}", kind_of(&value));
-        let response = serde_json::to_string(&error_response(
-            INVALID_REQUEST,
-            "Invalid request: a JSON-RPC message must be an object",
-        ))?;
-        return send_message(out, response).await;
-    }
-
-    // Requests carry an id; notifications don't.
-    if value.get("id").is_some() {
-        match serde_json::from_value::<JsonRpcRequest>(value) {
-            Ok(request) => {
-                let response = handler.handle_request(request).await;
-                send_message(out, serde_json::to_string(&response)?).await?;
-            }
-            Err(e) => {
-                error!("Invalid request: {}", e);
-                let response = serde_json::to_string(&error_response(INVALID_REQUEST, "Invalid request"))?;
-                send_message(out, response).await?;
-            }
-        }
-    } else {
-        match serde_json::from_value::<JsonRpcNotification>(value) {
-            Ok(notification) => handler.handle_notification(&notification),
-            Err(e) => error!("Invalid notification: {}", e),
-        }
-    }
-    Ok(())
 }

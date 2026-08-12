@@ -6,7 +6,7 @@ is in [the README](../README.md); this is the full surface.
 The **descriptions the caller actually receives** are snapshotted in
 `mcp-server/tests/tool-descriptions.txt`, and every argument's schema in
 `mcp-server/tests/argument-schemas.txt` (40 tools, 228 arguments). Both are generated —
-`UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot` — and committed so that a change to
+`UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot` — and committed so that a change to
 what a caller reads has to be reviewed by somebody (`docs/toolkit-contract.md`).
 
 | Tool | Description |

@@ -126,6 +126,7 @@ pub struct Alerter {
 }
 
 impl Alerter {
+    #[must_use]
     pub fn new(tx: tokio::sync::mpsc::Sender<String>) -> Self {
         Self {
             tx,
@@ -150,6 +151,10 @@ impl Alerter {
     ///
     /// Returns whether this changed the answer, so a caller can log the transition once rather than on
     /// every request.
+    // Not a `#[must_use]` candidate despite the `&self`: this SWAPS an atomic, so the call is worth
+    // making for its effect alone, and the handshake in `handle_request` does exactly that. The lint
+    // reads `&self` + a return value as a pure query, which is the one thing this is not.
+    #[allow(clippy::must_use_candidate)]
     pub fn note_era(&self, era: Era) -> bool {
         self.era.swap(era as u8, std::sync::atomic::Ordering::Relaxed) != era as u8
     }
@@ -241,6 +246,7 @@ impl Alerter {
 
 /// `JDWP_ALERTS=0` turns push notifications off entirely, leaving `debug.get_last_event` as the
 /// only way to learn about a hit. Same spelling convention as `JDWP_READONLY` / `JDWP_WATCHDOG_SECS`.
+#[must_use]
 pub fn alerts_enabled() -> bool {
     std::env::var("JDWP_ALERTS")
         .map_or(true, |v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
@@ -434,9 +440,10 @@ pub const LOG_LEVELS: [&str; 8] =
 /// wrong is one extra `tools/list`.
 pub const CACHE_TTL_MS: u64 = 3_600_000;
 
-/// `public`: nothing in a list reply varies by caller and none of it is secret. This server has no
-/// authorization surface at all (stdio takes credentials from the environment), so there is no
-/// per-caller variation for a shared intermediary to leak.
+/// `public`: nothing in a list reply varies by caller and none of it is secret.
+///
+/// This server has no authorization surface at all (stdio takes credentials from the environment), so
+/// there is no per-caller variation for a shared intermediary to leak.
 pub const CACHE_SCOPE: &str = "public";
 
 /// Which protocol era the client on the other end opened in (MCP-1).

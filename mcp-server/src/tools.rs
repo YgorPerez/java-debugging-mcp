@@ -83,6 +83,7 @@ fn with_session_id(mut schema: serde_json::Value) -> serde_json::Value {
 ///
 /// Split into themed groups purely so each stays readable — the MCP client sees one flat list, in
 /// the order assembled here.
+#[must_use]
 pub fn get_tools() -> Vec<Tool> {
     let mut tools = session_tools();
     tools.extend(stop_point_tools());
@@ -499,7 +500,7 @@ mod tests {
     /// wrong in a file where `debug.evaluate` and `Klass.CONSTANT` are ordinary text. Wrapping needs no
     /// heuristic and still makes a corrupted clause a two-line diff.
     ///
-    /// Regenerate with `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot`, then read the
+    /// Regenerate with `UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot`, then read the
     /// diff — that is the whole point of it. The filter is `_snapshot` rather than this test's own name
     /// because there are two of these now and one command has to rewrite both: a filter naming one of them
     /// leaves the other failing against a file it was never given the chance to update, which is a
@@ -519,7 +520,7 @@ mod tests {
         let committed = std::fs::read_to_string(&path).unwrap_or_else(|why| {
             panic!(
                 "cannot read the tool-description snapshot at {}: {why}. Create it with \
-                 UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot",
+                 UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot",
                 path.display()
             )
         });
@@ -541,7 +542,7 @@ mod tests {
             };
             panic!(
                 "a tool description changed without its snapshot being updated.\n\n{first}\n\nIf the change \
-                 was deliberate: UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot, then \
+                 was deliberate: UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot, then \
                  READ THE DIFF — a caller-visible change behind an unchanged tool name is what \
                  docs/toolkit-contract.md is for. If it was not deliberate, a merge has shredded a \
                  one-line string literal again (DOC-7, #108)."
@@ -554,7 +555,7 @@ mod tests {
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         let mut out = String::from(
             "# Every debug.* tool description, word-wrapped at 110 columns. GENERATED — do not hand-edit:\n\
-             #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot\n\
+             #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot\n\
              #\n\
              # This file exists so that a change to a tool description has to be READ by somebody. Two merges\n\
              # in the v0.9.0 range interleaved two of these single-line string literals and shipped the\n\
@@ -680,7 +681,7 @@ mod tests {
     /// other thing the description snapshot guards — a caller-visible change behind an unchanged tool name
     /// has to be READ by somebody.
     ///
-    /// Regenerate with `UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot`, the same one
+    /// Regenerate with `UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot`, the same one
     /// command that regenerates the description snapshot, then read the diff.
 
     #[test]
@@ -697,7 +698,7 @@ mod tests {
         let committed = std::fs::read_to_string(&path).unwrap_or_else(|why| {
             panic!(
                 "cannot read the argument-schema snapshot at {}: {why}. Create it with \
-                 UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot",
+                 UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot",
                 path.display()
             )
         });
@@ -719,7 +720,7 @@ mod tests {
             panic!(
                 "an argument's type, default or description changed without its snapshot being \
                  updated.\n\n{first}\n\nIf the change was deliberate: UPDATE_TOOL_DESCRIPTIONS=1 cargo test \
-                 --bin jdwp-mcp _snapshot, then READ THE DIFF — these are published to callers as \
+                 -p jdwp-mcp --lib _snapshot, then READ THE DIFF — these are published to callers as \
                  the inputSchema, and a caller-visible change behind an unchanged tool name is what \
                  docs/toolkit-contract.md is for."
             );
@@ -741,7 +742,7 @@ mod tests {
             .sum();
         let mut out = format!(
             "# Every debug.* tool's ARGUMENT schemas, as advertised to callers. GENERATED — do not hand-edit:\n\
-             #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test --bin jdwp-mcp _snapshot\n\
+             #     UPDATE_TOOL_DESCRIPTIONS=1 cargo test -p jdwp-mcp --lib _snapshot\n\
              #\n\
              # {} tools, {arg_count} arguments.\n\
              #\n\
