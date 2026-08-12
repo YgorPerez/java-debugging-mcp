@@ -9209,14 +9209,6 @@ fn descriptor_candidates(class_name: &str) -> Vec<String> {
     candidates
 }
 
-/// Collect a class's methods as `(declaring class, rendered signature)` pairs (DISC-2).
-///
-/// Kept flat rather than grouped by declaring class: an overload set spread across a class and its
-/// parent is exactly the comparison the caller is trying to make, so splitting it into sections would
-/// hide the thing they came for.
-///
-/// Split out of the handler because the superclass walk is the only real logic in it — the rest is
-/// argument handling and formatting, and the two do not need to be read together.
 /// What a method listing had to go to the debuggee for (DISC-2), separated from how it renders.
 ///
 /// The split is CLEAN-7 (#190)'s: everything below this line is a pure function of these two values, so
@@ -9253,7 +9245,12 @@ fn render_method_listing(read: &MethodListing, a: &crate::args::ListMethodsArgs)
     let limit = a.limit.max(1);
 
     // Sorted by rendered form so overloads land together, which is the comparison being made.
-    let mut rows = read.rows.clone();
+    //
+    // A vector of references, like the field listing below, and NOT a clone of the rows: cloning would
+    // deep-copy one rendered `String` per matched row, which is exactly the per-row re-allocation
+    // `collect_method_rows` keeps its `Arc<str>` owner to avoid. Worst on `inherited:true`, where the
+    // walk is longest.
+    let mut rows: Vec<&(std::sync::Arc<str>, String)> = read.rows.iter().collect();
     rows.sort_by(|x, y| x.1.cmp(&y.1));
     let matched = rows.len();
     let shown = matched.min(limit);
@@ -9347,6 +9344,14 @@ fn render_field_listing(read: &FieldListing, a: &crate::args::ListFieldsArgs) ->
     output + read.loader_note.as_deref().unwrap_or("")
 }
 
+/// Collect a class's methods as `(declaring class, rendered signature)` pairs (DISC-2).
+///
+/// Kept flat rather than grouped by declaring class: an overload set spread across a class and its
+/// parent is exactly the comparison the caller is trying to make, so splitting it into sections would
+/// hide the thing they came for.
+///
+/// Split out of the handler because the superclass walk is the only real logic in it — the rest is
+/// argument handling and formatting, and the two do not need to be read together.
 async fn collect_method_rows(
     reads: &mut crate::reads::Reads<'_>,
     start: u64,

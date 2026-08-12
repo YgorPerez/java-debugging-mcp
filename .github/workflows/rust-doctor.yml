@@ -415,9 +415,12 @@ jobs:
   # which cannot answer for a commit between releases — the case this job runs on. Before REL-5 it was
   # wrong in a louder way, comparing against bonk-dev/jdwp-client, an unrelated project that held the name
   # our library has since been renamed away from. See
-  # scripts/semver-check.sh for the whole argument, and for what this covers (jdwp-client's lib API —
-  # jdwp-mcp is a [[bin]] and contributes nothing) versus what it cannot (the MCP tool surface, which is
-  # what callers actually pin, and which only docs/toolkit-contract.md covers).
+  # scripts/semver-check.sh for the whole argument, and for what this covers (BOTH lib targets in the
+  # workspace — jdwp-client, and jdwp-mcp since CLEAN-3/#186 gave it one; the run was always `--workspace`,
+  # so the second arrived in the report the day the [lib] did) versus what it cannot (the MCP tool surface,
+  # which is what callers actually pin, and which only docs/toolkit-contract.md covers). jdwp-mcp's library
+  # is `#[doc(hidden)]` and not a supported API, so its findings are noise to be read as such rather than
+  # signal about the tool surface.
   #
   # IT GATES ON THE RELEASE PATH ONLY, and that is a change (CI-2, #122). release.yml passes
   # `gate_semver: true`, so a violation still blocks a tag — which is the point: the version number is what

@@ -595,20 +595,28 @@ fn semver_check_names_the_lib_targets_it_actually_reads() {
 
     let manifest = read("mcp-server/Cargo.toml");
     let mcp_is_a_lib = manifest.contains("[lib]");
-    assert_eq!(
-        mcp_is_a_lib,
-        script.contains("`jdwp-mcp`"),
-        "mcp-server/Cargo.toml {} a [lib], and scripts/semver-check.sh's `Covers:` paragraph {} name \
-         `jdwp-mcp`. A --workspace run reads every lib target there is; a header that disagrees with the \
-         manifests is the claim #186 had to correct in the commit that falsified it.",
-        if mcp_is_a_lib { "has" } else { "does not have" },
-        if mcp_is_a_lib { "does not" } else { "still does" },
-    );
 
-    assert!(
-        !script.contains("the only lib target in the workspace"),
-        "scripts/semver-check.sh is back to claiming one lib target. There are two."
-    );
+    // BOTH readers, because the claim was written down twice and only one copy was corrected first
+    // time round — `rust-doctor.yml`'s header restates it for a reader who never opens the script, which
+    // is exactly the second copy DOC-15 says will rot.
+    for path in ["scripts/semver-check.sh", ".github/workflows/rust-doctor.yml"] {
+        let body = read(path);
+        assert_eq!(
+            mcp_is_a_lib,
+            body.contains("jdwp-mcp"),
+            "mcp-server/Cargo.toml {} a [lib], and {path}'s description of what the semver check covers \
+             {} name jdwp-mcp. A --workspace run reads every lib target there is; a claim that disagrees \
+             with the manifests is what #186 had to correct in the commit that falsified it.",
+            if mcp_is_a_lib { "has" } else { "does not have" },
+            if mcp_is_a_lib { "does not" } else { "still does" },
+        );
+        assert!(
+            !body.contains("is a [[bin]] and contributes nothing")
+                && !body.contains("the only lib target in the workspace"),
+            "{path} is back to claiming jdwp-mcp contributes nothing to the semver check. It is a lib \
+             target and has been since #186."
+        );
+    }
 }
 
 /// The snapshot regeneration command names a cargo target, and naming the wrong one is a VACUOUS PASS

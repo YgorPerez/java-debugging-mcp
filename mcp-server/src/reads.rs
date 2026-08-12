@@ -99,6 +99,25 @@ impl FixtureClass {
         self.superclass = Some(superclass);
         self
     }
+
+    /// State one method's line table as `(bytecode index, source line)` pairs.
+    ///
+    /// A method with no entry here has an EMPTY table rather than an error, which is the `-g:none`
+    /// shape — so *stating nothing* is itself one of the two not-comparable cases DISC-7 cares about.
+    #[must_use]
+    pub fn with_line_table(mut self, method_id: u64, lines: &[(u64, i32)]) -> Self {
+        self.line_tables.push((
+            method_id,
+            lines
+                .iter()
+                .map(|&(line_code_index, line_number)| jdwp_client::method::LineTableEntry {
+                    line_code_index,
+                    line_number,
+                })
+                .collect(),
+        ));
+        self
+    }
 }
 
 /// A debuggee stated as data: the classes it has loaded and what it would say about each.
@@ -368,6 +387,34 @@ mod tests {
         let _ = reads.get_signature(10).await.unwrap();
         let _ = reads.get_methods(10).await.unwrap();
         assert_eq!(fx.reads(), 2, "each read served is one charged");
+    }
+
+    /// A stated line table comes back as stated, and an unstated method comes back EMPTY rather than as
+    /// an error — which is the `-g:none` shape, one of the two ways DISC-7 concludes *not comparable*.
+    ///
+    /// Asserted rather than assumed because the distinction is the whole reason `one_line_table` exists:
+    /// treating only `ABSENT_INFORMATION` as absent once made every method of a stripped class look like
+    /// drift.
+    #[tokio::test]
+    async fn a_stated_line_table_comes_back_and_an_unstated_method_comes_back_empty() {
+        let fx = Fixture::new(vec![FixtureClass::new("LOrder;", 10)
+            .with_methods(vec![method("total", "()I", 0x0001)])
+            .with_line_table(77, &[(0, 41), (8, 42), (19, 44)])]);
+        let mut reads = Reads::Fixture(&fx);
+
+        let stated = reads.get_line_table(10, 77).await.unwrap();
+        assert_eq!(
+            stated.lines.iter().map(|e| (e.line_code_index, e.line_number)).collect::<Vec<_>>(),
+            vec![(0, 41), (8, 42), (19, 44)]
+        );
+        assert_eq!((stated.start, stated.end), (0, 19), "start and end bracket the stated entries");
+
+        let unstated = reads.get_line_table(10, 999).await.unwrap();
+        assert!(
+            unstated.lines.is_empty(),
+            "a method the fixture states no table for is the `-g:none` shape — an EMPTY table, not an \
+             error, because those are two different not-comparable cases and only one of them is this one"
+        );
     }
 
     /// A superclass walk ends where the fixture says it ends, so the `inherited:true` path has a
