@@ -68,6 +68,9 @@ pub struct FixtureClass {
     pub class_loader: Option<u64>,
     /// `ReferenceType.SourceFile`, e.g. `EvalProbe.java`.
     pub source_file: Option<String>,
+    /// `Method.LineTable`, per method id. A method absent from this list has an EMPTY table, which is
+    /// the `-g:none` shape rather than an error — see [`Reads::get_line_table`].
+    pub line_tables: Vec<(u64, Vec<jdwp_client::method::LineTableEntry>)>,
     /// `ref_type_tag`: 1 = class, 2 = interface, 3 = array. Defaults to a class.
     pub tag: u8,
 }
@@ -265,6 +268,38 @@ impl<'a> Reads<'a> {
                 // the id itself keeps `describe_class_loaders` on its `0x…` branch, which is the shape a
                 // rendering test is asserting on anyway.
                 Ok(object_id)
+            }
+        }
+    }
+
+    /// One method's line table (`Method.LineTable`).
+    ///
+    /// The **source drift** verdicts (DISC-7) compare this against the `LineNumberTable` parsed out of a
+    /// `.class` on disk, so it is a read a render needs and one a fixture can state — including the two
+    /// absent shapes that mean *not comparable*: an `ABSENT_INFORMATION` error for an abstract or native
+    /// method, and a valid reply with **zero entries** for a `-g:none` class.
+    ///
+    /// # Errors
+    /// Propagates the connection's error on the live path. A fixture states a table or states none; a
+    /// stated-none is the empty table, which is the `-g:none` shape. The `ABSENT_INFORMATION` shape is
+    /// the JVM's and stays with the probe.
+    pub async fn get_line_table(
+        &mut self,
+        type_id: u64,
+        method_id: u64,
+    ) -> JdwpResult<jdwp_client::method::LineTable> {
+        match self {
+            Self::Live(conn) => conn.get_line_table(type_id, method_id).await,
+            Self::Fixture(fx) => {
+                fx.charge();
+                let lines = fx
+                    .by_id(type_id)
+                    .and_then(|c| c.line_tables.iter().find(|(m, _)| *m == method_id))
+                    .map(|(_, t)| t.clone())
+                    .unwrap_or_default();
+                let start = lines.first().map_or(0, |e| e.line_code_index);
+                let end = lines.last().map_or(0, |e| e.line_code_index);
+                Ok(jdwp_client::method::LineTable { start, end, lines })
             }
         }
     }

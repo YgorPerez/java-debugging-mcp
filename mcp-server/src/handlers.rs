@@ -2842,7 +2842,7 @@ impl RequestHandler {
         let local = local_source_section(&class_name, &file_name, &roots, &a);
         let freshness = if let Some(read) = &local.read {
             source_freshness_section(
-                &mut session.connection,
+                &mut crate::reads::Reads::live(&mut session.connection),
                 &class_name,
                 type_id,
                 &class_roots,
@@ -2927,7 +2927,8 @@ impl RequestHandler {
         }
 
         let before = session.connection.packets_sent();
-        let running = read_jvm_line_tables(&mut session.connection, type_id).await?;
+        let running =
+            read_jvm_line_tables(&mut crate::reads::Reads::live(&mut session.connection), type_id).await?;
         let mut report = compare_line_tables(&running, &built.methods);
         // DISC-9, opt-in: the second evidence, which costs a packet per method with code on both sides.
         // Inside the packet window so the reported cost is the whole cost, not the cheap half of it.
@@ -10586,16 +10587,16 @@ impl StaleReport {
 /// and neither does anything compiled `-g:none` — so it marks the method as not comparable and the walk
 /// continues.
 async fn read_jvm_line_tables(
-    conn: &mut jdwp_client::JdwpConnection,
+    reads: &mut crate::reads::Reads<'_>,
     type_id: u64,
 ) -> Result<Vec<MethodLines>, String> {
-    let methods = conn
+    let methods = reads
         .get_methods(type_id)
         .await
         .map_err(|e| format!("Failed to list the running class's methods: {e}"))?;
     let mut out = Vec::with_capacity(methods.len());
     for m in methods {
-        let (lines, comparable) = one_line_table(conn, type_id, m.method_id)
+        let (lines, comparable) = one_line_table(reads, type_id, m.method_id)
             .await
             .map_err(|e| format!("Failed to read the line table of {}: {e}", m.name))?;
         out.push(MethodLines { name: m.name, descriptor: m.signature, lines, comparable });
@@ -10610,11 +10611,11 @@ async fn read_jvm_line_tables(
 /// (a `-g:none` class, measured on `HotSpot` 21). Both mean not comparable; treating only the first as
 /// absent made every method of a stripped class look like drift.
 async fn one_line_table(
-    conn: &mut jdwp_client::JdwpConnection,
+    reads: &mut crate::reads::Reads<'_>,
     type_id: u64,
     method_id: u64,
 ) -> jdwp_client::JdwpResult<(Vec<(u64, i32)>, bool)> {
-    match conn.get_line_table(type_id, method_id).await {
+    match reads.get_line_table(type_id, method_id).await {
         Ok(t) => {
             let lines: Vec<(u64, i32)> =
                 t.lines.into_iter().map(|e| (e.line_code_index, e.line_number)).collect();
@@ -11659,7 +11660,7 @@ fn render_source_freshness(f: &SourceFreshness) -> String {
 /// output is. With no roots the reply says the check could not be made — which the caller needs, because
 /// silence here would otherwise read as a clean bill of health.
 async fn source_freshness_section(
-    conn: &mut jdwp_client::JdwpConnection,
+    reads: &mut crate::reads::Reads<'_>,
     class_name: &str,
     type_id: u64,
     class_roots: &[std::path::PathBuf],
@@ -11708,7 +11709,7 @@ async fn source_freshness_section(
             built.this_class,
         )));
     }
-    let running = match read_jvm_line_tables(conn, type_id).await {
+    let running = match read_jvm_line_tables(reads, type_id).await {
         Ok(r) => r,
         Err(e) => return render_source_freshness(&SourceFreshness::cannot_tell(e)),
     };
@@ -29767,5 +29768,97 @@ mod discovery_listing_tests {
             "an inherited walk should cost one resolve and three reads per class; a change here is a \
              change in what the debuggee is asked for, which is worth noticing deliberately"
         );
+    }
+}
+
+/// The **source drift** verdicts, driven from stated line tables and a temporary tree (CLEAN-7, #190).
+///
+/// `source_freshness` and `compare_line_tables` were already pure and already unit-tested — the *decision*
+/// was never the untested part. What had no test was `source_freshness_section`: the path that decides
+/// whether there is anything to compare at all, and which of five ways there is not. Every one of those
+/// branches returns the reply a caller reads, and reaching any of them used to mean launching a JVM
+/// because the function took a live connection.
+///
+/// #190 singles out "including the branch that says it could not check", and that is the point: a branch
+/// that reports an ABSENCE is the one most likely to be silently wrong, because its output looks like a
+/// pass to anything scanning for the word "drift".
+#[cfg(test)]
+mod source_freshness_section_tests {
+    use super::*;
+    use crate::reads::{Fixture, Reads};
+
+    fn no_reads() -> Fixture {
+        Fixture::new(Vec::new())
+    }
+
+    async fn section(class_roots: &[std::path::PathBuf], fx: &Fixture) -> String {
+        let source = (std::path::PathBuf::from("/tmp/Order.java"), 120usize);
+        source_freshness_section(
+            &mut Reads::Fixture(fx),
+            "com.example.Order",
+            10,
+            class_roots,
+            &source,
+            false,
+        )
+        .await
+    }
+
+    /// With no class roots there is no `.class` to compare against, and the reply has to say that rather
+    /// than stay quiet — silence here reads as "checked, and fine".
+    #[tokio::test]
+    async fn no_class_roots_is_reported_as_could_not_check_and_names_the_three_ways_to_set_them() {
+        let fx = no_reads();
+        let out = section(&[], &fx).await;
+
+        assert!(!out.is_empty(), "an unchecked axis must not render as silence:\n{out}");
+        assert!(out.contains("no class roots are configured"), "{out}");
+        for remedy in ["debug.attach", "JDWP_CLASS_ROOTS", "class_roots"] {
+            assert!(out.contains(remedy), "the reply must name {remedy} as a way to fix this:\n{out}");
+        }
+        assert!(
+            out.contains("BUILD OUTPUT") && out.contains("target/classes"),
+            "the one mistake this argument attracts is pointing it at src/main/java, so the reply says \
+             which of the two it wants:\n{out}"
+        );
+        assert_eq!(fx.reads(), 0, "this branch decides before it asks the debuggee anything");
+    }
+
+    /// A configured root with nothing in it is a different answer from no root at all, and the resolver's
+    /// own message is quoted rather than summarised — it already says which case this is.
+    #[tokio::test]
+    async fn a_class_root_that_does_not_hold_the_class_quotes_the_resolvers_own_message() {
+        let empty = tempfile::tempdir().expect("a temporary class root");
+        let fx = no_reads();
+        let out = section(&[empty.path().to_path_buf()], &fx).await;
+
+        assert!(!out.is_empty(), "{out}");
+        assert!(
+            out.contains("com/example/Order.class") || out.contains("com\\example\\Order.class"),
+            "the reply names the path it looked for, which is what makes a wrong root diagnosable:\n{out}"
+        );
+        assert_eq!(fx.reads(), 0, "nothing is asked of the debuggee before a file is found");
+    }
+
+    /// A file at the right path that is not a class file is a failed or partial build, and it is reported
+    /// as being about the FILE rather than about drift.
+    #[tokio::test]
+    async fn a_file_that_is_not_a_class_file_is_reported_as_that_and_not_as_drift() {
+        let root = tempfile::tempdir().expect("a temporary class root");
+        let pkg = root.path().join("com").join("example");
+        tokio::fs::create_dir_all(&pkg).await.expect("the package tree");
+        tokio::fs::write(pkg.join("Order.class"), b"public class Order {}").await.expect("a decoy");
+
+        let fx = no_reads();
+        let out = section(&[root.path().to_path_buf()], &fx).await;
+
+        assert!(out.contains("could not read"), "{out}");
+        assert!(out.contains("as a class file"), "the verdict is about the file, not the bytecode:\n{out}");
+        assert!(
+            !out.to_lowercase().contains("drift"),
+            "a file this side could not parse proves nothing about the JVM, and claiming drift would send \
+             the reader to redeploy something that is not the problem:\n{out}"
+        );
+        assert_eq!(fx.reads(), 0, "still no question reaches the debuggee");
     }
 }
