@@ -1542,7 +1542,7 @@ impl RequestHandler {
             && session.state.pending_breakpoints.is_empty()
             && session.pattern_sets.is_empty()
         {
-            return Ok(session.last_watchdog_note.as_ref().map_or_else(
+            return Ok(session.events.watchdog_note.as_ref().map_or_else(
                 || "No breakpoints set".to_string(),
                 |n| format!("No breakpoints set\n⏰ {n}"),
             ));
@@ -1555,7 +1555,7 @@ impl RequestHandler {
         let mut output = String::new();
         // Surface a watchdog auto-resume up front (SAFE-2): the caller was away, so the fact that a
         // stop point was disarmed and the VM resumed is the most important thing on this listing.
-        if let Some(n) = &session.last_watchdog_note {
+        if let Some(n) = &session.events.watchdog_note {
             let _ = writeln!(output, "⏰ {n}\n");
         }
         let _ = write!(
@@ -3316,17 +3316,14 @@ impl RequestHandler {
 
         let mut session = session_guard.lock().await;
 
-        if session.events.is_empty() {
+        if session.events.held.is_empty() {
             return Ok("No events received yet. Set a breakpoint and trigger it.".to_string());
         }
 
         // Newest last, matching `get_traces` — so a bare call (limit 1) prints exactly the latest
-        // event as it always did, and a larger limit reads as a chronological tail.
-        let total = session.events.len();
-        let take = a.limit.max(1).min(total);
-        let shown: Vec<crate::session::EventRecord> =
-            session.events.iter().skip(total - take).cloned().collect();
-        let (dropped, unshown) = (session.events_dropped, total - take);
+        // event as it always did, and a larger limit reads as a chronological tail. The three figures
+        // come from one call because they have to agree; see `EventRing::tail`.
+        let crate::session::EventTail { shown, unshown, dropped } = session.events.tail(a.limit);
 
         let mut lines: Vec<String> = Vec::new();
         for rec in &shown {
@@ -3355,7 +3352,8 @@ impl RequestHandler {
         }
         // SAFE-10: scoped to the newest event being rendered, so a rescue that has since been overtaken
         // by a fresh hit is not replayed as though it were about that hit.
-        let watchdog_note = session.watchdog_note_for(shown.last().map(|r| r.seq)).map(ToString::to_string);
+        let watchdog_note =
+            session.events.watchdog_note_for(shown.last().map(|r| r.seq)).map(ToString::to_string);
         drop(session);
 
         lines.push(format!("[suspended] {suspended}"));
@@ -6891,8 +6889,8 @@ fn render_session_line(
     if !s.traces.held.is_empty() {
         let _ = write!(line, ", {} trace(s)", s.traces.held.len());
     }
-    if !s.events.is_empty() {
-        let _ = write!(line, ", {} event(s)", s.events.len());
+    if !s.events.held.is_empty() {
+        let _ = write!(line, ", {} event(s)", s.events.held.len());
     }
     // The command that produced a launched JVM, on its own line: "which JDK, which classpath" is the question
     // a version-dependent bug turns on, and for a session someone else opened this listing is the only place
@@ -14208,7 +14206,7 @@ async fn store_reportable_event(
             });
             session.suspensions.mark_suspended(cause);
         }
-        let seq = session.push_event(event_set, escalation);
+        let seq = session.events.push(event_set, escalation);
         // Buffer first, then push. The buffer is the authoritative record and must be written whether
         // or not anyone is listening; the notification is a hint that one exists (EVT-2).
         if suspends {
@@ -14326,7 +14324,7 @@ async fn another_thread_is_suspended(session: &mut crate::session::DebugSession,
 /// line-table caches, so this adds nothing the debuggee was not paying already.
 async fn notify_suspension(session: &mut crate::session::DebugSession, seq: u64) {
     let alerter = session.alerter.clone();
-    let Some(rec) = session.events.back().cloned() else { return };
+    let Some(rec) = session.events.held.back().cloned() else { return };
     let Some(ev) = rec.set.events.first() else { return };
 
     let mut obj = serde_json::Map::new();
@@ -14900,7 +14898,7 @@ fn spawn_watchdog(
                     // needs more than one resume, and reporting a rescue that didn't happen — then
                     // clearing `suspensions.vm` so we never retry — is the worst thing this task can
                     // do (SAFE-7). On failure, leave `suspensions.vm` set so the next tick tries again.
-                    // EVT-2: every arm below sets `last_watchdog_note`, and every one of them is news
+                    // EVT-2: every arm below notes a watchdog rescue, and every one of them is news
                     // the caller cannot discover by asking — the VM they left suspended is no longer
                     // suspended, and a stop point they armed is now disabled. Pushed as well as
                     // recorded, so a caller who walked away is told rather than finding out later.
@@ -14912,7 +14910,7 @@ fn spawn_watchdog(
                             s.suspensions.mark_resumed();
                             let note = format!("watchdog auto-resumed the VM after {secs}s {disarmed}");
                             info!("{note}");
-                            s.note_watchdog(note);
+                            s.events.note_watchdog(note);
                             "warning"
                         }
                         Ok(Some(detail)) if detail.starts_with("cleared") => {
@@ -14920,7 +14918,7 @@ fn spawn_watchdog(
                             let note =
                                 format!("watchdog auto-resumed the VM after {secs}s {disarmed} ({detail})");
                             info!("{note}");
-                            s.note_watchdog(note);
+                            s.events.note_watchdog(note);
                             "warning"
                         }
                         Ok(Some(problem)) => {
@@ -14930,7 +14928,7 @@ fn spawn_watchdog(
                                 "⚠️ watchdog tried to resume the VM after {secs}s {disarmed}, but {problem}"
                             );
                             warn!("{note}");
-                            s.note_watchdog(note);
+                            s.events.note_watchdog(note);
                             // A still-frozen VM is an `error`: nothing the caller does next will work
                             // until it runs, which is a different thing from "we rescued it for you".
                             "error"
@@ -14938,11 +14936,11 @@ fn spawn_watchdog(
                         Err(e) => {
                             let note = format!("⚠️ watchdog could not resume the VM after {secs}s: {e}");
                             warn!("{note}");
-                            s.note_watchdog(note);
+                            s.events.note_watchdog(note);
                             "error"
                         }
                     };
-                    if let Some(note) = &s.last_watchdog_note {
+                    if let Some(note) = &s.events.watchdog_note {
                         s.alerter.alert(level, &json!({ "watchdog": note }));
                     }
                 }
@@ -15007,8 +15005,8 @@ async fn rescue_overdue_thread_suspends(s: &mut crate::session::DebugSession, se
     } else {
         warn!("{note}");
     }
-    s.note_watchdog(note);
-    if let Some(n) = &s.last_watchdog_note {
+    s.events.note_watchdog(note);
+    if let Some(n) = &s.events.watchdog_note {
         s.alerter.alert(level, &json!({ "watchdog": n }));
     }
 }

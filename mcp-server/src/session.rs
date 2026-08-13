@@ -23,16 +23,11 @@ pub struct DebugSession {
     /// See [`SessionState`]. It is where an invariant spanning two of those collections lives, and the
     /// reason it is a separate type rather than more fields here is ADR-0050.
     pub state: SessionState,
-    /// Ring buffer of reportable events, oldest first. Bounded by `MAX_EVENTS`.
+    /// Everything reportable this session has seen, and the watchdog note scoped to it (CLEAN-6, #189).
     ///
-    /// A single `Option` slot here used to mean a second hit erased the first with no trace — the
-    /// worst kind of gap in a debugging tool, because the answer you read looks complete. Traces got
-    /// a bounded buffer from the start; events now get the same treatment.
-    pub events: VecDeque<EventRecord>,
-    /// Monotonic sequence for event records (survives ring-buffer eviction).
-    pub event_seq: u64,
-    /// How many events the ring buffer has evicted — reported so a caller knows it fell behind.
-    pub events_dropped: u64,
+    /// See [`EventRing`]. The rescue note lives there rather than here because the watermark that scopes
+    /// it is the ring's own sequence — the invariant that put the two in one type.
+    pub events: EventRing,
     pub event_listener_task: Option<JoinHandle<()>>,
     /// Thread of the most recent suspension event — used to default `thread_id`.
     pub last_thread: Option<u64>,
@@ -51,24 +46,6 @@ pub struct DebugSession {
     /// where that separation, and ADR-0003's rule that none of it is the authority, are written down.
     pub suspensions: Suspensions,
     pub watchdog_task: Option<JoinHandle<()>>,
-    /// What the watchdog last did, if anything — surfaced in `list_stop_points` and `get_last_event`
-    /// so a caller who was away learns the VM was auto-resumed and which stop point was disarmed (SAFE-2).
-    pub last_watchdog_note: Option<String>,
-    /// [`event_seq`](Self::event_seq) at the moment [`last_watchdog_note`](Self::last_watchdog_note)
-    /// was written — the watermark that stops an old rescue from being replayed next to a new hit
-    /// (SAFE-10).
-    ///
-    /// The note is not durable state, it is an account of **one** suspension ending, and without this it
-    /// was rendered against every later event forever. That produced a `get_last_event` whose two lines
-    /// were each correct and jointly false: `[suspended] true` for a genuinely live breakpoint hit, over a
-    /// `[watchdog] auto-resumed the VM` about a suspension that had ended long before it — which reads as
-    /// "the hit you are looking at is stale" about a hit that was fine, and cost a detour to re-verify.
-    ///
-    /// An event newer than the watermark means the suspension the note describes is not the one being
-    /// rendered, so the note is that event's history rather than its state. SAFE-2's case is the other
-    /// one and is untouched: a caller who walked away has no newer event, the watermark still matches,
-    /// and they are told.
-    pub last_watchdog_seq: Option<u64>,
     /// Every **snapshot** this session has taken, and the accounting that makes a missing one explicable
     /// (CLEAN-6, #189). See [`TraceBuffer`].
     pub traces: TraceBuffer,
@@ -392,7 +369,7 @@ pub const MAX_TRACE_DISARMS: usize = 32;
 /// this way is explicable.
 pub const MAX_MONITOR_PENDING: usize = 256;
 
-/// Max reportable events retained per session; oldest are evicted, counted in `events_dropped`.
+/// Max reportable events retained per session; oldest are evicted, counted in [`EventRing::dropped`].
 ///
 /// Smaller than `MAX_TRACES` on purpose: a suspending event holds a thread, so they arrive at human
 /// pace, whereas traces stream from a running VM. 100 is far more than a session can work through.
@@ -430,6 +407,168 @@ pub struct FailedEscalation {
     pub vm_running: bool,
     /// The sentence `debug.get_last_event` prints, naming both halves of the state.
     pub note: String,
+}
+
+/// A session's reportable events, and the accounting that makes a missing one explicable (CLEAN-6, #189).
+///
+/// **The fourth cluster ADR-0050 describes, and chosen the same way: by invariant, not by touch count.**
+/// [`Self::push`] moves the ring, the sequence and the drop count together, and that much #189 already
+/// named as one cluster. The watchdog note is here because of what stamps it.
+///
+/// **SAFE-10's watermark is why the note belongs to the ring rather than to the session.** A note is an
+/// account of **one** suspension ending, and what scopes it to that suspension is
+/// [`watchdog_seq`](Self::watchdog_seq) — the ring's sequence at the moment the note was written. Written
+/// without the watermark it was rendered against every later event forever, which is #69: a
+/// `get_last_event` whose two lines were each correct and jointly false, `[suspended] true` for a
+/// genuinely live breakpoint hit over a `[watchdog] auto-resumed the VM` about a suspension that had ended
+/// long before it. So the note cannot be *stamped* without reading the counter — split them across two
+/// types and [`Self::note_watchdog`] needs the ring passed in, which is the invariant back in a caller.
+/// #189 grouped the note with the bounded note collections; the counter it depends on decides otherwise,
+/// and that is the one place this cluster departs from the issue's list.
+///
+/// **`get_last_event` reads it through the watermark. `list_stop_points` does not, and there is a
+/// pre-existing hole under that.** SAFE-10 scoped the one tool that renders the note beside an event; the
+/// listing prints it raw at the top, and *nothing* ever clears it — not [`Self::clear`], not a resume, not
+/// a fresh suspension. So one rescue at minute five captions every later listing for the life of the
+/// session, including after the stop point it names has been re-armed and hit again, which is #69's shape
+/// in the other tool that prints the note. It predates this type and is not made worse by it; it is
+/// written down here because moving the note next to its watermark would otherwise read as a claim that
+/// every reader consults it, and one does not.
+///
+/// **Nothing resets the sequence, including [`Self::clear`].** It is the identity a pushed notification
+/// has already handed to a client and the number the watermark compares against, so a reused one would
+/// name two events. [`dropped`](Self::dropped) survives a clear for the reason [`TraceBuffer::filed`]
+/// does: a session that fell behind must not read afterwards as one that never did.
+///
+/// **It is constructible with no socket**, which is the point of the type (ADR-0049, ADR-0050) — a test
+/// that wants a ring holding a hit and a stale rescue note builds one here in three lines.
+#[derive(Debug)]
+pub struct EventRing {
+    /// Reportable events, oldest first. Bounded by [`MAX_EVENTS`].
+    ///
+    /// A single `Option` slot here used to mean a second hit erased the first with no trace — the worst
+    /// kind of gap in a debugging tool, because the answer you read looks complete. Traces got a bounded
+    /// buffer from the start; events got the same treatment.
+    pub held: VecDeque<EventRecord>,
+    /// Monotonic sequence for event records. Survives eviction **and** a [`Self::clear`].
+    pub seq: u64,
+    /// How many events the ring has evicted — reported, so a caller knows it fell behind.
+    pub dropped: u64,
+    /// What the watchdog last did, if anything — surfaced in `list_stop_points` and `get_last_event` so a
+    /// caller who was away learns the VM was auto-resumed and which stop point was disarmed (SAFE-2).
+    pub watchdog_note: Option<String>,
+    /// [`seq`](Self::seq) at the moment [`watchdog_note`](Self::watchdog_note) was written — the watermark
+    /// that stops an old rescue from being replayed next to a new hit (SAFE-10).
+    ///
+    /// An event newer than the watermark means the suspension the note describes is not the one being
+    /// rendered, so the note is that event's history rather than its state. SAFE-2's case is the other one
+    /// and is untouched: a caller who walked away has no newer event, the watermark still matches, and
+    /// they are told. The type's own doc has what it cost to be absent.
+    pub watchdog_seq: Option<u64>,
+}
+
+/// A slice of the ring as a reply has to state it: what is being shown, and what is not.
+///
+/// One value rather than three returns because the three figures are one answer — see [`EventRing::tail`],
+/// whose doc is where the reason they cannot be computed apart lives.
+#[derive(Debug)]
+pub struct EventTail {
+    /// The events to render, oldest first — so the **newest is last**, matching `get_traces`, and a bare
+    /// call prints exactly the latest event as it always did.
+    pub shown: Vec<EventRecord>,
+    /// How many older events are still buffered but were not shown, so a caller knows a larger `limit`
+    /// has something to read.
+    pub unshown: usize,
+    /// How many the ring has evicted since the session opened — [`EventRing::dropped`], carried here so a
+    /// reply that has to explain a gap reads one value.
+    pub dropped: u64,
+}
+
+impl EventRing {
+    /// An empty ring: nothing seen, nothing dropped, no rescue to report.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { held: VecDeque::new(), seq: 0, dropped: 0, watchdog_note: None, watchdog_seq: None }
+    }
+
+    /// Push a reportable event, evicting the oldest if the ring is full. Returns the assigned seq.
+    ///
+    /// `escalation` is FILT-7's failed-escalation note, and is `None` for every hit that did not have to
+    /// escalate or escalated cleanly — see [`EventRecord::escalation`].
+    ///
+    /// **The seq is assigned before the eviction, and the record carries it.** An evicted event does not
+    /// give its number back: the sequence counts what arrived, and [`dropped`](Self::dropped) counts what
+    /// eviction took — which is what lets a reply explain a gap instead of printing a shorter list. The two
+    /// are not `seq - held.len()`, because [`Self::clear`] moves that difference without dropping anything.
+    pub fn push(&mut self, set: EventSet, escalation: Option<FailedEscalation>) -> u64 {
+        self.seq += 1;
+        if self.held.len() >= MAX_EVENTS {
+            self.held.pop_front();
+            self.dropped += 1;
+        }
+        self.held.push_back(EventRecord { seq: self.seq, set, escalation });
+        self.seq
+    }
+
+    /// The newest `limit` events, and what the caller is not being shown.
+    ///
+    /// **The figures have to agree, which is why this is one method rather than four lines in the
+    /// handler.** [`EventTail::unshown`] is precisely what the tail skipped, so it has to come from the
+    /// same clamped count the slice did — computed a second time beside a differently-clamped `limit` it
+    /// would tell a caller to pass a larger one for events that were already on screen.
+    ///
+    /// A `limit` of zero still yields one event, because a bare `debug.get_last_event` means *the latest*
+    /// and always has; a `limit` past the end shows everything with nothing unshown.
+    #[must_use]
+    pub fn tail(&self, limit: usize) -> EventTail {
+        let total = self.held.len();
+        let take = limit.max(1).min(total);
+        let unshown = total - take;
+        EventTail { shown: self.held.iter().skip(unshown).cloned().collect(), unshown, dropped: self.dropped }
+    }
+
+    /// Discard the events held, as `debug.get_last_event {drain: true}` does.
+    ///
+    /// **It keeps the sequence, the drop count and the watchdog note**, each for its own reason: the
+    /// sequence is an identity a notification has already handed out, the drop count is the only evidence
+    /// the ring ever fell behind, and the note is what `list_stop_points` prints to a caller who walked
+    /// away (SAFE-2). A drain says the caller has read the events, not that the rescue never happened.
+    ///
+    /// A method rather than `held.clear()` at the call site so that rule has somewhere to be asserted —
+    /// with the field cleared directly, "a drain must not reset the counter" is true only for as long as
+    /// nobody adds the obvious second line.
+    pub fn clear(&mut self) {
+        self.held.clear();
+    }
+
+    /// The watchdog note, but only when it is about the suspension a caller is *currently* looking at
+    /// (SAFE-10) — `newest_seq` is the sequence of the newest event being rendered.
+    ///
+    /// `None` for a note that a later event has superseded. Also `None` when there is no event to render
+    /// at all: with nothing on screen for the note to be misread as describing, `get_last_event` has its
+    /// own answer for an empty buffer, and SAFE-2's caller-walked-away case always has the event that
+    /// caused the suspension still in the buffer.
+    #[must_use]
+    pub fn watchdog_note_for(&self, newest_seq: Option<u64>) -> Option<&str> {
+        let (note, at) = (self.watchdog_note.as_deref()?, self.watchdog_seq?);
+        (newest_seq? <= at).then_some(note)
+    }
+
+    /// Record what the watchdog just did, stamped with the event it happened after (SAFE-10).
+    ///
+    /// One method rather than two assignments at each of the watchdog's four outcomes, because a note
+    /// written without its watermark is precisely the bug: it would be replayed against every later
+    /// event, which is what #69 reported.
+    pub fn note_watchdog(&mut self, note: String) {
+        self.watchdog_note = Some(note);
+        self.watchdog_seq = Some(self.seq);
+    }
+}
+
+impl Default for EventRing {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Why the VM is currently suspended — what the watchdog needs to act correctly on a timeout.
@@ -731,7 +870,7 @@ pub struct TraceBuffer {
     /// anyway (SAFE-8).
     pub disarms: std::collections::BTreeMap<String, u32>,
     /// How many distinct disarm notes were dropped because the map was full — reported, like
-    /// `events_dropped`, so a full buffer never reads as a quiet one.
+    /// [`EventRing::dropped`], so a full buffer never reads as a quiet one.
     pub disarms_dropped: u64,
 }
 
@@ -893,8 +1032,8 @@ pub enum EventPump {
 /// mediated calls). A convention nobody has stated is one that drifts on the commit that doubles it.
 ///
 /// - **`note_…`** — record that something happened, so a later reply can report it. The session is not
-///   acting; it is remembering. `note_redefinition`, `note_watchdog`, `note_disarmed_traced`,
-///   `note_trace_disarm`, `note_pop`.
+///   acting; it is remembering. `note_redefinition`, [`EventRing::note_watchdog`],
+///   `note_disarmed_traced`, [`TraceBuffer::note_disarm`], `note_pop`.
 /// - **`mark_…`** — set a session state that something else will read as a fact about the VM.
 ///   [`Suspensions::mark_suspended`], [`Suspensions::mark_resumed`].
 /// - **`open_…` / `close_…`** — one half of a pair's lifetime, where the other half completes it.
@@ -905,10 +1044,16 @@ pub enum EventPump {
 ///   closing it and must never decrement a count (ADR-0003). [`Suspensions::forget_thread`],
 ///   [`Suspensions::forget_all_threads`].
 /// - **`push_…`** — append to a **bounded** ring buffer, with eviction counted rather than silent.
-///   `push_event`.
+///   [`EventRing::push`], [`TraceBuffer::push`].
+/// - **`clear`** — discard what a caller has read. **What survives is decided per type, and the two here
+///   disagree on purpose**, so read the method before adding a third: both keep their monotonic counter
+///   ([`EventRing::seq`], [`TraceBuffer::filed`]) because it is an identity already handed out, but
+///   [`EventRing::clear`] keeps its drop count as the only evidence the ring fell behind, while
+///   [`TraceBuffer::clear`] resets its own — a disarm note explains a gap in a buffer that is now empty,
+///   so it goes with the records it was about.
 /// - **`register_…`** — add to a collection under an id the value itself carries. `register_stop_point`.
-/// - Everything else is a query and reads as one: `was_traced_and_disarmed`, `watchdog_note_for`,
-///   `classify_throw`, `next_stop_id`.
+/// - Everything else is a query and reads as one: `was_traced_and_disarmed`,
+///   [`EventRing::watchdog_note_for`], `classify_throw`, `next_stop_id`.
 ///
 /// This is a naming convention and deliberately not an ADR: nothing here is surprising to a reader who
 /// sees it, and nobody chose it against a real alternative. It is written where the next method will be
@@ -960,20 +1105,6 @@ impl DebugSession {
         }
     }
 
-    /// Push a reportable event, evicting the oldest if the buffer is full. Returns the assigned seq.
-    ///
-    /// `escalation` is FILT-7's failed-escalation note, and is `None` for every hit that did not have to
-    /// escalate or escalated cleanly — see [`EventRecord::escalation`].
-    pub fn push_event(&mut self, set: EventSet, escalation: Option<FailedEscalation>) -> u64 {
-        self.event_seq += 1;
-        if self.events.len() >= MAX_EVENTS {
-            self.events.pop_front();
-            self.events_dropped += 1;
-        }
-        self.events.push_back(EventRecord { seq: self.event_seq, set, escalation });
-        self.event_seq
-    }
-
     /// Record that the **opening** half of a monitor pair has arrived, so the closing half can measure
     /// the duration (DUMP-7, ADR-0035). Returns the eviction note when the map was full.
     ///
@@ -1008,28 +1139,6 @@ impl DebugSession {
     ) -> Option<std::time::Duration> {
         let opened = self.monitor_pending.remove(key)?;
         Some(now.saturating_duration_since(opened))
-    }
-
-    /// The watchdog note, but only when it is about the suspension a caller is *currently* looking at
-    /// (SAFE-10) — `newest_seq` is the sequence of the newest event being rendered.
-    ///
-    /// `None` for a note that a later event has superseded. Also `None` when there is no event to render
-    /// at all: with nothing on screen for the note to be misread as describing, `get_last_event` has its
-    /// own answer for an empty buffer, and SAFE-2's caller-walked-away case always has the event that
-    /// caused the suspension still in the buffer.
-    pub fn watchdog_note_for(&self, newest_seq: Option<u64>) -> Option<&str> {
-        let (note, at) = (self.last_watchdog_note.as_deref()?, self.last_watchdog_seq?);
-        (newest_seq? <= at).then_some(note)
-    }
-
-    /// Record what the watchdog just did, stamped with the event it happened after (SAFE-10).
-    ///
-    /// One method rather than two assignments at each of the watchdog's four outcomes, because a note
-    /// written without its watermark is precisely the bug: it would be replayed against every later
-    /// event, which is what #69 reported.
-    pub fn note_watchdog(&mut self, note: String) {
-        self.last_watchdog_note = Some(note);
-        self.last_watchdog_seq = Some(self.event_seq);
     }
 }
 
@@ -1135,8 +1244,10 @@ pub struct RethrowChain {
 /// Push `req_id` onto a bounded, duplicate-free FIFO, evicting the oldest entry at `cap` (TRACE-8).
 ///
 /// A free function rather than a method body so the bounding is testable without a live JDWP connection to
-/// build a whole [`DebugSession`] around — the same reason `note_trace_disarm`'s logic is mirrored in this
-/// module's tests, except that this one has no copy to drift from.
+/// build a whole [`DebugSession`] around. It is the workaround ADR-0050 later generalised into a type: the
+/// mirror test that used to sit beside this one — a reimplementation of [`TraceBuffer::note_disarm`] in a
+/// test body, for exactly the same reason — is gone, because cluster 2 gave the real method somewhere to be
+/// called from and cluster 4 deleted the copy.
 fn remember_bounded(queue: &mut std::collections::VecDeque<i32>, req_id: i32, cap: usize) {
     if queue.contains(&req_id) {
         return;
@@ -1490,16 +1601,12 @@ impl SessionManager {
             state: SessionState::new(),
             connection,
             endpoint,
-            events: VecDeque::new(),
-            event_seq: 0,
-            events_dropped: 0,
+            events: EventRing::new(),
             event_listener_task: None,
             last_thread: None,
             pending_step: None,
             suspensions: Suspensions::new(),
             watchdog_task: None,
-            last_watchdog_note: None,
-            last_watchdog_seq: None,
             traces: TraceBuffer::new(),
             read_only,
             source_roots,
@@ -1764,41 +1871,6 @@ mod tests {
         assert!(state.stop_points.contains_key("bp_1"), "the stop point is still registered");
     }
 
-    /// Mirrors `DebugSession::note_trace_disarm` on bare state, so the bounding logic is testable
-    /// without a live JDWP connection to build a whole session around.
-    fn note_into(notes: &mut std::collections::BTreeMap<String, u32>, dropped: &mut u64, n: &str) {
-        if let Some(c) = notes.get_mut(n) {
-            *c += 1;
-        } else if notes.len() < MAX_TRACE_DISARMS {
-            notes.insert(n.to_string(), 1);
-        } else {
-            *dropped += 1;
-        }
-    }
-
-    // SAFE-8: the disarm-note buffer must be bounded, collapse repeats, and count what it dropped.
-    #[test]
-    fn trace_disarm_notes_collapse_repeats_and_stay_bounded() {
-        let mut notes: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-        let mut dropped = 0u64;
-
-        // The same stop point disarming repeatedly must not grow the buffer — this is the case BP-2/BP-3
-        // made reachable, since a self-disarmed logpoint is now easy to re-arm.
-        for _ in 0..500 {
-            note_into(&mut notes, &mut dropped, "watch_3 stopped recording");
-        }
-        assert_eq!(notes.len(), 1, "repeats must collapse, not accumulate");
-        assert_eq!(notes["watch_3 stopped recording"], 500, "the count is what carries the repetition");
-        assert_eq!(dropped, 0);
-
-        // Distinct notes are capped, and the overflow is counted rather than silently discarded.
-        for i in 0..MAX_TRACE_DISARMS + 10 {
-            note_into(&mut notes, &mut dropped, &format!("bp_{i} stopped recording"));
-        }
-        assert_eq!(notes.len(), MAX_TRACE_DISARMS, "distinct notes must be capped");
-        assert!(dropped > 0, "overflow must be counted so a full buffer never reads as a quiet one");
-    }
-
     // TRACE-8 (#72): the disarmed-traced list is what stops a budget disarm from freezing the VM with the
     // hits it had already generated, so its bounding is load-bearing — an unbounded one would grow for the
     // life of a session, and a broken eviction would forget the id that is about to be needed.
@@ -1968,9 +2040,11 @@ mod tests {
 
     /// SAFE-8: repeats of a disarm note collapse into a count, and the map is bounded.
     ///
-    /// Called on the real method rather than on `remember_bounded` next door, which is the mirror shape
-    /// ADR-0050 is about — the neighbouring test reimplements what it asserts because a `DebugSession`
-    /// needed a socket. This one does not.
+    /// **This used to have a mirror beside it** — a `note_into` helper reimplementing
+    /// `TraceBuffer::note_disarm` in the test body, asserting on the reimplementation, and unable to fail
+    /// on any change to the real method. It existed because a `DebugSession` needed a socket (ADR-0049);
+    /// cluster 2 removed that reason and cluster 4 removed the test, which is the shape ADR-0050 exists to
+    /// delete rather than to accumulate.
     #[test]
     fn disarm_notes_collapse_and_the_map_is_bounded() {
         let mut buffer = TraceBuffer::new();
@@ -2249,5 +2323,152 @@ mod tests {
         assert_eq!(s.forget_all_threads(), vec!["ajp-1", "ajp-2", "ajp-3"], "ordered by thread id");
         assert!(s.threads.is_empty());
         assert!(s.forget_all_threads().is_empty(), "and a second disconnect has nothing left to name");
+    }
+
+    /// A **stated** event set: the ring's invariants are about the accounting around a record and never
+    /// about what is inside one — and `Event`'s wire discriminant is `pub(crate)` to `jdwp-client`
+    /// besides, so there is nothing to author here even if it mattered.
+    fn arrival() -> EventSet {
+        EventSet { suspend_policy: 2, events: Vec::new() }
+    }
+
+    /// A note this ring is holding, so a test can ask what it is scoped to.
+    fn rescue() -> String {
+        "watchdog auto-resumed the VM after 300s and disabled bp_1".to_string()
+    }
+
+    #[test]
+    fn every_event_is_numbered_in_arrival_order_and_the_pusher_is_told_which() {
+        let mut ring = EventRing::new();
+
+        assert_eq!(ring.push(arrival(), None), 1, "the first event is #1, not #0");
+        assert_eq!(ring.push(arrival(), None), 2);
+        assert_eq!(ring.push(arrival(), None), 3, "the returned seq is the one the caller notifies with");
+
+        assert_eq!(
+            ring.held.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the record carries the same number that was handed back, oldest first"
+        );
+        assert_eq!(ring.dropped, 0, "nothing was dropped while there was room");
+    }
+
+    /// An evicted event does **not** give its number back, which is why this asserts the surviving
+    /// *numbers* and not just the surviving count: a ring evicting from the wrong end holds exactly as
+    /// many records and starts them at #1.
+    #[test]
+    fn an_overflowing_ring_drops_the_oldest_and_never_reissues_its_number() {
+        let mut ring = EventRing::new();
+        let over = 5;
+        for _ in 0..MAX_EVENTS + over {
+            ring.push(arrival(), None);
+        }
+
+        assert_eq!(ring.held.len(), MAX_EVENTS, "the ring stays bounded");
+        assert_eq!(ring.dropped, over as u64, "and every eviction is COUNTED, not silent");
+        assert_eq!(
+            ring.held.front().map(|r| r.seq),
+            Some(over as u64 + 1),
+            "the oldest SURVIVOR is numbered past the events that were evicted"
+        );
+        assert_eq!(
+            ring.held.back().map(|r| r.seq),
+            Some((MAX_EVENTS + over) as u64),
+            "and the newest carries the count of everything that ever arrived"
+        );
+        assert_eq!(ring.tail(1).dropped, over as u64, "a reply reads the gap off the tail it renders");
+    }
+
+    /// The tail's `unshown` must come from the same clamped count its slice did — recomputed against the
+    /// caller's raw `limit` it would name events that are already on screen (see [`EventRing::tail`]).
+    #[test]
+    fn a_tail_shows_the_newest_and_says_how_many_older_ones_it_held_back() {
+        let mut ring = EventRing::new();
+        for _ in 0..5 {
+            ring.push(arrival(), None);
+        }
+
+        let two = ring.tail(2);
+        assert_eq!(two.shown.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![4, 5], "newest LAST");
+        assert_eq!(two.unshown, 3, "the three older ones are what a larger limit would reach");
+
+        let bare = ring.tail(0);
+        assert_eq!(
+            bare.shown.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![5],
+            "a bare get_last_event means the latest event, as it always has"
+        );
+        assert_eq!(bare.unshown, 4, "and the count held back follows the clamp, not the caller's zero");
+
+        let everything = ring.tail(99);
+        assert_eq!(everything.shown.len(), 5, "a limit past the end shows the whole ring");
+        assert_eq!(everything.unshown, 0, "with nothing left to catch up on");
+    }
+
+    /// SAFE-10 and its watermark: a drain is the caller saying they have read the events, not that the
+    /// numbering restarts or that the rescue never happened.
+    #[test]
+    fn draining_keeps_the_sequence_the_drop_count_and_the_rescue_note() {
+        let mut ring = EventRing::new();
+        for _ in 0..MAX_EVENTS + 2 {
+            ring.push(arrival(), None);
+        }
+        ring.note_watchdog(rescue());
+
+        ring.clear();
+
+        assert!(ring.held.is_empty(), "the events a caller has read are gone");
+        assert_eq!(ring.dropped, 2, "the drop count is the only evidence the ring ever fell behind");
+        assert_eq!(
+            ring.push(arrival(), None),
+            (MAX_EVENTS + 3) as u64,
+            "and the next event carries the NEXT number — a reused one would name two events"
+        );
+        assert_eq!(
+            ring.watchdog_note.as_deref(),
+            Some(rescue().as_str()),
+            "the rescue survives, because list_stop_points is where a caller who walked away reads it"
+        );
+        // Asserted separately from the note, because a clear that kept only ONE half leaves the note
+        // unrenderable rather than absent: `watchdog_note_for` answers `None` for every event forever, so
+        // `get_last_event` silently stops carrying `[watchdog] this suspension has since ended`.
+        assert_eq!(
+            ring.watchdog_seq,
+            Some((MAX_EVENTS + 2) as u64),
+            "and so does the watermark that decides which event it is rendered against"
+        );
+    }
+
+    /// SAFE-10 (#69): the note is an account of **one** suspension ending, so it is rendered against the
+    /// event that suspension belongs to and never against a later one.
+    #[test]
+    fn a_rescue_note_is_reported_only_against_the_suspension_it_ended() {
+        let mut ring = EventRing::new();
+        let hit = ring.push(arrival(), None);
+        ring.note_watchdog(rescue());
+
+        assert_eq!(
+            ring.watchdog_note_for(Some(hit)),
+            Some(rescue().as_str()),
+            "the caller looking at the suspension the watchdog ended is the one who must be told"
+        );
+
+        let fresh = ring.push(arrival(), None);
+        assert_eq!(
+            ring.watchdog_note_for(Some(fresh)),
+            None,
+            "a live hit must not be captioned with a rescue that happened before it"
+        );
+        assert_eq!(
+            ring.watchdog_note_for(Some(hit)),
+            Some(rescue().as_str()),
+            "and reading the older event back still gets its own history"
+        );
+        assert_eq!(ring.watchdog_note_for(None), None, "with nothing rendered there is nothing to caption");
+        assert_eq!(
+            EventRing::new().watchdog_note_for(Some(1)),
+            None,
+            "a ring the watchdog never rescued has no note to scope"
+        );
     }
 }
