@@ -527,6 +527,25 @@ pub struct Redefinition {
     pub popped_since: bool,
 }
 
+/// The state of a session's event pump — the task that reads JDWP events off the connection, records
+/// what a **traced** hit saw, and resumes the thread the event suspended (SESS-2, #195).
+///
+/// See [`DebugSession::event_pump`] for why there are three of these and not two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventPump {
+    /// Spawned and still reading. The only state in which this session can service an event, and
+    /// therefore the only one in which arming a stop point on it is safe.
+    Running,
+    /// Spawned and has exited. The pump exits when the connection closes, so this is how a session
+    /// learns its JVM is gone — at no cost, unlike a JDWP round trip, which could itself hang on the
+    /// half-dead socket this is meant to diagnose.
+    Ended,
+    /// Never spawned: the session was registered and the attach that registered it did not finish
+    /// building it. The socket is live and nobody is reading it. Reachable only as a failure, which is
+    /// why it is a state and not a `bool` — it used to be indistinguishable from [`Self::Running`].
+    Unstarted,
+}
+
 /// The methods a handler reaches a session through, rather than touching its fields.
 ///
 /// **They share a verb vocabulary, and it is written down here because the next thing to touch this file
@@ -550,6 +569,29 @@ pub struct Redefinition {
 /// sees it, and nobody chose it against a real alternative. It is written where the next method will be
 /// added, which is the only place it would have been read.
 impl DebugSession {
+    /// Whether the task draining this session's JDWP events is running (SESS-2, #195).
+    ///
+    /// **Three answers rather than a bool, because two of them are not the same fact.** A pump that has
+    /// *ended* means the connection closed and the JVM is gone; a pump that was *never started* means this
+    /// session was registered and then abandoned half-built, with a live socket and nobody reading it. The
+    /// remedies differ, but the bug this exists for is that they used to give the same answer: liveness
+    /// asked `event_listener_task.is_some_and(is_finished)`, so `None` — never spawned — read as *not
+    /// dead*, which is exactly what a healthy session reads as.
+    ///
+    /// **What that costs is the whole of trace mode's promise.** Nothing else undoes a JDWP event's
+    /// suspend policy: the pump is what snapshots a traced hit and resumes the thread it arrived on. With
+    /// no pump, an armed trace stop point suspends at its first hit and stays suspended, while
+    /// `debug.list_sessions` prints `running` and the arming reply reports success — which is what #195
+    /// observed against a `WildFly` instance, where only restarting the JVM cleared it.
+    #[must_use]
+    pub fn event_pump(&self) -> EventPump {
+        match self.event_listener_task.as_ref() {
+            None => EventPump::Unstarted,
+            Some(task) if task.is_finished() => EventPump::Ended,
+            Some(_) => EventPump::Running,
+        }
+    }
+
     /// Record a successful redefinition of `class_name` (SWAP-2). Repeated swaps of one class collapse
     /// into a count, and any earlier pop stops counting — a pop applies to the bytecode that was live
     /// when it happened, not to whatever replaced it afterwards.

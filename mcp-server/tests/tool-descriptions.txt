@@ -427,9 +427,12 @@ whether it is suspended, which threads it is holding one at a time with debug.su
 while a held worker leaves the JVM serving — and the remedies differ, debug.resume_thread against
 debug.continue), how many stop points/traces/events it holds, and how many JDWP packets it has cost. Use it
 when you have lost a session_id, or to check what is still attached before walking away. A session whose JVM
-has gone is shown as DEAD. A session that has hot-reloaded a class is flagged with the count, deliberately
-regardless of whose session it is: a session someone ELSE left behind is the case that matters, and this
-listing is the only place a third party can discover that a JVM is running installed bytecode.
+has gone is shown as DEAD. A session shown as NO EVENT PUMP has nothing reading its JVM's events, so it can
+still be read from but the five arming tools refuse it: a stop point armed there would suspend the debuggee at
+its first hit with nothing left alive to resume it, whatever trace says — disconnect it and attach again
+(SESS-2). A session that has hot-reloaded a class is flagged with the count, deliberately regardless of whose
+session it is: a session someone ELSE left behind is the case that matters, and this listing is the only place
+a third party can discover that a JVM is running installed bytecode.
 
 ## debug.list_stop_points
 List all active breakpoints, including deferred ones, exception breakpoints, field watchpoints, and wildcard

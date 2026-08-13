@@ -5326,11 +5326,113 @@ fn list_sessions_names_every_attachment_and_flags_a_dead_one() {
     let live_line = dead_seen.lines().find(|l| l.contains(&second_id)).expect("a line for the live session");
     assert!(!live_line.contains("DEAD"), "the other session is still attached: {live_line}");
 
+    // SESS-2 (#195). A dead session has no event pump either — its pump is what ended — so arming on it is
+    // the same trap and gets the same refusal, decided here rather than after a round trip down a socket
+    // whose far end is gone. Asserted on the dead session the test already has, since the state that
+    // matters is "no pump", not how it got there.
+    let refused = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"session_id": first_id, "class_pattern": "WatchProbe", "line": 45}),
+    );
+    assert_contains_all(
+        "arming a session with no event pump is refused",
+        &refused,
+        &["no event pump", "Nothing was armed", "debug.attach"],
+    );
+    // Reads are NOT refused: nothing about them waits for an event, and refusing them would be a rule
+    // borrowed from a case it does not apply to.
+    assert!(
+        !server
+            .call("debug.list_stop_points", serde_json::json!({"session_id": first_id}))
+            .contains("no event pump"),
+        "only the arming tools take this refusal"
+    );
+
     // And it can be removed by id, which is the escape hatch the listing points at.
     server.call("debug.disconnect", serde_json::json!({"session_id": first_id}));
     let after = server.call("debug.list_sessions", serde_json::json!({}));
     assert_contains_all("one left", &after, &["1 session(s)", &second_id]);
     assert!(!after.contains(&first_id), "the disconnected session must be gone:\n{after}");
+}
+
+/// SESS-2 (#195): an attach carrying a `session_id` leaves no half-built session behind.
+///
+/// **The trigger is an argument every tool publishes.** `session_id` is injected into all forty
+/// `inputSchema`s and read straight from the raw arguments by `resolve_session`, `debug.attach` included —
+/// so a caller reusing an id from an earlier run, or a client that echoes the last one it saw, passes one
+/// here. `open_session` then resolved *that* id instead of the one it had just minted, which had already
+/// been registered and made current. The attach reported `Failed to get session after creation`, and a
+/// session existed anyway: registered, current, and with neither an event pump nor a watchdog, because
+/// installing them was the step that had just failed.
+///
+/// **Every surface said it was healthy, which is why this is a wire-level test and not a unit one.**
+/// `debug.list_sessions` printed `running`; arming a trace stop point on it returned success and a JDWP
+/// request id. What could not lie is the debuggee: the pump is the only thing that resumes the thread a
+/// traced hit suspends, so the first request through the traced line hung for good and the reporter needed
+/// a JVM restart to clear it. So the assertions here end on the probe's own ticks and on the traces
+/// arriving — both facts about the JVM, neither of them this server's opinion of itself.
+///
+/// The stale id is **ignored** rather than refused, which is the same treatment `debug.list_sessions`
+/// already gives an argument it has no use for. Attaching creates a session; there is nothing for an id to
+/// select, and refusing one would break a caller who is passing it harmlessly today.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_attach_carrying_a_session_id_leaves_no_session_without_an_event_pump() {
+    let Some(jdk) = jdk_or_skip("an_attach_carrying_a_session_id_leaves_no_session_without_an_event_pump")
+    else {
+        return;
+    };
+    let probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start().expect("start server");
+
+    // The one line that reproduces #195. `Probe::attach` cannot be used here: passing the extra argument
+    // IS the test.
+    let stale = "session_from_an_earlier_run";
+    let attached = server.call(
+        "debug.attach",
+        serde_json::json!({"host": "127.0.0.1", "port": probe.port, "session_id": stale}),
+    );
+    assert_contains_all(
+        "the attach lands rather than reporting a failure it did not have",
+        &attached,
+        &["Connected to JVM"],
+    );
+    let id = session_id_from(&attached).expect("no session id in attach reply");
+    assert_ne!(id, stale, "the session id is minted here, never taken from the arguments");
+
+    // One session, and it is the one the reply named. Two would mean the stale id had registered a second.
+    let listed = server.call("debug.list_sessions", serde_json::json!({}));
+    assert_contains_all("exactly one healthy session", &listed, &["1 session(s)", &id, "running"]);
+    assert!(!listed.contains(stale), "the argument must not have become a session:\n{listed}");
+    assert!(
+        !listed.contains("NO EVENT PUMP"),
+        "the session was registered without the task that services its events:\n{listed}"
+    );
+
+    // The surface that cannot report health it does not have. `counter` IS WatchProbe's tick number, so a
+    // rising tick proves the writes the watchpoint reports are committing and that nothing is held.
+    let base = first_tick_witness(&probe, "before arming the traced watchpoint");
+    let set = server.call(
+        "debug.set_field_stop",
+        serde_json::json!({"session_id": id, "class_name": "WatchProbe", "field_name": "counter",
+                           "trace": true}),
+    );
+    assert_contains_all("traced watchpoint is armed", &set, &["watch_modify_", "trace (non-suspending)"]);
+
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > base + 2)).is_some(),
+        "the probe stopped ticking after a traced watchpoint — this is #195's freeze, and it means the \
+         session was armed without a pump to resume what its hits suspend\n  output: {:?}",
+        probe.output(),
+    );
+    // And the capture path is running, not merely the resume half: #195 saw `debug.get_traces` with
+    // nothing in it while the debuggee was frozen.
+    assert!(
+        server.wait_for_traces("field=WatchProbe.counter", EVENT_TIMEOUT).is_some(),
+        "no traces were recorded, so the event pump is not servicing this session"
+    );
+
+    server.panic_reset();
 }
 
 /// The `Hits: N` a `debug.list_stop_points` entry reports for one stop-point id (BP-9, #159).

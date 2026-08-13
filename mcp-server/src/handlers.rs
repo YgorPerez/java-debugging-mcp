@@ -41,6 +41,28 @@ const INSTRUCTIONS: &str = "JDWP debugging server for Java applications. \
 /// learned `debug.attach` from `debug.set_line_stop` did not learn it from `debug.get_stack`.
 const NO_SESSION_REFUSAL: &str = "No active debug session. Use debug.attach first.";
 
+/// What the five arming tools say when the session they resolved cannot service events (SESS-2, #195).
+///
+/// **The condition and the recovery step, for the reason DOC-18 (#193) gives**: a refusal naming only the
+/// condition leaves a caller to guess, and "cannot service events" is not a phrase anyone can act on by
+/// itself. A free function, so `reply-fragments.txt` can pin the wording the downstream toolkit reads
+/// (`docs/toolkit-contract.md`) — the same reason [`NO_SESSION_REFUSAL`] is a `const` and not a literal
+/// inside an `async fn`.
+///
+/// **It refuses rather than arming and warning, and that is the decision.** The alternative — arm it, say
+/// it may freeze — hands the caller a stop point that is *already* the failure: nothing undoes a JDWP
+/// event's suspend policy but the pump, so the first hit stops a request thread and no later call can
+/// release it. #195 needed a JVM restart. This costs the debuggee nothing to decide, which is what an
+/// argument-level refusal is for.
+fn no_event_pump_refusal(endpoint: &str) -> String {
+    format!(
+        "The session attached to {endpoint} has no event pump — nothing is reading this JVM's events, so \
+         a stop point armed on it would suspend the debuggee at its first hit and stay that way, whatever \
+         trace says. Nothing was armed and nothing was sent. Use debug.disconnect on it and debug.attach \
+         again; debug.list_sessions marks it NO EVENT PUMP."
+    )
+}
+
 /// A required `_meta` field the request did not carry (MCP-1). `-32602`, per the spec: a request
 /// missing a required field is malformed rather than unsupported.
 fn missing_meta_field(key: &str) -> JsonRpcError {
@@ -469,6 +491,42 @@ impl RequestHandler {
         args: &serde_json::Value,
     ) -> Result<std::sync::Arc<tokio::sync::Mutex<crate::session::DebugSession>>, String> {
         self.resolve_session(args).await.ok_or_else(|| NO_SESSION_REFUSAL.to_string())
+    }
+
+    /// [`Self::require_session`], plus the one condition under which arming a stop point is a trap
+    /// (SESS-2, #195).
+    ///
+    /// **Why the arming tools and not all 35.** A session whose event pump is not running can still be
+    /// read from perfectly well — `debug.get_stack`, `debug.list_threads` and `debug.evaluate` are
+    /// request/reply over the same socket and none of them waits for an event. What is unsafe is leaving
+    /// something behind that fires later: a stop point is the only thing here that suspends the debuggee at
+    /// a moment nobody is watching, and the pump is the only thing that resumes it. So this guards the five
+    /// `debug.set_*_stop` tools and `debug.arm_stop_points`, and the read tools are left alone rather than
+    /// refused for a reason that does not apply to them.
+    ///
+    /// **Both non-running states refuse, and `Ended` is not redundant.** Arming against a JVM that has gone
+    /// would fail at the wire anyway — but it fails after a round trip, on a socket whose remote end is
+    /// already gone, which is the shape that hangs. This answers first and costs nothing.
+    ///
+    /// The guard is defence in depth: `open_session` no longer registers a session it cannot finish
+    /// building, so reaching this needs a request to interleave with the attach that is still opening one.
+    /// MCP `2026-07-28` permits exactly that, and #195 is what it looks like when nothing checks.
+    async fn require_session_for_arming(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<std::sync::Arc<tokio::sync::Mutex<crate::session::DebugSession>>, String> {
+        let guard = self.require_session(args).await?;
+        // Scoped so the guard is not held across the return — every caller locks it again immediately.
+        let refusal = {
+            let session = guard.lock().await;
+            match session.event_pump() {
+                crate::session::EventPump::Running => None,
+                crate::session::EventPump::Ended | crate::session::EventPump::Unstarted => {
+                    Some(no_event_pump_refusal(&session.endpoint))
+                }
+            }
+        };
+        refusal.map_or(Ok(guard), Err)
     }
 
     pub async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
@@ -988,7 +1046,6 @@ impl RequestHandler {
         check_readonly_exprs(read_only, None, &session_exprs)?;
         let session_id = self
             .open_session(
-                &args,
                 connection,
                 format!("{host}:{port}"),
                 read_only,
@@ -1054,7 +1111,6 @@ impl RequestHandler {
     /// `launched`.
     async fn open_session(
         &self,
-        args: &serde_json::Value,
         connection: jdwp_client::JdwpConnection,
         endpoint: String,
         read_only: bool,
@@ -1081,11 +1137,15 @@ impl RequestHandler {
         // has said nothing about the other.
         let class_roots =
             class_roots.map_or_else(env_class_roots, |v| v.iter().map(std::path::PathBuf::from).collect());
+        // Kept so the rollback below has something to dispose: `create_session` takes the connection, and
+        // a session that cannot be reached again cannot be asked for it back. Cloning is how the event
+        // pump gets its own handle too — every clone shares one socket and one read-only flag (ADR-0001).
+        let mut rollback = connection.clone();
         let session_id = self
             .session_manager
             .create_session(
                 connection,
-                endpoint,
+                endpoint.clone(),
                 crate::session::SessionSeed {
                     read_only,
                     source_roots,
@@ -1099,11 +1159,34 @@ impl RequestHandler {
                 },
             )
             .await;
-        // Get the session guard once so the listener/watchdog handles are stored before we return.
-        let session_guard = self
-            .resolve_session(args)
-            .await
-            .ok_or_else(|| "Failed to get session after creation".to_string())?;
+        // Looked up BY THE ID JUST MINTED, never by the caller's arguments (SESS-2, #195).
+        //
+        // This read `self.resolve_session(args)`, and `session_id` is honoured on every tool from the raw
+        // arguments — `debug.attach` included, since `tools.rs` publishes it on all forty schemas. So an
+        // attach that *passed* one resolved to that session instead of to this one, and both outcomes were
+        // wrong: a stale id found nothing and returned an error over a session that had already been
+        // registered and made current, and a live id found somebody else's session and hung this JVM's
+        // event pump and watchdog handles on it, overwriting theirs. The first is #195 — an attach that
+        // reported failure, a `debug.list_sessions` that reported `running`, and a trace stop point that
+        // armed happily and then froze the debuggee's request threads until the JVM was restarted, because
+        // nothing was left alive to resume what its hits suspended.
+        //
+        // The lookup stays fallible because a concurrent `debug.disconnect` can legitimately remove this
+        // session between the two calls (MCP `2026-07-28` permits interleaved requests on one process), and
+        // that is the case the rollback exists for.
+        let Some(session_guard) = self.session_manager.get_session_by_id(&session_id).await else {
+            // Dispose rather than drop. Leaving a registered session behind is what #195 is about, and
+            // leaving the *socket* behind is the same failure one layer down: `VirtualMachine.Dispose`
+            // clears every event request and resumes every thread in one round trip, so the debuggee is
+            // left running with nothing armed instead of holding a connection nobody will ever read.
+            self.session_manager.remove_session(&session_id).await;
+            let _ = rollback.dispose().await;
+            return Err(format!(
+                "The session for {endpoint} was removed while it was still being built, so it has been \
+                 disposed: the JVM is running with nothing armed and nothing is attached to it. Nothing \
+                 else was left behind — debug.list_sessions will not show it. Attach again."
+            ));
+        };
 
         {
             let mut session = session_guard.lock().await;
@@ -1188,7 +1271,6 @@ impl RequestHandler {
         check_readonly_exprs(read_only, None, &session_exprs)?;
         let session_id = self
             .open_session(
-                &args,
                 connection,
                 format!("127.0.0.1:{port}"),
                 read_only,
@@ -1374,7 +1456,7 @@ impl RequestHandler {
         let instance_filter = parse_instance_filter(a.instance_id.as_deref())?;
         let max_classes = clamped_max_classes(a.max_classes);
 
-        let session_guard = self.require_session(&args).await?;
+        let session_guard = self.require_session_for_arming(&args).await?;
         let mut session = session_guard.lock().await;
         let resolved = ResolvedTrace::resolve(&a, &session.trace_exprs);
         // One definition, pointed at each pattern in turn below.
@@ -1538,7 +1620,7 @@ impl RequestHandler {
 
         // Resolved once and up front so a set is never half-armed against one session and half against
         // another, and so "no session" is one refusal rather than N identical ones.
-        let session_guard = self.require_session(&args).await?;
+        let session_guard = self.require_session_for_arming(&args).await?;
 
         let session_id = args.get("session_id").cloned();
         let mut outcomes: Vec<(String, crate::stop_point_set::ArmOutcome)> =
@@ -3623,7 +3705,7 @@ impl RequestHandler {
         }
         let patterns = a.class_pattern.as_ref().map(crate::args::ClassPatterns::list).unwrap_or_default();
 
-        let session_guard = self.require_session(&args).await?;
+        let session_guard = self.require_session_for_arming(&args).await?;
         let mut session = session_guard.lock().await;
         // FILT-6 (#83): the condition too, now that these three kinds can carry one. It was `None` here
         // because there was nothing to check, not because a condition is exempt.
@@ -3707,7 +3789,7 @@ impl RequestHandler {
         }
         let field_name = a.field_name.trim().to_string();
 
-        let session_guard = self.require_session(&args).await?;
+        let session_guard = self.require_session_for_arming(&args).await?;
         let mut session = session_guard.lock().await;
         // FILT-6 (#83): the condition too, now that these three kinds can carry one. It was `None` here
         // because there was nothing to check, not because a condition is exempt.
@@ -3796,7 +3878,7 @@ impl RequestHandler {
         }
         refuse_counted_method_filter(a.hit_count, method.as_deref())?;
 
-        let session_guard = self.require_session(&args).await?;
+        let session_guard = self.require_session_for_arming(&args).await?;
         let mut session = session_guard.lock().await;
         // FILT-6 (#83): the condition too, now that these three kinds can carry one. It was `None` here
         // because there was nothing to check, not because a condition is exempt.
@@ -3869,7 +3951,7 @@ impl RequestHandler {
         // Every refusal before anything is armed, so a rejected call leaves the debuggee untouched.
         refuse_bad_monitor_arming(&a, &kinds)?;
 
-        let session_guard = self.require_session(&args).await?;
+        let session_guard = self.require_session_for_arming(&args).await?;
         let mut session = session_guard.lock().await;
         // No `condition` on this kind (see `find_traced_request`), so only the trace expressions can invoke.
         check_readonly_exprs(session.read_only, None, &crate::args::trace_exprs(a.trace_expr.clone()))?;
@@ -6693,8 +6775,14 @@ fn describe_trace_budget(trace: bool, budget: Option<u32>) -> String {
 /// Its own function since SESS-1 (#157), so `debug.set_current_session` refuses a dead session on the same
 /// evidence `debug.list_sessions` prints `DEAD` on. Two readings of "is this JVM still there" that could
 /// disagree would put a caller in front of a listing saying DEAD and a switch that accepted it.
+///
+/// **A pump that was never started is NOT this, and the distinction is SESS-2 (#195).** The question here
+/// is whether the JVM is gone, and an unstarted pump says nothing about the JVM — the socket is live and
+/// nobody is reading it. It has its own answer in [`crate::session::EventPump::Unstarted`], its own line in
+/// the listing, and its own refusal on the arming path; folding it in here would report a running JVM as
+/// gone, which is the mirror image of the bug.
 fn session_is_dead(s: &crate::session::DebugSession) -> bool {
-    s.event_listener_task.as_ref().is_some_and(tokio::task::JoinHandle::is_finished)
+    s.event_pump() == crate::session::EventPump::Ended
 }
 
 /// Format one session into the `debug.list_sessions` output, as a whole line including its newline.
@@ -6709,12 +6797,18 @@ fn render_session_line(
 ) -> String {
     let is_current = current.is_some_and(|c| c == sid);
     let dead = session_is_dead(s);
-    let state = if dead {
-        "DEAD (JVM gone — debug.disconnect it)"
-    } else if s.suspended_since.is_some() {
-        "SUSPENDED"
-    } else {
-        "running"
+    // SESS-2 (#195). `NO EVENT PUMP` is ahead of `SUSPENDED` because it is the state that explains the
+    // other: a session in it will read as suspended the moment anything hits, and stay that way. It said
+    // `running` until #195 — the one word a caller reads as "this is fine" — over a session that could not
+    // resume a single thing it stopped.
+    let state = match s.event_pump() {
+        crate::session::EventPump::Ended => "DEAD (JVM gone — debug.disconnect it)",
+        crate::session::EventPump::Unstarted => {
+            "NO EVENT PUMP (nothing is reading this JVM's events, so anything armed on it would suspend \
+             the debuggee for good — debug.disconnect it and attach again)"
+        }
+        crate::session::EventPump::Running if s.suspended_since.is_some() => "SUSPENDED",
+        crate::session::EventPump::Running => "running",
     };
     // A wildcard family's members are already counted in `breakpoints`, so only the family record itself is
     // added — the alternative double-counts the same locations twice for one call (FILT-3).
@@ -25514,6 +25608,9 @@ mod tests {
         // wordings of it existed, and that absence is why nobody noticed the second one. A snapshot entry is
         // what makes a third wording a diff somebody reads rather than a thing a caller discovers.
         case("no_session_refusal", NO_SESSION_REFUSAL.to_string());
+        // SESS-2 (#195). The endpoint is the only thing that varies, and it is the half a caller needs to
+        // tell which of several sessions the refusal is about.
+        case("no_event_pump_refusal", no_event_pump_refusal("localhost:8787"));
 
         out
     }

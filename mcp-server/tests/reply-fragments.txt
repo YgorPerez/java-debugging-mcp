@@ -120,3 +120,6 @@ first·   ⚠️  second
 
 ## no_session_refusal
 No active debug session. Use debug.attach first.
+
+## no_event_pump_refusal
+The session attached to localhost:8787 has no event pump — nothing is reading this JVM's events, so a stop point armed on it would suspend the debuggee at its first hit and stay that way, whatever trace says. Nothing was armed and nothing was sent. Use debug.disconnect on it and debug.attach again; debug.list_sessions marks it NO EVENT PUMP.

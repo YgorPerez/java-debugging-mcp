@@ -827,6 +827,26 @@ modern **era** makes `notifications/message` request-scoped, and a hit belongs t
 there gets no push at all and the alert goes to the server's stderr (MCP-1, ADR-0047). The sentence that
 used to read "both always happen" was true for two years and is the kind of claim worth dating.
 
+**Event pump**:
+The one task per **session** that reads **event sets** off that session's connection and decides what each
+one becomes: a **snapshot** and an immediate resume for a **trace**, a buffered **event** and an **alert**
+for a suspending hit, an armed **deferred breakpoint** for a class load.
+**It is the only thing that undoes an event's suspend policy, and that is why it is a word a caller now
+reads.** JDWP suspends according to the policy the **event set** carried, before anything here sees the
+packet; nothing else resumes what that stopped. A session without a running pump therefore turns any stop
+point armed on it into an indefinite freeze — trace mode included, whose whole promise is the resume this
+task performs — while every other surface reports health, which is SESS-2 ([#195]). So
+`debug.list_sessions` names the state (`NO EVENT PUMP`) and the five arming tools **refuse** it.
+**A pump that has ENDED is a different fact from one never started**, and the two used to give one answer.
+The pump exits when the connection closes, so *ended* is how a session learns its JVM is gone — reported as
+`DEAD`, and at no cost, unlike a round trip that could itself hang on the half-dead socket. *Never started*
+says nothing about the JVM: the socket is live and nobody is reading it.
+_Avoid_: **listener** (the field is `event_listener_task` and the word is fine in the code, but a listener
+suggests something that only receives — the resume is half the job), poller (it blocks on a socket read;
+nothing polls), **watchdog** (the other per-session task, and it is the rescue rather than the service)
+
+[#195]: https://github.com/YgorPerez/java-debugging-mcp/issues/195
+
 **Alert**:
 Something the debugger says without being asked, because the debuggee's state changed under the caller —
 a stop point suspending the VM, or the watchdog resuming it and disarming whatever froze it. Best-effort
