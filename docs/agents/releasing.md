@@ -37,9 +37,28 @@ that back to the derived name**; it is the only name here npm will not accept.
 **The already-published wrappers cannot be repaired.** v0.21.0 and v0.22.0 both pin
 `jdwp-mcp-win32-x64@<their version>` exactly, and the exact pin is what normally makes a missing platform
 fixable with no release — it is how v0.22.0's linux-x86_64 gap was closed, on attempt 3 of its own run. That
-only works for a name we can still publish to. Windows needs the **next release** and a bootstrap publish of
-the new name. Until then a Windows `npx` prints the shim's two-causes message and points at
-`cargo install`, which works there and always has.
+only works for a name we can still publish to. **v0.21.0 and v0.22.0 are therefore permanently broken on
+Windows `npx`**, and print the shim's two-causes message pointing at `cargo install`, which works there and
+always has.
+
+**v0.23.0 is fixed, and it was fixed the way that name allows and the held one did not.** Its release run
+published four platforms and went red on `jdwp-mcp-windows-x64`, which had never existed — no trusted
+publisher, no first version. Publishing it **by hand afterwards repaired the already-shipped wrapper with no
+new release**, because the wrapper pins it exactly and the name is ours. Verified from the registry and then
+through the caller's own path, which is the check worth copying:
+
+```bash
+npm install jdwp-mcp@<version> --os=win32 --cpu=x64 --ignore-scripts
+node -e "console.log(require.resolve('jdwp-mcp-windows-x64/jdwp-mcp.exe'))"
+```
+
+`--os` / `--cpu` make npm resolve a platform this box is not, so a Windows gap is provable on Linux instead of
+inferred — and the `require.resolve` line is the literal expression the shim evaluates on Windows, so it tests
+the rename's one deliberate exception rather than only that a tarball landed.
+
+**The trusted publisher for `jdwp-mcp-windows-x64` is the live gap.** The package now exists, so the config
+has something to attach to; until someone attaches it, every tag repeats v0.23.0's failure on that one
+package — recoverable by hand each time, and an unforced repeat of a known failure (REL-10, #194).
 
 **npm needs a one-time bootstrap, and `scripts/bootstrap-npm.sh` is it.** Trusted publishing attaches to a package that already exists, so the first version of all six is published by hand — the same bootstrap ADR-0043 records for crates.io. The wizard gates on the release carrying all five binaries first (v0.20.0 carried four; `linux-aarch64` arrived with REL-9), verifies them against `SHA256SUMS`, publishes platforms-then-wrapper, and walks the trusted-publisher form for each package. **Until it has run once, the `publish-npm` job fails on every tag** — deliberately, since a missing bootstrap must not look like a success.
 | The release body | v0.9.0 | Built by `scripts/release-notes.py`, not `--generate-notes` |
