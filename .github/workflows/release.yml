@@ -712,55 +712,119 @@ jobs:
       # attempt 3 of its own run. It only works for a name we can still publish to — which Windows no
       # longer was, and is the reason that platform needed a rename rather than a re-run.
       #
-      # SO: publish what can be published, then FAIL THE JOB naming what could not. There is deliberately no
-      # `|| true` — a subset shipping unnoticed is the thing this must not do, and in CI nobody can be asked
-      # to confirm, so the red run IS the confirmation being demanded after the fact. `publish-npm` is the
-      # last job and the release and crates.io have already shipped by here, so a red here blocks nothing —
-      # it is a flag, which is exactly what an incomplete platform set deserves.
+      # SO: publish what can be published, ASK THE REGISTRY WHAT IT ACTUALLY SERVES, then FAIL THE JOB naming
+      # what does not resolve. There is deliberately no `|| true` — a subset shipping unnoticed is the thing
+      # this must not do, and in CI nobody can be asked to confirm, so the red run IS the confirmation being
+      # demanded after the fact. `publish-npm` is the last job and the release and crates.io have already
+      # shipped by here, so a red here blocks nothing — it is a flag, which is exactly what an incomplete
+      # platform set deserves.
+      #
+      # The middle clause is REL-10 (#194) and it is the one that was missing. The gap this job shipped with
+      # was not that it failed to notice a failed publish; it noticed. It was that "did not publish" and
+      # "the registry does not serve this" are different questions, and it only ever asked the first — so a
+      # re-run counted its own earlier successes as failures, and a publish that exited 0 without landing
+      # would have gone unremarked. `npm view` is the observation; an exit code is a claim.
       - name: Publish the platform packages, then the wrapper last
         shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           set -uo pipefail
-          failed=()
-          for pkg in jdwp-mcp-linux-x64 jdwp-mcp-linux-arm64 jdwp-mcp-darwin-arm64 jdwp-mcp-darwin-x64 jdwp-mcp-windows-x64; do
+          version="${TAG#v}"
+          pkgs=(jdwp-mcp-linux-x64 jdwp-mcp-linux-arm64 jdwp-mcp-darwin-arm64 jdwp-mcp-darwin-x64 jdwp-mcp-windows-x64)
+
+          # Is this exact version on the registry NOW? One question, asked in two places below for two
+          # different reasons, so it is one function rather than two spellings that can disagree.
+          on_registry() { [ "$(npm view "$1@$version" version 2>/dev/null || true)" = "$version" ]; }
+
+          for pkg in "${pkgs[@]}"; do
             echo "::group::npm publish $pkg"
-            if ( cd "npm/$pkg" && npm publish --access public ); then
+            # ALREADY PUBLISHED IS NOT A FAILURE, and reading it as one is a bug this job had. `npm publish`
+            # of an existing version exits non-zero, so on a RE-RUN every package that succeeded the first
+            # time was counted as having "did not publish" — which is v0.22.0's history exactly: attempt 3
+            # was re-run to land linux-x86_64, and the four already up would each have been reported as a
+            # failure. The registry is the authority on what exists, not this loop's exit codes.
+            if on_registry "$pkg"; then
+              echo "$pkg@$version is already on the registry — nothing to do"
+            elif ( cd "npm/$pkg" && npm publish --access public ); then
               echo "published $pkg"
             else
               echo "::warning::$pkg did not publish"
-              failed+=("$pkg")
             fi
             echo "::endgroup::"
           done
 
-          if [ "${#failed[@]}" -eq 5 ]; then
-            echo "::error::no platform package published, so there is nothing for a wrapper to point at. Not publishing the wrapper."
+          # THE PRE-FLIGHT, AND THE POINT OF IT: what the registry SERVES, asked before the wrapper goes up.
+          # REL-7 (#184) is why this is not the publish loop's exit codes. A wrapper that pins a version no
+          # registry has is the failure there, npm skips an unresolvable `optionalDependencies` entry
+          # silently, and the five results are all knowable before the wrapper is published. An
+          # `npm publish` that exits 0 is a claim; `npm view` is the observation.
+          echo "::group::does every pinned platform resolve at $version?"
+          missing=()
+          for pkg in "${pkgs[@]}"; do
+            # npm can lag its own publish by a few seconds, and a false "does not resolve" would turn a
+            # good release red. Bounded retry for that — the same reasoning as the `--retry` on this
+            # workflow's downloads. A genuine 404 costs 12 s here and is worth naming correctly.
+            resolved=""
+            for attempt in 1 2 3 4 5; do
+              if on_registry "$pkg"; then resolved=yes; break; fi
+              [ "$attempt" -lt 5 ] && sleep 3
+            done
+            if [ -n "$resolved" ]; then
+              echo "resolves: $pkg@$version"
+            else
+              echo "::warning::does NOT resolve: $pkg@$version — the wrapper pins it and npm will skip it silently"
+              missing+=("$pkg")
+            fi
+          done
+          echo "::endgroup::"
+
+          if [ "${#missing[@]}" -eq 5 ]; then
+            echo "::error::no platform package resolves at $version, so there is nothing for a wrapper to point at. Not publishing the wrapper."
             exit 1
           fi
 
-          # The wrapper goes last, always, and only once at least one platform is up.
+          # The wrapper goes last, always, and only once at least one platform is up. It keeps ALL FIVE pins
+          # even when one is missing, deliberately: the exact pin is what lets a later publish of the missing
+          # package fix the already-published wrapper with no new release, which is how v0.22.0's
+          # linux-x86_64 gap was closed. Narrowing the pins to what published would trade that repair path
+          # for tidier metadata, and buy the caller nothing — `require.resolve` fails either way and the shim
+          # prints the same message.
           echo "::group::npm publish jdwp-mcp (the wrapper)"
-          ( cd npm/jdwp-mcp && npm publish --access public ) || {
-            echo "::error::the wrapper did not publish. The platform packages above are inert until it does."
-            exit 1
-          }
+          if on_registry jdwp-mcp; then
+            echo "jdwp-mcp@$version is already on the registry — nothing to do"
+          else
+            ( cd npm/jdwp-mcp && npm publish --access public ) || {
+              echo "::error::the wrapper did not publish. The platform packages above are inert until it does."
+              exit 1
+            }
+          fi
           echo "::endgroup::"
 
-          if [ "${#failed[@]}" -ne 0 ]; then
+          if [ "${#missing[@]}" -ne 0 ]; then
             {
-              echo "## npm: shipped ${#failed[@]} platform(s) short"
+              echo "## npm: shipped ${#missing[@]} platform(s) short"
               echo
-              echo "Published the wrapper and $(( 5 - ${#failed[@]} )) of 5 platform packages. Missing:"
-              for f in "${failed[@]}"; do echo "- \`$f\`"; done
+              echo "The wrapper is published and pins all 5 platforms. $(( 5 - ${#missing[@]} )) resolve."
+              echo "These do NOT, so \`npx jdwp-mcp\` on them installs the wrapper and gets **no binary**:"
+              for f in "${missing[@]}"; do echo "- \`$f@$version\`"; done
               echo
               echo "Those platforms fall back to \`cargo install jdwp-mcp\`, which the launcher tells them."
-              echo "The wrapper pins each platform at this exact version, so publishing a missing one later"
-              echo "makes the already-published wrapper find it — no new release needed:"
+              echo "The pin is exact, so publishing a missing one later makes the already-published wrapper"
+              echo "find it — no new release needed, PROVIDED the name is still ours to publish to."
+              echo "(\`jdwp-mcp-win32-x64\` stopped being, which is REL-10 #194. Check the name is not an npm"
+              echo "security-holder package before assuming a re-run is the fix.)"
               echo
               echo '```'
-              for f in "${failed[@]}"; do echo "( cd npm/$f && npm publish --access public )"; done
+              for f in "${missing[@]}"; do echo "( cd npm/$f && npm publish --access public )"; done
+              echo '```'
+              echo
+              echo "Then confirm, because a publish exiting 0 is not the registry serving it:"
+              echo
+              echo '```'
+              for f in "${missing[@]}"; do echo "npm view $f@$version version"; done
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::npm shipped without: ${failed[*]}. The wrapper IS published, so the other platforms work; this job is red so the gap is not missed."
+            echo "::error::npm shipped without: ${missing[*]}. The wrapper IS published, so the other platforms work; this job is red so the gap is not missed."
             exit 1
           fi
