@@ -17,18 +17,12 @@ pub struct DebugSession {
     /// The `host:port` this session attached to. Kept so `debug.list_sessions` can identify a session
     /// by where it points rather than by an opaque id — the connection itself doesn't remember.
     pub endpoint: String,
-    /// Every stop point this session holds, of all five kinds, keyed by its **stop-point id** (ADR-0005).
+    /// Everything this session knows about its stop points, which is the half a test can build without a
+    /// socket (CLEAN-6, #189).
     ///
-    /// **One collection, not five** (CLEAN-4, #187). It was `breakpoints`, `exception_requests`,
-    /// `watchpoints`, `method_exits` and `monitor_requests`, and the cost of that was not the five fields:
-    /// it was that every question about a stop point — is it armed, is it **spent**, what glyph does it
-    /// get, is its filter dead — had to be asked five times, so a fix to one of those rules could land on
-    /// three kinds and miss two. See [`crate::stop_point::StopPoint`].
-    ///
-    /// A `HashMap`, so iteration order within a kind is unspecified — it always was. The order a *listing*
-    /// groups kinds in is [`StopPointKind::LISTING_ORDER`](crate::stop_point::StopPointKind::LISTING_ORDER),
-    /// which the renderer states rather than inheriting from this field's shape.
-    pub stop_points: HashMap<String, StopPoint>,
+    /// See [`SessionState`]. It is where an invariant spanning two of those collections lives, and the
+    /// reason it is a separate type rather than more fields here is ADR-0050.
+    pub state: SessionState,
     /// Ring buffer of reportable events, oldest first. Bounded by `MAX_EVENTS`.
     ///
     /// A single `Option` slot here used to mean a second hit erased the first with no trace — the
@@ -99,25 +93,6 @@ pub struct DebugSession {
     /// one and is untouched: a caller who walked away has no newer event, the watermark still matches,
     /// and they are told.
     pub last_watchdog_seq: Option<u64>,
-    /// JDWP request ids of **traced** stop points disarmed while events they generated were still in
-    /// flight (TRACE-8, #72 — found while implementing EXC-3).
-    ///
-    /// **What goes wrong without it, and it is the worst failure this crate has.** `try_record_trace`
-    /// recognises a traced hit by looking its request id up among the *enabled* requests. A budget disarm
-    /// clears `request_id`, so a hit that the JVM had already generated stops being recognisable the
-    /// instant the budget runs out — and the event falls through to the suspending path, which buffers it
-    /// and leaves the thread suspended. Trace mode's entire promise is that it never freezes anything.
-    ///
-    /// It needs a rethrow to see, which is why it survived until #68: an exception stop that disarms on
-    /// its budget mid-chain has three more throws of the same instance already coming. Measured on
-    /// `RethrowProbe` — the probe stopped printing at the exact tick the budget ran out, and stayed
-    /// stopped until a `debug.panic`.
-    ///
-    /// Bounded (`MAX_DISARMED_TRACED`), and nothing removes an entry — so membership alone must never be
-    /// the whole test. [`was_traced_and_disarmed`](Self::was_traced_and_disarmed) carries the reason and
-    /// the second clause; the short version is that a reused request id matching on membership would turn a
-    /// **suspending** breakpoint into one that silently never suspends.
-    pub disarmed_traced_requests: VecDeque<i32>,
     /// Rethrow chains in flight, keyed by `(request id, thread, exception object id)` (EXC-3).
     ///
     /// **The thread is in the key on purpose.** A rethrow unwinds on the thread that threw, so including
@@ -206,9 +181,6 @@ pub struct DebugSession {
     /// A `BTreeMap` so a report lists classes in a stable order rather than a hash order, matching
     /// [`trace_disarms`](Self::trace_disarms).
     pub redefinitions: std::collections::BTreeMap<String, Redefinition>,
-    /// Breakpoints requested on classes not yet loaded. Each holds a `CLASS_PREPARE` request that
-    /// fires when the class loads; the event pump then arms the real breakpoint. See handlers.rs.
-    pub pending_breakpoints: Vec<PendingBreakpoint>,
     /// Wildcard line-breakpoint families (FILT-3), keyed by their `bpset_` id.
     pub pattern_sets: HashMap<String, PatternStopSet>,
     /// The JVM this session STARTED, if any (LAUNCH-1) — `None` for an ordinary `debug.attach`, which is
@@ -241,18 +213,203 @@ pub struct DebugSession {
     pub traces: VecDeque<TraceRecord>,
     /// Monotonic sequence for trace records (survives ring-buffer eviction).
     pub trace_seq: u64,
-    /// Monotonic counter behind caller-facing stop-point ids (`bp_`/`exc_`/`watch_`).
-    ///
-    /// Ids used to embed the JDWP request id, so re-arming a disabled stop point gave it a *new* id and
-    /// silently broke any id the caller had stored — the thing that made `toggle_stop_point` awkward to
-    /// script (BP-3). The request id is an internal detail now: still reported, never the identity.
-    pub stop_seq: u64,
     /// Push channel to the MCP client (EVT-2). Lives on the session because the two things that need
     /// it — the event pump and the watchdog — already hold a session and nothing else.
     ///
     /// It never replaces the `events` buffer above. A notification is best-effort and a client may
     /// never read one, so `debug.get_last_event` has to remain sufficient on its own.
     pub alerter: crate::protocol::Alerter,
+}
+
+/// A session's stop-point bookkeeping, and the half of a [`DebugSession`] that needs no socket.
+///
+/// **Why this is a type and not four more fields on `DebugSession`: ADR-0050.** The short version is that
+/// `JdwpConnection` has exactly one constructor and it opens a `TcpStream` (ADR-0049), so anything reachable
+/// only through a `DebugSession` is reachable only from a test that launches a JVM. Three assertions were
+/// owed and unpayable for that reason alone, and [`Self::owns_live_request`] below is the one whose own doc
+/// comment said so.
+///
+/// **What is in here is decided by the invariants, not by which fields are touched most.** These four are
+/// exactly the state the methods below read or write together. `pattern_sets` is deliberately NOT among them
+/// even though CLEAN-6 (#189) grouped it with the stop points: no invariant here spans it, and moving it
+/// would have been churn wearing this commit's clothes.
+#[derive(Debug)]
+pub struct SessionState {
+    /// Every stop point this session holds, of all five kinds, keyed by its **stop-point id** (ADR-0005).
+    ///
+    /// **One collection, not five** (CLEAN-4, #187). It was `breakpoints`, `exception_requests`,
+    /// `watchpoints`, `method_exits` and `monitor_requests`, and the cost of that was not the five fields:
+    /// it was that every question about a stop point — is it armed, is it **spent**, what glyph does it
+    /// get, is its filter dead — had to be asked five times, so a fix to one of those rules could land on
+    /// three kinds and miss two. See [`crate::stop_point::StopPoint`].
+    ///
+    /// A `HashMap`, so iteration order within a kind is unspecified — it always was. The order a *listing*
+    /// groups kinds in is [`StopPointKind::LISTING_ORDER`](crate::stop_point::StopPointKind::LISTING_ORDER),
+    /// which the renderer states rather than inheriting from this field's shape.
+    pub stop_points: HashMap<String, StopPoint>,
+    /// Breakpoints requested on classes not yet loaded. Each holds a `CLASS_PREPARE` request that
+    /// fires when the class loads; the event pump then arms the real breakpoint via
+    /// [`Self::resolve_pending`].
+    pub pending_breakpoints: Vec<PendingBreakpoint>,
+    /// JDWP request ids of **traced** stop points disarmed while events they generated were still in
+    /// flight (TRACE-8, #72 — found while implementing EXC-3).
+    ///
+    /// **What goes wrong without it, and it is the worst failure this crate has.** `try_record_trace`
+    /// recognises a traced hit by looking its request id up among the *enabled* requests. A budget disarm
+    /// clears `request_id`, so a hit that the JVM had already generated stops being recognisable the
+    /// instant the budget runs out — and the event falls through to the suspending path, which buffers it
+    /// and leaves the thread suspended. Trace mode's entire promise is that it never freezes anything.
+    ///
+    /// It needs a rethrow to see, which is why it survived until #68: an exception stop that disarms on
+    /// its budget mid-chain has three more throws of the same instance already coming. Measured on
+    /// `RethrowProbe` — the probe stopped printing at the exact tick the budget ran out, and stayed
+    /// stopped until a `debug.panic`.
+    ///
+    /// Bounded (`MAX_DISARMED_TRACED`), and nothing removes an entry — so membership alone must never be
+    /// the whole test. [`was_traced_and_disarmed`](Self::was_traced_and_disarmed) carries the reason and
+    /// the second clause; the short version is that a reused request id matching on membership would turn a
+    /// **suspending** breakpoint into one that silently never suspends.
+    pub disarmed_traced_requests: VecDeque<i32>,
+    /// Monotonic counter behind caller-facing stop-point ids (`bp_`/`exc_`/`watch_`).
+    ///
+    /// Ids used to embed the JDWP request id, so re-arming a disabled stop point gave it a *new* id and
+    /// silently broke any id the caller had stored — the thing that made `toggle_stop_point` awkward to
+    /// script (BP-3). The request id is an internal detail now: still reported, never the identity.
+    pub stop_seq: u64,
+}
+
+impl SessionState {
+    /// A session's bookkeeping at the moment of attach — every collection empty, every counter at zero.
+    ///
+    /// **It takes no arguments, and that is the point of the type.** No socket, no runtime, no JVM: a test
+    /// that wants a session holding two stop points builds one here and says so in three lines, where before
+    /// it had to launch a debuggee (ADR-0050).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            stop_points: HashMap::new(),
+            pending_breakpoints: Vec::new(),
+            disarmed_traced_requests: VecDeque::new(),
+            stop_seq: 0,
+        }
+    }
+
+    /// Register an armed stop point under its own **stop-point id**.
+    ///
+    /// Takes the value rather than a key and a value, because the key **is** [`StopPoint::id`]: passing
+    /// them separately is a way for the two to disagree, and every reply that names a stop point reads the
+    /// field while `clear`, `toggle` and `get_traces` all address it by the key. One argument, one id.
+    pub fn register_stop_point(&mut self, sp: StopPoint) {
+        self.stop_points.insert(sp.id.clone(), sp);
+    }
+
+    /// Swap a **deferred** line breakpoint for the armed stop point it became, in one step. Answers
+    /// whether a deferral of that id was actually there.
+    ///
+    /// **The two collections move together, and until this existed they did not.** The event pump did
+    /// `pending_breakpoints.retain(…)` and [`Self::register_stop_point`] about ten lines apart, with a log
+    /// line and — the part that matters — an `await` between them. For the width of that await the
+    /// breakpoint was in **neither** collection: absent from `list_stop_points`, absent from the count, and
+    /// absent from [`Self::owns_live_request`], which is the one that decides whether a hit already in
+    /// flight gets surfaced or resumed and dropped.
+    ///
+    /// Nothing ever observed it, and the reason is worth stating because it is not a property of this
+    /// state: the caller holds the session guard across the whole block, so no other task can look. That
+    /// makes the invariant true by the caller's good behaviour rather than by construction — precisely the
+    /// shape CLEAN-6 (#189) names, *an invariant that lives in whichever handler happens to update two
+    /// fields together*. Here it cannot be got wrong, because there is no moment between the two writes.
+    ///
+    /// A caller that ignores the answer is registering a stop point for a deferral nobody recorded, which
+    /// would mean two stop points with one id if the deferral were still live elsewhere.
+    ///
+    /// **It takes the stop point and no id.** A deferral and the stop point it becomes carry the *same*
+    /// caller-facing id by definition — that is what makes `bp_4` still mean `bp_4` after the class loads
+    /// (BP-3) — so passing both would invite a caller to pass two, and the pair that disagreed would remove
+    /// one deferral while registering a different stop point.
+    pub fn resolve_pending(&mut self, armed: StopPoint) -> bool {
+        let before = self.pending_breakpoints.len();
+        self.pending_breakpoints.retain(|p| p.bp_id != armed.id);
+        let removed = before != self.pending_breakpoints.len();
+        self.register_stop_point(armed);
+        removed
+    }
+
+    /// Whether `req_id` belonged to a traced stop point that was disarmed with events in flight
+    /// (TRACE-8, #72).
+    ///
+    /// **Membership in the list is not sufficient, and getting that wrong would be worse than the bug this
+    /// fixes.** Nothing removes an id from the list, and JDWP request ids are allocated by the *debuggee* —
+    /// `HotSpot` happens to hand them out monotonically, but the spec promises nothing, and this crate talks
+    /// to whatever is on the port. If a reused id matched on membership alone, the hit it named would be
+    /// resumed and dropped: a **suspending** breakpoint that silently never suspends, with no error
+    /// anywhere and nothing in the reply to explain it. That is the same class of failure as the one being
+    /// fixed, pointing the other way.
+    ///
+    /// So the id must also not currently belong to a live stop point. The caller has already established
+    /// that it is not an *enabled traced* request (`find_traced_request` missed); this rules out its having
+    /// been reused for an enabled **suspending** one, which is the case that matters. A stale entry then
+    /// simply goes inert rather than needing to be purged.
+    pub fn was_traced_and_disarmed(&self, req_id: i32) -> bool {
+        self.disarmed_traced_requests.contains(&req_id) && !self.owns_live_request(req_id)
+    }
+
+    /// Whether any tracked stop point currently holds `req_id` as its live JDWP request.
+    ///
+    /// **All five kinds, which it did not used to be — and that is a behaviour change, not a refactor.**
+    /// Written as four hand-repeated clauses it silently omitted the monitor kind: the sentence above said
+    /// "any tracked stop point" and the code meant four of them. It fell out of CLEAN-4's one collection
+    /// and landed in that commit, which is the wrong place for it — a change in behaviour behind an
+    /// existing name belongs in a commit of its own, because `scripts/release-notes.py` builds the
+    /// published changelog from commit **subjects** and a `refactor(…)` subject does not say this
+    /// happened. This paragraph is the record it should have had.
+    ///
+    /// What changes: the guard's whole job is to stop [`Self::was_traced_and_disarmed`] matching on
+    /// membership alone, because request ids are allocated by the *debuggee* and **recur**. With the
+    /// monitor kind missing, a disarmed traced monitor request whose id the JVM had since reissued to a
+    /// live one would answer `true` — and the hit it named would be resumed and dropped rather than
+    /// surfaced. That is the same failure the list exists to prevent, pointing the other way, on one kind.
+    ///
+    /// **It had no test, and the reason was the seam rather than an oversight.** Reaching it needed a
+    /// `DebugSession`, which owns a `JdwpConnection` and cannot be built without a socket (ADR-0049). That
+    /// is what moving it onto [`SessionState`] fixed (CLEAN-6, #189, ADR-0050): the assertion is
+    /// `a_live_stop_point_of_every_kind_owns_its_request`, it is driven off
+    /// [`StopPointKind::LISTING_ORDER`](crate::stop_point::StopPointKind::LISTING_ORDER) so a sixth kind
+    /// cannot dodge it, and `a_deferrals_class_prepare_counts_as_a_live_request` covers the second clause.
+    /// Neither needs a JVM.
+    fn owns_live_request(&self, req_id: i32) -> bool {
+        self.stop_points.values().any(|sp| sp.owns_request(req_id))
+            // A deferred breakpoint's CLASS_PREPARE is a live request too, and arming the real breakpoint
+            // when it fires is not something to skip.
+            || self.pending_breakpoints.iter().any(|p| p.class_prepare_request_id == req_id)
+            // And an ARMED stop point keeps one for the rest of its life (BP-7, #115), which is how a copy
+            // loaded by a redeploy's new classloader gets armed at all.
+            || self
+                .stop_points
+                .values()
+                .filter_map(crate::stop_point::StopPoint::line)
+                .any(|l| l.rearm.watch().is_some_and(|w| w.request_id == req_id))
+    }
+
+    /// Remember that a traced stop point's JDWP request was just disarmed, so hits it had already
+    /// generated are still resumed rather than surfaced as suspending events (TRACE-8, #72).
+    pub fn note_disarmed_traced(&mut self, req_id: i32) {
+        remember_bounded(&mut self.disarmed_traced_requests, req_id, MAX_DISARMED_TRACED);
+    }
+
+    /// Allocate the next caller-facing stop-point id, e.g. `next_stop_id("bp_")` → `bp_1`.
+    ///
+    /// Stable for the life of the stop point, so disabling and re-arming it keeps the id the caller
+    /// already has (BP-3).
+    pub fn next_stop_id(&mut self, prefix: &str) -> String {
+        self.stop_seq += 1;
+        format!("{prefix}{}", self.stop_seq)
+    }
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Max trace snapshots retained per session; oldest are evicted (documented cap for TRACE-1).
@@ -454,73 +611,6 @@ impl DebugSession {
         self.last_watchdog_seq = Some(self.event_seq);
     }
 
-    /// Remember that a traced stop point's JDWP request was just disarmed, so hits it had already
-    /// generated are still resumed rather than surfaced as suspending events (TRACE-8, #72).
-    pub fn note_disarmed_traced(&mut self, req_id: i32) {
-        remember_bounded(&mut self.disarmed_traced_requests, req_id, MAX_DISARMED_TRACED);
-    }
-
-    /// Register an armed stop point under its own **stop-point id**.
-    ///
-    /// Takes the value rather than a key and a value, because the key **is** [`StopPoint::id`]: passing
-    /// them separately is a way for the two to disagree, and every reply that names a stop point reads the
-    /// field while `clear`, `toggle` and `get_traces` all address it by the key. One argument, one id.
-    pub fn register_stop_point(&mut self, sp: StopPoint) {
-        self.stop_points.insert(sp.id.clone(), sp);
-    }
-
-    /// Whether `req_id` belonged to a traced stop point that was disarmed with events in flight
-    /// (TRACE-8, #72).
-    ///
-    /// **Membership in the list is not sufficient, and getting that wrong would be worse than the bug this
-    /// fixes.** Nothing removes an id from the list, and JDWP request ids are allocated by the *debuggee* —
-    /// `HotSpot` happens to hand them out monotonically, but the spec promises nothing, and this crate talks
-    /// to whatever is on the port. If a reused id matched on membership alone, the hit it named would be
-    /// resumed and dropped: a **suspending** breakpoint that silently never suspends, with no error
-    /// anywhere and nothing in the reply to explain it. That is the same class of failure as the one being
-    /// fixed, pointing the other way.
-    ///
-    /// So the id must also not currently belong to a live stop point. The caller has already established
-    /// that it is not an *enabled traced* request (`find_traced_request` missed); this rules out its having
-    /// been reused for an enabled **suspending** one, which is the case that matters. A stale entry then
-    /// simply goes inert rather than needing to be purged.
-    pub fn was_traced_and_disarmed(&self, req_id: i32) -> bool {
-        self.disarmed_traced_requests.contains(&req_id) && !self.owns_live_request(req_id)
-    }
-
-    /// Whether any tracked stop point currently holds `req_id` as its live JDWP request.
-    ///
-    /// **All five kinds, which it did not used to be — and that is a behaviour change, not a refactor.**
-    /// Written as four hand-repeated clauses it silently omitted the monitor kind: the sentence above said
-    /// "any tracked stop point" and the code meant four of them. It fell out of CLEAN-4's one collection
-    /// and landed in that commit, which is the wrong place for it — a change in behaviour behind an
-    /// existing name belongs in a commit of its own, because `scripts/release-notes.py` builds the
-    /// published changelog from commit **subjects** and a `refactor(…)` subject does not say this
-    /// happened. This paragraph is the record it should have had.
-    ///
-    /// What changes: the guard's whole job is to stop [`Self::was_traced_and_disarmed`] matching on
-    /// membership alone, because request ids are allocated by the *debuggee* and **recur**. With the
-    /// monitor kind missing, a disarmed traced monitor request whose id the JVM had since reissued to a
-    /// live one would answer `true` — and the hit it named would be resumed and dropped rather than
-    /// surfaced. That is the same failure the list exists to prevent, pointing the other way, on one kind.
-    ///
-    /// **It has no test, and the reason is the seam rather than an oversight.** Reaching this needs a
-    /// `DebugSession`, which owns a `JdwpConnection` and cannot be built without a socket (ADR-0049).
-    /// CLEAN-6 (#189) is where that moves; the JVM-free assertion belongs there.
-    fn owns_live_request(&self, req_id: i32) -> bool {
-        self.stop_points.values().any(|sp| sp.owns_request(req_id))
-            // A deferred breakpoint's CLASS_PREPARE is a live request too, and arming the real breakpoint
-            // when it fires is not something to skip.
-            || self.pending_breakpoints.iter().any(|p| p.class_prepare_request_id == req_id)
-            // And an ARMED stop point keeps one for the rest of its life (BP-7, #115), which is how a copy
-            // loaded by a redeploy's new classloader gets armed at all.
-            || self
-                .stop_points
-                .values()
-                .filter_map(crate::stop_point::StopPoint::line)
-                .any(|l| l.rearm.watch().is_some_and(|w| w.request_id == req_id))
-    }
-
     /// Classify a traced exception hit as a first throw or a rethrow of an instance already captured,
     /// and advance that instance's chain (EXC-3, #68).
     ///
@@ -634,15 +724,6 @@ impl DebugSession {
         } else {
             self.trace_disarms_dropped += 1;
         }
-    }
-
-    /// Allocate the next caller-facing stop-point id, e.g. `next_stop_id("bp_")` → `bp_1`.
-    ///
-    /// Stable for the life of the stop point, so disabling and re-arming it keeps the id the caller
-    /// already has (BP-3).
-    pub fn next_stop_id(&mut self, prefix: &str) -> String {
-        self.stop_seq += 1;
-        format!("{prefix}{}", self.stop_seq)
     }
 }
 
@@ -1100,9 +1181,9 @@ impl SessionManager {
         } = seed;
         let session_id = format!("session_{}", uuid::v4());
         let session = DebugSession {
+            state: SessionState::new(),
             connection,
             endpoint,
-            stop_points: HashMap::new(),
             events: VecDeque::new(),
             event_seq: 0,
             events_dropped: 0,
@@ -1115,7 +1196,6 @@ impl SessionManager {
             watchdog_task: None,
             last_watchdog_note: None,
             last_watchdog_seq: None,
-            disarmed_traced_requests: VecDeque::new(),
             rethrow_chains: HashMap::new(),
             trace_disarms: std::collections::BTreeMap::new(),
             trace_disarms_dropped: 0,
@@ -1126,14 +1206,12 @@ impl SessionManager {
             step_exclude_classes,
             step_only_classes,
             redefinitions: std::collections::BTreeMap::new(),
-            pending_breakpoints: Vec::new(),
             pattern_sets: HashMap::new(),
             launched: None,
             monitor_pending: HashMap::new(),
             monitor_pending_dropped: 0,
             traces: VecDeque::new(),
             trace_seq: 0,
-            stop_seq: 0,
             alerter: self.alerter.clone(),
         };
 
@@ -1247,18 +1325,143 @@ mod tests {
 
     // BP-3: ids are stable and unique per stop point, and independent of any JDWP request id — which is
     // what lets a disable → re-arm keep the id the caller is holding.
+    //
+    // **This used to mirror `next_stop_id` instead of calling it** — a closure in the test body
+    // reimplemented the two lines and asserted on the reimplementation, because a `DebugSession` could not
+    // be built without a socket. It could not fail on any change to the real function, which is the
+    // **vacuous** verdict `CONTEXT.md` defines. It calls the real one now (CLEAN-6, #189).
     #[test]
     fn stop_ids_are_sequential_and_prefixed() {
-        let mut seq = 0u64;
-        // Mirrors `next_stop_id` without needing a live connection to build a DebugSession.
-        let mut next = |prefix: &str| {
-            seq += 1;
-            format!("{prefix}{seq}")
-        };
-        assert_eq!(next("bp_"), "bp_1");
-        assert_eq!(next("exc_"), "exc_2");
-        assert_eq!(next("watch_modify_"), "watch_modify_3");
-        assert_eq!(next("bp_"), "bp_4", "ids must never be reused within a session");
+        let mut state = SessionState::new();
+        assert_eq!(state.next_stop_id("bp_"), "bp_1");
+        assert_eq!(state.next_stop_id("exc_"), "exc_2");
+        assert_eq!(state.next_stop_id("watch_modify_"), "watch_modify_3");
+        assert_eq!(state.next_stop_id("bp_"), "bp_4", "ids must never be reused within a session");
+    }
+
+    /// A deferral, in the state a test needs it and nothing more.
+    ///
+    /// `signature` and `class_prepare_request_id` are the two that carry meaning here; everything else is
+    /// the quietest value that compiles, the same move `stop_point::build::armed` makes.
+    fn pending(bp_id: &str, class_prepare_request_id: i32) -> PendingBreakpoint {
+        PendingBreakpoint {
+            bp_id: bp_id.to_string(),
+            class_prepare_request_id,
+            class_pattern: "com.example.Orders".to_string(),
+            signature: "Lcom/example/Orders;".to_string(),
+            line: Some(42),
+            method: None,
+            hit_count: None,
+            instance_filter: None,
+            thread_filter: None,
+            condition: None,
+            trace: false,
+            trace_expr: Vec::new(),
+            trace_budget: None,
+            trace_frames: 0,
+            trace_max_length: None,
+        }
+    }
+
+    /// CLEAN-6 (#189): the assertion [`SessionState::owns_live_request`]'s own doc comment asked for.
+    ///
+    /// That paragraph said the test belongs here and named the seam as the reason it did not exist —
+    /// reaching the function needed a `DebugSession`, which owns a `JdwpConnection` and cannot be built
+    /// without a socket (ADR-0049). This is the assertion arriving, and it needs no JVM.
+    ///
+    /// **Every kind, which is the behaviour the doc comment records as a change.** Written as four
+    /// hand-repeated clauses it silently omitted the monitor kind: a disarmed traced monitor request whose
+    /// id the JVM had since reissued to a live one answered `true`, and the hit it named would be resumed
+    /// and dropped rather than surfaced. Driven off `LISTING_ORDER` so a sixth kind cannot be added without
+    /// this covering it.
+    #[test]
+    fn a_live_stop_point_of_every_kind_owns_its_request() {
+        for kind in crate::stop_point::StopPointKind::LISTING_ORDER {
+            let mut state = SessionState::new();
+            state.register_stop_point(crate::stop_point::build::armed("sp_1", kind));
+            assert!(
+                state.owns_live_request(7),
+                "{kind:?}: an armed stop point must own its live request. If it does not, \
+                 `was_traced_and_disarmed` matches on list membership alone and a hit already in flight is \
+                 resumed and dropped — a suspending stop point that silently never suspends"
+            );
+            assert!(!state.owns_live_request(8), "{kind:?}: and it must not claim a request it never held");
+        }
+    }
+
+    /// A deferred breakpoint's `CLASS_PREPARE` is a live request too — the second clause of
+    /// [`SessionState::owns_live_request`], and the one that keeps a deferral from being armed twice.
+    #[test]
+    fn a_deferrals_class_prepare_counts_as_a_live_request() {
+        let mut state = SessionState::new();
+        state.pending_breakpoints.push(pending("bp_1", 99));
+        assert!(state.owns_live_request(99), "the CLASS_PREPARE that will arm the real breakpoint is live");
+        assert!(!state.owns_live_request(7), "and nothing else is");
+    }
+
+    /// TRACE-8 (#72): **membership alone must never be the whole test**, which is the rule
+    /// [`SessionState::was_traced_and_disarmed`] exists to enforce and had no assertion for.
+    ///
+    /// Request ids are allocated by the *debuggee* and recur. If a reused id matched on membership, the hit
+    /// it named would be resumed and dropped — the same failure the list prevents, pointing the other way.
+    #[test]
+    fn a_disarmed_traced_request_stops_matching_once_its_id_is_live_again() {
+        let mut state = SessionState::new();
+        state.note_disarmed_traced(7);
+        assert!(
+            state.was_traced_and_disarmed(7),
+            "a disarmed traced request is recognised while its id is free"
+        );
+
+        // The debuggee reissues 7 to a live stop point — `build::armed` arms on exactly that id.
+        state.register_stop_point(crate::stop_point::build::armed(
+            "bp_1",
+            crate::stop_point::StopPointKind::Line,
+        ));
+        assert!(
+            !state.was_traced_and_disarmed(7),
+            "once 7 belongs to a live stop point it must NOT read as disarmed-and-traced: the hit would be \
+             resumed and dropped instead of surfaced"
+        );
+        assert!(
+            state.disarmed_traced_requests.contains(&7),
+            "and the entry goes inert rather than being purged"
+        );
+    }
+
+    /// CLEAN-6 (#189): resolving a deferral is **one step**, so there is no moment when the breakpoint is
+    /// in neither collection.
+    ///
+    /// The event pump used to `retain` the pending list and `register_stop_point` about ten lines apart with
+    /// an `await` between them. This asserts the property that replaced it: after one call the id is gone
+    /// from the deferrals and present among the stop points, and the count of things this session holds
+    /// never dipped.
+    #[test]
+    fn a_resolved_deferral_moves_between_the_two_collections_in_one_step() {
+        let mut state = SessionState::new();
+        state.pending_breakpoints.push(pending("bp_1", 99));
+        assert_eq!(state.pending_breakpoints.len() + state.stop_points.len(), 1);
+
+        let armed = crate::stop_point::build::armed("bp_1", crate::stop_point::StopPointKind::Line);
+        assert!(state.resolve_pending(armed), "the deferral was there, so it must report having removed it");
+
+        assert!(state.pending_breakpoints.is_empty(), "the deferral is gone");
+        assert!(state.stop_points.contains_key("bp_1"), "and the armed stop point kept the caller's id");
+        assert_eq!(
+            state.pending_breakpoints.len() + state.stop_points.len(),
+            1,
+            "one thing before and one thing after — a caller counting stop points never sees zero"
+        );
+    }
+
+    /// Resolving something never deferred answers `false`, which is how the event pump notices it is about
+    /// to have two records claiming one id.
+    #[test]
+    fn resolving_a_deferral_that_was_never_pending_says_so() {
+        let mut state = SessionState::new();
+        let armed = crate::stop_point::build::armed("bp_1", crate::stop_point::StopPointKind::Line);
+        assert!(!state.resolve_pending(armed), "nothing was pending, and the caller is told");
+        assert!(state.stop_points.contains_key("bp_1"), "the stop point is still registered");
     }
 
     /// Mirrors `DebugSession::note_trace_disarm` on bare state, so the bounding logic is testable

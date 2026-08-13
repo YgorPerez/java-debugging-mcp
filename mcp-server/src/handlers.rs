@@ -168,7 +168,7 @@ fn read_editable_stop_point(
         supports_condition,
         family_members: Vec::new(),
     };
-    if let Some(sp) = session.stop_points.get(id) {
+    if let Some(sp) = session.state.stop_points.get(id) {
         return Ok(mk(
             sp.kind().label(),
             sp.condition.clone(),
@@ -182,7 +182,7 @@ fn read_editable_stop_point(
         e.family_members.clone_from(&set.members);
         return Ok(e);
     }
-    if let Some(pb) = session.pending_breakpoints.iter().find(|p| p.bp_id == id) {
+    if let Some(pb) = session.state.pending_breakpoints.iter().find(|p| p.bp_id == id) {
         // Deferred is EDITABLE, unlike toggling. A pending breakpoint holds no request to silence, which
         // is why `enabled_state_of` refuses it — but it does hold the definition it will arm with, so
         // editing the condition it will arm with is exactly what this tool is for, and it costs nothing.
@@ -241,7 +241,7 @@ fn apply_stop_point_edit(
     condition: &FieldEdit<String>,
     hit_count: &FieldEdit<i32>,
 ) {
-    if let Some(sp) = session.stop_points.get_mut(id) {
+    if let Some(sp) = session.state.stop_points.get_mut(id) {
         // The one kind with no `condition` at all keeps it that way here rather than only at the refusal
         // above — see `EditableStopPoint::supports_condition` and ADR-0045.
         if sp.kind().takes_condition() {
@@ -250,7 +250,7 @@ fn apply_stop_point_edit(
         put_hit_count(&mut sp.hit_count, hit_count);
         return;
     }
-    if let Some(pb) = session.pending_breakpoints.iter_mut().find(|p| p.bp_id == id) {
+    if let Some(pb) = session.state.pending_breakpoints.iter_mut().find(|p| p.bp_id == id) {
         put_condition(&mut pb.condition, condition);
         put_hit_count(&mut pb.hit_count, hit_count);
         return;
@@ -291,7 +291,7 @@ fn parse_stop_point_edit(
 
 /// Whether `id` currently holds a live JDWP request, for any of the five kinds.
 fn is_armed(session: &crate::session::DebugSession, id: &str) -> bool {
-    session.stop_points.get(id).is_some_and(|sp| sp.enabled)
+    session.state.stop_points.get(id).is_some_and(|sp| sp.enabled)
 }
 
 /// Push a changed `hit_count` to the JVM, and report what it cost (BP-9, #159).
@@ -394,10 +394,10 @@ fn render_stop_point_update(
 /// `CLASS_PREPARE` watch and no request to silence, and answering "not found" for an id
 /// `debug.list_stop_points` is showing is the misleading reply BP-3 removed.
 fn enabled_state_of(session: &crate::session::DebugSession, id: &str) -> Result<bool, String> {
-    if let Some(sp) = session.stop_points.get(id) {
+    if let Some(sp) = session.state.stop_points.get(id) {
         return Ok(sp.enabled);
     }
-    if let Some(pb) = session.pending_breakpoints.iter().find(|p| p.bp_id == id) {
+    if let Some(pb) = session.state.pending_breakpoints.iter().find(|p| p.bp_id == id) {
         return Err(format!(
             "{id} is a deferred breakpoint waiting for {} to load — it holds no active breakpoint \
              request yet, so there is nothing to toggle. Use debug.clear_stop_point to drop it, or \
@@ -1448,8 +1448,8 @@ impl RequestHandler {
             return Ok(crate::stop_point_set::render_export(&export));
         }
 
-        if session.stop_points.is_empty()
-            && session.pending_breakpoints.is_empty()
+        if session.state.stop_points.is_empty()
+            && session.state.pending_breakpoints.is_empty()
             && session.pattern_sets.is_empty()
         {
             return Ok(session.last_watchdog_note.as_ref().map_or_else(
@@ -1473,7 +1473,7 @@ impl RequestHandler {
             "📍 {} breakpoint(s), {} deferred, {} exception, {} watchpoint(s), {} method-exit, {} \
              monitor{}:\n\n",
             count_of_kind(&session, StopPointKind::Line),
-            session.pending_breakpoints.len(),
+            session.state.pending_breakpoints.len(),
             count_of_kind(&session, StopPointKind::Exception),
             count_of_kind(&session, StopPointKind::Watchpoint),
             count_of_kind(&session, StopPointKind::MethodExit),
@@ -1562,9 +1562,9 @@ impl RequestHandler {
             // Deferral is read off the session rather than sniffed out of the reply text. A substring check
             // for "deferred" would be a reply-wording dependency of exactly the kind TEST-46 (#154) exists to
             // stop, and it would silently start reporting every entry as armed the day that word changed.
-            let pending_before = session_guard.lock().await.pending_breakpoints.len();
+            let pending_before = session_guard.lock().await.state.pending_breakpoints.len();
             let armed = self.dispatch_armable(&entry.tool, call).await;
-            let pending_after = session_guard.lock().await.pending_breakpoints.len();
+            let pending_after = session_guard.lock().await.state.pending_breakpoints.len();
 
             outcomes.push((
                 label,
@@ -1709,19 +1709,19 @@ impl RequestHandler {
 
         // A deferred (not-yet-armed) breakpoint lives in pending_breakpoints with only a
         // CLASS_PREPARE watch — clear that watch instead of a real breakpoint request.
-        if let Some(pos) = session.pending_breakpoints.iter().position(|p| p.bp_id == bp_id) {
-            let pb = session.pending_breakpoints.remove(pos);
+        if let Some(pos) = session.state.pending_breakpoints.iter().position(|p| p.bp_id == bp_id) {
+            let pb = session.state.pending_breakpoints.remove(pos);
             let _ = session.connection.clear_class_prepare(pb.class_prepare_request_id).await;
             return Ok(format!("✅ Deferred breakpoint cleared: {} ({})", bp_id, pb.class_pattern));
         }
 
         // Read before removing, because one kind still refuses to remove the bookkeeping when the wire
         // call failed — see `clear_one_stop_point`.
-        let Some(sp) = session.stop_points.get(bp_id).cloned() else {
+        let Some(sp) = session.state.stop_points.get(bp_id).cloned() else {
             return Err(format!("Breakpoint not found: {bp_id}"));
         };
         let reply = clear_one_stop_point(&mut session, &sp).await?;
-        session.stop_points.remove(bp_id);
+        session.state.stop_points.remove(bp_id);
         drop(session);
         Ok(reply)
     }
@@ -1946,7 +1946,7 @@ impl RequestHandler {
             let _ = session.connection.clear_step(req).await;
         }
         let n = count_of_kind(&session, StopPointKind::Line);
-        let np = session.pending_breakpoints.len();
+        let np = session.state.pending_breakpoints.len();
         let nf = session.pattern_sets.len();
         let ne = count_of_kind(&session, StopPointKind::Exception);
         let nw = count_of_kind(&session, StopPointKind::Watchpoint);
@@ -3166,8 +3166,9 @@ impl RequestHandler {
             let held: Vec<String> =
                 session.thread_suspends.values().map(|r| format!("\"{}\"", r.name)).collect();
             session.thread_suspends.clear();
-            let stops =
-                session.stop_points.len() + session.pending_breakpoints.len() + session.pattern_sets.len();
+            let stops = session.state.stop_points.len()
+                + session.state.pending_breakpoints.len()
+                + session.pattern_sets.len();
             if let Some((req, _)) = session.pending_step.take() {
                 let _ = session.connection.clear_step(req).await;
             }
@@ -4162,7 +4163,7 @@ async fn check_instance_filter_still_live(
     session: &mut crate::session::DebugSession,
     id: &str,
 ) -> Result<(), String> {
-    let filter = session.stop_points.get(id).and_then(|sp| sp.instance_filter);
+    let filter = session.state.stop_points.get(id).and_then(|sp| sp.instance_filter);
     let Some(oid) = filter else { return Ok(()) };
     // Both readings mean the same thing to a re-arm: collected, or collected long enough ago that the
     // JVM dropped the mapping. An unreachable debuggee is left alone — the re-arm below will say so.
@@ -4848,7 +4849,7 @@ fn overridden_traces(session: &crate::session::DebugSession) -> Vec<(&str, Vec<&
 fn line_stop_points(
     session: &crate::session::DebugSession,
 ) -> impl Iterator<Item = (&StopPoint, &crate::stop_point::LineBreakpoint)> {
-    session.stop_points.values().filter_map(|sp| sp.line().map(|l| (sp, l)))
+    session.state.stop_points.values().filter_map(|sp| sp.line().map(|l| (sp, l)))
 }
 
 /// Every stop point of one kind, in unspecified order within the kind.
@@ -4856,7 +4857,7 @@ fn stop_points_of(
     session: &crate::session::DebugSession,
     kind: StopPointKind,
 ) -> impl Iterator<Item = &StopPoint> {
-    session.stop_points.values().filter(move |sp| sp.kind() == kind)
+    session.state.stop_points.values().filter(move |sp| sp.kind() == kind)
 }
 
 /// How many stop points of one kind this session holds — the counts `list_stop_points`' header names one
@@ -5374,9 +5375,9 @@ async fn arm_one_field_watch(
                 if kind == jdwp_client::WatchKind::Access { "Access" } else { "Modification" },
             )
         })?;
-    let watch_id = session.next_stop_id(&format!("watch_{}_", kind.label()));
+    let watch_id = session.state.next_stop_id(&format!("watch_{}_", kind.label()));
     let label = format!("{watch_id} ({})", kind.label());
-    session.register_stop_point(StopPoint {
+    session.state.register_stop_point(StopPoint {
         id: watch_id,
         request_ids: vec![request_id],
         enabled: true,
@@ -5666,8 +5667,8 @@ async fn arm_one_method_exit(
         .await
         .map_err(|e| format!("Failed to set method-exit request on '{class_pattern}': {e}"))?;
 
-    let mexit_id = session.next_stop_id("mexit_");
-    session.register_stop_point(StopPoint {
+    let mexit_id = session.state.next_stop_id("mexit_");
+    session.state.register_stop_point(StopPoint {
         id: mexit_id.clone(),
         request_ids: vec![request_id],
         enabled: true,
@@ -6011,7 +6012,7 @@ async fn arm_monitor_kinds(
             Err(e) => {
                 for (id, req, k) in armed {
                     let _ = session.connection.clear_monitor_request(req, k).await;
-                    session.stop_points.remove(&id);
+                    session.state.stop_points.remove(&id);
                 }
                 return Err(e);
             }
@@ -6047,8 +6048,8 @@ async fn arm_one_monitor(
         .await
         .map_err(|e| format!("Failed to arm the '{}' monitor request: {e}", kind.label()))?;
 
-    let id = session.next_stop_id(&format!("mon_{}_", kind.label()));
-    session.register_stop_point(StopPoint {
+    let id = session.state.next_stop_id(&format!("mon_{}_", kind.label()));
+    session.state.register_stop_point(StopPoint {
         id: id.clone(),
         request_ids: vec![request_id],
         enabled: true,
@@ -6441,8 +6442,8 @@ async fn arm_one_exception(
         .await
         .map_err(|e| format!("Failed to set exception breakpoint: {e}"))?;
 
-    let exc_id = session.next_stop_id("exc_");
-    session.register_stop_point(StopPoint {
+    let exc_id = session.state.next_stop_id("exc_");
+    session.state.register_stop_point(StopPoint {
         id: exc_id.clone(),
         request_ids: vec![request_id],
         enabled: true,
@@ -6723,7 +6724,7 @@ fn render_session_line(
     // `list_stop_points` listed them, so the number a caller checks to see whether they left anything armed
     // was the one that could not see the kind most able to freeze a shared JVM. Every kind now, and the
     // same fix on `disconnect`'s "cleared N stop point(s)".
-    let stops = s.stop_points.len() + s.pending_breakpoints.len() + s.pattern_sets.len();
+    let stops = s.state.stop_points.len() + s.state.pending_breakpoints.len() + s.pattern_sets.len();
     let mut line = format!(
         "  {} [{}] {} — {}{}, {} stop point(s), {} JDWP packet(s)",
         if is_current { "▶" } else { " " },
@@ -6833,7 +6834,7 @@ fn note_traced_in_flight(session: &mut crate::session::DebugSession, traced: boo
         return;
     }
     for r in reqs {
-        session.note_disarmed_traced(*r);
+        session.state.note_disarmed_traced(*r);
     }
 }
 
@@ -6869,11 +6870,11 @@ fn note_every_traced_request_in_flight(session: &mut crate::session::DebugSessio
     // Collected before any noting, because `note_disarmed_traced` needs `&mut session` while these are
     // borrowed. Cheap: this is a handful of i32s per stop point, not a walk of anything.
     let mut traced: Vec<i32> = Vec::new();
-    for sp in session.stop_points.values().filter(|sp| sp.trace) {
+    for sp in session.state.stop_points.values().filter(|sp| sp.trace) {
         traced.extend(sp.request_ids.iter().copied());
     }
     for req in traced {
-        session.note_disarmed_traced(req);
+        session.state.note_disarmed_traced(req);
     }
 }
 
@@ -7166,7 +7167,7 @@ fn render_every_stop_point(output: &mut String, session: &crate::session::DebugS
     // `bp_` lines, and the family line is what explains why one call produced nine of them — and what to
     // clear to undo it. So they are emitted at the moment the listing leaves the line group.
     let mut asides_pending = true;
-    for sp in in_listing_order(session.stop_points.values()) {
+    for sp in in_listing_order(session.state.stop_points.values()) {
         if asides_pending && sp.kind() != StopPointKind::Line {
             render_line_asides(output, session, dead);
             asides_pending = false;
@@ -7181,7 +7182,7 @@ fn render_every_stop_point(output: &mut String, session: &crate::session::DebugS
 /// The deferred breakpoints and the wildcard families, in the one place `render_every_stop_point` emits
 /// them — see there for why they sit where they do.
 fn render_line_asides(output: &mut String, session: &crate::session::DebugSession, dead: &FilterHealth) {
-    for pb in &session.pending_breakpoints {
+    for pb in &session.state.pending_breakpoints {
         render_pending_line(output, pb, dead);
     }
     for set in session.pattern_sets.values() {
@@ -7976,7 +7977,7 @@ fn render_monitor_line(
 fn monitor_stops(
     session: &crate::session::DebugSession,
 ) -> impl Iterator<Item = (&StopPoint, &crate::stop_point::MonitorStop)> {
-    session.stop_points.values().filter_map(|sp| sp.monitor().map(|m| (sp, m)))
+    session.state.stop_points.values().filter_map(|sp| sp.monitor().map(|m| (sp, m)))
 }
 
 /// Drop one stop point's requests from the debuggee and describe what was cleared.
@@ -10458,6 +10459,7 @@ fn describe_live_frames(class_name: &str, thread: Option<u64>, live: Option<&[us
 /// this handler quietly disarming and rearming things the caller did not mention.
 fn stop_points_on(session: &crate::session::DebugSession, class_name: &str) -> Vec<String> {
     let mut ids: Vec<String> = session
+        .state
         .stop_points
         .values()
         .filter_map(|sp| match &sp.armed_on {
@@ -12215,7 +12217,7 @@ async fn try_arm_deferred_breakpoints(
         return false;
     };
     let pending: Vec<crate::session::PendingBreakpoint> =
-        session.pending_breakpoints.iter().filter(|p| p.signature == cp_sig).cloned().collect();
+        session.state.pending_breakpoints.iter().filter(|p| p.signature == cp_sig).cloned().collect();
     for pend in pending {
         match resolve_bp_location(&mut session.connection, cp_ref, pend.line, pend.method.as_deref()).await {
             Ok(loc) => {
@@ -12255,7 +12257,6 @@ async fn try_arm_deferred_breakpoints(
                         // Do the bookkeeping that only borrows `pend` first, so its owned fields can
                         // be moved (not cloned) into the stored stop point below.
                         let rearm = crate::stop_point::RearmState::Watching(handover_watch(&pend));
-                        session.pending_breakpoints.retain(|p| p.bp_id != pend.bp_id);
                         info!(
                             "Armed deferred breakpoint {} on {} (line {})",
                             pend.bp_id, pend.class_pattern, line
@@ -12265,7 +12266,14 @@ async fn try_arm_deferred_breakpoints(
                         // this runs in the event pump. Stored for `list_stop_points` to render.
                         let drift =
                             drift_check_for_armed_method(session, &pend.class_pattern, &method, lines).await;
-                        session.register_stop_point(StopPoint {
+                        // ONE STEP, and the `await` above is now the last thing before it rather than
+                        // sitting between two writes (CLEAN-6, #189). This used to be a `retain` up where
+                        // the `info!` is and a `register_stop_point` here, so for the width of that await
+                        // the breakpoint was in neither collection — invisible to `list_stop_points` and to
+                        // `owns_live_request`, which decides whether a hit already in flight is surfaced or
+                        // resumed and dropped. `false` would mean two records claiming one id; the `info!`
+                        // one line up names which breakpoint.
+                        if !session.state.resolve_pending(StopPoint {
                             id: pend.bp_id,
                             request_ids,
                             enabled: true,
@@ -12297,7 +12305,9 @@ async fn try_arm_deferred_breakpoints(
                                 arm,
                                 rearm,
                             }),
-                        });
+                        }) {
+                            warn!("Armed a deferred breakpoint that was not in the pending list");
+                        }
                     }
                     Err(e) => warn!("Failed to arm deferred breakpoint {}: {}", pend.bp_id, e),
                 }
@@ -12358,7 +12368,8 @@ async fn disarm_everything(session: &mut crate::session::DebugSession) {
     let _ = session.connection.clear_all_breakpoints().await;
     clear_standing_rearm_watches(session).await;
     // Also drop deferred breakpoints' CLASS_PREPARE watches.
-    let pend: Vec<i32> = session.pending_breakpoints.drain(..).map(|p| p.class_prepare_request_id).collect();
+    let pend: Vec<i32> =
+        session.state.pending_breakpoints.drain(..).map(|p| p.class_prepare_request_id).collect();
     for req in pend {
         let _ = session.connection.clear_class_prepare(req).await;
     }
@@ -12379,8 +12390,13 @@ async fn disarm_everything(session: &mut crate::session::DebugSession) {
     // The line breakpoints are skipped rather than re-cleared: `ClearAllBreakpoints` above has already
     // taken every one of them, and naming them again would spend a packet each on requests the JVM no
     // longer has.
-    let survivors: Vec<StopPoint> =
-        session.stop_points.drain().map(|(_, sp)| sp).filter(|sp| sp.kind() != StopPointKind::Line).collect();
+    let survivors: Vec<StopPoint> = session
+        .state
+        .stop_points
+        .drain()
+        .map(|(_, sp)| sp)
+        .filter(|sp| sp.kind() != StopPointKind::Line)
+        .collect();
     for sp in survivors {
         let _ = clear_stop_point_requests(session, &sp).await;
     }
@@ -12518,7 +12534,7 @@ async fn rearm_later_copies(session: &mut crate::session::DebugSession, cp_ref: 
         let loaders =
             describe_class_loaders(&mut crate::reads::Reads::live(&mut session.connection), &class_ids).await;
 
-        let Some(sp) = session.stop_points.get_mut(&bp_id) else { continue };
+        let Some(sp) = session.state.stop_points.get_mut(&bp_id) else { continue };
         sp.request_ids.push(primary);
         sp.request_ids.extend(extra.request_ids);
         let Some(info) = sp.line_mut() else { continue };
@@ -12579,7 +12595,7 @@ async fn arm_pattern_set_members(
             }
             spec_from_pattern_set(set, &fqn, signature)
         };
-        let bp_id = session.next_stop_id("bp_");
+        let bp_id = session.state.next_stop_id("bp_");
         match arm_and_insert(session, &[class_ref], &spec, bp_id, RearmPlan::family_member()).await {
             Ok(armed) => {
                 info!("Armed {} on newly loaded {} for family {}", armed.bp_id, fqn, set_id);
@@ -12782,7 +12798,7 @@ struct MonitorTraceSpec {
 /// its bookkeeping (and its `clear`/`panic` handling), so a parallel index would be a second source of
 /// truth that could outlive an entry it points at. The maps are small enough that scanning is free.
 fn find_traced_request(session: &crate::session::DebugSession, req_id: i32) -> Option<TracedRequest> {
-    let sp = session.stop_points.values().find(|sp| sp.owns_request(req_id) && sp.trace)?;
+    let sp = session.state.stop_points.values().find(|sp| sp.owns_request(req_id) && sp.trace)?;
     Some(TracedRequest {
         id: sp.id.clone(),
         // DUMP-7 deliberately gives the monitor kind no `condition`, and the reason is not that it was
@@ -12983,8 +12999,8 @@ struct FilterHealth {
 /// exactly where FILT-1 recommends the filter — that silence read as "the bug didn't reproduce".
 async fn dead_filter_threads(session: &mut crate::session::DebugSession) -> FilterHealth {
     let mut filters: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-    filters.extend(session.stop_points.values().filter_map(|sp| sp.thread_filter));
-    filters.extend(session.pending_breakpoints.iter().filter_map(|p| p.thread_filter));
+    filters.extend(session.state.stop_points.values().filter_map(|sp| sp.thread_filter));
+    filters.extend(session.state.pending_breakpoints.iter().filter_map(|p| p.thread_filter));
     filters.extend(session.pattern_sets.values().filter_map(|s| s.thread_filter));
 
     let mut health = FilterHealth::default();
@@ -13000,8 +13016,8 @@ async fn dead_filter_threads(session: &mut crate::session::DebugSession) -> Filt
     // read, for the reason `resolve_object_handle` gives — every other command answers INVALID_OBJECT
     // for a collected object AND for a typo.
     let mut objects: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-    objects.extend(session.stop_points.values().filter_map(|sp| sp.instance_filter));
-    objects.extend(session.pending_breakpoints.iter().filter_map(|p| p.instance_filter));
+    objects.extend(session.state.stop_points.values().filter_map(|sp| sp.instance_filter));
+    objects.extend(session.state.pending_breakpoints.iter().filter_map(|p| p.instance_filter));
     objects.extend(session.pattern_sets.values().filter_map(|s| s.instance_filter));
     for oid in objects {
         // Both readings mean the same thing here: collected, or so long collected the JVM dropped the
@@ -13083,13 +13099,13 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
     // events — see `disarmed_traced_requests`. Done here rather than at the budget path so it also covers
     // the watchdog and a manual `clear_stop_point`, which have the same in-flight window.
     if find_traced_request(session, req_id).is_some() {
-        session.note_disarmed_traced(req_id);
+        session.state.note_disarmed_traced(req_id);
     }
-    let sp = session.stop_points.values().find(|sp| sp.owns_request(req_id))?.clone();
+    let sp = session.state.stop_points.values().find(|sp| sp.owns_request(req_id))?.clone();
     // Not just the request that fired: a stop point disarmed on one of its copies while the others stay
     // armed is a stop point the caller has been told is off and which still freezes their VM (BP-4, #78).
     let _ = clear_stop_point_requests(session, &sp).await;
-    if let Some(s) = session.stop_points.get_mut(&sp.id) {
+    if let Some(s) = session.state.stop_points.get_mut(&sp.id) {
         s.request_ids.clear();
         s.enabled = false;
     }
@@ -13106,13 +13122,13 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
 /// JDWP call is [`clear_stop_point_requests`]'s single match and the noun is
 /// [`ArmedOn::wire_noun`](crate::stop_point::ArmedOn::wire_noun); what is left is this (CLEAN-4).
 async fn disable_stop_point(session: &mut crate::session::DebugSession, id: &str) -> Result<String, String> {
-    let Some(sp) = session.stop_points.get(id).cloned() else {
+    let Some(sp) = session.state.stop_points.get(id).cloned() else {
         return Err(format!("Stop point not found: {id}"));
     };
     clear_stop_point_requests(session, &sp)
         .await
         .map_err(|e| format!("Failed to clear {}: {e}", sp.armed_on.wire_noun()))?;
-    if let Some(s) = session.stop_points.get_mut(id) {
+    if let Some(s) = session.state.stop_points.get_mut(id) {
         s.request_ids.clear();
         s.enabled = false;
     }
@@ -13134,7 +13150,7 @@ async fn disable_stop_point(session: &mut crate::session::DebugSession, id: &str
 /// ending in the same five-line write-back with the same FILT-8 comment above it. Only the middle differs
 /// — the resolution and the wire call — so only the middle is per kind now (CLEAN-4).
 async fn rearm_stop_point(session: &mut crate::session::DebugSession, id: &str) -> Result<String, String> {
-    let Some(sp) = session.stop_points.get(id).cloned() else {
+    let Some(sp) = session.state.stop_points.get(id).cloned() else {
         return Err(format!("Stop point not found: {id}"));
     };
     // One resolve-and-arm per kind, each in its own function: the resolution steps differ (a location, a
@@ -13146,7 +13162,7 @@ async fn rearm_stop_point(session: &mut crate::session::DebugSession, id: &str) 
         ArmedOn::MethodExit(me) => rearm_method_exit(session, &sp, me).await?,
         ArmedOn::Monitor(mon) => rearm_monitor_request(session, &sp, mon).await?,
     };
-    if let Some(s) = session.stop_points.get_mut(id) {
+    if let Some(s) = session.state.stop_points.get_mut(id) {
         s.request_ids = armed.request_ids;
         s.enabled = true;
         // FILT-8: a re-arm issues a NEW JDWP request, so whatever the debuggee deleted is no longer the
@@ -13290,7 +13306,7 @@ async fn clear_pattern_family(
     }
     let mut cleared = 0usize;
     for member in &set.members {
-        if let Some(sp) = session.stop_points.remove(member) {
+        if let Some(sp) = session.state.stop_points.remove(member) {
             // Same in-flight window as the single-stop-point clear, on the path a wildcard family takes —
             // and this is the one TEST-31 (#114) actually caught, since a family clears its members here
             // rather than through `handle_clear_stop_point`.
@@ -13563,7 +13579,7 @@ async fn record_one_traced_event(
         // leave the thread frozen — trace mode's one promise, broken exactly when a budget disarm makes
         // it hardest to notice. Drop it and let the caller resume: the budget said stop recording, not
         // stop the VM.
-        if session.was_traced_and_disarmed(req_id) {
+        if session.state.was_traced_and_disarmed(req_id) {
             return Some(thread);
         }
         return None;
@@ -13717,7 +13733,7 @@ fn record_trace_cost(
     started: std::time::Instant,
     took: std::time::Duration,
 ) {
-    if let Some(sp) = session.stop_points.values_mut().find(|sp| sp.owns_request(req_id)) {
+    if let Some(sp) = session.state.stop_points.values_mut().find(|sp| sp.owns_request(req_id)) {
         sp.trace_cost.record(started, took);
     }
 }
@@ -13744,7 +13760,7 @@ fn record_trace_cost(
 /// past its own `method_name_matches` — costing no extra JDWP round trip, since that call has happened by
 /// then either way.
 fn record_stop_point_hit(session: &mut crate::session::DebugSession, req_id: i32) {
-    if let Some(sp) = session.stop_points.values_mut().find(|sp| sp.owns_request(req_id)) {
+    if let Some(sp) = session.state.stop_points.values_mut().find(|sp| sp.owns_request(req_id)) {
         sp.hits = sp.hits.saturating_add(1);
     }
 }
@@ -13769,6 +13785,7 @@ fn record_stop_point_hit(session: &mut crate::session::DebugSession, req_id: i32
 /// above its only useful property: that `hits + discarded` is every exit this request was delivered.
 fn record_discarded_exit(session: &mut crate::session::DebugSession, req_id: i32) {
     if let Some(me) = session
+        .state
         .stop_points
         .values_mut()
         .find(|sp| sp.owns_request(req_id))
@@ -13961,7 +13978,7 @@ fn render_investigation_traces(session: &crate::session::DebugSession) -> String
 /// has already removed is exactly the operation that can land on a **reused** id belonging to something
 /// else (`CONTEXT.md` § **Request id**).
 async fn spend_if_counted(session: &mut crate::session::DebugSession, req_id: i32) {
-    let Some(sp) = session.stop_points.values_mut().find(|sp| sp.owns_request(req_id)) else {
+    let Some(sp) = session.state.stop_points.values_mut().find(|sp| sp.owns_request(req_id)) else {
         return;
     };
     if sp.hit_count.is_none() {
@@ -13987,7 +14004,7 @@ async fn spend_if_counted(session: &mut crate::session::DebugSession, req_id: i3
 fn decrement_trace_budget(session: &mut crate::session::DebugSession, req_id: i32) -> Option<u32> {
     // Charged once per *hit*, not once per armed location: an execution passes through exactly one of a
     // duplicated line's copies, so the single event it produces decrements once here (BP-4, #78).
-    let sp = session.stop_points.values_mut().find(|sp| sp.owns_request(req_id))?;
+    let sp = session.state.stop_points.values_mut().find(|sp| sp.owns_request(req_id))?;
     let n = sp.trace_budget?.saturating_sub(1);
     sp.trace_budget = Some(n);
     Some(n)
@@ -14028,6 +14045,7 @@ async fn store_reportable_event(
         // the class, so an exit from a different one must resume and be dropped — otherwise a request for
         // `save` freezes the VM on the first unrelated getter that returns.
         let method_filter = session
+            .state
             .stop_points
             .values()
             .find(|sp| sp.owns_request(req_id))
@@ -14245,7 +14263,7 @@ async fn notify_suspension(session: &mut crate::session::DebugSession, seq: u64)
 /// Pure in-memory lookup over the session's own maps — no JDWP traffic — which is what makes it safe
 /// to call on the hit path while the VM is held.
 fn stop_point_id(session: &crate::session::DebugSession, req: i32) -> Option<String> {
-    session.stop_points.values().find(|sp| sp.owns_request(req)).map(|sp| sp.id.clone())
+    session.state.stop_points.values().find(|sp| sp.owns_request(req)).map(|sp| sp.id.clone())
 }
 
 /// How to *get* a suspended thread, named in one place because a dozen refusals need to say it (SAFE-11).
@@ -15267,7 +15285,7 @@ async fn arm_and_insert(
     };
     // Computed before the insert so the stop point carries it too, not only this reply (DISC-8).
     let drift = drift_check_for_armed_method(session, &spec.class_pattern, &method, jvm_lines).await;
-    session.register_stop_point(armed_line_stop_point(
+    session.state.register_stop_point(armed_line_stop_point(
         bp_id.clone(),
         request_ids.clone(),
         spec,
@@ -15421,7 +15439,7 @@ async fn defer_breakpoint(
         return Ok(DeferResult::ArmedOnRecheck(armed));
     }
 
-    session.pending_breakpoints.push(crate::session::PendingBreakpoint {
+    session.state.pending_breakpoints.push(crate::session::PendingBreakpoint {
         bp_id: bp_id.clone(),
         class_prepare_request_id: cp_req,
         class_pattern: spec.class_pattern.clone(),
@@ -15947,7 +15965,7 @@ async fn arm_pattern_family(
     index: &[(String, u64)],
     max_classes: usize,
 ) -> FamilyOutcome {
-    let set_id = session.next_stop_id("bpset_");
+    let set_id = session.state.next_stop_id("bpset_");
     let hits: Vec<(String, u64)> =
         index.iter().filter(|(fqn, _)| class_matches(fqn, &spec.class_pattern)).cloned().collect();
     let matched = hits.len();
@@ -15962,7 +15980,7 @@ async fn arm_pattern_family(
             continue;
         }
         let per_class = spec.for_pattern(&fqn);
-        let bp_id = session.next_stop_id("bp_");
+        let bp_id = session.state.next_stop_id("bp_");
         match arm_and_insert(session, &[type_id], &per_class, bp_id, RearmPlan::family_member()).await {
             Ok(armed) => members.push(FamilyMember { class: fqn, armed }),
             // Not a failure: the pattern matched a class that is not a target. Counted, never listed —
@@ -16075,7 +16093,7 @@ async fn arm_one_pattern(
     if is_wildcard(&spec.class_pattern) {
         return PatternOutcome::Family(arm_pattern_family(session, spec, index, max_classes).await);
     }
-    let bp_id = session.next_stop_id("bp_");
+    let bp_id = session.state.next_stop_id("bp_");
     let classes = match session.connection.classes_by_signature(&spec.signature).await {
         Ok(c) => c,
         Err(e) => return PatternOutcome::Failed(format!("Failed to find class: {e}")),
@@ -16109,7 +16127,7 @@ async fn arm_single_named(
 ) -> Result<String, String> {
     // One id for this breakpoint's whole life, allocated before we know whether it arms now or is
     // deferred — and kept across any later disable/re-arm (BP-3).
-    let bp_id = session.next_stop_id("bp_");
+    let bp_id = session.state.next_stop_id("bp_");
 
     let classes = session
         .connection
@@ -16134,7 +16152,7 @@ async fn arm_single_named(
     // TRACE-12 (#117). Read back out of the session rather than off `spec`, because what matters is the
     // location this actually armed at — `spec` carries the line the caller asked for, and BP-4's several
     // bytecode copies and BP-5's several classloaders are only known after arming.
-    if let Some((mine, bp)) = session.stop_points.get(bp_id).and_then(|sp| sp.line().map(|l| (sp, l))) {
+    if let Some((mine, bp)) = session.state.stop_points.get(bp_id).and_then(|sp| sp.line().map(|l| (sp, l))) {
         let (suspending, traced) = co_located_stop_points(session, Some(bp_id), &bp.arm);
         extra.push_str(&describe_policy_overlap(bp.arm.suspend_policy, mine.trace, &suspending, &traced));
     }
@@ -24620,7 +24638,7 @@ fn bind_object_heads(leaf: &str, heads: &[(&'static str, u64)]) -> String {
 /// `session.breakpoints` alone, which is why a condition on an exception, field or method-exit stop had
 /// nowhere to be evaluated even once it could be stored.
 fn suspending_condition(session: &crate::session::DebugSession, req_id: i32) -> Option<String> {
-    session.stop_points.values().find(|sp| sp.owns_request(req_id))?.condition.clone()
+    session.state.stop_points.values().find(|sp| sp.owns_request(req_id))?.condition.clone()
 }
 
 /// The bindings a hit supplies to its condition, read out of the event itself (FILT-6, #83).

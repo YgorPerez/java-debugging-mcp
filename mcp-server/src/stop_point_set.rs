@@ -138,7 +138,7 @@ fn sorted_of_kind(
     session: &crate::session::DebugSession,
     kind: StopPointKind,
 ) -> Vec<&crate::stop_point::StopPoint> {
-    let mut rows: Vec<_> = session.stop_points.values().filter(|sp| sp.kind() == kind).collect();
+    let mut rows: Vec<_> = session.state.stop_points.values().filter(|sp| sp.kind() == kind).collect();
     rows.sort_by_key(|sp| id_order(&sp.id));
     rows
 }
@@ -274,7 +274,7 @@ impl Builder {
             let line = fam
                 .members
                 .iter()
-                .find_map(|m| session.stop_points.get(m))
+                .find_map(|m| session.state.stop_points.get(m))
                 .and_then(StopPoint::line)
                 .and_then(|b| b.arm_line);
             if line.is_none() && fam.method.is_none() {
@@ -312,7 +312,7 @@ impl Builder {
     /// when the class is not loaded yet, and whether that is still true is for the next JVM to say (BP-7,
     /// ADR-0028). This is also the one kind whose locator was already stored unresolved.
     fn push_pending(&mut self, session: &crate::session::DebugSession) {
-        for pb in &session.pending_breakpoints {
+        for pb in &session.state.pending_breakpoints {
             let mut args = Map::new();
             args.insert("class_pattern".to_string(), json!(pb.class_pattern));
             if let Some(l) = pb.line {

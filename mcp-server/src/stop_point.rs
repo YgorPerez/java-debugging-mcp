@@ -196,7 +196,7 @@ impl ArmedOn {
 
 /// Anything armed in the debuggee that reports when execution reaches it — all five kinds, one type.
 ///
-/// Keyed in [`DebugSession::stop_points`](crate::session::DebugSession::stop_points) by its
+/// Keyed in [`SessionState::stop_points`](crate::session::SessionState::stop_points) by its
 /// [**stop-point id**](Self::id), which is the caller's handle on it and is not a JDWP **request id**
 /// (ADR-0005).
 // Three bools — `enabled`, `spent`, `trace` — and each is an independent property of the JDWP request as
