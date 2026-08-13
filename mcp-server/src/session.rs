@@ -575,6 +575,29 @@ pub struct ThreadSuspend {
     /// matching `debug.resume_thread`. Reported, never trusted — see
     /// [`Suspensions::threads`].
     pub issued: u32,
+    /// Why this session is holding the thread, and therefore what a rescue owes beyond releasing it.
+    pub hold: ThreadHold,
+}
+
+/// How a held thread came to be held — which decides what the watchdog must do besides resume it.
+///
+/// SAFE-13 ([#197](https://github.com/YgorPerez/java-debugging-mcp/issues/197)). Both variants mean "this
+/// session is holding one thread while the VM runs", so both belong in [`Suspensions::threads`] and both
+/// are rescued by the same arm. They differ in one thing: a requested suspend has nothing armed behind it,
+/// and a failed escalation has the stop point that will re-freeze the thread the instant it is released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadHold {
+    /// `debug.suspend_thread` — the caller named this thread. Releasing it is the whole rescue.
+    Requested,
+    /// A conditional stop point whose condition MATCHED and whose escalation to a VM-wide suspend failed
+    /// (FILT-7): the JVM is holding the hit thread for the event and the application is still running.
+    ///
+    /// **The request id is here because a rescue that only resumed would rescue nothing.** The stop point
+    /// is still armed and the thread is still executing the line it fired on, so it re-fires immediately —
+    /// the freeze → rescue → freeze cycle SAFE-2 exists to break, which is why the VM arm disarms as well
+    /// as resuming. Measured before this existed: one rescue, and the same stop point at `Hits: 2` with
+    /// its thread held again.
+    FailedEscalation(i32),
 }
 
 /// A VM-wide suspension: when it started, and why. **One value, because the pair has no legal half.**
@@ -653,14 +676,17 @@ impl Suspensions {
     /// is refusing, and what this must not do is silently keep the older clock, which would make the
     /// watchdog measure a suspension against the wrong start.
     ///
-    /// **The event pump is the caller that does not check, and there is a known hole under it.** It
-    /// records a cause on every suspending event, deliberately including one whose escalation to a
-    /// VM-wide suspend FAILED — that hit's thread is still held, and this is the only record of it. But a
-    /// failed escalation leaves the VM *running*, so a second hit arrives and overwrites both halves: the
-    /// watchdog then disarms the newer request and the older one is never disarmed, which is the SAFE-2
-    /// loss the paragraph above describes. It predates this type and is not made worse by it; it is
-    /// written down here because the honest reading of "it overwrites" is that one caller has not decided
-    /// anything about it.
+    /// **The event pump is the caller that does not check, and the hole that used to be under it is
+    /// closed** (SAFE-13, #197). It records a cause on every suspending event, and it used to include one
+    /// whose escalation to a VM-wide suspend had FAILED — on the reasoning that the hit thread is still
+    /// held and this was the only record of it. The premise was true and the shape was wrong: a failed
+    /// escalation leaves the VM *running*, so a second hit arrives and overwrites both halves, and the
+    /// watchdog then disarms the newer request while the older one keeps its thread. Measured, all of it.
+    ///
+    /// That case is now a **thread** hold, which is what it always was — see
+    /// [`Self::hold_thread_for_failed_escalation`]. So every remaining caller of this method is one that
+    /// genuinely holds the whole VM, and the overwrite it performs is reachable only by a second
+    /// VM-wide suspension, which `debug.pause` and `debug.thread_dump` both refuse.
     pub fn mark_suspended(&mut self, cause: SuspendCause) {
         self.vm = Some(VmSuspend { since: std::time::Instant::now(), cause });
     }
@@ -685,9 +711,54 @@ impl Suspensions {
     /// thread frozen forever by suspending it repeatedly — a rescue that never fires, produced by a line
     /// that looks like an update to a timestamp.
     pub fn hold_thread(&mut self, tid: u64, name: String, at: std::time::Instant) -> u32 {
-        let entry = self.threads.entry(tid).or_insert_with(|| ThreadSuspend { name, since: at, issued: 0 });
+        let entry = self.threads.entry(tid).or_insert_with(|| ThreadSuspend {
+            name,
+            since: at,
+            issued: 0,
+            hold: ThreadHold::Requested,
+        });
         entry.issued = entry.issued.saturating_add(1);
         entry.issued
+    }
+
+    /// Record that a **failed escalation** has left the JVM holding `tid` while the application runs
+    /// (FILT-7), so something can still reach it — SAFE-13 ([#197]).
+    ///
+    /// **This is a per-thread suspension and it used to be recorded as a VM-wide one**, which was wrong in
+    /// four ways at once, all of them measured (#197):
+    ///
+    ///  * `mark_suspended` refreshes its clock, so a second failed escalation moved the deadline the
+    ///    watchdog measures against — and hits arriving faster than `JDWP_WATCHDOG_SECS` pushed it out
+    ///    indefinitely, so the rescue never ran at all. Here the clock is [`ThreadSuspend::since`], which
+    ///    is *never* refreshed, so every held thread carries its own first-held instant.
+    ///  * It also overwrote the cause, so the watchdog disarmed the newest request and left the older one
+    ///    armed and holding a thread — the SAFE-2 loss. Each hold now carries its own request id.
+    ///  * `debug.list_sessions` read `SUSPENDED` off `suspensions.vm` about a VM that was demonstrably
+    ///    running. A thread hold renders as what it is, beside a session that reads `running`.
+    ///  * And `debug.pause` refused with *"Already suspended … left as it is"* — while the escalation
+    ///    message it was following says in as many words that `debug.pause` retries the VM-wide suspend.
+    ///    With no VM suspension recorded, the retry the caller was told to make now happens.
+    ///
+    /// [#197]: https://github.com/YgorPerez/java-debugging-mcp/issues/197
+    /// **[`ThreadSuspend::issued`] is NOT incremented, because nobody issued anything.** It counts
+    /// `debug.suspend_thread` calls this session made and is rendered to the caller as such — "2 of them
+    /// are this session's calls" for one call they made would tell them to resume twice, and the second
+    /// resume would drop the JVM's own event hold and take away the frame they were reading.
+    ///
+    /// **The hold kind wins over an existing one**, and that is deliberate rather than lossy: a thread the
+    /// caller had already suspended by name, and which then takes a failed escalation, must still have its
+    /// stop point disarmed when it is rescued — otherwise releasing it lands it straight back on the line
+    /// that fired. The caller's own claim is not lost; it is in `issued`, which this leaves alone.
+    pub fn hold_thread_for_failed_escalation(
+        &mut self,
+        tid: u64,
+        name: String,
+        at: std::time::Instant,
+        req_id: i32,
+    ) {
+        self.threads.entry(tid).and_modify(|e| e.hold = ThreadHold::FailedEscalation(req_id)).or_insert(
+            ThreadSuspend { name, since: at, issued: 0, hold: ThreadHold::FailedEscalation(req_id) },
+        );
     }
 
     /// Drop **one** of this session's claims on `tid`, as `debug.resume_thread` does — one call, one

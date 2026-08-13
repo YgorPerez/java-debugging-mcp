@@ -6457,6 +6457,127 @@ fn assert_failed_escalation_is_honest(jdk: &Jdk, fault: SuspendFault) {
     server.panic_reset();
 }
 
+/// SAFE-13 ([#197](https://github.com/YgorPerez/java-debugging-mcp/issues/197)): two failed escalations
+/// inside one watchdog interval, and **each held thread is rescued on its own clock**.
+///
+/// The FILT-7 test above runs with `JDWP_WATCHDOG_SECS=0` by design — what it asserts is the reply at the
+/// moment of the hit — so the rescue side of a failed escalation had no coverage at all, and this is the
+/// case that was broken. A failed escalation leaves the application RUNNING, so a second hit arrives; the
+/// old code recorded each one as a VM-wide suspension, and every consequence followed from that shape being
+/// wrong. Measured before the fix, on this exact staging:
+///
+///  * `debug.pause` answered *"Already suspended at a stop point (3s ago) — left as it is"* — while the
+///    escalation message the caller was following says, in as many words, that `debug.pause` retries the
+///    VM-wide suspend. The advice and the tool disagreed.
+///  * `debug.list_sessions` read `SUSPENDED` while the probe was demonstrably still printing.
+///  * the watchdog disarmed `bp_2`, the NEWER stop point, because the second hit had overwritten the cause
+///    — and left `bp_1` armed at `Hits: 2` with its thread held again, the freeze → rescue → freeze cycle
+///    SAFE-2 exists to break.
+///  * and only `beta` was still ticking, `alpha` having been held indefinitely with nothing tracking it.
+///
+/// **`ThreadProbe` rather than `CondProbe`, and the issue's own reproduction recipe is why.** #197 proposed
+/// `CondProbe`, where only `main` calls the conditioned method — so a failed escalation holds `main` and no
+/// second hit can ever arrive. Two dedicated workers on one line, each with a `thread_id` filter, is what
+/// stages two hits seconds apart, which is what makes "on its own clock" observable at all.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn two_failed_escalations_are_each_rescued_on_their_own_clock() {
+    // The gap is long enough that the second hit lands well inside the first thread's interval — which is
+    // the whole point, since a refreshed clock would postpone the first rescue past the end of this test.
+    const WATCHDOG_SECS: u64 = 8;
+    const GAP_SECS: u64 = 3;
+
+    let Some(jdk) = jdk_or_skip("two_failed_escalations_are_each_rescued_on_their_own_clock") else {
+        return;
+    };
+    // `launch_running`: the agent's banner precedes `main` starting the workers, so `debug.list_threads`
+    // would otherwise see six JVM-internal threads and neither worker (measured, TEST-17 #49).
+    let probe = Probe::launch_running(&jdk, "ThreadProbe", |l| l.contains("beta throw 1")).expect("launch");
+    // VirtualMachine.Suspend — set 1, command 8 — refused, which is what makes every escalation fail.
+    let relay = FaultRelay::start_refusing(probe.port, vec![(1, 8)]).expect("start the fault relay");
+    let mut server =
+        Server::start_with_env(&[("JDWP_WATCHDOG_SECS", &WATCHDOG_SECS.to_string())]).expect("start server");
+    server.attach(relay.port);
+
+    let threads = server.call("debug.list_threads", serde_json::json!({}));
+    let worker = |name: &str| -> String {
+        threads
+            .lines()
+            .find(|l| l.contains(name))
+            .and_then(|l| l.split_whitespace().find(|w| w.starts_with("0x")))
+            .unwrap_or_else(|| panic!("no {name} in debug.list_threads:\n{threads}"))
+            .to_string()
+    };
+    let (alpha, beta) = (worker("alpha-worker"), worker("beta-worker"));
+
+    let line = probe_line(&probe_source("ThreadProbe"), "// BP1");
+    let arm = |server: &mut Server, tid: &str| {
+        server.call(
+            "debug.set_line_stop",
+            serde_json::json!({"class_pattern": "ThreadProbe", "line": line, "condition": "i >= 0",
+                               "thread_id": tid}),
+        )
+    };
+
+    // Hit one, on alpha. `i >= 0` is true on every hit, so the condition matches and the escalation fails.
+    arm(&mut server, &alpha);
+    let hit = server
+        .wait_for_event(&format!("\"thread\":\"{alpha}\""), EVENT_TIMEOUT)
+        .expect("alpha never hit the conditioned line");
+    assert_contains_all("the failed escalation is reported as one", &hit, &["[escalation]", "MATCHED"]);
+
+    // A held thread is a THREAD suspension, so the session is running and says so. Reading `SUSPENDED`
+    // here is the state that made a held thread undiscoverable: true of neither the VM nor any thread a
+    // caller could name.
+    let sessions = server.call("debug.list_sessions", serde_json::json!({}));
+    assert!(
+        !sessions.contains("SUSPENDED"),
+        "a failed escalation leaves the VM RUNNING, so the session must not read SUSPENDED:\n{sessions}"
+    );
+
+    // And `debug.pause` must do what the escalation message says it does. It answered "Already suspended
+    // … left as it is" before, which is a no-op dressed as a state report. Here the retry is refused by
+    // the relay, so what matters is that it TRIED.
+    let pause = server.call("debug.pause", serde_json::json!({}));
+    assert!(
+        !pause.contains("Already suspended"),
+        "the escalation message tells the caller debug.pause retries the VM-wide suspend, so it must not \
+         refuse as though this session held the VM: {pause}"
+    );
+
+    // Hit two, on beta, a few seconds into alpha's interval. This is the event that used to move the one
+    // shared clock and replace the one shared cause.
+    std::thread::sleep(std::time::Duration::from_secs(GAP_SECS));
+    arm(&mut server, &beta);
+    server
+        .wait_for_event(&format!("\"thread\":\"{beta}\""), EVENT_TIMEOUT)
+        .expect("beta never hit the conditioned line");
+
+    // Past BOTH deadlines, each measured from its own thread's first hold.
+    std::thread::sleep(std::time::Duration::from_secs(WATCHDOG_SECS + GAP_SECS + 3));
+    let listing = server.call("debug.list_stop_points", serde_json::json!({}));
+    let disabled = listing.matches("DISABLED").count();
+    assert_eq!(
+        disabled, 2,
+        "both stop points must be disarmed — each rescue disarms the stop point behind ITS OWN held \
+         thread, so a second hit cannot leave the first one armed and re-freezing. Before the fix this was \
+         1, and the survivor was the OLDER one.\n  listing: {listing}"
+    );
+
+    // The debuggee's own account, which no reply can fake: both workers throwing again. Before the fix
+    // `alpha` stopped for good, and every surface reported health while it did.
+    let after: Vec<String> = probe.output().iter().rev().take(30).cloned().collect();
+    for who in ["alpha throw", "beta throw"] {
+        assert!(
+            after.iter().any(|l| l.contains(who)),
+            "{who} never resumed, so a rescue did not reach that thread. Both were held by a failed \
+             escalation and both deadlines have passed.\n  probe tail: {after:?}"
+        );
+    }
+
+    server.panic_reset();
+}
+
 /// BP-1: `toggle_stop_point` silences and re-arms a breakpoint without losing its definition. Tested
 /// on a trace breakpoint so the probe never freezes: disabled -> no new snapshots; re-enabled -> they
 /// resume.
@@ -7552,7 +7673,7 @@ fn suspending_one_thread_stops_its_ticks_while_the_others_keep_running() {
     assert_contains_all(
         "list_sessions shows the held thread",
         &sessions,
-        &["1 thread(s) suspended by you", "worker-b"],
+        &["1 thread(s) held by this session", "worker-b"],
     );
     assert!(
         !sessions.contains("SUSPENDED"),
@@ -7996,9 +8117,14 @@ fn panic_releases_a_per_thread_suspend_and_names_it() {
 
     let said = server.call("debug.panic", serde_json::json!({}));
     assert_contains_all(
+        // "this session was holding" rather than "debug.suspend_thread" since SAFE-13 (#197): the map
+        // this sentence counts now also holds threads left by a failed escalation, which no
+        // `debug.suspend_thread` call ever asked for — naming that call would point the caller at
+        // `debug.resume_thread` as the remedy, and for such a thread that releases it onto a stop point
+        // that is still armed.
         "panic names what it released",
         &said,
-        &["Also released", "worker-a", "debug.suspend_thread"],
+        &["Also released", "worker-a", "this session was holding"],
     );
     assert!(
         probe

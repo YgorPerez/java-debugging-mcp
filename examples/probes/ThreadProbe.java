@@ -15,9 +15,19 @@ public class ThreadProbe {
     }
 
     // Throw and swallow in one place, so a caught-exception breakpoint has a stable throw site.
+    //
+    // The stop-point marker below is on the throw itself, and it is a TRAILING comment on purpose: a
+    // marker on its own line would shift every line number under it, and `probe_line` is what every test
+    // here reads. Note also that this paragraph must not spell the marker, because `probe_line` returns the
+    // FIRST line that contains it and would hand a test this comment's line number instead — measured, by
+    // getting "No method contains line 19".
+    //
+    // `i` is a parameter, so it is in the local-variable table from the first instruction and a `condition`
+    // can read it at the marked line without waiting for a statement to run (the same reason
+    // `CondProbe.hot` takes one).
     static void doWork(String who, int i) {
         try {
-            throw new FilterException(who + "-" + i);
+            throw new FilterException(who + "-" + i); // BP1
         } catch (FilterException e) {
             // swallowed on purpose
         }

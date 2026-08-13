@@ -91,12 +91,30 @@ stopped while the reply said it had failed — and the assertion caught the mess
 therefore reported distinctly: verified running, verified stopped after all, and could-not-tell (which is
 reported as running, because distrusting a good frame costs less than trusting a moving one).
 
-**4. The watchdog and `hit_count` are unchanged, deliberately.**
+**4. `hit_count` is unchanged, deliberately, and so was the watchdog until SAFE-13.**
+
+> The heading here read "The watchdog and `hit_count` are unchanged" until 2026-08-13. It is no longer
+> true of the watchdog: SAFE-13 gave its per-thread arm the SAFE-2 disarm, so a rescue of a
+> failed-escalation hold now disables the stop point behind it. See the note under *Watchdog* below.
 
 *Watchdog.* Its clock starts at `mark_suspended`, which now happens at the escalation rather than at the
-hit — so a non-matching hit no longer arms it at all, which is right: nothing VM-wide is being held. A hit
-whose escalation *failed* still calls `mark_suspended`, even though the VM is running, because the hit
-thread **is** held and this is the only record that anything holds it; without it one thread of a shared
+hit — so a non-matching hit no longer arms it at all, which is right: nothing VM-wide is being held.
+
+> **Superseded 2026-08-13 by SAFE-13 ([#197](https://github.com/YgorPerez/java-debugging-mcp/issues/197)),
+> for the half of this paragraph that follows.** A hit whose escalation failed now records a **thread**
+> hold (`Suspensions::hold_thread_for_failed_escalation`), not a VM-wide one. The reasoning below — that
+> the thread is held and needs *a* record — was right; a VM suspension was the wrong record for it, and
+> all three consequences were measured: `mark_suspended` refreshes its clock, so hits closer together than
+> `JDWP_WATCHDOG_SECS` pushed the deadline out indefinitely and no rescue ran; it overwrites its cause, so
+> a watchdog that did run disarmed the *newest* request and left the older one armed and holding a thread;
+> and `debug.list_sessions` read `SUSPENDED` about a VM that was demonstrably still running. A thread hold
+> has its own never-refreshed clock and carries its own request id, so each held thread is rescued on its
+> own deadline and its own stop point is disarmed. One more thing that repaired: `debug.pause`, which this
+> file's own reply text tells the caller retries the VM-wide suspend, was answering *"Already suspended …
+> left as it is"* instead.
+
+A hit whose escalation *failed* still needed a record, because the hit
+thread **is** held; without one, one thread of a shared
 JVM would stay suspended forever with nothing able to notice. The reply is where the distinction is drawn,
 not the bookkeeping. One exposure narrows and none widens: a condition that hangs (a blocking invoke) used
 to freeze the whole VM outside the watchdog's view and now holds one thread.

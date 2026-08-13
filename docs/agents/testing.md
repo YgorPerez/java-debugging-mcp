@@ -149,7 +149,7 @@ amendments. Note what moved the needle each time: a *test* got faster, never the
 ## Working a flake
 
 **Run the unsharded suite.** `scripts/integration-test.sh` with no `--shard` still
-runs every `#[ignore]`d test in one process — **232** as of 2026-08-13 — which is the contention CI used to
+runs every `#[ignore]`d test in one process — **233** as of 2026-08-13 — which is the contention CI used to
 have. DOC-15 (#145) asserts that number against the binary rather than asking you to trust it; the
 assertion lives in `mcp_integration.rs` and anchors on the sentence above, **so keep it on one line** — it
 was broken across two by DOC-17's move and the test caught it immediately. Count it yourself if you prefer

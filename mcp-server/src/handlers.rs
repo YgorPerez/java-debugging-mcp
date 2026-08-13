@@ -2071,7 +2071,7 @@ impl RequestHandler {
         if !freed.is_empty() {
             let _ = write!(
                 threads,
-                "\n   ▶️  Also released {} thread(s) held by debug.suspend_thread: {}",
+                "\n   ▶️  Also released {} thread(s) this session was holding: {}",
                 freed.len(),
                 freed.join(", ")
             );
@@ -2431,7 +2431,7 @@ impl RequestHandler {
         if !unshown.is_empty() {
             let _ = writeln!(
                 output,
-                "⏸️  Also held by debug.suspend_thread but not on this page: {}",
+                "⏸️  Also held by this session but not on this page: {}",
                 unshown.join(", ")
             );
         }
@@ -6894,7 +6894,10 @@ fn render_session_line(
         let rest = held.len().saturating_sub(names.len());
         let _ = write!(
             line,
-            ", ⏸️ {} thread(s) suspended by you: {}{} (oldest {} ago)",
+            // `ago()` already ends in "ago", so the literal one here made every listing read
+            // "(oldest 0s ago ago)". Pre-existing; found by reading this line's output while changing the
+            // phrase in front of it.
+            ", ⏸️ {} thread(s) held by this session: {}{} (oldest {})",
             held.len(),
             names.join(", "),
             if rest > 0 { format!(" +{rest} more") } else { String::new() },
@@ -14241,16 +14244,46 @@ async fn store_reportable_event(
             // Record WHICH request suspended us, here and now. The watchdog used to re-derive this from
             // the newest buffered event, which `get_last_event {drain:true}` erases (SAFE-5).
             //
-            // Recorded even when the escalation FAILED, and that is deliberate. The hit thread is still
-            // held — deliberately, so the frame the caller asked for survives — and this is the only
-            // record that anything is holding it. Without it the watchdog has no clock to run and no
-            // stop point to disarm, so one thread of a shared JVM would stay suspended forever with
-            // nothing anywhere able to notice. The reply is where the distinction is drawn instead:
-            // `get_last_event` reports the VM as running and names the held thread.
-            let cause = event_set.events.first().map_or(crate::session::SuspendCause::ManualPause, |e| {
-                crate::session::SuspendCause::StopPoint(e.request_id)
-            });
-            session.suspensions.mark_suspended(cause);
+            // **A failed escalation that left the application RUNNING records a THREAD hold instead**
+            // (SAFE-13, #197). It used to record a VM-wide suspension here, on the reasoning that the hit
+            // thread is still held and this is the only record of it — the first half is true and the
+            // conclusion was not, because a VM suspension is the wrong shape for it and every consequence
+            // followed from that. The VM is running, so a second hit arrives; `mark_suspended` refreshes
+            // its clock, so hits closer together than `JDWP_WATCHDOG_SECS` pushed the deadline out
+            // indefinitely and the rescue never ran; and it overwrites its cause, so a watchdog that did
+            // run disarmed the newest request and left the older one armed and holding a thread. All three
+            // measured. `Suspensions::hold_thread_for_failed_escalation` carries the whole argument.
+            //
+            // The OTHER failed-escalation world still records a VM suspension, and the distinction is the
+            // one `escalate_to_vm_suspend` measures rather than deduces: when `vm_running` is false the
+            // suspend actually landed and the reply lied about it, so this session really does hold the VM
+            // and `debug.continue` really is what releases it.
+            let held_alone = escalation.as_ref().is_some_and(|e| e.vm_running);
+            let held_thread = event_thread(&event_set).zip(event_set.events.first().map(|e| e.request_id));
+            if let (true, Some((tid, req_id))) = (held_alone, held_thread) {
+                // `"?"` and not `""` on a failed read, matching `debug.suspend_thread`'s fallback. This
+                // path runs when the connection has just misbehaved, so the read failing is likelier here
+                // than anywhere — and an empty name renders as `0x7f2c…8800 ""` in the rescue note, which
+                // is the exact uselessness `ThreadSuspend::name` exists to prevent.
+                let name = session
+                    .connection
+                    .get_thread_name(tid)
+                    .await
+                    .ok()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "?".to_string());
+                session.suspensions.hold_thread_for_failed_escalation(
+                    tid,
+                    name,
+                    std::time::Instant::now(),
+                    req_id,
+                );
+            } else {
+                let cause = event_set.events.first().map_or(crate::session::SuspendCause::ManualPause, |e| {
+                    crate::session::SuspendCause::StopPoint(e.request_id)
+                });
+                session.suspensions.mark_suspended(cause);
+            }
         }
         let seq = session.events.push(event_set, escalation);
         // Buffer first, then push. The buffer is the authoritative record and must be written whether
@@ -14352,8 +14385,36 @@ async fn escalate_to_vm_suspend(
 /// nothing about the rest of the VM. Two round trips, on a path that has already gone wrong.
 async fn another_thread_is_suspended(session: &mut crate::session::DebugSession, hit: u64) -> Option<bool> {
     let all = session.connection.get_all_threads().await.ok()?;
-    let other = all.into_iter().find(|t| *t != hit)?;
-    Some(session.connection.suspend_count(other).await.ok()? > 0)
+    // **Not any other thread, and not just one of them** — both narrowings are SAFE-13 (#197), and the
+    // first is the one that would otherwise re-create the bug this method now helps decide.
+    //
+    // A thread THIS SESSION is holding is suspended *by us*, so reading it as evidence that the VM stopped
+    // is circular: the second failed escalation would conclude the opposite of the first, purely because
+    // the first had left a thread held. That is reachable in a plain two-hit sequence, and since
+    // `store_reportable_event` now uses `vm_running` to choose which bookkeeping to do, a wrong answer
+    // puts the session back to recording a VM-wide suspension that is not happening.
+    //
+    // And a sample of one was always thin: "the VM is stopped" means EVERY thread is suspended, so one
+    // arbitrary thread that happens to be held for an unrelated reason answers for all of them. Sampling
+    // a few and requiring them to agree costs at most two extra round trips on a path that has already
+    // failed, and it takes the false-positive from "one unlucky thread" to "three of them".
+    let mut sampled = 0;
+    for tid in all {
+        if tid == hit || session.suspensions.threads.contains_key(&tid) {
+            continue;
+        }
+        if session.connection.suspend_count(tid).await.ok()? <= 0 {
+            return Some(false);
+        }
+        sampled += 1;
+        if sampled == 3 {
+            break;
+        }
+    }
+    // No eligible thread at all means nothing was measured, and `None` is the honest answer — the caller
+    // renders it as "could not tell", which it reports as running (distrusting a good frame costs less
+    // than trusting a moving one).
+    (sampled > 0).then_some(true)
 }
 
 /// Push a `notifications/message` for a hit that has just frozen the debuggee (EVT-2).
@@ -14880,7 +14941,7 @@ async fn verify_thread_suspends(session: &mut crate::session::DebugSession) -> S
         return String::new();
     }
     format!(
-        "\n   ⏸️  {} thread(s) held by debug.suspend_thread are STILL suspended and this did not release \
+        "\n   ⏸️  {} thread(s) held by this session are STILL suspended and this did not release \
          them: {}\n   That is deliberate — debug.continue clears the VM's suspend depth, which is a \
          different count. debug.resume_thread gives a thread back; debug.panic clears both.",
         still.len(),
@@ -15022,12 +15083,41 @@ async fn rescue_overdue_thread_suspends(s: &mut crate::session::DebugSession, se
         return;
     }
     let held_for = s.suspensions.longest_held(&overdue, now);
+    // SAFE-13 (#197), and owed here for exactly the reason the VM arm disarms: a hold left by a FAILED
+    // ESCALATION has a stop point behind it, and releasing the thread without disarming it rescues
+    // nothing — the thread is still on the line that fired, so it re-fires at once and is held again.
+    // Measured before this existed: one rescue, then the same stop point at `Hits: 2` with its thread held
+    // again. Disarmed BEFORE the release, so the window between the two cannot be the one it re-fires in.
+    let armed_behind: Vec<i32> = overdue
+        .iter()
+        .filter_map(|tid| match s.suspensions.threads.get(tid)?.hold {
+            crate::session::ThreadHold::FailedEscalation(req) => Some(req),
+            crate::session::ThreadHold::Requested => None,
+        })
+        .collect();
+    let mut disarmed: Vec<String> = Vec::new();
+    for req in armed_behind {
+        if let Some(what) = disarm_request(s, req).await {
+            disarmed.push(what);
+        }
+    }
+    // Named in the note rather than counted, because "released a thread" and "disabled the stop point that
+    // was freezing it" are two different things for the caller to know, and the second is the one they have
+    // to undo by hand (debug.toggle_stop_point).
+    let also = if disarmed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", and disabled {} so it cannot re-freeze the thread — re-arm with debug.toggle_stop_point (or \
+             use trace:true) when ready",
+            disarmed.join(", ")
+        )
+    };
     let (freed, stuck) = release_thread_suspends(s, Some(&overdue)).await;
     let (note, level) = if stuck.is_empty() {
         (
             format!(
-                "watchdog released {} thread(s) suspended by debug.suspend_thread after {secs}s (held \
-                 up to {}): {}",
+                "watchdog released {} held thread(s) after {secs}s (held up to {}): {}{also}",
                 freed.len(),
                 ago(held_for),
                 freed.join(", ")
@@ -15037,8 +15127,11 @@ async fn rescue_overdue_thread_suspends(s: &mut crate::session::DebugSession, se
     } else {
         (
             format!(
-                "⚠️ watchdog tried to release {} thread(s) suspended by debug.suspend_thread after \
-                 {secs}s, but {} are STILL suspended: {}",
+                // `{also}` LAST, as in the success arm. Spliced before the "but N are STILL suspended"
+                // clause it pushed the load-bearing half of the resume-honesty wording behind a long
+                // instructional aside — and that clause is the whole reason this arm exists.
+                "⚠️ watchdog tried to release {} held thread(s) after {secs}s, but {} are STILL \
+                 suspended: {}{also}",
                 freed.len() + stuck.len(),
                 stuck.len(),
                 stuck.join(", ")
