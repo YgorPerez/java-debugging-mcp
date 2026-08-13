@@ -123,29 +123,11 @@ pub struct DebugSession {
     /// The JVM this session STARTED, if any (LAUNCH-1) — `None` for an ordinary `debug.attach`, which is
     /// the difference between a debuggee whose lifetime is ours and one that belongs to somebody else.
     pub launched: Option<LaunchedJvm>,
-    /// Halves of a monitor pair still waiting for their other half (DUMP-7, ADR-0035).
+    /// The debugger's own stopwatch across monitor pairs (DUMP-7, ADR-0035, CLEAN-6 #189).
     ///
-    /// **This exists because no monitor event carries an elapsed time.** `MONITOR_CONTENDED_ENTERED`
-    /// reports that a thread got the lock and says nothing about how long it waited; `MONITOR_WAIT`
-    /// carries the timeout the caller *asked* for, not what it got. "How long was it blocked" — the
-    /// question a contention diagnosis is actually asking — is on neither half, so the only way to have it
-    /// is to timestamp the opening half here and subtract on the closing one. Every reply that prints the
-    /// result says the debugger measured it.
-    ///
-    /// **The key includes which pair.** `Object.wait()` releases its monitor and re-acquires it on wake,
-    /// and that re-acquisition can itself be contended — so one thread can legitimately have a
-    /// `Blocked`→`Acquired` and a `Wait`→`Waited` measurement outstanding on the *same* monitor at the
-    /// same time. Keyed on (thread, monitor) alone they would overwrite each other and report one
-    /// duration as the other.
-    ///
-    /// Bounded by [`MAX_MONITOR_PENDING`], because entries are removed by the *closing* half and there is
-    /// no guarantee one ever arrives: a thread can die blocked, and arming only the opening half of a pair
-    /// is a legitimate (cheaper) way to use this. Drops are counted rather than silent, like every other
-    /// bounded buffer here.
-    pub monitor_pending: HashMap<MonitorPairKey, std::time::Instant>,
-    /// How many pending monitor halves were dropped because [`monitor_pending`](Self::monitor_pending)
-    /// was full — reported, so a missing duration is explicable rather than mysterious.
-    pub monitor_pending_dropped: u64,
+    /// See [`MonitorClock`]. It is a type rather than two fields because an unclosed half must never reach
+    /// a later request, and that rule was three lines in three handlers.
+    pub monitor_clock: MonitorClock,
     /// Push channel to the MCP client (EVT-2). Lives on the session because the two things that need
     /// it — the event pump and the watchdog — already hold a session and nothing else.
     ///
@@ -364,9 +346,9 @@ pub const MAX_TRACE_DISARMS: usize = 32;
 /// every other bound here does and is deliberate. Refusing would be self-defeating: the way this map fills
 /// is with halves that will never close, so a refusal would stop measuring durations *permanently* the
 /// first time 256 threads died blocked. Evicting the oldest keeps the mechanism alive and loses the entry
-/// least likely to still be waiting for its partner. The eviction is counted
-/// ([`monitor_pending_dropped`](DebugSession::monitor_pending_dropped)), so a duration that goes missing
-/// this way is explicable.
+/// least likely to still be waiting for its partner. The eviction is counted in [`MonitorClock::dropped`]
+/// — and read by nothing, which that field's own doc records rather than repeating the claim that a
+/// duration lost this way is explicable to a caller.
 pub const MAX_MONITOR_PENDING: usize = 256;
 
 /// Max reportable events retained per session; oldest are evicted, counted in [`EventRing::dropped`].
@@ -769,7 +751,7 @@ impl Suspensions {
     /// reasoned about apart: a thread suspended repeatedly still becomes overdue, because the first
     /// suspend set the clock and no later one moves it.
     ///
-    /// `now` is a parameter for the same reason [`DebugSession::open_monitor_pair`]'s `at` is — a caller
+    /// `now` is a parameter for the same reason [`MonitorClock::open`]'s `at` is — a caller
     /// wanting two figures about one moment must be able to pass the same moment to both, and a test must
     /// be able to name a moment five minutes on without depending on how long the machine has been up.
     /// `Instant` has no portable origin, so *backdating* is the operation with no safe form here.
@@ -1036,21 +1018,22 @@ pub enum EventPump {
 ///   `note_disarmed_traced`, [`TraceBuffer::note_disarm`], `note_pop`.
 /// - **`mark_…`** — set a session state that something else will read as a fact about the VM.
 ///   [`Suspensions::mark_suspended`], [`Suspensions::mark_resumed`].
-/// - **`open_…` / `close_…`** — one half of a pair's lifetime, where the other half completes it.
-///   `open_monitor_pair`, `close_monitor_pair`.
+/// - **`open` / `close`** — one half of a pair's lifetime, where the other half completes it.
+///   [`MonitorClock::open`], [`MonitorClock::close`].
 /// - **`hold_…` / `release_…`** — the same pairing for something the *caller* opens and closes, where the
 ///   debuggee is what is being held. [`Suspensions::hold_thread`], [`Suspensions::release_thread`].
-/// - **`forget_…`** — drop bookkeeping the debuggee has contradicted, which is not the same as the caller
-///   closing it and must never decrement a count (ADR-0003). [`Suspensions::forget_thread`],
-///   [`Suspensions::forget_all_threads`].
+/// - **`forget_…`** — drop bookkeeping that can no longer come true, which is not the same as the caller
+///   closing it and must never decrement or count anything: either the debuggee contradicted the claim
+///   (ADR-0003) or the request that would have completed it is gone. [`Suspensions::forget_thread`],
+///   [`Suspensions::forget_all_threads`], [`MonitorClock::forget_pair`].
 /// - **`push_…`** — append to a **bounded** ring buffer, with eviction counted rather than silent.
 ///   [`EventRing::push`], [`TraceBuffer::push`].
-/// - **`clear`** — discard what a caller has read. **What survives is decided per type, and the two here
-///   disagree on purpose**, so read the method before adding a third: both keep their monotonic counter
-///   ([`EventRing::seq`], [`TraceBuffer::filed`]) because it is an identity already handed out, but
-///   [`EventRing::clear`] keeps its drop count as the only evidence the ring fell behind, while
-///   [`TraceBuffer::clear`] resets its own — a disarm note explains a gap in a buffer that is now empty,
-///   so it goes with the records it was about.
+/// - **`clear`** — discard what a caller has read. **What survives is decided per type and the three here
+///   do not agree**, so read the method before adding a fourth. The monotonic counters always survive
+///   ([`EventRing::seq`], [`TraceBuffer::filed`]) because each is an identity already handed out. The drop
+///   counts do not: [`EventRing::clear`] keeps its own as the only evidence the ring fell behind, while
+///   [`TraceBuffer::clear`] and [`MonitorClock::clear`] reset theirs — a drop count explains a gap in
+///   something a caller can still ask about, and after those two there is nothing left for it to be about.
 /// - **`register_…`** — add to a collection under an id the value itself carries. `register_stop_point`.
 /// - Everything else is a query and reads as one: `was_traced_and_disarmed`,
 ///   [`EventRing::watchdog_note_for`], `classify_throw`, `next_stop_id`.
@@ -1103,42 +1086,6 @@ impl DebugSession {
         if let Some(entry) = self.redefinitions.get_mut(class_name) {
             entry.popped_since = true;
         }
-    }
-
-    /// Record that the **opening** half of a monitor pair has arrived, so the closing half can measure
-    /// the duration (DUMP-7, ADR-0035). Returns the eviction note when the map was full.
-    ///
-    /// An opening half arriving twice for the same key **overwrites** rather than being ignored. That is
-    /// the honest reading: JDWP delivered a second "started blocking" without a matching "acquired", so
-    /// either the first pair's close was never armed or the event was lost, and measuring the newer
-    /// pair is right where measuring from a stale start would report a duration that includes work the
-    /// thread was not blocked for.
-    pub fn open_monitor_pair(&mut self, key: MonitorPairKey, at: std::time::Instant) {
-        // Evict the OLDEST rather than refusing the new one — see `MAX_MONITOR_PENDING` for why this bound
-        // behaves opposite to every other one here.
-        if self.monitor_pending.len() >= MAX_MONITOR_PENDING && !self.monitor_pending.contains_key(&key) {
-            if let Some(oldest) = self.monitor_pending.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k) {
-                self.monitor_pending.remove(&oldest);
-                self.monitor_pending_dropped = self.monitor_pending_dropped.saturating_add(1);
-            }
-        }
-        self.monitor_pending.insert(key, at);
-    }
-
-    /// Close a monitor pair, returning how long it was open — the **debugger-measured** duration, since
-    /// no monitor event carries one.
-    ///
-    /// `None` when this closing half has no matching opening half, which is a normal state rather than an
-    /// error and has three innocent causes: the opening kind was never armed, the pair opened before
-    /// this stop point was, or the entry was evicted. A reply that got `None` must say the duration is
-    /// unavailable rather than print a zero, which would read as "it was not blocked at all".
-    pub fn close_monitor_pair(
-        &mut self,
-        key: &MonitorPairKey,
-        now: std::time::Instant,
-    ) -> Option<std::time::Duration> {
-        let opened = self.monitor_pending.remove(key)?;
-        Some(now.saturating_duration_since(opened))
     }
 }
 
@@ -1316,9 +1263,8 @@ impl MonitorPair {
 
 /// What identifies one outstanding monitor measurement: which thread, which monitor, which pair.
 ///
-/// See [`DebugSession::monitor_pending`] for why the pair is in the key rather than left out as
-/// redundant — a `wait` re-acquires its monitor on wake, so one thread can have both pairs open on one
-/// object at once.
+/// See [`MonitorClock::pending`] for why the pair is in the key rather than left out as redundant — a
+/// `wait` re-acquires its monitor on wake, so one thread can have both pairs open on one object at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MonitorPairKey {
     pub thread: u64,
@@ -1326,6 +1272,124 @@ pub struct MonitorPairKey {
     /// compared, never dereferenced, so a collected monitor costs an unmatched entry rather than an error.
     pub monitor: u64,
     pub pair: MonitorPair,
+}
+
+/// The debugger's own stopwatch across monitor pairs (DUMP-7, ADR-0035), and the fifth cluster ADR-0050
+/// describes (CLEAN-6, #189).
+///
+/// **It exists because no monitor event carries an elapsed time.** `MONITOR_CONTENDED_ENTERED` reports that
+/// a thread got the lock and says nothing about how long it waited; `MONITOR_WAIT` carries the timeout the
+/// caller *asked* for, not what it got. "How long was it blocked" — the question a contention diagnosis is
+/// actually asking — is on neither half, so the only way to have it is to timestamp the opening half here
+/// and subtract on the closing one. Every reply that prints the result says the debugger measured it.
+///
+/// **The invariant that chose this cluster: an unclosed half must never be handed to a later request.**
+/// Three rules move together, and each of the three was a line in a handler with a paragraph above it
+/// explaining the same hazard — clearing a monitor stop point drops its pair's halves, re-arming one drops
+/// them too, and `debug.panic` drops all of them. Left behind, any of those hands a stale start to the next
+/// stop point armed on this session, which then reports the time that stop point spent DISABLED as time a
+/// thread spent blocked: a number that is not wrong by a little. [`Self::forget_pair`] is that rule once.
+///
+/// **It is constructible with no socket**, which is the point of the type (ADR-0050). The eviction rule
+/// below runs backwards from every other bound in this file and had no test at all before, because
+/// reaching it against a real JVM needs 256 threads to die blocked.
+#[derive(Debug)]
+pub struct MonitorClock {
+    /// Halves still waiting for their other half, and the instant each arrived.
+    ///
+    /// Bounded by [`MAX_MONITOR_PENDING`], because entries are removed by the *closing* half and there is
+    /// no guarantee one ever arrives: a thread can die blocked, and arming only the opening half of a pair
+    /// is a legitimate (cheaper) way to use this.
+    ///
+    /// **The key includes which pair.** `Object.wait()` releases its monitor and re-acquires it on wake,
+    /// and that re-acquisition can itself be contended — so one thread can legitimately have a
+    /// `Blocked`→`Acquired` and a `Wait`→`Waited` measurement outstanding on the *same* monitor at the same
+    /// time. Keyed on (thread, monitor) alone they would overwrite each other and report one duration as
+    /// the other.
+    pub pending: HashMap<MonitorPairKey, std::time::Instant>,
+    /// How many opening halves eviction took because [`pending`](Self::pending) was full.
+    ///
+    /// **Counted, and read by nothing.** [`MAX_MONITOR_PENDING`]'s doc says the eviction is counted "so a
+    /// duration that goes missing this way is explicable" — the counting is real and the explaining is not:
+    /// no reply, no listing and no investigation report prints this figure, so an evicted measurement is
+    /// exactly as silent as an unbounded map would have made it. CLEAN-6 is a refactor and must not change
+    /// a reply, so this is recorded rather than fixed; every other bounded buffer here reports its drops,
+    /// and this one is the exception.
+    pub dropped: u64,
+}
+
+impl MonitorClock {
+    /// A session's monitor stopwatch at attach: nothing open, nothing lost.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { pending: HashMap::new(), dropped: 0 }
+    }
+
+    /// Record that the **opening** half of a pair has arrived, so the closing half can measure the
+    /// duration (DUMP-7, ADR-0035).
+    ///
+    /// An opening half arriving twice for the same key **overwrites** rather than being ignored. That is
+    /// the honest reading: JDWP delivered a second "started blocking" without a matching "acquired", so
+    /// either the first pair's close was never armed or the event was lost, and measuring the newer pair is
+    /// right where measuring from a stale start would report a duration that includes work the thread was
+    /// not blocked for.
+    ///
+    /// **At the bound it evicts the OLDEST rather than refusing the new one**, which is the opposite of
+    /// every other bound in this file and is deliberate — see [`MAX_MONITOR_PENDING`]. Refusing would be
+    /// self-defeating: the way this map fills is with halves that will never close, so a refusal would stop
+    /// measuring durations *permanently* the first time 256 threads died blocked.
+    pub fn open(&mut self, key: MonitorPairKey, at: std::time::Instant) {
+        if self.pending.len() >= MAX_MONITOR_PENDING && !self.pending.contains_key(&key) {
+            if let Some(oldest) = self.pending.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k) {
+                self.pending.remove(&oldest);
+                self.dropped = self.dropped.saturating_add(1);
+            }
+        }
+        self.pending.insert(key, at);
+    }
+
+    /// Close a pair, returning how long it was open — the **debugger-measured** duration, since no monitor
+    /// event carries one.
+    ///
+    /// `None` when this closing half has no matching opening half, which is a normal state rather than an
+    /// error and has three innocent causes: the opening kind was never armed, the pair opened before this
+    /// stop point was, or the entry was evicted. A reply that got `None` must say the duration is
+    /// unavailable rather than print a zero, which would read as "it was not blocked at all".
+    pub fn close(&mut self, key: &MonitorPairKey, now: std::time::Instant) -> Option<std::time::Duration> {
+        let opened = self.pending.remove(key)?;
+        Some(now.saturating_duration_since(opened))
+    }
+
+    /// Drop every open half of **one** pair kind, because the request that opened them is gone — the stop
+    /// point was cleared, or re-armed onto a new request id.
+    ///
+    /// **The other pair kind is untouched, and that is the whole reason this takes an argument.** A session
+    /// can have both pairs armed on the same threads and the same monitors at once ([`MonitorPairKey`]),
+    /// and clearing the contended stop point says nothing about a `wait` measurement in flight.
+    ///
+    /// It does **not** count what it drops. An eviction is this type failing to keep a measurement it was
+    /// asked to keep; this is a measurement whose request no longer exists, so there is nothing to explain
+    /// to a caller and nothing that would have completed it.
+    pub fn forget_pair(&mut self, pair: MonitorPair) {
+        self.pending.retain(|k, _| k.pair != pair);
+    }
+
+    /// Drop every open half and the eviction count with it — `debug.panic`'s case, where every armed
+    /// request has just been dropped.
+    ///
+    /// **The count goes, unlike [`EventRing::clear`]'s**, for the reason [`TraceBuffer::clear`]'s does: a
+    /// drop count explains a gap in something a caller can still ask about, and after this there is no
+    /// measurement left for it to be about.
+    pub fn clear(&mut self) {
+        self.pending.clear();
+        self.dropped = 0;
+    }
+}
+
+impl Default for MonitorClock {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A breakpoint waiting for its class to load. The `CLASS_PREPARE` request suspends the preparing
@@ -1617,8 +1681,7 @@ impl SessionManager {
             redefinitions: std::collections::BTreeMap::new(),
             pattern_sets: HashMap::new(),
             launched: None,
-            monitor_pending: HashMap::new(),
-            monitor_pending_dropped: 0,
+            monitor_clock: MonitorClock::new(),
             alerter: self.alerter.clone(),
         };
 
@@ -2154,7 +2217,7 @@ mod tests {
     /// it — a panic on a box that booted a minute ago, and a `windows-latest` or `macos-latest`
     /// contributor is who would hit it. `handlers.rs`'s `jvm_method` helper refuses the same trick for
     /// the same reason, and it is why `hold_thread` and `overdue_threads` take their instant rather than
-    /// reading the clock themselves, the way `open_monitor_pair` already did.
+    /// reading the clock themselves, the way [`MonitorClock::open`] already does.
     fn secs_after(t0: std::time::Instant, secs: u64) -> std::time::Instant {
         t0 + std::time::Duration::from_secs(secs)
     }
@@ -2470,5 +2533,161 @@ mod tests {
             None,
             "a ring the watchdog never rescued has no note to scope"
         );
+    }
+
+    /// A key naming one measurement. Distinct `thread`s give distinct keys, which is all these tests need
+    /// of the identity — the *pair* half of it has a test of its own.
+    fn blocked_on(thread: u64) -> MonitorPairKey {
+        MonitorPairKey { thread, monitor: 0xBEEF, pair: MonitorPair::Contended }
+    }
+
+    /// DUMP-7: the debugger is the only source of an elapsed time here, so the pair has to measure from
+    /// the half that opened it and answer honestly when there was no such half.
+    #[test]
+    fn a_closed_pair_measures_from_its_opening_half_and_an_unmatched_one_measures_nothing() {
+        let mut clock = MonitorClock::new();
+        let origin = std::time::Instant::now();
+
+        clock.open(blocked_on(7), origin);
+        assert_eq!(
+            clock.close(&blocked_on(7), secs_after(origin, 4)),
+            Some(std::time::Duration::from_secs(4)),
+            "the duration is measured across the two halves, because no monitor event carries one"
+        );
+        assert!(clock.pending.is_empty(), "and the closing half takes the entry with it");
+
+        assert_eq!(
+            clock.close(&blocked_on(7), secs_after(origin, 9)),
+            None,
+            "a closing half with no opening half reports nothing — never a zero, which would read as \
+             'it was not blocked at all'"
+        );
+    }
+
+    /// A `wait` releases its monitor and re-acquires it on wake, and that re-acquisition can itself be
+    /// contended — so one thread can have both pairs open on one object at once. Keyed without the pair
+    /// they would overwrite each other and report one duration as the other.
+    #[test]
+    fn both_pairs_of_one_thread_and_monitor_are_measured_independently() {
+        let mut clock = MonitorClock::new();
+        let origin = std::time::Instant::now();
+        let waiting = MonitorPairKey { pair: MonitorPair::Wait, ..blocked_on(7) };
+
+        clock.open(blocked_on(7), origin);
+        clock.open(waiting, secs_after(origin, 3));
+
+        assert_eq!(
+            clock.close(&waiting, secs_after(origin, 5)),
+            Some(std::time::Duration::from_secs(2)),
+            "the wait is measured from ITS own opening half"
+        );
+        assert_eq!(
+            clock.close(&blocked_on(7), secs_after(origin, 6)),
+            Some(std::time::Duration::from_secs(6)),
+            "and the contended pair is still open and still measuring from its own"
+        );
+    }
+
+    /// A second opening half for one key **overwrites**: JDWP delivered a "started blocking" with no
+    /// matching "acquired", so measuring from the stale start would report work the thread was not
+    /// blocked for.
+    #[test]
+    fn a_repeated_opening_half_measures_from_the_newer_one() {
+        let mut clock = MonitorClock::new();
+        let origin = std::time::Instant::now();
+
+        clock.open(blocked_on(7), origin);
+        clock.open(blocked_on(7), secs_after(origin, 10));
+
+        assert_eq!(clock.pending.len(), 1, "one key is one measurement, however many halves arrived");
+        assert_eq!(
+            clock.close(&blocked_on(7), secs_after(origin, 12)),
+            Some(std::time::Duration::from_secs(2)),
+            "measured from the newer start, not the stale one"
+        );
+    }
+
+    /// **This bound runs backwards from every other one in this file** — it evicts rather than refusing —
+    /// and reaching it against a real JVM needs 256 threads to die blocked, which is why it had no test
+    /// until the type could be built without a socket (ADR-0050).
+    #[test]
+    fn a_full_clock_evicts_its_oldest_measurement_rather_than_refusing_the_new_one() {
+        let mut clock = MonitorClock::new();
+        let origin = std::time::Instant::now();
+
+        for t in 0..u64::try_from(MAX_MONITOR_PENDING).unwrap_or(u64::MAX) {
+            clock.open(blocked_on(t), secs_after(origin, t));
+        }
+        assert_eq!(clock.pending.len(), MAX_MONITOR_PENDING);
+        assert_eq!(clock.dropped, 0, "nothing was lost while there was room");
+
+        let newcomer = blocked_on(9_000);
+        clock.open(newcomer, secs_after(origin, 9_000));
+
+        assert_eq!(clock.pending.len(), MAX_MONITOR_PENDING, "the map stays bounded");
+        assert_eq!(clock.dropped, 1, "and the eviction is counted");
+        assert!(
+            clock.pending.contains_key(&newcomer),
+            "the NEW half is kept — refusing it would stop this session measuring durations forever"
+        );
+        assert!(
+            !clock.pending.contains_key(&blocked_on(0)),
+            "and the one evicted is the oldest, which is the least likely to still be waiting"
+        );
+    }
+
+    /// A re-open of a key already present must not evict, because it is not a new entry — the guard for
+    /// that is what stops a busy monitor from evicting a stranger on every repeat.
+    #[test]
+    fn re_opening_a_measurement_already_held_evicts_nothing() {
+        let mut clock = MonitorClock::new();
+        let origin = std::time::Instant::now();
+        for t in 0..u64::try_from(MAX_MONITOR_PENDING).unwrap_or(u64::MAX) {
+            clock.open(blocked_on(t), secs_after(origin, t));
+        }
+
+        clock.open(blocked_on(3), secs_after(origin, 500));
+
+        assert_eq!(clock.dropped, 0, "a repeat is not an arrival, so nothing was displaced by it");
+        assert_eq!(clock.pending.len(), MAX_MONITOR_PENDING);
+    }
+
+    /// Clearing a monitor stop point drops the halves of **its** pair and says nothing about the other,
+    /// because a session can have both armed on the same threads at once.
+    #[test]
+    fn forgetting_one_pair_kind_leaves_the_other_measuring() {
+        let mut clock = MonitorClock::new();
+        let origin = std::time::Instant::now();
+        let waiting = MonitorPairKey { pair: MonitorPair::Wait, ..blocked_on(7) };
+        clock.open(blocked_on(7), origin);
+        clock.open(blocked_on(8), origin);
+        clock.open(waiting, origin);
+
+        clock.forget_pair(MonitorPair::Contended);
+
+        assert_eq!(clock.pending.len(), 1, "every contended half went, on every thread");
+        assert!(clock.pending.contains_key(&waiting), "and the wait pair is untouched");
+        assert_eq!(
+            clock.dropped, 0,
+            "a request that no longer exists is not a measurement this type failed to keep, so it is \
+             NOT counted as one"
+        );
+    }
+
+    /// `debug.panic` drops every armed request, so the pairing state goes with them — and the eviction
+    /// count goes too, because there is no measurement left for it to explain.
+    #[test]
+    fn clearing_takes_the_measurements_and_the_eviction_count_together() {
+        let mut clock = MonitorClock::new();
+        let origin = std::time::Instant::now();
+        for t in 0..=u64::try_from(MAX_MONITOR_PENDING).unwrap_or(u64::MAX) {
+            clock.open(blocked_on(t), secs_after(origin, t));
+        }
+        assert_eq!(clock.dropped, 1, "the setup really did evict one");
+
+        clock.clear();
+
+        assert!(clock.pending.is_empty());
+        assert_eq!(clock.dropped, 0, "unlike EventRing::clear — see the clear bullet in the vocabulary");
     }
 }

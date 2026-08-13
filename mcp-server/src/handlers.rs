@@ -8229,11 +8229,9 @@ fn clear_monitor_stop(
     sp: &StopPoint,
     mon: &crate::stop_point::MonitorStop,
 ) -> String {
-    // Any pair this kind had open dies with the request. Left behind, its start would be handed to
-    // whatever is armed on this pair next and reported as a duration reaching back before that stop point
-    // existed.
+    // Any pair this kind had open dies with the request — see `MonitorClock::forget_pair`.
     let (pair, _) = crate::session::MonitorPair::of(mon.kind);
-    session.monitor_pending.retain(|k, _| k.pair != pair);
+    session.monitor_clock.forget_pair(pair);
 
     // The partner is a different kind from this one, so this stop point — still in the map until the
     // caller removes it — can never match itself here.
@@ -8289,11 +8287,10 @@ async fn rearm_monitor_request(
         )
         .await
         .map_err(|e| format!("Failed to re-arm monitor request: {e}"))?;
-    // DUMP-7: any pair this kind had open belongs to the request that was just replaced. Left in place,
-    // the first event after a re-arm would be measured from before the disable and report the time the stop
-    // point spent DISABLED as time a thread spent blocked — a number that is not wrong by a little.
+    // DUMP-7: any pair this kind had open belongs to the request that was just replaced, so the first event
+    // after a re-arm would otherwise be measured from before the disable — see `MonitorClock::forget_pair`.
     let (pair, _) = crate::session::MonitorPair::of(mon.kind);
-    session.monitor_pending.retain(|k, _| k.pair != pair);
+    session.monitor_clock.forget_pair(pair);
     Ok(ReArmed { request_ids: vec![req], armed_on: None })
 }
 
@@ -12522,8 +12519,7 @@ async fn disarm_everything(session: &mut crate::session::DebugSession) {
     // The pairing state belongs to the requests that were just dropped. Left behind it would hand a stale
     // start to the next monitor stop point armed on this session and report a duration measured from
     // before it existed.
-    session.monitor_pending.clear();
-    session.monitor_pending_dropped = 0;
+    session.monitor_clock.clear();
 }
 
 /// Drop every armed stop point's standing class-load watch (BP-7, #115).
@@ -12965,10 +12961,10 @@ fn span_monitor_event(
     let (m, _) = monitor_of(details)?;
     let key = crate::session::MonitorPairKey { thread: m.thread, monitor: m.monitor, pair: spec.pair };
     if spec.opening {
-        session.open_monitor_pair(key, now);
+        session.monitor_clock.open(key, now);
         return Some(MonitorSpan::Opened);
     }
-    Some(MonitorSpan::Closed(session.close_monitor_pair(&key, now)))
+    Some(MonitorSpan::Closed(session.monitor_clock.close(&key, now)))
 }
 
 /// Whether this monitor hit should be recorded at all, given the caller's `min_duration_ms` (DUMP-7).
