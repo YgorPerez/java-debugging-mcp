@@ -103,21 +103,11 @@ pub struct DebugSession {
     /// Read as a pair with [`Self::step_exclude_classes`] — never merged with a call's own filter, and
     /// never applied on its own to a step that named the other field.
     pub step_only_classes: Option<Vec<String>>,
-    /// Classes this session redefined and **cannot restore** (SWAP-2), keyed by class name.
+    /// Classes this session redefined and **cannot restore** (SWAP-2, CLEAN-6 #189).
     ///
-    /// Its own bookkeeping because a redefinition is the only mutation here that outlives the thing that
-    /// made it. Every other one — a field write, a forced return, an invoked method — is finished when the
-    /// debuggee resumes; a redefined class keeps serving new bytecode after the resume, after the
-    /// disconnect, and to everyone else on a shared instance, and only redeploying the artifact undoes it.
-    ///
-    /// This exists because of what it bought. SWAP-1's triage considered a third permission axis — a mode
-    /// allowing `set_value` while still refusing to change the program — and rejected it on the grounds
-    /// that reporting the residue is the honest answer to an unrepairable side effect, not a mode nobody
-    /// remembers to set. That argument is only true if the reporting exists, which is this.
-    ///
-    /// A `BTreeMap` so a report lists classes in a stable order rather than a hash order, matching
-    /// [`TraceBuffer::disarms`].
-    pub redefinitions: std::collections::BTreeMap<String, Redefinition>,
+    /// See [`Redefinitions`]. It is a type rather than a map because a swap has to un-do an earlier pop,
+    /// and that rule had nowhere to be asserted while it lived here.
+    pub redefinitions: Redefinitions,
     /// Wildcard line-breakpoint families (FILT-3), keyed by their `bpset_` id.
     pub pattern_sets: HashMap<String, PatternStopSet>,
     /// The JVM this session STARTED, if any (LAUNCH-1) — `None` for an ordinary `debug.attach`, which is
@@ -805,6 +795,85 @@ pub struct Redefinition {
     pub popped_since: bool,
 }
 
+/// Classes this session redefined and **cannot restore** (SWAP-2), and the sixth and last cluster
+/// ADR-0050 describes (CLEAN-6, #189).
+///
+/// **Its own bookkeeping because a redefinition is the only mutation here that outlives the thing that
+/// made it.** Every other one — a field write, a forced return, an invoked method — is finished when the
+/// debuggee resumes; a redefined class keeps serving new bytecode after the resume, after the disconnect,
+/// and to everyone else on a shared instance, and only redeploying the artifact undoes it.
+///
+/// This exists because of what it bought. SWAP-1's triage considered a third permission axis — a mode
+/// allowing `set_value` while still refusing to change the program — and rejected it on the grounds that
+/// reporting the residue is the honest answer to an unrepairable side effect, not a mode nobody remembers
+/// to set. That argument is only true if the reporting exists, which is this.
+///
+/// **The invariant that chose this cluster: a pop belongs to the bytecode that was live when it
+/// happened.** [`Self::note_pop`] and [`Self::note_swap`] write the same record from opposite directions,
+/// and a swap has to *un-do* an earlier pop — the frames that were running under the old code are gone,
+/// so whether the newest swap reached the frames still running is once again unknown. Reported either way;
+/// what it changes is which of the two sentences the residue report prints, and that sentence is what tells
+/// the next person what to check. It lived in `DebugSession` and so could be asserted by nothing.
+///
+/// **It is constructible with no socket**, which is the point of the type (ADR-0050).
+#[derive(Debug)]
+pub struct Redefinitions {
+    /// Keyed by class name, in a `BTreeMap` so a report lists classes in a stable order rather than a hash
+    /// order — matching [`TraceBuffer::disarms`], and asserted by the renderer's own tests.
+    pub held: std::collections::BTreeMap<String, Redefinition>,
+}
+
+impl Redefinitions {
+    /// A session that has redefined nothing, which is nearly every session.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { held: std::collections::BTreeMap::new() }
+    }
+
+    /// Record a successful redefinition of `class_name`. Repeated swaps of one class collapse into a
+    /// count, because an iterating caller reloads the same class over and over and "17 times" is a
+    /// different situation to report than "once".
+    ///
+    /// **It moves the clock and clears any earlier pop, and both are the same rule.** `at` is what the
+    /// report renders "how long has this JVM been like this" from, so it has to name the *newest* swap;
+    /// and a pop recorded before that swap was about bytecode this one has just replaced, so continuing to
+    /// count it would report "a frame was popped since, so the new code is live" about code no frame has
+    /// been popped under.
+    ///
+    /// `at` is a parameter for the reason [`MonitorClock::open`]'s is: a test must be able to name a moment
+    /// five minutes on without depending on how long the machine has been up, and `Instant` has no portable
+    /// origin, so *backdating* is the operation with no safe form here.
+    pub fn note_swap(&mut self, class_name: &str, at: std::time::Instant) {
+        let entry = self.held.entry(class_name.to_string()).or_insert_with(|| Redefinition {
+            count: 0,
+            at,
+            popped_since: false,
+        });
+        entry.count += 1;
+        entry.at = at;
+        entry.popped_since = false;
+    }
+
+    /// Record that a frame in `class_name` was popped, so a later report can distinguish a swap that is
+    /// certainly live from one that may still be masked by frames that were already running.
+    ///
+    /// **A pop in a class this session never redefined is not tracked, and does not create a record.**
+    /// There is no residue to describe: popping a frame is not itself a thing a caller has to be warned
+    /// they cannot undo, and an entry made here would put a class into the residue report that this
+    /// session never changed.
+    pub fn note_pop(&mut self, class_name: &str) {
+        if let Some(entry) = self.held.get_mut(class_name) {
+            entry.popped_since = true;
+        }
+    }
+}
+
+impl Default for Redefinitions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Everything a traced session has recorded, and everything it can no longer show you (CLEAN-6, #189).
 ///
 /// **The second cluster ADR-0050 describes, and chosen the same way: by invariant, not by touch count.**
@@ -1013,9 +1082,14 @@ pub enum EventPump {
 /// will add twenty more** (CLEAN-6, #189, whose whole subject is the ratio of direct field touches to
 /// mediated calls). A convention nobody has stated is one that drifts on the commit that doubles it.
 ///
+/// It describes the whole session surface, not this `impl` alone: #189 closed the collections into
+/// [`SessionState`], [`EventRing`], [`Suspensions`], [`TraceBuffer`], [`MonitorClock`] and
+/// [`Redefinitions`], so a method following one of these verbs is far likelier to be added to one of those
+/// than here. This is still the block a reader lands on first.
+///
 /// - **`note_…`** — record that something happened, so a later reply can report it. The session is not
-///   acting; it is remembering. `note_redefinition`, [`EventRing::note_watchdog`],
-///   `note_disarmed_traced`, [`TraceBuffer::note_disarm`], `note_pop`.
+///   acting; it is remembering. [`Redefinitions::note_swap`], [`Redefinitions::note_pop`],
+///   [`EventRing::note_watchdog`], `note_disarmed_traced`, [`TraceBuffer::note_disarm`].
 /// - **`mark_…`** — set a session state that something else will read as a fact about the VM.
 ///   [`Suspensions::mark_suspended`], [`Suspensions::mark_resumed`].
 /// - **`open` / `close`** — one half of a pair's lifetime, where the other half completes it.
@@ -1062,29 +1136,6 @@ impl DebugSession {
             None => EventPump::Unstarted,
             Some(task) if task.is_finished() => EventPump::Ended,
             Some(_) => EventPump::Running,
-        }
-    }
-
-    /// Record a successful redefinition of `class_name` (SWAP-2). Repeated swaps of one class collapse
-    /// into a count, and any earlier pop stops counting — a pop applies to the bytecode that was live
-    /// when it happened, not to whatever replaced it afterwards.
-    pub fn note_redefinition(&mut self, class_name: &str) {
-        let entry = self.redefinitions.entry(class_name.to_string()).or_insert_with(|| Redefinition {
-            count: 0,
-            at: std::time::Instant::now(),
-            popped_since: false,
-        });
-        entry.count += 1;
-        entry.at = std::time::Instant::now();
-        entry.popped_since = false;
-    }
-
-    /// Record that a frame in `class_name` was popped, so a later report can distinguish a swap that is
-    /// certainly live from one that may still be masked by frames that were already running. A pop in a
-    /// class this session never redefined is not tracked — there is no residue to describe.
-    pub fn note_pop(&mut self, class_name: &str) {
-        if let Some(entry) = self.redefinitions.get_mut(class_name) {
-            entry.popped_since = true;
         }
     }
 }
@@ -1678,7 +1729,7 @@ impl SessionManager {
             trace_exprs,
             step_exclude_classes,
             step_only_classes,
-            redefinitions: std::collections::BTreeMap::new(),
+            redefinitions: Redefinitions::new(),
             pattern_sets: HashMap::new(),
             launched: None,
             monitor_clock: MonitorClock::new(),
@@ -2689,5 +2740,73 @@ mod tests {
 
         assert!(clock.pending.is_empty());
         assert_eq!(clock.dropped, 0, "unlike EventRing::clear — see the clear bullet in the vocabulary");
+    }
+
+    /// SWAP-2: an iterating caller reloads the same class over and over, and "17 times" is a different
+    /// situation to report than "once" — so a repeat is a count, and the clock names the NEWEST swap,
+    /// which is what "how long has this JVM been like this" is rendered from.
+    #[test]
+    fn a_repeated_swap_of_one_class_is_a_count_and_the_clock_names_the_newest() {
+        let mut swapped = Redefinitions::new();
+        let origin = std::time::Instant::now();
+
+        swapped.note_swap("com.acme.OrderService", origin);
+        swapped.note_swap("com.acme.OrderService", secs_after(origin, 60));
+
+        assert_eq!(swapped.held.len(), 1, "a repeat is a count, not another entry");
+        let rec = swapped.held.get("com.acme.OrderService").expect("the class is held");
+        assert_eq!(rec.count, 2);
+        assert_eq!(rec.at, secs_after(origin, 60), "the clock moved to the newest swap, not the first");
+    }
+
+    /// **The invariant this type exists to hold.** A pop applies to the bytecode that was live when it
+    /// happened; a fresh swap replaced that bytecode, so whether the newest code has reached the frames
+    /// still running is once again unknown — and the residue report has a different sentence for each.
+    #[test]
+    fn a_fresh_swap_undoes_an_earlier_pop() {
+        let mut swapped = Redefinitions::new();
+        let origin = std::time::Instant::now();
+
+        swapped.note_swap("com.acme.OrderService", origin);
+        swapped.note_pop("com.acme.OrderService");
+        assert!(
+            swapped.held["com.acme.OrderService"].popped_since,
+            "the pop is recorded: this swap IS live in the frames that matter"
+        );
+
+        swapped.note_swap("com.acme.OrderService", secs_after(origin, 60));
+
+        assert!(
+            !swapped.held["com.acme.OrderService"].popped_since,
+            "and the second swap un-does it — reporting otherwise would claim the NEW code is live \
+             because a frame was popped under the code it replaced"
+        );
+    }
+
+    /// A pop in a class this session never redefined leaves no record: there is no residue to describe,
+    /// and an entry here would name a class in the residue report that this session never changed.
+    #[test]
+    fn a_pop_in_a_class_this_session_never_redefined_is_not_tracked() {
+        let mut swapped = Redefinitions::new();
+
+        swapped.note_pop("com.acme.NeverTouched");
+
+        assert!(swapped.held.is_empty(), "nothing to report is reported as nothing");
+    }
+
+    #[test]
+    fn a_pop_marks_only_the_class_it_names() {
+        let mut swapped = Redefinitions::new();
+        let origin = std::time::Instant::now();
+        swapped.note_swap("com.acme.A", origin);
+        swapped.note_swap("com.acme.B", origin);
+
+        swapped.note_pop("com.acme.A");
+
+        assert!(swapped.held["com.acme.A"].popped_since);
+        assert!(
+            !swapped.held["com.acme.B"].popped_since,
+            "a pop is evidence about one class's frames and says nothing about another's"
+        );
     }
 }

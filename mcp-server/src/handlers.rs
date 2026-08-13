@@ -1770,9 +1770,9 @@ impl RequestHandler {
 
         out.push_str(&render_investigation_traces(&session));
 
-        if !session.redefinitions.is_empty() {
+        if !session.redefinitions.held.is_empty() {
             let _ = writeln!(out, "\n## Class redefinitions\n");
-            for (class, r) in &session.redefinitions {
+            for (class, r) in &session.redefinitions.held {
                 let _ = writeln!(out, "- `{class}` — {r:?}");
             }
         }
@@ -2062,7 +2062,7 @@ impl RequestHandler {
         // Panic reads as "put everything back", and for stop points and suspension it is. It cannot
         // un-redefine a class, so it must say what it is leaving in place rather than let the caller infer
         // from a clean-looking reply that the JVM is as it found it (SWAP-2).
-        let residue = describe_outstanding_redefinitions(&session.redefinitions);
+        let residue = describe_outstanding_redefinitions(&session.redefinitions.held);
         drop(session);
 
         // Named rather than counted, for the reason the redefinition residue is: "released 2 thread(s)"
@@ -3275,7 +3275,7 @@ impl RequestHandler {
             session.suspensions.mark_resumed();
             // Read the residue before the session is removed, because removing it is what destroys the
             // only record that these redefinitions happened (SWAP-2).
-            let residue = describe_outstanding_redefinitions(&session.redefinitions);
+            let residue = describe_outstanding_redefinitions(&session.redefinitions.held);
             // A JVM we STARTED is ours to end (LAUNCH-1). Done here, explicitly, rather than left to
             // `kill_on_drop` — the caller has to be told which it was, and a launched JVM's last output is
             // often the whole point of the run.
@@ -3585,7 +3585,7 @@ impl RequestHandler {
         // Everything below is reporting, and none of it may fail the swap — it already happened.
         // Recording it is part of that: SWAP-2's residue report is the reason a redefinition needs no
         // permission axis of its own, so it must be noted on the success path and nowhere else.
-        session.note_redefinition(&class_name);
+        session.redefinitions.note_swap(&class_name, std::time::Instant::now());
         let thread = crate::args::parse_thread_id(a.thread_id.as_deref()).or(session.last_thread);
         let live = live_frames_of(&mut session.connection, thread, type_id).await;
         let armed = stop_points_on(&session, &class_name);
@@ -3686,7 +3686,7 @@ impl RequestHandler {
         })?;
         // A pop of a class this session redefined means the swap is certainly live now, rather than
         // possibly masked by frames that entered with the old bytecode (SWAP-2).
-        session.note_pop(&class);
+        session.redefinitions.note_pop(&class);
         drop(session);
 
         let above = a.frame;
@@ -6917,10 +6917,11 @@ fn render_session_line(
     // NAMED, not counted. "2 class(es) still reloaded" tells a third party that something is wrong and
     // nothing about what, which leaves them no next step — and #61 asked for the classes to be named.
     // Bounded, because this is one line of a listing: the first few names, then a count of the rest.
-    if !s.redefinitions.is_empty() {
+    if !s.redefinitions.held.is_empty() {
         const NAMED: usize = 3;
-        let names: Vec<&str> = s.redefinitions.keys().take(NAMED).map(std::string::String::as_str).collect();
-        let rest = s.redefinitions.len().saturating_sub(names.len());
+        let names: Vec<&str> =
+            s.redefinitions.held.keys().take(NAMED).map(std::string::String::as_str).collect();
+        let rest = s.redefinitions.held.len().saturating_sub(names.len());
         let _ = write!(
             line,
             ", ⚠️ still reloaded: {}{}",
