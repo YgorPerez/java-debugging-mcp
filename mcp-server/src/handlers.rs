@@ -447,6 +447,79 @@ struct SessionDefaults<'a> {
     step_only_classes: Option<&'a Vec<String>>,
 }
 
+/// How a tool name reaches its handler: a **fn pointer per tool**, not a branch (CLEAN-9, #192).
+///
+/// **The boxed future is what buys the shape, and it is the whole cost.** An `async fn` has an anonymous
+/// return type, so thirty-seven of them cannot share one signature without erasing it; each entry is a
+/// non-capturing closure — which coerces to a plain fn pointer — that boxes the handler's future. That is
+/// one allocation per tool call, against a call that is about to spend JDWP round trips, and it is the
+/// price of routing being data.
+///
+/// **The gate decided this, and the first attempt failed it** (ADR-0007). The six dispatch groups existed
+/// to keep any one function under the complexity budget; collapsing them into a flat 37-arm `match` moved
+/// the finding rather than removing it — `clippy::cognitive_complexity` and rust-doctor's
+/// `high-cyclomatic-complexity` both fired on the merged function. A table has no arms to count, so the
+/// lookup is a `find` and the complexity is gone rather than relocated. That is the difference between this
+/// and the `match`, and it is why the issue that asked for it made the gate the arbiter.
+///
+/// Order is irrelevant — the names are unique, which `tool_names_are_unique_and_complete` in `tools.rs`
+/// asserts — so this is ordered the way `tools.rs` publishes them, purely so a reader diffing the two
+/// lists can.
+///
+/// **The five arming tools are deliberately absent.** They return a [`Reply`] rather than a `String`, and
+/// they are reached through [`RequestHandler::dispatch_armable`] behind the `ARMABLE_TOOLS` gate.
+/// `every_declared_tool_is_routed_and_every_route_is_declared` checks both halves against `tools.rs`.
+const ROUTES: &[(&str, Route)] = &[
+    ("debug.attach", |h, a| Box::pin(h.handle_attach(a))),
+    ("debug.launch", |h, a| Box::pin(h.handle_launch(a))),
+    ("debug.continue", |h, a| Box::pin(h.handle_continue(a))),
+    ("debug.step_over", |h, a| Box::pin(h.handle_step_over(a))),
+    ("debug.step_into", |h, a| Box::pin(h.handle_step_into(a))),
+    ("debug.step_out", |h, a| Box::pin(h.handle_step_out(a))),
+    ("debug.pause", |h, a| Box::pin(h.handle_pause(a))),
+    ("debug.list_sessions", |h, a| Box::pin(h.handle_list_sessions(a))),
+    ("debug.set_current_session", |h, a| Box::pin(h.handle_set_current_session(a))),
+    ("debug.disconnect", |h, a| Box::pin(h.handle_disconnect(a))),
+    ("debug.panic", |h, a| Box::pin(h.handle_panic(a))),
+    ("debug.suspend_thread", |h, a| Box::pin(h.handle_suspend_thread(a))),
+    ("debug.resume_thread", |h, a| Box::pin(h.handle_resume_thread(a))),
+    ("debug.list_stop_points", |h, a| Box::pin(h.handle_list_stop_points(a))),
+    ("debug.clear_stop_point", |h, a| Box::pin(h.handle_clear_stop_point(a))),
+    ("debug.toggle_stop_point", |h, a| Box::pin(h.handle_toggle_stop_point(a))),
+    ("debug.update_stop_point", |h, a| Box::pin(h.handle_update_stop_point(a))),
+    ("debug.arm_stop_points", |h, a| Box::pin(h.handle_arm_stop_points(a))),
+    ("debug.list_classes", |h, a| Box::pin(h.handle_list_classes(a))),
+    ("debug.list_methods", |h, a| Box::pin(h.handle_list_methods(a))),
+    ("debug.list_fields", |h, a| Box::pin(h.handle_list_fields(a))),
+    ("debug.source", |h, a| Box::pin(h.handle_source(a))),
+    ("debug.check_stale", |h, a| Box::pin(h.handle_check_stale(a))),
+    ("debug.get_stack", |h, a| Box::pin(h.handle_get_stack(a))),
+    ("debug.evaluate", |h, a| Box::pin(h.handle_evaluate(a))),
+    ("debug.evaluate_chain", |h, a| Box::pin(h.handle_evaluate_chain(a))),
+    ("debug.list_threads", |h, a| Box::pin(h.handle_list_threads(a))),
+    ("debug.thread_dump", |h, a| Box::pin(h.handle_thread_dump(a))),
+    ("debug.get_last_event", |h, a| Box::pin(h.handle_get_last_event(a))),
+    ("debug.set_value", |h, a| Box::pin(h.handle_set_value(a))),
+    ("debug.force_return", |h, a| Box::pin(h.handle_force_return(a))),
+    ("debug.reload_class", |h, a| Box::pin(h.handle_reload_class(a))),
+    ("debug.pop_frame", |h, a| Box::pin(h.handle_pop_frame(a))),
+    ("debug.get_traces", |h, a| Box::pin(h.handle_get_traces(a))),
+    ("debug.export_investigation", |h, a| Box::pin(h.handle_export_investigation(a))),
+    ("debug.list_instances", |h, a| Box::pin(h.handle_list_instances(a))),
+    ("debug.run_named_query", |h, a| Box::pin(h.handle_run_named_query(a))),
+];
+
+/// One entry of [`ROUTES`]: a handler with its future boxed so thirty-seven of them share a type.
+///
+/// A named alias because the type is what `clippy::type_complexity` exists to ask for, and because it is
+/// the signature every routed handler has: take the raw arguments, answer with prose or with a **refusal**.
+type Route = for<'h> fn(
+    &'h RequestHandler,
+    serde_json::Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'h>,
+>;
+
 impl RequestHandler {
     #[must_use]
     pub fn new(alerter: crate::protocol::Alerter) -> Self {
@@ -853,24 +926,11 @@ impl RequestHandler {
                 data: None,
             })?;
 
-        // Route to the appropriate handler, split into dispatch groups to keep each small — the split is
-        // for readability and for the complexity budget, and nothing else depends on which group a tool
-        // is in.
+        // One hop to the handler (CLEAN-9, #192): the six chained dispatch groups this used to walk are one
+        // table now, and `None` is still the only thing that produces the unknown-tool reply.
         let name = call_params.name.as_str();
         let args = call_params.arguments;
-        let result = if let Some(r) = self.dispatch_control(name, args.clone()).await {
-            r
-        } else if let Some(r) = self.dispatch_threads(name, args.clone()).await {
-            r
-        } else if let Some(r) = self.dispatch_stop_points(name, args.clone()).await {
-            r
-        } else if let Some(r) = self.dispatch_discovery(name, args.clone()).await {
-            r
-        } else if let Some(r) = self.dispatch_inspect(name, args).await {
-            r
-        } else {
-            Err(format!("Unknown tool: {name}"))
-        };
+        let result = self.dispatch(name, args).await.unwrap_or_else(|| Err(format!("Unknown tool: {name}")));
 
         match result {
             Ok(content) => {
@@ -888,81 +948,46 @@ impl RequestHandler {
         }
     }
 
-    /// Session-control and execution tools (attach, breakpoints, stepping, lifecycle).
-    /// Returns `None` if `name` isn't one of these, so the caller can try the next group.
-    async fn dispatch_control(&self, name: &str, args: serde_json::Value) -> Option<Result<String, String>> {
-        Some(match name {
-            "debug.attach" => self.handle_attach(args).await,
-            "debug.launch" => self.handle_launch(args).await,
-            "debug.continue" => self.handle_continue(args).await,
-            "debug.step_over" => self.handle_step_over(args).await,
-            "debug.step_into" => self.handle_step_into(args).await,
-            "debug.step_out" => self.handle_step_out(args).await,
-            "debug.pause" => self.handle_pause(args).await,
-            "debug.list_sessions" => self.handle_list_sessions(args).await,
-            "debug.set_current_session" => self.handle_set_current_session(args).await,
-            "debug.disconnect" => self.handle_disconnect(args).await,
-            "debug.panic" => self.handle_panic(args).await,
-            _ => return None,
-        })
-    }
-
-    /// The per-thread suspend pair (SAFE-11). Its own group rather than two more arms on
-    /// [`dispatch_control`](Self::dispatch_control), which was already at the complexity budget — and the
-    /// line is a real one: these two are the only tools here that act on ONE thread's execution while
-    /// leaving the rest of the debuggee running.
-    async fn dispatch_threads(&self, name: &str, args: serde_json::Value) -> Option<Result<String, String>> {
-        Some(match name {
-            "debug.suspend_thread" => self.handle_suspend_thread(args).await,
-            "debug.resume_thread" => self.handle_resume_thread(args).await,
-            _ => return None,
-        })
-    }
-
-    /// Arming, listing and disarming **stop points** — all five kinds, plus the three tools that work
-    /// across them. Returns `None` if `name` isn't one of these.
+    /// Look a tool name up in [`ROUTES`] and serve it — one hop, and the only place the mapping exists
+    /// (CLEAN-9, #192).
     ///
-    /// Its own group as of DISC-10 (#84), when a fifteenth arm pushed `dispatch_inspect` past the
-    /// complexity budget and the four `set_*_stop` tools were sitting in it while `set_line_stop` sat in
-    /// `dispatch_control`. The line is a real one and it is the one `CONTEXT.md` and `tools.rs` already
-    /// draw: everything here creates or removes a request in the debuggee, and nothing here reads state.
-    async fn dispatch_stop_points(
-        &self,
-        name: &str,
-        args: serde_json::Value,
-    ) -> Option<Result<String, String>> {
-        // The five arming tools live in their own dispatch below, and the split is what makes
-        // `debug.arm_stop_points` possible at all: it replays entries through `dispatch_armable`, so routing
-        // them from *here* would make this function call itself and `async fn` recursion needs boxing.
-        //
-        // The better half of the accident is that `ARMABLE_TOOLS` is now load-bearing for routing rather than
-        // a second list beside it. A tool added to `dispatch_armable` and forgotten in the constant does not
-        // get dispatched at all, which is a loud failure; the two cannot quietly disagree about what a set is
-        // allowed to name.
+    /// **It was six functions chained by `Option` fallthrough**, and three of their doc comments said out
+    /// loud that the grouping carried no information: `dispatch_control`, `dispatch_threads`,
+    /// `dispatch_stop_points`, `dispatch_discovery`, `dispatch_inspect`. Every handler has the same
+    /// signature, so which group a tool landed in was not a fact about the tool — it was a fact about which
+    /// group had last crossed the complexity budget, which is how `debug.set_line_stop` came to sit in
+    /// `dispatch_control` while the other four arming tools sat in `dispatch_inspect`. `dispatch_threads`
+    /// was two arms and fifteen lines, most of them explaining why it existed.
+    ///
+    /// It also drops the four `args.clone()`s the fallthrough needed, which handed every group in turn a
+    /// copy of the arguments until one of them claimed the name.
+    ///
+    /// `None` means no such tool, which [`Self::handle_call_tool`] turns into the reply it always has.
+    async fn dispatch(&self, name: &str, args: serde_json::Value) -> Option<Result<String, String>> {
+        // NOT a group, and the one thing here that must not be read as a leftover of the split. This is the
+        // gate that says which tools a **stop-point set** may name, and without it `debug.arm_stop_points`
+        // would be a way to invoke anything in this server from a blob of JSON (BP-8, #135). It is also what
+        // keeps that tool from routing through a function that would then call itself — `async fn` recursion
+        // needs boxing — and what makes `ARMABLE_TOOLS` load-bearing for routing rather than a second list
+        // beside it: a tool added to `dispatch_armable` and forgotten in the constant is not dispatched at
+        // all, which is a loud failure rather than a quiet disagreement.
         if crate::stop_point_set::ARMABLE_TOOLS.contains(&name) {
             // The one place a `Reply` becomes a `String` (CLEAN-8, #191). The outcome is what
             // `debug.arm_stop_points` needs and what an MCP caller has no field to put; the mapping onto a
             // `CallToolResult` stays exactly where it was, in `handle_call_tool`.
             return Some(self.dispatch_armable(name, args).await?.map(Reply::into_text));
         }
-        Some(match name {
-            "debug.list_stop_points" => self.handle_list_stop_points(args).await,
-            "debug.clear_stop_point" => self.handle_clear_stop_point(args).await,
-            "debug.toggle_stop_point" => self.handle_toggle_stop_point(args).await,
-            "debug.update_stop_point" => self.handle_update_stop_point(args).await,
-            // BP-8 (#135). Cannot recurse: `ARMABLE_TOOLS` does not contain this tool, so a set cannot name
-            // it, and the branch above is the only path back into the arming handlers.
-            "debug.arm_stop_points" => self.handle_arm_stop_points(args).await,
-            _ => return None,
-        })
+        let (_, route) = ROUTES.iter().find(|(tool, _)| *tool == name)?;
+        Some(route(self, args).await)
     }
 
     /// The five tools that **arm** a stop point, and the only ones a stop-point set may name (BP-8, #135).
     ///
-    /// Split out of [`Self::dispatch_stop_points`] so `debug.arm_stop_points` can replay a set through the real
-    /// handlers without the enclosing dispatch calling itself. Keep this in step with
-    /// [`crate::stop_point_set::ARMABLE_TOOLS`]; that constant is what routes to here, so the two cannot
-    /// disagree silently.
+    /// Kept apart from [`Self::dispatch`] so `debug.arm_stop_points` can replay a set through the real
+    /// handlers without the enclosing dispatch calling itself, and because these five are the only ones
+    /// whose [`Reply`] carries an **outcome** that a caller inside this process reads (CLEAN-8, #191). Keep
+    /// it in step with [`crate::stop_point_set::ARMABLE_TOOLS`]; that constant is what routes to here, so
+    /// the two cannot disagree silently.
     async fn dispatch_armable(&self, name: &str, args: serde_json::Value) -> Option<Result<Reply, String>> {
         Some(match name {
             "debug.set_line_stop" => self.handle_set_line_stop(args).await,
@@ -970,56 +995,6 @@ impl RequestHandler {
             "debug.set_field_stop" => self.handle_set_field_stop(args).await,
             "debug.set_method_exit_stop" => self.handle_set_method_exit_stop(args).await,
             "debug.set_monitor_stop" => self.handle_set_monitor_stop(args).await,
-            _ => return None,
-        })
-    }
-
-    /// The DISC series: questions about a **class** rather than about running state, every one of them
-    /// taking a class name and going through the same resolver. Returns `None` if `name` isn't one.
-    ///
-    /// Its own group as of DISC-5 (#53), when the fourth of them pushed `dispatch_inspect` past the
-    /// complexity budget. The line is a real one either way — these four answer "what is loaded, what
-    /// does it declare, what does it hold, what was it compiled from" without a suspended thread and
-    /// without invoking anything in the debuggee.
-    async fn dispatch_discovery(
-        &self,
-        name: &str,
-        args: serde_json::Value,
-    ) -> Option<Result<String, String>> {
-        Some(match name {
-            "debug.list_classes" => self.handle_list_classes(args).await,
-            "debug.list_methods" => self.handle_list_methods(args).await,
-            "debug.list_fields" => self.handle_list_fields(args).await,
-            "debug.source" => self.handle_source(args).await,
-            "debug.check_stale" => self.handle_check_stale(args).await,
-            _ => return None,
-        })
-    }
-
-    /// State-inspection and mutation tools (stack, evaluate, threads, set value, traces).
-    /// Returns `None` if `name` isn't one of these.
-    async fn dispatch_inspect(&self, name: &str, args: serde_json::Value) -> Option<Result<String, String>> {
-        Some(match name {
-            "debug.get_stack" => self.handle_get_stack(args).await,
-            "debug.evaluate" => self.handle_evaluate(args).await,
-            "debug.evaluate_chain" => self.handle_evaluate_chain(args).await,
-            "debug.list_threads" => self.handle_list_threads(args).await,
-            "debug.thread_dump" => self.handle_thread_dump(args).await,
-            "debug.get_last_event" => self.handle_get_last_event(args).await,
-            "debug.set_value" => self.handle_set_value(args).await,
-            "debug.force_return" => self.handle_force_return(args).await,
-            "debug.reload_class" => self.handle_reload_class(args).await,
-            "debug.pop_frame" => self.handle_pop_frame(args).await,
-            "debug.get_traces" => self.handle_get_traces(args).await,
-            // TRACE-14 (#136). Its own tool rather than a flag on `get_traces`, under ADR-0015's rule: the
-            // report covers the stop points, their costs, the attach target and the VM version, none of which
-            // is in the trace buffer — so it answers a different question rather than rendering the same one.
-            "debug.export_investigation" => self.handle_export_investigation(args).await,
-            // Not in `dispatch_discovery` despite taking class names: that group answers what a class
-            // DECLARES, with no suspended thread and no cost to anyone else. This one asks what is
-            // ALIVE, and stops the world to find out.
-            "debug.list_instances" => self.handle_list_instances(args).await,
-            "debug.run_named_query" => self.handle_run_named_query(args).await,
             _ => return None,
         })
     }
@@ -26262,6 +26237,53 @@ mod tests {
     /// of a sequence where one copy is load-bearing is the shape that deadlocks the day a sixth kind is
     /// added by copying the wrong template, so a sixth *copy* is the regression worth catching.
     ///
+    /// CLEAN-9 (#192): the declared tool surface and the routed one are the same set, both ways.
+    ///
+    /// **Both directions, because the two failures are different and only one of them is loud.** A tool
+    /// declared in `tools.rs` and never routed is published to every client and answers `Unknown tool` —
+    /// which reads as this server being broken rather than as a missing line. A route with no declaration
+    /// is dead code that a client can still reach, since a name is a string and nothing stops one being
+    /// sent. Neither was checkable until the routing became data: a `match` cannot be enumerated, which is
+    /// why the six dispatch groups had no test at all and why the closest thing was a hand-written list of
+    /// expected names in `tools.rs`.
+    ///
+    /// The armable five are added from `ARMABLE_TOOLS` rather than listed here, because that constant IS
+    /// the routing for them — the gate and the route are the same list on purpose (BP-8, #135).
+    ///
+    /// Same shape as `every_wire_command_this_crate_sends_is_classified` in `jdwp-client`: a table asserted
+    /// against the code and the code against the table, so neither can grow alone.
+    #[test]
+    fn every_declared_tool_is_routed_and_every_route_is_declared() {
+        let declared: std::collections::BTreeSet<String> =
+            tools::get_tools().into_iter().map(|t| t.name).collect();
+        let routed: std::collections::BTreeSet<String> = ROUTES
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .chain(crate::stop_point_set::ARMABLE_TOOLS.iter().map(|n| (*n).to_string()))
+            .collect();
+
+        let unrouted: Vec<&String> = declared.difference(&routed).collect();
+        assert!(
+            unrouted.is_empty(),
+            "these tools are published by tools.rs and reach no handler, so a caller who uses them gets \
+             `Unknown tool`: {unrouted:#?}"
+        );
+        let undeclared: Vec<&String> = routed.difference(&declared).collect();
+        assert!(
+            undeclared.is_empty(),
+            "these names route to a handler and are published nowhere, so nothing but a hand-typed call \
+             can reach them: {undeclared:#?}"
+        );
+
+        // A duplicate would shadow, silently, and the `find` above takes the first. `get_tools()` has its
+        // own uniqueness assertion; this is the same claim about the other list.
+        assert_eq!(
+            ROUTES.len(),
+            routed.len() - crate::stop_point_set::ARMABLE_TOOLS.len(),
+            "duplicate name in ROUTES"
+        );
+    }
+
     /// `load_class_index` is here for the opposite failure. It stood behind a wildcard guard at three
     /// handlers, and the guard is the point of the call rather than an optimisation over it: unguarded, it
     /// reads thousands of entries that a batch of exact class names has no use for (ADR-0010). A fourth
