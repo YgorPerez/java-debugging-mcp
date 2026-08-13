@@ -93,25 +93,9 @@ pub struct DebugSession {
     /// one and is untouched: a caller who walked away has no newer event, the watermark still matches,
     /// and they are told.
     pub last_watchdog_seq: Option<u64>,
-    /// Rethrow chains in flight, keyed by `(request id, thread, exception object id)` (EXC-3).
-    ///
-    /// **The thread is in the key on purpose.** A rethrow unwinds on the thread that threw, so including
-    /// it costs nothing and removes the one way this could misfire: JDWP object ids are reusable, so a
-    /// later, unrelated exception handed the same id would otherwise be folded into a dead chain.
-    pub rethrow_chains: HashMap<(i32, u64, u64), RethrowChain>,
-    /// Traced stop points that disarmed themselves on reaching their hit budget (TRACE-3), as
-    /// `(note, times)` keyed by note text. Surfaced by `get_traces` so silence is never mistaken for
-    /// "no more hits"; cleared with `clear`.
-    ///
-    /// Repeats are **collapsed** rather than appended, and the map is capped (`MAX_TRACE_DISARMS`).
-    /// It was an unbounded `Vec`, which only looked harmless while an auto-disarm also deleted the stop
-    /// point: BP-2/BP-3 made re-arming easy, so one budgeted logpoint can now disarm over and over. Every
-    /// other buffer here is bounded, and "`watch_3` disarmed itself 12 times" beats identical lines
-    /// anyway (SAFE-8).
-    pub trace_disarms: std::collections::BTreeMap<String, u32>,
-    /// How many distinct disarm notes were dropped because the map was full — reported, like
-    /// `events_dropped`, so a full buffer never reads as a quiet one.
-    pub trace_disarms_dropped: u64,
+    /// Every **snapshot** this session has taken, and the accounting that makes a missing one explicable
+    /// (CLEAN-6, #189). See [`TraceBuffer`].
+    pub traces: TraceBuffer,
     /// Read-only guard (SAFE-3): when set, method invocation, `set_value` and `force_return` are
     /// refused, so pointing the debugger at a production JVM can't accidentally mutate it. A guard
     /// against accident, NOT a security boundary — anyone who can reach the JDWP port can do anything.
@@ -179,7 +163,7 @@ pub struct DebugSession {
     /// remembers to set. That argument is only true if the reporting exists, which is this.
     ///
     /// A `BTreeMap` so a report lists classes in a stable order rather than a hash order, matching
-    /// [`trace_disarms`](Self::trace_disarms).
+    /// [`TraceBuffer::disarms`].
     pub redefinitions: std::collections::BTreeMap<String, Redefinition>,
     /// Wildcard line-breakpoint families (FILT-3), keyed by their `bpset_` id.
     pub pattern_sets: HashMap<String, PatternStopSet>,
@@ -209,10 +193,6 @@ pub struct DebugSession {
     /// How many pending monitor halves were dropped because [`monitor_pending`](Self::monitor_pending)
     /// was full — reported, so a missing duration is explicable rather than mysterious.
     pub monitor_pending_dropped: u64,
-    /// Ring buffer of trace/logpoint snapshots (see `TraceRecord`). Bounded by `MAX_TRACES`.
-    pub traces: VecDeque<TraceRecord>,
-    /// Monotonic sequence for trace records (survives ring-buffer eviction).
-    pub trace_seq: u64,
     /// Push channel to the MCP client (EVT-2). Lives on the session because the two things that need
     /// it — the event pump and the watchdog — already hold a session and nothing else.
     ///
@@ -527,6 +507,189 @@ pub struct Redefinition {
     pub popped_since: bool,
 }
 
+/// Everything a traced session has recorded, and everything it can no longer show you (CLEAN-6, #189).
+///
+/// **The second cluster ADR-0050 describes, and chosen the same way: by invariant, not by touch count.**
+/// These five fields are exactly the state [`Self::push`] and [`Self::clear`] read or write together. A
+/// snapshot's `seq` comes from the counter, the counter is what tells a reader how many records the ring
+/// has dropped, a **fold** evicts the sighting it supersedes *from the ring*, and a disarm note explains a
+/// gap the ring cannot — so no two of them can be moved apart without leaving the invariant in a handler.
+///
+/// **The invariant that was living in a handler.** `file_trace_record` in `handlers.rs` bumped `trace_seq`,
+/// stamped it onto the record, classified the throw, evicted the superseded sighting and rang the buffer —
+/// five writes across four fields, in one function, reachable only from the event pump and therefore
+/// (ADR-0049) only from a test that launches a JVM. `session.rs` could not assert any of it. The ordering
+/// is not incidental either: the seq has to be assigned *before* [`Self::classify_throw`], because the
+/// chain records it as the sighting a later rethrow will supersede.
+///
+/// **Two counters that are not the same counter.** [`filed`](Self::filed) counts every record ever taken;
+/// `held.len()` is what survives. `debug.get_traces` and the investigation report both print the
+/// difference, and that difference is the only thing telling a reader that the earliest hits of a long
+/// trace are gone — which is why the counter is not just the ring's length plus a drop count. A **fold**
+/// makes them disagree a second way, and legitimately: a superseded sighting is removed from the ring
+/// without being lost, because the fold that replaced it carries `first_seq`.
+#[derive(Debug)]
+pub struct TraceBuffer {
+    /// Snapshots, oldest first. Bounded by [`MAX_TRACES`].
+    pub held: VecDeque<TraceRecord>,
+    /// How many snapshots have ever been filed here — **not** how many are held.
+    ///
+    /// Monotonic and never reset by eviction, so it survives the ring: it is what a **snapshot**'s `#seq`
+    /// is, and `filed - held.len()` is what a reader cannot see any more.
+    pub filed: u64,
+    /// Rethrow chains in flight, keyed by `(request id, thread, exception object id)` (EXC-3).
+    ///
+    /// **The thread is in the key on purpose.** A rethrow unwinds on the thread that threw, so including
+    /// it costs nothing and removes the one way this could misfire: JDWP object ids are reusable, so a
+    /// later, unrelated exception handed the same id would otherwise be folded into a dead chain.
+    pub rethrow_chains: HashMap<(i32, u64, u64), RethrowChain>,
+    /// Traced stop points that disarmed themselves on reaching their hit budget (TRACE-3), as
+    /// `(note, times)` keyed by note text. Surfaced by `get_traces` so silence is never mistaken for
+    /// "no more hits"; cleared with `clear`.
+    ///
+    /// Repeats are **collapsed** rather than appended, and the map is capped ([`MAX_TRACE_DISARMS`]).
+    /// It was an unbounded `Vec`, which only looked harmless while an auto-disarm also deleted the stop
+    /// point: BP-2/BP-3 made re-arming easy, so one budgeted logpoint can now disarm over and over. Every
+    /// other buffer here is bounded, and "`watch_3` disarmed itself 12 times" beats identical lines
+    /// anyway (SAFE-8).
+    pub disarms: std::collections::BTreeMap<String, u32>,
+    /// How many distinct disarm notes were dropped because the map was full — reported, like
+    /// `events_dropped`, so a full buffer never reads as a quiet one.
+    pub disarms_dropped: u64,
+}
+
+impl TraceBuffer {
+    /// An empty buffer — no snapshots, no chains, no notes, nothing filed.
+    ///
+    /// **It takes no arguments, which is the point of the type** (ADR-0050): a test that wants a buffer
+    /// holding three folded rethrows builds one here, where before it had to launch a debuggee and
+    /// persuade it to throw the same instance four times.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            held: VecDeque::new(),
+            filed: 0,
+            rethrow_chains: HashMap::new(),
+            disarms: std::collections::BTreeMap::new(),
+            disarms_dropped: 0,
+        }
+    }
+
+    /// File one **snapshot**: stamp its `seq`, fold it if it is a rethrow, and ring the buffer.
+    ///
+    /// Returns the [`ThrowKind`], which is what decides whether the caller charges the **trace budget** —
+    /// a collapsed rethrow is not a new finding and does not spend one.
+    ///
+    /// **Every write the record needs, in the one order that works.** The seq is assigned before the
+    /// classification because [`Self::classify_throw`] stores it as the sighting a later rethrow of the
+    /// same instance will supersede; classifying first would fold each record into the one before it. The
+    /// eviction of the superseded record happens before the ring's own eviction, so a fold cannot push an
+    /// unrelated snapshot out to make room for a record that is about to replace one anyway.
+    ///
+    /// The record arrives with `seq` and `rethrow` unset and leaves with both decided here, so no caller
+    /// can file one carrying a seq it chose itself.
+    pub fn push(
+        &mut self,
+        mut rec: TraceRecord,
+        req_id: i32,
+        thread: u64,
+        exception: Option<u64>,
+    ) -> ThrowKind {
+        self.filed += 1;
+        rec.seq = self.filed;
+        let kind = self.classify_throw(req_id, thread, exception, rec.seq);
+        if let ThrowKind::Rethrow { fold, supersedes } = kind {
+            rec.rethrow = Some(fold);
+            // The previous latest-sighting of this instance is what this record replaces, so it goes.
+            // Absent when the buffer already evicted it, which needs no repair — the fold's own
+            // `first_seq` still points at the original throw.
+            if let Some(old) = supersedes {
+                self.held.retain(|r| r.seq != old);
+            }
+        }
+        if self.held.len() >= MAX_TRACES {
+            self.held.pop_front();
+        }
+        self.held.push_back(rec);
+        kind
+    }
+
+    /// Record that a traced stop point disarmed itself (SAFE-8). Repeats of the same note increment a
+    /// count instead of adding an entry, and once [`MAX_TRACE_DISARMS`] distinct notes are held a new one
+    /// is dropped and counted rather than growing the map without bound.
+    pub fn note_disarm(&mut self, note: String) {
+        if let Some(n) = self.disarms.get_mut(&note) {
+            *n += 1;
+        } else if self.disarms.len() < MAX_TRACE_DISARMS {
+            self.disarms.insert(note, 1);
+        } else {
+            self.disarms_dropped += 1;
+        }
+    }
+
+    /// Empty the buffer, as `debug.get_traces {clear: true}` does.
+    ///
+    /// **The disarm notes go with the snapshots, and that is the invariant.** A note says *this stop point
+    /// stopped recording, so the silence after it is not "no more hits"* — it is an account of a gap in a
+    /// buffer, and kept past the buffer it explains it describes records nobody can look at. The dropped
+    /// counter goes for the same reason.
+    ///
+    /// [`filed`](Self::filed) is deliberately **not** reset: it is what a snapshot's `#seq` is, and
+    /// restarting it would hand two different records the same number in one session — including two a
+    /// **fold** in flight is still pointing at. Clearing empties what is held; it does not un-happen the
+    /// hits.
+    pub fn clear(&mut self) {
+        self.held.clear();
+        self.disarms.clear();
+        self.disarms_dropped = 0;
+    }
+
+    /// What a traced hit is, with respect to chains already being tracked (EXC-3).
+    ///
+    /// Private since CLEAN-6: [`Self::push`] is its only caller and the seq it takes has to be the one
+    /// that call just assigned. A second caller passing a seq of its own is how the fold would come to
+    /// point at a record that does not exist.
+    fn classify_throw(
+        &mut self,
+        req_id: i32,
+        thread: u64,
+        exception: Option<u64>,
+        next_seq: u64,
+    ) -> ThrowKind {
+        let Some(exc) = exception else {
+            return ThrowKind::First;
+        };
+        let key = (req_id, thread, exc);
+        if let Some(chain) = self.rethrow_chains.get_mut(&key) {
+            chain.collapsed = chain.collapsed.saturating_add(1);
+            let supersedes = chain.rolling_seq.replace(next_seq);
+            // The first rethrow is not a fold of anything yet — it becomes the rolling record, and only
+            // the ones after it collapse into a count.
+            return ThrowKind::Rethrow {
+                fold: RethrowFold { collapsed: chain.collapsed - 1, first_seq: chain.first_seq },
+                supersedes,
+            };
+        }
+        // Evict the oldest chain rather than growing without bound. An exception whose chain is this stale
+        // has been handled long ago, so the only thing lost is folding that will never be asked for.
+        if self.rethrow_chains.len() >= MAX_RETHROW_CHAINS {
+            if let Some(oldest) = self.rethrow_chains.iter().min_by_key(|(_, c)| c.first_seq).map(|(k, _)| *k)
+            {
+                self.rethrow_chains.remove(&oldest);
+            }
+        }
+        self.rethrow_chains
+            .insert(key, RethrowChain { first_seq: next_seq, rolling_seq: None, collapsed: 0 });
+        ThrowKind::First
+    }
+}
+
+impl Default for TraceBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The state of a session's event pump — the task that reads JDWP events off the connection, records
 /// what a **traced** hit saw, and resumes the thread the event suspended (SESS-2, #195).
 ///
@@ -637,76 +800,6 @@ impl DebugSession {
         self.suspended_cause = Some(cause);
     }
 
-    /// Record that the VM is running again. Every resume path calls this, so neither field is left stale.
-    pub const fn mark_resumed(&mut self) {
-        self.suspended_since = None;
-        self.suspended_cause = None;
-    }
-
-    /// Record what the watchdog just did, stamped with the event it happened after (SAFE-10).
-    ///
-    /// One method rather than two assignments at each of the watchdog's four outcomes, because a note
-    /// written without its watermark is precisely the bug: it would be replayed against every later
-    /// event, which is what #69 reported.
-    pub fn note_watchdog(&mut self, note: String) {
-        self.last_watchdog_note = Some(note);
-        self.last_watchdog_seq = Some(self.event_seq);
-    }
-
-    /// Classify a traced exception hit as a first throw or a rethrow of an instance already captured,
-    /// and advance that instance's chain (EXC-3, #68).
-    ///
-    /// **Why this exists.** An exception stop armed on an application type with `trace_max_hits: 30`
-    /// captured 38 snapshots of which 30 were *one* instance walking `WildFly`'s EJB interceptor chain —
-    /// `InterceptorContext.proceed` rethrowing at every layer. Two things went wrong and they compound:
-    /// the stop point disarmed itself mid-request on a budget exhausted entirely on plumbing, and the one
-    /// informative record — the original throw, with the application frame and the cause — was the 9th,
-    /// reachable only by paging past the noise.
-    ///
-    /// **What is kept, and why not less.** Blanket dedupe by instance would be wrong: a rethrow at a
-    /// *different site* can be the interesting one, and a wrapper that drops the cause is the exact
-    /// failure this repo's swallowed-exception playbook exists for. So both ends survive — the first
-    /// capture, and the latest sighting, which converges on the escape point as the chain unwinds — and
-    /// only the middle is replaced by a count. The latest is a *rolling* record rather than a prediction:
-    /// nothing here can know which rethrow is the last one, so each supersedes the previous, and whichever
-    /// turns out to be final is the one left standing.
-    ///
-    /// Charging the budget is the caller's job, and [`ThrowKind::Rethrow`] means don't — that is the half
-    /// that stops framework plumbing from spending a request's whole allowance.
-    pub fn classify_throw(
-        &mut self,
-        req_id: i32,
-        thread: u64,
-        exception: Option<u64>,
-        next_seq: u64,
-    ) -> ThrowKind {
-        let Some(exc) = exception else {
-            return ThrowKind::First;
-        };
-        let key = (req_id, thread, exc);
-        if let Some(chain) = self.rethrow_chains.get_mut(&key) {
-            chain.collapsed = chain.collapsed.saturating_add(1);
-            let supersedes = chain.rolling_seq.replace(next_seq);
-            // The first rethrow is not a fold of anything yet — it becomes the rolling record, and only
-            // the ones after it collapse into a count.
-            return ThrowKind::Rethrow {
-                fold: RethrowFold { collapsed: chain.collapsed - 1, first_seq: chain.first_seq },
-                supersedes,
-            };
-        }
-        // Evict the oldest chain rather than growing without bound. An exception whose chain is this stale
-        // has been handled long ago, so the only thing lost is folding that will never be asked for.
-        if self.rethrow_chains.len() >= MAX_RETHROW_CHAINS {
-            if let Some(oldest) = self.rethrow_chains.iter().min_by_key(|(_, c)| c.first_seq).map(|(k, _)| *k)
-            {
-                self.rethrow_chains.remove(&oldest);
-            }
-        }
-        self.rethrow_chains
-            .insert(key, RethrowChain { first_seq: next_seq, rolling_seq: None, collapsed: 0 });
-        ThrowKind::First
-    }
-
     /// Record that the **opening** half of a monitor pair has arrived, so the closing half can measure
     /// the duration (DUMP-7, ADR-0035). Returns the eviction note when the map was full.
     ///
@@ -755,17 +848,20 @@ impl DebugSession {
         (newest_seq? <= at).then_some(note)
     }
 
-    /// Record that a traced stop point disarmed itself (SAFE-8). Repeats of the same note increment a
-    /// count instead of adding an entry, and once `MAX_TRACE_DISARMS` distinct notes are held a new one
-    /// is dropped and counted rather than growing the map without bound.
-    pub fn note_trace_disarm(&mut self, note: String) {
-        if let Some(n) = self.trace_disarms.get_mut(&note) {
-            *n += 1;
-        } else if self.trace_disarms.len() < MAX_TRACE_DISARMS {
-            self.trace_disarms.insert(note, 1);
-        } else {
-            self.trace_disarms_dropped += 1;
-        }
+    /// Record that the VM is running again. Every resume path calls this, so neither field is left stale.
+    pub const fn mark_resumed(&mut self) {
+        self.suspended_since = None;
+        self.suspended_cause = None;
+    }
+
+    /// Record what the watchdog just did, stamped with the event it happened after (SAFE-10).
+    ///
+    /// One method rather than two assignments at each of the watchdog's four outcomes, because a note
+    /// written without its watermark is precisely the bug: it would be replayed against every later
+    /// event, which is what #69 reported.
+    pub fn note_watchdog(&mut self, note: String) {
+        self.last_watchdog_note = Some(note);
+        self.last_watchdog_seq = Some(self.event_seq);
     }
 }
 
@@ -1238,9 +1334,7 @@ impl SessionManager {
             watchdog_task: None,
             last_watchdog_note: None,
             last_watchdog_seq: None,
-            rethrow_chains: HashMap::new(),
-            trace_disarms: std::collections::BTreeMap::new(),
-            trace_disarms_dropped: 0,
+            traces: TraceBuffer::new(),
             read_only,
             source_roots,
             class_roots,
@@ -1252,8 +1346,6 @@ impl SessionManager {
             launched: None,
             monitor_pending: HashMap::new(),
             monitor_pending_dropped: 0,
-            traces: VecDeque::new(),
-            trace_seq: 0,
             alerter: self.alerter.clone(),
         };
 
@@ -1568,6 +1660,193 @@ mod tests {
         let mut zero = std::collections::VecDeque::new();
         remember_bounded(&mut zero, 1, 0);
         assert!(zero.is_empty(), "cap 0 must store nothing rather than push after not evicting");
+    }
+
+    /// A snapshot in the state these tests need it and nothing more — a **stated** record, authored here
+    /// rather than captured, the same move `pending` above makes.
+    fn snapshot(class: &str) -> TraceRecord {
+        TraceRecord {
+            // Both are assigned by `TraceBuffer::push`. Deliberately wrong here, so a push that failed to
+            // stamp them would be visible rather than accidentally right.
+            seq: u64::MAX,
+            rethrow: None,
+            bp_id: "exc_1".to_string(),
+            thread: 0x1f4c,
+            class: class.to_string(),
+            method: "reservar".to_string(),
+            line: Some(412),
+            args: Vec::new(),
+            captured: Vec::new(),
+            callers: Vec::new(),
+            expr: Vec::new(),
+            detail: Vec::new(),
+        }
+    }
+
+    /// CLEAN-6 (#189): the seq is the buffer's to assign, and it counts what was FILED rather than what
+    /// is held.
+    ///
+    /// The difference is what `debug.get_traces` and the investigation report print as "N are no longer
+    /// here", and it is the one number a reader has to tell a quiet trace from a buffer that overflowed.
+    /// Unassertable before this cluster moved: filing a record needed the event pump, and the event pump
+    /// needs a socket (ADR-0049).
+    #[test]
+    fn a_filed_snapshot_is_stamped_with_the_count_of_everything_ever_filed() {
+        let mut buffer = TraceBuffer::new();
+        for i in 1..=3 {
+            buffer.push(snapshot("Pedido"), 1, 0x1f4c, None);
+            assert_eq!(buffer.filed, i, "every push counts, whatever the ring does with it");
+        }
+        let seqs: Vec<u64> = buffer.held.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3], "the record carries the seq the buffer gave it, in arrival order");
+    }
+
+    /// The ring evicts the oldest and the counter does not follow it down.
+    ///
+    /// `filed - held.len()` is what a reader cannot see any more, so a counter reset by eviction would
+    /// report a full buffer as a complete one — the silence-reads-as-an-answer failure this repo is built
+    /// against.
+    #[test]
+    fn an_overflowing_buffer_drops_the_oldest_and_still_says_how_many_it_took() {
+        let mut buffer = TraceBuffer::new();
+        for _ in 0..MAX_TRACES + 5 {
+            buffer.push(snapshot("Pedido"), 1, 0x1f4c, None);
+        }
+        assert_eq!(buffer.held.len(), MAX_TRACES, "the ring is bounded");
+        assert_eq!(
+            buffer.filed,
+            MAX_TRACES as u64 + 5,
+            "the count is of what was filed, not of what is held"
+        );
+        assert_eq!(
+            buffer.held.front().map(|r| r.seq),
+            Some(6),
+            "the five oldest are the ones evicted, and the survivors keep the seqs they were filed with"
+        );
+    }
+
+    /// EXC-3: one exception instance rethrown many times keeps both ends and collapses the middle.
+    ///
+    /// **The assertion with teeth is that the middle is gone from the RING**, not merely marked. A fold
+    /// that annotated the record without evicting the sighting it supersedes would leave the buffer full
+    /// of interceptor plumbing — the 30-of-38 capture that #68 was filed about — with every test still
+    /// green, because the note would be there and the count would be right.
+    #[test]
+    fn a_rethrown_instance_keeps_its_first_and_latest_sighting_and_folds_the_middle() {
+        let mut buffer = TraceBuffer::new();
+        let (req, thread, exc) = (7, 0x1f4c, 0x9999);
+
+        assert!(
+            matches!(buffer.push(snapshot("Throwing"), req, thread, Some(exc)), ThrowKind::First),
+            "the first sighting of an instance is a first throw and is charged"
+        );
+        for _ in 0..4 {
+            assert!(
+                matches!(
+                    buffer.push(snapshot("Interceptor"), req, thread, Some(exc)),
+                    ThrowKind::Rethrow { .. }
+                ),
+                "every later sighting of the same instance on the same thread is a rethrow"
+            );
+        }
+
+        assert_eq!(buffer.filed, 5, "a fold does not stop a record being filed");
+        assert_eq!(buffer.held.len(), 2, "only the first throw and the latest sighting survive in the ring");
+        let seqs: Vec<u64> = buffer.held.iter().map(|r| r.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 5],
+            "the two ends, and the rolling latest is the one that converges on the escape"
+        );
+
+        let fold = buffer.held.back().and_then(|r| r.rethrow).expect("the escaping record carries the fold");
+        assert_eq!(
+            fold.first_seq, 1,
+            "the fold points at the original throw, which has the application frame"
+        );
+        assert_eq!(fold.collapsed, 3, "three of the four rethrows were collapsed; the fourth IS this record");
+    }
+
+    /// A different instance is not the same chain, and neither is the same instance on another thread.
+    ///
+    /// The thread is in the key precisely because JDWP object ids are reusable, so this is the assertion
+    /// that a later unrelated exception handed a recycled id is not folded into a dead chain.
+    #[test]
+    fn a_chain_is_keyed_by_request_thread_and_instance_together() {
+        let mut buffer = TraceBuffer::new();
+        buffer.push(snapshot("A"), 7, 0x1f4c, Some(0x9999));
+
+        for (req, thread, exc, why) in [
+            (7, 0x1f4c, 0xAAAA, "a different instance"),
+            (7, 0x2222, 0x9999, "the same id on another thread"),
+            (8, 0x1f4c, 0x9999, "the same id from another stop point"),
+        ] {
+            assert!(
+                matches!(buffer.push(snapshot("B"), req, thread, Some(exc)), ThrowKind::First),
+                "{why} must start its own chain, not fold into the first"
+            );
+        }
+        assert_eq!(buffer.held.len(), 4, "nothing was superseded, so every record is still held");
+    }
+
+    /// A hit with no exception is never a rethrow — a line breakpoint or a watchpoint has no instance to
+    /// chain, and folding one would collapse unrelated hits of the same stop point into a count.
+    #[test]
+    fn a_hit_with_no_exception_is_always_a_first_throw() {
+        let mut buffer = TraceBuffer::new();
+        for _ in 0..3 {
+            assert!(matches!(buffer.push(snapshot("Pedido"), 1, 0x1f4c, None), ThrowKind::First));
+        }
+        assert_eq!(buffer.held.len(), 3, "three hits of one logpoint are three snapshots");
+    }
+
+    /// SAFE-8: repeats of a disarm note collapse into a count, and the map is bounded.
+    ///
+    /// Called on the real method rather than on `remember_bounded` next door, which is the mirror shape
+    /// ADR-0050 is about — the neighbouring test reimplements what it asserts because a `DebugSession`
+    /// needed a socket. This one does not.
+    #[test]
+    fn disarm_notes_collapse_and_the_map_is_bounded() {
+        let mut buffer = TraceBuffer::new();
+        for _ in 0..12 {
+            buffer.note_disarm("watch_3 stopped recording".to_string());
+        }
+        assert_eq!(buffer.disarms.len(), 1, "a repeat is a count, not another entry");
+        assert_eq!(buffer.disarms.get("watch_3 stopped recording"), Some(&12));
+        assert_eq!(buffer.disarms_dropped, 0, "nothing was dropped while there was room");
+
+        for i in 0..MAX_TRACE_DISARMS + 5 {
+            buffer.note_disarm(format!("bp_{i} stopped recording"));
+        }
+        assert_eq!(buffer.disarms.len(), MAX_TRACE_DISARMS, "the map stays bounded");
+        assert_eq!(buffer.disarms_dropped, 6, "and every note it could not hold is COUNTED, not silent");
+    }
+
+    /// `debug.get_traces {clear: true}` empties the buffer and the notes together, and leaves the count.
+    ///
+    /// **Both halves are the invariant.** A note kept past the snapshots it explains describes records
+    /// nobody can look at; a `filed` reset would hand two records in one session the same `#seq`,
+    /// including records a fold still in flight is pointing at.
+    #[test]
+    fn clearing_takes_the_disarm_notes_with_it_and_leaves_the_filed_count() {
+        let mut buffer = TraceBuffer::new();
+        buffer.push(snapshot("Pedido"), 1, 0x1f4c, None);
+        buffer.push(snapshot("Pedido"), 1, 0x1f4c, None);
+        buffer.note_disarm("bp_1 stopped recording".to_string());
+
+        buffer.clear();
+
+        assert!(buffer.held.is_empty(), "the snapshots go");
+        assert!(buffer.disarms.is_empty(), "and so do the notes that explain gaps between them");
+        assert_eq!(buffer.disarms_dropped, 0);
+        assert_eq!(buffer.filed, 2, "clearing empties what is held; it does not un-happen the hits");
+
+        buffer.push(snapshot("Pedido"), 1, 0x1f4c, None);
+        assert_eq!(
+            buffer.held.front().map(|r| r.seq),
+            Some(3),
+            "so the next snapshot cannot reuse a number an earlier one had"
+        );
     }
 
     // TRACE-7: a traced stop point that has captured nothing must be distinguishable from one that

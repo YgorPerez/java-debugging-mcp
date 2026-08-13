@@ -4033,7 +4033,7 @@ impl RequestHandler {
             );
         }
 
-        if session.traces.is_empty() && session.trace_disarms.is_empty() {
+        if session.traces.held.is_empty() && session.traces.disarms.is_empty() {
             return Ok(format!(
                 "No trace snapshots yet. Set a breakpoint with trace:true and trigger it.{dead_note}"
             ));
@@ -4041,10 +4041,11 @@ impl RequestHandler {
 
         // Filter first (TRACE-4), so the "showing X of Y" counts and the `limit` tail both reflect what
         // the caller asked for rather than the whole buffer.
-        let total = session.traces.len();
+        let total = session.traces.held.len();
         let class_filter = a.class_filter.as_deref().map(str::to_lowercase);
         let matched: Vec<&crate::session::TraceRecord> = session
             .traces
+            .held
             .iter()
             .filter(|r| a.bp_id.as_ref().is_none_or(|id| &r.bp_id == id))
             .filter(|r| a.since.is_none_or(|s| r.seq > s))
@@ -4067,23 +4068,23 @@ impl RequestHandler {
         // A stop point that hit its budget disarmed itself (TRACE-3) — say so, so a caller doesn't
         // read the silence that follows as "no more hits". Kept until the buffer is cleared. Repeats are
         // collapsed into a count (SAFE-8), which is both bounded and easier to read.
-        for (note, times) in &session.trace_disarms {
+        for (note, times) in &session.traces.disarms {
             match times {
                 1 => lines.push(format!("⏸  {note}")),
                 n => lines.push(format!("⏸  {note} (×{n})")),
             }
         }
-        if session.trace_disarms_dropped > 0 {
+        if session.traces.disarms_dropped > 0 {
             lines.push(format!(
                 "[dropped] {} further disarm notice(s) (cap {}) — read and clear them sooner",
-                session.trace_disarms_dropped,
+                session.traces.disarms_dropped,
                 crate::session::MAX_TRACE_DISARMS
             ));
         }
         if a.clear {
+            // One call rather than three writes: the disarm notes explain gaps in the buffer they are
+            // cleared with, and `filed` deliberately survives — see `TraceBuffer::clear` (CLEAN-6, #189).
             session.traces.clear();
-            session.trace_disarms.clear();
-            session.trace_disarms_dropped = 0;
             drop(session);
             lines.push("(buffer cleared)".to_string());
         }
@@ -6872,8 +6873,8 @@ fn render_session_line(
         );
     }
     // Buffer counts only when there is something to read, so a quiet session stays one short line.
-    if !s.traces.is_empty() {
-        let _ = write!(line, ", {} trace(s)", s.traces.len());
+    if !s.traces.held.is_empty() {
+        let _ = write!(line, ", {} trace(s)", s.traces.held.len());
     }
     if !s.events.is_empty() {
         let _ = write!(line, ", {} event(s)", s.events.len());
@@ -13760,7 +13761,7 @@ async fn record_one_traced_event(
     let recorded = recorded && matches!(kind, crate::session::ThrowKind::First);
     if recorded {
         if let Some(label) = charge_trace_budget(session, req_id).await {
-            session.note_trace_disarm(label);
+            session.traces.note_disarm(label);
         }
     }
     // FILT-8, and LAST on purpose: everything above finds this stop point by request id, and retiring it
@@ -13794,23 +13795,12 @@ fn file_trace_record(
     if let (Some(spec), Some(span)) = (req.monitor, monitor_span) {
         rec.detail.push(monitor_duration_detail(spec, span));
     }
-    session.trace_seq += 1;
-    rec.seq = session.trace_seq;
-    let kind = session.classify_throw(req_id, thread, exception_instance(details), rec.seq);
-    if let crate::session::ThrowKind::Rethrow { fold, supersedes } = kind {
-        rec.rethrow = Some(fold);
-        // The previous latest-sighting of this instance is what this record replaces, so it goes. Absent
-        // when the buffer already evicted it, which needs no repair — the fold's own `first_seq` still
-        // points at the original throw.
-        if let Some(old) = supersedes {
-            session.traces.retain(|r| r.seq != old);
-        }
-    }
-    if session.traces.len() >= crate::session::MAX_TRACES {
-        session.traces.pop_front();
-    }
-    session.traces.push_back(rec);
-    kind
+    // Five writes across four fields until CLEAN-6 (#189): the seq bumped and stamped, the throw
+    // classified, the superseded sighting evicted, the ring rung. They moved to `TraceBuffer::push`
+    // together with the ORDER between them, which is the part that was only true by this function being
+    // careful — the seq has to be assigned before the classification, or each record folds into the one
+    // before it. Here it is one call, and `session.rs` can assert it without a JVM.
+    session.traces.push(rec, req_id, thread, exception_instance(details))
 }
 
 /// Charge one hit against a traced stop point's budget (TRACE-3). When the budget reaches zero, disarm
@@ -14003,8 +13993,8 @@ fn describe_investigation_exposure() -> String {
 /// `traces.len()` is what survives, so the difference is exactly what a reader of this report cannot see, and
 /// printing it is the difference between a partial record and a misleading one.
 fn render_investigation_traces(session: &crate::session::DebugSession) -> String {
-    let held = session.traces.len();
-    let filed = session.trace_seq;
+    let held = session.traces.held.len();
+    let filed = session.traces.filed;
     let mut out = format!("\n## Trace snapshots\n\n{held} in the buffer, {filed} recorded in total");
     if filed > held as u64 {
         let _ = write!(
@@ -14018,7 +14008,7 @@ fn render_investigation_traces(session: &crate::session::DebugSession) -> String
     }
     out.push_str(".\n\n");
 
-    if session.traces.is_empty() {
+    if session.traces.held.is_empty() {
         out.push_str(
             "No snapshots. With stop points armed above, that means either nothing reached them or every hit \
              was filtered — see their `Hits:` counts, which distinguish the two.\n",
@@ -14027,14 +14017,14 @@ fn render_investigation_traces(session: &crate::session::DebugSession) -> String
     }
 
     out.push_str("```\n");
-    for rec in &session.traces {
+    for rec in &session.traces.held {
         let _ = writeln!(out, "{}", format_trace_line(rec));
     }
     out.push_str("```\n");
 
-    if !session.trace_disarms.is_empty() {
+    if !session.traces.disarms.is_empty() {
         out.push_str("\nStop points that disarmed themselves on their budget (TRACE-3):\n\n");
-        for (note, times) in &session.trace_disarms {
+        for (note, times) in &session.traces.disarms {
             match times {
                 1 => {
                     let _ = writeln!(out, "- {note}");
