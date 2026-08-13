@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.22.0"
+version = "0.23.0"
 edition = "2021"
 # MEASURED, not declared (BUILD-2, #142). "1.82" sat here untested and was false in both directions
 # that matter: the workspace has never built on it. Two separate floors, found by running each toolchain:
@@ -69,7 +69,7 @@ categories = ["development-tools::debugging", "command-line-utilities"]
 #
 # So this needs no test pinning it and no warning beside it. It is load-bearing for `release.sh` — whose
 # `cargo update` step would fail on a half-done bump — and inert for everyone else.
-jdwp-client = { package = "java-debugging-jdwp-client", path = "jdwp-client", version = "0.22.0" }
+jdwp-client = { package = "java-debugging-jdwp-client", path = "jdwp-client", version = "0.23.0" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
