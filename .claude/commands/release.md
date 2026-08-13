@@ -325,10 +325,17 @@ neither downloads the binary nor registers the MCP: the plugin declares the serv
 pinned binary at that path — `hooks/hooks.json` diffs `${CLAUDE_PLUGIN_ROOT}/jdwp-version` against
 `${CLAUDE_PLUGIN_DATA}/jdwp-version` and runs `scripts/ensure-jdwp.sh` only when they differ.
 
-So the installer updates the plugin checkout, and that is all it does for jdwp:
+**A pushed pin does not reach the installer either — the plugin's own version is what gates it.** Step 7's
+commit moves `jdwp-version`; Claude Code compares `.claude-plugin/plugin.json`'s `version`, and its cache is
+a **directory per plugin version, not per commit**. So `install.sh` on a pin bump alone prints *"already at
+the latest version"* and updates nothing, and the pin sits correct in git, correct on GitHub, and absent
+from every machine. Cut the plugin release first — `scripts/release.sh X.Y.Z` over there, minor by
+precedent (v0.21.0 → 2.1.0, v0.22.0 → 2.2.0, v0.23.0 → 2.6.0) — then pull it:
 
 ```bash
-cd ~/html/infotravel-dev-toolkit && ./install.sh    # note the plugin commit it reports
+cd ~/html/infotravel-dev-toolkit && scripts/release.sh <plugin-version> --yes
+claude plugin update infotravel-dev@infotravel-dev-toolkit   # must report the version you just cut
+./install.sh
 ```
 
 **The binary is still the old one at this point.** The hook has not fired — that needs a session start — so
@@ -337,7 +344,7 @@ installed. This is the old stale-binary trap wearing new clothes, and it is why 
 evidence of anything. Run what the hook runs, and the release is installed now:
 
 ```bash
-R=~/.claude/plugins/cache/infotravel-dev-toolkit/infotravel-dev/<plugin-commit>
+R=~/.claude/plugins/cache/infotravel-dev-toolkit/infotravel-dev/<plugin-version>
 D=~/.claude/plugins/data/infotravel-dev-infotravel-dev-toolkit
 cat "$R/jdwp-version"        # must be the version you just cut; if not, the plugin didn't update
 CLAUDE_PLUGIN_ROOT="$R" CLAUDE_PLUGIN_DATA="$D" "$R/scripts/ensure-jdwp.sh" \
@@ -349,13 +356,27 @@ release's own `SHA256SUMS`, downloads to a temp dir, and moves it into place onl
 matches — so doing it by hand costs nothing and removes a whole restart's worth of uncertainty. The `cp` is
 the hook's second half: skip it and the next session re-downloads.
 
-Prove what is installed by **capability**, never by the pin file or the installer's stamp:
+Prove what is installed by **capability**, never by the pin file or the installer's stamp — and note that
+**the two pin files agreeing is not evidence the binary moved.** The hook skips the download when they
+match, so a `$D/jdwp-version` written ahead of its binary is a stale binary the hook will never correct.
+The bytes settle it, against the release's own manifest:
+
+```bash
+sha256sum "$D/bin/jdwp-mcp"          # must appear in this release's SHA256SUMS
+```
+
+Then a capability, because a checksum proves which file is there and not what it can do:
 
 ```bash
 printf '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n' | "$D/bin/jdwp-mcp" 2>/dev/null \
-  | python3 -c "import json,sys; t=[x['name'] for x in json.load(sys.stdin)['result']['tools']]; \
-print(len(t), 'tools'); print('<a tool new in this release>' in t)"
+  | python3 -c "import json,sys; t=json.load(sys.stdin)['result']['tools']; \
+print(len(t), 'tools'); print(any('<a string only this release advertises>' in x['description'] for x in t))"
 ```
+
+**A release with no new tool still has a capability to check**, and reaching for a tool name is what leaves
+you stuck when it does not: a **count is not a check** (rename one, add one, count unchanged), and v0.23.0
+added no tool at all. Pick a state name or a refusal that only the new version's *descriptions* carry —
+v0.23.0's was `NO EVENT PUMP`, new in `debug.list_sessions`.
 
 **`~/.claude.json` is not part of this any more.** There is no user-scoped `jdwp` entry to inspect or
 re-point: `install.sh` §4 removes the one older versions of it created, and the plugin's server is
