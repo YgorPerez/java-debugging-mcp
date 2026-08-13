@@ -34,7 +34,10 @@ line and arming reports success either way. Run debug.check_stale to settle it �
 thirty entries would be thirty round trips, and a set re-armed ten seconds later against the same JVM needs
 none of them. A set that arms SUSPENDING stop points is warned about and not refused, because this is the one
 call that can arm many at once, where every other path arms one and you read a reply between each. A set from
-a NEWER build of this server is refused rather than read optimistically.
+a NEWER build of this server is refused rather than read optimistically. A session whose JVM has gone, or one
+left without an event pump, is REFUSED rather than armed: nothing would be reading the events, so a stop point
+there would suspend the debuggee at its first hit with nothing alive to resume it — debug.list_sessions marks
+the session and debug.attach opens a working one (SESS-2).
 
 ## debug.attach
 Open a debug session against a JVM that is ALREADY RUNNING with -agentlib:jdwp — host + port; nothing is
@@ -740,7 +743,10 @@ often null (a constructor that calls no super(...) never sets one), which leaves
 the only usable discriminator. `!`, `&&` and `||` all work. A condition-skipped hit is NOT charged to the
 trace budget, so a budget of N still means N matches rather than N throws. On a SUSPENDING exception stop the
 VM is frozen while the condition is evaluated; on a traced one only the hit thread is held, which is what
-makes this the cheap way to filter an exception trace on a shared instance.
+makes this the cheap way to filter an exception trace on a shared instance. A session whose JVM has gone, or
+one left without an event pump, is REFUSED rather than armed: nothing would be reading the events, so a stop
+point there would suspend the debuggee at its first hit with nothing alive to resume it — debug.list_sessions
+marks the session and debug.attach opens a working one (SESS-2).
 
 ## debug.set_field_stop
 Break when a field is read or written — answers "who mutates this?" for a field that changes behind your back
@@ -792,7 +798,10 @@ for a reference field — which reading the field cannot give you, because a FIE
 reported BEFORE the write lands. There is deliberately no oldValue: at condition time the field still holds
 it, so its own name reads it, and status != newValue asks whether this write actually changes anything. `!`,
 `&&` and `||` all work. A condition-skipped hit is NOT charged to the trace budget. On a SUSPENDING watch the
-VM is frozen while the condition is evaluated.
+VM is frozen while the condition is evaluated. A session whose JVM has gone, or one left without an event
+pump, is REFUSED rather than armed: nothing would be reading the events, so a stop point there would suspend
+the debuggee at its first hit with nothing alive to resume it — debug.list_sessions marks the session and
+debug.attach opens a working one (SESS-2).
 
 ## debug.set_line_stop
 Set a breakpoint at a location (class_pattern + line and/or method). class_pattern takes AN EXACT CLASS, A
@@ -901,7 +910,10 @@ fires for every hit, with no error and a reply claiming the stop point is scoped
 first case and no instance of an unfetched class can exist anyway, so the handle would belong to something
 else. THE HANDLE IS A WEAK REFERENCE (ADR-0022): if the debuggee collects the object the filter simply stops
 matching and the stop point goes quiet, which is indistinguishable from the code never running —
-debug.list_stop_points checks for that and says so.
+debug.list_stop_points checks for that and says so. A session whose JVM has gone, or one left without an event
+pump, is REFUSED rather than armed: nothing would be reading the events, so a stop point there would suspend
+the debuggee at its first hit with nothing alive to resume it — debug.list_sessions marks the session and
+debug.attach opens a working one (SESS-2).
 
 ## debug.set_method_exit_stop
 Report what a method actually RETURNED, without having to guess which `return` statement runs — for a method
@@ -963,7 +975,10 @@ NOT WANT (FILT-6), evaluated on the returning method's own frame — so its loca
 `&&` and `||` all work, and a condition-skipped hit is NOT charged to the trace budget. Two costs worth
 knowing: on a SUSPENDING request the VM is frozen while the condition is evaluated, and this request receives
 EVERY method of a matching class, so a condition on a broad class_pattern is evaluated far more often than it
-fires — a method filter is the cheaper narrowing.
+fires — a method filter is the cheaper narrowing. A session whose JVM has gone, or one left without an event
+pump, is REFUSED rather than armed: nothing would be reading the events, so a stop point there would suspend
+the debuggee at its first hit with nothing alive to resume it — debug.list_sessions marks the session and
+debug.attach opens a working one (SESS-2).
 
 ## debug.set_monitor_stop
 Watch LOCK CONTENTION as it happens, WITHOUT SUSPENDING ANYTHING — the answer to "requests are hanging on a
@@ -1027,7 +1042,10 @@ freeze lands on the next acquisition of any hot lock and can re-fire the instant
 carry the CALLER CHAIN (trace_frames, default 3), which is usually the actual answer: the same synchronized
 block is entered from every request path, so the lock and the line rarely identify the problem while the path
 does. A JVM without canRequestMonitorEvents is told so in a sentence that names the fallback, not a bare
-NOT_IMPLEMENTED.
+NOT_IMPLEMENTED. A session whose JVM has gone, or one left without an event pump, is REFUSED rather than
+armed: nothing would be reading the events, so a stop point there would suspend the debuggee at its first hit
+with nothing alive to resume it — debug.list_sessions marks the session and debug.attach opens a working one
+(SESS-2).
 
 ## debug.set_value
 Write a value to a local variable, a static field (e.g. ConfigDefaultUtils.dsInfra — flip tenant/infra on a

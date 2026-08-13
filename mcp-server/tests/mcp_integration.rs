@@ -5374,25 +5374,32 @@ fn list_sessions_names_every_attachment_and_flags_a_dead_one() {
     let live_line = dead_seen.lines().find(|l| l.contains(&second_id)).expect("a line for the live session");
     assert!(!live_line.contains("DEAD"), "the other session is still attached: {live_line}");
 
-    // SESS-2 (#195). A dead session has no event pump either — its pump is what ended — so arming on it is
-    // the same trap and gets the same refusal, decided here rather than after a round trip down a socket
-    // whose far end is gone. Asserted on the dead session the test already has, since the state that
-    // matters is "no pump", not how it got there.
+    // SESS-2 (#195). A dead session cannot service events either — its pump is what ended — so arming on
+    // it is refused here rather than after a round trip down a socket whose far end is gone.
+    //
+    // **The refusal has to describe THIS state and not the other one.** A JVM that is gone cannot freeze,
+    // and it is listed as `DEAD` rather than `NO EVENT PUMP`, so the sentence written for a pump that
+    // never started would send a caller looking for a listing state they will not find. Asserted on the
+    // words only the `Ended` sentence has, and on the absence of the other one's diagnosis.
     let refused = server.call(
         "debug.set_line_stop",
         serde_json::json!({"session_id": first_id, "class_pattern": "WatchProbe", "line": 45}),
     );
     assert_contains_all(
-        "arming a session with no event pump is refused",
+        "arming a session whose JVM has gone is refused",
         &refused,
-        &["no event pump", "Nothing was armed", "debug.attach"],
+        &["is gone", "Nothing was armed", "DEAD", "debug.attach"],
+    );
+    assert!(
+        !refused.contains("would suspend the debuggee"),
+        "a JVM that is gone cannot freeze, so the refusal must not diagnose one: {refused}"
     );
     // Reads are NOT refused: nothing about them waits for an event, and refusing them would be a rule
     // borrowed from a case it does not apply to.
     assert!(
         !server
             .call("debug.list_stop_points", serde_json::json!({"session_id": first_id}))
-            .contains("no event pump"),
+            .contains("Nothing was armed"),
         "only the arming tools take this refusal"
     );
 

@@ -127,5 +127,8 @@ first·   ⚠️  second
 ## no_session_refusal
 No active debug session. Use debug.attach first.
 
-## no_event_pump_refusal
+## no_event_pump_refusal/ended
+The JVM at localhost:8787 is gone — its event pump exited when the connection closed, so there is nothing left to arm a stop point in. Nothing was armed and nothing was sent. debug.list_sessions marks this session DEAD; debug.disconnect removes it, and debug.attach opens a session against a JVM that is running.
+
+## no_event_pump_refusal/unstarted
 The session attached to localhost:8787 has no event pump — nothing is reading this JVM's events, so a stop point armed on it would suspend the debuggee at its first hit and stay that way, whatever trace says. Nothing was armed and nothing was sent. Use debug.disconnect on it and debug.attach again; debug.list_sessions marks it NO EVENT PUMP.

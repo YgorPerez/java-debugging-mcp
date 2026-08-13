@@ -44,6 +44,13 @@ const NO_SESSION_REFUSAL: &str = "No active debug session. Use debug.attach firs
 
 /// What the five arming tools say when the session they resolved cannot service events (SESS-2, #195).
 ///
+/// **Two sentences, because the two states are two different findings.** The first cut wrote one refusal
+/// for both and it was only true of [`crate::session::EventPump::Unstarted`]: it diagnosed a freeze that
+/// cannot happen against a JVM that is gone, and it closed by telling the caller to look for `NO EVENT
+/// PUMP` in
+/// `debug.list_sessions`, which is not what a dead session is listed as. A refusal naming a symptom the
+/// caller cannot find is worse than a short one — it sends them looking.
+///
 /// **The condition and the recovery step, for the reason DOC-18 (#193) gives**: a refusal naming only the
 /// condition leaves a caller to guess, and "cannot service events" is not a phrase anyone can act on by
 /// itself. A free function, so `reply-fragments.txt` can pin the wording the downstream toolkit reads
@@ -55,13 +62,23 @@ const NO_SESSION_REFUSAL: &str = "No active debug session. Use debug.attach firs
 /// event's suspend policy but the pump, so the first hit stops a request thread and no later call can
 /// release it. #195 needed a JVM restart. This costs the debuggee nothing to decide, which is what an
 /// argument-level refusal is for.
-fn no_event_pump_refusal(endpoint: &str) -> String {
-    format!(
-        "The session attached to {endpoint} has no event pump — nothing is reading this JVM's events, so \
-         a stop point armed on it would suspend the debuggee at its first hit and stay that way, whatever \
-         trace says. Nothing was armed and nothing was sent. Use debug.disconnect on it and debug.attach \
-         again; debug.list_sessions marks it NO EVENT PUMP."
-    )
+fn no_event_pump_refusal(endpoint: &str, pump: crate::session::EventPump) -> String {
+    match pump {
+        // Unreachable: `require_session_for_arming` refuses only the two states below.
+        crate::session::EventPump::Running => String::new(),
+        crate::session::EventPump::Ended => format!(
+            "The JVM at {endpoint} is gone — its event pump exited when the connection closed, so there is \
+             nothing left to arm a stop point in. Nothing was armed and nothing was sent. \
+             debug.list_sessions marks this session DEAD; debug.disconnect removes it, and debug.attach \
+             opens a session against a JVM that is running."
+        ),
+        crate::session::EventPump::Unstarted => format!(
+            "The session attached to {endpoint} has no event pump — nothing is reading this JVM's events, \
+             so a stop point armed on it would suspend the debuggee at its first hit and stay that way, \
+             whatever trace says. Nothing was armed and nothing was sent. Use debug.disconnect on it and \
+             debug.attach again; debug.list_sessions marks it NO EVENT PUMP."
+        ),
+    }
 }
 
 /// A required `_meta` field the request did not carry (MCP-1). `-32602`, per the spec: a request
@@ -595,8 +612,9 @@ impl RequestHandler {
             let session = guard.lock().await;
             match session.event_pump() {
                 crate::session::EventPump::Running => None,
-                crate::session::EventPump::Ended | crate::session::EventPump::Unstarted => {
-                    Some(no_event_pump_refusal(&session.endpoint))
+                // Both refuse, and each gets its own sentence — see `no_event_pump_refusal`.
+                pump @ (crate::session::EventPump::Ended | crate::session::EventPump::Unstarted) => {
+                    Some(no_event_pump_refusal(&session.endpoint, pump))
                 }
             }
         };
@@ -6813,14 +6831,18 @@ fn render_session_line(
     // other: a session in it will read as suspended the moment anything hits, and stay that way. It said
     // `running` until #195 — the one word a caller reads as "this is fine" — over a session that could not
     // resume a single thing it stopped.
-    let state = match s.event_pump() {
-        crate::session::EventPump::Ended => "DEAD (JVM gone — debug.disconnect it)",
-        crate::session::EventPump::Unstarted => {
-            "NO EVENT PUMP (nothing is reading this JVM's events, so anything armed on it would suspend \
-             the debuggee for good — debug.disconnect it and attach again)"
-        }
-        crate::session::EventPump::Running if s.suspended_since.is_some() => "SUSPENDED",
-        crate::session::EventPump::Running => "running",
+    let state = match (s.event_pump(), s.suspended_since.is_some()) {
+        (crate::session::EventPump::Ended, _) => "DEAD (JVM gone — debug.disconnect it)".to_string(),
+        // BOTH facts, not the newer one. The two are independent — `debug.pause` suspends without any
+        // event — and dropping `SUSPENDED` here would lose the more actionable half: a frozen debuggee
+        // needs `debug.continue`, whatever is wrong with the session that froze it.
+        (crate::session::EventPump::Unstarted, suspended) => format!(
+            "{}NO EVENT PUMP (nothing is reading this JVM's events, so anything armed on it would suspend \
+             the debuggee for good — debug.disconnect it and attach again)",
+            if suspended { "SUSPENDED, and " } else { "" }
+        ),
+        (crate::session::EventPump::Running, true) => "SUSPENDED".to_string(),
+        (crate::session::EventPump::Running, false) => "running".to_string(),
     };
     // A wildcard family's members are already counted in `breakpoints`, so only the family record itself is
     // added — the alternative double-counts the same locations twice for one call (FILT-3).
@@ -25645,9 +25667,16 @@ mod tests {
         // wordings of it existed, and that absence is why nobody noticed the second one. A snapshot entry is
         // what makes a third wording a diff somebody reads rather than a thing a caller discovers.
         case("no_session_refusal", NO_SESSION_REFUSAL.to_string());
-        // SESS-2 (#195). The endpoint is the only thing that varies, and it is the half a caller needs to
-        // tell which of several sessions the refusal is about.
-        case("no_event_pump_refusal", no_event_pump_refusal("localhost:8787"));
+        // SESS-2 (#195). Both, because they are two different findings about two different states, and a
+        // refusal that described the wrong one is what this pair exists to stop being written again.
+        case(
+            "no_event_pump_refusal/ended",
+            no_event_pump_refusal("localhost:8787", crate::session::EventPump::Ended),
+        );
+        case(
+            "no_event_pump_refusal/unstarted",
+            no_event_pump_refusal("localhost:8787", crate::session::EventPump::Unstarted),
+        );
 
         out
     }

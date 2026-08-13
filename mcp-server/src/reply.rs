@@ -37,7 +37,15 @@
 /// written in the first place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// At least one stop point is armed in the debuggee as a result of this call.
+    /// Not deferred: whatever this call did, it is not waiting on a class load.
+    ///
+    /// **Read it as the absence of a deferral, not as a promise that something armed** — and that is a
+    /// statement about what the value can honestly carry, not a shortcut. A call naming several class
+    /// patterns can arm none of them: a wildcard matching nothing, or every pattern refused, both end up
+    /// here, and `debug.arm_stop_points` counts the entry as armed. That is what the
+    /// `pending_breakpoints` delta this replaces reported too, so it is unchanged rather than newly
+    /// wrong — but the reply's own per-pattern rows are what say how many armed, and this enum is not a
+    /// second answer to that question.
     Armed,
     /// Nothing is armed yet: the class is not loaded, and a `CLASS_PREPARE` watch will arm it when it is.
     ///
