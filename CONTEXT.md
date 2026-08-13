@@ -1401,6 +1401,32 @@ currently in use (#72).
 
 ### Safety posture
 
+**Refusal**:
+A call this server will not serve, answered as prose the caller can act on. **Not a fault** — the call was
+understood and the answer is that it will not be run.
+
+**What earns it a name here rather than leaving it as "an error" is that it costs the debuggee nothing.** An
+*argument-level* refusal is decided **before the debuggee is touched**, and fourteen of them say so in the
+reply literally ("Nothing was sent"), so a caller who passed contradictory arguments learns that from the
+reply instead of from a JPA exception thrown three invocations deep carrying a message about something else.
+Two families assert the property by name
+(`every_monitor_arming_refusal_explains_itself_before_touching_the_debuggee` and the named-query twin), and
+the first of them needs neither a JVM nor a subprocess to run since CLEAN-3 (#186). Not every refusal is
+argument-level — one that must look a class up to know the method is absent has already spent a packet — but
+the ones decidable for free are decided for free, deliberately.
+
+**A refusal that names only the condition is half a refusal** (DOC-18, #193). One failure — a call naming no
+resolvable session — was refused in two wordings across thirty-five tools: twenty-nine named the condition
+(`No active debug session`) and one also named the recovery step (`… Use debug.attach first.`), so which one
+a caller got depended only on which tool they reached for — and the tool they were likelier to reach for
+first was one of the twenty-nine that told them less. The recovery step is the whole value of a refusal a caller can act on. The wording is
+also a **downstream contract** (`docs/toolkit-contract.md`): a reworded refusal reaches a skill written
+against the old wording with nothing to announce it.
+_Avoid_: **decline** (taken, and by a neighbour close enough to confuse — `Walked::Declined` is a fact about
+*one object* a read could not walk, and its remedy is to invoke instead; a refusal is about the *call*),
+**reject** (used here for a design alternative considered and not taken, as in ADR-0003's rejected
+alternative), error, failure (both suggest a fault, and the call was legal, understood and answered)
+
 **Read-only**:
 A mode in which nothing changes the debuggee — no method invocation, no writes, no forced returns, no hot
 reload, and no popped frame. A guard against accident, **not** a security boundary: anyone who can reach the
