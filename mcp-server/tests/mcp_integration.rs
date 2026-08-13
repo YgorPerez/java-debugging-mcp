@@ -10,10 +10,13 @@
 //
 // Without a JDK each test prints SKIP and passes, so a JDK-less CI stays green rather than red.
 //
-// **Four tests here are NOT `#[ignore]`d**, and they are the point of TEST-12 (#37): they drive the same
-// server against a recorded JDWP session instead of a JVM (`common/cassette.rs`, ADR-0014). They need no
-// JDK and no Java, so they run in the default `cargo test` — a test that needs no JDK must not hide behind
-// the flag that exists for tests that do (TEST-9, #25). Note the corollary:
+// **Some tests here are NOT `#[ignore]`d**, and no count is given because one written down here would
+// rot — it said "four" while there were twelve. Four of them are the point of TEST-12 (#37): they drive
+// the same server against a recorded JDWP session instead of a JVM (`common/cassette.rs`, ADR-0014). The
+// others need no debuggee at all, being assertions about pure functions — the refusal tables, the two
+// verdict matrices, `the_event_census_names_every_kind_in_the_buffer`. None of them needs a JDK or Java,
+// so they run in the default `cargo test` — a test that needs no JDK must not hide behind the flag that
+// exists for tests that do (TEST-9, #25). Note the corollary:
 // `scripts/integration-test.sh` passes `--ignored`, which runs ONLY ignored tests, so it does not run
 // them. Both commands are needed to see everything in this file.
 
@@ -21,9 +24,9 @@ mod common;
 
 use common::cassette::{cassette_path, rerecording, Cassette, CassetteRecorder, ReplayServer, RERECORD_ENV};
 use common::{
-    assert_contains_all, jdk_or_skip, probe_line, probe_source, probe_source_path, refusal_verdict,
-    resume_verdict, EventFault, Fault, FaultRelay, InProcess, Jdk, JvmState, LatencyRelay, Probe, Server,
-    EVENT_KIND_BREAKPOINT, EVENT_TIMEOUT,
+    assert_contains_all, event_census, jdk_or_skip, probe_line, probe_source, probe_source_path,
+    refusal_verdict, resume_verdict, EventFault, Fault, FaultRelay, InProcess, Jdk, JvmState, LatencyRelay,
+    Probe, Server, EVENT_KIND_BREAKPOINT, EVENT_TIMEOUT,
 };
 
 /// EVAL-1 / EVAL-2: static-method invocation and object arguments, through the real handlers.
@@ -4701,19 +4704,25 @@ fn events_are_buffered_so_a_second_hit_doesnt_erase_the_first() {
     // one, and a *count* is not a diagnosis — three events existed and nothing said what the third was.
     // The whole buffer is read here (no `drain`, so it changes nothing) purely so the failure names it.
     let buffered = server.call("debug.get_last_event", serde_json::json!({"limit": 10}));
-    // And a census by kind, because the buffer alone still leaves the reader counting. Which KIND doubled
-    // is the issue's first acceptance criterion, and the two candidates need opposite responses: a second
-    // `breakpoint` means the stop point at BP2 — never cleared before the step, on a line inside a
-    // 100000-iteration loop — fired twice, so the test's staging is what is wrong; a second `step` means
-    // one `debug.step_over` produced two events, which would be the buffer's or the stepper's doing.
-    let census = |kind: &str| buffered.matches(&format!("\"event\":\"{kind}\"")).count();
+    // And a census by kind, because the buffer alone still leaves the reader counting. WHICH kind arrived
+    // is the issue's first acceptance criterion, and the candidates need opposite responses. A second
+    // `breakpoint` is a DUPLICATE DELIVERY and not a staging artefact: BP2 is never cleared before the
+    // step and sits inside a 100000-iteration loop, so "it could fire again" is true in principle — but
+    // not inside this window, because the hit holds the VM until `debug.step_over` resumes it for exactly
+    // one line, 44 → 45, which is not a whole iteration. A second `step` means one `debug.step_over`
+    // produced two events, which would be the buffer's or the stepper's doing. And a kind this test never
+    // staged would mean the expectation below is wrong rather than the debugger — `store_reportable_event`
+    // has no kind filter, so a lifecycle event consumes a sequence number like any other. The sibling
+    // test's doc has which of the three the measurement leaves reachable.
+    //
+    // [`event_census`] names whichever it is. The pair of counters this replaced could not name the third
+    // case at all — it showed only as `breakpoint` and `step` failing to add up to the total, which is an
+    // inference, and the JDK 21 sighting went unread for exactly that reason.
     assert_contains_all(
         &format!(
-            "newest event, and the backlog is announced\nthe buffer holds {} breakpoint and {} step \
-             event(s), of {} in all — this test stages exactly one of each\nthe whole buffer was:\n{buffered}",
-            census("breakpoint"),
-            census("step"),
-            buffered.matches("\"event\":\"").count(),
+            "newest event, and the backlog is announced\n{} — this test stages exactly one breakpoint \
+             and one step\nthe whole buffer was:\n{buffered}",
+            event_census(&buffered),
         ),
         &latest,
         &["\"event\":\"step\"", "[pending] 1 older event"],
@@ -12075,16 +12084,107 @@ fn every_refused_attach_world_gets_its_own_verdict() {
     }
 }
 
+/// TEST-23 ([#64](https://github.com/YgorPerez/java-debugging-mcp/issues/64)): the census the two tests
+/// below assert through, and the reason it is a **census rather than a pair of counters**.
+///
+/// #64's first acceptance criterion is *say where the third event comes from*, and its two sightings both
+/// failed on a **total** — `[pending] 2 older event(s)` where one was staged — which is the one thing that
+/// cannot answer it. The first version of the diagnosis counted `breakpoint` and `step` only, so an event
+/// of any other kind showed up as the two counts failing to add up to the total, leaving the reader to
+/// infer a kind nobody had named. This names every kind it finds, so the next sighting reads its own cause
+/// off the assertion message.
+///
+/// Not `#[ignore]`d, because it needs no JDK (TEST-9, #25): the input is a reply this suite has in hand.
+#[test]
+fn the_event_census_names_every_kind_in_the_buffer() {
+    // Verbatim from a local run, `thread` and `method` included — a fixture labelled as real output gets
+    // reused as a reply-shape reference, so it has to actually be one.
+    let staged = "[event] {\"class\":\"ExcProbe\",\"event\":\"breakpoint\",\"line\":44,\"method\":\"main\",\
+                  \"seq\":1,\"thread\":\"0x1\"}\n[event] {\"class\":\"ExcProbe\",\"event\":\"step\",\
+                  \"line\":45,\"method\":\"main\",\"seq\":2,\"thread\":\"0x1\"}\n[suspended] true";
+    assert_contains_all(
+        "the staged pair is named and counted",
+        &event_census(staged),
+        &["1 breakpoint", "1 step", "2 event(s) counted"],
+    );
+
+    // The JDK 21 sighting: a third event of a kind the test DID stage. A census that only totalled would
+    // say "3 in all" and leave which kind doubled to be guessed.
+    let doubled = format!("{staged}\n[event] {{\"event\":\"breakpoint\",\"line\":44,\"seq\":3}}");
+    assert_contains_all(
+        "a doubled kind is named as doubled",
+        &event_census(&doubled),
+        &["2 breakpoint", "1 step", "3 event(s) counted"],
+    );
+
+    // And the case the counters could not name at all: a kind neither test stages. `vm_start` is the one
+    // that is reachable — `store_reportable_event` has no kind filter, so a lifecycle event consumes a
+    // sequence number like any other — and it is exactly what a reader of #64 was left to hypothesise.
+    let foreign = format!("{staged}\n[event] {{\"event\":\"vm_start\",\"seq\":3}}");
+    assert_contains_all(
+        "a kind the test never staged is named rather than inferred",
+        &event_census(&foreign),
+        &["1 breakpoint", "1 step", "1 vm_start", "3 event(s) counted"],
+    );
+
+    // COUNTED, not totalled, and this is the case that forces the distinction: every caller reads a
+    // bounded `limit` out of a buffer that holds up to `MAX_EVENTS`, so the reply's own `[pending]` and
+    // `[dropped]` lines are the only account of what it did not show. A census claiming a total would
+    // report "2 in all" for a buffer of seven — and its own doc tells the reader to treat a census that
+    // disagrees with `[pending]` as evidence of a composite event set, so the false total would be
+    // diagnosed as the one thing it is not.
+    let truncated = format!("{staged}\n[pending] 5 older event(s) buffered — pass limit to read them");
+    let census = event_census(&truncated);
+    assert_contains_all("a truncated tail counts only what it was shown", &census, &["2 event(s) counted"]);
+    assert!(
+        !census.contains("7 event") && !census.contains("in all"),
+        "the census must not claim a total it cannot see: {census}"
+    );
+
+    // An empty reply says so rather than rendering nothing: a census that vanished would make "no events
+    // at all" and "the assertion message lost its census" the same output. Phrased about the REPLY, so it
+    // stays true of a refusal, which carries no events either and is not an empty buffer.
+    assert_contains_all(
+        "an empty reply is still a census",
+        &event_census("No events received yet."),
+        &["no events", "0 event(s) counted"],
+    );
+}
+
 /// TEST-23 ([#64](https://github.com/YgorPerez/java-debugging-mcp/issues/64)): what the event buffer does
 /// when a hit arrives twice — the debugger-side shape of the failure CI caught and this box will not
 /// reproduce.
 ///
-/// The sighting was `[pending] 2 older event(s)` where the test staged one, on a JDK this machine does not
-/// have. Rather than soak for it, [`EventFault::DuplicateKind`] puts the extra event on the wire, which is
-/// the debugger would see if two armed requests had matched one location. What that pins down is everything
-/// downstream of the extra event: that the buffer keeps both, that the backlog count follows, and that
-/// nothing silently coalesces them — so when the real thing recurs, the reading is about *why a second
-/// event existed* rather than about whether the buffer can be trusted.
+/// The sighting was `[pending] 2 older event(s)` where the test staged one. Rather than soak for it,
+/// [`EventFault::DuplicateKind`] puts the extra event on the wire, which is what the debugger would see if
+/// two armed requests had matched one location. What that pins down is everything downstream of the extra
+/// event: that the buffer keeps both, that the backlog count follows, and that nothing silently coalesces
+/// them — so when the real thing recurs, the reading is about *why a second event existed* rather than
+/// about whether the buffer can be trusted.
+///
+/// **What the extra event can and cannot be, measured rather than reasoned about.** #64's own body offers
+/// "the test's staging produces three events on some JDKs and two on others" as the cheap way out, and a
+/// later comment attached a mechanism to it: `store_reportable_event` has no kind filter, so a lifecycle
+/// event consumes a sequence number like any other. Both halves of that are true and it still does not
+/// reach these two tests. Measured on JDK 11.0.32, 17.0.20 and 21.0.12, 20 rounds each: the buffer is
+/// **empty** immediately after `debug.attach` every single time — the `VM_START` a `debug.launch` sees at
+/// `seq:1` is a product of `suspend=y`, and [`Probe`] launches with `suspend=n`, so the agent is past
+/// `VMInit` long before the attach. And a `CLASS_PREPARE` cannot reach the buffer at all:
+/// `try_arm_deferred_breakpoints` returns `true` for **any** event set carrying one, whether or not it
+/// armed anything, so the filter is on the kind and not on the arming.
+///
+/// `VM_DEATH` is the other automatic event and it is **not** filtered — but it needs this probe to exit,
+/// and `ExcProbe` loops 100000 times over a `Thread.sleep(150)`, which is about four hours. The one thing
+/// that could cut that short is the watchdog rescuing a stalled run, and it cannot: `JDWP_WATCHDOG_SECS`
+/// defaults to 120, neither test overrides it, and both waits here are capped at [`EVENT_TIMEOUT`] (25 s).
+/// A killed probe closes the connection rather than delivering a clean `VM_DEATH` anyway.
+///
+/// That closes the candidate list, because JDWP delivers only events the debugger requested plus those two
+/// automatic ones, and these tests arm exactly one `BREAKPOINT` and one `SINGLE_STEP` (measured: one
+/// request at line 44, no extra code-index copies; and no `THREAD_START`/`THREAD_DEATH` request exists
+/// anywhere in this codebase). A third buffered event here is a **second breakpoint or a second step** — a
+/// duplicate delivery, which is #64's open question and not a staging artefact. The escape hatch is shut;
+/// do not reopen it without a sighting whose census names a foreign kind.
 ///
 /// It does **not** show that a JVM sends an event twice. See [`EventFault::DuplicateKind`] for that limit.
 #[test]
@@ -12123,15 +12223,29 @@ fn a_duplicated_hit_is_buffered_twice_rather_than_coalesced() {
     let buffered = server.call("debug.get_last_event", serde_json::json!({"limit": 10}));
     let hits = buffered.matches("\"event\":\"breakpoint\"").count();
     assert_eq!(
-        hits, 2,
-        "the fault fired, so the debugger coalesced or dropped a copy — got {hits}:\n{buffered}"
+        hits,
+        2,
+        "the fault fired, so the debugger coalesced or dropped a copy — got {hits}, {}:\n{buffered}",
+        event_census(&buffered)
     );
 
     // And the newest-event view must announce the backlog rather than pretend there is one event.
     let latest = server.last_event();
+    // Re-read rather than reuse `buffered` above, and this is the assertion that made it necessary. It is
+    // the one that failed in the v0.23.0 release gate on JDK 21 — `[pending] 2 older event(s)` where the
+    // fault stages one. `hits == 2` had passed one call earlier, which leaves exactly two worlds: the
+    // third event arrived between these two calls, or it was already there and is a kind `hits` does not
+    // count. Neither was recorded, because the only dump was in the message of the assertion that passed.
+    // A stale dump would now describe the buffer as it was *before* the event that broke the assertion,
+    // which is worse than no dump: it reads like an exoneration. Neither call passes `drain`, so reading
+    // changes nothing — and it is read eagerly rather than inside the panic message so that a wedged
+    // server cannot turn a clear assertion failure into a hang.
+    let at_assert = server.call("debug.get_last_event", serde_json::json!({"limit": 10}));
     assert!(
         latest.contains("[pending] 1 older event"),
-        "an unread older copy must be announced as pending: {latest}"
+        "an unread older copy must be announced as pending: {latest}\n{}\nthe whole buffer, re-read at \
+         this assertion:\n{at_assert}",
+        event_census(&at_assert)
     );
 
     // Now finish the sequence the flaky test performs, and the result is CI's failure **verbatim**: three
@@ -12141,8 +12255,13 @@ fn a_duplicated_hit_is_buffered_twice_rather_than_coalesced() {
     server.call("debug.step_over", serde_json::json!({}));
     server.wait_for_event("\"event\":\"step\"", EVENT_TIMEOUT).expect("step never reported");
     let after_step = server.last_event();
+    let at_final = server.call("debug.get_last_event", serde_json::json!({"limit": 10}));
     assert_contains_all(
-        "the injected duplicate reproduces the CI fingerprint exactly",
+        &format!(
+            "the injected duplicate reproduces the CI fingerprint exactly\n{} — this test stages two \
+             breakpoints (one hit, duplicated once) and one step\nthe whole buffer:\n{at_final}",
+            event_census(&at_final),
+        ),
         &after_step,
         &["\"event\":\"step\"", "[pending] 2 older event(s)"],
     );

@@ -2369,6 +2369,49 @@ pub fn jdk_or_skip(test: &str) -> Option<Jdk> {
     }
 }
 
+/// Every event kind in a `debug.get_last_event` reply, counted and named — for an assertion whose
+/// failure would otherwise be a **total**.
+///
+/// TEST-23 ([#64](https://github.com/YgorPerez/java-debugging-mcp/issues/64)) is the reason this exists,
+/// and its two sightings are the reason it names kinds it was never told to expect. Both failed on
+/// `[pending] 2 older event(s) buffered` where the test staged one, and a count of events cannot say
+/// which event, so the first sighting's third entry is unknown and will stay that way. The second sighting
+/// was read against a hand-rolled pair of counters for `breakpoint` and `step`, which could report a
+/// third kind only as *the two counts not adding up to the total* — an inference, and one nobody drew.
+///
+/// So the contract is: **no kind is privileged and none is filtered.** Anything the reply renders as
+/// `"event":"…"` is counted under its own name, which is what makes the next sighting's assertion
+/// message a diagnosis rather than another observation that something was off by one.
+///
+/// **It counts what the reply SHOWS, and says so rather than claiming a total.** `get_last_event` renders
+/// the tail its `limit` asked for, so a buffer holding more than that reports the rest on its own
+/// `[pending]` line, and events already evicted at `MAX_EVENTS` are on a `[dropped]` line — neither is
+/// visible to anything scanning the text. A census phrased as "of N in all" would state a total it cannot
+/// see, in the one helper whose entire job is a diagnosis nobody has to double-check; so it is phrased as
+/// what it counted, and every caller prints the whole reply beside it where those two lines are.
+///
+/// One consequence worth knowing before reading a disagreement as a finding: the reply renders one
+/// `[event]` line per event **within** each buffered record, all sharing that record's `seq`, while
+/// `[pending]` counts **records**. So a composite event set carrying two events reads as two here and as
+/// one pending — and the repeated `seq` is the tell that it was one delivery rather than two.
+pub fn event_census(reply: &str) -> String {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for kind in reply.split("\"event\":\"").skip(1).filter_map(|rest| rest.split('"').next()) {
+        *counts.entry(kind).or_default() += 1;
+    }
+    let total: usize = counts.values().sum();
+    let named: Vec<String> = counts.iter().map(|(kind, n)| format!("{n} {kind}")).collect();
+    // "no events" rather than an empty span: a census that rendered to nothing at all would make an empty
+    // buffer and a lost census the same output, which is the failure this whole helper exists to avoid.
+    // It describes the REPLY, so it stays true of a refusal or an error reply, which carries no events
+    // either and must not be reported as an empty buffer.
+    let held = match named.split_last() {
+        None => "no events".to_string(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    };
+    format!("the reply shows {held}, {total} event(s) counted")
+}
 /// Assert `got` contains every string in `wants`, with a message naming the ones it doesn't.
 pub fn assert_contains_all(label: &str, got: &str, wants: &[&str]) {
     let missing: Vec<&str> = wants.iter().copied().filter(|w| !got.contains(w)).collect();
