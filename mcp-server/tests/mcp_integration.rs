@@ -4493,6 +4493,54 @@ fn an_exported_set_drops_a_thread_filter_and_says_the_entry_is_now_broader() {
     server.panic_reset();
 }
 
+/// CLEAN-8 (#191): a set entry whose class is not loaded is reported **deferred**, not armed.
+///
+/// **This is the assertion the old shape could pass by accident.** `debug.arm_stop_points` used to work out
+/// each entry's outcome by reading `pending_breakpoints.len()` off the session before the dispatch and again
+/// after, and inferring it from the delta — the handler reading its own result out of a side effect on
+/// shared state. It now reads the outcome off the handler's own reply. Both would satisfy an assertion made
+/// against a set that only ever arms, which is what the two existing set tests are: `0 deferred` is the
+/// count they both check.
+///
+/// **Asserted through the export round trip rather than a hand-written block**, because the block's shape is
+/// the thing the format constant owns: a set typed out here would be a second copy of it, and one that
+/// cannot go stale visibly. `DeferredProbe` idles until told to load `LateWorker`, so the class is genuinely
+/// absent for as long as this test needs it.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn an_armed_set_reports_an_entry_whose_class_is_not_loaded_as_deferred() {
+    let Some(jdk) = jdk_or_skip("an_armed_set_reports_an_entry_whose_class_is_not_loaded_as_deferred") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "DeferredProbe").expect("launch DeferredProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.contains("ready")).expect("probe never printed ready");
+
+    let line = probe_line(&probe_source("DeferredProbe"), "// BP1");
+    let set =
+        server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "LateWorker", "line": line}));
+    assert!(set.contains("Deferred"), "the class must still be absent for this test to mean anything: {set}");
+
+    let exported = server.call("debug.list_stop_points", serde_json::json!({"export": true}));
+    let block = set_block(&exported).unwrap_or_else(|| panic!("no ```json block: {exported}"));
+    server.panic_reset();
+
+    let armed = server.call("debug.arm_stop_points", serde_json::json!({"set": block}));
+    assert_contains_all(
+        "the entry is counted as deferred and not as armed",
+        &armed,
+        &["0 armed, 1 deferred, 0 refused"],
+    );
+    // And the session agrees, which is the half that says the deferral is real rather than only reported.
+    assert_contains_all(
+        "the re-armed set left a pending breakpoint behind",
+        &server.call("debug.list_stop_points", serde_json::json!({})),
+        &["1 deferred"],
+    );
+    server.panic_reset();
+}
+
 /// The set is refused rather than half-applied when it is not a set at all, and the refusals reach the caller
 /// through the tool rather than only through the unit tests of the parser.
 #[test]

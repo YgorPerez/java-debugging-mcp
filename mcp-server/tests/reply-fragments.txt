@@ -67,6 +67,12 @@
 ## trace_exprs/several
 ·   Trace expr[0]: a·   Trace expr[1]: b·   Trace expr[2]: c
 
+## trace_line/bare
+#7 [bp_3] br.com.app.Pedido.reservar:-1 thread=0x1f4c
+
+## trace_line/full
+#7 [bp_3] br.com.app.Pedido.reservar:412 ← br.com.app.Controller.post:88 thread=0x1f4c field=Pedido.total {pedido=Pedido@0x7f3a} captured{val$tenant="acme"} | pedido.total => (int) 4200 ↻ rethrow of #2 (+3 more rethrow(s) collapsed)
+
 ## clamp_notes/none
 
 

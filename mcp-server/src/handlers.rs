@@ -7,6 +7,7 @@ use crate::protocol::{
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ListToolsResult, ServerCapabilities, ServerInfo,
     ToolsCapability, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND,
 };
+use crate::reply::{Outcome, Reply};
 use crate::session::SessionManager;
 use crate::stop_point::{ArmedOn, StopPoint, StopPointKind};
 use crate::tools;
@@ -939,7 +940,10 @@ impl RequestHandler {
         // get dispatched at all, which is a loud failure; the two cannot quietly disagree about what a set is
         // allowed to name.
         if crate::stop_point_set::ARMABLE_TOOLS.contains(&name) {
-            return self.dispatch_armable(name, args).await;
+            // The one place a `Reply` becomes a `String` (CLEAN-8, #191). The outcome is what
+            // `debug.arm_stop_points` needs and what an MCP caller has no field to put; the mapping onto a
+            // `CallToolResult` stays exactly where it was, in `handle_call_tool`.
+            return Some(self.dispatch_armable(name, args).await?.map(Reply::into_text));
         }
         Some(match name {
             "debug.list_stop_points" => self.handle_list_stop_points(args).await,
@@ -959,7 +963,7 @@ impl RequestHandler {
     /// handlers without the enclosing dispatch calling itself. Keep this in step with
     /// [`crate::stop_point_set::ARMABLE_TOOLS`]; that constant is what routes to here, so the two cannot
     /// disagree silently.
-    async fn dispatch_armable(&self, name: &str, args: serde_json::Value) -> Option<Result<String, String>> {
+    async fn dispatch_armable(&self, name: &str, args: serde_json::Value) -> Option<Result<Reply, String>> {
         Some(match name {
             "debug.set_line_stop" => self.handle_set_line_stop(args).await,
             "debug.set_exception_stop" => self.handle_set_exception_stop(args).await,
@@ -1426,7 +1430,7 @@ impl RequestHandler {
         Ok(out)
     }
 
-    async fn handle_set_line_stop(&self, args: serde_json::Value) -> Result<String, String> {
+    async fn handle_set_line_stop(&self, args: serde_json::Value) -> Result<Reply, String> {
         let a: crate::args::SetBreakpointArgs = crate::args::parse(&args)?;
         let patterns = a.class_pattern.list();
         if patterns.is_empty() {
@@ -1506,9 +1510,20 @@ impl RequestHandler {
         let overridden = describe_overridden_traces(&overridden_traces(&session));
         drop(session);
 
-        Ok(render_pattern_outcomes(&base, &patterns, &outcomes, resolved.note.as_deref(), max_classes)
-            + &overridden
-            + resolved.session_default_note.as_str())
+        // The outcome the delta in `debug.arm_stop_points` used to infer, read off the outcomes that
+        // decided the text (CLEAN-8, #191). Same rule as the delta had — anything deferred makes the whole
+        // call deferred — and it is now the same value the renderer counts rather than a second reading of
+        // the session taken around the call.
+        let outcome = if outcomes.iter().any(|o| matches!(o, PatternOutcome::Deferred { .. })) {
+            Outcome::Deferred
+        } else {
+            Outcome::Armed
+        };
+        let text =
+            render_pattern_outcomes(&base, &patterns, &outcomes, resolved.note.as_deref(), max_classes);
+        Ok(Reply { text, outcome }
+            .followed_by(&overridden)
+            .followed_by(resolved.session_default_note.as_str()))
     }
 
     async fn handle_list_stop_points(&self, args: serde_json::Value) -> Result<String, String> {
@@ -1619,8 +1634,10 @@ impl RequestHandler {
         let entries = crate::stop_point_set::parse(&a.set)?;
 
         // Resolved once and up front so a set is never half-armed against one session and half against
-        // another, and so "no session" is one refusal rather than N identical ones.
-        let session_guard = self.require_session_for_arming(&args).await?;
+        // another, and so "no session" — or a session with no event pump — is one refusal rather than N
+        // identical ones. The guard itself is not kept: every entry re-resolves through the handler it is
+        // routed to, and since CLEAN-8 (#191) nothing here reads session state to work out what happened.
+        self.require_session_for_arming(&args).await?;
 
         let session_id = args.get("session_id").cloned();
         let mut outcomes: Vec<(String, crate::stop_point_set::ArmOutcome)> =
@@ -1641,12 +1658,16 @@ impl RequestHandler {
 
             let call = route_to_session(entry.args, session_id.as_ref());
 
-            // Deferral is read off the session rather than sniffed out of the reply text. A substring check
-            // for "deferred" would be a reply-wording dependency of exactly the kind TEST-46 (#154) exists to
-            // stop, and it would silently start reporting every entry as armed the day that word changed.
-            let pending_before = session_guard.lock().await.state.pending_breakpoints.len();
+            // Deferral is read off the handler's own [`Reply`] (CLEAN-8, #191). It used to be inferred
+            // from a `pending_breakpoints.len()` delta taken around this call — the handler reading its own
+            // result out of a side effect on shared state, and the only thing its return type left it. The
+            // alternative that comment rejected is still rejected and for the same reason: a substring
+            // check for "deferred" would be a reply-wording dependency of exactly the kind TEST-46 (#154)
+            // exists to stop, and it would report every entry as armed the day that word changed.
+            //
+            // The delta is DELETED rather than kept as a cross-check. Two sources of truth for one fact is
+            // the shape SAFE-5 is the post-mortem of.
             let armed = self.dispatch_armable(&entry.tool, call).await;
-            let pending_after = session_guard.lock().await.state.pending_breakpoints.len();
 
             outcomes.push((
                 label,
@@ -1656,10 +1677,10 @@ impl RequestHandler {
                         entry.tool
                     )),
                     Some(Err(why)) => crate::stop_point_set::ArmOutcome::Refused(why),
-                    Some(Ok(_)) if pending_after > pending_before => {
-                        crate::stop_point_set::ArmOutcome::Deferred
-                    }
-                    Some(Ok(_)) => crate::stop_point_set::ArmOutcome::Armed,
+                    Some(Ok(reply)) => match reply.outcome {
+                        Outcome::Deferred => crate::stop_point_set::ArmOutcome::Deferred,
+                        Outcome::Armed => crate::stop_point_set::ArmOutcome::Armed,
+                    },
                 },
             ));
         }
@@ -3696,7 +3717,7 @@ impl RequestHandler {
         ))
     }
 
-    async fn handle_set_exception_stop(&self, args: serde_json::Value) -> Result<String, String> {
+    async fn handle_set_exception_stop(&self, args: serde_json::Value) -> Result<Reply, String> {
         let a: crate::args::SetExceptionBreakpointArgs = crate::args::parse(&args)?;
         if !a.caught && !a.uncaught {
             return Err(
@@ -3743,7 +3764,9 @@ impl RequestHandler {
             )
             .await;
             drop(session);
-            return out;
+            // An exception stop point has no target to defer against — a **catch-all** matches on the
+            // throw, and a named one arms on the pattern whether or not the class is loaded.
+            return out.map(Reply::armed);
         }
 
         // Several patterns, or a wildcard: one exc_ per resolved class, and a row per class (FILT-3/FILT-4).
@@ -3775,10 +3798,10 @@ impl RequestHandler {
             ),
             resolved.session_default_note
         );
-        Ok(render_batch_arming("exception stop(s)", &batches, max_classes, &trailer))
+        Ok(Reply::armed(render_batch_arming("exception stop(s)", &batches, max_classes, &trailer)))
     }
 
-    async fn handle_set_field_stop(&self, args: serde_json::Value) -> Result<String, String> {
+    async fn handle_set_field_stop(&self, args: serde_json::Value) -> Result<Reply, String> {
         let a: crate::args::SetWatchpointArgs = crate::args::parse(&args)?;
         let kinds = watch_kinds(&a)?;
         let classes = a.class_name.list();
@@ -3830,7 +3853,9 @@ impl RequestHandler {
             )
             .await;
             drop(session);
-            return out;
+            // A watchpoint cannot be deferred either: it needs the field, which needs the class loaded, so
+            // an absent class is a refusal here rather than a wait.
+            return out.map(Reply::armed);
         }
 
         // Several classes, or a wildcard: one watch per kind per class that HAS the field (FILT-3/FILT-4).
@@ -3860,10 +3885,10 @@ impl RequestHandler {
             resolved.note.as_deref(),
         );
         let trailer = format!("{trailer}{}", resolved.session_default_note);
-        Ok(render_batch_arming("watchpoint(s)", &batches, max_classes, &trailer))
+        Ok(Reply::armed(render_batch_arming("watchpoint(s)", &batches, max_classes, &trailer)))
     }
 
-    async fn handle_set_method_exit_stop(&self, args: serde_json::Value) -> Result<String, String> {
+    async fn handle_set_method_exit_stop(&self, args: serde_json::Value) -> Result<Reply, String> {
         let a: crate::args::SetMethodBreakpointArgs = crate::args::parse(&args)?;
         let patterns = a.class_pattern.list();
         if patterns.is_empty() {
@@ -3916,10 +3941,10 @@ impl RequestHandler {
             let (mexit_id, request_id) =
                 arm_one_method_exit(&mut session, &a, class_pattern, method.as_ref(), &mexit).await?;
             drop(session);
-            return Ok(format!(
+            return Ok(Reply::armed(format!(
                 "✅ Method-exit reporting armed on {class_pattern}\n   Stop-point ID: {mexit_id}\n   JDWP \
                  Request ID: {request_id}{mode}{extra}"
-            ));
+            )));
         }
 
         // Several patterns: one request each, and no expansion — see above.
@@ -3930,7 +3955,7 @@ impl RequestHandler {
         drop(session);
 
         let trailer = format!("{mode}{extra}{}", resolved.session_default_note);
-        Ok(render_batch_arming("method-exit request(s)", &batches, 0, &trailer))
+        Ok(Reply::armed(render_batch_arming("method-exit request(s)", &batches, 0, &trailer)))
     }
 
     /// `debug.set_monitor_stop` (DUMP-7, #96): report lock contention as it happens, without a suspend.
@@ -3944,7 +3969,7 @@ impl RequestHandler {
     /// events and can never measure a duration, under an id whose reply said it would — and the caller
     /// would have to read `list_stop_points` to discover it. This differs from the batched *pattern* arming
     /// elsewhere, where each row is an independent question about a different class.
-    async fn handle_set_monitor_stop(&self, args: serde_json::Value) -> Result<String, String> {
+    async fn handle_set_monitor_stop(&self, args: serde_json::Value) -> Result<Reply, String> {
         let a: crate::args::SetMonitorStopArgs = crate::args::parse(&args)?;
         let kinds = parse_monitor_kinds(a.kinds.as_deref())?;
 
@@ -3994,12 +4019,12 @@ impl RequestHandler {
             .iter()
             .map(|(id, req, k)| format!("   {}  {id}  (JDWP request {req})", k.label()))
             .collect();
-        Ok(format!(
+        Ok(Reply::armed(format!(
             "✅ Monitor contention reporting armed{}\n{}\n{}",
             resolved.session_default_note,
             rows.join("\n"),
             describe_monitor_arm(&a, &kinds, &arm, caps, resolved.note.as_deref()),
-        ))
+        )))
     }
 
     async fn handle_get_traces(&self, args: serde_json::Value) -> Result<String, String> {
@@ -4062,26 +4087,7 @@ impl RequestHandler {
             crate::session::MAX_TRACES
         ));
         for rec in matched.into_iter().skip(start) {
-            let callers_s = format_trace_callers(rec);
-            let detail_s = format_trace_detail(rec);
-            let args_s = format_trace_args(rec);
-            let captured_s = format_trace_captured(rec);
-            let expr_s = format_trace_expr(rec);
-            lines.push(format!(
-                "#{} [{}] {}.{}:{}{} thread=0x{:x}{}{}{}{}{}",
-                rec.seq,
-                rec.bp_id,
-                rec.class,
-                rec.method,
-                rec.line.unwrap_or(-1),
-                callers_s,
-                rec.thread,
-                detail_s,
-                args_s,
-                captured_s,
-                expr_s,
-                format_trace_rethrow(rec),
-            ));
+            lines.push(format_trace_line(rec));
         }
         // A stop point that hit its budget disarmed itself (TRACE-3) — say so, so a caller doesn't
         // read the silence that follows as "no more hits". Kept until the buffer is cleared. Repeats are
@@ -6748,6 +6754,36 @@ fn describe_hit_count(hit_count: Option<i32>, trace: bool, budget: Option<u32>, 
         );
     }
     out
+}
+
+/// One **snapshot** as a line, assembled from the seven fragment helpers (CLEAN-8, #191).
+///
+/// **Why this is a function rather than a format string written twice.** It was written twice — a
+/// twelve-placeholder literal, byte-identical in `debug.get_traces` and in the investigation report, whose
+/// arguments differ in nothing but whether the fragments were bound to locals first. The seven helpers
+/// below already existed to keep the *fragments* from drifting; nothing kept the assembly from drifting,
+/// and the assembly is where the field order, the `0x` on the thread and the `-1` for a missing line live.
+/// Two copies of a twelve-slot ordering is two chances to add a thirteenth to one of them.
+///
+/// `-1` for a snapshot with no line, and it is the pre-existing rendering rather than a choice made here:
+/// a **hidden class** or a method compiled without `-g` has no line table, and the whole line is data a
+/// caller reads rather than a number anything computes from.
+fn format_trace_line(rec: &crate::session::TraceRecord) -> String {
+    format!(
+        "#{} [{}] {}.{}:{}{} thread=0x{:x}{}{}{}{}{}",
+        rec.seq,
+        rec.bp_id,
+        rec.class,
+        rec.method,
+        rec.line.unwrap_or(-1),
+        format_trace_callers(rec),
+        rec.thread,
+        format_trace_detail(rec),
+        format_trace_args(rec),
+        format_trace_captured(rec),
+        format_trace_expr(rec),
+        format_trace_rethrow(rec),
+    )
 }
 
 fn describe_trace_budget(trace: bool, budget: Option<u32>) -> String {
@@ -14017,22 +14053,7 @@ fn render_investigation_traces(session: &crate::session::DebugSession) -> String
 
     out.push_str("```\n");
     for rec in &session.traces {
-        let _ = writeln!(
-            out,
-            "#{} [{}] {}.{}:{}{} thread=0x{:x}{}{}{}{}{}",
-            rec.seq,
-            rec.bp_id,
-            rec.class,
-            rec.method,
-            rec.line.unwrap_or(-1),
-            format_trace_callers(rec),
-            rec.thread,
-            format_trace_detail(rec),
-            format_trace_args(rec),
-            format_trace_captured(rec),
-            format_trace_expr(rec),
-            format_trace_rethrow(rec),
-        );
+        let _ = writeln!(out, "{}", format_trace_line(rec));
     }
     out.push_str("```\n");
 
@@ -15410,21 +15431,24 @@ async fn register_deferred_breakpoint(
     session: &mut crate::session::DebugSession,
     spec: &BreakpointSpec,
     bp_id: String,
-) -> Result<String, String> {
+) -> Result<Reply, String> {
     match defer_breakpoint(session, spec, bp_id).await? {
-        DeferResult::ArmedOnRecheck(armed) => Ok(format!(
+        // Armed, not deferred, and the distinction is the reason this is read from the value rather than
+        // from the session: the load race closed in our favour, so there is a live request in the debuggee
+        // and `pending_breakpoints` never grew.
+        DeferResult::ArmedOnRecheck(armed) => Ok(Reply::armed(format!(
             "✅ {} set at {}:{} (class had just loaded)\n   Method: {}\n   Stop-point ID: {}",
             if spec.trace { "Trace breakpoint" } else { "Breakpoint" },
             spec.class_pattern,
             armed.line,
             armed.method_name,
             armed.bp_id
-        )),
-        DeferResult::Deferred { bp_id } => Ok(format!(
+        ))),
+        DeferResult::Deferred { bp_id } => Ok(Reply::deferred(format!(
             "⏳ Deferred breakpoint for {0} ({1}) — {0} is not loaded yet. It will arm automatically when the class loads (trigger the request that loads it), then hit normally.\n   Stop-point ID: {bp_id}",
             spec.class_pattern,
             describe_where(spec.line_opt, spec.method_hint.as_deref())
-        )),
+        ))),
     }
 }
 
@@ -16218,7 +16242,7 @@ async fn arm_single_named(
     session: &mut crate::session::DebugSession,
     spec: &BreakpointSpec,
     frames_note: Option<&str>,
-) -> Result<String, String> {
+) -> Result<Reply, String> {
     // One id for this breakpoint's whole life, allocated before we know whether it arms now or is
     // deferred — and kept across any later disable/re-arm (BP-3).
     let bp_id = session.state.next_stop_id("bp_");
@@ -16263,16 +16287,18 @@ async fn arm_single_named(
     if let Some(c) = &spec.condition {
         let _ = write!(extra, "\n   Condition: {c}");
     }
-    Ok(format!(
-        "✅ {} set at {}:{}\n   Method: {}\n   Stop-point ID: {}\n   JDWP Request ID: {}{}",
-        if spec.trace { "Trace breakpoint" } else { "Breakpoint" },
-        spec.class_pattern,
-        line,
-        method_name,
-        bp_id,
-        request_id,
-        extra
-    ) + &armed.drift.arming_note())
+    Ok(Reply::armed(
+        format!(
+            "✅ {} set at {}:{}\n   Method: {}\n   Stop-point ID: {}\n   JDWP Request ID: {}{}",
+            if spec.trace { "Trace breakpoint" } else { "Breakpoint" },
+            spec.class_pattern,
+            line,
+            method_name,
+            bp_id,
+            request_id,
+            extra
+        ) + &armed.drift.arming_note(),
+    ))
 }
 
 fn render_pattern_outcomes(
@@ -25507,6 +25533,44 @@ mod tests {
     }
 
     /// The cases, and each one is chosen to reach a branch rather than to look realistic.
+    /// A **stated** trace record for the snapshot above — authored test data, never a captured hit
+    /// (`CONTEXT.md`'s word, and the reason it is not called a fixture).
+    ///
+    /// `everything` fills every optional fragment, so the assembled line exercises all twelve slots. The
+    /// values are chosen to be *distinguishable in the rendered line* rather than realistic: a snapshot
+    /// whose fields all read alike cannot show that two of them swapped places, which is the drift the
+    /// assembled case exists to catch.
+    fn stated_trace(everything: bool) -> crate::session::TraceRecord {
+        let value = |name: &str, rendered: &str| crate::session::TracedValue {
+            name: name.to_string(),
+            rendered: rendered.to_string(),
+            object_id: None,
+        };
+        crate::session::TraceRecord {
+            seq: 7,
+            bp_id: "bp_3".to_string(),
+            thread: 0x1f4c,
+            class: "br.com.app.Pedido".to_string(),
+            method: "reservar".to_string(),
+            // `None` is the case with no line table at all, which renders as -1.
+            line: if everything { Some(412) } else { None },
+            args: if everything { vec![value("pedido", "Pedido@0x7f3a")] } else { vec![] },
+            captured: if everything { vec![value("val$tenant", "\"acme\"")] } else { vec![] },
+            callers: if everything { vec!["br.com.app.Controller.post:88".to_string()] } else { vec![] },
+            expr: if everything {
+                vec![("pedido.total".to_string(), "(int) 4200".to_string())]
+            } else {
+                vec![]
+            },
+            detail: if everything { vec![("field".to_string(), "Pedido.total".to_string())] } else { vec![] },
+            rethrow: if everything {
+                Some(crate::session::RethrowFold { collapsed: 3, first_seq: 2 })
+            } else {
+                None
+            },
+        }
+    }
+
     fn render_reply_fragment_snapshot() -> String {
         let mut out = String::from(
             "# Caller-visible reply FRAGMENTS from the pure renderers. GENERATED — do not hand-edit:\n\
@@ -25568,6 +25632,14 @@ mod tests {
         case("trace_exprs/none", describe_trace_exprs(&[]));
         case("trace_exprs/one", describe_trace_exprs(&ex(&["pedido.total"])));
         case("trace_exprs/several", describe_trace_exprs(&ex(&["a", "b", "c"])));
+
+        // CLEAN-8 (#191). The ASSEMBLED line, not only its fragments — the twelve-slot ordering was
+        // written out twice, in `debug.get_traces` and in the investigation report, and the seven helpers
+        // pinned below covered everything about that line except the order they go in. Two cases: the
+        // minimum a snapshot can be, and one with every fragment non-empty, since a fragment that moved
+        // would otherwise only show up in whichever half of the line the sparse case does not reach.
+        case("trace_line/bare", format_trace_line(&stated_trace(false)));
+        case("trace_line/full", format_trace_line(&stated_trace(true)));
 
         case("clamp_notes/none", merge_clamp_notes(None, None).unwrap_or_default());
         case("clamp_notes/first", merge_clamp_notes(Some("first".into()), None).unwrap_or_default());

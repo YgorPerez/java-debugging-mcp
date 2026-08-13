@@ -67,6 +67,7 @@ pub mod protocol;
 /// everything else here — see the crate docs.
 #[doc(hidden)]
 pub mod reads;
+mod reply;
 mod session;
 mod stop_point;
 mod stop_point_set;
