@@ -1298,7 +1298,7 @@ impl RequestHandler {
             // state still has to be TRUE on the session, or `list_sessions` would call a frozen VM running
             // and the watchdog would never rescue a caller who walked away mid-setup (SAFE-4/SAFE-7).
             if a.suspend {
-                session.mark_suspended(crate::session::SuspendCause::ManualPause);
+                session.suspensions.mark_suspended(crate::session::SuspendCause::ManualPause);
             }
         }
 
@@ -1961,7 +1961,7 @@ impl RequestHandler {
         // "Continue" means the application actually runs again, so clear any counted suspend depth
         // rather than issuing one resume and hoping (SAFE-7).
         let note = resume_and_verify(&mut session).await?;
-        session.mark_resumed();
+        session.suspensions.mark_resumed();
         // SAFE-11. `debug.continue` deliberately does NOT release a thread held by
         // `debug.suspend_thread`, and this line is what makes that defensible rather than silent. The two
         // are different counts with different remedies — this clears the VM's depth, `debug.resume_thread`
@@ -2020,7 +2020,7 @@ impl RequestHandler {
             .await
             .map_err(|e| format!("Failed to set step: {e}"))?;
         session.pending_step = Some((req, thread_id));
-        session.mark_resumed();
+        session.suspensions.mark_resumed();
         session.connection.resume_all().await.map_err(|e| format!("Failed to resume for step: {e}"))?;
         drop(session);
 
@@ -2052,7 +2052,7 @@ impl RequestHandler {
         // The panic button's whole job is to leave the VM running, so it must clear a counted suspend
         // depth and report honestly if it couldn't (SAFE-7).
         let note = resume_and_verify(&mut session).await?;
-        session.mark_resumed();
+        session.suspensions.mark_resumed();
         // SAFE-11: `resume_all_fully` clears the VM-WIDE depth, and stops as soon as the thread it probes
         // reaches zero — a worker held by `debug.suspend_thread` can sit at a higher count than that and
         // stay frozen through a panic that reported "resumed all threads". The panic button's whole
@@ -2387,8 +2387,12 @@ impl RequestHandler {
         // extra JDWP packets — which matters, because the cost line below would otherwise start lying
         // about what the call spent, and because a listing on a 300-thread pool cannot afford a
         // `SuspendCount` per row.
-        let held: std::collections::BTreeMap<u64, (String, std::time::Duration)> =
-            session.thread_suspends.iter().map(|(t, r)| (*t, (r.name.clone(), r.since.elapsed()))).collect();
+        let held: std::collections::BTreeMap<u64, (String, std::time::Duration)> = session
+            .suspensions
+            .threads
+            .iter()
+            .map(|(t, r)| (*t, (r.name.clone(), r.since.elapsed())))
+            .collect();
         drop(session);
 
         let shown = rows.len();
@@ -2931,7 +2935,7 @@ impl RequestHandler {
         // An already-suspended VM is read as it is and left alone: resuming it here would throw away
         // the breakpoint state the caller is standing in, and re-suspending it would build a counted
         // depth that one resume can't undo (SAFE-7).
-        let already = session.suspended_cause.is_some();
+        let already = session.suspensions.vm.is_some();
         let suspend_now = a.suspend && !already;
         if suspend_now {
             session
@@ -2941,7 +2945,7 @@ impl RequestHandler {
                 .map_err(|e| format!("Failed to suspend for the dump: {e}"))?;
             // Arm the watchdog for the window we hold it: if this call dies before the resume below,
             // something still un-freezes the VM (SAFE-4).
-            session.mark_suspended(crate::session::SuspendCause::ManualPause);
+            session.suspensions.mark_suspended(crate::session::SuspendCause::ManualPause);
         }
 
         // The held window starts here and ends at the resume below — measured around the reads only, so
@@ -2962,7 +2966,7 @@ impl RequestHandler {
             let probe = rows.first().map_or_else(|| all.first().copied().unwrap_or(0), |r| r.id);
             match session.connection.resume_all_fully(probe, MAX_RESUME_ATTEMPTS).await {
                 Ok((issued, 0)) => {
-                    session.mark_resumed();
+                    session.suspensions.mark_resumed();
                     let _ = write!(
                         resume_note,
                         "▶️  Suspended for the dump and resumed again ({issued} resume(s)) — verified running."
@@ -3016,12 +3020,12 @@ impl RequestHandler {
 
         // Idempotent: suspending an already-suspended VM builds a counted suspend DEPTH that one resume
         // can't undo, so the watchdog would resume once, believe it had succeeded, clear
-        // `suspended_since` and never retry — leaving the JVM frozen permanently while reporting it
+        // `suspensions.vm` and never retry — leaving the JVM frozen permanently while reporting it
         // rescued. Re-suspending would also overwrite a `StopPoint` cause with `ManualPause` and lose
         // the SAFE-2 disarm. So when it is already stopped, say so and change nothing (SAFE-7).
-        if let Some(cause) = session.suspended_cause {
-            let since = session.suspended_since.map_or(0, |t| t.elapsed().as_secs());
-            let how = match cause {
+        if let Some(vm) = session.suspensions.vm {
+            let since = vm.since.elapsed().as_secs();
+            let how = match vm.cause {
                 crate::session::SuspendCause::ManualPause => "by an earlier debug.pause",
                 crate::session::SuspendCause::StopPoint(_) => "at a stop point",
             };
@@ -3034,10 +3038,10 @@ impl RequestHandler {
 
         session.connection.suspend_all().await.map_err(|e| format!("Failed to suspend: {e}"))?;
         // Arm the watchdog for a MANUAL pause too. This used to suspend every thread and record
-        // nothing, so `suspended_since` stayed None and the watchdog — the one thing that makes
+        // nothing, so `suspensions.vm` stayed None and the watchdog — the one thing that makes
         // attaching to a shared JVM defensible — never fired. A forgotten `debug.pause` froze the VM
         // permanently, the same hazard SAFE-1 fixed for disconnect (SAFE-4).
-        session.mark_suspended(crate::session::SuspendCause::ManualPause);
+        session.suspensions.mark_suspended(crate::session::SuspendCause::ManualPause);
         let secs = watchdog_secs();
         drop(session);
 
@@ -3107,15 +3111,9 @@ impl RequestHandler {
         // The JVM is the authority on the depth, never our own count (ADR-0003's rejected alternative).
         let depth = session.connection.suspend_count(tid).await.unwrap_or(-1);
         let label = name.clone().unwrap_or_else(|| "?".to_string());
-        let entry = session.thread_suspends.entry(tid).or_insert_with(|| crate::session::ThreadSuspend {
-            name: label.clone(),
-            since: std::time::Instant::now(),
-            issued: 0,
-        });
-        entry.issued += 1;
-        let ours = entry.issued;
+        let ours = session.suspensions.hold_thread(tid, label.clone(), std::time::Instant::now());
         let secs = watchdog_secs();
-        let vm_held = session.suspended_cause;
+        let vm_held = session.suspensions.vm.map(|v| v.cause);
         drop(session);
 
         Ok(render_thread_suspend(&ThreadSuspendReply {
@@ -3150,10 +3148,10 @@ impl RequestHandler {
             Some(raw) => crate::args::parse_thread_id(Some(raw)).ok_or_else(|| bad_thread_id(raw))?,
             // Defaulting is safe in exactly one shape — one held thread — and guessing among several
             // would resume a worker the caller is still reading. So the ambiguous case lists them.
-            None => match session.thread_suspends.len() {
-                0 => return Err(nothing_held_note(session.suspended_cause)),
-                1 => *session.thread_suspends.keys().next().unwrap_or(&0),
-                _ => return Err(which_thread_note(&session.thread_suspends)),
+            None => match session.suspensions.threads.len() {
+                0 => return Err(nothing_held_note(session.suspensions.vm.map(|v| v.cause))),
+                1 => *session.suspensions.threads.keys().next().unwrap_or(&0),
+                _ => return Err(which_thread_note(&session.suspensions.threads)),
             },
         };
 
@@ -3168,7 +3166,7 @@ impl RequestHandler {
             ThreadLiveness::Live(_, _) | ThreadLiveness::Unreadable(_) => None,
         };
         if let Some(note) = gone {
-            let held = session.thread_suspends.remove(&tid).is_some();
+            let held = session.suspensions.forget_thread(tid);
             drop(session);
             return Err(format!(
                 "{note}\n   {}",
@@ -3204,20 +3202,15 @@ impl RequestHandler {
             .map_err(|e| format!("Failed to resume thread 0x{tid:x}: {e}"))?;
         let left = session.connection.suspend_count(tid).await.unwrap_or(0);
 
-        let name = session.thread_suspends.get(&tid).map_or_else(
+        // One call, one decrement — and the record as it stood is what names the thread, because the
+        // reply has to report the age of a claim it is in the middle of dropping. The rule that our own
+        // count reaching zero drops the record even while the JVM reports depth is now
+        // `Suspensions::release_thread`'s, and asserted there.
+        let name = session.suspensions.release_thread(tid).map_or_else(
             || format!("0x{tid:x}"),
             |r| format!("0x{tid:x} \"{}\" (held {})", r.name, ago(r.since.elapsed())),
         );
-        // Drop our claim by one. When our own count reaches zero the entry goes, even if the JVM still
-        // reports depth — whatever is left is not ours, and saying otherwise would put this session's
-        // name on somebody else's suspension.
-        if let Some(rec) = session.thread_suspends.get_mut(&tid) {
-            rec.issued = rec.issued.saturating_sub(1);
-            if rec.issued == 0 {
-                session.thread_suspends.remove(&tid);
-            }
-        }
-        let vm_held = session.suspended_cause;
+        let vm_held = session.suspensions.vm.map(|v| v.cause);
         drop(session);
 
         Ok(format!(
@@ -3253,15 +3246,14 @@ impl RequestHandler {
         // trip, and can't leave a request behind the way clearing our tracked set one by one might.
         let safety = if let Some(guard) = self.session_manager.get_session_by_id(&session_id).await {
             let mut session = guard.lock().await;
-            let was_suspended = session.suspended_since.is_some();
+            let was_suspended = session.suspensions.vm.is_some();
             // SAFE-11. `VirtualMachine.Dispose` resumes threads suspended by the THREAD-level command as
             // many times as necessary as well as those suspended VM-wide — that is the spec's own
             // wording, and the resume-honesty matrix asserts it against the probe's ticks rather than
             // taking it on trust. So there is nothing extra to send; what there is to do is stop
             // claiming to hold threads we no longer hold, and tell the caller which ones went.
             let held: Vec<String> =
-                session.thread_suspends.values().map(|r| format!("\"{}\"", r.name)).collect();
-            session.thread_suspends.clear();
+                session.suspensions.forget_all_threads().iter().map(|n| format!("\"{n}\"")).collect();
             let stops = session.state.stop_points.len()
                 + session.state.pending_breakpoints.len()
                 + session.pattern_sets.len();
@@ -3280,7 +3272,7 @@ impl RequestHandler {
                     "Dispose failed — best-effort cleared breakpoints and resumed ({stops} stop point(s))"
                 )
             };
-            session.mark_resumed();
+            session.suspensions.mark_resumed();
             // Read the residue before the session is removed, because removing it is what destroys the
             // only record that these redefinitions happened (SWAP-2).
             let residue = describe_outstanding_redefinitions(&session.redefinitions);
@@ -6831,7 +6823,7 @@ fn render_session_line(
     // other: a session in it will read as suspended the moment anything hits, and stay that way. It said
     // `running` until #195 — the one word a caller reads as "this is fine" — over a session that could not
     // resume a single thing it stopped.
-    let state = match (s.event_pump(), s.suspended_since.is_some()) {
+    let state = match (s.event_pump(), s.suspensions.vm.is_some()) {
         (crate::session::EventPump::Ended, _) => "DEAD (JVM gone — debug.disconnect it)".to_string(),
         // BOTH facts, not the newer one. The two are independent — `debug.pause` suspends without any
         // event — and dropping `SUSPENDED` here would lose the more actionable half: a frozen debuggee
@@ -6869,15 +6861,16 @@ fn render_session_line(
     // debug.continue). Shown for every session rather than only the current one, for the same reason the
     // redefinition residue is: a session somebody else walked away from is the case that matters, and
     // this listing is the only place a third party can discover that a worker is frozen.
-    if !s.thread_suspends.is_empty() {
+    if !s.suspensions.threads.is_empty() {
         const NAMED: usize = 3;
-        let oldest = s.thread_suspends.values().map(|r| r.since.elapsed()).max().unwrap_or_default();
-        let names: Vec<&str> = s.thread_suspends.values().take(NAMED).map(|r| r.name.as_str()).collect();
-        let rest = s.thread_suspends.len().saturating_sub(names.len());
+        let held = &s.suspensions.threads;
+        let oldest = held.values().map(|r| r.since.elapsed()).max().unwrap_or_default();
+        let names: Vec<&str> = held.values().take(NAMED).map(|r| r.name.as_str()).collect();
+        let rest = held.len().saturating_sub(names.len());
         let _ = write!(
             line,
             ", ⏸️ {} thread(s) suspended by you: {}{} (oldest {} ago)",
-            s.thread_suspends.len(),
+            held.len(),
             names.join(", "),
             if rest > 0 { format!(" +{rest} more") } else { String::new() },
             ago(oldest)
@@ -14213,7 +14206,7 @@ async fn store_reportable_event(
             let cause = event_set.events.first().map_or(crate::session::SuspendCause::ManualPause, |e| {
                 crate::session::SuspendCause::StopPoint(e.request_id)
             });
-            session.mark_suspended(cause);
+            session.suspensions.mark_suspended(cause);
         }
         let seq = session.push_event(event_set, escalation);
         // Buffer first, then push. The buffer is the authoritative record and must be written whether
@@ -14780,7 +14773,8 @@ async fn release_thread_suspends(
     only: Option<&[u64]>,
 ) -> (Vec<String>, Vec<String>) {
     let held: Vec<(u64, String)> = session
-        .thread_suspends
+        .suspensions
+        .threads
         .iter()
         .filter(|(t, _)| only.is_none_or(|ids| ids.contains(t)))
         .map(|(t, r)| (*t, r.name.clone()))
@@ -14804,7 +14798,7 @@ async fn release_thread_suspends(
             stuck.push(format!("0x{tid:x} \"{name}\" ({left} left)"));
         } else {
             freed.push(format!("0x{tid:x} \"{name}\""));
-            session.thread_suspends.remove(&tid);
+            session.suspensions.forget_thread(tid);
         }
     }
     (freed, stuck)
@@ -14818,15 +14812,15 @@ async fn release_thread_suspends(
 /// trusting our own count, and a thread that reached 0 by some other route must not be advertised as
 /// frozen. A thread that answers 0 has its record dropped here, so the claim expires by itself.
 async fn verify_thread_suspends(session: &mut crate::session::DebugSession) -> String {
-    if session.thread_suspends.is_empty() {
+    if session.suspensions.threads.is_empty() {
         return String::new();
     }
-    let ids: Vec<u64> = session.thread_suspends.keys().copied().collect();
+    let ids: Vec<u64> = session.suspensions.threads.keys().copied().collect();
     let mut still: Vec<String> = Vec::new();
     for tid in ids {
         let left = session.connection.suspend_count(tid).await.unwrap_or(0);
         if left > 0 {
-            if let Some(rec) = session.thread_suspends.get(&tid) {
+            if let Some(rec) = session.suspensions.threads.get(&tid) {
                 still.push(format!(
                     "0x{tid:x} \"{}\" ({left} suspend(s), held {})",
                     rec.name,
@@ -14834,7 +14828,8 @@ async fn verify_thread_suspends(session: &mut crate::session::DebugSession) -> S
                 ));
             }
         } else {
-            session.thread_suspends.remove(&tid);
+            // The claim expires against the JVM's own answer rather than against our count (ADR-0003).
+            session.suspensions.forget_thread(tid);
         }
     }
     if still.is_empty() {
@@ -14873,8 +14868,8 @@ fn spawn_watchdog(
                 break;
             };
             let mut s = g.lock().await;
-            if let Some(since) = s.suspended_since {
-                if since.elapsed().as_secs() >= secs {
+            if let Some(vm) = s.suspensions.vm {
+                if vm.since.elapsed().as_secs() >= secs {
                     // A pending single-step must be cleared before the resume, or the next resume
                     // re-fires it.
                     if let Some((req, _)) = s.pending_step.take() {
@@ -14885,10 +14880,13 @@ fn spawn_watchdog(
                     // (SAFE-2). The cause was recorded when the VM suspended, so draining the event
                     // buffer can no longer hide it (SAFE-5), and a manual pause — which has no stop
                     // point to disarm — is reported as itself rather than as a failure (SAFE-4).
-                    let disarmed = match s.suspended_cause {
-                        Some(crate::session::SuspendCause::ManualPause) =>
+                    // There is no third arm any more: a suspension carries its cause as one value with
+                    // its clock (`VmSuspend`), so "stopped since some time, for no recorded reason" — which
+                    // this had to answer `(cause unrecorded)` to — is no longer a representable state.
+                    let disarmed = match vm.cause {
+                        crate::session::SuspendCause::ManualPause =>
                             "suspended by debug.pause (a manual pause — no stop point to disarm)".to_string(),
-                        Some(crate::session::SuspendCause::StopPoint(req)) => {
+                        crate::session::SuspendCause::StopPoint(req) => {
                             disarm_request(&mut s, req).await.map_or_else(
                                 || "(its stop point was already cleared, so there was nothing left to disarm)".to_string(),
                                 |what| format!(
@@ -14896,13 +14894,12 @@ fn spawn_watchdog(
                                 ),
                             )
                         }
-                        None => "(cause unrecorded)".to_string(),
                     };
 
                     // Resume for REAL: a counted suspend depth (e.g. a pause on top of a breakpoint)
                     // needs more than one resume, and reporting a rescue that didn't happen — then
-                    // clearing `suspended_since` so we never retry — is the worst thing this task can
-                    // do (SAFE-7). On failure, leave `suspended_since` set so the next tick tries again.
+                    // clearing `suspensions.vm` so we never retry — is the worst thing this task can
+                    // do (SAFE-7). On failure, leave `suspensions.vm` set so the next tick tries again.
                     // EVT-2: every arm below sets `last_watchdog_note`, and every one of them is news
                     // the caller cannot discover by asking — the VM they left suspended is no longer
                     // suspended, and a stop point they armed is now disabled. Pushed as well as
@@ -14912,14 +14909,14 @@ fn spawn_watchdog(
                     // already on the session, and that copy is the one to alert from.
                     let level = match resume_and_verify(&mut s).await {
                         Ok(None) => {
-                            s.mark_resumed();
+                            s.suspensions.mark_resumed();
                             let note = format!("watchdog auto-resumed the VM after {secs}s {disarmed}");
                             info!("{note}");
                             s.note_watchdog(note);
                             "warning"
                         }
                         Ok(Some(detail)) if detail.starts_with("cleared") => {
-                            s.mark_resumed();
+                            s.suspensions.mark_resumed();
                             let note =
                                 format!("watchdog auto-resumed the VM after {secs}s {disarmed} ({detail})");
                             info!("{note}");
@@ -14964,7 +14961,7 @@ fn spawn_watchdog(
 /// needs that lock piles up behind it — a stall the caller never asked for, produced by the *cheap* tool,
 /// and one nothing else here would ever resume.
 ///
-/// **Why it is a separate arm** rather than folded into the VM-wide one: `suspended_since` means "the VM
+/// **Why it is a separate arm** rather than folded into the VM-wide one: `suspensions.vm` means "the VM
 /// is stopped", and these threads are a different fact with a different remedy, so the two must be able
 /// to fire independently. A session can easily be in one state and not the other.
 ///
@@ -14973,22 +14970,14 @@ fn spawn_watchdog(
 /// everywhere else here, a thread it could not free keeps its record so the next tick tries again —
 /// never go quiet on a false success (SAFE-7).
 async fn rescue_overdue_thread_suspends(s: &mut crate::session::DebugSession, secs: u64) {
-    let overdue: Vec<u64> = s
-        .thread_suspends
-        .iter()
-        .filter(|(_, r)| r.since.elapsed().as_secs() >= secs)
-        .map(|(t, _)| *t)
-        .collect();
+    // One instant for both figures, so the "held up to" a note prints cannot disagree with the
+    // selection it describes.
+    let now = std::time::Instant::now();
+    let overdue = s.suspensions.overdue_threads(secs, now);
     if overdue.is_empty() {
         return;
     }
-    let held_for = s
-        .thread_suspends
-        .iter()
-        .filter(|(t, _)| overdue.contains(t))
-        .map(|(_, r)| r.since.elapsed())
-        .max()
-        .unwrap_or_default();
+    let held_for = s.suspensions.longest_held(&overdue, now);
     let (freed, stuck) = release_thread_suspends(s, Some(&overdue)).await;
     let (note, level) = if stuck.is_empty() {
         (

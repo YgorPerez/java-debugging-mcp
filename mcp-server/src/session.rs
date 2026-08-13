@@ -40,40 +40,16 @@ pub struct DebugSession {
     /// cleared before the next resume, or it re-fires the instant threads run again.
     ///
     /// The **thread** joined the tuple with SAFE-11, and it is a pair rather than two fields for the same
-    /// reason `suspended_since`/`suspended_cause` are set together: two fields that mean one thing drift,
+    /// reason [`VmSuspend`] is one value rather than two `Option`s: two fields that mean one thing drift,
     /// which is the bug SAFE-5 fixed. `debug.resume_thread` needs the thread, because releasing one thread
     /// that still has a step armed on it re-suspends it at the very next line — and JDWP's step events are
     /// `SuspendPolicy::All`, so a per-thread resume would freeze the WHOLE VM. That is a new way to leave
     /// the debuggee suspended, which is precisely what the resume-honesty matrix's `Freeze` list is for.
     pub pending_step: Option<(i32, u64)>,
-    /// When the VM last suspended; cleared on resume. Drives the watchdog.
-    pub suspended_since: Option<std::time::Instant>,
-    /// **Why** the VM is suspended, recorded at suspension time and cleared on resume.
-    ///
-    /// The watchdog used to re-derive the offending stop point from the newest buffered event, which
-    /// `get_last_event {drain:true}` could erase — so the polling caller `drain` exists for was exactly
-    /// the one whose freeze never got disarmed (SAFE-5). One authoritative field instead of two sources
-    /// of truth, and it also lets a manual `debug.pause` be told apart from a stop-point hit (SAFE-4).
-    pub suspended_cause: Option<SuspendCause>,
-    /// Threads this session is holding suspended **one at a time** (SAFE-11), keyed by thread id.
-    ///
-    /// Separate from [`suspended_since`](Self::suspended_since) on purpose, and the separation is the
-    /// whole design. That field means *the VM is stopped* — every thread, nobody's request served — and
-    /// `debug.continue` is what ends it. This one means *these N threads are stopped and the rest of the
-    /// JVM is serving normally*, which is a different fact, ends a different way, and has a different
-    /// blast radius. Collapsing them would make `debug.list_sessions` say `SUSPENDED` about a VM that is
-    /// running fine, and would make `debug.pause`'s idempotency check refuse a pause because one worker
-    /// was held.
-    ///
-    /// **It is bookkeeping, never the authority.** ADR-0003 rejected tracking our own suspend depth and
-    /// resuming that many times, because the count drifts the moment anything outside this session
-    /// suspends the same thread — another debugger, an IDE left attached, an `EventThread` event. So this
-    /// records *what this session asked for*, and every reply about whether a thread is actually running
-    /// still comes from `ThreadReference.SuspendCount`.
-    ///
-    /// A `BTreeMap` so listings and rescue notes name threads in a stable order rather than a hash order,
-    /// matching [`redefinitions`](Self::redefinitions).
-    pub thread_suspends: std::collections::BTreeMap<u64, ThreadSuspend>,
+    /// Everything this session is holding suspended: the whole VM, individual threads, or both
+    /// (CLEAN-6, #189). See [`Suspensions`] — the two are separate facts on purpose, and the type is
+    /// where that separation, and ADR-0003's rule that none of it is the authority, are written down.
+    pub suspensions: Suspensions,
     pub watchdog_task: Option<JoinHandle<()>>,
     /// What the watchdog last did, if anything — surfaced in `list_stop_points` and `get_last_event`
     /// so a caller who was away learns the VM was auto-resumed and which stop point was disarmed (SAFE-2).
@@ -434,7 +410,7 @@ pub struct EventRecord {
     /// A field on the record rather than a session flag, because it is a fact about **this hit** and the
     /// next hit may escalate cleanly. The state it names — matched, one thread held, application still
     /// running — is one no other field can express: the event's own suspend policy says a thread was
-    /// suspended, and `suspended_since` says this session is holding something, and both are true while
+    /// suspended, and `suspensions.vm` says this session is holding something, and both are true while
     /// the VM is emphatically not stopped.
     pub escalation: Option<FailedEscalation>,
 }
@@ -486,8 +462,209 @@ pub struct ThreadSuspend {
     pub since: std::time::Instant,
     /// How many `debug.suspend_thread` calls this session has made against this thread without a
     /// matching `debug.resume_thread`. Reported, never trusted — see
-    /// [`thread_suspends`](DebugSession::thread_suspends).
+    /// [`Suspensions::threads`].
     pub issued: u32,
+}
+
+/// A VM-wide suspension: when it started, and why. **One value, because the pair has no legal half.**
+///
+/// It was `suspended_since: Option<Instant>` and `suspended_cause: Option<SuspendCause>`, which admits
+/// four states for a fact that has two. Two of the four are the bug SAFE-5 fixed — a manual pause that
+/// recorded a timestamp and no cause, so the watchdog resumed the VM and could not say what had frozen it —
+/// and `mark_suspended`/`mark_resumed` were added to keep them in step. That is mediation, and it worked;
+/// this is the same invariant held by construction instead, which is the difference ADR-0050 argues for.
+///
+/// What it removes at the call sites is the guards against the states that can no longer occur:
+/// `suspended_since.map_or(0, …)` next to a cause the code had already matched as `Some`, and the
+/// watchdog's `None => "(cause unrecorded)"` arm, which existed only because a suspension could have a
+/// clock and no reason.
+#[derive(Debug, Clone, Copy)]
+pub struct VmSuspend {
+    /// When the VM suspended. Drives the watchdog, and the "how long ago" every reply about an
+    /// already-suspended VM prints.
+    pub since: std::time::Instant,
+    /// **Why** the VM is suspended, recorded at suspension time rather than re-derived.
+    ///
+    /// The watchdog used to work the offending stop point out from the newest buffered event, which
+    /// `get_last_event {drain:true}` could erase — so the polling caller `drain` exists for was exactly
+    /// the one whose freeze never got disarmed (SAFE-5). One authoritative field instead of two sources
+    /// of truth, and it also lets a manual `debug.pause` be told apart from a stop-point hit (SAFE-4).
+    pub cause: SuspendCause,
+}
+
+/// A session's suspension bookkeeping, and the third cluster ADR-0050 describes (CLEAN-6, #189).
+///
+/// **The two fields are two different facts, and keeping them apart is the whole design.** [`Self::vm`]
+/// means *the VM is stopped* — every thread, nobody's request served — and `debug.continue` is what ends
+/// it. [`Self::threads`] means *these N threads are stopped and the rest of the JVM is serving normally*,
+/// which ends a different way and has a different blast radius. Collapsing them would make
+/// `debug.list_sessions` say `SUSPENDED` about a VM that is running fine, and would make `debug.pause`'s
+/// idempotency check refuse a pause because one worker was held. They are in one type because the
+/// **watchdog reads both on every tick** and rescues them on separate arms, which is the invariant that
+/// spans them: a session can be in either state, both, or neither, and each has to be able to fire alone.
+///
+/// **None of it is the authority, and that is ADR-0003.** Tracking our own suspend depth and resuming
+/// that many times was the rejected alternative, because the count drifts the moment anything outside this
+/// session suspends the same thread — another debugger, an IDE left attached, an `EventThread` event. So
+/// this records *what this session asked for*, every reply about whether a thread is actually running
+/// comes from `ThreadReference.SuspendCount`, and [`Self::forget_thread`] is how a claim the JVM has
+/// contradicted stops being made. Until this type existed, that rule had nowhere to be asserted: the
+/// bookkeeping lived on a [`DebugSession`], which owns a [`JdwpConnection`] and cannot be built without a
+/// socket (ADR-0049), so every one of the rules below was enforced by a handler and tested by nothing.
+///
+/// **It is constructible with no socket**, which is the point of the type — a test that wants a session
+/// holding two threads since three minutes ago builds one here in four lines.
+#[derive(Debug)]
+pub struct Suspensions {
+    /// The VM-wide suspension, or `None` when the debuggee is running.
+    pub vm: Option<VmSuspend>,
+    /// Threads this session is holding suspended **one at a time** (SAFE-11), keyed by thread id.
+    ///
+    /// A `BTreeMap` so listings and rescue notes name threads in a stable order rather than a hash order,
+    /// matching [`DebugSession::redefinitions`] — and [`Self::forget_all_threads`] returns that order to
+    /// the disconnect reply.
+    pub threads: std::collections::BTreeMap<u64, ThreadSuspend>,
+}
+
+impl Suspensions {
+    /// A session's suspension state at the moment of attach: the VM is running and no thread is held.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { vm: None, threads: std::collections::BTreeMap::new() }
+    }
+
+    /// Record that the VM is now suspended, and why.
+    ///
+    /// **It overwrites, and the callers do not all agree that is safe.** `debug.pause` and
+    /// `debug.thread_dump` refuse to suspend a VM that is already suspended, because a second suspend
+    /// builds a counted depth one resume cannot undo *and* would replace a `StopPoint` cause with
+    /// `ManualPause`, losing the SAFE-2 disarm — so the refusal lives with the caller that knows why it
+    /// is refusing, and what this must not do is silently keep the older clock, which would make the
+    /// watchdog measure a suspension against the wrong start.
+    ///
+    /// **The event pump is the caller that does not check, and there is a known hole under it.** It
+    /// records a cause on every suspending event, deliberately including one whose escalation to a
+    /// VM-wide suspend FAILED — that hit's thread is still held, and this is the only record of it. But a
+    /// failed escalation leaves the VM *running*, so a second hit arrives and overwrites both halves: the
+    /// watchdog then disarms the newer request and the older one is never disarmed, which is the SAFE-2
+    /// loss the paragraph above describes. It predates this type and is not made worse by it; it is
+    /// written down here because the honest reading of "it overwrites" is that one caller has not decided
+    /// anything about it.
+    pub fn mark_suspended(&mut self, cause: SuspendCause) {
+        self.vm = Some(VmSuspend { since: std::time::Instant::now(), cause });
+    }
+
+    /// Record that the VM is running again. Every resume path calls this, so nothing is left stale.
+    ///
+    /// **It says nothing about [`Self::threads`]**, deliberately. `debug.continue` clears the VM's suspend
+    /// depth, which is a different count from a per-thread suspend, and a thread held by
+    /// `debug.suspend_thread` is still held afterwards — which is exactly what `verify_thread_suspends`
+    /// tells the caller instead of letting them assume otherwise.
+    pub const fn mark_resumed(&mut self) {
+        self.vm = None;
+    }
+
+    /// Record that this session has suspended thread `tid`, and return how many suspends of it this
+    /// session is now claiming — the `ours` figure the reply prints.
+    ///
+    /// **A second suspend of the same thread does not restart its clock**, and that is the invariant this
+    /// method exists to hold rather than to describe. [`ThreadSuspend::since`] is the age the watchdog
+    /// measures against `JDWP_WATCHDOG_SECS`; the hazard it exists for is how long a worker has been off
+    /// the pool, and that clock started at the *first* suspend. Refreshing it would let a caller keep a
+    /// thread frozen forever by suspending it repeatedly — a rescue that never fires, produced by a line
+    /// that looks like an update to a timestamp.
+    pub fn hold_thread(&mut self, tid: u64, name: String, at: std::time::Instant) -> u32 {
+        let entry = self.threads.entry(tid).or_insert_with(|| ThreadSuspend { name, since: at, issued: 0 });
+        entry.issued = entry.issued.saturating_add(1);
+        entry.issued
+    }
+
+    /// Drop **one** of this session's claims on `tid`, as `debug.resume_thread` does — one call, one
+    /// decrement (ADR-0003). Returns the record as it stood *before* the decrement, which is what the
+    /// reply names the thread and its age from, or `None` when this session was not holding it.
+    ///
+    /// **The record goes when our own count reaches zero, even if the JVM still reports depth.** Whatever
+    /// is left then is not ours, and keeping the entry would put this session's name on somebody else's
+    /// suspension — including in the watchdog's rescue list, which would resume a thread we never held.
+    pub fn release_thread(&mut self, tid: u64) -> Option<ThreadSuspend> {
+        let rec = self.threads.get_mut(&tid)?;
+        let before = rec.clone();
+        rec.issued = rec.issued.saturating_sub(1);
+        if rec.issued == 0 {
+            self.threads.remove(&tid);
+        }
+        Some(before)
+    }
+
+    /// Stop claiming `tid` **entirely**, whatever this session's own count says. Answers whether there
+    /// was a claim to drop.
+    ///
+    /// This is ADR-0003's rule in its bookkeeping half: the JVM is the authority, so a thread it says is
+    /// running — or one that has ended, or one a `debug.panic` resumed to a count of zero — is not ours to
+    /// claim any more, and how many times *we* asked is beside the point. Distinct from
+    /// [`Self::release_thread`] for exactly that reason: one is a caller giving a thread back, the other
+    /// is a claim expiring against evidence, and decrementing here would leave a record for a thread
+    /// nothing is holding.
+    pub fn forget_thread(&mut self, tid: u64) -> bool {
+        self.threads.remove(&tid).is_some()
+    }
+
+    /// Stop claiming every thread, returning their names in the map's stable order — `debug.disconnect`'s
+    /// case, where `VirtualMachine.Dispose` has already resumed them all.
+    ///
+    /// The names come back because the reply has to say which threads went: the claim is being dropped
+    /// because it is no longer true, and a caller who left a worker suspended is the one person who needs
+    /// to be told it was released.
+    pub fn forget_all_threads(&mut self) -> Vec<String> {
+        let names = self.threads.values().map(|r| r.name.clone()).collect();
+        self.threads.clear();
+        names
+    }
+
+    /// The threads this session has held for at least `secs` — the watchdog's second arm (SAFE-11).
+    ///
+    /// **Only the overdue ones.** A thread suspended ten seconds ago is a caller at work, not a leak, and
+    /// sweeping it up with one held for three minutes would make the tool unusable for its purpose.
+    ///
+    /// Measured from [`ThreadSuspend::since`], which is why this and [`Self::hold_thread`] cannot be
+    /// reasoned about apart: a thread suspended repeatedly still becomes overdue, because the first
+    /// suspend set the clock and no later one moves it.
+    ///
+    /// `now` is a parameter for the same reason [`DebugSession::open_monitor_pair`]'s `at` is — a caller
+    /// wanting two figures about one moment must be able to pass the same moment to both, and a test must
+    /// be able to name a moment five minutes on without depending on how long the machine has been up.
+    /// `Instant` has no portable origin, so *backdating* is the operation with no safe form here.
+    #[must_use]
+    pub fn overdue_threads(&self, secs: u64, now: std::time::Instant) -> Vec<u64> {
+        self.threads
+            .iter()
+            .filter(|(_, r)| now.saturating_duration_since(r.since).as_secs() >= secs)
+            .map(|(t, _)| *t)
+            .collect()
+    }
+
+    /// How long the oldest of `tids` has been held — the "held up to" figure a rescue note prints.
+    ///
+    /// Zero when none of them is held, which a caller reaches only by asking about threads that were
+    /// released underneath it.
+    ///
+    /// Takes `now` so a rescue measures this against the very instant it selected the threads with
+    /// [`Self::overdue_threads`], rather than a few microseconds later.
+    #[must_use]
+    pub fn longest_held(&self, tids: &[u64], now: std::time::Instant) -> std::time::Duration {
+        self.threads
+            .iter()
+            .filter(|(t, _)| tids.contains(t))
+            .map(|(_, r)| now.saturating_duration_since(r.since))
+            .max()
+            .unwrap_or_default()
+    }
+}
+
+impl Default for Suspensions {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// One class this session redefined, and what is worth saying about it afterwards (SWAP-2).
@@ -719,9 +896,14 @@ pub enum EventPump {
 ///   acting; it is remembering. `note_redefinition`, `note_watchdog`, `note_disarmed_traced`,
 ///   `note_trace_disarm`, `note_pop`.
 /// - **`mark_…`** — set a session state that something else will read as a fact about the VM.
-///   `mark_suspended`, `mark_resumed`.
+///   [`Suspensions::mark_suspended`], [`Suspensions::mark_resumed`].
 /// - **`open_…` / `close_…`** — one half of a pair's lifetime, where the other half completes it.
 ///   `open_monitor_pair`, `close_monitor_pair`.
+/// - **`hold_…` / `release_…`** — the same pairing for something the *caller* opens and closes, where the
+///   debuggee is what is being held. [`Suspensions::hold_thread`], [`Suspensions::release_thread`].
+/// - **`forget_…`** — drop bookkeeping the debuggee has contradicted, which is not the same as the caller
+///   closing it and must never decrement a count (ADR-0003). [`Suspensions::forget_thread`],
+///   [`Suspensions::forget_all_threads`].
 /// - **`push_…`** — append to a **bounded** ring buffer, with eviction counted rather than silent.
 ///   `push_event`.
 /// - **`register_…`** — add to a collection under an id the value itself carries. `register_stop_point`.
@@ -792,14 +974,6 @@ impl DebugSession {
         self.event_seq
     }
 
-    /// Record that the VM is now suspended, and why. Paired with [`mark_resumed`](Self::mark_resumed) so
-    /// the timestamp and the cause can't drift apart — the bug SAFE-5 fixed came from tracking them
-    /// separately.
-    pub fn mark_suspended(&mut self, cause: SuspendCause) {
-        self.suspended_since = Some(std::time::Instant::now());
-        self.suspended_cause = Some(cause);
-    }
-
     /// Record that the **opening** half of a monitor pair has arrived, so the closing half can measure
     /// the duration (DUMP-7, ADR-0035). Returns the eviction note when the map was full.
     ///
@@ -846,12 +1020,6 @@ impl DebugSession {
     pub fn watchdog_note_for(&self, newest_seq: Option<u64>) -> Option<&str> {
         let (note, at) = (self.last_watchdog_note.as_deref()?, self.last_watchdog_seq?);
         (newest_seq? <= at).then_some(note)
-    }
-
-    /// Record that the VM is running again. Every resume path calls this, so neither field is left stale.
-    pub const fn mark_resumed(&mut self) {
-        self.suspended_since = None;
-        self.suspended_cause = None;
     }
 
     /// Record what the watchdog just did, stamped with the event it happened after (SAFE-10).
@@ -1328,9 +1496,7 @@ impl SessionManager {
             event_listener_task: None,
             last_thread: None,
             pending_step: None,
-            suspended_since: None,
-            suspended_cause: None,
-            thread_suspends: std::collections::BTreeMap::new(),
+            suspensions: Suspensions::new(),
             watchdog_task: None,
             last_watchdog_note: None,
             last_watchdog_seq: None,
@@ -1897,12 +2063,191 @@ mod tests {
         assert!((share - 0.01).abs() < 0.0005, "expected ~1% of the window, got {share}");
     }
 
-    // SAFE-4/SAFE-5: the two halves of "the VM is suspended" move together. Tracking them separately is
-    // what let a manual pause record no cause at all, and a drain erase the offender.
+    // SAFE-2/SAFE-4: the request id is part of the cause's identity, because the watchdog disarms the
+    // request the cause names. Two stop-point causes that compared equal would let it disarm the wrong one.
     #[test]
     fn suspend_cause_distinguishes_a_stop_point_from_a_manual_pause() {
         assert_ne!(SuspendCause::ManualPause, SuspendCause::StopPoint(7));
         assert_eq!(SuspendCause::StopPoint(7), SuspendCause::StopPoint(7));
         assert_ne!(SuspendCause::StopPoint(7), SuspendCause::StopPoint(8));
+    }
+
+    /// `secs` seconds after `t0`, for the watchdog assertions below.
+    ///
+    /// **Forward from an origin the test owns, never backwards from now.** Building an age with
+    /// `Instant::now() - 300s` would make these tests depend on how long the machine has been up:
+    /// `Instant` has no portable origin, and `checked_sub` answers `None` when the result would precede
+    /// it — a panic on a box that booted a minute ago, and a `windows-latest` or `macos-latest`
+    /// contributor is who would hit it. `handlers.rs`'s `jvm_method` helper refuses the same trick for
+    /// the same reason, and it is why `hold_thread` and `overdue_threads` take their instant rather than
+    /// reading the clock themselves, the way `open_monitor_pair` already did.
+    fn secs_after(t0: std::time::Instant, secs: u64) -> std::time::Instant {
+        t0 + std::time::Duration::from_secs(secs)
+    }
+
+    // SAFE-4/SAFE-5: the two halves of "the VM is suspended" cannot come apart, because they are one
+    // value. Tracking them separately is what let a manual pause record a clock and no cause at all — so
+    // the watchdog resumed the VM and could not say what had frozen it.
+    #[test]
+    fn a_vm_suspension_carries_its_clock_and_its_cause_together() {
+        let mut s = Suspensions::new();
+        assert!(s.vm.is_none(), "a fresh session's debuggee is running");
+
+        s.mark_suspended(SuspendCause::StopPoint(11));
+        let vm = s.vm.expect("suspended");
+        assert_eq!(vm.cause, SuspendCause::StopPoint(11));
+        assert!(vm.since.elapsed() < std::time::Duration::from_secs(5), "the clock started just now");
+
+        s.mark_resumed();
+        assert!(s.vm.is_none(), "a resume clears the cause with the clock, never one without the other");
+    }
+
+    // SAFE-11, and the reason `Suspensions` holds both fields: a held thread is not a suspended VM, and a
+    // suspended VM does not release a held thread. Collapsing them would make `debug.list_sessions` print
+    // SUSPENDED about a VM serving requests normally, and make `debug.continue` look like it freed a worker.
+    #[test]
+    fn a_suspended_vm_and_a_held_thread_are_independent_facts() {
+        let mut s = Suspensions::new();
+
+        s.hold_thread(0x1f, "http-worker-3".to_string(), std::time::Instant::now());
+        assert!(s.vm.is_none(), "holding one worker does not stop the VM");
+
+        s.mark_suspended(SuspendCause::ManualPause);
+        assert_eq!(s.threads.len(), 1, "suspending the VM does not change what we hold thread-wise");
+
+        s.mark_resumed();
+        assert!(
+            s.threads.contains_key(&0x1f),
+            "debug.continue clears the VM's depth, which is a different count — the worker is still held"
+        );
+    }
+
+    // The invariant `hold_thread` exists to hold rather than to describe: the watchdog measures a thread's
+    // age from the FIRST suspend, so a caller cannot keep a worker frozen forever by suspending it again.
+    #[test]
+    fn a_second_suspend_of_one_thread_does_not_restart_its_clock() {
+        let mut s = Suspensions::new();
+        let t0 = std::time::Instant::now();
+        let five_min_on = secs_after(t0, 300);
+        assert_eq!(s.hold_thread(0x2a, "pool-1-thread-4".to_string(), t0), 1);
+
+        assert_eq!(
+            s.hold_thread(0x2a, "pool-1-thread-4".to_string(), five_min_on),
+            2,
+            "our own claim count grows"
+        );
+        assert_eq!(s.threads[&0x2a].since, t0, "the clock the watchdog reads must not move");
+        assert_eq!(s.threads.len(), 1, "and it is still one thread, not two records");
+        assert_eq!(
+            s.overdue_threads(120, five_min_on),
+            vec![0x2a],
+            "so it is still overdue five minutes on, which is the rescue this protects"
+        );
+    }
+
+    // ADR-0003, one call one decrement: a caller who suspended twice is told they are one call short
+    // rather than told they succeeded. The record has to survive the first release for the reply to say so.
+    #[test]
+    fn a_thread_held_twice_needs_two_releases() {
+        let mut s = Suspensions::new();
+        let now = std::time::Instant::now();
+        s.hold_thread(0x33, "scheduler".to_string(), now);
+        s.hold_thread(0x33, "scheduler".to_string(), now);
+
+        let first = s.release_thread(0x33).expect("we were holding it");
+        assert_eq!(first.issued, 2, "the record as it stood, so the reply can name a claim it is dropping");
+        assert_eq!(s.threads[&0x33].issued, 1, "one claim left, so this session still holds the thread");
+
+        let second = s.release_thread(0x33).expect("still held");
+        assert_eq!(second.issued, 1);
+        assert!(!s.threads.contains_key(&0x33), "our count reached zero, so the claim goes");
+    }
+
+    // ADR-0003's other half, and the distinction between the two verbs. `forget_thread` drops the whole
+    // claim because the debuggee has contradicted it — a thread that ended, or one a debug.panic resumed
+    // to zero. Decrementing there would leave a record for a thread nothing is holding, which the watchdog
+    // would then try to rescue and `list_sessions` would report as frozen.
+    #[test]
+    fn the_debuggees_answer_forgets_a_claim_our_own_count_still_believes_in() {
+        let mut s = Suspensions::new();
+        let now = std::time::Instant::now();
+        s.hold_thread(0x44, "doomed".to_string(), now);
+        s.hold_thread(0x44, "doomed".to_string(), now);
+
+        assert!(s.forget_thread(0x44), "there was a claim to drop");
+        assert!(s.threads.is_empty(), "the whole claim goes, not one of its two suspends");
+        assert!(!s.forget_thread(0x44), "and a second call has nothing to drop");
+    }
+
+    // Neither verb may panic on a thread this session never held: `debug.resume_thread` reaches both with
+    // a caller-supplied id, and `verify_thread_suspends` reaches `forget_thread` for a thread the JVM has
+    // already let go.
+    #[test]
+    fn releasing_or_forgetting_a_thread_nobody_held_says_so() {
+        let mut s = Suspensions::new();
+        assert!(s.release_thread(0x99).is_none());
+        assert!(!s.forget_thread(0x99));
+        assert!(s.threads.is_empty(), "and neither invented a record on the way");
+    }
+
+    // SAFE-11's watchdog arm: only the OVERDUE threads. A thread suspended ten seconds ago is a caller at
+    // work, not a leak. Paired with the clock invariant above — a repeatedly suspended thread stays overdue,
+    // which is the span between `hold_thread` and `overdue_threads` that neither can be checked apart from.
+    #[test]
+    fn only_threads_past_the_watchdogs_bound_are_overdue() {
+        let mut s = Suspensions::new();
+        let t0 = std::time::Instant::now();
+        let now = secs_after(t0, 300);
+        s.hold_thread(0x1, "stale-worker".to_string(), t0);
+        s.hold_thread(0x2, "recent-worker".to_string(), secs_after(t0, 290));
+
+        assert_eq!(s.overdue_threads(120, now), vec![0x1], "the ten-second-old one is a caller at work");
+        assert!(s.overdue_threads(600, now).is_empty(), "nothing is overdue against a longer bound");
+
+        s.hold_thread(0x1, "stale-worker".to_string(), now);
+        assert_eq!(
+            s.overdue_threads(120, now),
+            vec![0x1],
+            "suspending it again must not buy it another 120 seconds — that is the rescue never firing"
+        );
+    }
+
+    // The "held up to" figure a rescue note prints is the OLDEST of the threads being released, and it is
+    // measured over the ids asked about rather than over everything held: the watchdog releases a subset.
+    #[test]
+    fn the_rescue_note_measures_the_oldest_of_the_threads_it_names() {
+        let mut s = Suspensions::new();
+        let t0 = std::time::Instant::now();
+        let now = secs_after(t0, 300);
+        s.hold_thread(0x1, "oldest".to_string(), t0);
+        s.hold_thread(0x2, "middle".to_string(), secs_after(t0, 100));
+        s.hold_thread(0x3, "newest".to_string(), secs_after(t0, 299));
+
+        assert_eq!(
+            s.longest_held(&[0x2, 0x3], now),
+            std::time::Duration::from_secs(200),
+            "the oldest of the two NAMED, not the 300s thread nobody asked about"
+        );
+        assert_eq!(
+            s.longest_held(&[], now),
+            std::time::Duration::ZERO,
+            "and nothing named is zero rather than a panic on an empty max"
+        );
+    }
+
+    // `debug.disconnect`'s case: Dispose has already resumed every thread, so every claim goes at once and
+    // the reply names them. In the map's stable order, because a caller comparing two disconnect replies
+    // should not see a hash order shuffle.
+    #[test]
+    fn forgetting_every_thread_names_them_in_a_stable_order() {
+        let mut s = Suspensions::new();
+        let now = std::time::Instant::now();
+        s.hold_thread(0x30, "ajp-3".to_string(), now);
+        s.hold_thread(0x10, "ajp-1".to_string(), now);
+        s.hold_thread(0x20, "ajp-2".to_string(), now);
+
+        assert_eq!(s.forget_all_threads(), vec!["ajp-1", "ajp-2", "ajp-3"], "ordered by thread id");
+        assert!(s.threads.is_empty());
+        assert!(s.forget_all_threads().is_empty(), "and a second disconnect has nothing left to name");
     }
 }

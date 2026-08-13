@@ -44,8 +44,8 @@ applies unchanged here, so the tool issues exactly one `ThreadReference.Resume`,
 `ThreadReference.SuspendCount`, and says **`STILL suspended`** when the count did not reach zero. A
 caller who suspended twice is told they are one call short instead of being told they succeeded.
 
-Session state (`thread_suspends`) records *what this session asked for* and is never the authority on
-whether a thread is running.
+Session state (`Suspensions::threads`) records *what this session asked for* and is never the authority
+on whether a thread is running.
 
 ### 3. The watchdog covers per-thread suspends, on the same timer
 
@@ -55,7 +55,7 @@ that needs that lock piles up behind it. That is a stall the caller never asked 
 *cheap* tool, and — before this — nothing else in the server would ever have resumed it.
 
 It is a **separate branch** of the watchdog rather than an extension of the VM-wide one, because
-`suspended_since` means "the VM is stopped" and these threads are a different fact with a different
+`Suspensions::vm` means "the VM is stopped" and these threads are a different fact with a different
 remedy. It releases only the threads that are *overdue*, verifies each against `SuspendCount`, and on
 failure keeps the record so the next tick tries again — the SAFE-7 rule that a rescue must never go
 quiet on a false success.
