@@ -6150,6 +6150,53 @@ async fn arm_one_monitor(
     Ok((id, request_id, kind))
 }
 
+/// The per-pair duration lines of a monitor arm reply: whether a figure is available at all, and — where
+/// one is — the two ways it can mislead.
+///
+/// Extracted from [`describe_monitor_arm`] when TEST-51 (#182) made the honest version of the second
+/// paragraph long enough to push that function past `clippy::too_many_lines`. It is the right seam anyway:
+/// this depends on nothing but which kinds were armed, where its caller reaches for the args, the arm, the
+/// capabilities and the frames note.
+///
+/// **The wording is load-bearing and was wrong until #182.** It used to say the figure was "trustworthy at
+/// the multi-second scale a wedged lock shows; noisy below ~10ms", which reads as an error bounded by the
+/// block's own length. It is bounded by nothing: a traced stop holds the contender at the opening event, so
+/// the figure is how long it waited *after* we resumed it — 1 ms measured for a thread kept off a lock
+/// 800 ms. See [`monitor_duration_detail`].
+fn describe_monitor_pairing(kinds: &[jdwp_client::MonitorKind]) -> String {
+    let mut out = String::new();
+    for pair in [crate::session::MonitorPair::Contended, crate::session::MonitorPair::Wait] {
+        let members: Vec<jdwp_client::MonitorKind> =
+            kinds.iter().copied().filter(|k| crate::session::MonitorPair::of(*k).0 == pair).collect();
+        if members.is_empty() {
+            continue;
+        }
+        let label = pair.duration_label();
+        if members.len() == 2 {
+            let _ = write!(
+                out,
+                "\n   {label}: measured across both events, BY THIS SERVER — no monitor event carries a \
+                 duration, so the figure carries our own capture latency (~0.86ms/hit before caller \
+                 frames) and SPANS OUR HANDLING of the two events rather than the JVM's. On a traced stop \
+                 the hit thread is held at the first event until we resume it, and the second cannot happen \
+                 before that — so this is how long it waited AFTER we released it, and it READS SHORT when \
+                 our pump was late: measured at 1ms for a thread kept off a lock 800ms. A figure smaller \
+                 than you expected is therefore not evidence the lock was held briefly. Several samples of \
+                 the same lock are worth much more than one."
+            );
+        } else if let Some(only) = members.first() {
+            let _ = write!(
+                out,
+                "\n   {label}: NOT available — only '{}' is armed, and a duration is measured across both \
+                 halves. Add '{}' to get one.",
+                only.label(),
+                only.partner().label()
+            );
+        }
+    }
+    out
+}
+
 /// Everything a monitor arm reply says about HOW it was armed — and, more than for any other kind, about
 /// what it can and cannot claim.
 ///
@@ -6177,30 +6224,7 @@ fn describe_monitor_arm(
 
     // Which durations are available, stated per pair rather than as one verdict: a call arming three kinds
     // has one complete pair and one half, and "a duration is available" would be true and misleading.
-    for pair in [crate::session::MonitorPair::Contended, crate::session::MonitorPair::Wait] {
-        let members: Vec<jdwp_client::MonitorKind> =
-            kinds.iter().copied().filter(|k| crate::session::MonitorPair::of(*k).0 == pair).collect();
-        if members.is_empty() {
-            continue;
-        }
-        let label = pair.duration_label();
-        if members.len() == 2 {
-            let _ = write!(
-                out,
-                "\n   {label}: measured across both events, BY THIS SERVER — no monitor event carries a \
-                 duration, so the figure includes our own capture latency (~0.86ms/hit before caller \
-                 frames). Reliable at the multi-second scale a wedged lock shows; noisy below ~10ms."
-            );
-        } else if let Some(only) = members.first() {
-            let _ = write!(
-                out,
-                "\n   {label}: NOT available — only '{}' is armed, and a duration is measured across both \
-                 halves. Add '{}' to get one.",
-                only.label(),
-                only.partner().label()
-            );
-        }
-    }
+    out.push_str(&describe_monitor_pairing(kinds));
 
     if let Some(min) = arm.min_duration_ms {
         let _ = write!(
@@ -6210,7 +6234,10 @@ fn describe_monitor_arm(
              notification. The opening event of each pair also stops producing snapshots and becomes pure \
              timestamping, because at that instant nothing has elapsed to compare — otherwise the \
              trace_max_hits budget would go on \"started blocking\" lines. debug.list_stop_points still \
-             counts every hit, so Hits with no snapshots means \"contended constantly, never for {min}ms\"."
+             counts every hit, so Hits with no snapshots means \"contended constantly, never for {min}ms\" \
+             — but read that with the caveat above: the figure this filters on can come out SHORT when the \
+             opening half queued in our event pump, so a block that really did last longer than {min}ms can \
+             be dropped here. Hits with no snapshots is therefore weaker evidence than it looks (TEST-51)."
         );
     }
     match &arm.monitor_class {
@@ -13004,10 +13031,18 @@ const fn monitor_hit_is_recordable(spec: MonitorTraceSpec, span: MonitorSpan) ->
 /// apart in the reply and opposite in what a caller does about them — see `CONTEXT.md`.
 ///
 /// **Every wording here says who measured it.** The figure is this server's own, taken between two events
-/// neither of which carries a time, so it includes the capture latency of the opening half (~0.86 ms per
-/// hit before caller frames, TRACE-7) and the event-pump queueing behind it. On a millisecond-scale block
-/// that overhead is a material fraction; on the multi-second blocks a wedged app server is asked about it
-/// is noise. A caller cannot judge which case they are in unless the reply admits whose number it is.
+/// neither of which carries a time, so it carries the capture latency of both halves (~0.86 ms per hit
+/// before caller frames, TRACE-7) and the event-pump queueing around them.
+///
+/// **On the CONTENDED pair it is not an error term at all, and that is what this used to get wrong**
+/// (TEST-51, #182). A traced monitor stop is armed at `EventThread`, so the JVM holds the *contending*
+/// thread at the opening event until this pump resumes it, and the closing event cannot be generated before
+/// then. So the figure is `(we process ENTERED) − (we process ENTER)` = **how long the contender waited
+/// after we released it**. A late pump does not add error to the block, it replaces it: the contention
+/// resolves while we hold the contender, and what is left to measure is the remainder of the holder's
+/// cycle. Measured across five stall lengths, a thread held off a lock for 800 ms reported **1 ms** — so
+/// the under-report is bounded by neither the block nor the latency, and it is not "noise against a
+/// multi-second block" as ADR-0035 first had it. A caller filtering on `min_duration_ms` filters on this.
 fn monitor_duration_detail(spec: MonitorTraceSpec, span: MonitorSpan) -> (String, String) {
     let label = spec.pair.duration_label().to_string();
     match span {
@@ -13031,7 +13066,10 @@ fn monitor_duration_detail(spec: MonitorTraceSpec, span: MonitorSpan) -> (String
             label,
             format!(
                 "{}ms (measured by the DEBUGGER across both events — no monitor event carries a duration, \
-                 so this includes our own capture latency)",
+                 so this spans OUR handling of the two, not the JVM's: on a traced stop the hit thread is \
+                 held at the first event until we resume it, which makes this how long it waited AFTER we \
+                 released it. It reads SHORT when our event pump was late — measured at 1ms for a thread \
+                 kept off a lock 800ms — so a small figure is not evidence of a brief wait)",
                 d.as_millis()
             ),
         ),
@@ -13723,9 +13761,20 @@ async fn record_one_traced_event(
     // the timestamp is what makes the *next* event measurable — skipping the bookkeeping for a hit we are
     // not going to record would silently break the duration on the hit we would have.
     //
-    // Timed at arrival rather than after the capture: the capture is ours (~0.86 ms, TRACE-7), and charging
-    // it to how long a thread was blocked would report our own cost as the debuggee's, which is the same
-    // rule `TraceCost` follows in the other direction.
+    // Timed before THIS event's capture rather than after it: the capture is ours (~0.86 ms, TRACE-7), and
+    // charging it to how long a thread was blocked would report our own cost as the debuggee's, which is
+    // the same rule `TraceCost` follows in the other direction.
+    //
+    // **It is NOT "at arrival", and that wording used to be here.** TEST-51 (#182) is what it cost. By the
+    // time this line runs the pump has awaited the composite off the wire, waited for the session lock,
+    // resolved the location and run the method filter — and events are processed one at a time, with a
+    // whole `capture_trace` between one and the next, so a burst of threads blocking on one lock queues.
+    //
+    // On the contended pair that is not merely late, it is load-bearing: the arming policy is `EventThread`,
+    // so the JVM holds the hit thread here until `try_record_trace` resumes it, and the CLOSING event cannot
+    // be generated before that. The figure therefore measures how long the contender waited *after we let it
+    // go* — 1 ms, measured, for a thread kept off a lock 800 ms. `monitor_duration_detail` says so to the
+    // caller, because `min_duration_ms` drops a pair on that figure.
     let monitor_span =
         req.monitor.and_then(|spec| span_monitor_event(session, spec, &details, std::time::Instant::now()));
     let skip = wrong_method

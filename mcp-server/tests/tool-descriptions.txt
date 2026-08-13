@@ -994,58 +994,67 @@ Pass kinds:["all"] for every kind. THE DURATION IS MEASURED BY THIS SERVER AND E
 MONITOR EVENT CARRIES ONE: MONITOR_CONTENDED_ENTERED reports that a thread got the lock and nothing about how
 long it waited, and MONITOR_WAIT's timeout is the number the caller PASSED to wait(…), not what it got — a
 wait(5000) that returns in 3ms still reports 5000. So "blocked for 4200ms" is computed here, between the two
-events of a pair, and it includes this server's own capture latency (~0.86ms per hit before caller frames).
-Trustworthy at the multi-second scale a wedged lock shows; noisy below ~10ms. ARMING ONE HALF OF A PAIR IS
-LEGAL AND CHEAPER — one request instead of two, answering "is anything blocking at all" — and its snapshots
-say the duration was not measurable rather than printing a zero. VOLUME IS THE REAL RISK AND IT IS UNLIKE ANY
-OTHER STOP POINT. An uncontended lock produces nothing at all, but a hot contended one produces two events per
-acquisition, and contention is not a site you chose — it is wherever threads happen to collide, INCLUDING
-inside the JDK (a seven-thread probe produced 434 events in 3 seconds, with a ReferenceQueue$Lock among them).
-Capture is serialised at roughly 720 hits/s with the default 3 caller frames, so this is the easiest way yet
-to reach that ceiling; trace_max_hits (default 200) is what stops it, and 0 removes the protection. PASS
-thread_id — IT IS THE ONLY FILTER THAT REDUCES DEBUGGEE COST, applied inside the JVM, so a non-matching event
-costs no packet and no capture. PASS min_duration_ms TO SEE ONLY THE BLOCKS THAT HURT, and read what it is
-honestly: JDWP has no duration modifier, so the event has already been generated, has already cost the
-debuggee its notification and has already arrived here — it filters what you READ. It needs both halves of the
-pair (there is nothing to measure otherwise, and it is refused rather than silently arming a stop point that
-can never record), and it changes what the opening event does: that event stops producing snapshots and
-becomes pure timestamping, because at that instant nothing has elapsed to compare — otherwise the whole hit
-budget would go on "started blocking" lines. debug.list_stop_points still counts every hit, so Hits: 900 with
-no snapshots means "contended constantly, never for that long", which is a different finding from Hits: 0.
-monitor_class IS ACCEPTED ONLY WITH wait/waited AND REFUSED ON blocked/acquired, and the asymmetry is JDWP's
-rather than this tool's. The spec defines ClassOnly per event kind, and the monitor reading applies only to
-the wait pair; on the contended pair HotSpot tests the class of the CODE THAT BLOCKED instead. Measured on
-Temurin 11.0.32 over 3s windows: a ClassOnly naming the lock's type gave 0 events on blocked and 74 on wait,
-one naming the blocking code's class gave 45 on blocked and 0 on wait. So it is refused where it would not
-mean what it reads like, rather than passed through under a reply claiming the stop point is scoped to a lock
-type. instance_id IS ACCEPTED AND ALWAYS REFUSED, for the same reason it is on method exits: InstanceOnly
-tests the frame's `this`, which is NOT the monitor, and HotSpot accepts it and ignores it anyway — measured
-against a probe whose every frame is static, so nothing could legitimately match, and the request still
-reported all three of its locks. THERE IS DELIBERATELY NO condition ON THIS KIND, and it is a safety decision
-rather than an omission: a condition is evaluated on the hit thread, and a thread suspended at a monitorenter
-is blocked on the very lock in the snapshot — an expression that invokes anything needing that monitor cannot
-complete, so the debugger would wedge the thread it is reporting on. min_duration_ms is this kind's filter and
-it needs nothing from the debuggee. AND AN INVOKING trace_expr IS NOW REFUSED ON blocked FOR THE SAME REASON,
-because a caution was not enough: a getter that reads a field under synchronized looks exactly like one that
-does not. blocked is the ONE of the four kinds where the hit thread does not own the monitor its own snapshot
-names — at acquired it has just entered, at wait it still holds the lock (Java requires that to call wait() at
-all), and at waited it has re-acquired it, all measured rather than assumed. Measured too: the cost of being
-wrong is not the two-second budget but a thread suspended for ever — the call completes when the lock is
-finally released and the JVM re-suspends that thread AT THAT MOMENT, 1.2s after this server gave up and
-resumed it, and nothing clears it, because the watchdog resumes a suspended VM and the VM is running. FIELD
-READS ARE ACCEPTED EVERYWHERE and invoking is accepted on the other three kinds. What no arming check can see
-is an expression naming a DIFFERENT lock, which can stall on any kind — that one is reported by the timeout
-message when it happens. trace DEFAULTS TO TRUE AND trace:false REQUIRES A thread_id. A suspending monitor
-stop is the most dangerous thing this server can arm — every other kind has a line, class, method or field to
-narrow it to because you chose where it fires, and contention gives you nothing to narrow to, so a VM-wide
-freeze lands on the next acquisition of any hot lock and can re-fire the instant you resume. Snapshots also
-carry the CALLER CHAIN (trace_frames, default 3), which is usually the actual answer: the same synchronized
-block is entered from every request path, so the lock and the line rarely identify the problem while the path
-does. A JVM without canRequestMonitorEvents is told so in a sentence that names the fallback, not a bare
-NOT_IMPLEMENTED. A session whose JVM has gone, or one left without an event pump, is REFUSED rather than
-armed: nothing would be reading the events, so a stop point there would suspend the debuggee at its first hit
-with nothing alive to resume it — debug.list_sessions marks the session and debug.attach opens a working one
-(SESS-2).
+events of a pair, and it spans THIS SERVER'S HANDLING of the two events rather than the JVM's, which is a
+bigger caveat than it sounds and is the correction to a sentence that used to call this trustworthy at the
+multi-second scale. On a traced stop the arming policy is event-thread, so the JVM holds the CONTENDING THREAD
+at the first event until this server processes it and resumes it — and the second event cannot even be
+generated before that. So the figure is how long that thread waited AFTER WE RELEASED IT, not how long it was
+blocked: when the event pump is busy, the contention resolves while we are still holding the contender, and
+what gets measured is only whatever is left of the holder's cycle. Measured by stalling the pump deliberately
+at five different lengths: a thread kept off a lock for 800ms reported 1ms, and the under-report is bounded by
+neither the block nor the latency. So A SMALL FIGURE IS NOT EVIDENCE OF A SHORT WAIT, several samples of one
+lock are worth far more than one, and it matters most when you filter — min_duration_ms drops a pair on this
+figure, so a lock that really did hold a thread for a second can be filtered out of a 200ms report because
+this server was late. ARMING ONE HALF OF A PAIR IS LEGAL AND CHEAPER — one request instead of two, answering
+"is anything blocking at all" — and its snapshots say the duration was not measurable rather than printing a
+zero. VOLUME IS THE REAL RISK AND IT IS UNLIKE ANY OTHER STOP POINT. An uncontended lock produces nothing at
+all, but a hot contended one produces two events per acquisition, and contention is not a site you chose — it
+is wherever threads happen to collide, INCLUDING inside the JDK (a seven-thread probe produced 434 events in 3
+seconds, with a ReferenceQueue$Lock among them). Capture is serialised at roughly 720 hits/s with the default
+3 caller frames, so this is the easiest way yet to reach that ceiling; trace_max_hits (default 200) is what
+stops it, and 0 removes the protection. PASS thread_id — IT IS THE ONLY FILTER THAT REDUCES DEBUGGEE COST,
+applied inside the JVM, so a non-matching event costs no packet and no capture. PASS min_duration_ms TO SEE
+ONLY THE BLOCKS THAT HURT, and read what it is honestly: JDWP has no duration modifier, so the event has
+already been generated, has already cost the debuggee its notification and has already arrived here — it
+filters what you READ. It needs both halves of the pair (there is nothing to measure otherwise, and it is
+refused rather than silently arming a stop point that can never record), and it changes what the opening event
+does: that event stops producing snapshots and becomes pure timestamping, because at that instant nothing has
+elapsed to compare — otherwise the whole hit budget would go on "started blocking" lines.
+debug.list_stop_points still counts every hit, so Hits: 900 with no snapshots means "contended constantly,
+never for that long", which is a different finding from Hits: 0. monitor_class IS ACCEPTED ONLY WITH
+wait/waited AND REFUSED ON blocked/acquired, and the asymmetry is JDWP's rather than this tool's. The spec
+defines ClassOnly per event kind, and the monitor reading applies only to the wait pair; on the contended pair
+HotSpot tests the class of the CODE THAT BLOCKED instead. Measured on Temurin 11.0.32 over 3s windows: a
+ClassOnly naming the lock's type gave 0 events on blocked and 74 on wait, one naming the blocking code's class
+gave 45 on blocked and 0 on wait. So it is refused where it would not mean what it reads like, rather than
+passed through under a reply claiming the stop point is scoped to a lock type. instance_id IS ACCEPTED AND
+ALWAYS REFUSED, for the same reason it is on method exits: InstanceOnly tests the frame's `this`, which is NOT
+the monitor, and HotSpot accepts it and ignores it anyway — measured against a probe whose every frame is
+static, so nothing could legitimately match, and the request still reported all three of its locks. THERE IS
+DELIBERATELY NO condition ON THIS KIND, and it is a safety decision rather than an omission: a condition is
+evaluated on the hit thread, and a thread suspended at a monitorenter is blocked on the very lock in the
+snapshot — an expression that invokes anything needing that monitor cannot complete, so the debugger would
+wedge the thread it is reporting on. min_duration_ms is this kind's filter and it needs nothing from the
+debuggee. AND AN INVOKING trace_expr IS NOW REFUSED ON blocked FOR THE SAME REASON, because a caution was not
+enough: a getter that reads a field under synchronized looks exactly like one that does not. blocked is the
+ONE of the four kinds where the hit thread does not own the monitor its own snapshot names — at acquired it
+has just entered, at wait it still holds the lock (Java requires that to call wait() at all), and at waited it
+has re-acquired it, all measured rather than assumed. Measured too: the cost of being wrong is not the
+two-second budget but a thread suspended for ever — the call completes when the lock is finally released and
+the JVM re-suspends that thread AT THAT MOMENT, 1.2s after this server gave up and resumed it, and nothing
+clears it, because the watchdog resumes a suspended VM and the VM is running. FIELD READS ARE ACCEPTED
+EVERYWHERE and invoking is accepted on the other three kinds. What no arming check can see is an expression
+naming a DIFFERENT lock, which can stall on any kind — that one is reported by the timeout message when it
+happens. trace DEFAULTS TO TRUE AND trace:false REQUIRES A thread_id. A suspending monitor stop is the most
+dangerous thing this server can arm — every other kind has a line, class, method or field to narrow it to
+because you chose where it fires, and contention gives you nothing to narrow to, so a VM-wide freeze lands on
+the next acquisition of any hot lock and can re-fire the instant you resume. Snapshots also carry the CALLER
+CHAIN (trace_frames, default 3), which is usually the actual answer: the same synchronized block is entered
+from every request path, so the lock and the line rarely identify the problem while the path does. A JVM
+without canRequestMonitorEvents is told so in a sentence that names the fallback, not a bare NOT_IMPLEMENTED.
+A session whose JVM has gone, or one left without an event pump, is REFUSED rather than armed: nothing would
+be reading the events, so a stop point there would suspend the debuggee at its first hit with nothing alive to
+resume it — debug.list_sessions marks the session and debug.attach opens a working one (SESS-2).
 
 ## debug.set_value
 Write a value to a local variable, a static field (e.g. ConfigDefaultUtils.dsInfra — flip tenant/infra on a

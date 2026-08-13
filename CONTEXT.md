@@ -628,11 +628,22 @@ way ("UNMEASURED rather than free"). A monitor duration is the opposite: it desc
 caller can reasonably read our number as theirs. So the label belongs to figures that cross that line, and
 adding it to a figure that describes us would be noise.
 
-So the label is not modesty about precision, it is a claim about **provenance**. A monitor duration is
-timestamped at the opening event and subtracted at the closing one, which means it includes our own capture
-latency (~0.86 ms per hit before caller frames) — noise against the multi-second block a wedged server is
-asked about, a material fraction of a 5 ms one. A caller cannot tell which case they are in unless the reply
-says whose number it is.
+So the label is not modesty about precision, it is a claim about **provenance**. A caller cannot tell whose
+number they are reading unless the reply says so.
+
+**And the gap is bigger than "our capture latency", which is what this entry used to call it** (TEST-51,
+[#182](https://github.com/YgorPerez/java-debugging-mcp/issues/182)). Both stamps are taken when *we process*
+the event, not when the JVM sent it — and a traced monitor stop is armed at **event-thread** policy, so the
+JVM holds the contending thread at the opening event until we get round to it and resume it. The closing
+event cannot even be generated before then. So a contended figure is
+
+> how long the thread waited **after we released it** — not how long it was blocked.
+
+A late event pump therefore does not add error to the figure, it **replaces** it: the contention resolves
+while we are holding the contender, and what is left to measure is whatever remains of the holder's cycle.
+Measured by stalling the pump deliberately: a thread held off a lock for 800 ms reported **1 ms**. The
+under-report is bounded by nothing — not by the block, not by the latency. It matters most when you filter,
+because `min_duration_ms` filters on this figure. ADR-0035 carries the measurements.
 
 **Class-load watch**:
 A request the debugger holds *instead of* a stop point, so a class it cannot arm yet can be armed the moment

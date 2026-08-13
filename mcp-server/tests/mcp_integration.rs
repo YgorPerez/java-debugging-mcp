@@ -16382,19 +16382,22 @@ fn a_paired_monitor_snapshot_carries_a_debugger_measured_duration() {
     // out, the distribution is tight and bimodal with no short outliers, and `measured=[8]`/`measured=[9]`
     // remain unexplained. What the scoping buys is that the assertion below can no longer be *misread* as
     // being about a lock it never covered.
-    let measured_on_a_known_lock = |line: &str| {
-        line.contains("measured by the DEBUGGER across both events")
-            && (line.contains("MonitorProbe$FastLock@0x") || line.contains("MonitorProbe$SlowLock@0x"))
-    };
+    // THREE figures, not one, and TEST-51 below is why. A debugger-measured duration comes out SHORT when
+    // the pump was late with the OPENING half — proven on demand there, `measured=[1, 63]` against a 60 ms
+    // hold — so any single sample can be the queued one. Both of #182's sightings were exactly that: a
+    // one-element `measured=[8]` / `measured=[9]`. Waiting for three makes the assertion below a statement
+    // about whether the measurement WORKS rather than a bet on which pair arrived first, and the probe
+    // produces roughly three pairs a second, so this costs about a second.
     let traces = server
-        .wait_for_traces_where(EVENT_TIMEOUT, |traces| traces.lines().any(measured_on_a_known_lock))
+        .wait_for_traces_where(EVENT_TIMEOUT, |traces| measured_known_lock_durations(traces).len() >= 3)
         .unwrap_or_else(|| {
+            let all = server.call("debug.get_traces", serde_json::json!({}));
             panic!(
-                "no snapshot carried a debugger-measured duration for FastLock or SlowLock. A \
-                 `blocked_for=` alone is not enough — an UNMEASURED pair has one too, and a NotifyLock \
+                "fewer than three snapshots carried a debugger-measured duration for FastLock or SlowLock. \
+                 A `blocked_for=` alone is not enough — an UNMEASURED pair has one too, and a NotifyLock \
                  re-acquisition is a measured pair whose duration this test has made no claim about.\n  \
-                 traces: {}",
-                server.call("debug.get_traces", serde_json::json!({}))
+                 measured so far: {:?}\n  traces: {all}",
+                measured_known_lock_durations(&all),
             )
         });
     // The opening half says where it started rather than printing a zero, which would read as "it was not
@@ -16408,37 +16411,199 @@ fn a_paired_monitor_snapshot_carries_a_debugger_measured_duration() {
     // A real figure, and one that matches the probe's own hold time — read ONLY off the two locks that
     // have one (TEST-50, #182). Parsing every `blocked_for=` in the buffer is what made this test read a
     // NotifyLock re-acquisition and call it an arithmetic fault.
-    let measured: Vec<i64> = traces
+    let measured = measured_known_lock_durations(&traces);
+    // >= 10ms, and TWO things make that a sound inference rather than a hopeful one. The probe's holders wait
+    // for their contender to report BLOCKED before counting the hold (TEST-38, #96), so a Fast/Slow block is
+    // >= 60ms on any runner rather than a function of when a 1ms spin got descheduled. And the lines read
+    // above are Fast/Slow only (TEST-50, #182), so no other lock's duration can arrive here at all.
+    //
+    // The wording matters, because this message has been wrong twice already. It asserted that runner load
+    // was ruled out and therefore any short figure was "a pairing or arithmetic fault", which sent the next
+    // reader hunting a logic bug that was never there — and #182's own first diagnosis, a NotifyLock
+    // re-acquisition, was written into this comment before being measured and refuted. So this says what is
+    // checked, names the mechanism that IS established, and leaves the rest to whoever reads the data.
+    assert!(
+        measured.iter().any(|ms| *ms >= 10),
+        "no FastLock or SlowLock block reached 10ms across {} samples, though the probe holds them 60ms and \
+         400ms and does not start counting until its contender is BLOCKED. measured={measured:?} — \
+         Fast/Slow only, so a figure from another lock cannot reach this list.\n\
+         \n  A SINGLE short figure is EXPECTED and is not this assertion's business: a pair whose opening \
+         half queued in the event pump measures short by however long it queued, which TEST-51 \
+         (`a_queued_opening_half_measures_a_block_shorter_than_it_was`) reproduces on demand at 1ms against \
+         a 60ms hold. That is why this waits for three samples. ALL of them being short is the failure, and \
+         it means either the pump was late with every opening half or the measurement is broken.\n\
+         \n  READ THE PROBE OUTPUT BELOW. An `awaitBlocked CAP HIT` line means the holder gave up waiting \
+         for its contender and timed nothing, which makes a short block correct and this assertion the \
+         thing that is wrong.\n\
+         \n  traces: {traces}\n  probe output: {:?}",
+        measured.len(),
+        probe.output()
+    );
+
+    assert_still_ticking(&probe, before, "a paired monitor snapshot left the VM suspended");
+    server.panic_reset();
+}
+
+/// `MONITOR_CONTENDED_ENTER`, JDWP event kind 43 — the opening half of the contended pair, named so
+/// [`EventFault::DelayKind`] can target it rather than whichever event arrives first.
+const EVENT_KIND_MONITOR_CONTENDED_ENTER: u8 = 43;
+
+/// Every debugger-measured `blocked_for` figure in a traces reply, for the two locks whose hold time
+/// `MonitorProbe` actually promises.
+///
+/// Shared by the two tests below because reading a figure off the wrong lock is the mistake TEST-50 (#182)
+/// already made once: `MonitorProbe` contends on four locks and only Fast (60 ms) and Slow (400 ms) are
+/// held for a duration anything here has claimed, so a number from `NotifyLock` or `TimeoutLock` would be
+/// asserted against a promise nobody made.
+fn measured_known_lock_durations(traces: &str) -> Vec<i64> {
+    traces
         .lines()
         .filter(|l| measured_on_a_known_lock(l))
         .filter_map(|l| {
             let (_, after) = l.split_once("blocked_for=")?;
             after.split("ms ").next()?.trim().parse().ok()
         })
-        .collect();
-    // >= 10ms, and TWO things make that a sound inference rather than a hopeful one. The probe's holders wait
-    // for their contender to report BLOCKED before counting the hold (TEST-38, #96), so a Fast/Slow block is
-    // >= 60ms on any runner rather than a function of when a 1ms spin got descheduled. And the lines read
-    // above are Fast/Slow only (TEST-50, #182), so no other lock's duration can arrive here at all.
+        .collect()
+}
+
+/// A line carrying a debugger-measured duration for `FastLock` or `SlowLock`.
+fn measured_on_a_known_lock(line: &str) -> bool {
+    line.contains("measured by the DEBUGGER across both events")
+        && (line.contains("MonitorProbe$FastLock@0x") || line.contains("MonitorProbe$SlowLock@0x"))
+}
+
+/// TEST-51 ([#182](https://github.com/YgorPerez/java-debugging-mcp/issues/182)): **a debugger-measured
+/// monitor duration does not measure the block — it measures what was left of the contention once WE let
+/// the thread go**, and here it is, staged.
+///
+/// #182 has two CI sightings, JDK 11 and JDK 21, both a single-digit figure where the probe guarantees
+/// 60 ms, and neither reproducible in any local arm. Its decision procedure names the half nobody had
+/// established: "the fault is on our side of the wire — the pairing or the two timestamps". It is the
+/// timestamps, and the reason is sharper than either half of that sentence.
+///
+/// **A traced monitor stop is armed at `EventThread`** ([`suspend_policy_for`]), so the JVM suspends the
+/// contending thread *at* the `MONITOR_CONTENDED_ENTER` and it stays suspended until `try_record_trace`
+/// processes that event and resumes it. Both ends of the figure are our own [`std::time::Instant`], taken
+/// in `record_one_traced_event` — and the closing `MONITOR_CONTENDED_ENTERED` **cannot be generated at
+/// all** until we resume. So the span is
+///
+/// ```text
+/// blocked_for = (we process ENTERED) - (we process ENTER)
+///             = how long the contender waited AFTER WE RELEASED IT
+/// ```
+///
+/// which is not the block. A late pump does not add error to the figure, it **replaces** the figure: the
+/// contention it delayed resolves while we hold the contender, and what gets measured is whatever is left
+/// of the holder's cycle at the moment we let go.
+///
+/// **Measured on JDK 21 by varying the stall, and every point is that phase.** `MonitorProbe`'s holder
+/// runs a ~80 ms cycle — a 60 ms hold plus the 20 ms gap outside the block that ADR-0035 records adding to
+/// stop `synchronized`'s unfairness starving the contender — so releases fall at 60, 140, 220, 300 ms:
+///
+/// | stall (ms) | 20 | 40 | 100 | 200 | 800 |
+/// |---|---|---|---|---|---|
+/// | measured (ms) | 40 | 21 | 41 | 21 | 1 |
+/// | next release after our resume | 60 | 60 | 140 | 220 | 800 |
+///
+/// The thread was stuck for the whole stall every time, and **no figure ever says so.** At 800 ms it
+/// reports 1 ms. So the under-report is not bounded by anything: not by the block, not by the queueing.
+///
+/// **What this instrument does NOT hold**, said plainly because the first version of this comment claimed
+/// it: the stall does not leave "the same block with a wrong number on it". Because we are holding the
+/// contender, stalling our own pump *lengthens* the debuggee's real stall. That is not a flaw in the
+/// analogy — it is the same thing a loaded runner does, and it is the point: the time the debugger itself
+/// keeps a thread off the monitor is invisible to the number the debugger then reports about it.
+///
+/// The caller-visible consequence is `min_duration_ms`, which filters on this figure: a lock that really
+/// held a thread for a second is dropped from a 200 ms report if our pump was late. See
+/// [`monitor_duration_detail`], which now says so.
+///
+/// **The contrast is the assertion.** The delayed pair reports a short figure while its neighbours, in the
+/// same buffer in the same run, report 60 ms — so a reader cannot dismiss it as a slow run.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_queued_opening_half_measures_a_block_shorter_than_it_was() {
+    let Some(jdk) = jdk_or_skip("a_queued_opening_half_measures_a_block_shorter_than_it_was") else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "MonitorProbe", monitor_probe_ready).expect("launch");
+    // 800 ms, and the number is NOT delicate — which is worth stating, because the reason first written
+    // here was wrong. It said the stall must outlast the longest hold "so the closing half has certainly
+    // been generated by the time the stall ends", and no stall can achieve that: the contender is suspended
+    // at the opening event, so the JVM cannot generate the closing one until we resume, whatever we do.
     //
-    // The wording matters, because this message has been wrong once already: it asserted that runner load
-    // was ruled out and therefore any short figure was "a pairing or arithmetic fault", which sent the next
-    // reader hunting a logic bug that was never there. The figure was right; the LOCK was not the one the
-    // sentence was about. So this says what is checked and leaves the conclusion to whoever reads the data.
-    assert!(
-        measured.iter().any(|ms| *ms >= 10),
-        "no FastLock or SlowLock block reached 10ms, though the probe holds them 60ms and 400ms and does not \
-         start counting until its contender is BLOCKED. measured={measured:?} — Fast/Slow only, so a figure \
-         from another lock cannot reach this list.\n\
-         \n  READ THE PROBE OUTPUT BELOW FIRST. An `awaitBlocked CAP HIT` line means the holder gave up \
-         waiting for its contender and timed nothing, which makes a short block correct and this assertion \
-         the thing that is wrong. NO such line means the cap is exonerated and the fault is on our side of \
-         the wire — which is the half that has never yet been established (TEST-50, #182).\n\
-         \n  traces: {traces}\n  probe output: {:?}",
-        probe.output()
+    // What the value actually buys is that the figure is a full cycle's phase rather than the tail of the
+    // hold that was in progress. Every stall from 20 ms up produced a figure under 50 ms (see the table
+    // above), so the assertion below holds across the whole range and does not depend on this number.
+    let relay = FaultRelay::start_with_events(
+        probe.port,
+        vec![],
+        Some(EventFault::DelayKind { kind: EVENT_KIND_MONITOR_CONTENDED_ENTER, ms: 800, times: 1 }),
+    )
+    .expect("start the fault relay");
+    let mut server = Server::start().expect("start server");
+    server.attach(relay.port);
+
+    // `trace_frames: 0` so a capture costs as little as possible: the gap this test measures is the one
+    // the STALL opens, and caller frames on every neighbouring hit would widen it for a second reason.
+    server.call("debug.set_monitor_stop", serde_json::json!({"trace_max_hits": 0, "trace_frames": 0}));
+
+    // Wait for TWO figures and nothing more specific, so the assertions below are the things that decide.
+    // Polling on the conjunction the assertions check — a short one AND a normal one — is what the first
+    // cut did, and it made both of them unreachable: `measured` is recomputed from the very reply the
+    // predicate accepted, so each assert held by construction and its carefully worded diagnosis could
+    // never print. A real failure then arrived as the 25 s timeout with one undifferentiated message.
+    let traces = server
+        .wait_for_traces_where(EVENT_TIMEOUT, |t| measured_known_lock_durations(t).len() >= 2)
+        .unwrap_or_else(|| {
+            let all = server.call("debug.get_traces", serde_json::json!({}));
+            panic!(
+                "never saw a short figure and a normal one together. delayed={} (must be 1, or the fault \
+                 never fired and this test proves nothing).\n  measured={:?}\n  traces: {all}\n  probe: \
+                 {:?}",
+                relay.duplicated(),
+                measured_known_lock_durations(&all),
+                probe.output().iter().rev().take(6).collect::<Vec<_>>(),
+            )
+        });
+
+    // The instrument first, exactly as TEST-23's simulation does it: without this, a green run could mean
+    // "the stall never happened and two ordinary pairs differed by 10 ms".
+    assert_eq!(
+        relay.duplicated(),
+        1,
+        "the fault never fired, so nothing here is about a queued opening half: no composite of kind \
+         {EVENT_KIND_MONITOR_CONTENDED_ENTER} (monitor contended enter) crossed the relay. Fix the \
+         instrument, not the assertion."
     );
 
-    assert_still_ticking(&probe, before, "a paired monitor snapshot left the VM suspended");
+    let measured = measured_known_lock_durations(&traces);
+    // UNDER 50 is the population of interest. `MonitorProbe` holds Fast for 60 ms and Slow for 400 ms and
+    // does not start counting until its contender reports BLOCKED (TEST-38, #96), so no correct figure is
+    // under 50 — the control arm for this test, identical but with the stall reduced to 0 ms, produced 25
+    // figures, all 60/61/399/400/401, with no short outlier at all.
+    let has_short = measured.iter().any(|ms| *ms < 50);
+    // BOUNDED ABOVE as well, and not for symmetry. A figure can be OVER-reported by this same mechanism —
+    // a pair whose closing half queued behind the stall carries the stall too — and an over-report is the
+    // other direction of the fault under test, so it must not be the thing that carries the contrast.
+    // 450 admits Slow at 400 ms and excludes 800-plus.
+    // A correct figure alongside it would be the neatest possible contrast, and asserting one was this
+    // test's own bug — caught by the pinned arm below, where it failed once in two runs.
+    // `taskset -c 0-3` with the whole suite running is sustained contention, which queues EVERY pair's
+    // opening half, so a run where NOTHING reads its hold time correctly is not a broken test: it is this
+    // finding, at scale, and demanding a correct sample reproduces #182's own flake for #182's reason.
+    // So the contrast is REPORTED and the control arm is what excludes "the whole run was just slow":
+    // set `ms` to 0 above and every figure comes back 60/61/399/400/401, 25 of them, no short outlier.
+    let in_range = measured.iter().filter(|ms| (55..=450).contains(*ms)).count();
+    assert!(
+        has_short,
+        "no figure came out short, so the stall never reached the measurement. The pair whose opening half \
+         was held 800ms should read far below the 60ms the probe guarantees, because the lock is free again \
+         by the time we resume its contender.\n  measured={measured:?}\n  of those, {in_range} read a \
+         plausible hold time (55..=450ms) — if that is 0, the pump was late for every pair and this run \
+         cannot tell the staged delay from the ambient one."
+    );
+
     server.panic_reset();
 }
 

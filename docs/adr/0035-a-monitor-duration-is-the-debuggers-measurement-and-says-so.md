@@ -38,12 +38,14 @@ would have looked like a duration and been plausible on every reply.
 `ENTER` is timestamped and matched to the following `ENTERED` on the same (thread, monitor); `WAIT` to
 `WAITED` likewise. The resulting figure is a **debugger** measurement, so every surface that prints one says
 so: `blocked_for=4200ms (measured by the DEBUGGER across both events — no monitor event carries a duration,
-so this includes our own capture latency)`.
+so this carries our own capture latency, and can read SHORT as well as long: whichever half queued in our
+event pump moves the figure, and a late start subtracts)`.
 
 It has to say so for two reasons that a bare number hides. It includes this server's own capture cost
-(~0.86 ms per hit before caller frames, TRACE-7) plus event-pump queueing, which is noise against the
-multi-second block a wedged server is asked about and a material fraction of a 5 ms one. And it requires
-**both halves armed** — one half can only report that the event happened.
+(~0.86 ms per hit before caller frames, TRACE-7) plus event-pump queueing — **and that error is not only
+additive and not bounded by the length of the block, which this section originally claimed it was.** See
+*What TEST-51 caught* below. And it requires **both halves armed** — one half can only report that the event
+happened.
 
 The two pairs are named apart (`blocked_for`, `waited_for`) rather than sharing one `elapsed`. Blocking is
 involuntary and a long one is a fault; `Object.wait()` is voluntary and a long one is often a healthy idle
@@ -162,6 +164,63 @@ stop point existed — a number wrong by minutes rather than by milliseconds.
 METH-1: a session holding nothing but method-exit requests reported `0 stop point(s)` while
 `list_stop_points` listed them. The number a caller checks to see whether they left anything armed could not
 see the kind most able to freeze a shared JVM. Fixed for both kinds rather than widened to two.
+
+## What TEST-51 caught: the latency is not only additive, and it is not bounded by the block
+
+**Added 2026-08-13**, from TEST-50 ([#182](https://github.com/YgorPerez/java-debugging-mcp/issues/182)).
+
+The Decision above said the figure "includes our own capture latency … which is noise against the
+multi-second block a wedged server is asked about". Both halves of that are wrong, and #182 is the bill: a CI
+flake reporting a **single-digit millisecond** block where the probe guarantees 60 ms, twice, on two
+different JDKs, unreproducible in every local arm for two sessions.
+
+Both stamps are taken in `record_one_traced_event`, and neither is at arrival: by then the pump has awaited
+the composite off the wire, waited for the session lock, resolved the location and run the method filter —
+and it processes one event at a time with a whole `capture_trace` between one and the next, so a burst of
+threads blocking on one lock queues.
+
+**The decisive detail is the suspend policy, not the queueing.** A traced monitor stop is armed at
+`EventThread`, so the JVM holds the *contending* thread at the opening event until we process it and resume
+it — and the closing `MONITOR_CONTENDED_ENTERED` cannot be generated before that. So the figure is
+
+```text
+blocked_for = (we process ENTERED) − (we process ENTER)
+            = how long the contender waited AFTER WE RELEASED IT
+```
+
+A late pump therefore does not *add error to* the block, it **replaces** the block: the contention resolves
+while we are holding the contender, and what is left to measure is whatever remains of the holder's cycle at
+the moment we let go.
+
+Measured by `a_queued_opening_half_measures_a_block_shorter_than_it_was`, which holds the first
+`MONITOR_CONTENDED_ENTER` composite in a proxy, at five stall lengths on JDK 21. `MonitorProbe`'s holder runs
+a ~80 ms cycle (the 60 ms hold plus the 20 ms gap recorded below), so releases fall at 60, 140, 220, 300 ms —
+and every figure is the distance from our resume to the next release:
+
+| stall (ms) | 20 | 40 | 100 | 200 | 800 |
+|---|---|---|---|---|---|
+| measured (ms) | 40 | 21 | 41 | 21 | **1** |
+| next release after our resume | 60 | 60 | 140 | 220 | 800 |
+
+The thread was off the monitor for the whole stall in every row, and no figure says so. With the stall at
+0 ms the same run yields 25 figures, all 60/61/399/400/401, with no short outlier — which is what makes this
+a controlled result, and also exonerates the pairing and the arithmetic, #182's other two hypotheses.
+
+So the under-report is bounded by **nothing**: not by the block, not by the latency. A thread held off a lock
+for 800 ms reports 1 ms.
+
+**One thing the instrument does not claim.** Stalling our own pump lengthens the debuggee's real stall,
+because we are the ones holding the contender — this is not "the same block with a wrong number on it". That
+is not a flaw in the analogy; it is the finding. The time the debugger itself keeps a thread off a monitor is
+invisible to the number the debugger then reports about that thread.
+
+**The consequence a caller pays is `min_duration_ms`.** It drops a pair whose figure falls under the
+threshold, so a genuinely slow lock whose opening half queued is silently filtered out of the very report
+that asked for slow locks — and the silence is the shape this tool works hardest to avoid, because
+`Hits` counting before the threshold makes "contended constantly, never for long" the reading it invites.
+The reply now says the figure can be short as well as long, and `debug.set_monitor_stop`'s description says
+what that means for a threshold. **Not changed:** the figure itself, and the decision to report the
+debugger's own measurement rather than none — there is no duration on the wire to prefer to it.
 
 ## What JDK 11 caught, and the lesson
 
