@@ -1327,6 +1327,24 @@ the one promise a conditional stop point cannot make, and a tool here says what 
 _Avoid_: upgrade, promote (both suggest the stop point changed kind; the arming is unchanged and only the
 suspension widened)
 
+**Failed escalation**:
+What a hit leaves when the VM-wide suspend an **escalation** asked for does not land: the hit thread stays
+held, the rest of the JVM keeps serving, and the session still reads as VM-wide **suspended**.
+
+Its own term because none of the words already here fits it. It is not a **held thread** — that is
+`debug.suspend_thread`'s doing, and `debug.resume_thread` is what ends it. The debuggee is not
+**suspended**, and a caller told that it is would go looking for a freeze that is not there. And it is not
+the **escalation window**, which is the gap before a suspend that *does* land, not the state after one that
+never will.
+
+The suspension is recorded anyway, deliberately, and that is the part worth naming: it is the only record
+that anything is holding the thread, so without it the **watchdog** has no clock to run and no stop point
+to **disarm**. The cost is that `debug.list_sessions` prints `SUSPENDED` for a VM that is serving normally,
+which is why every reply about such a hit states **both** facts instead of choosing the newer one.
+_Avoid_: partial escalation, half-suspended (both suggest the VM is in some middle state; it is entirely
+running), escalation failure (that names the round trip that errored — the cause, not the state it left
+behind)
+
 **Watchdog**:
 The timer that resumes a debuggee left **VM-wide** suspended too long and disarms whatever froze it, so a
 forgotten suspending stop point cannot hold a shared instance indefinitely.
