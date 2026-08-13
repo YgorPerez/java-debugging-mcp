@@ -430,7 +430,10 @@ fn every_npm_manifest_carries_the_crate_version() {
         "jdwp-mcp-linux-arm64",
         "jdwp-mcp-darwin-arm64",
         "jdwp-mcp-darwin-x64",
-        "jdwp-mcp-win32-x64",
+        // NOT `jdwp-mcp-win32-x64`, which npm's security-holder account took on 2026-08-12 (REL-10, #194).
+        // The binary is still a `win32` one and the manifest's `"os"` field still says so — only the
+        // package NAME diverges from `process.platform`, because that is the half npm owns.
+        "jdwp-mcp-windows-x64",
     ];
 
     let crate_version = read("Cargo.toml")
@@ -486,6 +489,64 @@ fn every_npm_manifest_carries_the_crate_version() {
              anywhere. An exact pin is required — a caret or a tilde is the same bug with a delay."
         );
     }
+
+    // REL-10 (#194): the pins and the DIRECTORIES must be the same set, in both directions.
+    //
+    // The loop above only proves every name in `PLATFORMS` is pinned. It would pass with the wrapper also
+    // pinning a sixth package nobody builds — which is the exact shape of the bug #194 exists for: v0.22.0
+    // shipped pinning `jdwp-mcp-win32-x64@0.22.0`, a version no registry had, and npm skips an unresolvable
+    // `optionalDependencies` entry SILENTLY, so Windows got the wrapper and no binary. It is also what a
+    // half-finished rename looks like: the directory moved and the pin did not, or the reverse.
+    //
+    // Checked against the filesystem and against the manifest's OWN keys, not against `PLATFORMS` twice.
+    // The first cut of this compared the directories to `PLATFORMS` and read as though it compared them to
+    // the pins — a mutation adding a sixth pin to the wrapper passed it, which is precisely the case the
+    // paragraph above says it catches. Three sets have to agree, so all three are named here.
+    let mut dirs: Vec<String> = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../npm"))
+        .expect("npm/ must exist — it is where the platform packages live")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "jdwp-mcp") // the wrapper itself is not one of its own platforms
+        .collect();
+    dirs.sort();
+
+    // The keys the manifest actually carries, read out of the `optionalDependencies` object rather than
+    // assumed from `PLATFORMS`. The block ends at the first `}` because it holds no nested objects.
+    let block = optional.split('}').next().expect("optionalDependencies must be a JSON object");
+    let mut pins: Vec<String> = block
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix('"')?.split('"').next().map(str::to_owned))
+        .filter(|k| k.starts_with("jdwp-mcp-"))
+        .collect();
+    pins.sort();
+
+    let mut declared: Vec<String> = PLATFORMS.iter().map(|s| (*s).to_owned()).collect();
+    declared.sort();
+
+    assert_eq!(
+        pins, dirs,
+        "the wrapper pins {pins:?} but npm/ holds {dirs:?}. A pin with no directory is a package nobody \
+         builds, and npm skips an unresolvable `optionalDependencies` entry SILENTLY rather than failing \
+         the install — that platform just gets no binary, which is REL-7 (#184) exactly. A directory with \
+         no pin is a package that publishes and that `npx` can never reach."
+    );
+    assert_eq!(
+        pins, declared,
+        "the wrapper pins {pins:?} and this test's PLATFORMS says {declared:?}. Whichever is right, the \
+         version assertions above only cover PLATFORMS, so a pin missing from it is a pin nothing checks \
+         the version of."
+    );
+
+    // And nothing may reintroduce the name npm holds. `npm publish` to it is refused on ownership, so a
+    // rename back would fail at the one step that cannot be retried later.
+    assert!(
+        !wrapper.contains("jdwp-mcp-win32-x64"),
+        "`jdwp-mcp-win32-x64` is an npm security-holder package owned by `npm-support` since 2026-08-12 \
+         (REL-10, #194) — publishing to it is refused on ownership. The Windows package is \
+         `jdwp-mcp-windows-x64`. The binary is still a win32 one and the manifest's `\"os\"` field still \
+         says `win32`; only the package name moved."
+    );
 }
 
 /// Every script a workflow runs DIRECTLY is executable in git's index.

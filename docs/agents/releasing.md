@@ -15,14 +15,30 @@ you consult during a release rather than carry into every session.
 | Both crates, to crates.io | REL-5 (ADR-0043) | Runs last, because it is the only irreversible step |
 | Six npm packages | REL-6 (#168) | The `jdwp-mcp` wrapper and one binary package per platform. Publishes **after** crates.io, and the wrapper goes **last of the six** — npm has no transaction, so making the package `npx` actually names the final one is what stops a half-published set being installable |
 
-**v0.21.0's npm set is missing Windows, and it can be completed WITHOUT a new release.** npm's spam
-detection refused `jdwp-mcp-win32-x64` with `403 … Package name triggered spam detection` on the bootstrap
-run — after the other four had published with the same token, so it is a heuristic about the name and not
-about credentials or content. The wrapper was published listing all five anyway, because an unresolvable
-`optionalDependencies` entry is skipped silently by npm (measured: `npm install` exits 0 and installs the
-rest). So the moment npm clears the name, `npm publish` of `jdwp-mcp-win32-x64@0.21.0` from
-`npm/jdwp-mcp-win32-x64/` makes the ALREADY-PUBLISHED wrapper work on Windows — the pin is exact, so
-nothing else has to move. Until then a Windows `npx` prints the shim's two-causes message and points at
+**Windows `npx` is broken on every published version, and npm took the name it needed** (REL-10, #194). The
+`403 … Package name triggered spam detection` that refused `jdwp-mcp-win32-x64` on the v0.21.0 bootstrap run
+was read here as a heuristic to wait out. It was not: on **2026-08-12** that name became an npm
+security-holder package owned by `npm-support`, so `npm publish` to it is now refused on **ownership**, and
+there is no clearing to wait for. Measured:
+
+```
+$ npm view jdwp-mcp-win32-x64 --json
+  "dist-tags":   { "latest": "0.0.1-security" },
+  "description": "security holding package",
+  "repository":  "npm/security-holder",
+  "maintainers": [ "npm-support <support@npmjs.com>" ]
+```
+
+The platform package is therefore **`jdwp-mcp-windows-x64`**. The binary is unchanged and its manifest's
+`"os"` field still says `win32` — only the package name diverges from `process.platform`, which the shim
+carries as its one deliberate exception (`PACKAGE_OS` in `npm/jdwp-mcp/bin/jdwp-mcp.cjs`). **Do not "fix"
+that back to the derived name**; it is the only name here npm will not accept.
+
+**The already-published wrappers cannot be repaired.** v0.21.0 and v0.22.0 both pin
+`jdwp-mcp-win32-x64@<their version>` exactly, and the exact pin is what normally makes a missing platform
+fixable with no release — it is how v0.22.0's linux-x86_64 gap was closed, on attempt 3 of its own run. That
+only works for a name we can still publish to. Windows needs the **next release** and a bootstrap publish of
+the new name. Until then a Windows `npx` prints the shim's two-causes message and points at
 `cargo install`, which works there and always has.
 
 **npm needs a one-time bootstrap, and `scripts/bootstrap-npm.sh` is it.** Trusted publishing attaches to a package that already exists, so the first version of all six is published by hand — the same bootstrap ADR-0043 records for crates.io. The wizard gates on the release carrying all five binaries first (v0.20.0 carried four; `linux-aarch64` arrived with REL-9), verifies them against `SHA256SUMS`, publishes platforms-then-wrapper, and walks the trusted-publisher form for each package. **Until it has run once, the `publish-npm` job fails on every tag** — deliberately, since a missing bootstrap must not look like a success.

@@ -34,6 +34,6 @@
     "jdwp-mcp-linux-arm64": "0.22.0",
     "jdwp-mcp-darwin-arm64": "0.22.0",
     "jdwp-mcp-darwin-x64": "0.22.0",
-    "jdwp-mcp-win32-x64": "0.22.0"
+    "jdwp-mcp-windows-x64": "0.22.0"
   }
 }

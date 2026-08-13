@@ -193,7 +193,7 @@ PLATFORM_PKGS=(
   jdwp-mcp-linux-arm64
   jdwp-mcp-darwin-arm64
   jdwp-mcp-darwin-x64
-  jdwp-mcp-win32-x64
+  jdwp-mcp-windows-x64
 )
 WRAPPER_PKG=jdwp-mcp
 GH_REPO="YgorPerez/java-debugging-mcp"
@@ -206,7 +206,7 @@ SLICES=(
   "linux-aarch64|jdwp-mcp-linux-arm64|jdwp-mcp"
   "macos-aarch64|jdwp-mcp-darwin-arm64|jdwp-mcp"
   "macos-x86_64|jdwp-mcp-darwin-x64|jdwp-mcp"
-  "windows-x86_64|jdwp-mcp-win32-x64|jdwp-mcp.exe"
+  "windows-x86_64|jdwp-mcp-windows-x64|jdwp-mcp.exe"
 )
 
 cd "$(dirname "$0")/.."
@@ -464,11 +464,20 @@ say  "stage 6 and let $WORKFLOW_FILE do it: a package that already exists never 
 note "Anything already on npm is skipped, so a re-run after a failure resumes rather than repeats."
 confirm "Publish these five now?" || { warn "stopped; nothing was published"; exit 1; }
 # COLLECTED, NOT ABORTED ON. npm can refuse ONE name for reasons that have nothing to do with the others
-# — v0.21.0's `jdwp-mcp-win32-x64` was refused by spam detection after the other four had published with
-# the same token — and stopping there meant the four that worked were unusable, because the wrapper never
-# went out. Publishing a SUBSET is safe in a way a half-published wrapper is not: an `optionalDependencies`
-# entry that does not resolve is skipped silently by npm (measured), the other platforms work fully, and
-# the shim tells the missing platform what happened and points at `cargo install`.
+# — v0.21.0's `jdwp-mcp-win32-x64` was refused with `403 … Package name triggered spam detection` after the
+# other four had published with the same token — and stopping there meant the four that worked were
+# unusable, because the wrapper never went out.
+#
+# THAT `403` WAS NOT THROTTLING. On 2026-08-12 the name became an npm security-holder package owned by
+# `npm-support`, so the refusal was npm taking the name rather than rate-limiting the attempt, and the
+# Windows package was renamed to `jdwp-mcp-windows-x64` (REL-10, #194). A `403` here can mean the name is
+# gone for good; it looks identical to one that will succeed on a retry, so do not assume a retry is the fix.
+#
+# Publishing a SUBSET is LESS BAD than a half-published wrapper, which is not the same as safe: an
+# `optionalDependencies` entry that does not resolve is skipped silently by npm (measured), so that platform
+# installs the wrapper and gets NO BINARY. REL-7 (#184) is what that costs when the missing platform is the
+# common one — v0.22.0 shipped without linux-x86_64. The shim does tell that caller the truth and points at
+# `cargo install`, but a caller reading a shim message has a broken install, not a working subset.
 #
 # What must not happen is a subset shipping because nobody noticed. So every failure is named, and the
 # wrapper needs an explicit yes when the set is incomplete.

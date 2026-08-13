@@ -19,7 +19,16 @@ const { spawnSync } = require("node:child_process");
 // `process.platform` / `process.arch` are npm's own `os` / `cpu` vocabulary, which is why the package
 // names are built from them rather than from Rust target triples: the two disagree (`win32` vs
 // `pc-windows-msvc`, `x64` vs `x86_64`) and translating in two directions is a table to get wrong.
-const pkg = `jdwp-mcp-${process.platform}-${process.arch}`;
+//
+// ONE PACKAGE NAME DIVERGES FROM THAT RULE, AND IT IS A REGISTRY OWNERSHIP FACT RATHER THAN A TASTE ONE
+// (REL-10, #194). The rule above produces `jdwp-mcp-win32-x64`; npm's security-holder account took that name
+// on 2026-08-12 and it can no longer be published to, so the Windows package is `jdwp-mcp-windows-x64`.
+// **Do not "fix" this back to the derived name** — it reads like an inconsistency and it is the only name
+// here that npm will not accept. `platformKey` below stays in npm's vocabulary, because that half really is
+// `process.platform` and is compared against it.
+const PACKAGE_OS = { win32: "windows" };
+const platformKey = `${process.platform}-${process.arch}`;
+const pkg = `jdwp-mcp-${PACKAGE_OS[process.platform] ?? process.platform}-${process.arch}`;
 const binary = process.platform === "win32" ? "jdwp-mcp.exe" : "jdwp-mcp";
 
 let resolved;
@@ -28,6 +37,9 @@ try {
 } catch {
   // Two different failures reach here and they need different advice, so say which is which rather than
   // printing "not found" over both.
+  // PLATFORM KEYS, not package names — `win32-x64` is what `process.platform`/`process.arch` report on
+  // Windows, and this list is compared against exactly that. The package it maps to is
+  // `jdwp-mcp-windows-x64`; see `PACKAGE_OS` above for why the two differ.
   const supported = [
     "linux-x64",
     "linux-arm64",
@@ -35,7 +47,7 @@ try {
     "darwin-x64",
     "win32-x64",
   ];
-  const known = supported.includes(`${process.platform}-${process.arch}`);
+  const known = supported.includes(platformKey);
   process.stderr.write(
     known
       ? `jdwp-mcp: ${pkg} is not installed, though this platform is supported.\n` +
@@ -46,7 +58,7 @@ try {
           `       platforms; check https://www.npmjs.com/package/${pkg} and try a newer jdwp-mcp.\n` +
           `  Either way this always works, and is fully supported:\n` +
           `    cargo install jdwp-mcp\n`
-      : `jdwp-mcp: no prebuilt binary for ${process.platform}-${process.arch}.\n` +
+      : `jdwp-mcp: no prebuilt binary for ${platformKey}.\n` +
           `  Prebuilt: ${supported.join(", ")}.\n` +
           `  Everything else builds from source and is fully supported that way:\n` +
           `    cargo install jdwp-mcp\n`,

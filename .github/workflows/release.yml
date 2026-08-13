@@ -674,7 +674,7 @@ jobs:
           linux-aarch64 jdwp-mcp-linux-arm64 jdwp-mcp
           macos-aarch64 jdwp-mcp-darwin-arm64 jdwp-mcp
           macos-x86_64 jdwp-mcp-darwin-x64 jdwp-mcp
-          windows-x86_64 jdwp-mcp-win32-x64 jdwp-mcp.exe
+          windows-x86_64 jdwp-mcp-windows-x64 jdwp-mcp.exe
           SLICES
 
       # THE WRAPPER IS PUBLISHED LAST, AND THAT ORDERING IS THE "ALL OR NONE" GUARANTEE. npm has no
@@ -686,16 +686,31 @@ jobs:
       #
       # A version already on npm makes its `npm publish` fail, and that is left to fail for the reason the
       # cargo step above states — a published version cannot be replaced, and re-running will not help.
-      # ONE BLOCKED NAME MUST NOT STRAND THE OTHERS, and this loop learned that from v0.21.0: npm's spam
-      # detection refused `jdwp-mcp-win32-x64` after the other four had published, and a fail-fast loop
-      # would have left those four on the registry with no wrapper pointing at them — unusable, because the
-      # wrapper is the only package `npx` names.
+      # ONE BLOCKED NAME MUST NOT STRAND THE OTHERS, and this loop learned that from v0.21.0: npm refused
+      # `jdwp-mcp-win32-x64` after the other four had published, and a fail-fast loop would have left those
+      # four on the registry with no wrapper pointing at them — unusable, because the wrapper is the only
+      # package `npx` names.
       #
-      # A subset is safe in a way a half-published wrapper is not: an `optionalDependencies` entry that does
-      # not resolve is skipped silently by npm, so the platforms that published work completely, and the
-      # missing one gets the shim's message plus `cargo install`. And because the wrapper pins each platform
-      # at an exact version, publishing the missing package later makes the already-published wrapper find
-      # it, with no new release.
+      # THAT REFUSAL WAS READ AS SPAM DETECTION AND WAS SOMETHING WORSE. It presented as
+      # `403 … Package name triggered spam detection`, so this comment and docs/agents/releasing.md both
+      # said to wait for npm to clear the name. npm did not clear it: on 2026-08-12 the name became an npm
+      # security-holder package owned by `npm-support`, which is why the Windows package is now
+      # `jdwp-mcp-windows-x64` (REL-10, #194). The lesson worth keeping is that a `403` on a publish can mean
+      # the name is gone rather than the attempt was throttled, and the two look identical from here.
+      #
+      # A subset is LESS BAD than a half-published wrapper, which is not the same as safe — and the earlier
+      # wording here ("the platforms that published work completely") quietly assumed the missing platform
+      # would be a rare one. At v0.22.0 it was linux-x86_64, the commonest there is: an
+      # `optionalDependencies` entry that does not resolve is skipped SILENTLY by npm, so that platform
+      # installed the wrapper, got no binary, and fell through to the shim's message. REL-7 (#184) is the
+      # record. The shim does at least tell that caller the truth — it distinguishes "you passed
+      # --omit=optional" from "this version shipped without your platform" — but a caller reaching a shim
+      # message is a broken install, not a working subset.
+      #
+      # The exact pin is what makes it repairable without a release: publishing the missing package later
+      # makes the already-published wrapper find it. That is how v0.22.0's linux-x86_64 gap was closed, on
+      # attempt 3 of its own run. It only works for a name we can still publish to — which Windows no
+      # longer was, and is the reason that platform needed a rename rather than a re-run.
       #
       # SO: publish what can be published, then FAIL THE JOB naming what could not. There is deliberately no
       # `|| true` — a subset shipping unnoticed is the thing this must not do, and in CI nobody can be asked
@@ -707,7 +722,7 @@ jobs:
         run: |
           set -uo pipefail
           failed=()
-          for pkg in jdwp-mcp-linux-x64 jdwp-mcp-linux-arm64 jdwp-mcp-darwin-arm64 jdwp-mcp-darwin-x64 jdwp-mcp-win32-x64; do
+          for pkg in jdwp-mcp-linux-x64 jdwp-mcp-linux-arm64 jdwp-mcp-darwin-arm64 jdwp-mcp-darwin-x64 jdwp-mcp-windows-x64; do
             echo "::group::npm publish $pkg"
             if ( cd "npm/$pkg" && npm publish --access public ); then
               echo "published $pkg"
