@@ -1285,15 +1285,30 @@ row, a vanished one is only a count. A **filter** naming one is **unmatchable** 
 _Avoid_: dropped, lost (both suggest the debugger mislaid it)
 
 **Held thread**:
-One thread this session froze with `debug.suspend_thread` while the rest of the JVM goes on serving. Its
-own term because the whole-VM words do not fit: the debuggee is not **suspended** — a caller reading
-`SUSPENDED` about it would go looking for a freeze that is not there — and the remedy is
-`debug.resume_thread` rather than `debug.continue`. What it makes readable is the thread's own frames,
-locals and monitors; what it does **not** make possible is **invocation**, which JDWP grants only to a
-thread suspended by an event.
+One thread this session is holding while the rest of the JVM goes on serving. Its own term because the
+whole-VM words do not fit: the debuggee is not **suspended** — a caller reading `SUSPENDED` about it would
+go looking for a freeze that is not there — and the remedy is `debug.resume_thread` rather than
+`debug.continue`. What it makes readable is the thread's own frames, locals and monitors.
+
+**It has two routes, and the genus is the useful word because one thing rescues both** (SAFE-13, #197). A
+caller *asked* for one by naming it to `debug.suspend_thread`; the other is what a **failed escalation**
+leaves behind, where the JVM is holding the hit thread and the escalation that would have widened it to the
+whole VM never landed. Either way exactly one thread is stopped, the application is otherwise serving, the
+**watchdog** measures the same clock against it, and a listing counts them together — so a reply that named
+only the first route would be describing a thread nobody suspended by that name.
+
+**The two routes differ in one caller-visible way and it already has a term.** A failed escalation's thread
+is **event-suspended**, so a method can be invoked on it; a `debug.suspend_thread` hold cannot, whatever
+else it reads. The other difference is what a **rescue** owes: releasing a failed escalation's thread
+without also **disarming** the stop point behind it lands it straight back on the line that fired.
+
 _Avoid_: pinned, parked, frozen (the first two are application states, the third reads as the whole VM).
 The bar on *pinned* is about **threads** and is not retracted by **filter pin**, which is a different
 subject — an object the debuggee holds — and is always qualified for that reason.
+_Avoid_ also "held by `debug.suspend_thread`" as a synonym for the genus, which is what four replies said
+until #197 put a second route into the same listing: it names a call the caller may never have made, and it
+points them at `debug.resume_thread` as the remedy, which for the other route releases the thread onto a
+stop point that is still armed.
 
 **Event-suspended**:
 Held because a stop point fired *on this thread* or a step landed on it, as opposed to held by a
@@ -1322,6 +1337,13 @@ live-heap walk: 522 ms of held application threads on a 2M-object heap to answer
 is **suspended** during that, in the counted sense this glossary defines; everything is **held**. A term
 that only covered suspensions would have made the most expensive diagnostic here the one with no cost to
 report.
+
+**One held duration is currently spent and never reported, and naming it is the point of putting this
+beside `blocked_for`** (TEST-51, #182). A traced **monitor stop** holds the contending thread from the
+opening **monitor event** until the **event pump** gets to it, and the **debugger-measured** figure the
+snapshot carries starts at that later moment — so the stretch we ourselves kept that thread off the lock is
+a held duration this server imposed, did not measure, and subtracts from the number it prints. The two
+concepts meet there: what is missing from a `blocked_for` is exactly a held duration nobody is charged for.
 _Avoid_: pause on its own (`debug.pause` is a specific tool), latency (that is how long the answer took,
 which is the thing this is deliberately not)
 
@@ -1340,30 +1362,42 @@ suspension widened)
 
 **Failed escalation**:
 What a hit leaves when the VM-wide suspend an **escalation** asked for does not land: the hit thread stays
-held, the rest of the JVM keeps serving, and the session still reads as VM-wide **suspended**.
+held and the rest of the JVM keeps serving.
 
-Its own term because none of the words already here fits it. It is not a **held thread** — that is
-`debug.suspend_thread`'s doing, and `debug.resume_thread` is what ends it. The debuggee is not
-**suspended**, and a caller told that it is would go looking for a freeze that is not there. And it is not
-the **escalation window**, which is the gap before a suspend that *does* land, not the state after one that
-never will.
+Its own term because it is a state and not an error. The debuggee is not **suspended**, and a caller told
+that it is would go looking for a freeze that is not there. And it is not the **escalation window**, which
+is the gap before a suspend that *does* land, not the state after one that never will.
 
-The suspension is recorded anyway, deliberately, and that is the part worth naming: it is the only record
-that anything is holding the thread, so without it the **watchdog** has no clock to run and no stop point
-to **disarm**. The cost is that `debug.list_sessions` prints `SUSPENDED` for a VM that is serving normally,
-which is why every reply about such a hit states **both** facts instead of choosing the newer one.
+**It leaves a held thread, which is the entry above and used to be denied here** (SAFE-13, #197). This entry
+read "it is not a **held thread** — that is `debug.suspend_thread`'s doing", and the code matched by
+recording a VM-wide suspension instead, on the reasoning that *something* had to record that a thread was
+held. The premise was right and the shape was wrong, and all of it was measured: a VM-wide record has one
+clock that a second hit refreshes, so hits arriving faster than the **watchdog**'s bound pushed its
+deadline out indefinitely and no **rescue** ran; it has one cause, so a rescue that did run **disarmed** the
+newest request and left the older one armed and still holding its thread; and `debug.list_sessions` read
+`SUSPENDED` about a VM that was serving normally. One held thread per hold, each with its own clock and its
+own request id, is what the state was all along.
+
+**Whether the application is really running is measured, not deduced from the error**, and that is the one
+distinction still worth drawing here: a suspend that landed and then misreported leaves the VM genuinely
+stopped, so that world does record a VM-wide suspension and `debug.continue` really is what ends it. Every
+reply about such a hit states **both** facts — the match and the state — rather than choosing the newer one.
 _Avoid_: partial escalation, half-suspended (both suggest the VM is in some middle state; it is entirely
 running), escalation failure (that names the round trip that errored — the cause, not the state it left
 behind)
 
 **Watchdog**:
-The timer that resumes a debuggee left **VM-wide** suspended too long and disarms whatever froze it, so a
-forgotten suspending stop point cannot hold a shared instance indefinitely.
-**It does not cover a thread held by a traced hit**, and the word "VM-wide" is the whole of the difference.
-A traced hit suspends only the hit thread and never records a suspension, so nothing the watchdog reads is
-set and it has no reason to look — which is why an in-flight traced hit whose request went away could leave
-one application thread frozen for the life of the JVM (#114). `debug.panic` was the only escape, because it
-resumes the VM outright rather than by reading who is holding it.
+The timer that releases a debuggee left stopped too long and disarms whatever froze it, so a forgotten
+suspending stop point cannot hold a shared instance indefinitely. It reads two states on every tick and
+rescues them on separate arms: the VM-wide **suspended** one, and each **held thread**.
+
+**What it does not cover is a suspension nothing recorded, and that — not "VM-wide" — is the
+discriminator.** This entry said the word "VM-wide" was the whole of the difference, which stopped being
+true once a **failed escalation**'s single held thread got a record of its own (SAFE-13, #197). A traced hit
+suspends only the hit thread and records *nothing*, so nothing the watchdog reads is set and it has no
+reason to look — which is why an in-flight traced hit whose request went away could leave one application
+thread frozen for the life of the JVM (#114). `debug.panic` was the only escape, because it resumes the VM
+outright rather than by reading who is holding it.
 **It has now happened twice by unrelated routes**, which is what turns the `_Avoid_` below from a caution into
 a fact. #114 was an in-flight hit whose request went away; DUMP-8 (#123) is a `trace_expr` whose invocation
 outran its budget, where the JVM re-suspends the thread when the call finally returns — over a second after
@@ -1373,9 +1407,11 @@ _Avoid_ reading this as "nothing stays frozen": it bounds the suspension a **cal
 way a thread can end up held.
 
 **Rescue**:
-What the **watchdog** does on finding the **debuggee** VM-wide **suspended** past its bound: resume it *and*
-**disarm** whatever froze it. Both halves, because resuming without disarming re-freezes on the next hit of the
-stop point that caused it.
+What the **watchdog** does on finding the **debuggee** stopped past its bound: release it *and* **disarm**
+whatever froze it. Both halves, because releasing without disarming re-freezes on the next hit of the stop
+point that caused it — and that is as true of one **held thread** as of the whole VM, which is the half this
+entry described and the code did not until SAFE-13 (#197). A thread released onto its own still-armed stop
+point is back on the line that fired before anything can notice.
 _Avoid_: auto-resume (it names half of the action, and the half it omits is the one SAFE-2 and SAFE-5 were
 filed about)
 
