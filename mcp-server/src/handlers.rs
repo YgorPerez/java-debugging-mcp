@@ -1538,13 +1538,20 @@ impl RequestHandler {
             return Ok(crate::stop_point_set::render_export(&export));
         }
 
+        // SAFE-14 (#198): what the banner says, against what the stop points it named read as now. Worked
+        // out once for both exits — this one is where every named stop point has necessarily been cleared,
+        // so a caller told to `debug.toggle_stop_point` an id that is no longer here is told why.
+        let since_the_rescue = describe_changes_since_the_rescue(&session.events.watchdog_disarmed, |id| {
+            stop_point_since_rescue(&session.state.stop_points, id)
+        });
+
         if session.state.stop_points.is_empty()
             && session.state.pending_breakpoints.is_empty()
             && session.pattern_sets.is_empty()
         {
             return Ok(session.events.watchdog_note.as_ref().map_or_else(
                 || "No breakpoints set".to_string(),
-                |n| format!("No breakpoints set\n⏰ {n}"),
+                |n| format!("No breakpoints set\n⏰ {n}{since_the_rescue}"),
             ));
         }
 
@@ -1554,9 +1561,12 @@ impl RequestHandler {
 
         let mut output = String::new();
         // Surface a watchdog auto-resume up front (SAFE-2): the caller was away, so the fact that a
-        // stop point was disarmed and the VM resumed is the most important thing on this listing.
+        // stop point was disarmed and the VM resumed is the most important thing on this listing — for as
+        // long as it is still the case. `since_the_rescue` is empty while it is, and says what has changed when it is
+        // not, so the banner can never read as an instruction over an entry showing it already carried out
+        // (SAFE-14, #198).
         if let Some(n) = &session.events.watchdog_note {
-            let _ = writeln!(output, "⏰ {n}\n");
+            let _ = writeln!(output, "⏰ {n}{since_the_rescue}\n");
         }
         let _ = write!(
             output,
@@ -7308,6 +7318,92 @@ fn in_listing_order<'a>(points: impl Iterator<Item = &'a StopPoint>) -> Vec<&'a 
     let mut rows: Vec<&StopPoint> = points.collect();
     rows.sort_by_key(|sp| sp.kind().listing_rank());
     rows
+}
+
+/// Where a stop point named by a watchdog rescue note stands **now** (SAFE-14, #198).
+///
+/// Three states, not two, for the reason [`StopPoint::state_suffix`] has three: "the caller re-armed it"
+/// and "the caller cleared it away" are different things to be told, and only the first leaves an entry
+/// in the listing for the banner to contradict.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SinceRescue {
+    /// Armed again, so the note's *re-arm it* has already been done and is now false.
+    ReArmed,
+    /// Still disarmed: the note is current, and SAFE-2's returning caller needs it exactly as written.
+    StillDisarmed,
+    /// Gone from the session, so there is nothing left to re-arm.
+    Cleared,
+}
+
+/// How one stop point the watchdog disarmed reads now, off the stop-point table.
+///
+/// **`spent` counts as re-armed, and reading only `enabled` gets that backwards.** Every path that sets
+/// `spent` clears `enabled` in the same breath (`StopPoint::armed_glyph` states the invariant), so a
+/// spent stop point answers `enabled: false` and would look like one the caller never touched. It is the
+/// opposite: `spent` is only reachable by being ARMED and firing its `hit_count`, and one the watchdog
+/// had disarmed has no request left to fire — so the caller must have re-armed it in between. Leaving it
+/// as [`SinceRescue::StillDisarmed`] puts #198 back one state along, with `re-arm it` over an entry
+/// reading SPENT.
+///
+/// Takes the table rather than the session, so the mapping the whole qualification rests on can be
+/// asserted without a JVM — it was the untested half when this was written.
+fn stop_point_since_rescue(
+    stop_points: &std::collections::HashMap<String, StopPoint>,
+    id: &str,
+) -> SinceRescue {
+    match stop_points.get(id) {
+        Some(sp) if sp.enabled || sp.spent => SinceRescue::ReArmed,
+        Some(_) => SinceRescue::StillDisarmed,
+        None => SinceRescue::Cleared,
+    }
+}
+
+/// What a listing has to add under a watchdog banner when what the banner says has stopped being true
+/// (SAFE-14, #198).
+///
+/// **Empty is the common case, and the important one**: while every stop point the note named is still
+/// disarmed the listing renders byte-for-byte as it did before, which is SAFE-2's case entire — the
+/// caller who walked away, came back, and must read that the VM was rescued and what was turned off.
+///
+/// **The note itself is never rewritten and never dropped.** It is the only surface a *failed* rescue has
+/// (`⚠️ watchdog tried to resume the VM … but …`), and a caller shown what happened followed by what has
+/// changed since can reconcile the two; one shown a silently edited note cannot.
+///
+/// **So each line discharges the one claim it is about and no more.** A failed rescue's note says the VM
+/// is still frozen AND that a stop point was disarmed; re-arming that stop point settles the second half
+/// only, so the wording below is about the instruction rather than about the note — "everything above is
+/// now history" would tell a caller their VM is running when the same note says it is not.
+///
+/// `now` is a seam and not a generality: it is what lets the wording be asserted against every
+/// combination without a session, while [`stop_point_since_rescue`] — the mapping it is called with in
+/// production — is asserted against a stop-point table.
+///
+/// Only `list_stop_points` reads this. `get_last_event` renders the note beside an event and scopes it by
+/// SAFE-10's watermark instead, which is the right question there and the wrong one here — see
+/// [`EventRing`](crate::session::EventRing), whose doc carries the measurement.
+fn describe_changes_since_the_rescue(disarmed: &[String], now: impl Fn(&str) -> SinceRescue) -> String {
+    let mut out = String::new();
+    // One line per state rather than one sentence covering both: the two have different remedies —
+    // nothing to do, versus nothing left to do it to — and a caller who used only one of them should not
+    // have to work out which half is theirs.
+    let mut line = |want: SinceRescue, tail: &str| {
+        let ids: Vec<&str> = disarmed.iter().filter(|id| now(id) == want).map(String::as_str).collect();
+        if !ids.is_empty() {
+            let _ = write!(
+                out,
+                "\n   ↳ {} {} since been {tail}",
+                ids.join(", "),
+                if ids.len() == 1 { "has" } else { "have" }
+            );
+        }
+    };
+    line(
+        SinceRescue::ReArmed,
+        "re-armed, so that instruction is already carried out — the entries below are the current state \
+         of the stop points.",
+    );
+    line(SinceRescue::Cleared, "cleared, so there is nothing left to re-arm.");
+    out
 }
 
 /// Every stop point of every kind, in the order `debug.list_stop_points` reports them.
@@ -13250,7 +13346,7 @@ async fn method_name_matches(
 /// trace-budget path to auto-disarm (TRACE-3). Both are *automatic*, so deleting the entry would
 /// silently destroy a condition or `trace_expr` the user typed by hand — the very setup SAFE-2's design
 /// note said not to throw away. Disabling keeps it recoverable in one call (BP-2).
-async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32) -> Option<String> {
+async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32) -> Option<Disarmed> {
     // TRACE-8 (#72): note it BEFORE clearing, while the stop point still says it was traced. Hits this request
     // already generated are in flight and must still be resumed rather than surfaced as suspending
     // events — see `disarmed_traced_requests`. Done here rather than at the budget path so it also covers
@@ -13266,7 +13362,21 @@ async fn disarm_request(session: &mut crate::session::DebugSession, req_id: i32)
         s.request_ids.clear();
         s.enabled = false;
     }
-    Some(sp.describe_for_rescue())
+    Some(Disarmed { id: sp.id.clone(), description: sp.describe_for_rescue() })
+}
+
+/// One stop point an automatic path just disarmed, as its two readers need it.
+///
+/// Two values rather than the one string this used to be, because the readers want different halves. The
+/// note's prose wants [`description`](Self::description) — `breakpoint bp_1 at WatchProbe:27` — and
+/// `list_stop_points` wants [`id`](Self::id), so it can ask whether the stop point the note tells the
+/// caller to re-arm has since been re-armed (SAFE-14, #198). Recovering the id from the prose is the
+/// version that breaks: `bp_1` is a prefix of `bp_11`.
+struct Disarmed {
+    /// The caller-facing id (`bp_1`), which is what a later listing can look up.
+    id: String,
+    /// The human phrase a note embeds, from [`StopPoint::describe_for_rescue`].
+    description: String,
 }
 
 /// Disable the stop point with this caller-facing id: clear its JDWP request, keep its definition.
@@ -13871,7 +13981,7 @@ fn file_trace_record(
 async fn charge_trace_budget(session: &mut crate::session::DebugSession, req_id: i32) -> Option<String> {
     let remaining = decrement_trace_budget(session, req_id)?;
     if remaining == 0 {
-        let what = disarm_request(session, req_id).await?;
+        let what = disarm_request(session, req_id).await?.description;
         Some(format!(
             "{what} stopped recording — reached its trace-hit budget and disarmed itself. Re-arm with a higher trace_max_hits if you need more."
         ))
@@ -14988,16 +15098,29 @@ fn spawn_watchdog(
                     // There is no third arm any more: a suspension carries its cause as one value with
                     // its clock (`VmSuspend`), so "stopped since some time, for no recorded reason" — which
                     // this had to answer `(cause unrecorded)` to — is no longer a representable state.
+                    // SAFE-14 (#198): the id as well as the prose. A note whose "re-arm it" the caller has
+                    // already acted on is history, and `list_stop_points` can only say so if the note
+                    // carries what it named. An `Option` and not a list, because a VM suspension has ONE
+                    // cause and this arm disarms what that cause names; `None` for both branches that
+                    // disarm nothing, whose notes report only that the VM was resumed and so never stop
+                    // being true.
+                    let mut disarmed_id: Option<String> = None;
                     let disarmed = match vm.cause {
-                        crate::session::SuspendCause::ManualPause =>
-                            "suspended by debug.pause (a manual pause — no stop point to disarm)".to_string(),
+                        crate::session::SuspendCause::ManualPause => {
+                            "suspended by debug.pause (a manual pause — no stop point to disarm)".to_string()
+                        }
                         crate::session::SuspendCause::StopPoint(req) => {
-                            disarm_request(&mut s, req).await.map_or_else(
-                                || "(its stop point was already cleared, so there was nothing left to disarm)".to_string(),
-                                |what| format!(
-                                    "and disabled {what} so it can't re-freeze the VM — re-arm it with debug.toggle_stop_point (or use trace:true) when ready"
-                                ),
-                            )
+                            match disarm_request(&mut s, req).await {
+                                None => "(its stop point was already cleared, so there was nothing left to disarm)".to_string(),
+                                Some(what) => {
+                                    let phrase = format!(
+                                        "and disabled {} so it can't re-freeze the VM — re-arm it with debug.toggle_stop_point (or use trace:true) when ready",
+                                        what.description
+                                    );
+                                    disarmed_id = Some(what.id);
+                                    phrase
+                                }
+                            }
                         }
                     };
 
@@ -15017,7 +15140,7 @@ fn spawn_watchdog(
                             s.suspensions.mark_resumed();
                             let note = format!("watchdog auto-resumed the VM after {secs}s {disarmed}");
                             info!("{note}");
-                            s.events.note_watchdog(note);
+                            s.events.note_watchdog(note, disarmed_id.as_slice());
                             "warning"
                         }
                         Ok(Some(detail)) if detail.starts_with("cleared") => {
@@ -15025,7 +15148,7 @@ fn spawn_watchdog(
                             let note =
                                 format!("watchdog auto-resumed the VM after {secs}s {disarmed} ({detail})");
                             info!("{note}");
-                            s.events.note_watchdog(note);
+                            s.events.note_watchdog(note, disarmed_id.as_slice());
                             "warning"
                         }
                         Ok(Some(problem)) => {
@@ -15035,7 +15158,7 @@ fn spawn_watchdog(
                                 "⚠️ watchdog tried to resume the VM after {secs}s {disarmed}, but {problem}"
                             );
                             warn!("{note}");
-                            s.events.note_watchdog(note);
+                            s.events.note_watchdog(note, disarmed_id.as_slice());
                             // A still-frozen VM is an `error`: nothing the caller does next will work
                             // until it runs, which is a different thing from "we rescued it for you".
                             "error"
@@ -15043,7 +15166,7 @@ fn spawn_watchdog(
                         Err(e) => {
                             let note = format!("⚠️ watchdog could not resume the VM after {secs}s: {e}");
                             warn!("{note}");
-                            s.events.note_watchdog(note);
+                            s.events.note_watchdog(note, disarmed_id.as_slice());
                             "error"
                         }
                     };
@@ -15096,9 +15219,13 @@ async fn rescue_overdue_thread_suspends(s: &mut crate::session::DebugSession, se
         })
         .collect();
     let mut disarmed: Vec<String> = Vec::new();
+    // SAFE-14 (#198): the ids travel with the note, so a listing can tell a caller who has since re-armed
+    // one of these that the instruction below it is already done.
+    let mut disarmed_ids: Vec<String> = Vec::new();
     for req in armed_behind {
         if let Some(what) = disarm_request(s, req).await {
-            disarmed.push(what);
+            disarmed.push(what.description);
+            disarmed_ids.push(what.id);
         }
     }
     // Named in the note rather than counted, because "released a thread" and "disabled the stop point that
@@ -15144,7 +15271,7 @@ async fn rescue_overdue_thread_suspends(s: &mut crate::session::DebugSession, se
     } else {
         warn!("{note}");
     }
-    s.events.note_watchdog(note);
+    s.events.note_watchdog(note, &disarmed_ids);
     if let Some(n) = &s.events.watchdog_note {
         s.alerter.alert(level, &json!({ "watchdog": n }));
     }
@@ -25325,6 +25452,140 @@ async fn compare_object(
 mod tests {
     use super::*;
 
+    /// SAFE-14 (#198): the mapping the whole qualification rests on — how a stop point the watchdog
+    /// disarmed reads **now**.
+    ///
+    /// **SPENT is the case this exists for.** It was written as `enabled`-only, on a doc comment claiming
+    /// spent keeps `enabled: true`; it does the opposite (`StopPoint::armed_glyph` — every path that sets
+    /// `spent` clears `enabled`), so a spent stop point read as one nobody had touched and the banner went
+    /// back to saying `re-arm it` over an entry reading SPENT. Code review caught it, and nothing in the
+    /// suite would have: the wording test drives this mapping by hand.
+    #[test]
+    fn a_spent_stop_point_reads_as_re_armed_because_only_a_re_arm_could_have_spent_it() {
+        let mut table = std::collections::HashMap::new();
+        table.insert("bp_armed".to_string(), listed_stop_point("bp_armed", true, false));
+        table.insert("bp_off".to_string(), listed_stop_point("bp_off", false, false));
+        table.insert("bp_spent".to_string(), listed_stop_point("bp_spent", false, true));
+
+        assert_eq!(
+            stop_point_since_rescue(&table, "bp_armed"),
+            SinceRescue::ReArmed,
+            "the caller did what the note asked, so the note is history"
+        );
+        assert_eq!(
+            stop_point_since_rescue(&table, "bp_off"),
+            SinceRescue::StillDisarmed,
+            "still off is SAFE-2's case, and the banner has to stand there exactly as written"
+        );
+        assert_eq!(
+            stop_point_since_rescue(&table, "bp_spent"),
+            SinceRescue::ReArmed,
+            "spent means it was ARMED and fired its hit_count — and one the watchdog disarmed has no \
+             request left to fire, so the caller re-armed it in between. Reading `enabled` alone calls \
+             that untouched and puts #198 back with `re-arm it` over a SPENT entry."
+        );
+        assert_eq!(
+            stop_point_since_rescue(&table, "bp_gone"),
+            SinceRescue::Cleared,
+            "a stop point cleared away entirely has nothing left to re-arm"
+        );
+    }
+
+    /// One stop point as the listing sees it: the three fields this mapping reads, and defaults for the
+    /// thirteen it does not.
+    fn listed_stop_point(id: &str, enabled: bool, spent: bool) -> StopPoint {
+        StopPoint {
+            id: id.to_string(),
+            request_ids: if enabled { vec![7] } else { Vec::new() },
+            enabled,
+            spent,
+            hit_count: None,
+            hits: 0,
+            condition: None,
+            trace: false,
+            trace_expr: Vec::new(),
+            trace_budget: None,
+            trace_frames: 0,
+            trace_max_length: None,
+            trace_cost: crate::stop_point::TraceCost::default(),
+            thread_filter: None,
+            instance_filter: None,
+            // A watchpoint because it is the cheapest payload to build; this mapping reads neither the
+            // kind nor anything inside it.
+            armed_on: ArmedOn::Watchpoint(crate::stop_point::Watchpoint {
+                kind: jdwp_client::WatchKind::Modify,
+                class_name: "com.example.OrderRepo".to_string(),
+                field_name: "total".to_string(),
+                is_static: false,
+            }),
+        }
+    }
+
+    /// SAFE-14 (#198): the listing qualifies the watchdog banner against the stop points it named, and
+    /// **says nothing at all while the banner is still true** — which is the case SAFE-2 exists for and
+    /// the one a fix here could most easily break.
+    ///
+    /// The bug was a banner reading `disabled bp_1 … re-arm it` directly above `bp_1`'s own entry showing
+    /// it armed: each half correct, the pair false. So what is asserted is that a re-armed stop point is
+    /// named and a still-disarmed one is not.
+    #[test]
+    fn a_rescue_banner_is_qualified_only_where_it_has_stopped_being_true() {
+        let named = ["bp_1".to_string(), "bp_2".to_string()];
+
+        let current = describe_changes_since_the_rescue(&named, |_| SinceRescue::StillDisarmed);
+        assert!(
+            current.is_empty(),
+            "a note whose stop points are all still disarmed is SAFE-2's banner exactly, and must render \
+             byte-for-byte as it did before: {current:?}"
+        );
+        assert!(
+            describe_changes_since_the_rescue(&[], |_| SinceRescue::ReArmed).is_empty(),
+            "a rescue that named no stop point — a manual pause — has no claim to qualify"
+        );
+
+        let one = describe_changes_since_the_rescue(&named, |id| {
+            if id == "bp_1" {
+                SinceRescue::ReArmed
+            } else {
+                SinceRescue::StillDisarmed
+            }
+        });
+        assert!(
+            one.contains("bp_1 has since been re-armed"),
+            "the stop point the caller re-armed has to be NAMED, or the qualification is as ambiguous as \
+             the banner: {one}"
+        );
+        assert!(
+            !one.contains("bp_2"),
+            "and the one still disarmed must not be, because the banner is still right about it: {one}"
+        );
+
+        let both = describe_changes_since_the_rescue(&named, |id| {
+            if id == "bp_1" {
+                SinceRescue::ReArmed
+            } else {
+                SinceRescue::Cleared
+            }
+        });
+        assert!(
+            both.contains("bp_1 has since been re-armed") && both.contains("bp_2 has since been cleared"),
+            "re-armed and cleared are different remedies — nothing to do, versus nothing left to do it \
+             to — so each gets its own line: {both}"
+        );
+        assert_eq!(
+            both.lines().filter(|l| l.contains('↳')).count(),
+            2,
+            "one line per group, not one sentence covering both: {both}"
+        );
+
+        let plural = describe_changes_since_the_rescue(&named, |_| SinceRescue::ReArmed);
+        assert!(
+            plural.contains("bp_1, bp_2 have since been re-armed"),
+            "two stop points take a plural verb, since a rescue can disarm more than one (SAFE-13's \
+             thread arm does): {plural}"
+        );
+    }
+
     /// EVAL-14 (#134): a session default is inherited only where the caller named nothing, and the two
     /// lists are NEVER merged — merging would push a caller's own four expressions past the cap and drop
     /// the tail, which is the failure the cap exists to make visible rather than to cause.
@@ -25803,7 +26064,22 @@ mod tests {
             "no_event_pump_refusal/unstarted",
             no_event_pump_refusal("localhost:8787", crate::session::EventPump::Unstarted),
         );
-
+        // SAFE-14 (#198). Pinned for the reason `session_default/*` above is: it returns an indented
+        // multi-line block that another sentence embeds, and the empty case is a caller-visible contract
+        // in its own right — it is what keeps SAFE-2's banner byte-identical while the note is still true.
+        let named = ex(&["bp_1", "bp_2"]);
+        let bp_1_rearmed =
+            |bp_2: SinceRescue| move |id: &str| if id == "bp_1" { SinceRescue::ReArmed } else { bp_2 };
+        let since = |f: &dyn Fn(&str) -> SinceRescue| describe_changes_since_the_rescue(&named, f);
+        case("changes_since_the_rescue/current", since(&|_| SinceRescue::StillDisarmed));
+        case(
+            "changes_since_the_rescue/none-named",
+            describe_changes_since_the_rescue(&[], |_| SinceRescue::ReArmed),
+        );
+        case("changes_since_the_rescue/re-armed", since(&bp_1_rearmed(SinceRescue::StillDisarmed)));
+        case("changes_since_the_rescue/all-re-armed", since(&|_| SinceRescue::ReArmed));
+        case("changes_since_the_rescue/cleared", since(&|_| SinceRescue::Cleared));
+        case("changes_since_the_rescue/mixed", since(&bp_1_rearmed(SinceRescue::Cleared)));
         out
     }
 

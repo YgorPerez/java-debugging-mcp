@@ -19,7 +19,7 @@ This repo is single-context, and the shape is the real one rather than an illust
 ```
 /
 ├── CONTEXT.md
-├── docs/adr/                           ← 38 of them; README.md is the index
+├── docs/adr/                           ← README.md is the index
 │   ├── 0001-read-only-enforced-at-the-wire-boundary.md
 │   └── 0002-trace-budget-counted-server-side.md
 ├── jdwp-client/

@@ -1412,8 +1412,16 @@ whatever froze it. Both halves, because releasing without disarming re-freezes o
 point that caused it — and that is as true of one **held thread** as of the whole VM, which is the half this
 entry described and the code did not until SAFE-13 (#197). A thread released onto its own still-armed stop
 point is back on the line that fired before anything can notice.
-_Avoid_: auto-resume (it names half of the action, and the half it omits is the one SAFE-2 and SAFE-5 were
-filed about)
+**A rescue is reported in two claims, and only one of them can expire** (SAFE-14, #198). *The VM was
+released* is permanent. *This stop point is disarmed — re-arm it* stops being true the moment the caller
+does it, and reporting the pair as one indivisible thing left *re-arm it* standing over a stop point the
+same listing showed as armed: each half correct, the pair false. So a report that has gone partly stale is
+qualified rather than dropped — a rescue that FAILED has no other surface, and deleting a report because
+one claim expired would take a **still-frozen debuggee** with it.
+_Avoid_ letting *auto-resume* be the whole name for this: it is the release half, and the half it omits —
+the **disarm** — is the one SAFE-2 and SAFE-5 were filed about. Paired with the disarm in the same breath,
+which is how every reply and tool description here already reads it, the word is fine; standing alone it
+promises a rescue that re-freezes on the next hit.
 
 **Resume honesty**:
 The property that after **any** resume path, from **any** suspended state, the debuggee is genuinely running —

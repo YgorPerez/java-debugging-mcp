@@ -5783,6 +5783,95 @@ fn a_watchdog_note_is_not_replayed_next_to_a_newer_hit() {
     server.panic_reset();
 }
 
+/// SAFE-14 (#198): the *listing* prints the same note, and it printed it unscoped — so one rescue
+/// captioned every later `debug.list_stop_points` for the life of the session, including after the
+/// caller did the one thing the note tells them to do.
+///
+/// The failure is #69's shape in the other tool that prints the note: a banner reading `disabled bp_1
+/// … re-arm it` directly above `bp_1`'s own entry, which says it is armed. Each half is correct on its
+/// own and the pair is false, and the caller who reconciles them spends a detour deciding whether their
+/// stop point is dead.
+///
+/// **The assertion is that the banner and the entry under it agree, not that the banner is gone**, and
+/// that is what makes it deterministic. Absence would be a race with the *next* rescue, which is
+/// legitimate and rewrites the note — the flake the SAFE-10 test above documents. Agreement holds at
+/// every instant, whichever side of a rescue the read lands on.
+///
+/// **The re-armed stop point gets a condition that cannot match**, so it stays armed without freezing
+/// the VM a second time. Without it the listing under test is whichever of two states the read caught,
+/// and the run that caught the rescued one would pass having proved nothing.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_rescue_banner_never_contradicts_the_stop_point_listed_under_it() {
+    let Some(jdk) = jdk_or_skip("a_rescue_banner_never_contradicts_the_stop_point_listed_under_it") else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "WatchProbe").expect("launch WatchProbe");
+    let mut server = Server::start_with_env(&[("JDWP_WATCHDOG_SECS", "1")]).expect("start server");
+    probe.attach(&mut server);
+    probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some()).expect("probe never ticked");
+
+    let line = probe_line(&probe_source("WatchProbe"), "counter = counter + 1;");
+    let set =
+        server.call("debug.set_line_stop", serde_json::json!({"class_pattern": "WatchProbe", "line": line}));
+    let id = grab_token(&set, "bp_").expect("no bp id in the arm reply");
+    server.wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT).expect("breakpoint never fired");
+
+    let frozen_at = highest_tick(&probe).expect("no tick before the suspension");
+    assert!(
+        probe.wait_for_line(EVENT_TIMEOUT, |l| tick_index(l).is_some_and(|n| n > frozen_at + 3)).is_some(),
+        "the watchdog never rescued the freeze\n  output: {:?}",
+        probe.output(),
+    );
+
+    // SAFE-2's own case first, and it must keep working: the caller who walked away is told, and the
+    // entry under the banner says the same thing. Asserted here so a fix that simply stops printing the
+    // banner cannot pass the consistency check below by printing nothing at all.
+    let rescued = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert_contains_all(
+        "a caller who walked away reads the rescue on the listing (SAFE-2), and the entry agrees",
+        &rescued,
+        &["⏰", "watchdog auto-resumed", &id, "DISABLED"],
+    );
+
+    // A condition that can never match, so the re-arm below cannot re-freeze the VM: `counter` only ever
+    // grows. It is set while the stop point is still disabled, which costs no JDWP packet.
+    server.call(
+        "debug.update_stop_point",
+        serde_json::json!({"breakpoint_id": &id, "condition": "WatchProbe.counter < 0"}),
+    );
+    // Exactly what the banner instructs.
+    let toggled =
+        server.call("debug.toggle_stop_point", serde_json::json!({"breakpoint_id": &id, "enabled": true}));
+    assert!(!toggled.contains("not found"), "the re-arm the banner asks for failed: {toggled}");
+
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    let banner = listed
+        .lines()
+        .find(|l| l.contains('⏰'))
+        .unwrap_or_else(|| panic!("SAFE-2's banner is gone from the listing entirely:\n{listed}"));
+    let entry = listed
+        .lines()
+        .find(|l| l.contains(&format!("[{id}]")))
+        .unwrap_or_else(|| panic!("{id} is missing from its own listing:\n{listed}"));
+    assert!(
+        !entry.contains("DISABLED"),
+        "the re-arm did not take, so this run proves nothing about the banner over it: {entry}"
+    );
+    // The banner still leads — SAFE-2's caller has to read the rescue — so what must have changed is
+    // that it no longer stands as an instruction over an entry showing it already carried out.
+    let stands_alone =
+        banner.contains(&id) && banner.contains("disabled") && !listed.contains("has since been re-armed");
+    assert!(
+        !stands_alone,
+        "the listing says {id} is armed and the banner above it tells the caller to re-arm it, with \
+         nothing saying they already have. Each half is correct alone and the pair is false, which is \
+         what #69 cost a caller in get_last_event and what #198 reports here.\n\n{listed}"
+    );
+
+    server.panic_reset();
+}
+
 /// TEST-4: `JDWP_WATCHDOG_SECS=0` disables the watchdog — documented behaviour that was unverified.
 /// A suspended VM must stay suspended (the probe stops ticking and stays stopped).
 #[test]

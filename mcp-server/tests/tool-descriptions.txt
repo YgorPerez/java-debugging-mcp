@@ -483,23 +483,28 @@ IS REPORTED **SPENT** ONCE IT HAS FIRED, which is a third state and not a synony
 something YOU did with toggle_stop_point and can undo, spent is something the DEBUGGEE did — JDWP's Count
 modifier makes the JVM report the Nth occurrence and delete the request itself. Before this existed such a
 stop point was listed as armed forever, which is the same silence-reads-as-an-answer failure the Hits line
-above removes. toggle_stop_point re-arms a spent stop point with the same count. PASS export:true TO GET THE
-SET BACK AS CONTENT YOU CAN KEEP, instead of a listing to read. A stop-point set dies with the process — stdio
-means the client's lifetime IS the session's — so eight stop points across four classes, with their
-conditions, trace_expr lists and hit_counts, are gone at disconnect and re-armed by hand tomorrow. The export
-is the list of debug.set_* calls that would recreate them, which is also exactly what debug.arm_stop_points
-takes back. THIS SERVER WRITES NO FILE AND READS NONE: you store the block, which keeps the safety model's
-reliance on process death being an unambiguous end of session, and means there is no policy here about where
-your output lands. TWO THINGS CANNOT CROSS INTO ANOTHER JVM AND ARE DROPPED RATHER THAN CARRIED, each named in
-the reply against the stop point it came from: an instance filter (a JDWP object id is a WEAK reference to one
-object in one JVM, ADR-0022) and a thread filter (same reason, and a pool that retires idle workers
-invalidates it even inside one JVM). Read those lines, because a dropped filter leaves that entry BROADER than
-the one you exported — on a shared instance that is the difference between a diagnostic and an outage.
-Resolved class, method and field ids are not in the set at all; it carries the class name, line and field name
-you gave and re-resolves them, which is what makes a set usable against a REDEPLOYED build rather than only
-against the same process. trace_max_hits in the set is the budget REMAINING, not the one you originally asked
-for, since that is the only one a session keeps — a stop point that has spent 190 of 200 exports with 10. A
-disabled or spent stop point is exported with its arguments and marked, and arm_stop_points will NOT arm it.
+above removes. toggle_stop_point re-arms a spent stop point with the same count. A WATCHDOG RESCUE IS REPORTED
+AT THE TOP OF THE LISTING, because a caller who walked away needs both halves of it — their VM was released,
+and a stop point was disarmed so it cannot re-freeze — before anything else on the page. IT IS REPORTED AS AN
+INSTRUCTION ONLY WHILE IT IS STILL ONE: once a stop point the rescue disabled has been re-armed, or cleared
+away, the banner carries a line saying so, so "re-arm it" can never stand over an entry that the same listing
+shows as armed. PASS export:true TO GET THE SET BACK AS CONTENT YOU CAN KEEP, instead of a listing to read. A
+stop-point set dies with the process — stdio means the client's lifetime IS the session's — so eight stop
+points across four classes, with their conditions, trace_expr lists and hit_counts, are gone at disconnect and
+re-armed by hand tomorrow. The export is the list of debug.set_* calls that would recreate them, which is also
+exactly what debug.arm_stop_points takes back. THIS SERVER WRITES NO FILE AND READS NONE: you store the block,
+which keeps the safety model's reliance on process death being an unambiguous end of session, and means there
+is no policy here about where your output lands. TWO THINGS CANNOT CROSS INTO ANOTHER JVM AND ARE DROPPED
+RATHER THAN CARRIED, each named in the reply against the stop point it came from: an instance filter (a JDWP
+object id is a WEAK reference to one object in one JVM, ADR-0022) and a thread filter (same reason, and a pool
+that retires idle workers invalidates it even inside one JVM). Read those lines, because a dropped filter
+leaves that entry BROADER than the one you exported — on a shared instance that is the difference between a
+diagnostic and an outage. Resolved class, method and field ids are not in the set at all; it carries the class
+name, line and field name you gave and re-resolves them, which is what makes a set usable against a REDEPLOYED
+build rather than only against the same process. trace_max_hits in the set is the budget REMAINING, not the
+one you originally asked for, since that is the only one a session keeps — a stop point that has spent 190 of
+200 exports with 10. A disabled or spent stop point is exported with its arguments and marked, and
+arm_stop_points will NOT arm it.
 
 ## debug.list_threads
 List threads by name (one `0x<id> <name>` line each). A JVM like WildFly has hundreds of threads — filter with

@@ -132,3 +132,21 @@ The JVM at localhost:8787 is gone — its event pump exited when the connection 
 
 ## no_event_pump_refusal/unstarted
 The session attached to localhost:8787 has no event pump — nothing is reading this JVM's events, so a stop point armed on it would suspend the debuggee at its first hit and stay that way, whatever trace says. Nothing was armed and nothing was sent. Use debug.disconnect on it and debug.attach again; debug.list_sessions marks it NO EVENT PUMP.
+
+## changes_since_the_rescue/current
+
+
+## changes_since_the_rescue/none-named
+
+
+## changes_since_the_rescue/re-armed
+·   ↳ bp_1 has since been re-armed, so that instruction is already carried out — the entries below are the current state of the stop points.
+
+## changes_since_the_rescue/all-re-armed
+·   ↳ bp_1, bp_2 have since been re-armed, so that instruction is already carried out — the entries below are the current state of the stop points.
+
+## changes_since_the_rescue/cleared
+·   ↳ bp_1, bp_2 have since been cleared, so there is nothing left to re-arm.
+
+## changes_since_the_rescue/mixed
+·   ↳ bp_1 has since been re-armed, so that instruction is already carried out — the entries below are the current state of the stop points.·   ↳ bp_2 has since been cleared, so there is nothing left to re-arm.

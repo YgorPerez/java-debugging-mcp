@@ -398,14 +398,20 @@ pub struct FailedEscalation {
 /// #189 grouped the note with the bounded note collections; the counter it depends on decides otherwise,
 /// and that is the one place this cluster departs from the issue's list.
 ///
-/// **`get_last_event` reads it through the watermark. `list_stop_points` does not, and there is a
-/// pre-existing hole under that.** SAFE-10 scoped the one tool that renders the note beside an event; the
-/// listing prints it raw at the top, and *nothing* ever clears it — not [`Self::clear`], not a resume, not
-/// a fresh suspension. So one rescue at minute five captions every later listing for the life of the
-/// session, including after the stop point it names has been re-armed and hit again, which is #69's shape
-/// in the other tool that prints the note. It predates this type and is not made worse by it; it is
-/// written down here because moving the note next to its watermark would otherwise read as a claim that
-/// every reader consults it, and one does not.
+/// **The two readers scope it differently, because they render it beside different things.**
+/// `get_last_event` renders the note beside an *event*, so SAFE-10's watermark is what it needs: a note
+/// older than the event on screen is that event's history, not its state. `list_stop_points` renders it
+/// beside the *stop points*, and the watermark answers the wrong question there — re-arming pushes no
+/// event, so the watermark still matches while the note's "re-arm it" has already been done. Measured on
+/// a live JVM for SAFE-14 (#198): scoping the listing by the watermark leaves the banner exactly where it
+/// was, over a stop point the listing itself shows as armed. So the listing scopes by
+/// [`watchdog_disarmed`](Self::watchdog_disarmed) instead — the ids the note tells the caller to re-arm,
+/// checked against what those ids read as now.
+///
+/// **Nothing ever clears the note** — not [`Self::clear`], not a resume, not a fresh suspension — and
+/// that is deliberate rather than the gap it looks like: it is the only surface a *failed* rescue has
+/// (`⚠️ watchdog tried to resume the VM … but …`), which must not be dropped while it is still true. The
+/// note is qualified where it is read, never deleted.
 ///
 /// **Nothing resets the sequence, including [`Self::clear`].** It is the identity a pushed notification
 /// has already handed to a client and the number the watermark compares against, so a reused one would
@@ -428,6 +434,12 @@ pub struct EventRing {
     pub dropped: u64,
     /// What the watchdog last did, if anything — surfaced in `list_stop_points` and `get_last_event` so a
     /// caller who was away learns the VM was auto-resumed and which stop point was disarmed (SAFE-2).
+    ///
+    /// **`note` is this stored record; `banner` is what a listing renders from it.** Two words on purpose,
+    /// because SAFE-14 is the difference between them: the note is one thing and the two tools that print
+    /// it scope it differently, so "the banner is stale" and "the note is wrong" are separate claims and
+    /// only the first was ever true. Neither word is a caller's — `CONTEXT.md` names the thing they are
+    /// about, which is a **rescue**.
     pub watchdog_note: Option<String>,
     /// [`seq`](Self::seq) at the moment [`watchdog_note`](Self::watchdog_note) was written — the watermark
     /// that stops an old rescue from being replayed next to a new hit (SAFE-10).
@@ -437,6 +449,17 @@ pub struct EventRing {
     /// and is untouched: a caller who walked away has no newer event, the watermark still matches, and
     /// they are told. The type's own doc has what it cost to be absent.
     pub watchdog_seq: Option<u64>,
+    /// The stop points [`watchdog_note`](Self::watchdog_note) tells the caller to re-arm, by caller-facing
+    /// id — what `list_stop_points` checks the note against (SAFE-14, #198).
+    ///
+    /// **Empty for a rescue that disarmed nothing**, which is a manual pause (there is no stop point) and
+    /// a stop point already cleared by hand (there is nothing left to name). Both notes are pure history —
+    /// the VM was resumed — so they have no claim that can go stale and are never qualified.
+    ///
+    /// Ids rather than the note's own prose, because the prose cannot be searched for one: `bp_1` is a
+    /// prefix of `bp_11`, and a listing that qualified the wrong stop point would be the same class of
+    /// wrong the qualification exists to fix.
+    pub watchdog_disarmed: Vec<String>,
 }
 
 /// A slice of the ring as a reply has to state it: what is being shown, and what is not.
@@ -460,7 +483,14 @@ impl EventRing {
     /// An empty ring: nothing seen, nothing dropped, no rescue to report.
     #[must_use]
     pub const fn new() -> Self {
-        Self { held: VecDeque::new(), seq: 0, dropped: 0, watchdog_note: None, watchdog_seq: None }
+        Self {
+            held: VecDeque::new(),
+            seq: 0,
+            dropped: 0,
+            watchdog_note: None,
+            watchdog_seq: None,
+            watchdog_disarmed: Vec::new(),
+        }
     }
 
     /// Push a reportable event, evicting the oldest if the ring is full. Returns the assigned seq.
@@ -526,14 +556,21 @@ impl EventRing {
         (newest_seq? <= at).then_some(note)
     }
 
-    /// Record what the watchdog just did, stamped with the event it happened after (SAFE-10).
+    /// Record what the watchdog just did: the note, the event it happened after (SAFE-10), and the stop
+    /// points it disarmed (SAFE-14).
     ///
-    /// One method rather than two assignments at each of the watchdog's four outcomes, because a note
+    /// One method rather than three assignments at each of the watchdog's five outcomes, because a note
     /// written without its watermark is precisely the bug: it would be replayed against every later
-    /// event, which is what #69 reported.
-    pub fn note_watchdog(&mut self, note: String) {
+    /// event, which is what #69 reported. `disarmed` is the same rule one tool along — a note that cannot
+    /// say which stop points it told the caller to re-arm cannot be told apart from one they have already
+    /// re-armed, which is what #198 reported.
+    ///
+    /// The ids **replace** rather than extend: a note describes one rescue, and the previous one's stop
+    /// points are not this one's to speak for.
+    pub fn note_watchdog(&mut self, note: String, disarmed: &[String]) {
         self.watchdog_note = Some(note);
         self.watchdog_seq = Some(self.seq);
+        self.watchdog_disarmed = disarmed.to_vec();
     }
 }
 
@@ -2522,6 +2559,11 @@ mod tests {
         "watchdog auto-resumed the VM after 300s and disabled bp_1".to_string()
     }
 
+    /// The stop point [`rescue`] tells the caller to re-arm — the note's other half since SAFE-14.
+    fn rescued(ring: &mut EventRing) {
+        ring.note_watchdog(rescue(), &["bp_1".to_string()]);
+    }
+
     #[test]
     fn every_event_is_numbered_in_arrival_order_and_the_pusher_is_told_which() {
         let mut ring = EventRing::new();
@@ -2598,7 +2640,7 @@ mod tests {
         for _ in 0..MAX_EVENTS + 2 {
             ring.push(arrival(), None);
         }
-        ring.note_watchdog(rescue());
+        rescued(&mut ring);
 
         ring.clear();
 
@@ -2622,6 +2664,50 @@ mod tests {
             Some((MAX_EVENTS + 2) as u64),
             "and so does the watermark that decides which event it is rendered against"
         );
+        // The note's other half, and it survives for the same reason: the listing that prints the note to a
+        // caller who walked away is also the one that has to say whether they have since acted on it, and
+        // a drain that kept the note without its ids would leave the banner unqualifiable — the SAFE-14
+        // bug back, reached by a different route.
+        assert_eq!(
+            ring.watchdog_disarmed,
+            vec!["bp_1".to_string()],
+            "the stop points the note tells the caller to re-arm survive a drain with the note"
+        );
+    }
+
+    /// SAFE-14 (#198): a note carries the stop points it told the caller to re-arm, and one rescue's ids
+    /// are never the next rescue's.
+    #[test]
+    fn a_rescue_note_carries_the_stop_points_it_disarmed_and_only_its_own() {
+        let mut ring = EventRing::new();
+        rescued(&mut ring);
+        assert_eq!(
+            ring.watchdog_disarmed,
+            vec!["bp_1".to_string()],
+            "the listing can only qualify a banner it can match against the table"
+        );
+
+        ring.note_watchdog(
+            "watchdog auto-resumed the VM after 300s and disabled bp_2".to_string(),
+            &["bp_2".to_string()],
+        );
+        assert_eq!(
+            ring.watchdog_disarmed,
+            vec!["bp_2".to_string()],
+            "a note describes ONE rescue — carrying the previous one's stop points forward would have \
+             this note speak for a disarm it is not about"
+        );
+
+        ring.note_watchdog(
+            "watchdog auto-resumed the VM after 300s, suspended by debug.pause (no stop point to disarm)"
+                .to_string(),
+            &[],
+        );
+        assert!(
+            ring.watchdog_disarmed.is_empty(),
+            "a rescue that disarmed nothing names nothing: its note is only that the VM was resumed, \
+             which never stops being true and so is never qualified"
+        );
     }
 
     /// SAFE-10 (#69): the note is an account of **one** suspension ending, so it is rendered against the
@@ -2630,7 +2716,7 @@ mod tests {
     fn a_rescue_note_is_reported_only_against_the_suspension_it_ended() {
         let mut ring = EventRing::new();
         let hit = ring.push(arrival(), None);
-        ring.note_watchdog(rescue());
+        rescued(&mut ring);
 
         assert_eq!(
             ring.watchdog_note_for(Some(hit)),
