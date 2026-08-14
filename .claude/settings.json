@@ -54,12 +54,7 @@
     "command -- which cost two bugs in opposite directions, the soak rule firing on a `git commit`",
     "whose message quoted a test run, and a body that merely MENTIONED SKIP_JDWP_AGENT_GUARD=1",
     "standing the entire guard down. THAT COUNT IS ASSERTED by mcp-server/tests/docs_claims.rs, so",
-    "this comment cannot quietly go stale.",
-    "",
-    "statusline.py surfaces this repo's invisible states: branch (amber on main), workspace version,",
-    "dirty count, unpushed commits, and -- the one that earns its slot -- an annotated tag on HEAD",
-    "that the remote does not have, which is exactly what `scripts/release.sh` leaves behind by",
-    "design."
+    "this comment cannot quietly go stale."
   ],
   "hooks": {
     "PreToolUse": [
@@ -114,10 +109,5 @@
         ]
       }
     ]
-  },
-  "statusLine": {
-    "type": "command",
-    "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/statusline.py",
-    "refreshInterval": 10
   }
 }
