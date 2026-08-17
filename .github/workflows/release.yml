@@ -49,7 +49,7 @@ jobs:
     # forty times the measurement. See tests.yml's `changes` job for the general argument and the sourcing.
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -159,7 +159,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             ext: .exe
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -262,7 +262,7 @@ jobs:
       # upload. Naming it `${{ matrix.name }}` (`linux-x86_64`) meant the download had no way to say
       # "mine" without listing the slices, which is how REL-2 (#41) happened.
       - name: Upload the binary
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.ASSET }}
           path: ${{ env.ASSET }}
@@ -285,7 +285,7 @@ jobs:
     # directory the cargo cache does not reach.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -334,7 +334,7 @@ jobs:
       # commit's parent) and every commit between it and here; the default depth-1 fetch has neither, and
       # would produce a changelog of one commit against no baseline rather than an error.
       - name: Check out the tagged commit and its history
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -346,7 +346,7 @@ jobs:
       # reusable workflow silently adopts that workflow's artifacts; naming what we want instead of taking
       # what is there is what keeps the next gate's uploads out too.
       - name: Collect every platform's binary
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           pattern: jdwp-mcp-* # the build matrix names its artifacts after the file they carry
@@ -538,7 +538,7 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -596,7 +596,7 @@ jobs:
       id-token: write # the OIDC exchange; NOT a write to this repository
       contents: read # the checkout, and `gh release download` for the assets
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -611,7 +611,7 @@ jobs:
       # NO `registry-url`, deliberately. That input exists to write an `.npmrc` carrying `NODE_AUTH_TOKEN`,
       # which is the stored-token path this job is built to avoid, and npm's default registry is already
       # the one we publish to. No `cache:` either, so the caching zizmor warns about is never switched on.
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 # zizmor: ignore[cache-poisoning]
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4.4.0 # zizmor: ignore[cache-poisoning]
         with:
           node-version: "22.14.0"
 

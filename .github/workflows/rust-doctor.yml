@@ -59,7 +59,7 @@ jobs:
       CLIPPY_CONF_DIR: ${{ github.workspace }}
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -180,7 +180,7 @@ jobs:
       # `scripts/doctor.sh` reads it with `head -1` to work out which passes the gate really has the tool
       # for, and a second install step would be invisible to it. Its comment says so at the line.
       - name: Install the tools the gate needs
-        uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
+        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
         with:
           tool: cargo-deny,cargo-machete,cargo-shear,typos,zizmor
 
@@ -425,7 +425,7 @@ jobs:
 
       - name: Upload SARIF as an artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rust-doctor-sarif
           path: rust-doctor.sarif
@@ -471,7 +471,7 @@ jobs:
     # JSON twice, for the baseline tag and for HEAD. See tests.yml's `changes` job for the general argument.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0 # tags and history: the baseline is a tag, not a registry
@@ -483,7 +483,7 @@ jobs:
           cache: "false"
 
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
+        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
         with:
           tool: cargo-semver-checks
 
