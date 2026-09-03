@@ -1008,7 +1008,13 @@
     same pattern), rather than truncating quietly. The cap also applies to classes that load *later*: the
     family stops arming new ones once it is full, and `debug.list_stop_points` reports that it is.
 - method: {"default":null,"type":["string","null"]}
-    Method name (optional). If given without `line`, breaks at the method's first line.
+    Method name (optional). If given without `line`, breaks at the method's first line. **Looked up in every
+    loaded copy of the class, not just the first** (BP-11). A class name resolves to one type per classloader,
+    and after a redeploy the retired deployment's copy is still loaded and still sorts first — so a method the
+    running code declares can be absent from the copy that would otherwise have been inspected. If a later
+    copy has it, that one is armed and the reply names it. If no copy has it, the reply says how many were
+    searched, and — when a `class_root` can answer — whether your BUILD declares it, which distinguishes "the
+    loaded copy predates your source" from "the name is wrong". The two used to read identically.
 - session_id: {"default":null,"type":["string","null"]}
     Which debug session to act on, from `debug.list_sessions`. Omitted, the CURRENT session is used — the most
     recently attached one — which is what every example here assumes. Give it when more than one JVM is

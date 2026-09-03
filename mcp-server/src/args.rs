@@ -444,6 +444,14 @@ pub struct SetBreakpointArgs {
     #[serde(default)]
     pub line: Option<i32>,
     /// Method name (optional). If given without `line`, breaks at the method's first line.
+    ///
+    /// **Looked up in every loaded copy of the class, not just the first** (BP-11). A class name resolves
+    /// to one type per classloader, and after a redeploy the retired deployment's copy is still loaded and
+    /// still sorts first — so a method the running code declares can be absent from the copy that would
+    /// otherwise have been inspected. If a later copy has it, that one is armed and the reply names it. If
+    /// no copy has it, the reply says how many were searched, and — when a `class_root` can answer —
+    /// whether your BUILD declares it, which distinguishes "the loaded copy predates your source" from
+    /// "the name is wrong". The two used to read identically.
     #[serde(default)]
     pub method: Option<String>,
     /// Only stop on the Nth hit (optional).

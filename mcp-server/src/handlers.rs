@@ -15348,6 +15348,9 @@ struct ArmedBreakpoint {
     /// DISC-8 and DISC-14: the stale-bytecode caveat when there is a proof of drift, the reason when there
     /// was nothing to compare, and nothing at all only when the two were compared and agreed.
     drift: DriftCheck,
+    /// BP-11 (#203): which loaded copy answered, when it was not the one that sorted first. `None` on the
+    /// ordinary path, which is every class loaded once and every class whose first copy has the method.
+    answered_by: Option<String>,
 }
 
 impl ArmedBreakpoint {
@@ -15384,6 +15387,11 @@ impl ArmedBreakpoint {
                 "\n   ⚠️ One copy of the line could not be armed ({p}) — this stop point \
                                covers the others, so a path through the missing copy will not report."
             );
+        }
+        // BP-11 (#203). Last, because it is about which copy the LINE above came from, and a reader has to
+        // have read the line before that matters.
+        if let Some(c) = &self.answered_by {
+            s.push_str(c);
         }
         s
     }
@@ -15560,6 +15568,237 @@ fn armed_line_stop_point(
     }
 }
 
+/// Which loaded copy of the class this stop point is armed against as its PRIMARY (BP-11, #203).
+struct PrimaryCopy {
+    class_id: u64,
+    loc: ResolvedLocation,
+    /// The remaining copies, in `classes_by_signature` order with the primary removed — what
+    /// [`resolve_other_classloader_copies`] arms next.
+    others: Vec<u64>,
+    /// Named only when the primary was NOT the copy that sorted first. Copy #0 answering is the ordinary
+    /// case and says nothing worth a line.
+    caveat: Option<String>,
+}
+
+/// Pick the copy to arm as primary, trying **every** loaded copy of the class name (BP-11, #203).
+///
+/// EVAL-13 (#116) fixed this shape for `debug.evaluate` — a member lookup that failed against a retired
+/// deployment's copy blamed the caller's signature and never mentioned the other copies. Its *Out of scope*
+/// named stop points, and the arming path kept the defect: `.first()`, and a `NoSuchMethod` worded from the
+/// class name and the method hint alone. The reported cost was five tool calls, all of them spent doubting a
+/// method name that was fine — `debug.list_methods` on the same class moments later answered correctly and
+/// volunteered the discriminator.
+///
+/// **Only `NoSuchMethod` retries**, the same split [`StaticMemberMiss`] draws and for the same reason: a
+/// `NoSuchLine` or an unreadable method table would repeat against every copy and bury itself N times over.
+/// A line that is missing from the primary is also a different diagnosis — BP-5 arms every copy anyway, so
+/// the primary's own line table is the one the caller asked about — and re-deciding that is #202's subject,
+/// not this one's.
+///
+/// **Costs nothing on the single-copy path**, which is nearly every class: the loop runs once and returns on
+/// the first `Ok`, and the class-root read below happens only once a lookup has already failed.
+async fn resolve_primary_copy(
+    session: &mut crate::session::DebugSession,
+    class_type_ids: &[u64],
+    spec: &BreakpointSpec,
+    rearm: &RearmPlan,
+) -> Result<PrimaryCopy, ArmError> {
+    let mut absent: Option<BpLocationError> = None;
+    for (i, &class_id) in class_type_ids.iter().enumerate() {
+        let attempt = resolve_bp_location(
+            &mut session.connection,
+            class_id,
+            spec.line_opt,
+            spec.method_hint.as_deref(),
+        )
+        .await;
+        match attempt {
+            Ok(loc) => {
+                let others = class_type_ids.iter().copied().filter(|&o| o != class_id).collect();
+                let caveat = if i == 0 {
+                    None
+                } else {
+                    let labels = describe_class_loaders(
+                        &mut crate::reads::Reads::live(&mut session.connection),
+                        class_type_ids,
+                    )
+                    .await;
+                    Some(format!(
+                        "\n   ⚠️  Armed against copy #{i} of {}, not the first one — {} is loaded {} times \
+                         and the copies that sort ahead of #{i} do not declare {}. On WildFly that is the \
+                         retired deployment's copy still being reachable; it means the arming reply and \
+                         debug.list_methods can only agree once they are both looking at #{i}. Loaded by: \
+                         {}. Pin a read to this copy with {}@<the 0x… for #{i}>.",
+                        spec.class_pattern,
+                        spec.class_pattern,
+                        class_type_ids.len(),
+                        spec.method_hint.as_deref().unwrap_or("the target method"),
+                        labels.join("; "),
+                        spec.class_pattern,
+                    ))
+                };
+                return Ok(PrimaryCopy { class_id, loc, others, caveat });
+            }
+            // The one outcome another copy could answer differently.
+            Err(e @ BpLocationError::NoSuchMethod(_)) => {
+                absent.get_or_insert(e);
+            }
+            Err(other) => return Err(ArmError::from_location(&other, &spec.class_pattern)),
+        }
+    }
+    // The first `NoSuchMethod` is the one reported, so a single-copy JVM keeps today's message as its
+    // opening clause and only gains what follows it.
+    let miss =
+        absent.unwrap_or_else(|| BpLocationError::NoSuchMethod(spec.method_hint.clone().unwrap_or_default()));
+    // A wildcard family's member keeps the bare message. For `*.Service` + `handle`, a class that does not
+    // declare the method is the expected MAJORITY of matches rather than a fault (see [`BpLocationError`]),
+    // and enriching it would spend a class-file read per class to print 37 paragraphs saying "not a target".
+    if matches!(rearm.watch, crate::stop_point::RearmState::CoveredByFamily) {
+        return Err(ArmError::from_location(&miss, &spec.class_pattern));
+    }
+    Err(ArmError::NoSuchMethod(arming_miss_message(session, spec, &miss, class_type_ids.len()).await))
+}
+
+/// The reply for a method name that no loaded copy declares (BP-11, #203).
+///
+/// Three facts, in the order a reader needs them: what was looked for, **how much was searched**, and
+/// whether the build on disk disagrees with the JVM. The middle one is what the old message lacked most —
+/// "Method 'x' not found in C" reads as though one class were inspected and there were only one to inspect,
+/// so the natural next move is to doubt the name. It is stated even for a single copy, because "1 copy
+/// searched" is the sentence that makes "2 copies searched" mean something when it appears.
+///
+/// **The build check is what turns a dead end into a diagnosis, and it is the same read `debug.check_stale`
+/// already does.** A method the build declares and no loaded copy has is not a typo: the JVM is holding a
+/// copy older than the source you are reading, because nothing has re-loaded the class since the redeploy —
+/// classes load on first use, so a class nothing has thrown or called since the deploy is still the retired
+/// one. That reading is offered ONLY on that evidence, so a genuine typo never acquires it.
+async fn arming_miss_message(
+    session: &crate::session::DebugSession,
+    spec: &BreakpointSpec,
+    miss: &BpLocationError,
+    copies: usize,
+) -> String {
+    let class = &spec.class_pattern;
+    let mut msg = format!("{miss} in {class}");
+    if copies > 1 {
+        let _ = write!(
+            msg,
+            " — it is loaded {copies} times, one class per classloader, and NONE of the {copies} copies \
+             declares it"
+        );
+    } else {
+        msg.push_str(" (1 loaded copy, and it was searched)");
+    }
+    let method = spec.method_hint.as_deref().unwrap_or("");
+    match build_declares_method(session, class, method).await {
+        BuildVerdict::Declares(path) => {
+            let _ = write!(
+                msg,
+                ".\n   ⚠️  YOUR BUILD DOES DECLARE IT — {} has {method} — so this is not the name being \
+                 wrong: the copy the JVM holds is OLDER than the source you are reading. A class loads on \
+                 first use, so one that nothing has called or thrown since the redeploy is still the \
+                 retired deployment's. Trigger the code path that loads the new copy and arm again, or \
+                 debug.reload_class to install your build without one.",
+                path.display()
+            );
+        }
+        BuildVerdict::Absent(path) => {
+            let _ = write!(
+                msg,
+                ".\n   Your build does not declare it either ({} was read), so the name is wrong rather \
+                 than stale. debug.list_methods on {class} shows what it does have.",
+                path.display()
+            );
+        }
+        BuildVerdict::NotChecked(why) => {
+            let _ = write!(
+                msg,
+                ".\n   ℹ️  The build was NOT consulted, so a stale loaded copy and a wrong name are still \
+                 indistinguishable from here: {}.\n   debug.list_methods on {class} shows what the \
+                 loaded cop{} declare{}.",
+                why_terse(&why),
+                if copies > 1 { "ies" } else { "y" },
+                if copies > 1 { "" } else { "s" },
+            );
+        }
+    }
+    msg
+}
+
+/// Whether the compiled class on disk declares the method the arming call named (BP-11, #203).
+///
+/// Reuses `resolve_class_file` + [`crate::classfile::parse`] rather than a second lookup, for the reason
+/// `drift_caveat_from_tables` reuses `compare_line_tables`: two paths that answer "what does the build have"
+/// are two answers that can disagree. Matched on the **name** alone and deliberately not the descriptor — a
+/// method whose signature changed is the case that most wants this sentence, and it is `list_methods`' job
+/// to show which overloads exist.
+enum BuildVerdict {
+    /// The build declares it, with the file that says so.
+    Declares(std::path::PathBuf),
+    /// The build was read and does not declare it.
+    Absent(std::path::PathBuf),
+    /// No proof either way, with the reason in the caller's terms (DISC-14's rule).
+    NotChecked(String),
+}
+
+async fn build_declares_method(
+    session: &crate::session::DebugSession,
+    class_name: &str,
+    method: &str,
+) -> BuildVerdict {
+    if method.is_empty() {
+        return BuildVerdict::NotChecked("the call named no method to look for".to_string());
+    }
+    if session.class_roots.is_empty() {
+        return BuildVerdict::NotChecked(
+            "no class root is configured. Set one with debug.attach {\"class_roots\":[...]} or \
+             JDWP_CLASS_ROOTS — a class root is where the package tree starts in the BUILD OUTPUT \
+             (target/classes), not src/main/java — and this check then runs unasked"
+                .to_string(),
+        );
+    }
+    let path = match resolve_class_file(class_name, None, &session.class_roots) {
+        Ok(p) => p,
+        Err(why) => return BuildVerdict::NotChecked(why),
+    };
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(why) => {
+            return BuildVerdict::NotChecked(format!("found {} but could not read it: {why}", path.display()))
+        }
+    };
+    let built = match crate::classfile::parse(&bytes) {
+        Ok(c) => c,
+        Err(why) => {
+            return BuildVerdict::NotChecked(format!(
+                "{} could not be parsed as a class file: {why}",
+                path.display()
+            ))
+        }
+    };
+    if built.this_class != class_name {
+        return BuildVerdict::NotChecked(format!(
+            "{} declares {}, not {class_name} — that is a wrong class root rather than evidence either way",
+            path.display(),
+            built.this_class
+        ));
+    }
+    if built.methods.iter().any(|m| m.name == method) {
+        BuildVerdict::Declares(path)
+    } else {
+        BuildVerdict::Absent(path)
+    }
+}
+
+/// A `NotChecked` reason with its trailing full stop dropped, so it can sit mid-sentence.
+///
+/// The reasons are quoted verbatim from `resolve_class_file` and friends, which word them as standalone
+/// sentences — and two full stops in a row is the kind of seam that makes a reply read as assembled rather
+/// than written.
+fn why_terse(why: &str) -> String {
+    why.trim_end().trim_end_matches('.').to_string()
+}
+
 async fn arm_and_insert(
     session: &mut crate::session::DebugSession,
     class_type_ids: &[u64],
@@ -15567,17 +15806,13 @@ async fn arm_and_insert(
     bp_id: String,
     rearm: RearmPlan,
 ) -> Result<ArmedBreakpoint, ArmError> {
-    let Some((&class_type_id, other_copies)) = class_type_ids.split_first() else {
+    if class_type_ids.is_empty() {
         return Err(ArmError::Other(format!("{} is not loaded", spec.class_pattern)));
-    };
-    let loc = resolve_bp_location(
-        &mut session.connection,
-        class_type_id,
-        spec.line_opt,
-        spec.method_hint.as_deref(),
-    )
-    .await
-    .map_err(|e| ArmError::from_location(&e, &spec.class_pattern))?;
+    }
+    // BP-11 (#203): every loaded copy is tried, not just the first, and the reply says which one answered.
+    let PrimaryCopy { class_id: class_type_id, loc, others: other_copies, caveat } =
+        resolve_primary_copy(session, class_type_ids, spec, &rearm).await?;
+    let other_copies = other_copies.as_slice();
     let (method, index, extra, line, jvm_lines) =
         (loc.method, loc.code_index, loc.extra_code_indices, loc.line, loc.lines);
     // FILT-9: a static method has no `this`, and HotSpot accepts the modifier anyway rather than saying
@@ -15660,7 +15895,16 @@ async fn arm_and_insert(
     // After arming, not before: the breakpoint is the thing the caller asked for, and a drift check that
     // could fail must never be able to prevent it. Everything this call does is fallible-but-ignorable by
     // construction, and it returns `None` rather than an error for the same reason.
-    Ok(ArmedBreakpoint { bp_id, line, method_name: method.name, request_ids, loader_count, partial, drift })
+    Ok(ArmedBreakpoint {
+        bp_id,
+        line,
+        method_name: method.name,
+        request_ids,
+        loader_count,
+        partial,
+        drift,
+        answered_by: caveat,
+    })
 }
 
 /// The target class isn't loaded yet: register a `CLASS_PREPARE` watch (`EventThread` suspend, so the

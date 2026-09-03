@@ -18426,3 +18426,178 @@ fn this_reads_the_same_on_a_traced_hit_and_on_a_suspending_one() {
 
     server.panic_reset();
 }
+
+/// BP-11 (#203): arming by method name tries EVERY loaded copy, and the reply names the one that answered.
+///
+/// EVAL-13 (#116) fixed this shape for `debug.evaluate` and its *Out of scope* named stop points, so the
+/// arming path kept the defect: `classes_by_signature().first()`, and a `NoSuchMethod` worded from the class
+/// name and the method hint alone — true of the copy it inspected, false of the build the caller was
+/// reading, and naming neither. The reported cost was five tool calls, every one of them spent doubting a
+/// method name that was fine.
+///
+/// **Both directions, because `classes_by_signature` promises no order** — the same reason
+/// `a_member_on_only_one_classloaders_copy_resolves_and_the_reply_names_the_copy` asserts both. `senseAAA`
+/// is only on the unpatched copy and `senseBBB` only on the patched one, so whichever copy the resolver
+/// reaches first, exactly one of the two arms has to survive by trying the other — and exactly one carries
+/// the caveat. Asserting "the caveat appeared" against a single arm would pass for the wrong reason half the
+/// time and be a coin flip the rest.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn arming_by_method_name_tries_every_loaded_copy_and_names_the_one_that_answered() {
+    let Some(jdk) =
+        jdk_or_skip("arming_by_method_name_tries_every_loaded_copy_and_names_the_one_that_answered")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "TwinMemberProbe").expect("launch TwinMemberProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    // The probe's own premises, stated by the JVM rather than assumed: the name loaded twice, and each copy
+    // missing the other's member. Without these a green run could mean the loaders collapsed into one type,
+    // in which case there is no multiplicity and nothing was proven.
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("loaded twice=true"))
+        .expect("probe did not load the class twice — nothing for this test to assert about");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l == "alpha lacks senseBBB=true")
+        .expect("the unpatched copy has the patched copy's member — the byte surgery did not take");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l == "beta lacks senseAAA=true")
+        .expect("the patched copy still has the original member — the byte surgery did not take");
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("ran beta:")).expect("second copy never ran");
+
+    let arm = |server: &mut Server, method: &str| {
+        server.call(
+            "debug.set_line_stop",
+            serde_json::json!({
+                "class_pattern": "TwinMemberProbe$Widget", "method": method, "trace": true,
+            }),
+        )
+    };
+    let aaa = arm(&mut server, "senseAAA");
+    let bbb = arm(&mut server, "senseBBB");
+
+    // Both arm. Pre-fix, whichever copy sorted second answered `Method '…' not found in
+    // TwinMemberProbe$Widget` for a method that exists in the JVM it is looking at.
+    assert!(aaa.contains("bp_"), "the member on the unpatched copy did not arm: {aaa}");
+    assert!(bbb.contains("bp_"), "the member on the patched copy did not arm: {bbb}");
+
+    let caveat = "not the first one";
+    let carried: Vec<&str> = [("senseAAA", &aaa), ("senseBBB", &bbb)]
+        .iter()
+        .filter(|(_, r)| r.contains(caveat))
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        carried.len(),
+        1,
+        "exactly one of the two arms must have been answered by a copy that was not tried first, and say \
+         so — got {carried:?}\n  senseAAA: {aaa}\n  senseBBB: {bbb}"
+    );
+
+    // And the caveat is actionable rather than decorative: it names the loaders and how to pin a read to
+    // the copy that answered, which is the whole reason `debug.list_methods` was more use than the arm.
+    let named = if carried[0] == "senseAAA" { &aaa } else { &bbb };
+    assert_contains_all(
+        "the caveat names which copy answered and how to reach it",
+        named,
+        &["is loaded 2 times", "TwinLoader", "Pin a read to this copy"],
+    );
+
+    server.panic_reset();
+}
+
+/// BP-11 (#203): a method the BUILD declares and no loaded copy has is reported as the loaded copy being
+/// older than the source, not as the name being wrong.
+///
+/// This is the reported session exactly. `descreveCausa` was in the build on disk; what the JVM held was the
+/// retired deployment's copy, which predates it, because nothing had thrown since the redeploy and a class
+/// loads on first use. `Method 'descreveCausa' not found in …ApiException` is true of the copy it inspected
+/// and false of the file the reader had open, and the natural next move is to doubt the name — which is
+/// where the five calls went.
+///
+/// The negative is in the same test on purpose: a misspelling has to keep failing plainly. A reply that
+/// offered the stale-build reading to every miss would be worse than the one it replaces, since the reading
+/// is only worth anything when it is evidence.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_method_the_build_declares_but_no_loaded_copy_has_reports_the_mismatch() {
+    let Some(jdk) = jdk_or_skip("a_method_the_build_declares_but_no_loaded_copy_has_reports_the_mismatch")
+    else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+
+    // A build that is AHEAD of what is running: same class, one method more. That is what a redeploy whose
+    // class has not been re-loaded looks like from the debugger's side, and compiling a variant reproduces
+    // it without any byte surgery — the running JVM cannot have a method its class file never had.
+    let ahead = tempfile::tempdir().expect("tempdir");
+    jdk.compile_probe_variant("SwapProbe", ahead.path(), |src| {
+        src.replacen(
+            "public class SwapProbe {",
+            "public class SwapProbe {\n    static int descreveCausa() { return 7; }\n",
+            1,
+        )
+    })
+    .expect("compile the ahead-of-the-JVM SwapProbe");
+
+    let mut server = Server::start().expect("start server");
+    attach_with_class_roots(&mut server, probe.port, Some(ahead.path()));
+
+    let missing = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "SwapProbe", "method": "descreveCausa", "trace": true}),
+    );
+    assert!(!missing.contains("bp_"), "a method no loaded copy has must not arm: {missing}");
+    assert_contains_all(
+        "the reply names the build-versus-loaded mismatch, and how much it searched",
+        &missing,
+        &["YOUR BUILD DOES DECLARE IT", "loaded copy", "OLDER than the source", "debug.reload_class"],
+    );
+
+    // The negative. Same class root, a name nothing declares — so the build was consulted and DISAGREES
+    // with the stale reading, which is the one piece of evidence that rules it out.
+    let typo = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "SwapProbe", "method": "desrceveCausa", "trace": true}),
+    );
+    assert!(!typo.contains("bp_"), "a misspelled method must not arm: {typo}");
+    assert_contains_all(
+        "a misspelling is answered as a misspelling, and still says what was searched",
+        &typo,
+        &["1 loaded copy", "does not declare it either", "debug.list_methods"],
+    );
+    assert!(
+        !typo.contains("OLDER than the source"),
+        "a misspelling must not acquire the stale-build explanation — it is only worth anything as \
+         evidence: {typo}"
+    );
+
+    // And with no class root at all the reply says the build was not consulted, rather than implying it
+    // was. DISC-14's rule: every non-proof is a reason, because silence reads as "checked and fine".
+    //
+    // A SECOND probe, because a JDWP agent started with `server=y` accepts one connection and refuses the
+    // rest — so the two class-root worlds need two debuggees, not two sessions against one.
+    let bare_probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch the second SwapProbe");
+    let mut bare = Server::start().expect("start second server");
+    bare.attach(bare_probe.port);
+    let unchecked = bare.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "SwapProbe", "method": "descreveCausa", "trace": true}),
+    );
+    assert_contains_all(
+        "with nothing to compare against, the reply says so and names the fix",
+        &unchecked,
+        &["1 loaded copy", "NOT consulted", "class_roots"],
+    );
+    assert!(
+        !unchecked.contains("YOUR BUILD DOES DECLARE IT")
+            && !unchecked.contains("does not declare it either"),
+        "a verdict must not be reported when nothing was read: {unchecked}"
+    );
+
+    server.panic_reset();
+}
