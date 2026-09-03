@@ -14110,7 +14110,7 @@ fn an_exact_class_name_arms_every_classloaders_copy() {
         "there is no `finally` in this probe, so the arming reply must not name one: {set}"
     );
     assert!(
-        set.contains("several classloaders' copies of this class"),
+        set.contains("several COPIES of this class, one per classloader"),
         "the arming reply has to say which multiplicity put it on two requests: {set}"
     );
 
@@ -18722,7 +18722,7 @@ fn a_stop_point_armed_by_method_name_follows_the_method_across_a_redeploy_that_m
     // CLASSLOADERS' copies, and the count line said they were two bytecode copies of one source line —
     // a claim about the caller's `finally` that there is no `finally` to support.
     assert!(
-        listed.contains("Armed at 2 locations") && listed.contains("several classloaders' copies"),
+        listed.contains("Armed at 2 locations") && listed.contains("several COPIES of this class"),
         "two requests from two classloaders must not be reported as a duplicated `finally` line: {listed}"
     );
     assert!(

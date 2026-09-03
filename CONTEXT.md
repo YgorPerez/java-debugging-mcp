@@ -231,7 +231,8 @@ beside a proof that the build has moved (BP-10,
 [#202](https://github.com/YgorPerez/java-debugging-mcp/issues/202)).
 _Avoid_: "the class" once more than one copy is loaded (that names a name, not a type); **reload** for this
 (a copy is a second *definition* under a second loader, not a redefinition of the first — see the entry
-under **The target**)
+under **The target**); *copy* for the several-bytecode-indices-of-one-line sense — those are several
+**armed locations** inside one copy, and v0.25.0 shipped a reply putting both senses in one sentence
 
 **Hidden class**:
 A class the JVM made rather than a compiler — what is actually behind a lambda, a method reference or a
@@ -535,8 +536,31 @@ anyway — as `BreakpointInfo` and its four per-kind siblings did in CLEAN-4 (#1
 The *concepts* below keep their own names: a line breakpoint is still a breakpoint.
 
 **Line breakpoint**:
-A stop point at one source location. The only kind that can carry a condition, the only kind that can be
-deferred, and the only kind that forms a **wildcard family**.
+A stop point at one source location — one *source* location, which is not one **armed location**; see
+below. The only kind that can carry a condition, the only kind that can be deferred, and the only kind that
+forms a **wildcard family**.
+
+**Armed location**:
+One concrete place a stop point is actually armed: a bytecode index, in a method, of a **reference type**.
+The umbrella both of a line breakpoint's multiplicities produce, and the reason `Armed at N locations` can
+read `4` for a stop point the caller set on one line.
+
+**Defined because its absence is what stretched another word.** Two unrelated multiplicities turn one
+source line into several armed locations — `javac` inlines a `finally` body once per exit path, so the line
+is in the line table more than once (BP-4,
+[#78](https://github.com/YgorPerez/java-debugging-mcp/issues/78)); and every classloader that loaded the
+name defines its own **copy** (BP-5,
+[#79](https://github.com/YgorPerez/java-debugging-mcp/issues/79)). They multiply: two loaders holding a
+`finally` line is four armed locations. With no word for the product, replies reached for *copy* for both —
+and **copy** is spent on the second sense alone.
+
+A stop point is still ONE thing to the caller however many it holds: one **stop-point id**, listed once,
+cleared once, its trace budget charged once per **hit** rather than once per location (ADR-0005).
+_Avoid_: **copy** for the several-bytecode-indices sense (that is several armed locations in ONE copy);
+the bare word where the COUNT is the point — `Armed at 4 locations` is armed locations, and dropping the
+qualifier there invites the reading that the caller's one line is four lines. Bare "location" stays
+correct for a position a reply *reports* — a throw site, a catch site, a **watchpoint**'s mutating
+location — because nothing is being counted
 
 **Exception breakpoint**:
 A stop point on a thrown exception of a given class and its subclasses, reporting the throw site and the

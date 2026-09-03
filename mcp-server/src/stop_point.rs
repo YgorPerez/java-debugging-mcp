@@ -763,7 +763,7 @@ pub struct BreakpointArm {
     ///
     /// Two different multiplicities land here, which is why it is a full location rather than a bare
     /// bytecode index:
-    ///  - **one line, several bytecode copies in the same method** — `javac` inlines a `finally` body once
+    ///  - **one line, several armed locations in the same method** — `javac` inlines a `finally` body once
     ///    per exit path (BP-4, #78), so `class_id` and `method_id` repeat and only the index moves;
     ///  - **one class name, several loaded copies of it** — every classloader that has loaded the name
     ///    defines its own reference type (BP-5, #79), so `class_id` differs too.

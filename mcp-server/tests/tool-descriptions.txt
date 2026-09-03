@@ -880,9 +880,9 @@ used to mean both, and in a session that had configured no roots — the toolkit
 the second: an arm against a war exported before the edit printed its `2 locations` and `2 classloaders`
 warnings, said nothing about staleness, and cost six tool calls before the Method: line gave it away. A
 wildcard that arms many classes states one shared reason once rather than per class. Costs no extra JDWP
-packets, because arming already read the line table. ONE SOURCE LINE CAN BE SEVERAL BYTECODE LOCATIONS, AND
-ALL OF THEM ARE ARMED: javac does not compile a finally body once and jump to it, it inlines a copy per exit
-path, so a line inside a finally is in the line table twice — once for normal completion and once for the
+packets, because arming already read the line table. ONE SOURCE LINE CAN BE SEVERAL ARMED LOCATIONS, AND ALL
+OF THEM ARE ARMED: javac does not compile a finally body once and jump to it, it inlines the body once per
+exit path, so a line inside a finally is in the line table twice — once for normal completion and once for the
 exception path. Arming only the first (which is what this did before) means the stop point reports the calls
 that SUCCEEDED and goes silent on the one that failed, which is the case you are debugging and is
 indistinguishable from the code never running. A finally is the idiomatic logpoint site precisely because the

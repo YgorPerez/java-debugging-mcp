@@ -77,16 +77,16 @@ Watching for more copies, and one has already been MISSED — see the line above
 Watching for more copies, and one has already been MISSED — see the line above. Arming a new copy is automatic, so nothing here needs repeating by hand; whether it SUCCEEDS is the question that line answers, and for this stop point it did not. Re-arm it once the copy you care about is loaded, and name a `method` instead if you want the location to follow the code — a line number cannot.
 
 ## several_locations/finally
-one source line, several bytecode copies, which is what `javac` emits for a `finally` body. Arming only the first would fire on normal completion and stay silent on the throw.
+one source line, several ARMED LOCATIONS in one copy of the class, which is what `javac` emits for a `finally` body — it inlines it once per exit path. Arming only the first would fire on normal completion and stay silent on the throw.
 
 ## several_locations/classloaders
-several classloaders' copies of this class — each is a different reference type, and a redeploy is how a second one appears. Arming only the first is how a stop point reports "armed" and then never fires, because it is watching another deployment's copy.
+several COPIES of this class, one per classloader — each is a different reference type, and a redeploy is how a second one appears. Arming only the first is how a stop point reports "armed" and then never fires, because it is watching another deployment's copy.
 
 ## several_locations/both
-several classloaders' copies of this class (BP-5), AND several bytecode copies of the line inside one of them, which is what `javac` emits for a `finally` body (BP-4). Arming only the first would miss both another deployment's copy and, within one copy, the exception path through the line.
+several COPIES of this class, one per classloader (BP-5), AND several ARMED LOCATIONS for the line inside one of those copies, which is what `javac` emits for a `finally` body (BP-4). Arming only the first would miss both another deployment's copy and, inside the copy it did arm, the exception path through the line.
 
 ## several_locations/finally-in-a-later-copy
-several classloaders' copies of this class (BP-5), AND several bytecode copies of the line inside one of them, which is what `javac` emits for a `finally` body (BP-4). Arming only the first would miss both another deployment's copy and, within one copy, the exception path through the line.
+several COPIES of this class, one per classloader (BP-5), AND several ARMED LOCATIONS for the line inside one of those copies, which is what `javac` emits for a `finally` body (BP-4). Arming only the first would miss both another deployment's copy and, inside the copy it did arm, the exception path through the line.
 
 ## trace_exprs/none
 

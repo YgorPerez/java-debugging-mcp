@@ -6747,7 +6747,7 @@ fn render_field_stop_reply(
 ///    snapshot. Saying "auto-disarms after 200 trace hits" and leaving the caller to work that out is
 ///    exactly the reporting-two-numbers-that-cannot-both-apply failure this repo keeps finding.
 ///  - **JDWP counts per REQUEST, and one stop point can own several.** A `finally` line is armed at two
-///    bytecode copies (BP-4) and a class loaded by two loaders at two types (BP-5), each with its own
+///    armed locations (BP-4) and a class loaded by two loaders at two types (BP-5), each with its own
 ///    independent count. So it fires when whichever copy first reaches N, which is not "the Nth time the
 ///    line ran". Stated only when it applies, so an ordinary single-location arm reads as it always has.
 fn describe_hit_count(hit_count: Option<i32>, trace: bool, budget: Option<u32>, locations: usize) -> String {
@@ -7109,6 +7109,8 @@ fn worse_drift(existing: &DriftCheck, fresh: DriftCheck) -> DriftCheck {
 /// path. BP-5's is a class name loaded by more than one classloader, each defining its own reference type.
 /// The text said `finally` unconditionally, so a stop point on a class loaded twice was told its two
 /// requests were two bytecode copies of one line, which is a claim about the caller's source and is false.
+/// The words are now the glossary's: BP-4's multiplicity is several **armed locations**, BP-5's is several
+/// **copies**, and `CONTEXT.md` spends `copy` on the second alone.
 /// Found while covering #202, where a redeploy makes the second reason the ordinary one.
 ///
 /// **One classifier, two renderings**, because the arming reply and the listing want different lengths and
@@ -7118,8 +7120,8 @@ fn worse_drift(existing: &DriftCheck, fresh: DriftCheck) -> DriftCheck {
 /// downstream, so it was the worse of the two to leave wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SeveralLocations {
-    /// One class, one line, several bytecode copies of it (BP-4).
-    BytecodeCopies,
+    /// One class, one line, several **armed locations** for it (BP-4).
+    DuplicatedLine,
     /// Several classloaders' copies of the class, one location in each (BP-5).
     ClassCopies,
     /// Both at once, which a redeploy of a class containing a `finally` produces.
@@ -7144,24 +7146,25 @@ impl SeveralLocations {
         match (per_class.len() > 1, per_class.values().any(|&n| n > 1)) {
             (true, true) => Self::Both,
             (true, false) => Self::ClassCopies,
-            _ => Self::BytecodeCopies,
+            _ => Self::DuplicatedLine,
         }
     }
 
     /// The compact clause, printed by both the arming reply and the listing.
     const fn reason(self) -> &'static str {
         match self {
-            Self::BytecodeCopies => {
-                "one source line, several bytecode copies, which is what `javac` emits for a `finally` \
-                 body"
+            Self::DuplicatedLine => {
+                "one source line, several ARMED LOCATIONS in one copy of the class, which is what `javac` \
+                 emits for a `finally` body — it inlines it once per exit path"
             }
             Self::ClassCopies => {
-                "several classloaders' copies of this class — each is a different reference type, and a \
-                 redeploy is how a second one appears"
+                "several COPIES of this class, one per classloader — each is a different reference type, \
+                 and a redeploy is how a second one appears"
             }
             Self::Both => {
-                "several classloaders' copies of this class (BP-5), AND several bytecode copies of the \
-                 line inside one of them, which is what `javac` emits for a `finally` body (BP-4)"
+                "several COPIES of this class, one per classloader (BP-5), AND several ARMED LOCATIONS \
+                 for the line inside one of those copies, which is what `javac` emits for a `finally` \
+                 body (BP-4)"
             }
         }
     }
@@ -7169,7 +7172,7 @@ impl SeveralLocations {
     /// What arming only the first location would have cost — the arming reply's second sentence.
     const fn cost(self) -> &'static str {
         match self {
-            Self::BytecodeCopies => {
+            Self::DuplicatedLine => {
                 " Arming only the first would fire on normal completion and stay silent on the throw."
             }
             Self::ClassCopies => {
@@ -7177,8 +7180,8 @@ impl SeveralLocations {
                  because it is watching another deployment's copy."
             }
             Self::Both => {
-                " Arming only the first would miss both another deployment's copy and, within one copy, \
-                 the exception path through the line."
+                " Arming only the first would miss both another deployment's copy and, inside the copy it \
+                 did arm, the exception path through the line."
             }
         }
     }
@@ -12705,10 +12708,10 @@ async fn try_arm_deferred_breakpoints(
                             thread: pend.thread_filter,
                             instance: pend.instance_filter,
                         };
-                        let extra_copies = arm_extra_line_copies(session, &arm, filters).await;
-                        arm.extra_locations = extra_copies.armed;
+                        let extra_locs = arm_extra_line_locations(session, &arm, filters).await;
+                        arm.extra_locations = extra_locs.armed;
                         let mut request_ids = vec![req_id];
-                        request_ids.extend(extra_copies.request_ids);
+                        request_ids.extend(extra_locs.request_ids);
                         // Do the bookkeeping that only borrows `pend` first, so its owned fields can
                         // be moved (not cloned) into the stored stop point below.
                         let rearm = crate::stop_point::RearmState::Watching(handover_watch(&pend));
@@ -12785,7 +12788,7 @@ async fn try_arm_deferred_breakpoints(
 /// seam is a real one, since this is the part that translates a *resolved location* into the armed record and
 /// touches nothing about the pump or the pending list.
 ///
-/// `extra` is the other bytecode copies of a duplicated line (BP-4, #78), each of which becomes an
+/// `extra` is the other armed locations of a duplicated line (BP-4, #78), each of which becomes an
 /// [`ArmedLocation`](crate::stop_point::ArmedLocation) in the same class and method: a `CLASS_PREPARE` names
 /// exactly one reference type, so there is no cross-classloader multiplicity to fold in here.
 fn deferred_arm(
@@ -12968,7 +12971,7 @@ async fn rearm_later_copies(session: &mut crate::session::DebugSession, cp_ref: 
             class_id: cp_ref,
             method_id,
             bytecode_index: code_index,
-            // The duplicated bytecode copies of this line INSIDE the new class (BP-4, #78) — a `finally`
+            // The other armed locations for this line INSIDE the new class (BP-4, #78) — a `finally`
             // is inlined per exit path in every copy of the class, not just the first one armed.
             extra_locations: extra_code_indices
                 .into_iter()
@@ -12997,7 +13000,7 @@ async fn rearm_later_copies(session: &mut crate::session::DebugSession, cp_ref: 
                 continue;
             }
         };
-        let extra = arm_extra_line_copies(session, &fresh, filters).await;
+        let extra = arm_extra_line_locations(session, &fresh, filters).await;
         fresh.extra_locations = extra.armed;
 
         // Recomputed from the arm rather than appended to, so the labels stay in one order and a copy
@@ -13972,10 +13975,10 @@ async fn rearm_line_breakpoint(
     // The rest of a duplicated line (BP-4, #78). Re-resolved by name just above, so a redeploy that
     // moved or merged the copies is reflected here rather than replayed from stale indices.
     let mut arm = arm;
-    let extra_copies = arm_extra_line_copies(session, &arm, filters).await;
-    arm.extra_locations = extra_copies.armed;
+    let extra_locs = arm_extra_line_locations(session, &arm, filters).await;
+    arm.extra_locations = extra_locs.armed;
     let mut request_ids = vec![req];
-    request_ids.extend(extra_copies.request_ids);
+    request_ids.extend(extra_locs.request_ids);
     Ok(ReArmed {
         request_ids,
         armed_on: Some(ArmedOn::Line(crate::stop_point::LineBreakpoint { arm, ..bp.clone() })),
@@ -15769,7 +15772,7 @@ struct ExtraLineCopies {
 /// the whole stop point would leave the caller with nothing where they could have had one copy — so it
 /// is dropped from `armed` and reported in `refused`. Silence is the one option not available: a stop
 /// point that quietly covers less than it claims is precisely the bug both issues are.
-async fn arm_extra_line_copies(
+async fn arm_extra_line_locations(
     session: &mut crate::session::DebugSession,
     arm: &crate::stop_point::BreakpointArm,
     filters: jdwp_client::EventFilters,
@@ -16164,14 +16167,14 @@ async fn arm_and_insert(
         extra_locations: locations,
         suspend_policy: spec.suspend_policy,
     };
-    let extra_copies = arm_extra_line_copies(session, &arm, filters).await;
-    arm.extra_locations = extra_copies.armed;
+    let extra_locs = arm_extra_line_locations(session, &arm, filters).await;
+    arm.extra_locations = extra_locs.armed;
     // Read once, from the arm as it will be STORED, so the reply below and `list_stop_points` are two
     // renderings of one answer rather than two computations of it (BP-10, #202).
     let several_locations = SeveralLocations::of(&arm);
     let mut request_ids = vec![request_id];
-    request_ids.extend(extra_copies.request_ids);
-    let mut partial = extra_copies.refused;
+    request_ids.extend(extra_locs.request_ids);
+    let mut partial = extra_locs.refused;
     partial.extend(unresolved);
     // BP-7 (#115). A watch that could not be registered is REPORTED, not dropped: a stop point that is
     // not watching for later copies behaves exactly as it did before #115, and that is the failure this
@@ -17069,7 +17072,7 @@ async fn arm_single_named(
     let mut extra = describe_trace_mode(spec, frames_note);
     // TRACE-12 (#117). Read back out of the session rather than off `spec`, because what matters is the
     // location this actually armed at — `spec` carries the line the caller asked for, and BP-4's several
-    // bytecode copies and BP-5's several classloaders are only known after arming.
+    // armed locations and BP-5's several classloaders are only known after arming.
     if let Some((mine, bp)) = session.state.stop_points.get(bp_id).and_then(|sp| sp.line().map(|l| (sp, l))) {
         let (suspending, traced) = co_located_stop_points(session, Some(bp_id), &bp.arm);
         extra.push_str(&describe_policy_overlap(bp.arm.suspend_policy, mine.trace, &suspending, &traced));
