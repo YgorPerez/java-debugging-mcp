@@ -17518,6 +17518,24 @@ const TAG_OBJECT: u8 = 76; // 'L'
 const TAG_ARRAY: u8 = 91; // '['
 const TAG_STRING: u8 = 115; // 's'
 
+/// `StackFrame.ThisObject` refused, which for `this` is almost always a frame id the JVM has retired
+/// (TRACE-16, #204).
+///
+/// **Named as a boundary rather than reported as a JDWP code**, because the code on its own reads as a bad
+/// expression. `INVALID_FRAMEID` here means the thread was resumed since the frame was handed out, and the
+/// thing that resumes it under a debugger's own nose is an invocation — a rendered `toString()`, a getter
+/// in an earlier link. [`refreshed_hit_frame`] closes that window inside one traced capture; this is what
+/// the caller reads when it is some *other* resume, and it points at the route that needs no frame at all.
+fn this_from_a_retired_frame(e: &jdwp_client::JdwpError) -> String {
+    format!(
+        "Failed to get 'this': {e} — the JVM will not answer for this frame any more. A frame id dies \
+         when its thread is resumed, and an INVOCATION resumes it: rendering an object runs its \
+         toString(), so anything evaluated after that is asking about a frame that no longer exists. \
+         Read the object directly instead — every reply prints `this` as `@0x…` beside the frame's \
+         locals, and `@0x…<.field>` needs no frame."
+    )
+}
+
 async fn resolve_head(
     conn: &mut jdwp_client::JdwpConnection,
     thread_id: u64,
@@ -17532,7 +17550,7 @@ async fn resolve_head(
         let obj = conn
             .get_this_object(thread_id, frame.frame_id)
             .await
-            .map_err(|e| format!("Failed to get 'this': {e}"))?;
+            .map_err(|e| this_from_a_retired_frame(&e))?;
         if obj == 0 {
             return Err("No 'this' in this frame (static method)".to_string());
         }
@@ -20704,6 +20722,11 @@ async fn resolve_any_head(
         (Some(Err(_)), Some(fr)) if segs.len() == 1 && head_seg.args.is_none() => {
             bare_name_not_found(conn, fr, &head_seg.name).await
         }
+        // TRACE-16 (#204): `this` is a keyword, so the static-member reading was never available to it —
+        // and appending "not a resolvable static member: no loaded class matches the leading segment(s)"
+        // to a frame or static-method failure actively suggests the head was misspelled, which is the one
+        // thing it cannot be. The head's own message stands alone.
+        (Some(Err(head_err)), _) if head_seg.name == "this" => head_err.clone(),
         (Some(Err(head_err)), _) => {
             format!("{head_err} (also not a resolvable static member: {static_err})")
         }
@@ -24542,7 +24565,7 @@ async fn capture_trace(
         // A thread may be shallower than the requested depth — that is normal (a request thread's
         // entry point has no caller), not an error, so take whatever came back.
         callers = describe_caller_chain(conn, frames.get(1..).unwrap_or_default()).await;
-        if let Some(frame) = frames.first().cloned() {
+        if let Some(mut frame) = frames.first().cloned() {
             args = capture_frame_locals(conn, thread, frame.frame_id, loc, local_len).await;
             // TRACE-10: an anonymous inner class's `call()` or `run()` has almost nothing in its
             // variable table — the enclosing method's captured locals are synthetic FIELDS on `this`.
@@ -24554,7 +24577,12 @@ async fn capture_trace(
             // slot. One that fails records its error there and the others are untouched — a chain going
             // null on some hits and not others is the normal case rather than the exception, and it is the
             // same reasoning that makes a batched arming reply per-pattern instead of one verdict.
-            for e in trace_exprs.iter().cloned() {
+            for (i, e) in trace_exprs.iter().cloned().enumerate() {
+                // TRACE-16 (#204): a FRESH frame id for every element after the first, because the
+                // element before it may have retired the one we were holding. See `refreshed_hit_frame`.
+                if i > 0 {
+                    frame = refreshed_hit_frame(conn, thread, frame).await;
+                }
                 // The `#<charset>` selector reaches a trace this way, which is the whole reason it is a
                 // suffix on the expression: a stop point's arming call has a schema to extend but its
                 // `trace_expr` does not, and the decode is scoped to the value the caller named rather
@@ -24612,6 +24640,49 @@ async fn capture_trace(
         detail,
         // Filled in by the caller, which is what owns the chain bookkeeping (EXC-3).
         rethrow: None,
+    }
+}
+
+/// Re-read the hit frame's id between two `trace_expr` elements (TRACE-16, #204).
+///
+/// **A JDWP frame id dies when its thread is resumed, and rendering an object resumes it.** An element
+/// whose value is an object is rendered with `Some(thread)` — the caller asked for this expression, so
+/// `toString()` is allowed to run — and `ObjectReference.InvokeMethod` runs it by resuming the thread and
+/// re-suspending it afterwards. Every frame id that thread had handed out is invalid from that moment,
+/// which is why the element *after* one that rendered an object used to be answered from a dead frame.
+///
+/// **The reported symptom was `this`, and that understated it** (#204 diagnosed the frame as retired by
+/// trace mode's own resume — it is not; `capture_trace` runs with the hit thread still suspended, which is
+/// why `this.owner` has been asserted on a traced hit since #115). Measured on Temurin 21, one element
+/// rendering an object broke *every* later element in the same snapshot, and two of the three shapes lied
+/// about why:
+///
+/// * `this.name` → `Failed to get 'this': INVALID_FRAMEID`, the one that names the real fault;
+/// * `sessao.getNmSchema()` → `Failed to read variable value: INVALID_FRAMEID`;
+/// * a plain local `schema` → *"'schema' is not a local variable in this frame, and `TenantProbe` … declares
+///   no field by that name"* — printed beside `schema="infotravel"` in the same record's locals, because
+///   `get_variable_table` succeeded (it is keyed by class and method, not by frame) and only the *value*
+///   read failed, so the resolver fell through to its bare-name message.
+///
+/// That last one is the reason this is fixed by refreshing the frame rather than by carrying the captured
+/// `this` down to [`resolve_head`]: the captured `this` would answer one of those three and leave the other
+/// two answering confidently and wrongly.
+///
+/// **One `ThreadReference.Frames` packet, and only between elements.** Not conditional on whether the
+/// previous element actually invoked: that is unknowable from here without `render_value` reporting it, and
+/// a cap of four expressions bounds this at three packets on a path that already spends many per element.
+/// It is inside the timed capture window, so [`crate::stop_point::TraceCost`] reports it honestly. A
+/// failure keeps the frame we had, so a refresh that cannot happen is never worse than not refreshing.
+async fn refreshed_hit_frame(
+    conn: &mut jdwp_client::JdwpConnection,
+    thread: u64,
+    frame: jdwp_client::thread::Frame,
+) -> jdwp_client::thread::Frame {
+    // Depth 0, length 1 — the hit frame only. The invocation returned before JDWP answered it, so the
+    // thread is standing exactly where the event left it and frame 0 is the same frame under a new id.
+    match conn.get_frames(thread, 0, 1).await {
+        Ok(frames) => frames.into_iter().next().unwrap_or(frame),
+        Err(_) => frame,
     }
 }
 

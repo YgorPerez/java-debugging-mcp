@@ -18187,3 +18187,242 @@ fn a_named_query_with_no_bean_in_the_frame_names_the_two_step_instead_of_guessin
 
     server.panic_reset();
 }
+
+/// TRACE-16 (#204): `this.<field>` in a `trace_expr` resolves on a traced hit — including after an
+/// earlier element in the same list rendered an object.
+///
+/// **The premise the issue reported is not the one that reproduces, and the difference is what this test
+/// had to be built around.** #204 diagnosed `this` as structurally unresolvable on every traced stop point,
+/// because trace mode snapshots and resumes. It does not: `capture_trace` runs with the hit thread still
+/// suspended, which is why `a_stop_point_armed_before_a_redeploy_arms_the_new_classloaders_copy_too` has
+/// asserted `this.owner => "v1"` on a traced hit since #115. What retires the frame is an **invocation** —
+/// rendering an object runs its `toString()`, and JDWP resumes the thread to do it.
+///
+/// So the ORDER of the elements is the test. `this` first, whose value is an object and whose rendering
+/// therefore invokes; the field reads after it. Reversed, this passes against the unfixed server and proves
+/// nothing.
+///
+/// The static method is in the same run rather than a test of its own because it is the same question asked
+/// of the other branch: a frame with no `this` has to say *that*, and reporting `INVALID_FRAMEID` for it
+/// would be the same confusion (a mode boundary read as a bad expression) wearing the opposite cause.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn this_resolves_in_a_trace_expr_after_an_earlier_element_rendered_an_object() {
+    let Some(jdk) = jdk_or_skip("this_resolves_in_a_trace_expr_after_an_earlier_element_rendered_an_object")
+    else {
+        return;
+    };
+    let mut probe =
+        Probe::launch_running(&jdk, "InstProbe", |l| l.starts_with("ready")).expect("launch InstProbe");
+    let source = probe_source("InstProbe");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "InstProbe", "line": probe_line(&source, "// BP1"), "trace": true,
+            "trace_expr": ["this", "this.name", "this.touched", "noSuchThing.atAll"],
+        }),
+    );
+    assert!(armed.contains("bp_"), "the stop point did not arm: {armed}");
+
+    let traces = server
+        .wait_for_traces("this.touched => ", EVENT_TIMEOUT)
+        .expect("the traced hit never recorded a slot for this.touched");
+    let hit = traces
+        .lines()
+        .find(|l| l.contains("this.touched => "))
+        .unwrap_or_else(|| panic!("no hit line in:\n{traces}"));
+
+    // The two field reads, both AFTER the element that invoked. Pre-fix both answer
+    // `Failed to get 'this': JDWP error code 30: INVALID_FRAMEID`.
+    assert!(
+        !hit.contains("this.name => <error:") && !hit.contains("this.touched => <error:"),
+        "a `this` head after an element that rendered an object must resolve against a live frame, not \
+         the one that element's toString() retired: {hit}"
+    );
+    assert!(
+        hit.contains("this.name => \"X\"") || hit.contains("this.name => \"Y\""),
+        "the field read resolved but not to the instance the snapshot captured: {hit}"
+    );
+
+    // And the head that genuinely cannot resolve is UNCHANGED — still offered the static-member reading,
+    // which for a misspelled name is the useful one. Dropping that clause for every head would have been
+    // the easy way to satisfy the `this` half of #204 and would have cost the case it was written for.
+    assert!(
+        hit.contains("noSuchThing.atAll => <error:") && hit.contains("not a resolvable static member"),
+        "an unresolvable non-`this` head must keep the static-member reading: {hit}"
+    );
+
+    server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": "bp_1"}));
+
+    // A static frame has no `this` to capture, and that is a different answer rather than the same one.
+    // `stat()` is the probe's static-method site, on the same tick as `work()`.
+    let stat = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "InstProbe", "line": probe_line(&source, "// BP2"), "trace": true,
+            "trace_expr": ["this.name"],
+        }),
+    );
+    assert!(stat.contains("bp_"), "the static-method stop point did not arm: {stat}");
+    // Waited on the METHOD, not on the expression: the buffer still holds `work()`'s records, whose slot
+    // is spelled identically, so a needle of `this.name => ` returns on the previous stop point's answer.
+    let traces = server
+        .wait_for_traces("InstProbe.stat:", EVENT_TIMEOUT)
+        .expect("the static-method hit never recorded its slot");
+    let hit = traces
+        .lines()
+        .find(|l| l.contains("InstProbe.stat:") && l.contains("this.name => "))
+        .unwrap_or_else(|| panic!("no static-method hit line in:\n{traces}"));
+    assert!(
+        hit.contains("static method"),
+        "a static frame must say it has no `this`, not report a frame id fault: {hit}"
+    );
+    assert!(
+        !hit.contains("INVALID_FRAMEID") && !hit.contains("not a resolvable static member"),
+        "`this` is a keyword — neither a retired frame nor a misspelled static member is the reading \
+         here, and appending either sends the reader to re-check a name that cannot be wrong: {hit}"
+    );
+
+    server.panic_reset();
+}
+
+/// TRACE-16 (#204), the half the issue did not report: an ordinary LOCAL after an element that rendered
+/// an object, which used to be answered with a confident denial that the local exists.
+///
+/// **This is the finding that decided the shape of the fix.** Carrying the captured `this` down to the head
+/// resolver — what #204 asked for — answers `this.<field>` and leaves these two answering wrongly, because
+/// the frame id is retired for *every* read that needs one. Measured on Temurin 21 against this probe, one
+/// element rendering `sessao` broke all three elements after it:
+///
+/// ```text
+/// | sessao => TenantProbe$Session "TenantProbe$Session@34404761"
+/// | schema => <error: 'schema' is not a local variable in this frame, and TenantProbe (nor any of its
+///              superclasses) declares a field by that name — so there is nothing for a bare 'schema' to
+///              mean here.>
+/// | i      => <error: … same …>
+/// | sessao.getNmSchema() => <error: Failed to read variable value: … INVALID_FRAMEID …>
+/// ```
+///
+/// The first two are the dangerous ones and the reason this test exists: `schema="infotravel"` is printed
+/// in the same record's locals, two columns to the left of a reply saying it does not exist. It reads as a
+/// fact about the program rather than about the debugger, because `get_variable_table` is keyed by class
+/// and method and so still succeeded — only the *value* read failed, and the resolver fell through to its
+/// bare-name message. A substring assertion on `<error:` would not have caught it; the assertion has to be
+/// on the value.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_local_in_a_trace_expr_survives_an_earlier_element_that_rendered_an_object() {
+    let Some(jdk) =
+        jdk_or_skip("a_local_in_a_trace_expr_survives_an_earlier_element_that_rendered_an_object")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch_running(&jdk, "TenantProbe", |l| l.starts_with("handled "))
+        .expect("launch TenantProbe");
+    let line = probe_line(&probe_source("TenantProbe"), "TRACE_LINE");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    // `sessao` FIRST — an object, so rendering it invokes `toString()` — then the two locals and a getter
+    // chain off the object. Four elements is the cap, and all three after the first are what regressed.
+    let armed = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "TenantProbe", "line": line, "trace": true,
+            "trace_expr": ["sessao", "schema", "i", "sessao.getNmSchema()"],
+        }),
+    );
+    assert!(armed.contains("bp_"), "the stop point did not arm: {armed}");
+
+    let traces = server
+        .wait_for_traces("sessao.getNmSchema() => ", EVENT_TIMEOUT)
+        .expect("the traced hit never recorded a slot for the getter chain");
+    let hit = traces
+        .lines()
+        .find(|l| l.contains("sessao.getNmSchema() => "))
+        .unwrap_or_else(|| panic!("no hit line in:\n{traces}"));
+
+    assert!(
+        hit.contains("schema => \""),
+        "the local after the element that invoked must read as its value, and it is printed in this very \
+         record's locals: {hit}"
+    );
+    assert!(
+        !hit.contains("is not a local variable in this frame"),
+        "a retired frame id must never be reported as the local not existing — that is a claim about the \
+         program, made from a fault in the debugger: {hit}"
+    );
+    assert!(hit.contains("i => (int) "), "the second local must read too: {hit}");
+    assert!(
+        hit.contains("sessao.getNmSchema() => \""),
+        "a getter chain after an element that invoked must resolve its head: {hit}"
+    );
+
+    server.panic_reset();
+}
+
+/// TRACE-16 (#204): the same expression records the same value on a suspending hit and on a traced one.
+///
+/// The acceptance criterion that no single-mode test can state. Both halves run against the same instance
+/// in the same process, so a difference could only come from the mode — which is what "trace mode is a
+/// snapshot of what a suspending hit would have shown" has to mean to be worth relying on.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn this_reads_the_same_on_a_traced_hit_and_on_a_suspending_one() {
+    let Some(jdk) = jdk_or_skip("this_reads_the_same_on_a_traced_hit_and_on_a_suspending_one") else {
+        return;
+    };
+    let mut probe =
+        Probe::launch_running(&jdk, "InstProbe", |l| l.starts_with("ready")).expect("launch InstProbe");
+    let line = probe_line(&probe_source("InstProbe"), "// BP1");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    // `x` is the instance held for the life of the run (`y` is the one the `drop` cue clears), so pinning
+    // both halves to it is what makes the two readings comparable at all.
+    let listed = server
+        .call("debug.list_instances", serde_json::json!({"class_names": ["InstProbe"], "max_instances": 5}));
+    let x = inst_probe_handle(&mut server, &listed, "X");
+
+    let logpoint = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "InstProbe", "line": line, "trace": true, "instance_id": x,
+            "trace_expr": ["this", "this.name"],
+        }),
+    );
+    assert!(logpoint.contains("bp_"), "the traced stop point did not arm: {logpoint}");
+    let traces = server
+        .wait_for_traces("this.name => ", EVENT_TIMEOUT)
+        .expect("the traced hit never recorded a slot for this.name");
+    let from_trace = traces
+        .lines()
+        .find_map(|l| l.split("this.name => ").nth(1).map(|t| t.split(" |").next().unwrap_or(t).trim()))
+        .expect("no this.name slot in the traces")
+        .to_string();
+    server.call("debug.clear_stop_point", serde_json::json!({"breakpoint_id": "bp_1"}));
+
+    // Now the suspending arm of the same question. Pinned to the same instance, so the hit that suspends
+    // is the one whose `this` the traced half just read.
+    let suspending = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "InstProbe", "line": line, "instance_id": x}),
+    );
+    assert!(suspending.contains("bp_"), "the suspending stop point did not arm: {suspending}");
+    server
+        .wait_for_event(&format!("\"line\":{line}"), EVENT_TIMEOUT)
+        .expect("the suspending stop point never hit");
+    let evaluated = server.evaluate("this.name");
+    server.call("debug.continue", serde_json::json!({}));
+
+    assert!(
+        evaluated.contains(&from_trace),
+        "the traced hit read `this.name` as {from_trace} and the suspending hit as `{evaluated}` — one \
+         expression, one instance, two modes, so a disagreement is the mode leaking into the answer"
+    );
+
+    server.panic_reset();
+}

@@ -516,6 +516,13 @@ pub struct SetBreakpointArgs {
     /// `condition` because "are these two the same instance?" is a question about ONE INSTANT: a condition
     /// can merely filter on it, and two separate expressions leave a reader comparing `@0x…` handles by
     /// eye — which stops being possible the moment either side is an expression rather than a local.
+    ///
+    /// **`this` is an expression head here, and each element is answered against a LIVE frame** (TRACE-16):
+    /// rendering an object runs its `toString()` in the debuggee, which resumes the hit thread and retires
+    /// every frame id it had handed out — so the elements after one whose value was an object used to be
+    /// answered from a dead frame, `this.<field>` reporting `INVALID_FRAMEID` and a plain local reporting
+    /// that it does not exist. The frame is re-read between elements. A static frame has no `this` and says
+    /// so, rather than reporting a frame fault.
     #[serde(default)]
     pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm this logpoint automatically after recording this many hits, so
@@ -1388,6 +1395,13 @@ pub struct SetExceptionBreakpointArgs {
     /// `condition` because "are these two the same instance?" is a question about ONE INSTANT: a condition
     /// can merely filter on it, and two separate expressions leave a reader comparing `@0x…` handles by
     /// eye — which stops being possible the moment either side is an expression rather than a local.
+    ///
+    /// **`this` is an expression head here, and each element is answered against a LIVE frame** (TRACE-16):
+    /// rendering an object runs its `toString()` in the debuggee, which resumes the hit thread and retires
+    /// every frame id it had handed out — so the elements after one whose value was an object used to be
+    /// answered from a dead frame, `this.<field>` reporting `INVALID_FRAMEID` and a plain local reporting
+    /// that it does not exist. The frame is re-read between elements. A static frame has no `this` and says
+    /// so, rather than reporting a frame fault.
     #[serde(default)]
     pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit),
@@ -1541,6 +1555,13 @@ pub struct SetWatchpointArgs {
     /// `condition` because "are these two the same instance?" is a question about ONE INSTANT: a condition
     /// can merely filter on it, and two separate expressions leave a reader comparing `@0x…` handles by
     /// eye — which stops being possible the moment either side is an expression rather than a local.
+    ///
+    /// **`this` is an expression head here, and each element is answered against a LIVE frame** (TRACE-16):
+    /// rendering an object runs its `toString()` in the debuggee, which resumes the hit thread and retires
+    /// every frame id it had handed out — so the elements after one whose value was an object used to be
+    /// answered from a dead frame, `this.<field>` reporting `INVALID_FRAMEID` and a plain local reporting
+    /// that it does not exist. The frame is re-read between elements. A static frame has no `this` and says
+    /// so, rather than reporting a frame fault.
     #[serde(default)]
     pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit),
@@ -1707,6 +1728,13 @@ pub struct SetMethodBreakpointArgs {
     /// `condition` because "are these two the same instance?" is a question about ONE INSTANT: a condition
     /// can merely filter on it, and two separate expressions leave a reader comparing `@0x…` handles by
     /// eye — which stops being possible the moment either side is an expression rather than a local.
+    ///
+    /// **`this` is an expression head here, and each element is answered against a LIVE frame** (TRACE-16):
+    /// rendering an object runs its `toString()` in the debuggee, which resumes the hit thread and retires
+    /// every frame id it had handed out — so the elements after one whose value was an object used to be
+    /// answered from a dead frame, `this.<field>` reporting `INVALID_FRAMEID` and a plain local reporting
+    /// that it does not exist. The frame is re-read between elements. A static frame has no `this` and says
+    /// so, rather than reporting a frame fault.
     #[serde(default)]
     pub trace_expr: Option<TraceExprs>,
     /// Only with `trace:true` — disarm automatically after this many hits (default 200; 0 = no limit).

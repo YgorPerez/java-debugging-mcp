@@ -1492,6 +1492,22 @@ meaningful *while* its request is live: remembering one and matching on it later
 different request, which is why anything keeping a set of past ids must also check that the id is not
 currently in use (#72).
 
+**Frame id**:
+The debuggee's own identifier for one frame of one suspended thread, handed out by `ThreadReference.Frames`.
+The third id in this section with a lifetime shorter than it looks, and the last of the three to be written
+down — an **object handle** is weak, a **request id** may recur, and this one simply **dies when its thread is
+resumed**. Every read that needs a frame (`StackFrame.GetValues`, `StackFrame.ThisObject`, so every local and
+every `this`) answers `INVALID_FRAMEID` from that moment on.
+
+**An invocation is a resume**, and that is the part that has to be read before you act rather than after.
+`ObjectReference.InvokeMethod` runs the method by resuming the thread and re-suspending it afterwards, so
+calling *anything* in the debuggee — including a `toString()` run to render a value — retires every frame id
+that thread had issued, its own caller's included. A frame id therefore cannot be held across an invocation;
+it has to be re-read (TRACE-16, #204, where holding one made a `trace_expr` element deny that a local printed
+two columns to its left existed).
+_Avoid_: "the frame" for a frame id kept across a call — the *frame* is still there, which is exactly why the
+dead id reads as a fact about the program
+
 ### Safety posture
 
 **Refusal**:

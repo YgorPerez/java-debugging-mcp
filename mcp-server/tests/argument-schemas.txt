@@ -776,7 +776,12 @@
     for two Strings. It belongs here and not only in `condition` because "are these two the same instance?" is
     a question about ONE INSTANT: a condition can merely filter on it, and two separate expressions leave a
     reader comparing `@0x…` handles by eye — which stops being possible the moment either side is an
-    expression rather than a local.
+    expression rather than a local. **`this` is an expression head here, and each element is answered against
+    a LIVE frame** (TRACE-16): rendering an object runs its `toString()` in the debuggee, which resumes the
+    hit thread and retires every frame id it had handed out — so the elements after one whose value was an
+    object used to be answered from a dead frame, `this.<field>` reporting `INVALID_FRAMEID` and a plain local
+    reporting that it does not exist. The frame is re-read between elements. A static frame has no `this` and
+    says so, rather than reporting a frame fault.
 - trace_frames: {"default":3,"format":"uint","minimum":0,"type":"integer"}
     Only with `trace:true` — how many CALLER frames to record above the throw, so a swallowed exception says
     **which request path reached the catch**, which is usually the whole question (default 3; 0 for the
@@ -899,7 +904,12 @@
     belongs here and not only in `condition` because "are these two the same instance?" is a question about
     ONE INSTANT: a condition can merely filter on it, and two separate expressions leave a reader comparing
     `@0x…` handles by eye — which stops being possible the moment either side is an expression rather than a
-    local.
+    local. **`this` is an expression head here, and each element is answered against a LIVE frame**
+    (TRACE-16): rendering an object runs its `toString()` in the debuggee, which resumes the hit thread and
+    retires every frame id it had handed out — so the elements after one whose value was an object used to be
+    answered from a dead frame, `this.<field>` reporting `INVALID_FRAMEID` and a plain local reporting that it
+    does not exist. The frame is re-read between elements. A static frame has no `this` and says so, rather
+    than reporting a frame fault.
 - trace_frames: {"default":3,"format":"uint","minimum":0,"type":"integer"}
     Only with `trace:true` — how many CALLER frames to record above the mutating frame, so "who mutates this?"
     is answered with the path that got there, not just the innermost setter (default 3; 0 for the mutating
@@ -1028,7 +1038,12 @@
     for two Strings. It belongs here and not only in `condition` because "are these two the same instance?" is
     a question about ONE INSTANT: a condition can merely filter on it, and two separate expressions leave a
     reader comparing `@0x…` handles by eye — which stops being possible the moment either side is an
-    expression rather than a local.
+    expression rather than a local. **`this` is an expression head here, and each element is answered against
+    a LIVE frame** (TRACE-16): rendering an object runs its `toString()` in the debuggee, which resumes the
+    hit thread and retires every frame id it had handed out — so the elements after one whose value was an
+    object used to be answered from a dead frame, `this.<field>` reporting `INVALID_FRAMEID` and a plain local
+    reporting that it does not exist. The frame is re-read between elements. A static frame has no `this` and
+    says so, rather than reporting a frame fault.
 - trace_frames: {"default":3,"format":"uint","minimum":0,"type":"integer"}
     Only with `trace:true` — how many CALLER frames to record above the hit, so a snapshot says **which path
     reached it**, not just that it fired (default 3; 0 for the hit frame alone, capped at 20). Callers are
@@ -1152,7 +1167,12 @@
     belongs here and not only in `condition` because "are these two the same instance?" is a question about
     ONE INSTANT: a condition can merely filter on it, and two separate expressions leave a reader comparing
     `@0x…` handles by eye — which stops being possible the moment either side is an expression rather than a
-    local.
+    local. **`this` is an expression head here, and each element is answered against a LIVE frame**
+    (TRACE-16): rendering an object runs its `toString()` in the debuggee, which resumes the hit thread and
+    retires every frame id it had handed out — so the elements after one whose value was an object used to be
+    answered from a dead frame, `this.<field>` reporting `INVALID_FRAMEID` and a plain local reporting that it
+    does not exist. The frame is re-read between elements. A static frame has no `this` and says so, rather
+    than reporting a frame fault.
 - trace_frames: {"default":3,"format":"uint","minimum":0,"type":"integer"}
     Only with `trace:true` — how many caller frames to record above the return, as `class.method:line`
     (default 3; 0 for the returning frame alone, capped at 20). The measured price of that depth: capture
