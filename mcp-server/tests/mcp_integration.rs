@@ -18496,8 +18496,8 @@ fn arming_by_method_name_tries_every_loaded_copy_and_names_the_one_that_answered
          so — got {carried:?}\n  senseAAA: {aaa}\n  senseBBB: {bbb}"
     );
 
-    // And the caveat is actionable rather than decorative: it names the loaders and how to pin a read to
-    // the copy that answered, which is the whole reason `debug.list_methods` was more use than the arm.
+    // And the caveat says what to DO, which is the whole reason `debug.list_methods` was more use than
+    // the arm: it names the loaders and the selector that pins a read to the copy that answered.
     let named = if carried[0] == "senseAAA" { &aaa } else { &bbb };
     assert_contains_all(
         "the caveat names which copy answered and how to reach it",
@@ -18597,6 +18597,240 @@ fn a_method_the_build_declares_but_no_loaded_copy_has_reports_the_mismatch() {
         !unchecked.contains("YOUR BUILD DOES DECLARE IT")
             && !unchecked.contains("does not declare it either"),
         "a verdict must not be reported when nothing was read: {unchecked}"
+    );
+
+    server.panic_reset();
+}
+
+/// BP-10 (#202): a stop point armed by METHOD name before a redeploy fires at that method after a redeploy
+/// that MOVED it, and the listing says which line the new copy landed on.
+///
+/// **This closes a coverage gap, and the measurement is the finding.** #202 reported that a redeploy re-arms
+/// an exact-name stop point at the retired build's line. It does not: `rearm_later_copies` re-resolves from
+/// `ReArmWatch::line`/`method`, which are the locator as the CALLER gave it, so a stop point armed by method
+/// name with no line finds the method's first location *in the new copy*. What the reporter actually saw is
+/// the second half of their own report — the listing printing `:81` beside a reassurance, because the header
+/// carries the FIRST copy's line and nothing said a later copy had landed elsewhere.
+///
+/// So `a_stop_point_armed_before_a_redeploy_arms_the_new_classloaders_copy_too` (#115) is not wrong, it is
+/// vacuous on this question: `RedeployProbe` defines both copies from the SAME bytes, so the method is at
+/// the same line in each and a resolver that reused the first copy's line would pass it. `MovedMethodProbe`
+/// exists for exactly that — two copies of one name whose line tables differ and whose bytecode does not.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_stop_point_armed_by_method_name_follows_the_method_across_a_redeploy_that_moved_it() {
+    let Some(jdk) =
+        jdk_or_skip("a_stop_point_armed_by_method_name_follows_the_method_across_a_redeploy_that_moved_it")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "MovedMethodProbe").expect("launch MovedMethodProbe");
+    let source = probe_source("MovedMethodProbe");
+    let (was, now) = (probe_line(&source, "// WORK_A"), probe_line(&source, "// WORK_B"));
+    assert_ne!(was, now, "the probe's two copies must declare work at different lines");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l == "deployed v1").expect("probe never deployed v1");
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("ran v1:")).expect("v1's copy never ran");
+
+    // Armed by METHOD name and no line, while exactly ONE copy is loaded. Both halves are the premise: a
+    // line would be #202's other case, and two copies at arm time is #79's and would arm both outright.
+    let set = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "MovedMethodProbe$WidgetA", "method": "work",
+            "trace": true, "trace_expr": "this.owner",
+        }),
+    );
+    assert!(set.contains("bp_"), "the stop point did not arm on the only loaded copy: {set}");
+    assert!(
+        set.contains(&format!(":{was}")),
+        "the first copy must resolve to work's line in THIS build ({was}): {set}"
+    );
+    server
+        .wait_for_traces("this.owner => \"v1\"", EVENT_TIMEOUT)
+        .expect("no traced hit from the copy that WAS loaded when the stop point armed");
+
+    // The redeploy, with the method moved. Nothing is re-armed by hand, on purpose.
+    probe.send_line("redeploy").expect("send the redeploy cue");
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("work moved=true")).expect(
+        "the two copies have the same line table — the probe's surgery did not take, so there is \
+                 nothing here for a re-resolve to get right or wrong",
+    );
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("ran v2:")).expect("v2's copy never ran");
+
+    let traces = server
+        .wait_for_traces("this.owner => \"v2\"", EVENT_TIMEOUT)
+        .unwrap_or_else(|| panic!("the copy loaded by the second classloader never reported"));
+    let hit = traces
+        .lines()
+        .find(|l| l.contains("this.owner => \"v2\""))
+        .unwrap_or_else(|| panic!("no v2 hit line in:\n{traces}"));
+    assert!(
+        hit.contains(&format!("work:{now}")),
+        "the new copy must be armed at the METHOD in that copy — it moved from :{was} to :{now}, and a \
+         re-arm that reused the retired build's line would fire at :{was} or not at all: {hit}"
+    );
+
+    // And the listing no longer states one line as though it were every armed copy's.
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    assert_eq!(
+        listed.matches("bp_1").count(),
+        1,
+        "a copy armed by the class-load watch joins the existing stop point (ADR-0005): {listed}"
+    );
+    assert_contains_all(
+        "the listing names the line the later copy landed on, and that the METHOD is what travelled",
+        &listed,
+        &[&format!("a later copy resolved to :{now}"), "armed FIRST", "by METHOD name"],
+    );
+    // Found while covering this issue, and the same defect one line up: two requests here are two
+    // CLASSLOADERS' copies, and the count line said they were two bytecode copies of one source line —
+    // a claim about the caller's `finally` that there is no `finally` to support.
+    assert!(
+        listed.contains("Armed at 2 locations") && listed.contains("several classloaders' copies"),
+        "two requests from two classloaders must not be reported as a duplicated `finally` line: {listed}"
+    );
+    assert!(
+        !listed.contains("`finally` body"),
+        "there is no `finally` in this probe, so nothing here may name one: {listed}"
+    );
+
+    server.panic_reset();
+}
+
+/// BP-10 (#202): armed by an explicit LINE, the same redeploy is reported as a copy that could NOT be armed
+/// — and the reassurance stops promising that no re-arming is needed.
+///
+/// **A line number is all there is to travel, and it carries no intent to recover.** `:49` is looked up in
+/// the new copy's own line table; once the code above it has moved, that number is in no method of the new
+/// copy at all, `CLASS_PREPARE` fires, the location does not resolve — and until this the outcome was a
+/// `warn!` in the server's own log. The caller kept an entry saying it was watching for copies, covering one
+/// fewer than they thought, under a line that said re-arming was unnecessary.
+///
+/// The contrast with the method-name case is the point of having both tests: same probe, same redeploy, and
+/// the only difference is which locator the caller typed.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn a_stop_point_armed_by_line_says_the_location_did_not_travel_across_the_redeploy() {
+    let Some(jdk) =
+        jdk_or_skip("a_stop_point_armed_by_line_says_the_location_did_not_travel_across_the_redeploy")
+    else {
+        return;
+    };
+    let mut probe = Probe::launch(&jdk, "MovedMethodProbe").expect("launch MovedMethodProbe");
+    let was = probe_line(&probe_source("MovedMethodProbe"), "// WORK_A");
+    let mut server = Server::start().expect("start server");
+    probe.attach(&mut server);
+
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l == "deployed v1").expect("probe never deployed v1");
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("ran v1:")).expect("v1's copy never ran");
+
+    let set = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({
+            "class_pattern": "MovedMethodProbe$WidgetA", "line": was,
+            "trace": true, "trace_expr": "this.owner",
+        }),
+    );
+    assert!(set.contains("bp_"), "the stop point did not arm: {set}");
+    server
+        .wait_for_traces("this.owner => \"v1\"", EVENT_TIMEOUT)
+        .expect("no traced hit from the copy that was loaded when the stop point armed");
+
+    probe.send_line("redeploy").expect("send the redeploy cue");
+    probe
+        .wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("work moved=true"))
+        .expect("the probe's two copies share a line table, so this test's premise is gone");
+    probe.wait_for_line(EVENT_TIMEOUT, |l| l.starts_with("ran v2:")).expect("v2's copy never ran");
+
+    // The class-load watch fires on the new copy; the LINE does not resolve in it. Polled, because the
+    // event pump does the arming and there is no reply to synchronise on.
+    let listed = server
+        .wait_for_listing_where(EVENT_TIMEOUT, |l| l.contains("could NOT be armed"))
+        .unwrap_or_else(|| {
+            panic!(
+                "a later copy that loaded and could not be armed must be reported, not only logged:\n{}",
+                server.call("debug.list_stop_points", serde_json::json!({}))
+            )
+        });
+    assert_contains_all(
+        "the listing says what is not covered, why, and what to do about it",
+        &listed,
+        &["could NOT be armed", "armed by LINE", "carries no intent to recover", "Re-arm with `method`"],
+    );
+    assert!(
+        !listed.contains("does NOT need re-arming"),
+        "an explicit-line stop point across a redeploy is exactly the case that DOES need re-arming — the \
+         reassurance must not be printed for it: {listed}"
+    );
+
+    server.panic_reset();
+}
+
+/// BP-10 (#202): `list_stop_points` never pairs the no-re-arming reassurance with a stale-bytecode warning
+/// for the same method.
+///
+/// The defect as filed. Each line was true of a different thing — the first about ARMING, the second about
+/// LOCATION — and read together the first licensed ignoring the second:
+///
+/// ```text
+/// ✓ [bp_2] …ApiException:81 (trace)
+///      Method: enviaEmailErro
+///      👀 Watching for more copies — … does NOT need re-arming after a redeploy
+///        ⚠️  STALE BYTECODE: … the JVM has line 81 at bytecode 0, your build has line 110 at 0
+/// ```
+///
+/// Both arming shapes are checked against a stale build in one run, because they take different branches
+/// and only one of them could ever have carried the strong promise.
+#[test]
+#[ignore = "needs a JDK and a live JVM; run with --ignored"]
+fn the_listing_never_promises_no_re_arming_beside_a_stale_bytecode_warning() {
+    let Some(jdk) = jdk_or_skip("the_listing_never_promises_no_re_arming_beside_a_stale_bytecode_warning")
+    else {
+        return;
+    };
+    let probe = Probe::launch_running(&jdk, "SwapProbe", |l| l.starts_with("answer 1 tick "))
+        .expect("launch SwapProbe");
+    let shifted = swap_probe_with_shifted_lines(&jdk);
+    let line = probe_line(&probe_source("SwapProbe"), "// SWAP_VALUE");
+    let mut server = Server::start().expect("start server");
+    attach_with_class_roots(&mut server, probe.port, Some(shifted.path()));
+
+    // By LINE first, which is what the DISC-8 test arms and therefore the shape the report came from.
+    let by_line = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "SwapProbe", "line": line, "trace": true}),
+    );
+    assert!(by_line.contains("STALE BYTECODE"), "the shifted build must read as drift: {by_line}");
+
+    // By METHOD name too: it is the branch where the promise IS true, so it has to keep saying so without
+    // reading as though it covered the line the entry prints.
+    let by_method = server.call(
+        "debug.set_line_stop",
+        serde_json::json!({"class_pattern": "SwapProbe", "method": "answer", "trace": true}),
+    );
+    assert!(by_method.contains("STALE BYTECODE"), "the shifted build must read as drift: {by_method}");
+
+    let listed = server.call("debug.list_stop_points", serde_json::json!({}));
+    // The MARKER, not the phrase: the reassurance now names the stale line so a reader takes the two
+    // together, so "STALE BYTECODE" appears twice per entry and counting the phrase would count the cure
+    // as the disease.
+    assert_eq!(
+        listed.matches("⚠️  STALE BYTECODE:").count(),
+        2,
+        "both entries must carry the proof: {listed}"
+    );
+    assert!(
+        !listed.contains("does NOT need re-arming"),
+        "no entry reporting STALE BYTECODE may also say re-arming is unnecessary — each is true of a \
+         different thing, and together the first licenses ignoring the second:\n{listed}"
+    );
+    assert_contains_all(
+        "each entry states arming and location as one thought rather than two that fight",
+        &listed,
+        &["ARMING does not need repeating", "not instead of it", "carries no intent to recover"],
     );
 
     server.panic_reset();

@@ -215,6 +215,20 @@ stayed enabled, and never fired, which is indistinguishable from the hypothesis 
 class-load watch for life and arms the new copy itself (ADR-0028). The two fixes are asymmetric on purpose,
 and the asymmetry is the point: the loud one could be *answered better*, the silent one had to be
 *prevented*, because nothing a reply says can reach someone who is reading an absence.
+
+**Arming has since needed both halves, and a third thing neither covered.** #116's *Out of scope* named stop
+points, so the loud failure stayed on the arming path for six weeks: `set_line_stop {method: "x"}` against
+the stale copy answered "Method 'x' not found in C", which is true of the copy it inspected and false of the
+build being read. Arming now tries every copy too and says which answered, and when a class root can answer
+it says whether the BUILD declares the method — which is what separates "the loaded copy predates your
+source" from "the name is wrong" (BP-11,
+[#203](https://github.com/YgorPerez/java-debugging-mcp/issues/203)). The third thing is **location**: a copy
+has its own line table, so what travels to a new copy depends on what the caller typed. A `method` name is
+re-resolved per copy and follows the method wherever it moved; a `line` is a number looked up in the new
+copy's own table, and after an edit above it that is a different statement or no statement at all. So the
+class-load watch's promise is now scoped to the arming shape, and it never claims the location travelled
+beside a proof that the build has moved (BP-10,
+[#202](https://github.com/YgorPerez/java-debugging-mcp/issues/202)).
 _Avoid_: "the class" once more than one copy is loaded (that names a name, not a type); **reload** for this
 (a copy is a second *definition* under a second loader, not a redefinition of the first — see the entry
 under **The target**)

@@ -19,6 +19,9 @@
 itens = "itens"
 cliente = "cliente"
 limite = "limite"      # `Config.LIMITE` in a doc example, mcp-server/src/args.rs:390
+erro = "erro"          # `enviaEmailErro`, the method name #202 was reported against and quoted
+                       # verbatim in ADR-0028 and in two doc comments. Correcting it to `Error`
+                       # would make the quotation name a method that does not exist.
 
 # ── Deliberate misspellings, which is the category that matters: correcting these changes behaviour.
 #

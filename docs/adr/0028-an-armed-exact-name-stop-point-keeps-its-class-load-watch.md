@@ -95,6 +95,43 @@ A stop point that is **not** watching says so explicitly rather than leaving it 
 absent line — which is the case when a watch could not be registered, and it must not be
 indistinguishable from the fixed one.
 
+## Amended by BP-10 (#202): the promise is scoped to the arming shape
+
+**The mechanism above is intact and the measurement confirms it.** #202 reported that a redeploy re-arms an
+exact-name stop point at the retired build's line; it does not, and the section above is why — the watch
+carries the caller's locator, so a stop point armed by method name finds the method's first location in the
+new copy. What #202 actually found is in the two lines this ADR quotes as its own example, read side by side
+with DISC-8's:
+
+```
+✓ [bp_2] …ApiException:81 (trace)
+     Method: enviaEmailErro
+     👀 Watching for more copies — … does NOT need re-arming after a redeploy
+       ⚠️  STALE BYTECODE: … the JVM has line 81 at bytecode 0, your build has line 110 at 0
+```
+
+Each is true of a different thing — the first about **arming**, the second about **location** — and read
+together the first licenses ignoring the second. Three changes, none of which touches the watch:
+
+* **The reassurance is scoped to what the caller typed.** A `method` name is re-resolved per copy and so
+  follows the code; a `line` is a number looked up in the new copy's own table, and a number carries no
+  intent to recover. Only the first case can carry the strong promise, and now only it does. Pinned in
+  `reply-fragments.txt` — this is a fragment whose *wording* was the defect, so a rewording has to fail a
+  test.
+* **A later copy that landed on a different line says so**, and one that could not be armed at all says
+  that. The second was a `warn!` in the server's own log, which is not somewhere a caller looks: an
+  explicit-line stop point across a redeploy that moved the code silently covered one copy fewer than the
+  listing implied.
+* **The staleness verdict is re-run against the copy just armed** rather than left describing the copy armed
+  first. A redeploy is exactly when a verdict about the retired copy stops being about the code that will
+  run.
+
+The proof also changed. `RedeployProbe` defines both copies from the **same bytes**, so the method is at the
+same line in each and this ADR's own re-resolution claim was never exercised — a resolver that reused the
+first copy's line would have passed the test. `MovedMethodProbe` is the same shape with the second copy's
+`LineNumberTable` genuinely different, and it is where "fires at the method after a redeploy that moved it"
+is now asserted.
+
 ## Alternatives considered
 
 ### Make the failure loud instead of fixing it (the issue's own fallback)

@@ -689,17 +689,62 @@ pub struct ReArmWatch {
     pub request_id: i32,
     /// The JNI signature this watch matches, compared against the `ClassPrepare` event's own.
     pub signature: String,
-    /// How many copies this watch has armed SINCE the stop point was set. Counted because it is the one
-    /// number that distinguishes "armed on 4 classloaders because this library is in four wars" from
-    /// "armed on 4 because you have redeployed three times", and `list_stop_points` is where a reader goes
-    /// to tell those apart.
-    pub later_copies: usize,
+    /// What this watch has actually DONE, as opposed to what it is watching for (BP-10, #202).
+    ///
+    /// **Boxed, and that is a size decision rather than an ownership one.** These four fields are all at
+    /// their defaults until a later copy actually loads, and a redeploy is rare — so carrying them inline
+    /// made `LineBreakpoint`, and through it [`ArmedOn`], big enough that clippy's `large_enum_variant`
+    /// fired on an enum whose other four variants gained nothing. One pointer, paid by every line stop
+    /// point, instead of fifty-odd bytes paid by every stop point of every kind.
+    pub later: Box<LaterCopies>,
     /// The location as the CALLER asked for it, not as it resolved. A later copy is re-resolved from
     /// these, and it has to be: a stop point armed by method name whose resolved line was then reused as
     /// the target would land wherever that line number happens to be in the redeployed class, which is
     /// exactly the drift the caller never asked for.
     pub line: Option<i32>,
     pub method: Option<String>,
+}
+
+/// What a [`ReArmWatch`] has done since the stop point was armed — the redeploys it has seen (BP-7, BP-10).
+///
+/// One struct because all four answer the same question, *what has actually happened to this stop point
+/// while I was not looking*, and `list_stop_points` is the only place any of them can be read: the arming
+/// happens in the event pump, where there is no reply.
+#[derive(Debug, Clone, Default)]
+pub struct LaterCopies {
+    /// How many copies this watch has armed SINCE the stop point was set. Counted because it is the one
+    /// number that distinguishes "armed on 4 classloaders because this library is in four wars" from
+    /// "armed on 4 because you have redeployed three times", and `list_stop_points` is where a reader goes
+    /// to tell those apart.
+    pub copies: usize,
+    /// Lines a later copy resolved this stop point to that DIFFER from the line it is listed at, distinct
+    /// and in arming order (BP-10, #202).
+    ///
+    /// **The listing shows one line and can be armed at several.** [`LineBreakpoint::line`] is the primary
+    /// copy's, fixed at the first arm; a copy armed later re-resolves from the watch's own `line`/`method`,
+    /// so a stop point armed by METHOD name against a build where the method has since moved is armed at
+    /// the method in the new copy and at the old line in the retired one. Both are true and the header can
+    /// only print one — which is how one entry came to carry two conclusions, a `:81` beside a reassurance
+    /// that no re-arming was needed.
+    ///
+    /// A `Vec` rather than one line because a stop point can be re-armed by several redeploys and each can
+    /// land somewhere new; keeping only the latest would report the count of copies and the line of one.
+    pub lines: Vec<i32>,
+    /// How many later copies loaded and could NOT be armed (BP-10, #202).
+    ///
+    /// **The silence this closes is the explicit-line one.** A stop point armed by METHOD name re-resolves
+    /// the name in each new copy and lands somewhere; one armed by LINE has only a number to travel, and a
+    /// number is in no method of the new copy at all once the code above it has moved. `CLASS_PREPARE`
+    /// fires, the location does not resolve, and until this the outcome was a `warn!` in the server's own
+    /// log — so the caller kept an entry that said it was watching for copies and covered one fewer than
+    /// they thought.
+    pub misses: usize,
+    /// The FIRST reason a later copy could not be armed, worded for the caller.
+    ///
+    /// One reason rather than a growing list: every miss on one stop point has the same cause, and an app
+    /// server that redeploys hourly must not accumulate a paragraph per redeploy in a listing whose job is
+    /// to fit several stop points on a screen.
+    pub miss: Option<String>,
 }
 
 /// The resolved JDWP location and suspend policy for a breakpoint, kept so a disabled breakpoint can be

@@ -58,6 +58,27 @@
 ## trace_frames/noted
 ·   Caller frames: 3·   ⚠️  clamped from 99
 
+## rearm/by-method
+Watching for more copies — a class loaded again under a new classloader is armed automatically, and this stop point was armed by METHOD name, which is re-resolved in each new copy. So it does NOT need re-arming after a redeploy, and a method that has MOVED is still armed at the method.
+
+## rearm/by-method-stale
+Watching for more copies — a class loaded again under a new classloader is armed automatically, so ARMING does not need repeating after a redeploy. Read that together with the STALE BYTECODE line below and not instead of it: the line printed above was resolved against a copy your build disagrees with, so it is not the statement you are reading. The method name IS re-resolved per copy, so a copy loaded from your build will arm at the right place — this one was not.
+
+## rearm/by-line
+Watching for more copies — a class loaded again under a new classloader is armed automatically, so ARMING does not need repeating. But this stop point was armed by LINE, and a line number is all there is to travel: :42 is looked up in the new copy's own line table, which after an edit above it is a different statement. Nothing can re-resolve it — a number carries no intent to recover. Re-arm with `method` if you want the location to follow the code.
+
+## rearm/by-line-stale
+Watching for more copies — a class loaded again under a new classloader is armed automatically, so ARMING does not need repeating. But this stop point was armed by LINE, and a line number is all there is to travel: :42 is looked up in the new copy's own line table, which after an edit above it is a different statement. Nothing can re-resolve it — a number carries no intent to recover. Re-arm with `method` if you want the location to follow the code. The STALE BYTECODE line below is the proof that your build has already moved under it.
+
+## several_locations/finally
+one source line, several bytecode copies, which is what `javac` emits for a `finally` body
+
+## several_locations/classloaders
+several classloaders' copies of this class — each is a different reference type, and a redeploy is how a second one appears
+
+## several_locations/both
+several classloaders' copies of this class (BP-5), AND several bytecode copies of the line inside one of them, which is what `javac` emits for a `finally` body (BP-4)
+
 ## trace_exprs/none
 
 

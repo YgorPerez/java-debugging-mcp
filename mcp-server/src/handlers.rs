@@ -7080,6 +7080,95 @@ fn escalating_stop_points<'a>(
     co_located_stop_points(session, Some(&sp.id), &bp.arm).0
 }
 
+/// Which of the two multiplicities put this stop point on several JDWP requests (BP-10, #202).
+///
+/// **Two independent reasons land in the same counter, and the line used to name only one of them.** BP-4's
+/// is a source line in the line table more than once — `javac` inlines a `finally` body per exit path. BP-5's
+/// is a class name loaded by more than one classloader, each defining its own reference type. The text said
+/// `finally` unconditionally, so a stop point on a class loaded twice was told its two requests were two
+/// bytecode copies of one line, which is a claim about the caller's source and is false. Found while
+/// covering #202, where a redeploy makes the second reason the ordinary one.
+///
+/// Read off the arm rather than off a flag: the locations know which they are, since a duplicated line
+/// repeats `class_id` and a second copy of the class does not.
+fn why_several_locations(bp: &crate::stop_point::LineBreakpoint) -> &'static str {
+    let mut classes = std::collections::HashSet::new();
+    classes.insert(bp.arm.class_id);
+    classes.extend(bp.arm.extra_locations.iter().map(|l| l.class_id));
+    let several_classes = classes.len() > 1;
+    let several_in_one = bp.arm.extra_locations.iter().any(|l| l.class_id == bp.arm.class_id);
+    match (several_classes, several_in_one) {
+        (true, true) => {
+            "several classloaders' copies of this class (BP-5), AND several bytecode copies of the line \
+             inside one of them, which is what `javac` emits for a `finally` body (BP-4)"
+        }
+        (true, false) => {
+            "several classloaders' copies of this class — each is a different reference type, and a \
+             redeploy is how a second one appears"
+        }
+        _ => "one source line, several bytecode copies, which is what `javac` emits for a `finally` body",
+    }
+}
+
+/// What the standing class-load watch promises, worded so it cannot be read as covering more than it does
+/// (BP-10, #202).
+///
+/// **One sentence used to answer two questions, and read together the first licensed ignoring the second.**
+/// BP-7's line said a redeploy needs no re-arming — true, and about ARMING. Beside it, DISC-8's line said
+/// the JVM's line table for this method does not match the build — true, and about LOCATION. A listing
+/// printed both about the same stop point:
+///
+/// ```text
+/// ✓ [bp_2] …ApiException:81 (trace)
+///      Method: enviaEmailErro
+///      👀 Watching for more copies — … does NOT need re-arming after a redeploy
+///        ⚠️  STALE BYTECODE: … the JVM has line 81 at bytecode 0, your build has line 110 at 0
+/// ```
+///
+/// So the reassurance is now scoped by what the caller actually armed, and it never claims the location
+/// travelled when there is a proof that the build has moved under it:
+///
+/// * **by method name** — the name is re-resolved in each new copy ([`rearm_later_copies`] passes
+///   `line`/`method` as the CALLER gave them), so a method that moved is armed at the method. This is the
+///   only case where the strong promise is true, and it is the one worth stating strongly.
+/// * **by explicit line** — the NUMBER travels, not the statement. `:81` is looked up in the new copy's own
+///   line table, and after an edit above it that is a different statement. Nothing can re-resolve it: a
+///   line number carries no intent to recover.
+/// * **with a proof of drift** — arming still travels, and the line printed above came from a copy the
+///   build disagrees with, so the two facts are stated in one breath rather than in two that fight.
+fn rearm_reassurance(bp: &crate::stop_point::LineBreakpoint) -> String {
+    let stale = matches!(bp.drift, DriftCheck::Stale(_));
+    let by_line = bp.arm_line.is_some();
+    match (by_line, stale) {
+        (false, false) => "Watching for more copies — a class loaded again under a new classloader is \
+                           armed automatically, and this stop point was armed by METHOD name, which is \
+                           re-resolved in each new copy. So it does NOT need re-arming after a redeploy, \
+                           and a method that has MOVED is still armed at the method."
+            .to_string(),
+        (false, true) => "Watching for more copies — a class loaded again under a new classloader is armed \
+                          automatically, so ARMING does not need repeating after a redeploy. Read that \
+                          together with the STALE BYTECODE line below and not instead of it: the line \
+                          printed above was resolved against a copy your build disagrees with, so it is \
+                          not the statement you are reading. The method name IS re-resolved per copy, so \
+                          a copy loaded from your build will arm at the right place — this one was not."
+            .to_string(),
+        (true, _) => format!(
+            "Watching for more copies — a class loaded again under a new classloader is armed \
+             automatically, so ARMING does not need repeating. But this stop point was armed by LINE, and \
+             a line number is all there is to travel: :{} is looked up in the new copy's own line table, \
+             which after an edit above it is a different statement. Nothing can re-resolve it — a number \
+             carries no intent to recover. Re-arm with `method` if you want the location to follow the \
+             code.{}",
+            bp.arm_line.unwrap_or_default(),
+            if stale {
+                " The STALE BYTECODE line below is the proof that your build has already moved under it."
+            } else {
+                ""
+            }
+        ),
+    }
+}
+
 /// The classloader and re-arm lines of one listed breakpoint (BP-5 #79, BP-7 #115).
 ///
 /// Its own function because these four branches are one subject — *which copies of this class this stop
@@ -7104,20 +7193,49 @@ fn render_classloader_and_rearm(output: &mut String, sp: &StopPoint, bp: &crate:
     // redeploys of one — and the second reading is the one that means a copy you care about may have
     // arrived since you last looked.
     if let crate::stop_point::RearmState::Watching(w) = &bp.rearm {
-        if w.later_copies > 0 {
+        if w.later.copies > 0 {
             let _ = writeln!(
                 output,
                 "     ↻ {} copy/copies of this class have loaded SINCE it was armed and were armed too \
                  — that is what a redeploy looks like from here, and the retired copies above are still \
                  listed because their loaders have not been collected yet",
-                w.later_copies
+                w.later.copies
             );
         }
-        let _ = writeln!(
-            output,
-            "     👀 Watching for more copies — a class loaded again under a new classloader is armed \
-             automatically, so this stop point does NOT need re-arming after a redeploy"
-        );
+        // BP-10 (#202): the line a later copy actually resolved to, when it is not the one printed above.
+        // The header can only carry the primary copy's, so without this the entry reads as though every
+        // armed copy were at `:{}` — which is precisely how one stop point came to state two things.
+        if !w.later.lines.is_empty() {
+            let _ = writeln!(
+                output,
+                "     ↳ a later copy resolved to {} — the line above is the copy armed FIRST, and this \
+                 stop point covers both. {}",
+                w.later.lines.iter().map(|l| format!(":{l}")).collect::<Vec<_>>().join(", "),
+                if bp.arm_line.is_some() {
+                    "It was armed by LINE, so what travelled to the new copy is the number, not the \
+                     statement."
+                } else {
+                    "It was armed by METHOD name, which is re-resolved per copy, so this is the method \
+                     having moved in the redeployed build."
+                }
+            );
+        }
+        // BP-10 (#202): a later copy that loaded and could NOT be armed, which for an explicit-line stop
+        // point is what a redeploy that moved the code looks like. Printed BEFORE the reassurance, because
+        // it is the fact the reassurance has to be read against.
+        if w.later.misses > 0 {
+            let _ = writeln!(
+                output,
+                "     ⚠️  {} later cop{} of this class loaded and could NOT be armed — this stop point \
+                 does not cover {}, and a path through {} will not report. First reason: {}",
+                w.later.misses,
+                if w.later.misses == 1 { "y" } else { "ies" },
+                if w.later.misses == 1 { "it" } else { "them" },
+                if w.later.misses == 1 { "it" } else { "any of them" },
+                w.later.miss.as_deref().unwrap_or("unrecorded"),
+            );
+        }
+        let _ = writeln!(output, "     👀 {}", rearm_reassurance(bp));
     } else if sp.is_armed() && matches!(bp.rearm, crate::stop_point::RearmState::Unwatched) {
         // Said out loud rather than left to be inferred from an absent line. NOT printed for a wildcard
         // family's member: the family's own watch arms a redeploy's copy as a new member, so telling its
@@ -7166,10 +7284,10 @@ fn render_breakpoint_line(
     if sp.is_armed() && sp.request_ids.len() > 1 {
         let _ = writeln!(
             output,
-            "     Armed at {} locations (JDWP requests {}) — one source line, several bytecode copies, \
-             which is what `javac` emits for a `finally` body",
+            "     Armed at {} locations (JDWP requests {}) — {}",
             sp.request_ids.len(),
-            sp.request_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            sp.request_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+            why_several_locations(bp)
         );
     }
     render_classloader_and_rearm(output, sp, bp);
@@ -12672,7 +12790,7 @@ fn handover_watch(pend: &crate::session::PendingBreakpoint) -> crate::stop_point
     crate::stop_point::ReArmWatch {
         request_id: pend.class_prepare_request_id,
         signature: pend.signature.clone(),
-        later_copies: 0,
+        later: Box::default(),
         line: pend.line,
         method: pend.method.clone(),
     }
@@ -12727,25 +12845,51 @@ async fn rearm_later_copies(session: &mut crate::session::DebugSession, cp_ref: 
         let loc = match resolve_bp_location(&mut session.connection, cp_ref, line, method.as_deref()).await {
             Ok(loc) => loc,
             // A copy that does not have the location is news, not an error: the redeployed class may
-            // genuinely no longer have that line. There is no reply to carry it, so it is logged and the
-            // stop point keeps the copies it has.
+            // genuinely no longer have that line. BP-10 (#202): recorded on the stop point as well as
+            // logged, because a `warn!` in the server's log is not somewhere the caller looks — and this
+            // is the shape an explicit-LINE stop point takes on every redeploy that moved the code, so
+            // the entry would otherwise say it is watching for copies and quietly cover one fewer.
             Err(e) => {
                 warn!("{bp_id}: {cp_sig} loaded again but the location did not resolve in the new copy: {e}");
+                if let Some(w) = session
+                    .state
+                    .stop_points
+                    .get_mut(&bp_id)
+                    .and_then(StopPoint::line_mut)
+                    .and_then(|i| i.rearm.watch_mut())
+                {
+                    w.later.misses += 1;
+                    w.later.miss.get_or_insert_with(|| e.to_string());
+                }
                 continue;
             }
         };
+        // Destructured rather than read field by field, so `fresh_method` and `fresh_lines` are MOVED out
+        // for the drift check below instead of cloned once per newly-loaded class.
+        //
+        // BP-10 (#202) is why they are wanted at all: the listing could previously only speak about the
+        // copy armed FIRST, so a stop point armed by method name against a build where the method had
+        // since moved was armed at the method in the new copy and listed at the old line, with a
+        // reassurance beside it that read as covering both.
+        let ResolvedLocation {
+            method: fresh_method,
+            code_index,
+            extra_code_indices,
+            line: fresh_line,
+            lines: fresh_lines,
+        } = loc;
+        let method_id = fresh_method.method_id;
         let mut fresh = crate::stop_point::BreakpointArm {
             class_id: cp_ref,
-            method_id: loc.method.method_id,
-            bytecode_index: loc.code_index,
+            method_id,
+            bytecode_index: code_index,
             // The duplicated bytecode copies of this line INSIDE the new class (BP-4, #78) — a `finally`
             // is inlined per exit path in every copy of the class, not just the first one armed.
-            extra_locations: loc
-                .extra_code_indices
+            extra_locations: extra_code_indices
                 .into_iter()
                 .map(|bytecode_index| crate::stop_point::ArmedLocation {
                     class_id: cp_ref,
-                    method_id: loc.method.method_id,
+                    method_id,
                     bytecode_index,
                 })
                 .collect(),
@@ -12753,7 +12897,7 @@ async fn rearm_later_copies(session: &mut crate::session::DebugSession, cp_ref: 
         };
         let primary = match session
             .connection
-            .set_breakpoint_ex(cp_ref, loc.method.method_id, loc.code_index, arm.suspend_policy, filters)
+            .set_breakpoint_ex(cp_ref, method_id, code_index, arm.suspend_policy, filters)
             .await
         {
             Ok(req) => req,
@@ -12776,21 +12920,73 @@ async fn rearm_later_copies(session: &mut crate::session::DebugSession, cp_ref: 
         let loaders =
             describe_class_loaders(&mut crate::reads::Reads::live(&mut session.connection), &class_ids).await;
 
-        let Some(sp) = session.state.stop_points.get_mut(&bp_id) else { continue };
-        sp.request_ids.push(primary);
-        sp.request_ids.extend(extra.request_ids);
-        let Some(info) = sp.line_mut() else { continue };
-        info.arm.extra_locations.push(crate::stop_point::ArmedLocation {
-            class_id: cp_ref,
-            method_id: fresh.method_id,
-            bytecode_index: fresh.bytecode_index,
-        });
-        info.arm.extra_locations.extend(fresh.extra_locations);
-        info.loaders = loaders;
-        if let Some(w) = info.rearm.watch_mut() {
-            w.later_copies += 1;
+        // BP-10 (#202): the verdict re-run against the copy just armed, not left describing the one armed
+        // first. A redeploy is exactly when a stale verdict stops being about the code that will run — and
+        // `list_stop_points` is the only place this path can say anything, the event pump having no reply.
+        // Costs a local file read and no JDWP packets, as at arming time: `fresh_lines` is already in hand.
+        // `decode_signature` rather than the stop point's `class_pattern`: the pattern is the caller's
+        // spelling (dotted, slashed or a raw JNI signature) and `resolve_class_file` wants the canonical
+        // dotted name, which is what the wire signature decodes to.
+        let fresh_drift =
+            drift_check_for_armed_method(session, &decode_signature(cp_sig), &fresh_method, fresh_lines)
+                .await;
+        let mut ids = vec![primary];
+        ids.extend(extra.request_ids);
+        record_later_copy(
+            session,
+            &bp_id,
+            ids,
+            LaterCopyArmed { class_id: cp_ref, arm: fresh, line: fresh_line, loaders, drift: fresh_drift },
+        );
+        info!(
+            "{bp_id}: armed a newly loaded copy of {cp_sig} at line {fresh_line} (BP-7) — now {} copies",
+            class_ids.len()
+        );
+    }
+}
+
+/// What arming one newly-loaded copy produced, ready to be written onto the stop point.
+struct LaterCopyArmed {
+    class_id: u64,
+    arm: crate::stop_point::BreakpointArm,
+    /// The line THIS copy resolved to, which is not always the one the stop point is listed at (BP-10).
+    line: i32,
+    loaders: Vec<String>,
+    /// The staleness verdict re-run against this copy (BP-10, #202).
+    drift: DriftCheck,
+}
+
+/// Write one newly-armed copy onto the stop point that owns it — the half of [`rearm_later_copies`] that
+/// touches no JDWP and can therefore be read on its own.
+///
+/// Split out because the loop above went past the length the gate allows, and it is the right seam: above
+/// is *arming a copy*, here is *what the listing will say about it*, and everything here is a field write.
+fn record_later_copy(
+    session: &mut crate::session::DebugSession,
+    bp_id: &str,
+    request_ids: Vec<i32>,
+    armed: LaterCopyArmed,
+) {
+    let LaterCopyArmed { class_id, arm, line, loaders, drift } = armed;
+    let Some(sp) = session.state.stop_points.get_mut(bp_id) else { return };
+    sp.request_ids.extend(request_ids);
+    let Some(info) = sp.line_mut() else { return };
+    info.arm.extra_locations.push(crate::stop_point::ArmedLocation {
+        class_id,
+        method_id: arm.method_id,
+        bytecode_index: arm.bytecode_index,
+    });
+    info.arm.extra_locations.extend(arm.extra_locations);
+    info.loaders = loaders;
+    let listed_line = i32::try_from(info.line).unwrap_or(0);
+    info.drift = drift;
+    if let Some(w) = info.rearm.watch_mut() {
+        w.later.copies += 1;
+        // Recorded only when it MOVED. A redeploy of an unchanged class resolves to the same line, and a
+        // listing that announced that would say something on every redeploy and mean nothing.
+        if line != listed_line && !w.later.lines.contains(&line) {
+            w.later.lines.push(line);
         }
-        info!("{bp_id}: armed a newly loaded copy of {cp_sig} (BP-7) — now {} copies", class_ids.len());
     }
 }
 
@@ -15958,7 +16154,7 @@ impl RearmPlan {
             watch: crate::stop_point::RearmState::Watching(crate::stop_point::ReArmWatch {
                 request_id,
                 signature: spec.signature.clone(),
-                later_copies: 0,
+                later: Box::default(),
                 line: spec.line_opt,
                 method: spec.method_hint.clone(),
             }),
@@ -26221,6 +26417,45 @@ mod tests {
         }
     }
 
+    /// The BP-10 (#202) fragments: the re-arm reassurance in all four of its branches, and the line that
+    /// says why one stop point holds several JDWP requests.
+    ///
+    /// Four cases for the first, which is every branch — arming shape crossed with whether the build has
+    /// been proved to have moved — and three for the second, which is every multiplicity.
+    fn rearm_fragments() -> Vec<(&'static str, String)> {
+        fn stated_rearm(holder: &mut StopPoint, arm_line: Option<i32>, stale: bool) -> String {
+            let Some(bp) = holder.line_mut() else { return String::new() };
+            bp.arm_line = arm_line;
+            bp.arm_method = if arm_line.is_some() { None } else { Some("save".to_string()) };
+            bp.drift = if stale {
+                DriftCheck::Stale("\n   ⚠️  STALE BYTECODE: stated".to_string())
+            } else {
+                DriftCheck::Current
+            };
+            rearm_reassurance(bp)
+        }
+        fn stated_locations(holder: &mut StopPoint, extra: Vec<crate::stop_point::ArmedLocation>) -> String {
+            let Some(bp) = holder.line_mut() else { return String::new() };
+            bp.arm.extra_locations = extra;
+            why_several_locations(bp).to_string()
+        }
+        let at = |class_id: u64, bytecode_index: u64| crate::stop_point::ArmedLocation {
+            class_id,
+            method_id: 0x20,
+            bytecode_index,
+        };
+        let mut h = crate::stop_point::build::armed("bp_1", StopPointKind::Line);
+        vec![
+            ("rearm/by-method", stated_rearm(&mut h, None, false)),
+            ("rearm/by-method-stale", stated_rearm(&mut h, None, true)),
+            ("rearm/by-line", stated_rearm(&mut h, Some(42), false)),
+            ("rearm/by-line-stale", stated_rearm(&mut h, Some(42), true)),
+            ("several_locations/finally", stated_locations(&mut h, vec![at(0x10, 9)])),
+            ("several_locations/classloaders", stated_locations(&mut h, vec![at(0x11, 0)])),
+            ("several_locations/both", stated_locations(&mut h, vec![at(0x10, 9), at(0x11, 0)])),
+        ]
+    }
+
     /// The cases, and each one is chosen to reach a branch rather than to look realistic.
     /// A **stated** trace record for the snapshot above — authored test data, never a captured hit
     /// (`CONTEXT.md`'s word, and the reason it is not called a fixture).
@@ -26317,6 +26552,13 @@ mod tests {
         case("trace_frames/zero", describe_trace_frames(true, 0, None, "no caller frames are captured"));
         case("trace_frames/some", describe_trace_frames(true, 3, None, "hint"));
         case("trace_frames/noted", describe_trace_frames(true, 3, Some("clamped from 99"), "hint"));
+
+        // BP-10 (#202). Pinned because this is the fragment whose WORDING was the defect: one sentence
+        // answered two questions, and beside DISC-8's stale-bytecode line the first licensed ignoring the
+        // second. Its own function, so the cases can be listed without a nested `fn` after a statement.
+        for (name, body) in rearm_fragments() {
+            case(name, body);
+        }
 
         case("trace_exprs/none", describe_trace_exprs(&[]));
         case("trace_exprs/one", describe_trace_exprs(&ex(&["pedido.total"])));

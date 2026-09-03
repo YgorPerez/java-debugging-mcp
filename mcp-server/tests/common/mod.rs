@@ -2276,6 +2276,28 @@ impl Server {
         }
     }
 
+    /// Poll `debug.list_stop_points` until the reply satisfies `matches`, returning it.
+    ///
+    /// **For what the EVENT PUMP writes into a listing, which no reply can be waited on.** A class-load
+    /// watch arms (or fails to arm) a redeploy's copy inside the pump, and the only place a caller learns
+    /// the outcome is this listing — so a single read races the redeploy exactly as `wait_for_traces`
+    /// races a traced hit.
+    pub fn wait_for_listing_where(
+        &mut self,
+        timeout: Duration,
+        matches: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let listed = self.call("debug.list_stop_points", serde_json::json!({}));
+            if matches(&listed) {
+                return Some(listed);
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        None
+    }
+
     /// Poll `debug.get_last_event` until it reports something containing `needle`.
     ///
     /// `get_last_event` keeps returning the previous hit until a new one lands, so `needle` must be
