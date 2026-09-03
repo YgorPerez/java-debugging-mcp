@@ -14100,6 +14100,19 @@ fn an_exact_class_name_arms_every_classloaders_copy() {
         &set,
         &["bp_", "Armed on 2 classloaders"],
     );
+    // BP-10 (#202), found in review: two requests here are two CLASSLOADERS' copies, and the arming reply
+    // said they were two bytecode copies of one source line inlined by a `finally`. There is no `finally`
+    // in this probe, so that is a claim about the caller's source with nothing behind it — and this reply
+    // is the copy `docs/toolkit-contract.md` pins downstream, so it was the worse of the two to leave
+    // wrong. The listing was fixed one function away; this is the other half.
+    assert!(
+        !set.contains("`finally` body"),
+        "there is no `finally` in this probe, so the arming reply must not name one: {set}"
+    );
+    assert!(
+        set.contains("several classloaders' copies of this class"),
+        "the arming reply has to say which multiplicity put it on two requests: {set}"
+    );
 
     // Both copies have to report. Pre-fix only one does, and which one is up to the JVM's ordering.
     // One wait per copy, for the same reason the BP-4 test does: a single wait returns on whichever
@@ -18259,11 +18272,17 @@ fn this_resolves_in_a_trace_expr_after_an_earlier_element_rendered_an_object() {
 
     // A static frame has no `this` to capture, and that is a different answer rather than the same one.
     // `stat()` is the probe's static-method site, on the same tick as `work()`.
+    //
+    // BARE `this` IS IN THE LIST, and it is there because leaving it out is what let the first version of
+    // this fix ship an unreachable guard. A one-segment head takes an earlier arm of the same match, which
+    // replaced "No 'this' in this frame (static method)" with `bare_name_not_found`'s advice to write
+    // `Klass.this` — the misdirection this issue is about, with a nonsense suggestion attached. `this.name`
+    // is two segments and never reached it.
     let stat = server.call(
         "debug.set_line_stop",
         serde_json::json!({
             "class_pattern": "InstProbe", "line": probe_line(&source, "// BP2"), "trace": true,
-            "trace_expr": ["this.name"],
+            "trace_expr": ["this", "this.name"],
         }),
     );
     assert!(stat.contains("bp_"), "the static-method stop point did not arm: {stat}");
@@ -18284,6 +18303,20 @@ fn this_resolves_in_a_trace_expr_after_an_earlier_element_rendered_an_object() {
         !hit.contains("INVALID_FRAMEID") && !hit.contains("not a resolvable static member"),
         "`this` is a keyword — neither a retired frame nor a misspelled static member is the reading \
          here, and appending either sends the reader to re-check a name that cannot be wrong: {hit}"
+    );
+    // The bare head takes the same branch. Its slot is `this => `, and the assertions are the same two
+    // facts plus the one wording only this shape could reach.
+    let bare = traces
+        .lines()
+        .find(|l| l.contains("InstProbe.stat:") && l.contains("this => "))
+        .unwrap_or_else(|| panic!("no bare `this` slot in the static-method hit:\n{traces}"));
+    assert!(
+        bare.contains("static method"),
+        "a bare `this` on a static frame must say it has no `this`: {bare}"
+    );
+    assert!(
+        !bare.contains("nothing for a bare 'this' to mean here") && !bare.contains("Klass.this"),
+        "`this` is a keyword, so advice to qualify it names a construct that does not exist: {bare}"
     );
 
     server.panic_reset();
@@ -18758,7 +18791,13 @@ fn a_stop_point_armed_by_line_says_the_location_did_not_travel_across_the_redepl
     assert_contains_all(
         "the listing says what is not covered, why, and what to do about it",
         &listed,
-        &["could NOT be armed", "armed by LINE", "carries no intent to recover", "Re-arm with `method`"],
+        &[
+            "could NOT be armed",
+            "First reason:",
+            "already been MISSED",
+            "name a `method` instead",
+            "a line number cannot",
+        ],
     );
     assert!(
         !listed.contains("does NOT need re-arming"),

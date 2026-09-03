@@ -7080,33 +7080,107 @@ fn escalating_stop_points<'a>(
     co_located_stop_points(session, Some(&sp.id), &bp.arm).0
 }
 
+/// Keep whichever of two staleness verdicts is the stronger warning (BP-10, #202).
+///
+/// **A proof of drift is never deleted, which is the rule ADR-0051 states for the rescue record and the
+/// same reason applies here.** Refreshing the verdict against the copy just armed was meant to stop a
+/// listing describing a copy that has been superseded — but a plain overwrite can also SILENCE a real one:
+/// the primary copy is still armed and still listed at its own line, so a redeploy whose new copy happens
+/// to match the build would have removed the `⚠️ STALE BYTECODE` that was true of the copy the header
+/// names. Found in review.
+///
+/// `Stale` therefore wins over everything, and a `Current` never displaces a `NotChecked` reason. Between
+/// two of the same kind the fresher one wins, since it describes the copy most recently armed.
+fn worse_drift(existing: &DriftCheck, fresh: DriftCheck) -> DriftCheck {
+    match (existing, &fresh) {
+        // Two ways the OLDER verdict outranks the newer one, merged because they answer the same way:
+        // a proof of drift is never unproved by a later copy, and "could not tell" outranks "checked and
+        // fine" for DISC-14's reason — silence reads as checked.
+        (DriftCheck::Stale(_), DriftCheck::Current | DriftCheck::NotChecked(_))
+        | (DriftCheck::NotChecked(_), DriftCheck::Current) => existing.clone(),
+        _ => fresh,
+    }
+}
+
 /// Which of the two multiplicities put this stop point on several JDWP requests (BP-10, #202).
 ///
-/// **Two independent reasons land in the same counter, and the line used to name only one of them.** BP-4's
-/// is a source line in the line table more than once — `javac` inlines a `finally` body per exit path. BP-5's
-/// is a class name loaded by more than one classloader, each defining its own reference type. The text said
-/// `finally` unconditionally, so a stop point on a class loaded twice was told its two requests were two
-/// bytecode copies of one line, which is a claim about the caller's source and is false. Found while
-/// covering #202, where a redeploy makes the second reason the ordinary one.
+/// **Two independent reasons land in the same counter, and both replies used to name only one of them.**
+/// BP-4's is a source line in the line table more than once — `javac` inlines a `finally` body per exit
+/// path. BP-5's is a class name loaded by more than one classloader, each defining its own reference type.
+/// The text said `finally` unconditionally, so a stop point on a class loaded twice was told its two
+/// requests were two bytecode copies of one line, which is a claim about the caller's source and is false.
+/// Found while covering #202, where a redeploy makes the second reason the ordinary one.
 ///
-/// Read off the arm rather than off a flag: the locations know which they are, since a duplicated line
-/// repeats `class_id` and a second copy of the class does not.
-fn why_several_locations(bp: &crate::stop_point::LineBreakpoint) -> &'static str {
-    let mut classes = std::collections::HashSet::new();
-    classes.insert(bp.arm.class_id);
-    classes.extend(bp.arm.extra_locations.iter().map(|l| l.class_id));
-    let several_classes = classes.len() > 1;
-    let several_in_one = bp.arm.extra_locations.iter().any(|l| l.class_id == bp.arm.class_id);
-    match (several_classes, several_in_one) {
-        (true, true) => {
-            "several classloaders' copies of this class (BP-5), AND several bytecode copies of the line \
-             inside one of them, which is what `javac` emits for a `finally` body (BP-4)"
+/// **One classifier, two renderings**, because the arming reply and the listing want different lengths and
+/// must not be free to disagree about the facts: [`Self::reason`] is the compact clause both print, and
+/// [`Self::cost`] is the consequence only the arming reply has room for. That reply made the same false
+/// claim one function away from the listing — and it is the copy `docs/toolkit-contract.md` pins
+/// downstream, so it was the worse of the two to leave wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeveralLocations {
+    /// One class, one line, several bytecode copies of it (BP-4).
+    BytecodeCopies,
+    /// Several classloaders' copies of the class, one location in each (BP-5).
+    ClassCopies,
+    /// Both at once, which a redeploy of a class containing a `finally` produces.
+    Both,
+}
+
+impl SeveralLocations {
+    /// Read the shape off the arm: the locations know which they are, since a duplicated line repeats
+    /// `class_id` and a second copy of the class does not.
+    ///
+    /// Counted per class rather than compared against the primary's id, because a duplicated `finally` can
+    /// live in a LATER copy: `record_later_copy` pushes that copy's own extra bytecode indices under its
+    /// own class id, so a test against `arm.class_id` could not see them and the reply dropped the BP-4
+    /// half. Found in review. The primary is seeded at 1 because its own location is not in
+    /// `extra_locations`; every other class id starts from the entry that introduced it.
+    fn of(arm: &crate::stop_point::BreakpointArm) -> Self {
+        let mut per_class: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        per_class.insert(arm.class_id, 1);
+        for l in &arm.extra_locations {
+            *per_class.entry(l.class_id).or_insert(0) += 1;
         }
-        (true, false) => {
-            "several classloaders' copies of this class — each is a different reference type, and a \
-             redeploy is how a second one appears"
+        match (per_class.len() > 1, per_class.values().any(|&n| n > 1)) {
+            (true, true) => Self::Both,
+            (true, false) => Self::ClassCopies,
+            _ => Self::BytecodeCopies,
         }
-        _ => "one source line, several bytecode copies, which is what `javac` emits for a `finally` body",
+    }
+
+    /// The compact clause, printed by both the arming reply and the listing.
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::BytecodeCopies => {
+                "one source line, several bytecode copies, which is what `javac` emits for a `finally` \
+                 body"
+            }
+            Self::ClassCopies => {
+                "several classloaders' copies of this class — each is a different reference type, and a \
+                 redeploy is how a second one appears"
+            }
+            Self::Both => {
+                "several classloaders' copies of this class (BP-5), AND several bytecode copies of the \
+                 line inside one of them, which is what `javac` emits for a `finally` body (BP-4)"
+            }
+        }
+    }
+
+    /// What arming only the first location would have cost — the arming reply's second sentence.
+    const fn cost(self) -> &'static str {
+        match self {
+            Self::BytecodeCopies => {
+                " Arming only the first would fire on normal completion and stay silent on the throw."
+            }
+            Self::ClassCopies => {
+                " Arming only the first is how a stop point reports \"armed\" and then never fires, \
+                 because it is watching another deployment's copy."
+            }
+            Self::Both => {
+                " Arming only the first would miss both another deployment's copy and, within one copy, \
+                 the exception path through the line."
+            }
+        }
     }
 }
 
@@ -7139,6 +7213,25 @@ fn why_several_locations(bp: &crate::stop_point::LineBreakpoint) -> &'static str
 fn rearm_reassurance(bp: &crate::stop_point::LineBreakpoint) -> String {
     let stale = matches!(bp.drift, DriftCheck::Stale(_));
     let by_line = bp.arm_line.is_some();
+    // A copy this watch has already FAILED to arm is proof against the strong promise, whatever the caller
+    // typed — so it is checked before the arming shape. Found in review: the by-method branch went on
+    // saying re-arming was unnecessary directly beneath `⚠️ 1 later copy … could NOT be armed`, which is
+    // this issue's own defect reproduced on the branch its miss counter had just created. The test written
+    // with the fix covered only the by-line shape, which never carried the promise.
+    if bp.rearm.watch().is_some_and(|w| w.later.misses > 0) {
+        return format!(
+            "Watching for more copies, and one has already been MISSED — see the line above. Arming a new \
+             copy is automatic, so nothing here needs repeating by hand; whether it SUCCEEDS is the \
+             question that line answers, and for this stop point it did not.{}",
+            if by_line {
+                " Re-arm it once the copy you care about is loaded, and name a `method` instead if you \
+                 want the location to follow the code — a line number cannot."
+            } else {
+                " The method name IS re-resolved per copy, so the miss means the copy that loaded does \
+                 not declare it under that name. Re-arm once the copy you care about is loaded."
+            }
+        );
+    }
     match (by_line, stale) {
         (false, false) => "Watching for more copies — a class loaded again under a new classloader is \
                            armed automatically, and this stop point was armed by METHOD name, which is \
@@ -7147,10 +7240,10 @@ fn rearm_reassurance(bp: &crate::stop_point::LineBreakpoint) -> String {
             .to_string(),
         (false, true) => "Watching for more copies — a class loaded again under a new classloader is armed \
                           automatically, so ARMING does not need repeating after a redeploy. Read that \
-                          together with the STALE BYTECODE line below and not instead of it: the line \
-                          printed above was resolved against a copy your build disagrees with, so it is \
-                          not the statement you are reading. The method name IS re-resolved per copy, so \
-                          a copy loaded from your build will arm at the right place — this one was not."
+                          together with the STALE BYTECODE line below and not instead of it: a copy this \
+                          stop point is armed on does not match your build, so the line printed above is \
+                          not necessarily the statement you are reading. The method name IS re-resolved \
+                          per copy, so a copy loaded from your build will arm at the right place."
             .to_string(),
         (true, _) => format!(
             "Watching for more copies — a class loaded again under a new classloader is armed \
@@ -7161,7 +7254,8 @@ fn rearm_reassurance(bp: &crate::stop_point::LineBreakpoint) -> String {
              code.{}",
             bp.arm_line.unwrap_or_default(),
             if stale {
-                " The STALE BYTECODE line below is the proof that your build has already moved under it."
+                " The STALE BYTECODE line below is the proof that your build has moved under a copy this \
+                 stop point is armed on."
             } else {
                 ""
             }
@@ -7287,7 +7381,7 @@ fn render_breakpoint_line(
             "     Armed at {} locations (JDWP requests {}) — {}",
             sp.request_ids.len(),
             sp.request_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-            why_several_locations(bp)
+            SeveralLocations::of(&bp.arm).reason()
         );
     }
     render_classloader_and_rearm(output, sp, bp);
@@ -12851,16 +12945,7 @@ async fn rearm_later_copies(session: &mut crate::session::DebugSession, cp_ref: 
             // the entry would otherwise say it is watching for copies and quietly cover one fewer.
             Err(e) => {
                 warn!("{bp_id}: {cp_sig} loaded again but the location did not resolve in the new copy: {e}");
-                if let Some(w) = session
-                    .state
-                    .stop_points
-                    .get_mut(&bp_id)
-                    .and_then(StopPoint::line_mut)
-                    .and_then(|i| i.rearm.watch_mut())
-                {
-                    w.later.misses += 1;
-                    w.later.miss.get_or_insert_with(|| e.to_string());
-                }
+                note_later_copy_miss(session, &bp_id, &e.to_string());
                 continue;
             }
         };
@@ -12901,8 +12986,14 @@ async fn rearm_later_copies(session: &mut crate::session::DebugSession, cp_ref: 
             .await
         {
             Ok(req) => req,
+            // BP-10 (#202), and the exact complement of the resolve failure above: the location resolved
+            // and the JVM refused the request, so the copy is not covered either. Recorded for the same
+            // reason — a `warn!` in the server's log is not somewhere the caller looks, and the listing
+            // would otherwise say it is watching for copies while covering one fewer. Found in review;
+            // the first fix took only the sibling path.
             Err(e) => {
                 warn!("{bp_id}: failed to arm the newly loaded copy of {cp_sig}: {e}");
+                note_later_copy_miss(session, &bp_id, &e.to_string());
                 continue;
             }
         };
@@ -12945,6 +13036,28 @@ async fn rearm_later_copies(session: &mut crate::session::DebugSession, cp_ref: 
     }
 }
 
+/// Record that a later copy of the class loaded and could not be armed (BP-10, #202).
+///
+/// Two paths reach here and both leave the copy uncovered: the location did not resolve in the new copy,
+/// or it resolved and the JVM refused the request. One function so neither can be the one that forgets —
+/// the second was missed by the first attempt at this, and a listing that reports one of the two silences
+/// is not much better than one that reports neither.
+///
+/// The FIRST reason is kept and later ones only bump the count, for the reason
+/// [`crate::stop_point::LaterCopies::miss`] gives: every miss on one stop point has the same cause.
+fn note_later_copy_miss(session: &mut crate::session::DebugSession, bp_id: &str, why: &str) {
+    if let Some(w) = session
+        .state
+        .stop_points
+        .get_mut(bp_id)
+        .and_then(StopPoint::line_mut)
+        .and_then(|i| i.rearm.watch_mut())
+    {
+        w.later.misses += 1;
+        w.later.miss.get_or_insert_with(|| why.to_string());
+    }
+}
+
 /// What arming one newly-loaded copy produced, ready to be written onto the stop point.
 struct LaterCopyArmed {
     class_id: u64,
@@ -12979,7 +13092,7 @@ fn record_later_copy(
     info.arm.extra_locations.extend(arm.extra_locations);
     info.loaders = loaders;
     let listed_line = i32::try_from(info.line).unwrap_or(0);
-    info.drift = drift;
+    info.drift = worse_drift(&info.drift, drift);
     if let Some(w) = info.rearm.watch_mut() {
         w.later.copies += 1;
         // Recorded only when it MOVED. A redeploy of an unchanged class resolves to the same line, and a
@@ -15547,6 +15660,9 @@ struct ArmedBreakpoint {
     /// BP-11 (#203): which loaded copy answered, when it was not the one that sorted first. `None` on the
     /// ordinary path, which is every class loaded once and every class whose first copy has the method.
     answered_by: Option<String>,
+    /// BP-10 (#202): why this stop point holds several JDWP requests, when it does. Carried rather than
+    /// recomputed so the arming reply and the listing cannot answer it differently.
+    several_locations: SeveralLocations,
 }
 
 impl ArmedBreakpoint {
@@ -15561,10 +15677,10 @@ impl ArmedBreakpoint {
         if self.request_ids.len() > 1 {
             let _ = write!(
                 s,
-                "\n   Armed at {} locations — this source line is in the line table more than once, \
-                 which is what `javac` does to a `finally` body (it is inlined once per exit path). \
-                 Arming only the first would fire on normal completion and stay silent on the throw.",
-                self.request_ids.len()
+                "\n   Armed at {} locations — {}.{}",
+                self.request_ids.len(),
+                self.several_locations.reason(),
+                self.several_locations.cost()
             );
         }
         if self.loader_count > 1 {
@@ -16050,6 +16166,9 @@ async fn arm_and_insert(
     };
     let extra_copies = arm_extra_line_copies(session, &arm, filters).await;
     arm.extra_locations = extra_copies.armed;
+    // Read once, from the arm as it will be STORED, so the reply below and `list_stop_points` are two
+    // renderings of one answer rather than two computations of it (BP-10, #202).
+    let several_locations = SeveralLocations::of(&arm);
     let mut request_ids = vec![request_id];
     request_ids.extend(extra_copies.request_ids);
     let mut partial = extra_copies.refused;
@@ -16100,6 +16219,7 @@ async fn arm_and_insert(
         partial,
         drift,
         answered_by: caveat,
+        several_locations,
     })
 }
 
@@ -17958,15 +18078,23 @@ const TAG_OBJECT: u8 = 76; // 'L'
 const TAG_ARRAY: u8 = 91; // '['
 const TAG_STRING: u8 = 115; // 's'
 
-/// `StackFrame.ThisObject` refused, which for `this` is almost always a frame id the JVM has retired
-/// (TRACE-16, #204).
+/// `StackFrame.ThisObject` refused, worded for the ONE error code the diagnosis fits (TRACE-16, #204).
 ///
-/// **Named as a boundary rather than reported as a JDWP code**, because the code on its own reads as a bad
-/// expression. `INVALID_FRAMEID` here means the thread was resumed since the frame was handed out, and the
-/// thing that resumes it under a debugger's own nose is an invocation — a rendered `toString()`, a getter
-/// in an earlier link. [`refreshed_hit_frame`] closes that window inside one traced capture; this is what
-/// the caller reads when it is some *other* resume, and it points at the route that needs no frame at all.
-fn this_from_a_retired_frame(e: &jdwp_client::JdwpError) -> String {
+/// **`INVALID_FRAMEID` is named as a boundary rather than reported as a code**, because the code on its own
+/// reads as a bad expression. It means the thread was resumed since the frame was handed out, and the thing
+/// that resumes it under a debugger's own nose is an invocation — a rendered `toString()`, a getter in an
+/// earlier link. [`refreshed_hit_frame`] closes that window inside one traced capture; this is what the
+/// caller reads when it is some *other* resume, and it points at the route that needs no frame at all.
+///
+/// **Every other error keeps the plain wording, and that gate was missing** until review caught it. The
+/// paragraph above is a confident causal claim, so applying it to a `ConnectionClosed` (the debuggee exited
+/// mid-read) or an `OPAQUE_FRAME` (a native frame has no `this` to give) told the caller a frame id had been
+/// retired by an invocation and sent them to read `@0x…` handles against a JVM that may not be there. A
+/// diagnosis offered for a code it does not describe is the defect this whole issue is about, one level up.
+fn this_read_failure(e: &jdwp_client::JdwpError) -> String {
+    if !matches!(e, jdwp_client::JdwpError::JdwpErrorCode(jdwp_client::protocol::ERR_INVALID_FRAMEID, _)) {
+        return format!("Failed to get 'this': {e}");
+    }
     format!(
         "Failed to get 'this': {e} — the JVM will not answer for this frame any more. A frame id dies \
          when its thread is resumed, and an INVOCATION resumes it: rendering an object runs its \
@@ -17987,10 +18115,7 @@ async fn resolve_head(
         return Err("Expression must start with a local variable or 'this'".to_string());
     }
     if seg.name == "this" {
-        let obj = conn
-            .get_this_object(thread_id, frame.frame_id)
-            .await
-            .map_err(|e| this_from_a_retired_frame(&e))?;
+        let obj = conn.get_this_object(thread_id, frame.frame_id).await.map_err(|e| this_read_failure(&e))?;
         if obj == 0 {
             return Err("No 'this' in this frame (static method)".to_string());
         }
@@ -21159,14 +21284,20 @@ async fn resolve_any_head(
     // silent on the fact that qualifying the name is the fix. Naming the class costs one round trip on
     // a path that has already failed.
     Err(match (&head_result, frame) {
+        // TRACE-16 (#204): `this` is a keyword, so neither of the two readings below was ever available to
+        // it. "Not a resolvable static member: no loaded class matches the leading segment(s)" and
+        // `bare_name_not_found`'s "there is nothing for a bare 'this' to mean here … qualify it:
+        // `Klass.this`" both say the head was misspelled, which is the one thing it cannot be. The head's
+        // own message stands alone.
+        //
+        // FIRST, and that ordering is the whole of it: a bare `this` is ONE segment, so the arm below
+        // matched it and replaced "No 'this' in this frame (static method)" with advice to qualify a
+        // keyword. Found in review — the test written with this fix exercised `this.name`, which is two
+        // segments and never reached that arm.
+        (Some(Err(head_err)), _) if head_seg.name == "this" => head_err.clone(),
         (Some(Err(_)), Some(fr)) if segs.len() == 1 && head_seg.args.is_none() => {
             bare_name_not_found(conn, fr, &head_seg.name).await
         }
-        // TRACE-16 (#204): `this` is a keyword, so the static-member reading was never available to it —
-        // and appending "not a resolvable static member: no loaded class matches the leading segment(s)"
-        // to a frame or static-method failure actively suggests the head was misspelled, which is the one
-        // thing it cannot be. The head's own message stands alone.
-        (Some(Err(head_err)), _) if head_seg.name == "this" => head_err.clone(),
         (Some(Err(head_err)), _) => {
             format!("{head_err} (also not a resolvable static member: {static_err})")
         }
@@ -26352,6 +26483,67 @@ mod tests {
         assert!(w.contains("yours to do"), "the review has to be assigned to the caller: {w}");
     }
 
+    /// TRACE-16 (#204): the retired-frame diagnosis is offered for `INVALID_FRAMEID` and for nothing else.
+    ///
+    /// The message is a confident causal claim — a frame id died because the thread was resumed, and an
+    /// invocation is what resumed it — so attaching it to any other failure tells the caller something that
+    /// is not true and sends them to read `@0x…` handles instead. Found in review: the first version mapped
+    /// every `get_this_object` error through it, including a debuggee that had exited mid-read.
+    #[test]
+    fn only_an_invalid_frameid_is_diagnosed_as_a_retired_frame() {
+        use jdwp_client::JdwpError;
+        let retired = this_read_failure(&JdwpError::JdwpErrorCode(
+            jdwp_client::protocol::ERR_INVALID_FRAMEID,
+            "INVALID_FRAMEID".to_string(),
+        ));
+        assert!(retired.contains("A frame id dies when its thread is resumed"), "{retired}");
+        assert!(retired.contains("@0x"), "it has to name the route that needs no frame: {retired}");
+
+        // OPAQUE_FRAME (32) is a native frame, which has no `this` to give and was never resumed out from
+        // under us. A connection that has gone is the other one that used to acquire the claim.
+        for other in [
+            JdwpError::JdwpErrorCode(32, "OPAQUE_FRAME".to_string()),
+            JdwpError::JdwpErrorCode(jdwp_client::protocol::ERR_INVALID_OBJECT, "INVALID_OBJECT".to_string()),
+        ] {
+            let plain = this_read_failure(&other);
+            assert!(plain.starts_with("Failed to get 'this':"), "{plain}");
+            assert!(
+                !plain.contains("frame id dies"),
+                "a diagnosis must not be offered for a code it does not describe: {plain}"
+            );
+        }
+    }
+
+    /// BP-10 (#202): refreshing the staleness verdict after a redeploy never DELETES a proof of drift.
+    ///
+    /// The refresh exists so a listing stops describing a copy that has been superseded. A plain overwrite
+    /// also silences a true warning, because the primary copy is still armed and still listed at its own
+    /// line — so a redeploy whose new copy happens to match the build would have removed the `⚠️ STALE
+    /// BYTECODE` that was true of the copy the header names. Found in review. Same rule ADR-0051 states for
+    /// the rescue record: qualified where it is read, never deleted.
+    #[test]
+    fn a_refreshed_drift_verdict_never_silences_a_proof_of_drift() {
+        let stale = || DriftCheck::Stale("\n   ⚠️  STALE BYTECODE: stated".to_string());
+        let unchecked = || DriftCheck::NotChecked("no class root".to_string());
+        let kind = |d: &DriftCheck| match d {
+            DriftCheck::Stale(_) => "stale",
+            DriftCheck::Current => "current",
+            DriftCheck::NotChecked(_) => "unchecked",
+        };
+        let is = |d: &DriftCheck, want: &str| kind(d) == want;
+
+        // A proof survives whatever the newer copy says.
+        assert!(is(&worse_drift(&stale(), DriftCheck::Current), "stale"));
+        assert!(is(&worse_drift(&stale(), unchecked()), "stale"));
+        // "Could not tell" outranks "checked and fine", for DISC-14's reason: silence reads as checked.
+        assert!(is(&worse_drift(&unchecked(), DriftCheck::Current), "unchecked"));
+        // And a newly-discovered drift is reported, which is the case the refresh was added for.
+        assert!(is(&worse_drift(&DriftCheck::Current, stale()), "stale"));
+        assert!(is(&worse_drift(&unchecked(), stale()), "stale"));
+        // Between two of the same kind the fresher one wins: it describes the copy most recently armed.
+        assert!(is(&worse_drift(&DriftCheck::Current, DriftCheck::Current), "current"));
+    }
+
     /// TEST-46 (#154): the caller-visible reply FRAGMENTS, pinned rather than substring-checked.
     ///
     /// 163 substring assertions guard these strings today, and a substring check passes a rewording. That
@@ -26423,21 +26615,37 @@ mod tests {
     /// Four cases for the first, which is every branch — arming shape crossed with whether the build has
     /// been proved to have moved — and three for the second, which is every multiplicity.
     fn rearm_fragments() -> Vec<(&'static str, String)> {
-        fn stated_rearm(holder: &mut StopPoint, arm_line: Option<i32>, stale: bool) -> String {
+        // `Watching` throughout, because that is the only state `rearm_reassurance` is ever reached in —
+        // the listing calls it inside `if let RearmState::Watching(w)`.
+        fn stated_rearm(holder: &mut StopPoint, arm_line: Option<i32>, stale: bool, misses: usize) -> String {
             let Some(bp) = holder.line_mut() else { return String::new() };
             bp.arm_line = arm_line;
-            bp.arm_method = if arm_line.is_some() { None } else { Some("save".to_string()) };
+            let method = if arm_line.is_some() { None } else { Some("save".to_string()) };
+            bp.arm_method = method.clone();
             bp.drift = if stale {
                 DriftCheck::Stale("\n   ⚠️  STALE BYTECODE: stated".to_string())
             } else {
                 DriftCheck::Current
             };
+            let mut watch = crate::stop_point::ReArmWatch {
+                request_id: 11,
+                signature: "Lcom/example/Orders;".to_string(),
+                later: Box::default(),
+                line: arm_line,
+                method,
+            };
+            watch.later.misses = misses;
+            watch.later.miss = (misses > 0).then(|| "No method contains line 42".to_string());
+            bp.rearm = crate::stop_point::RearmState::Watching(watch);
             rearm_reassurance(bp)
         }
         fn stated_locations(holder: &mut StopPoint, extra: Vec<crate::stop_point::ArmedLocation>) -> String {
             let Some(bp) = holder.line_mut() else { return String::new() };
             bp.arm.extra_locations = extra;
-            why_several_locations(bp).to_string()
+            let shape = SeveralLocations::of(&bp.arm);
+            // The separator too: the arming reply writes `"— {}.{}"`, so a fragment joined without the
+            // full stop would pin a string this server never prints.
+            format!("{}.{}", shape.reason(), shape.cost())
         }
         let at = |class_id: u64, bytecode_index: u64| crate::stop_point::ArmedLocation {
             class_id,
@@ -26446,13 +26654,24 @@ mod tests {
         };
         let mut h = crate::stop_point::build::armed("bp_1", StopPointKind::Line);
         vec![
-            ("rearm/by-method", stated_rearm(&mut h, None, false)),
-            ("rearm/by-method-stale", stated_rearm(&mut h, None, true)),
-            ("rearm/by-line", stated_rearm(&mut h, Some(42), false)),
-            ("rearm/by-line-stale", stated_rearm(&mut h, Some(42), true)),
+            ("rearm/by-method", stated_rearm(&mut h, None, false, 0)),
+            ("rearm/by-method-stale", stated_rearm(&mut h, None, true, 0)),
+            ("rearm/by-line", stated_rearm(&mut h, Some(42), false, 0)),
+            ("rearm/by-line-stale", stated_rearm(&mut h, Some(42), true, 0)),
+            // A copy already MISSED outranks the arming shape, so the same by-method case that carries
+            // the strong promise above must not carry it here. Found in review: the promise was printed
+            // directly beneath the `could NOT be armed` warning, which is this issue's own defect.
+            ("rearm/by-method-missed", stated_rearm(&mut h, None, false, 1)),
+            ("rearm/by-line-missed", stated_rearm(&mut h, Some(42), false, 2)),
             ("several_locations/finally", stated_locations(&mut h, vec![at(0x10, 9)])),
             ("several_locations/classloaders", stated_locations(&mut h, vec![at(0x11, 0)])),
             ("several_locations/both", stated_locations(&mut h, vec![at(0x10, 9), at(0x11, 0)])),
+            // The BP-4 half living in a LATER copy, which a test against the primary's class id could
+            // not see. Found in review.
+            (
+                "several_locations/finally-in-a-later-copy",
+                stated_locations(&mut h, vec![at(0x11, 0), at(0x11, 9)]),
+            ),
         ]
     }
 

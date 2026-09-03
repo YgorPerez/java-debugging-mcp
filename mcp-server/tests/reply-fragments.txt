@@ -62,22 +62,31 @@
 Watching for more copies — a class loaded again under a new classloader is armed automatically, and this stop point was armed by METHOD name, which is re-resolved in each new copy. So it does NOT need re-arming after a redeploy, and a method that has MOVED is still armed at the method.
 
 ## rearm/by-method-stale
-Watching for more copies — a class loaded again under a new classloader is armed automatically, so ARMING does not need repeating after a redeploy. Read that together with the STALE BYTECODE line below and not instead of it: the line printed above was resolved against a copy your build disagrees with, so it is not the statement you are reading. The method name IS re-resolved per copy, so a copy loaded from your build will arm at the right place — this one was not.
+Watching for more copies — a class loaded again under a new classloader is armed automatically, so ARMING does not need repeating after a redeploy. Read that together with the STALE BYTECODE line below and not instead of it: a copy this stop point is armed on does not match your build, so the line printed above is not necessarily the statement you are reading. The method name IS re-resolved per copy, so a copy loaded from your build will arm at the right place.
 
 ## rearm/by-line
 Watching for more copies — a class loaded again under a new classloader is armed automatically, so ARMING does not need repeating. But this stop point was armed by LINE, and a line number is all there is to travel: :42 is looked up in the new copy's own line table, which after an edit above it is a different statement. Nothing can re-resolve it — a number carries no intent to recover. Re-arm with `method` if you want the location to follow the code.
 
 ## rearm/by-line-stale
-Watching for more copies — a class loaded again under a new classloader is armed automatically, so ARMING does not need repeating. But this stop point was armed by LINE, and a line number is all there is to travel: :42 is looked up in the new copy's own line table, which after an edit above it is a different statement. Nothing can re-resolve it — a number carries no intent to recover. Re-arm with `method` if you want the location to follow the code. The STALE BYTECODE line below is the proof that your build has already moved under it.
+Watching for more copies — a class loaded again under a new classloader is armed automatically, so ARMING does not need repeating. But this stop point was armed by LINE, and a line number is all there is to travel: :42 is looked up in the new copy's own line table, which after an edit above it is a different statement. Nothing can re-resolve it — a number carries no intent to recover. Re-arm with `method` if you want the location to follow the code. The STALE BYTECODE line below is the proof that your build has moved under a copy this stop point is armed on.
+
+## rearm/by-method-missed
+Watching for more copies, and one has already been MISSED — see the line above. Arming a new copy is automatic, so nothing here needs repeating by hand; whether it SUCCEEDS is the question that line answers, and for this stop point it did not. The method name IS re-resolved per copy, so the miss means the copy that loaded does not declare it under that name. Re-arm once the copy you care about is loaded.
+
+## rearm/by-line-missed
+Watching for more copies, and one has already been MISSED — see the line above. Arming a new copy is automatic, so nothing here needs repeating by hand; whether it SUCCEEDS is the question that line answers, and for this stop point it did not. Re-arm it once the copy you care about is loaded, and name a `method` instead if you want the location to follow the code — a line number cannot.
 
 ## several_locations/finally
-one source line, several bytecode copies, which is what `javac` emits for a `finally` body
+one source line, several bytecode copies, which is what `javac` emits for a `finally` body. Arming only the first would fire on normal completion and stay silent on the throw.
 
 ## several_locations/classloaders
-several classloaders' copies of this class — each is a different reference type, and a redeploy is how a second one appears
+several classloaders' copies of this class — each is a different reference type, and a redeploy is how a second one appears. Arming only the first is how a stop point reports "armed" and then never fires, because it is watching another deployment's copy.
 
 ## several_locations/both
-several classloaders' copies of this class (BP-5), AND several bytecode copies of the line inside one of them, which is what `javac` emits for a `finally` body (BP-4)
+several classloaders' copies of this class (BP-5), AND several bytecode copies of the line inside one of them, which is what `javac` emits for a `finally` body (BP-4). Arming only the first would miss both another deployment's copy and, within one copy, the exception path through the line.
+
+## several_locations/finally-in-a-later-copy
+several classloaders' copies of this class (BP-5), AND several bytecode copies of the line inside one of them, which is what `javac` emits for a `finally` body (BP-4). Arming only the first would miss both another deployment's copy and, within one copy, the exception path through the line.
 
 ## trace_exprs/none
 

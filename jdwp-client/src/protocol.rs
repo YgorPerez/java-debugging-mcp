@@ -180,6 +180,15 @@ pub(crate) const ERR_NOT_IMPLEMENTED: u16 = 99;
 /// would blame the debugger for the garbage collector doing its job (TRACE-10, #85).
 pub const ERR_INVALID_OBJECT: u16 = 20;
 
+/// `INVALID_FRAMEID` — the frame id was one this JVM issued and is not one it still honours.
+///
+/// Public for the same reason as [`ERR_INVALID_OBJECT`], and it is the same lesson about lifetime one
+/// object along: a frame id dies when its thread is **resumed**, and an `InvokeMethod` resumes the thread
+/// to run the method. So this is what a perfectly valid frame id becomes the moment anything is called in
+/// the debuggee, its own caller's included, and reporting it as a bad expression sends the reader to
+/// re-check a name that was never wrong (TRACE-16, #204). `CONTEXT.md` § **Frame id**.
+pub const ERR_INVALID_FRAMEID: u16 = 30;
+
 /// JDWP error-code to human-readable name mapping.
 const ERROR_MESSAGES: &[(u16, &str)] = &[
     (0, "NONE"),
